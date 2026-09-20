@@ -303,6 +303,7 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('--append-system-prompt');
         expect(promptArgs).toContain('test-title-prompt');
         expect(promptArgs).not.toContain('test-saycode-owned-prompt');
+        expect(promptArgs).not.toContain('<saycode-api-gateway>');
         expect(promptArgs).toContain('test-agent-orchestration-prompt');
     });
 
@@ -319,6 +320,8 @@ describe('claudeLocal --continue handling', () => {
         const promptArgs = spawnArgs.join('\n');
         expect(spawnArgs).toContain('--append-system-prompt');
         expect(promptArgs).toContain('test-title-prompt\n\ntest-saycode-owned-prompt\n\ntest-agent-orchestration-prompt');
+        expect(promptArgs).toContain('{NAME}_SAYCODE_API_URL');
+        expect(promptArgs.match(/<saycode-api-gateway>/g)).toHaveLength(1);
     });
 
     it('honors a per-block override that turns the Saycode-owned prompt off while the master value is on', async () => {

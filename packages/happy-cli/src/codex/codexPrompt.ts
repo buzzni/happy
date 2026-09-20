@@ -5,6 +5,7 @@ import {
     type SaycodePromptBlockOverrides,
 } from '@/prompt/promptProvenance';
 import { hashObject } from '@/utils/deterministicJson';
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 
 import type { ReasoningEffort } from './codexAppServerTypes';
 
@@ -72,6 +73,9 @@ export function buildCodexDeveloperInstructions({
     }
     if (mode.saycodeSystemPromptEnabled !== undefined) {
         blocks.push(mode.appendSystemPrompt);
+    }
+    if (mode.saycodeSystemPromptEnabled !== false) {
+        blocks.push(SAYCODE_API_GATEWAY_PROMPT);
     }
     return blocks.filter((block): block is string => Boolean(block)).join('\n\n') || undefined;
 }

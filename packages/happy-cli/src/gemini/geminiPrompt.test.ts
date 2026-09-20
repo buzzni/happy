@@ -1,3 +1,4 @@
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 import { describe, expect, it } from 'vitest';
 
 import { CHANGE_TITLE_INSTRUCTION } from './constants';
@@ -35,7 +36,7 @@ describe('buildGeminiTurnPrompt', () => {
       userText: 'plain first turn',
       isNewSession: true,
       hasTitle: false,
-    })).toBe(`plain first turn\n\n${CHANGE_TITLE_INSTRUCTION}`);
+    })).toBe(`${SAYCODE_API_GATEWAY_PROMPT}\n\nplain first turn\n\n${CHANGE_TITLE_INSTRUCTION}`);
   });
 
   it('does not repeat session instructions on a continuing ACP session', () => {
@@ -62,7 +63,7 @@ describe('buildGeminiTurnPrompt', () => {
       appendSystemPrompt: 'CLIENT APPEND',
       isNewSession: true,
       hasTitle: true,
-    })).toBe('CLIENT APPEND\n\nresume');
+    })).toBe(`CLIENT APPEND\n\n${SAYCODE_API_GATEWAY_PROMPT}\n\nresume`);
   });
 
   it('keeps child-session orchestration on when the master is off unless its block is explicitly off', () => {
@@ -91,7 +92,7 @@ describe('buildGeminiTurnPrompt', () => {
     });
 
     expect(prompt).toBe(
-      `CLIENT APPEND\n\n[PREVIOUS]\nUser: earlier turn\n[/PREVIOUS]\n\ncurrent turn\n\n${CHANGE_TITLE_INSTRUCTION}`,
+      `CLIENT APPEND\n\n${SAYCODE_API_GATEWAY_PROMPT}\n\n[PREVIOUS]\nUser: earlier turn\n[/PREVIOUS]\n\ncurrent turn\n\n${CHANGE_TITLE_INSTRUCTION}`,
     );
     expect(prompt.match(/current turn/g)).toHaveLength(1);
   });
@@ -111,9 +112,9 @@ describe('hashGeminiMode', () => {
       .not.toBe(enabled);
   });
 
-  it('does not restart when only the unrelated master switch changes', () => {
+  it('restarts when the API gateway system policy changes', () => {
     expect(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: true }))
-      .toBe(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: false }));
+      .not.toBe(hashGeminiMode({ ...base, appendSystemPrompt: 'A', saycodeSystemPromptEnabled: false }));
   });
 
   it('treats an absent policy as the legacy enabled policy', () => {
@@ -129,5 +130,18 @@ describe('hashGeminiMode', () => {
   it('does not restart for an explicit value equal to the default-on orchestration policy', () => {
     expect(hashGeminiMode(base))
       .toBe(hashGeminiMode({ ...base, saycodePromptBlocks: { agentOrchestration: true } }));
+  });
+});
+
+
+describe('Saycode API gateway session guidance', () => {
+  it('adds the common rule once at session start and removes it under master OFF', () => {
+    const input = { userText: 'continue', isNewSession: true, hasTitle: true };
+    const first = buildGeminiTurnPrompt(input);
+    expect(first).toContain('{NAME}_SAYCODE_API_URL');
+    expect(first).toContain('registered API contract');
+    expect(first.match(/<saycode-api-gateway>/g)).toHaveLength(1);
+    expect(buildGeminiTurnPrompt({ ...input, isNewSession: false })).toBe('continue');
+    expect(buildGeminiTurnPrompt({ ...input, saycodeSystemPromptEnabled: false })).toBe('continue');
   });
 });

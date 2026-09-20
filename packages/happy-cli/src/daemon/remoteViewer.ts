@@ -13,17 +13,116 @@
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
-/** Binaries the remote screen needs, in the order a user should install them. */
-export const VIEWER_TOOLS = ['Xvfb', 'x11vnc', 'websockify'] as const
-export type ViewerTool = (typeof VIEWER_TOOLS)[number]
+import type { ViewerResizeMode } from './viewerWebRoot'
 
 /** apt package that provides each binary — they do not all match by name. */
 const APT_PACKAGE: Record<string, string> = {
     Xvfb: 'xvfb',
+    Xvnc: 'tigervnc-standalone-server',
+    vncconfig: 'tigervnc-common',
     x11vnc: 'x11vnc',
+    openbox: 'openbox',
     websockify: 'websockify',
     novnc: 'novnc',
 }
+
+/** What this machine can actually run for the remote screen. */
+export type ViewerCapabilities = {
+    hasXvnc: boolean
+    hasXvfb: boolean
+    hasX11vnc: boolean
+    hasWebsockify: boolean
+    hasWindowManager: boolean
+    /**
+     * TigerVNC's clipboard helper — see {@link buildVncConfigArgs}.
+     *
+     * Required rather than optional on purpose: a caller that leaves it out
+     * would lose pasting into the remote screen and nothing would say so.
+     */
+    hasVncConfig: boolean
+}
+
+export type ViewerBackend = {
+    kind: 'xvnc' | 'xvfb-x11vnc'
+    resizeMode: ViewerResizeMode
+    windowManager: boolean
+}
+
+/**
+ * Which display server to run, and what the client may ask it for.
+ *
+ * `remote` resize — the client asking the server to match its window, which
+ * is the only way to fill a browser window exactly — needs two things at
+ * once, and both are checked here rather than assumed:
+ *
+ * - a server that implements `SetDesktopSize`. x11vnc has no such hook at
+ *   all (no `setDesktopSizeHook` in its source), so the request is silently
+ *   dropped and the screen stays clipped. TigerVNC's Xvnc implements it.
+ * - something that re-fits the browser window afterwards. The viewer display
+ *   has no window manager of its own, and Chrome's window is final once
+ *   opened (measured 2026-09-14), so a resized desktop without a WM leaves
+ *   the browser covering only part of it — worse than scaling.
+ */
+export function selectViewerBackend(capabilities: ViewerCapabilities): ViewerBackend | null {
+    if (!capabilities.hasWebsockify) return null
+    if (capabilities.hasXvnc) {
+        return {
+            kind: 'xvnc',
+            resizeMode: capabilities.hasWindowManager ? 'remote' : 'scale',
+            windowManager: capabilities.hasWindowManager,
+        }
+    }
+    if (capabilities.hasXvfb && capabilities.hasX11vnc) {
+        return { kind: 'xvfb-x11vnc', resizeMode: 'scale', windowManager: capabilities.hasWindowManager }
+    }
+    return null
+}
+
+/**
+ * What the screen cannot open without.
+ *
+ * Deliberately not the same list as {@link desiredViewerTools}: a machine
+ * whose Xvfb/x11vnc screen already works must not be told it is broken
+ * because it lacks the newer server.
+ */
+export function missingViewerTools(capabilities: ViewerCapabilities): string[] {
+    const missing: string[] = []
+    if (!capabilities.hasXvnc && !(capabilities.hasXvfb && capabilities.hasX11vnc)) {
+        missing.push('Xvnc')
+    }
+    if (!capabilities.hasWebsockify) missing.push('websockify')
+    return missing
+}
+
+/**
+ * What an explicit install should put on the machine — the blockers plus
+ * whatever is still missing for an exact fill. Installing is the moment the
+ * user has already accepted a package change, so it is also the moment to
+ * close the gap; nothing here is installed behind their back.
+ */
+export function desiredViewerTools(capabilities: ViewerCapabilities): string[] {
+    const desired = missingViewerTools(capabilities)
+    if (!capabilities.hasXvnc && !desired.includes('Xvnc')) desired.push('Xvnc')
+    if (!capabilities.hasWindowManager) desired.push('openbox')
+    // Normally arrives with Xvnc's own package, so this only fires on a
+    // machine that lost it — where pasting is broken and nothing else in
+    // this list would bring it back.
+    if (!capabilities.hasVncConfig) desired.push('vncconfig')
+    return desired
+}
+
+/**
+ * The size the remote screen starts at.
+ *
+ * Read by both the display server and the browser window, because without a
+ * window manager nothing can maximize or resize a window after the fact, so
+ * a browser that does not open at the screen's own size leaves dead black
+ * space the user cannot reclaim.
+ *
+ * Only a starting point on the Xvnc backend: the viewer resizes the desktop
+ * to its own window as soon as it connects, and openbox refits the browser.
+ */
+export const VIEWER_SCREEN = { width: 1920, height: 1080 } as const
 
 export function buildXvfbArgs({ display, width, height }: {
     display: string
@@ -47,6 +146,77 @@ export function buildX11vncArgs({ display, vncPort }: { display: string; vncPort
         '-nopw',
         '-quiet',
     ]
+}
+
+/**
+ * TigerVNC's Xvnc: an X server and a VNC server in one process, replacing
+ * the Xvfb + x11vnc pair. Taken for one property the pair cannot offer —
+ * it accepts `SetDesktopSize`, so the remote screen becomes exactly the
+ * size of the viewer's window instead of being letterboxed into it.
+ */
+export function buildXvncArgs({ display, vncPort, width, height }: {
+    display: string
+    vncPort: number
+    width: number
+    height: number
+}): string[] {
+    return [
+        display,
+        '-geometry', `${width}x${height}`,
+        '-depth', '24',
+        '-rfbport', String(vncPort),
+        // Same posture as the x11vnc path: no authentication of its own, so
+        // loopback only and the daemon relay is the only way in.
+        '-localhost',
+        '-SecurityTypes=None',
+        '-AlwaysShared=1',
+        '-AcceptSetDesktopSize=1',
+        '-desktop', 'Saycode remote browser',
+    ]
+}
+
+/**
+ * TigerVNC hands the VNC clipboard to X through a helper, not from inside
+ * Xvnc: without `vncconfig` running on the display, nothing takes ownership
+ * of the X CLIPBOARD selection and a paste from the viewer lands nowhere
+ * (measured — with the helper the selection carries the text and offers
+ * UTF8_STRING, without it there is no selection owner at all).
+ *
+ * `-nowin` keeps it headless: the helper's own window would otherwise sit on
+ * the screen the user is looking at.
+ */
+export function buildVncConfigArgs(): string[] {
+    return ['-nowin']
+}
+
+/**
+ * Openbox exists here for exactly one behaviour: on an RandR screen change
+ * it reconfigures every client (`screen_resize()` → `client_reconfigure()`),
+ * which is what re-fits the browser to a desktop the viewer just resized.
+ *
+ * Every window is forced maximized and undecorated so the browser covers the
+ * screen with no title bar of its own — this display has one application and
+ * no user sitting at it to arrange windows.
+ */
+export function buildOpenboxConfig(): string {
+    return [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<openbox_config xmlns="http://openbox.org/3.4/rc">',
+        '  <applications>',
+        '    <application class="*">',
+        '      <decor>no</decor>',
+        '      <maximized>yes</maximized>',
+        '    </application>',
+        '  </applications>',
+        '</openbox_config>',
+        '',
+    ].join('\n')
+}
+
+export function buildOpenboxArgs({ configPath }: { configPath: string }): string[] {
+    // --sm-disable: no session manager on this display, and openbox otherwise
+    // waits on one at startup.
+    return ['--sm-disable', '--config-file', configPath]
 }
 
 export function buildWebsockifyArgs({ webPort, vncPort, webRoot }: {
@@ -250,7 +420,7 @@ export function readFlagFromCmdline(cmdline: string, flag: string): string | nul
 }
 
 export function viewerProcessMatchesLease(
-    kind: 'xvfb' | 'x11vnc' | 'websockify',
+    kind: 'xvfb' | 'xvnc' | 'x11vnc' | 'websockify',
     cmdline: string,
     lease: { display: string; vncPort: number; webPort: number },
 ): boolean {
@@ -261,6 +431,12 @@ export function viewerProcessMatchesLease(
     const hasExecutable = args.some((arg) => arg.split('/').pop()?.toLowerCase() === kind)
     if (!hasExecutable) return false
     if (kind === 'xvfb') return args.includes(lease.display)
+    if (kind === 'xvnc') {
+        // Xvnc is both the X server and the VNC server, so its own cmdline
+        // carries the two facts that identify the slot.
+        const portAt = args.indexOf('-rfbport')
+        return args.includes(lease.display) && args[portAt + 1] === String(lease.vncPort)
+    }
     if (kind === 'x11vnc') {
         const displayAt = args.indexOf('-display')
         const portAt = args.indexOf('-rfbport')
@@ -280,14 +456,26 @@ function which(binary: string): Promise<string | null> {
     })
 }
 
-/** Which viewer binaries are absent on this machine. */
-export async function detectMissingViewerTools(): Promise<string[]> {
-    const missing: string[] = []
-    for (const tool of VIEWER_TOOLS) {
-        if (!(await which(tool))) missing.push(tool)
+/** What this machine has installed, as {@link selectViewerBackend} reads it. */
+export async function detectViewerCapabilities(): Promise<ViewerCapabilities> {
+    const [xvnc, xvfb, x11vnc, websockify, openbox, vncconfig] = await Promise.all([
+        which('Xvnc'),
+        which('Xvfb'),
+        which('x11vnc'),
+        which('websockify'),
+        which('openbox'),
+        which('vncconfig'),
+    ])
+    return {
+        hasXvnc: xvnc !== null,
+        hasXvfb: xvfb !== null,
+        hasX11vnc: x11vnc !== null,
+        hasWebsockify: websockify !== null,
+        hasWindowManager: openbox !== null,
+        hasVncConfig: vncconfig !== null,
     }
-    return missing
 }
+
 
 /**
  * Whether that port is actually serving noVNC's client page.

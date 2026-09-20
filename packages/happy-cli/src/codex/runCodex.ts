@@ -113,6 +113,7 @@ import {
     prepareCodexInitialPrompt,
     prepareCodexSessionStart,
 } from './initialPrompt';
+import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import {
@@ -138,6 +139,7 @@ import { isManagedBrokerServer } from '@/launcher/codexApproval';
 import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
 import type { RunnerPrincipal } from '@/claude/runClaude';
+import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 
 /** See the Claude counterpart. */
 const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
@@ -145,6 +147,11 @@ const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
+
+type ClaimedUserMessage = {
+    message: UserMessage;
+    attachmentsPromise: Promise<PendingAttachment[]>;
+};
 
 /**
  * Main entry point for the codex command with ink UI
@@ -364,6 +371,7 @@ export async function runCodex(opts: {
         }
     });
     session = initialSession;
+    let difficultyRoutingState = session.getMetadata()?.difficultyRoutingState as DifficultyRoutingState | undefined;
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {
@@ -455,24 +463,10 @@ export async function runCodex(opts: {
         logger.debug('[Codex] Reset turn-scoped options after abort');
     };
 
-    const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {
-        // A managed run answers exactly the prompt its envelope was admitted
-        // for. A message posted to this session by the account owner arrives
-        // here as an ordinary user turn: it would change the model, the
-        // permission mode and the system prompt, then queue another turn —
-        // spending this run's capability on work that passed no admission and
-        // silently replacing the selection that was priced. Refused before any
-        // of that happens; a new prompt needs a new run.
-        //
-        // This is the general free-text path only. Permission answers and tool
-        // responses arrive as their own RPCs, bound to an approval this run is
-        // already waiting on, and are untouched.
-        if (managedStartup) {
-            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
-            return;
-        }
+    const handleUserMessage = createSerialAsyncHandler<ClaimedUserMessage>(async ({ message, attachmentsPromise }) => {
+        const delegatedDifficultyRoutingMessage = isDelegatedDifficultyRoutingMessage(message);
 
-        const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
+        const attachmentsForThisMessage = await attachmentsPromise;
 
         // Resolve permission mode (validated + downgrade-guarded in permissionMode.ts)
         const messagePermissionMode = resolveRemoteCodexPermissionMode(
@@ -490,8 +484,12 @@ export async function runCodex(opts: {
         let messageModel = currentModel;
         if (message.meta?.hasOwnProperty('model')) {
             messageModel = message.meta.model || undefined;
-            currentModel = messageModel;
-            logger.debug(`[Codex] Model updated from user message: ${messageModel || 'reset to default'}`);
+            if (!delegatedDifficultyRoutingMessage) {
+                currentModel = messageModel;
+                logger.debug(`[Codex] Model updated from user message: ${messageModel || 'reset to default'}`);
+            } else {
+                logger.debug(`[Codex] Auto-route fallback model received for this turn: ${messageModel || 'default'}`);
+            }
         } else {
             logger.debug(`[Codex] User message received with no model override, using current: ${currentModel || 'default'}`);
         }
@@ -504,11 +502,11 @@ export async function runCodex(opts: {
             const incoming = (message.meta as Record<string, unknown>).effort;
             if (incoming === null || incoming === undefined) {
                 messageEffort = undefined;
-                currentEffort = undefined;
+                if (!delegatedDifficultyRoutingMessage) currentEffort = undefined;
                 logger.debug(`[Codex] Effort reset to default`);
             } else if (isSupportedCodexReasoningEffort(incoming)) {
                 messageEffort = incoming;
-                currentEffort = messageEffort;
+                if (!delegatedDifficultyRoutingMessage) currentEffort = messageEffort;
                 logger.debug(`[Codex] Effort updated from user message: ${messageEffort}`);
             } else {
                 logger.debug(`[Codex] Ignoring invalid effort from user message: ${String(incoming)}`);
@@ -551,6 +549,28 @@ export async function runCodex(opts: {
         });
         currentAppendSystemPrompt = messageAppendSystemPrompt;
 
+        const routed = !delegatedDifficultyRoutingMessage || isCodexClearText(message.content.text)
+            ? null
+            : await resolveDifficultyRouting({
+                agent: 'codex',
+                sourceMachineId: machineId ?? '',
+                sessionId: response?.id ?? session.sessionId,
+                contentText: message.content.text,
+                meta: message.meta,
+                current: { model: messageModel, effort: messageEffort },
+                state: difficultyRoutingState,
+            });
+        if (routed) {
+            messageModel = routed.route.model ?? messageModel;
+            if (isSupportedCodexReasoningEffort(routed.route.effort)) {
+                messageEffort = routed.route.effort;
+            }
+            if (routed.event.ev.t === 'difficulty-routing') {
+                routed.event.ev.result.model = messageModel ?? '';
+                routed.event.ev.result.effort = messageEffort ?? null;
+            }
+        }
+
         const enhancedMode: EnhancedMode = {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
@@ -569,6 +589,14 @@ export async function runCodex(opts: {
                 attachments: attachmentsForThisMessage,
             });
             deferredTurn?.commit();
+            if (routed && enqueueResult === 'queued') {
+                difficultyRoutingState = routed.state;
+                session.sendSessionProtocolMessage(routed.event);
+                session.updateMetadata((current) => ({
+                    ...current,
+                    difficultyRoutingState: routed.state,
+                }));
+            }
         } catch (error) {
             deferredTurn?.rollback();
             throw error;
@@ -581,7 +609,25 @@ export async function runCodex(opts: {
             errorName: error instanceof Error ? error.name : typeof error,
         });
     });
-    session.onUserMessage(handleUserMessage);
+    session.onUserMessage((message) => {
+        // A managed run answers exactly the prompt its envelope was admitted
+        // for. A message posted to this session by the account owner arrives
+        // here as an ordinary user turn: it would change the model, the
+        // permission mode and the system prompt, then queue another turn —
+        // spending this run's capability on work that passed no admission and
+        // silently replacing the selection that was priced. Refused before any
+        // of that happens; a new prompt needs a new run.
+        //
+        // This is the general free-text path only. Permission answers and tool
+        // responses arrive as their own RPCs, bound to an approval this run is
+        // already waiting on, and are untouched.
+        if (managedStartup) {
+            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
+            return;
+        }
+        const attachmentsPromise = session.drainAttachmentsForUserMessage();
+        return handleUserMessage({ message, attachmentsPromise });
+    });
     const initialPromptDelivered = await prepareCodexSessionStart({
         // An offline start has no session to confirm against; the guard above
         // (`assertCodexAutomationServerAvailable`) already refused that case,
@@ -1121,7 +1167,11 @@ export async function runCodex(opts: {
 
     // Event handler: same EventMsg types as the legacy MCP server — no changes needed
     client.setEventHandler((msg) => {
-        logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
+        // Text deltas arrive many times per second. Logging their full body would
+        // stringify every preview frame and duplicate the answer in debug logs.
+        if (msg.type !== 'agent_message_delta') {
+            logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
+        }
 
         if (msg.type === 'codex_usage') {
             try {
@@ -1138,7 +1188,21 @@ export async function runCodex(opts: {
         }
 
         // Add messages to the ink UI buffer based on message type
-        if (msg.type === 'agent_message') {
+        if (msg.type === 'agent_message_delta') {
+            const messageId = typeof msg.item_id === 'string' ? msg.item_id : null;
+            const index = typeof msg.index === 'number' ? msg.index : null;
+            const offset = typeof msg.offset === 'number' ? msg.offset : null;
+            const delta = typeof msg.delta === 'string' ? msg.delta : null;
+            if (messageId && index !== null && offset !== null && delta !== null) {
+                session.sendStreamDelta({
+                    messageId,
+                    index,
+                    offset,
+                    delta,
+                    final: msg.final === true,
+                });
+            }
+        } else if (msg.type === 'agent_message') {
             messageBuffer.addMessage((msg as any).message, 'assistant');
         } else if (msg.type === 'agent_reasoning_delta') {
             // Skip reasoning deltas in the UI to reduce noise
@@ -1242,7 +1306,7 @@ export async function runCodex(opts: {
 
         // Convert events into the unified session-protocol envelope stream.
         // Reasoning deltas are handled by ReasoningProcessor to avoid duplicate text output.
-        if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
+        if (msg.type !== 'agent_message_delta' && msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
             // The state object is rebuilt per call, so the correlation fields are carried in and
             // read back out rather than living on it.
             const turnState = {

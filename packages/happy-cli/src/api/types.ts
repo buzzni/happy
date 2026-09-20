@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
+import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
 import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
@@ -205,6 +206,7 @@ export const MachineMetadataSchema = z.object({
     agents: z.tuple([z.literal('claude'), z.literal('codex')]),
     access: z.literal('read-write'),
   }).optional(),
+  difficultyRouting: DifficultyRoutingCapabilitySchema.optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -287,7 +289,13 @@ export const MessageMetaSchema = z.object({
   }).nullable().optional().catch(undefined),
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)
-  axStep: z.enum(['plan', 'design', 'free']).optional(),
+  // .catch() for the same reason as saycodePromptBlocks above: a strict enum drops
+  // the user's whole turn in routeIncomingMessage when a newer app sends a step this
+  // CLI predates. An unlearned step degrades to "no explicit step", never to silence.
+  axStep: z.enum(['plan', 'design', 'free']).optional().catch(undefined),
+  difficultyRoutingIntent: DifficultyRoutingIntentSchema.optional().catch(undefined),
+  difficultyRoutingPrompt: z.string().optional(),
+  difficultyRoutingAuthorization: z.string().optional(),
 })
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>
@@ -435,6 +443,11 @@ export type Metadata = {
    * doesn't supply it (specs/session-created-by).
    */
   createdBy?: { accountId: string; displayName?: string }
+  difficultyRoutingState?: {
+    difficulty?: 'trivial' | 'routine' | 'hard' | 'escalated'
+    hardTurns?: number
+    updatedAt?: number
+  }
 };
 
 export type AgentGoalStatus = {

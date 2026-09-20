@@ -4,6 +4,7 @@ import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
+import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 
 const {
     mockIo,
@@ -257,6 +258,40 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockSocket.connect).toHaveBeenCalled();
     });
 
+    // 닫히지 않은 세션이 "아직 붙을 때가 아니다"라고 답하는 것은 실패한 dial 이
+    // 아니다 — reconnectAttempts 가 움직이지 않으므로 백오프가 이 분기를 늦출 수
+    // 없고, 백오프에서 다시 예약하면 기계가 닫혀 있는 내내 base delay 마다
+    // shouldReconnect() 를 다시 묻게 된다. macOS 에서 이 술어는 동기 execSync 다.
+    it('polls the not-ready check on its own clock rather than at the base delay', async () => {
+        vi.useFakeTimers();
+        mockShouldReconnect.mockReturnValue(false);
+
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.connected = false;
+        mockSocket.connect.mockClear();
+
+        // 지터를 상한에 고정해 각 지연이 정확히 공칭값이 되게 한다.
+        const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+        try {
+            emitSocketEvent('disconnect', 'transport close');
+            mockShouldReconnect.mockClear();
+
+            const window = 60_000;
+            await vi.advanceTimersByTimeAsync(window);
+
+            const looks = mockShouldReconnect.mock.calls.length;
+            const expected = window / RECONNECT_NOT_READY_POLL_MS;
+            expect(looks).toBeLessThanOrEqual(expected + 1);
+            // 그렇다고 멈추면 안 된다 — 기계가 준비되는 순간을 여전히 봐야 한다.
+            expect(looks).toBeGreaterThanOrEqual(expected - 1);
+            expect(mockSocket.connect).not.toHaveBeenCalled();
+        } finally {
+            random.mockRestore();
+        }
+
+        await client.close();
+    });
+
     it('registers core socket handlers and connects', () => {
         new ApiSessionClient('fake-token', session);
 
@@ -341,13 +376,26 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockSocket.connect).toHaveBeenCalledTimes(1);
 
-        emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+        // specs/machine-socket-duplicate-registration/ — the cadence is
+        // jittered; pin the source so each delay is exactly its nominal value.
+        const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+        try {
+            emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
 
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(mockSocket.connect).toHaveBeenCalledTimes(2);
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(mockSocket.connect).toHaveBeenCalledTimes(2);
 
-        await vi.advanceTimersByTimeAsync(3000);
-        expect(mockSocket.connect).toHaveBeenCalledTimes(3);
+            // AC1 — the dial is still out; no second one is stacked on it.
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(mockSocket.connect).toHaveBeenCalledTimes(2);
+
+            // Resolved, so the cadence carries on at its next tick.
+            emitSocketEvent('connect_error', new Error('ECONNREFUSED'));
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(mockSocket.connect).toHaveBeenCalledTimes(3);
+        } finally {
+            random.mockRestore();
+        }
 
         await client.close();
     });

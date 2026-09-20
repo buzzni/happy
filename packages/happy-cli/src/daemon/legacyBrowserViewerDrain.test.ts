@@ -22,3 +22,22 @@ describe('legacy browser viewer drain', () => {
         ], profile)).toEqual([])
     })
 })
+
+describe('legacy browser viewer drain across display servers', () => {
+    const profile = '/root/.happy/chrome-profiles/default'
+    const shared = [
+        { pid: 20, cmdline: ['/usr/bin/Xvnc', ':99', '-geometry', '1920x1080', '-rfbport', '5900'].join('\0') },
+        { pid: 21, cmdline: ['/usr/bin/python3', '/usr/bin/websockify', '--web', '/root/.happy/browser-viewers/novnc-web/remote', '127.0.0.1:6080', '127.0.0.1:5900'].join('\0') },
+        { pid: 22, cmdline: ['chrome', '--display=:99', `--user-data-dir=${profile}`].join('\0') },
+    ]
+
+    // An Xvnc-backed shared viewer holds exactly the ports the broker's first
+    // per-user slot needs, so failing to recognise it leaks that slot.
+    it('drains a shared viewer whose display server is Xvnc', () => {
+        expect(selectLegacyBrowserViewerPids(shared, profile)).toEqual([20, 21, 22])
+    })
+
+    it('still refuses a partial Xvnc signature', () => {
+        expect(selectLegacyBrowserViewerPids(shared.slice(0, 2), profile)).toEqual([])
+    })
+})

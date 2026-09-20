@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Prisma } from '@prisma/client';
 import {
+    ackAutomationSync,
     claimAutomationRun,
     heartbeatAutomationRun,
     registerAutomationMachineKey,
@@ -373,6 +374,7 @@ describe('automationExecutionService', () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({
             id: 'run-1', status: 'COMPLETED', reportId: 'report-1', outcome: 'WOKE', sessionId: 'session-1',
+            automation: automation(),
         });
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
             runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
@@ -410,6 +412,7 @@ describe('automationExecutionService', () => {
         tx.automationRun.findFirst.mockResolvedValue({
             id: 'run-1', status: 'RUNNING', reportId: null,
             runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+            automation: automation(),
         });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
@@ -435,6 +438,7 @@ describe('automationExecutionService', () => {
         tx.automationRun.findFirst.mockResolvedValue({
             id: 'run-1', status: 'RUNNING', reportId: null,
             runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+            automation: automation(),
         });
 
         await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
@@ -475,6 +479,7 @@ describe('automationExecutionService', () => {
         tx.automationRun.findFirst.mockResolvedValue({
             id: 'run-1', status: 'RUNNING', reportId: null,
             runLeaseExpiresAt: new Date(now.getTime() - 1),
+            automation: automation(),
         });
         tx.session.findFirst.mockResolvedValue({ id: 'session-1' } as never);
 
@@ -491,6 +496,7 @@ describe('automationExecutionService', () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({
             id: 'run-1', status: 'RUNNING', reportId: null, runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+            automation: automation(),
         });
 
         await reportAutomationRun(tx as never, 'account-1', 'machine-1', {
@@ -508,6 +514,7 @@ describe('automationExecutionService', () => {
         const tx = makeTx();
         tx.automationRun.findFirst.mockResolvedValue({
             id: 'run-1', status: 'RUNNING', reportId: null, runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+            automation: automation(),
         });
         tx.session.findFirst.mockResolvedValue({ id: 'session-1' } as never);
 
@@ -546,4 +553,105 @@ describe('automationExecutionService', () => {
         }, now)).resolves.toEqual({ ok: false, error: 'report-conflict' });
         expect(tx.automationRun.updateMany).not.toHaveBeenCalled();
     });
+
+    // specs/automation-request-surge R1/R2 — the surge came from project-scoped
+    // automation traffic being announced as an account-wide invalidation. The
+    // service, not the client, must name the affected projects, and an
+    // acknowledgement that changed nothing must name none.
+    it('reports the affected projects of the acknowledgements that actually advanced', async () => {
+        const tx = makeTx();
+        tx.automation.updateMany
+            .mockResolvedValueOnce({ count: 1 })
+            .mockResolvedValueOnce({ count: 0 });
+        tx.automation.findMany.mockResolvedValue([{ projectId: 'project-9' }] as never);
+
+        await expect(ackAutomationSync(tx as never, 'account-1', 'machine-1', [
+            { automationId: 'automation-1', revision: 2 },
+            { automationId: 'automation-2', revision: 7 },
+        ], now)).resolves.toEqual({
+            ok: true,
+            value: { acknowledged: 1, affectedProjectIds: ['project-9'] },
+        });
+        expect(tx.automation.findMany).toHaveBeenCalledWith({
+            where: {
+                id: { in: ['automation-1'] },
+                machineAccountId: 'account-1',
+                machineId: 'machine-1',
+            },
+            select: { projectId: true },
+        });
+    });
+
+    it('reports no affected project when every acknowledgement is a no-op', async () => {
+        const tx = makeTx();
+        tx.automation.updateMany.mockResolvedValue({ count: 0 });
+
+        await expect(ackAutomationSync(tx as never, 'account-1', 'machine-1', [
+            { automationId: 'automation-1', revision: 2 },
+        ], now)).resolves.toEqual({
+            ok: true,
+            value: { acknowledged: 0, affectedProjectIds: [] },
+        });
+        expect(tx.automation.findMany).not.toHaveBeenCalled();
+    });
+
+    it('does not trust a repeated automation id for more affected projects than rows changed', async () => {
+        const tx = makeTx();
+        tx.automation.updateMany
+            .mockResolvedValueOnce({ count: 1 })
+            .mockResolvedValueOnce({ count: 0 });
+        tx.automation.findMany.mockResolvedValue([{ projectId: 'project-9' }] as never);
+
+        await expect(ackAutomationSync(tx as never, 'account-1', 'machine-1', [
+            { automationId: 'automation-1', revision: 2 },
+            { automationId: 'automation-1', revision: 2 },
+        ], now)).resolves.toEqual({
+            ok: true,
+            value: { acknowledged: 1, affectedProjectIds: ['project-9'] },
+        });
+        expect(tx.automation.findMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ id: { in: ['automation-1'] } }),
+        }));
+    });
+
+    it('names the authoritative project of a claimed run', async () => {
+        const tx = makeTx();
+        tx.automation.findFirst.mockResolvedValue(automation({ projectId: 'project-7' }));
+
+        const result = await claimAutomationRun(tx as never, 'account-1', 'machine-1', {
+            automationId: 'automation-1', generation: 3, scheduledFor: new Date(now.getTime() - 30_000),
+        }, now);
+        expect(result).toEqual({ ok: true, value: expect.objectContaining({ projectId: 'project-7' }) });
+    });
+
+    it('names the authoritative project of a started run', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'CLAIMED', generation: 3,
+            claimExpiresAt: new Date(now.getTime() + 60_000),
+            automation: automation({ projectId: 'project-7' }),
+        });
+
+        await expect(startAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token',
+        }, now)).resolves.toEqual({ ok: true, value: expect.objectContaining({ projectId: 'project-7' }) });
+    });
+
+    it('names the authoritative project of a reported run', async () => {
+        const tx = makeTx();
+        tx.automationRun.findFirst.mockResolvedValue({
+            id: 'run-1', status: 'RUNNING', reportId: null,
+            runLeaseExpiresAt: new Date(now.getTime() + 1_000),
+            automation: automation({ projectId: 'project-7' }),
+        });
+
+        await expect(reportAutomationRun(tx as never, 'account-1', 'machine-1', {
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'FAILED',
+            outcome: 'ERROR', sessionId: null, detailCiphertext: null,
+            failureCode: 'TOOL_INVENTORY_EMPTY',
+        }, now)).resolves.toEqual({ ok: true, value: expect.objectContaining({
+            idempotent: false, projectId: 'project-7',
+        }) });
+    });
+
 });

@@ -257,11 +257,11 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     c: message
                 };
 
-                // Resolve seq
-                const updSeq = await allocateUserSeq(userId);
-                const msgSeq = await allocateSessionSeq(sid);
-
-                // Check if message already exists
+                // Check if message already exists. This runs before seq
+                // allocation on purpose: a redelivered message is dropped
+                // here, and allocating first would take the contended
+                // Account.seq and Session.seq row locks — and advance both
+                // counters — for a write that never happens.
                 if (useLocalId) {
                     const existing = await db.sessionMessage.findFirst({
                         where: { sessionId: sid, localId: useLocalId }
@@ -270,6 +270,10 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                         return { msg: existing, update: null };
                     }
                 }
+
+                // Resolve seq
+                const updSeq = await allocateUserSeq(userId);
+                const msgSeq = await allocateSessionSeq(sid);
 
                 // Create message
                 const msg = await db.sessionMessage.create({

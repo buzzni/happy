@@ -80,6 +80,9 @@ type DeferredRawTurnCompletion = {
     source: string;
 };
 
+const CODEX_AGENT_MESSAGE_DELTA_FLUSH_MS = 80;
+const CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS = 2_048;
+
 export type ApprovalHandler = (params: {
     type: 'exec' | 'patch' | 'mcp';
     callId: string;
@@ -307,6 +310,10 @@ export class CodexAppServerClient {
     private openCommandExecutionTurns = new Map<string, string | null>();
     private deferredRawTurnCompletion: DeferredRawTurnCompletion | null = null;
     private rawTurnCompletionFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    private pendingAgentMessageDeltas = new Map<string, string>();
+    private sentAgentMessageChars = new Map<string, number>();
+    private pendingAgentMessageDeltaChars = 0;
+    private agentMessageDeltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
     // Last known startup status per MCP server.
     // Used to explain a watchdog-forced abort: a turn can hang building its tool
@@ -498,6 +505,7 @@ export class CodexAppServerClient {
             return;
         }
         this._turnId = null;
+        this.clearAgentMessageDeltas();
 
         if (turnId && this.completedTurnIds.has(turnId)) {
             return;
@@ -589,6 +597,77 @@ export class CodexAppServerClient {
         }
         this.deferredRawTurnCompletion = null;
         this.emitRawTurnCompletion(deferred.turnId, deferred.status, deferred.error, deferred.source);
+    }
+
+    private flushAgentMessageDeltas(finalItemId?: string): void {
+        if (this.agentMessageDeltaFlushTimer) {
+            clearTimeout(this.agentMessageDeltaFlushTimer);
+            this.agentMessageDeltaFlushTimer = null;
+        }
+
+        const pending = Array.from(this.pendingAgentMessageDeltas.entries());
+        this.pendingAgentMessageDeltas.clear();
+        this.pendingAgentMessageDeltaChars = 0;
+
+        for (const [itemId, text] of pending) {
+            const offset = this.sentAgentMessageChars.get(itemId) ?? 0;
+            const isFinal = itemId === finalItemId;
+            for (let start = 0; start < text.length; start += CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS) {
+                const delta = text.slice(start, start + CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS);
+                this.eventHandler?.({
+                    type: 'agent_message_delta',
+                    item_id: itemId,
+                    index: 0,
+                    offset: offset + start,
+                    delta,
+                    final: isFinal && start + delta.length === text.length,
+                });
+            }
+            if (isFinal) {
+                this.sentAgentMessageChars.delete(itemId);
+            } else {
+                this.sentAgentMessageChars.set(itemId, offset + text.length);
+            }
+        }
+
+        if (finalItemId
+            && !pending.some(([itemId]) => itemId === finalItemId)
+            && this.sentAgentMessageChars.has(finalItemId)) {
+            const offset = this.sentAgentMessageChars.get(finalItemId) ?? 0;
+            this.sentAgentMessageChars.delete(finalItemId);
+            this.eventHandler?.({
+                type: 'agent_message_delta',
+                item_id: finalItemId,
+                index: 0,
+                offset,
+                delta: '',
+                final: true,
+            });
+        }
+    }
+
+    private enqueueAgentMessageDelta(itemId: string, delta: string): void {
+        this.pendingAgentMessageDeltas.set(itemId, (this.pendingAgentMessageDeltas.get(itemId) ?? '') + delta);
+        this.pendingAgentMessageDeltaChars += delta.length;
+        if (this.pendingAgentMessageDeltaChars >= CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS) {
+            this.flushAgentMessageDeltas();
+            return;
+        }
+        if (this.agentMessageDeltaFlushTimer) return;
+        this.agentMessageDeltaFlushTimer = setTimeout(() => {
+            this.agentMessageDeltaFlushTimer = null;
+            this.flushAgentMessageDeltas();
+        }, CODEX_AGENT_MESSAGE_DELTA_FLUSH_MS);
+    }
+
+    private clearAgentMessageDeltas(): void {
+        if (this.agentMessageDeltaFlushTimer) {
+            clearTimeout(this.agentMessageDeltaFlushTimer);
+            this.agentMessageDeltaFlushTimer = null;
+        }
+        this.pendingAgentMessageDeltas.clear();
+        this.sentAgentMessageChars.clear();
+        this.pendingAgentMessageDeltaChars = 0;
     }
 
     private handleRawNotification(method: string, params: any): boolean {
@@ -688,6 +767,15 @@ export class CodexAppServerClient {
             return true;
         }
 
+        if (method === 'item/agentMessage/delta') {
+            const itemId = typeof params?.itemId === 'string' ? params.itemId : '';
+            const delta = typeof params?.delta === 'string' ? params.delta : '';
+            if (itemId && delta) {
+                this.enqueueAgentMessageDelta(itemId, delta);
+            }
+            return true;
+        }
+
         const item = params?.item;
         if (!item || typeof item !== 'object') {
             return method.startsWith('item/');
@@ -767,12 +855,16 @@ export class CodexAppServerClient {
         }
 
         if (method === 'item/completed' && item.type === 'agentMessage') {
+            const itemId = typeof item.id === 'string' ? item.id : '';
+            if (itemId) {
+                this.flushAgentMessageDeltas(itemId);
+            }
             const text = typeof item.text === 'string' ? item.text : '';
             if (text.length > 0) {
                 this.eventHandler?.({
                     type: 'agent_message',
                     message: text,
-                    item_id: item.id,
+                    item_id: itemId,
                     phase: item.phase,
                 });
             }
@@ -930,6 +1022,7 @@ export class CodexAppServerClient {
                 return;
             }
             this.connected = false;
+            this.clearAgentMessageDeltas();
             void this.cleanupMultiAuthProxy();
             // Reject all pending requests
             for (const [id, req] of this.pending) {
@@ -1039,6 +1132,7 @@ export class CodexAppServerClient {
          */
         awaitProcessExit?: boolean;
     }): Promise<void> {
+        this.clearAgentMessageDeltas();
         if (!this.connected
             && !this.process
             && !this.sandboxCleanup

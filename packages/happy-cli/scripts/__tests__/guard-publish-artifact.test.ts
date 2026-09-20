@@ -25,6 +25,7 @@ function createPublishTarball(
         omitNativeMessagingPermission?: boolean
         omitSaycodeAgent?: boolean
         omitTweetnacl?: boolean
+        companionToolsSentinel?: boolean
     } = {}
 ): string {
     const fixtureRoot = mkdtempSync(join(tmpdir(), 'happy-cli-guard-test-'))
@@ -53,6 +54,9 @@ function createPublishTarball(
         ],
         ...(options.removeFastifyTransitiveAfterInstall
             ? { scripts: { postinstall: 'node scripts/remove-fastify-transitive.mjs' } }
+            : {}),
+        ...(options.companionToolsSentinel
+            ? { scripts: { postinstall: 'node scripts/companion-tools-sentinel.mjs' } }
             : {})
     }))
     writeFixtureFile(
@@ -123,6 +127,14 @@ function createPublishTarball(
             packageRoot,
             'scripts/remove-fastify-transitive.mjs',
             `import { rmSync } from 'node:fs'\nrmSync(new URL('../node_modules/fastify/node_modules/abstract-logging', import.meta.url), { recursive: true, force: true })\n`
+        )
+    }
+
+    if (options.companionToolsSentinel) {
+        writeFixtureFile(
+            packageRoot,
+            'scripts/companion-tools-sentinel.mjs',
+            `import { writeFileSync } from 'node:fs'\nimport { join } from 'node:path'\nif (!process.env.HAPPY_SKIP_COMPANION_TOOLS) writeFileSync(join(process.env.HOME, 'guard-companion-tools-ran'), 'ran')\n`
         )
     }
 
@@ -205,6 +217,28 @@ describe('guard-publish-artifact', () => {
             encoding: 'utf8',
             timeout: 30_000,
             env: { ...process.env, HOME: realHome, HAPPY_HOME_DIR: realHome }
+        })
+
+        expect(result.status, result.stderr).toBe(0)
+        expect(existsSync(sentinel)).toBe(false)
+    }, 40_000)
+
+    // The real postinstall installs codex-multi-auth into this very prefix, and
+    // assertProductionDependencyClosure reads the whole prefix — codex-multi-auth
+    // ships nested packages npm reports as `invalid`, which failed the guard and
+    // blamed Happy's own artifact. `pnpm cli:install` runs this guard on every
+    // run (install-local.cjs), so the documented dev workflow broke with it.
+    it('keeps the smoke install from running the companion-tools postinstall', () => {
+        const realHome = mkdtempSync(join(tmpdir(), 'happy-cli-guard-companion-home-'))
+        temporaryDirectories.push(realHome)
+        const sentinel = join(realHome, 'guard-companion-tools-ran')
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', {
+            companionToolsSentinel: true
+        })
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball, '--install-smoke'], {
+            encoding: 'utf8',
+            timeout: 30_000,
+            env: { ...process.env, HOME: realHome }
         })
 
         expect(result.status, result.stderr).toBe(0)

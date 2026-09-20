@@ -1,3 +1,4 @@
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 import { describe, expect, it } from 'vitest';
 
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
@@ -54,7 +55,7 @@ describe('buildCodexDeveloperInstructions', () => {
             connectorGuidance: 'CONNECTOR FACTS',
             agentOrchestrationPrompt: 'AGENT ORCHESTRATION: happy agent spawn',
             mode: { appendSystemPrompt: 'LEGACY APPEND' },
-        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn');
+        })).toBe('CONNECTOR FACTS\n\nAGENT ORCHESTRATION: happy agent spawn\n\n' + SAYCODE_API_GATEWAY_PROMPT);
     });
 
     it('keeps default-on orchestration when Saycode prompts are off', () => {
@@ -73,7 +74,7 @@ describe('buildCodexDeveloperInstructions', () => {
                 saycodeSystemPromptEnabled: true,
                 saycodePromptBlocks: { agentOrchestration: false },
             },
-        })).toBe('CONNECTOR FACTS');
+        })).toBe('CONNECTOR FACTS\n\n' + SAYCODE_API_GATEWAY_PROMPT);
     });
 });
 
@@ -208,5 +209,19 @@ describe('hashCodexEnhancedMode', () => {
             ...baseMode,
             saycodeSystemPromptEnabled: false,
         }));
+    });
+});
+
+
+describe('Saycode API gateway developer guidance', () => {
+    it.each([true, undefined])('keeps discovery in developer instructions (master=%s)', (enabled) => {
+        const prompt = buildCodexDeveloperInstructions({ mode: { saycodeSystemPromptEnabled: enabled } });
+        expect(prompt).toContain('{NAME}_SAYCODE_API_URL');
+        expect(prompt).toContain('registered API contract');
+        expect(buildCodexTurnPrompt({ message: 'continue', mode: {}, includeAppendSystemPrompt: false, hasTitle: true })).toBe('continue');
+    });
+
+    it('omits the guidance when master is off', () => {
+        expect(buildCodexDeveloperInstructions({ mode: { saycodeSystemPromptEnabled: false } })).toBeUndefined();
     });
 });

@@ -1,3 +1,4 @@
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 import { describe, expect, it } from 'vitest';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 
@@ -13,10 +14,10 @@ describe('buildClaudeSystemPromptOptions', () => {
     connectorGuidance: 'CONNECTOR FACTS',
   };
 
-  it('preserves the legacy prompt byte-for-byte when enabled or absent', () => {
+  it('preserves existing blocks and adds gateway guidance when enabled or absent', () => {
     const expected = {
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nWORKER DELEGATION\n\nCONNECTOR FACTS' + '\n\n' + SAYCODE_API_GATEWAY_PROMPT,
     };
 
     expect(buildClaudeSystemPromptOptions({ ...input, saycodeSystemPromptEnabled: true })).toEqual(expected);
@@ -71,7 +72,28 @@ describe('buildClaudeSystemPromptOptions with per-block overrides', () => {
       saycodePromptBlocks: { workerDelegation: false },
     })).toEqual({
       customSystemPrompt: 'USER CUSTOM\n\nCHAT TITLE\n\nSAYCODE BASE',
-      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nCONNECTOR FACTS',
+      appendSystemPrompt: 'CLIENT APPEND\n\nCHAT TITLE\n\nSAYCODE BASE\n\nAGENT ORCHESTRATION: happy agent spawn\n\nORCHESTRATOR\n\nCONNECTOR FACTS' + '\n\n' + SAYCODE_API_GATEWAY_PROMPT,
     });
+  });
+});
+
+
+describe('Saycode API gateway system guidance', () => {
+  it.each([true, undefined])('discovers API suffixes through system instructions (master=%s)', (enabled) => {
+    const result = buildClaudeSystemPromptOptions({
+      saycodeSystemPrompt: '', appendSystemPrompt: 'PROJECT API CONTRACT',
+      saycodeSystemPromptEnabled: enabled,
+    });
+    expect(result.appendSystemPrompt).toContain('{NAME}_SAYCODE_API_URL');
+    expect(result.appendSystemPrompt).toContain('registered API contract');
+    expect(result.appendSystemPrompt).toContain('PROJECT API CONTRACT');
+    expect(result.appendSystemPrompt?.match(/<saycode-api-gateway>/g)).toHaveLength(1);
+  });
+
+  it('respects master OFF without losing project context', () => {
+    expect(buildClaudeSystemPromptOptions({
+      saycodeSystemPrompt: '', appendSystemPrompt: 'PROJECT API CONTRACT',
+      saycodeSystemPromptEnabled: false,
+    }).appendSystemPrompt).toBe('PROJECT API CONTRACT');
   });
 });

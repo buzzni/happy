@@ -17,6 +17,30 @@ export async function allocateUserSeq(accountId: string) {
     return seq;
 }
 
+/**
+ * Allocates `count` update seqs for one account in a single `Account.seq`
+ * update, mirroring `allocateSessionSeqBatch`.
+ *
+ * Every writer for an account contends on that one row, so a caller that
+ * emits N updates in a row should take its whole block at once instead of
+ * taking (and releasing) the row lock N times. Deliberately not transaction
+ * aware: the caller is expected to allocate outside any open transaction so
+ * the row lock is not held for the transaction's lifetime.
+ */
+export async function allocateUserSeqBatch(accountId: string, count: number) {
+    if (count <= 0) {
+        return [] as number[];
+    }
+    const user = await db.account.update({
+        where: { id: accountId },
+        select: { seq: true },
+        data: { seq: { increment: count } }
+    });
+    const endSeq = user.seq;
+    const startSeq = endSeq - count + 1;
+    return Array.from({ length: count }, (_, index) => startSeq + index);
+}
+
 export async function allocateSessionSeq(sessionId: string) {
     const session = await db.session.update({
         where: { id: sessionId },

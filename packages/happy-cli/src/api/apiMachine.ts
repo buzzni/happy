@@ -24,6 +24,7 @@ import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer'
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
+import type { DifficultyRoutingClassifierHost } from '@/daemon/difficultyRoutingClassifierHost';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -106,8 +107,8 @@ import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
-import { existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
@@ -124,9 +125,14 @@ import {
     resolveProfileUserDataDir,
 } from '@/daemon/browserSetup';
 import {
+    buildOpenboxArgs,
+    buildOpenboxConfig,
+    buildVncConfigArgs,
     buildWebsockifyArgs,
     buildX11vncArgs,
     buildXvfbArgs,
+    buildXvncArgs,
+    VIEWER_SCREEN,
     VIEWER_SLOTS,
     VIEWER_VNC_PORTS,
     VIEWER_WEB_PORTS,
@@ -136,7 +142,11 @@ import {
     readFlagFromCmdline,
     summariseViewerBrowser,
     type ViewerBrowserSummary,
-    detectMissingViewerTools,
+    detectViewerCapabilities,
+    desiredViewerTools,
+    missingViewerTools,
+    selectViewerBackend,
+    type ViewerBackend,
     isViewerServing,
     planViewerInstall,
     resolveViewerProfileDir,
@@ -149,6 +159,7 @@ import {
     BrowserViewerLeaseRegistry,
     type BrowserViewerLeaseRecord,
 } from '@/daemon/browserViewerLeaseRegistry';
+import { ensureViewerWebRoot } from '@/daemon/viewerWebRoot';
 import { BrowserSessionBrokerClient } from '@/daemon/browserSessionBrokerContract';
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken';
 import { deriveBrowserViewerBridgeToken } from '@/daemon/browserBridge';
@@ -162,11 +173,13 @@ import {
     killAllDaemonTerminalSessions,
     recordBytesIn,
     recordBytesOut,
+    recordTerminalActivity,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
+import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayMs } from '@/api/reconnectCadence';
 import { getProjectPath } from '@/claude/utils/path';
 import {
     forkSession as claudeForkSession,
@@ -197,6 +210,25 @@ import type { CheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
+/*
+ * How often the connection supervisor re-reads the socket's actual state.
+ *
+ * Long enough that a normal reconnect (a 1s kick, then every 3s) settles
+ * between two ticks and the supervisor never sees a transient gap worth
+ * reporting; short enough that a socket nobody is retrying is picked up in
+ * well under a minute rather than in hours.
+ */
+const CONNECTION_SUPERVISOR_INTERVAL_MS = 30_000;
+
+/** What the daemon can answer about its own link to the server. */
+export interface MachineConnectionHealth {
+    /** A live socket exists right now. */
+    connected: boolean;
+    /** A retry cadence is in flight. Meaningless while `connected`. */
+    reconnecting: boolean;
+    /** Milliseconds since the socket was last up, or null while connected. */
+    disconnectedForMs: number | null;
+}
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -294,6 +326,9 @@ interface ServerToDaemonEvents {
     'terminal-frame-fwd': (msg: { sessionId: string; data: string }) => void;
     'terminal-resize-fwd': (msg: { sessionId: string; cols: number; rows: number }) => void;
     'terminal-close-fwd': (msg: { sessionId: string }) => void;
+    // specs/desktop-terminal-reliability/ Phase 3 — the client asks for
+    // everything after the last seq it saw, following a reconnect or a gap.
+    'terminal-resume-fwd': (msg: { sessionId: string; afterSeq: number }) => void;
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
@@ -419,7 +454,16 @@ interface DaemonToServerEvents {
     // specs/remote-terminal/ Phase 2 — daemon-originated stream frames.
     // `data` is the E2EE-encrypted PTY chunk; happy-server forwards it
     // to the client without inspection.
-    'terminal-frame': (msg: { sessionId: string; data: string }) => void;
+    // `seq` is monotonic per session and starts at 1, so 0 means "seen
+    // nothing". Frames sent before this shipped carry none, which the client
+    // reads as "the next one after whatever I last had".
+    'terminal-frame': (msg: { sessionId: string; seq?: number; data: string }) => void;
+    // The whole replay buffer as one frame, when the client fell further behind
+    // than the buffer reaches. The client resets its screen to this.
+    'terminal-snapshot': (msg: { sessionId: string; seq: number; data: string }) => void;
+    // There is no honest answer to the resume: say where the hole starts rather
+    // than let the client believe it is current.
+    'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number }) => void;
     'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null }) => void;
     // Preview WebSocket relay — upstream→browser bytes and tunnel teardown.
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
@@ -503,6 +547,7 @@ type MachineRpcHandlers = {
      * on every request.
      */
     byosOfflineReceive?: ByosOfflineRpcHandlers;
+    difficultyRouting?: DifficultyRoutingClassifierHost;
 }
 
 /**
@@ -694,7 +739,50 @@ export class ApiMachineClient {
     // terminal-open-fwd handler can run validatePath against the same
     // root the rest of the RPC surface uses (Files tab / writeFile).
     private allowedRoot: string;
+    /**
+     * The pending next dial. Non-null means "a retry cadence is running", which
+     * is all `getConnectionHealth()` and the connection supervisor read it for.
+     */
     private reconnectInterval: NodeJS.Timeout | null = null;
+    /** Consecutive dials since the last successful connect. Drives the backoff. */
+    private reconnectAttempts = 0;
+    /**
+     * When the outstanding `socket.connect()` was issued, or null when no dial
+     * is out. specs/machine-socket-duplicate-registration/ — this is the
+     * single-flight guard: the old cadence dialled every 3s regardless, so a
+     * slow handshake collected several overlapping dials and several of them
+     * completed, leaving the server holding more than one live machine socket.
+     */
+    private reconnectDialStartedAt: number | null = null;
+    /**
+     * `shutdown()` 이 시작됐는가.
+     *
+     * `socket.close()` 는 `disconnect` 를 발생시키고, 그 핸들러가 재연결 cadence 를
+     * 다시 켠다. 정리하려고 끈 타이머가 끄는 그 동작 때문에 되살아나는 것이라,
+     * 종료 절차가 이벤트 루프를 놓지 못하고 run.ts 의 1초 fallback 에 걸려
+     * `forcing exit with code 1` 로 끝난다. 강제 종료는 정리를 건너뛰므로 서버는
+     * 소켓이 죽은 줄 ping 예산이 다 될 때까지 모른다 — 재시작 한 번이 필요 이상으로
+     * 긴 오프라인이 되는 경로다.
+     *
+     * apiSession 은 같은 결함을 `closed` 플래그로 이미 막아 뒀다(2026-09-05:
+     * 닫은 세션이 1초 뒤 되살아나 프로세스가 2시간 11분 남았던 건). 여기에는
+     * 그 대응물이 없었다.
+     */
+    private shuttingDown = false;
+    /*
+     * specs/daemon-socket-watchdog/ — the level-triggered backstop.
+     *
+     * Every other reconnect path here is edge-triggered: it runs because
+     * `connect_error` or `disconnect` fired. An edge that is never wired, or
+     * never fires, leaves this process alive and socket-less forever, and
+     * nothing downstream can tell — the local heartbeat file keeps saying
+     * `running` and the server keeps serving the last daemon state it was
+     * told. This interval asks the question the edges cannot: is there a
+     * socket right now, and if not, is anyone trying?
+     */
+    private connectionSupervisorInterval: NodeJS.Timeout | null = null;
+    /** When the socket was last known to be down. Null only while connected. */
+    private disconnectedSince: number | null = null;
 
     constructor(
         private token: string,
@@ -770,6 +858,7 @@ export class ApiMachineClient {
         checkpoint,
         byosOfflineReceive,
         linkSpawnedSession,
+        difficultyRouting,
     }: MachineRpcHandlers) {
         this.previewPortRegistry = portRegistry;
         this.resumeSessionHandler = resumeSession ?? null;
@@ -790,6 +879,12 @@ export class ApiMachineClient {
             this.rpcHandlerManager.registerHandler(
                 'byos-offline:deliver', byosOfflineReceive.deliver,
             );
+        }
+
+        if (difficultyRouting) {
+            this.rpcHandlerManager.registerHandler('difficulty-routing:classify', (params) => (
+                difficultyRouting.classify(params as never)
+            ));
         }
 
         if (checkpoint) {
@@ -1266,11 +1361,16 @@ export class ApiMachineClient {
             }
             const headless = chosen.headless;
             const env = chosen.display ? { DISPLAY: chosen.display } : undefined;
+            // Sized only when this Chrome is going onto the viewer's own
+            // Xvfb screen. A daemon running under a real desktop display
+            // gets Chrome's normal window, which is that user's to arrange.
+            const windowSize = viewerState ? VIEWER_SCREEN : undefined;
             let launched = launchChrome(chrome.path, {
                 userDataDir,
                 cdpPort,
                 headless,
                 display: chosen.display ?? undefined,
+                windowSize,
             }, env);
             let { pid } = launched;
             let ready = await waitForCdp(cdpPort, 15_000);
@@ -1288,6 +1388,7 @@ export class ApiMachineClient {
                     headless,
                     display: chosen.display ?? undefined,
                     noSandbox: true,
+                    windowSize,
                 }, env);
                 ({ pid } = launched);
                 ready = await waitForCdp(cdpPort, 15_000);
@@ -1316,19 +1417,29 @@ export class ApiMachineClient {
         // bridge's own click/fill are ref-based and cannot drive a captcha,
         // which is why this exists. See specs/browser-remote-login/.
         this.rpcHandlerManager.registerHandler('browser-viewer:status', async () => {
-            const missing = await detectMissingViewerTools();
+            const capabilities = await detectViewerCapabilities();
+            const missing = missingViewerTools(capabilities);
+            // `upgradable` is not `missing`: the screen works without these,
+            // it just cannot size itself to the viewer's window.
+            const upgradable = missing.length === 0 ? desiredViewerTools(capabilities) : [];
             return {
                 installed: missing.length === 0,
                 missing,
-                canSudo: missing.length === 0 ? false : await canSudoWithoutPassword(),
+                canSudo: missing.length === 0 && upgradable.length === 0
+                    ? false
+                    : await canSudoWithoutPassword(),
                 running: this.viewer !== null,
                 webPort: this.viewer?.webPort ?? null,
                 display: this.viewer?.display ?? null,
+                upgradable,
             };
         });
 
         this.rpcHandlerManager.registerHandler('browser-viewer:install', async () => {
-            const missing = await detectMissingViewerTools();
+            // Installs the whole modern stack, not only what blocks the
+            // screen: the user has already accepted a package change here,
+            // and this is what turns a scaled screen into an exact fit.
+            const missing = desiredViewerTools(await detectViewerCapabilities());
             const plan = planViewerInstall({
                 missing,
                 canSudo: missing.length === 0 ? true : await canSudoWithoutPassword(),
@@ -1339,12 +1450,17 @@ export class ApiMachineClient {
                 return plan;
             }
             const result = await runShell(plan.command);
-            const stillMissing = await detectMissingViewerTools();
+            const after = await detectViewerCapabilities();
+            const stillMissing = missingViewerTools(after);
             return {
                 action: 'run',
                 command: plan.command,
+                // `ok` still means "the screen can open" — that is what the
+                // caller gates on. What the install asked for beyond that
+                // travels separately instead of being folded into a success.
                 ok: stillMissing.length === 0,
                 missing: stillMissing,
+                upgradable: desiredViewerTools(after),
                 stderr: result.ok ? undefined : result.output,
             };
         });
@@ -2015,7 +2131,7 @@ export class ApiMachineClient {
     private async startViewerStackOnce(
         options: { callerWillLaunchBrowser?: boolean } = {},
     ): Promise<ViewerStackStartResult> {
-        const missing = await detectMissingViewerTools();
+        const missing = missingViewerTools(await detectViewerCapabilities());
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
         }
@@ -2056,12 +2172,9 @@ export class ApiMachineClient {
         if (vncPort === null || webPort === null) {
             throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
         }
-        spawnDetached('Xvfb', buildXvfbArgs({ display, width: 1920, height: 1080 }));
-        await delay(1500);
-        spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
-        await delay(800);
+        const shared = await this.startViewerDisplay(display, vncPort);
         spawnDetached('websockify', buildWebsockifyArgs({
-            webPort, vncPort, webRoot: resolveNovncWebRoot(),
+            webPort, vncPort, webRoot: shared.webRoot,
         }));
         const ready = await waitForPort(webPort, 15_000);
         this.viewer = { display, vncPort, webPort };
@@ -2139,7 +2252,7 @@ export class ApiMachineClient {
     }
 
     private async startIsolatedViewerStackOnce(viewerKey: string): Promise<IsolatedViewerStartResult> {
-        const missing = await detectMissingViewerTools();
+        const missing = missingViewerTools(await detectViewerCapabilities());
         if (missing.length > 0) {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
         }
@@ -2199,14 +2312,11 @@ export class ApiMachineClient {
 
         const profileDir = resolveViewerProfileDir(configuration.happyHomeDir, viewerKey);
         mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-        const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display: slot.display, width: 1920, height: 1080 }));
-        await delay(1500);
-        const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display: slot.display, vncPort: slot.vncPort }));
-        await delay(800);
+        const isolated = await this.startViewerDisplay(slot.display, slot.vncPort);
         const websockify = spawnDetached('websockify', buildWebsockifyArgs({
             webPort: slot.webPort,
             vncPort: slot.vncPort,
-            webRoot: resolveNovncWebRoot(),
+            webRoot: isolated.webRoot,
         }));
         const ready = await waitForPort(slot.webPort, 15_000);
         const browser = await this.ensureViewerBrowser(slot.display, false, profileDir, viewerKey);
@@ -2220,8 +2330,7 @@ export class ApiMachineClient {
             profileDir,
             lastUsedAt: Date.now(),
             processIds: {
-                ...(xvfb.pid ? { xvfb: xvfb.pid } : {}),
-                ...(x11vnc.pid ? { x11vnc: x11vnc.pid } : {}),
+                ...isolated.processIds,
                 ...(websockify.pid ? { websockify: websockify.pid } : {}),
             },
         };
@@ -2240,9 +2349,108 @@ export class ApiMachineClient {
         };
     }
 
+    /**
+     * Brings up the display and VNC server for one viewer slot.
+     *
+     * Two backends, chosen by what the machine has. TigerVNC's Xvnc accepts
+     * the client's `SetDesktopSize`, which is the only way the remote screen
+     * can become exactly the size of the user's window — noVNC otherwise
+     * draws a fixed 1920x1080 desktop clipped into whatever window it gets
+     * (reported 2026-09-19). Machines with only the older Xvfb + x11vnc pair
+     * keep working, scaled rather than clipped.
+     *
+     * The window manager is not decoration: a desktop that resizes under a
+     * browser window nothing re-maximizes is worse than one that does not
+     * resize at all, so `selectViewerBackend` only asks for remote resizing
+     * when openbox is there to refit the window.
+     */
+    private async startViewerDisplay(display: string, vncPort: number): Promise<{
+        backend: ViewerBackend;
+        webRoot: string;
+        processIds: { xvnc?: number; xvfb?: number; x11vnc?: number };
+    }> {
+        const capabilities = await detectViewerCapabilities();
+        const preferred = selectViewerBackend(capabilities);
+        if (!preferred) {
+            throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missingViewerTools(capabilities).join(', ')}`);
+        }
+
+        const processIds: { xvnc?: number; xvfb?: number; x11vnc?: number } = {};
+        let backend = preferred;
+        let serving = false;
+        if (preferred.kind === 'xvnc') {
+            // Whoever holds it, a busy port makes the wait below meaningless:
+            // it would report someone else's server as ours.
+            if (!(await isPortFree(vncPort))) {
+                logger.debug(`[viewer] ${vncPort} was already in use before starting Xvnc on ${display}`);
+            }
+            const xvnc = spawnDetached('Xvnc', buildXvncArgs({ display, vncPort, ...VIEWER_SCREEN }));
+            serving = await waitForPort(vncPort, 8_000);
+            if (serving) {
+                if (xvnc.pid) processIds.xvnc = xvnc.pid;
+                if (capabilities.hasVncConfig) {
+                    // Without this helper a paste reaches Xvnc and stops
+                    // there: nothing owns the X CLIPBOARD selection.
+                    spawnDetached('vncconfig', buildVncConfigArgs(), { DISPLAY: display });
+                } else {
+                    logger.debug('[viewer] vncconfig is missing; pasting into the remote screen will not work');
+                }
+            } else {
+                // Installed but unable to start — a display already in use, a
+                // missing font path. Say so: falling back silently reads to
+                // the user as "resizing just does not work on this machine".
+                logger.debug(`[viewer] Xvnc did not open ${vncPort} on ${display}; falling back to Xvfb + x11vnc`);
+                if (xvnc.pid) {
+                    try { process.kill(-xvnc.pid, 'SIGTERM'); } catch { /* already gone */ }
+                    // Xvfb cannot take a display whose lock file is still
+                    // there, and the lock goes with the process.
+                    await delay(500);
+                }
+            }
+        }
+        if (!serving) {
+            if (!capabilities.hasXvfb || !capabilities.hasX11vnc) {
+                throw new Error('원격 화면의 디스플레이 서버를 시작하지 못했습니다.');
+            }
+            const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display, ...VIEWER_SCREEN }));
+            await delay(1500);
+            const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
+            await delay(800);
+            if (xvfb.pid) processIds.xvfb = xvfb.pid;
+            if (x11vnc.pid) processIds.x11vnc = x11vnc.pid;
+            backend = {
+                kind: 'xvfb-x11vnc',
+                resizeMode: 'scale',
+                windowManager: capabilities.hasWindowManager,
+            };
+        }
+
+        if (backend.windowManager) {
+            // Not tracked as a viewer process: openbox is a client of this
+            // display and exits with it, so there is nothing extra to reap.
+            const configPath = join(configuration.happyHomeDir, 'browser-viewers', 'openbox.xml');
+            mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+            // Written atomically: another slot's openbox may be reading this
+            // very file, and a half-written rc.xml silently falls back to
+            // decorated, unmaximized windows.
+            const configTemp = `${configPath}.${randomUUID()}.tmp`;
+            writeFileSync(configTemp, buildOpenboxConfig());
+            renameSync(configTemp, configPath);
+            spawnDetached('openbox', buildOpenboxArgs({ configPath }), { DISPLAY: display });
+        }
+
+        const webRoot = ensureViewerWebRoot({
+            sourceRoot: resolveNovncWebRoot(),
+            targetRoot: join(configuration.happyHomeDir, 'browser-viewers', 'novnc-web', backend.resizeMode),
+            resizeMode: backend.resizeMode,
+            onFallback: (reason) => logger.debug(`[viewer] serving stock noVNC: web root mirror failed: ${reason}`),
+        });
+        return { backend, webRoot, processIds };
+    }
+
     private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<void> {
         for (const [kind, pid] of Object.entries(lease.processIds ?? {}) as Array<[
-            'xvfb' | 'x11vnc' | 'websockify',
+            'xvfb' | 'xvnc' | 'x11vnc' | 'websockify',
             number,
         ]>) {
             if (!pid) continue;
@@ -2315,7 +2523,7 @@ export class ApiMachineClient {
         const cdpPort = await pickFreeCdpPort();
         if (cdpPort === null) return summariseViewerBrowser({ chromeInstalled: true, cdpPort: null });
         const env = { DISPLAY: display };
-        let launched = launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display }, env);
+        let launched = launchChrome(chrome.path, { userDataDir, cdpPort, headless: false, display, windowSize: VIEWER_SCREEN }, env);
         let up = await waitForCdp(cdpPort, 15_000);
         if (!up) {
             // Same kernel/namespace fallback the launch RPC uses.
@@ -2326,6 +2534,7 @@ export class ApiMachineClient {
                 headless: false,
                 display,
                 noSandbox: true,
+                windowSize: VIEWER_SCREEN,
             }, env);
             up = await waitForCdp(cdpPort, 15_000);
         }
@@ -2739,10 +2948,10 @@ export class ApiMachineClient {
          * field rather than a local decision here.
          */
         this.credentialStopped = true;
-        if (this.reconnectInterval) {
-            clearInterval(this.reconnectInterval);
-            this.reconnectInterval = null;
-        }
+        this.stopSmartReconnect();
+        // The supervisor exists to restart reconnects; with no credential
+        // there is nothing for it to restart them with.
+        this.stopConnectionSupervisor();
         // The field is non-nullable and every other path assumes a socket
         // exists; closing is what stops the traffic, and `disconnected` is what
         // the rest of this class already checks.
@@ -2765,13 +2974,19 @@ export class ApiMachineClient {
             reconnection: false,
         });
 
+        // Down until proven up: a socket that never connects has been down
+        // since the moment we started dialling, not since some later event.
+        this.disconnectedSince = Date.now();
+        this.startConnectionSupervisor();
+
         this.socket.on('connect', () => {
             logger.debug('[API MACHINE] Connected to server');
+            this.disconnectedSince = null;
 
-            if (this.reconnectInterval) {
-                clearInterval(this.reconnectInterval);
-                this.reconnectInterval = null;
-            }
+            // The dial landed: end the cadence and return the backoff to its
+            // first step so the next blip still recovers in about a second.
+            this.stopSmartReconnect();
+            this.reconnectAttempts = 0;
 
             this.updateDaemonState((state) => ({
                 ...state,
@@ -2791,6 +3006,11 @@ export class ApiMachineClient {
 
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API MACHINE] Disconnected from server — reason: ${reason}`);
+            this.disconnectedSince = Date.now();
+            // A socket that was up has no dial outstanding; a socket that
+            // dropped mid-handshake has one that just resolved. Either way the
+            // next tick may dial without waiting out the in-flight budget.
+            this.reconnectDialStartedAt = null;
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
             // Tear down any live preview WebSocket tunnels — the relay path is
@@ -2977,9 +3197,17 @@ export class ApiMachineClient {
                 if (cwdDecision.fallback) {
                     const banner = formatCwdFallbackBanner(cwdDecision);
                     if (banner) {
+                        // The banner is an output frame like any other, so it
+                        // takes seq 1 and goes into the replay buffer. Emitting
+                        // it unsequenced would both break the "every frame
+                        // carries a seq" contract this same ack advertises via
+                        // caps.resume, and consume seq 1 on the client — which
+                        // reads a missing seq as "the next one" — so the shell's
+                        // first real chunk would look like a duplicate.
+                        const seq = entry.output.push(banner);
                         try {
                             const data = encodeBase64(encrypt(machineKey, machineVariant, banner));
-                            this.socket.emit('terminal-frame', { sessionId, data });
+                            this.socket.emit('terminal-frame', { sessionId, seq, data });
                             recordBytesOut(sessionId, banner.length);
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-open-fwd banner encrypt failed: ${(e as Error).message}`);
@@ -2998,9 +3226,17 @@ export class ApiMachineClient {
                 const outputCoalescer = createTerminalOutputCoalescer({
                     sessionId,
                     emit: (chunk) => {
+                        /*
+                         * specs/desktop-terminal-reliability/ Phase 3 — the
+                         * coalesced chunk is the unit of replay, so it is what
+                         * gets a seq. Buffer first, then send: a frame the
+                         * client asks to replay must already be in the buffer
+                         * by the time the ask can arrive.
+                         */
+                        const seq = entry.output.push(chunk);
                         try {
                             const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
-                            this.socket.emit('terminal-frame', { sessionId, data });
+                            this.socket.emit('terminal-frame', { sessionId, seq, data });
                         } catch (e) {
                             logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
                         }
@@ -3032,7 +3268,13 @@ export class ApiMachineClient {
                 logger.debug(
                     `[REMOTE-TERMINAL] open session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} pid=${pty.pid}`,
                 );
-                ack({ ok: true, pid: pty.pid });
+                /*
+                 * The desktop client has spoken resume/snapshot since
+                 * specs/desktop-terminal-reliability/ Phase 3 but has been
+                 * running in legacy mode all along, because nothing ever
+                 * advertised these. Both are honoured below.
+                 */
+                ack({ ok: true, pid: pty.pid, caps: { resume: true, snapshot: true } });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
@@ -3055,6 +3297,51 @@ export class ApiMachineClient {
             } catch (e) {
                 logger.debug(`[API MACHINE] terminal-frame-fwd decrypt failed: ${(e as Error).message}`);
             }
+        });
+
+        /*
+         * specs/desktop-terminal-reliability/ Phase 3 — a client that missed
+         * frames (a reconnect, or a gap it noticed in the seq) asks for
+         * everything after the last seq it saw.
+         *
+         * Not attached on a managed runtime, for the same reason as
+         * terminal-frame-fwd: forwarded terminal events reach the host outside
+         * the RPC dispatch gate, so the allowlist there would not see this.
+         */
+        if (!this.managedHandlers) this.socket.on('terminal-resume-fwd', (msg) => {
+            const { sessionId, afterSeq } = msg || {};
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry) return;
+            const seen = Number.isFinite(afterSeq) ? Math.max(0, Math.trunc(afterSeq as number)) : 0;
+            const answer = entry.output.resume(seen);
+            /*
+             * A resume is proof the client is still watching. Without this the
+             * idle watchdog keeps counting from the last byte that actually
+             * moved, and a terminal recovered at minute 14 dies at minute 15.
+             */
+            recordTerminalActivity(sessionId);
+            try {
+                if (answer.kind === 'replay') {
+                    for (const frame of answer.frames) {
+                        const data = encodeBase64(encrypt(machineKey, machineVariant, frame.chunk));
+                        this.socket.emit('terminal-frame', { sessionId, seq: frame.seq, data });
+                    }
+                } else if (answer.kind === 'snapshot') {
+                    const data = encodeBase64(encrypt(machineKey, machineVariant, answer.data));
+                    this.socket.emit('terminal-snapshot', { sessionId, seq: answer.seq, data });
+                } else if (answer.kind === 'gap') {
+                    // Nothing to send that would be true. Say where the hole
+                    // starts rather than letting the client believe it is current.
+                    this.socket.emit('terminal-frame-gap', { sessionId, fromSeq: answer.fromSeq });
+                }
+            } catch (e) {
+                logger.debug(`[API MACHINE] terminal-resume-fwd reply failed: ${(e as Error).message}`);
+                return;
+            }
+            logger.debug(
+                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${seen} answer=${answer.kind}`
+                + (answer.kind === 'replay' ? ` frames=${answer.frames.length}` : ''),
+            );
         });
 
         this.socket.on('terminal-resize-fwd', (msg) => {
@@ -3116,6 +3403,10 @@ export class ApiMachineClient {
 
         this.socket.on('connect_error', (error) => {
             logger.debug(`[API MACHINE] Connection error: ${error.message}`);
+            // This is how a dial resolves when it fails. Clearing the marker
+            // before rescheduling lets the next tick dial immediately instead
+            // of waiting out the in-flight budget.
+            this.reconnectDialStartedAt = null;
             this.startSmartReconnect();
         });
 
@@ -3210,37 +3501,127 @@ export class ApiMachineClient {
         this.runtimeActivityProvider = provider;
     }
 
+    /**
+     * What this daemon can honestly say about its link to the server.
+     *
+     * Read by the daemon heartbeat so the local state file records a socket
+     * that is down instead of a bare `running` that is true of the process
+     * and false of everything anyone actually wants from it.
+     */
+    getConnectionHealth(): MachineConnectionHealth {
+        const connected = this.socket?.connected === true;
+        return {
+            connected,
+            reconnecting: this.reconnectInterval !== null,
+            disconnectedForMs: connected || this.disconnectedSince === null
+                ? null
+                : Date.now() - this.disconnectedSince,
+        };
+    }
+
+    private startConnectionSupervisor() {
+        if (this.connectionSupervisorInterval) return;
+        this.connectionSupervisorInterval = setInterval(() => {
+            if (this.socket?.connected) {
+                this.disconnectedSince = null;
+                return;
+            }
+            if (this.disconnectedSince === null) this.disconnectedSince = Date.now();
+            /*
+             * A retry is already in flight, which is the ordinary shape of a
+             * server that is down: not a defect, so nothing is reported.
+             * `startSmartReconnect` would refuse to stack a second cadence on
+             * its own — what this guard is actually for is keeping the line
+             * below rare enough to mean something.
+             */
+            if (this.reconnectInterval) return;
+            /*
+             * Reached only when every edge-triggered path missed. Logged at
+             * the moment of repair rather than on every tick: a line here
+             * means a reconnect loop should have been running and was not,
+             * which is a defect worth finding in the log, not a status beat.
+             */
+            const downFor = Math.round((Date.now() - this.disconnectedSince) / 1000);
+            logger.debug(`[API MACHINE] Socket down ${downFor}s with nothing retrying — starting reconnect`);
+            this.startSmartReconnect();
+        }, CONNECTION_SUPERVISOR_INTERVAL_MS);
+    }
+
+    private stopConnectionSupervisor() {
+        if (this.connectionSupervisorInterval) {
+            clearInterval(this.connectionSupervisorInterval);
+            this.connectionSupervisorInterval = null;
+        }
+    }
+
     private startSmartReconnect() {
         // A runtime whose credential is gone does not reconnect. Retrying would
         // present a dead bearer over and over while the parent already knows
         // this runtime is not authorised.
         if (this.credentialStopped) return;
+        // Nor does one that is on its way out.
+        if (this.shuttingDown) return;
         if (this.reconnectInterval) return;
+        this.scheduleReconnectDial();
+    }
 
-        this.reconnectInterval = setInterval(() => {
+    /** Ends the cadence and forgets any dial it was waiting on. */
+    private stopSmartReconnect() {
+        if (this.reconnectInterval) {
+            clearTimeout(this.reconnectInterval);
+            this.reconnectInterval = null;
+        }
+        this.reconnectDialStartedAt = null;
+    }
+
+    /**
+     * True while a `socket.connect()` is still waiting for `connect` or
+     * `connect_error`. Expires on its own so a handshake that resolves with
+     * neither cannot wedge the cadence shut.
+     */
+    private isReconnectDialInFlight(): boolean {
+        if (this.reconnectDialStartedAt === null) return false;
+        if (Date.now() - this.reconnectDialStartedAt < RECONNECT_DIAL_TIMEOUT_MS) return true;
+        this.reconnectDialStartedAt = null;
+        return false;
+    }
+
+    private scheduleReconnectDial(overrideDelayMs?: number) {
+        const delayMs = overrideDelayMs ?? reconnectDelayMs(this.reconnectAttempts);
+        this.reconnectInterval = setTimeout(() => {
+            this.reconnectInterval = null;
+            /*
+             * Every condition is re-read when the timer fires, not when it was
+             * scheduled. A stop that arrives in between leaves this callback on
+             * the queue, and it would otherwise reconnect with the credential
+             * that just expired.
+             */
+            if (this.credentialStopped) return;
             if (this.socket.connected) {
-                clearInterval(this.reconnectInterval!);
-                this.reconnectInterval = null;
+                this.reconnectAttempts = 0;
+                return;
+            }
+            if (this.isReconnectDialInFlight()) {
+                // Stacking a second dial on an unresolved one is precisely what
+                // duplicated the machine socket. Wait for this one to land.
+                this.scheduleReconnectDial();
                 return;
             }
             if (!shouldReconnect()) {
                 logger.debug('[API MACHINE] Still not ready to reconnect');
+                // Not a failed dial: `reconnectAttempts` stays where it is, so
+                // the backoff cannot pace this branch. Poll on its own clock
+                // instead of re-asking `shouldReconnect()` every base delay for
+                // as long as the machine stays shut.
+                this.scheduleReconnectDial(RECONNECT_NOT_READY_POLL_MS);
                 return;
             }
-            logger.debug('[API MACHINE] Attempting reconnect');
+            this.reconnectAttempts += 1;
+            this.reconnectDialStartedAt = Date.now();
+            logger.debug(`[API MACHINE] Attempting reconnect (attempt ${this.reconnectAttempts})`);
             this.socket.connect();
-        }, 3000);
-
-        if (shouldReconnect()) {
-            logger.debug('[API MACHINE] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => {
-                // Re-checked when it fires, not when it was scheduled. A stop
-                // that arrives in between leaves this timeout on the queue, and
-                // it would reconnect with the credential that just expired.
-                if (this.credentialStopped) return;
-                if (!this.socket.connected) this.socket.connect();
-            }, 1000);
-        }
+            this.scheduleReconnectDial();
+        }, delayMs);
     }
 
     private stopKeepAlive() {
@@ -3253,13 +3634,15 @@ export class ApiMachineClient {
 
     shutdown() {
         logger.debug('[API MACHINE] Shutting down');
+        // Set before anything can fire `disconnect`, and never cleared: the
+        // close below wakes the disconnect handler, which would otherwise start
+        // the reconnect cadence right back up.
+        this.shuttingDown = true;
         this.stopKeepAlive();
+        this.stopConnectionSupervisor();
         for (const cdpPipe of this.browserCdpPipes.values()) cdpPipe.close();
         this.browserCdpPipes.clear();
-        if (this.reconnectInterval) {
-            clearInterval(this.reconnectInterval);
-            this.reconnectInterval = null;
-        }
+        this.stopSmartReconnect();
         if (this.socket) {
             this.socket.close();
             logger.debug('[API MACHINE] Socket closed');

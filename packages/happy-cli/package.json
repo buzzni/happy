@@ -1,6 +1,6 @@
 {
   "name": "@buzzni/happy-cli",
-  "version": "1.1.10-aplus.212",
+  "version": "1.1.10-aplus.220",
   "description": "A+ Dev Studio fork of slopus/happy. Mobile and Web client for Claude Code and Codex.",
   "author": "Kirill Dubovitskiy (upstream), justinbuzzni (aplus fork)",
   "license": "MIT",
@@ -100,13 +100,14 @@
     "prepare:publish": "node scripts/prepare-publish-package.cjs",
     "guard:publish": "node scripts/guard-publish-artifact.cjs",
     "prepublishOnly": "node scripts/assert-publish-tool.cjs && pnpm test && node scripts/guard-publish-artifact.cjs . --install-smoke",
-    "postinstall": "node scripts/verify-bundled-deps.cjs && node scripts/unpack-tools.cjs && node scripts/fix-node-pty-perms.cjs"
+    "postinstall": "node scripts/verify-bundled-deps.cjs && node scripts/unpack-tools.cjs && node scripts/fix-node-pty-perms.cjs && node scripts/install-companion-tools.cjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.14.1",
-    "@anthropic-ai/claude-agent-sdk": "^0.3.179",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.276",
     "@anthropic-ai/sandbox-runtime": "^0.0.37",
     "@anthropic-ai/sdk": "0.96.0",
+    "@buzzni/saycode-cli": "0.5.1",
     "@modelcontextprotocol/sdk": "1.29.0",
     "@noble/ed25519": "^3.0.0",
     "@noble/hashes": "^2.0.1",
@@ -119,7 +120,6 @@
     "@types/qrcode-terminal": "^0.12.2",
     "@types/react": "^19.2.7",
     "@types/tmp": "^0.2.6",
-    "@buzzni/saycode-cli": "0.5.1",
     "ai": "^5.0.107",
     "axios": "^1.13.2",
     "chalk": "^5.6.2",
@@ -137,12 +137,16 @@
     "ps-list": "^8.1.1",
     "qrcode-terminal": "^0.12.0",
     "react": "^19.2.0",
+    "shell-quote": "1.8.3",
     "socket.io-client": "^4.8.1",
     "tar": "^7.5.2",
     "tmp": "^0.2.5",
     "tweetnacl": "^1.0.3",
     "ws": "^8.19.0",
     "zod": "^4.0.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "4.2.0"
   },
   "bundledDependencies": [
     "@slopus/happy-wire",
@@ -152,6 +156,7 @@
     "@eslint/compat": "^1",
     "@types/inquirer": "^9.0.9",
     "@types/node": ">=20",
+    "@types/shell-quote": "^1.7.5",
     "@types/ws": "^8.18.1",
     "cross-env": "^10.1.0",
     "dotenv": "^16.6.1",

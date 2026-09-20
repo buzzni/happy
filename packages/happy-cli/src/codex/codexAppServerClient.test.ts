@@ -171,6 +171,133 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(new CodexAppServerClient().supportsGoalActions()).toBe(false);
     });
 
+    it('coalesces raw agent message deltas into a continuous preview before the persisted answer', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (_msg, stdout) => {
+                appServerStdout = stdout;
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+
+        await client.connect();
+        try {
+            if (!appServerStdout) throw new Error('app-server stdout unavailable');
+            pushJsonLine(appServerStdout, {
+                method: 'item/agentMessage/delta',
+                params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'Hel' },
+            });
+            pushJsonLine(appServerStdout, {
+                method: 'item/agentMessage/delta',
+                params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'lo' },
+            });
+
+            await waitFor(() => events.some((event) => event.type === 'agent_message_delta'), 300);
+            expect(events.filter((event) => event.type === 'agent_message_delta')).toEqual([{
+                type: 'agent_message_delta',
+                item_id: 'message-1',
+                index: 0,
+                offset: 0,
+                delta: 'Hello',
+                final: false,
+            }]);
+
+            pushJsonLine(appServerStdout, {
+                method: 'item/agentMessage/delta',
+                params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: '!' },
+            });
+            pushJsonLine(appServerStdout, {
+                method: 'item/completed',
+                params: {
+                    threadId: 'thread-1',
+                    turnId: 'turn-1',
+                    item: { type: 'agentMessage', id: 'message-1', text: 'Hello!', phase: 'final_answer' },
+                },
+            });
+
+            await waitFor(() => events.some((event) => event.type === 'agent_message'));
+            expect(events.filter((event) => event.type === 'agent_message_delta')).toEqual([
+                {
+                    type: 'agent_message_delta',
+                    item_id: 'message-1',
+                    index: 0,
+                    offset: 0,
+                    delta: 'Hello',
+                    final: false,
+                },
+                {
+                    type: 'agent_message_delta',
+                    item_id: 'message-1',
+                    index: 0,
+                    offset: 5,
+                    delta: '!',
+                    final: true,
+                },
+            ]);
+            expect(events.filter((event) => event.type === 'agent_message')).toEqual([
+                expect.objectContaining({ message: 'Hello!', item_id: 'message-1' }),
+            ]);
+        } finally {
+            await client.disconnect();
+        }
+    });
+
+    it('splits an oversized raw agent message delta into bounded continuous frames', async () => {
+        let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
+        mockSpawn.mockImplementation(() => createMockProcess({
+            onRequest: (_msg, stdout) => {
+                appServerStdout = stdout;
+            },
+        }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+
+        await client.connect();
+        try {
+            if (!appServerStdout) throw new Error('app-server stdout unavailable');
+            pushJsonLine(appServerStdout, {
+                method: 'item/agentMessage/delta',
+                params: {
+                    threadId: 'thread-1',
+                    turnId: 'turn-1',
+                    itemId: 'message-large',
+                    delta: 'a'.repeat(2_050),
+                },
+            });
+
+            await waitFor(() => events.filter((event) => event.type === 'agent_message_delta').length === 2);
+            expect(events.filter((event) => event.type === 'agent_message_delta')).toEqual([
+                expect.objectContaining({ item_id: 'message-large', offset: 0, delta: 'a'.repeat(2_048), final: false }),
+                expect.objectContaining({ item_id: 'message-large', offset: 2_048, delta: 'aa', final: false }),
+            ]);
+
+            pushJsonLine(appServerStdout, {
+                method: 'item/completed',
+                params: {
+                    threadId: 'thread-1',
+                    turnId: 'turn-1',
+                    item: { type: 'agentMessage', id: 'message-large', text: 'a'.repeat(2_050), phase: 'final_answer' },
+                },
+            });
+            await waitFor(() => events.filter((event) => event.type === 'agent_message_delta').length === 3);
+            expect(events.filter((event) => event.type === 'agent_message_delta').at(-1)).toEqual({
+                type: 'agent_message_delta',
+                item_id: 'message-large',
+                index: 0,
+                offset: 2_050,
+                delta: '',
+                final: true,
+            });
+        } finally {
+            await client.disconnect();
+        }
+    });
+
     it('emits response-scoped usage with the native Codex response id', async () => {
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
         mockSpawn.mockImplementation(() => createMockProcess({

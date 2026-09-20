@@ -104,6 +104,7 @@ vi.mock('@/claude/claudeLocal', () => ({
 }));
 
 import { runClaude } from './runClaude';
+import { logger } from '@/ui/logger';
 
 function createDeferred<T>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -159,7 +160,7 @@ async function startRemoteRunClaudeHarness(opts: {
         onFileEvent: vi.fn(),
         on: vi.fn(),
         trackAttachmentDownload: vi.fn(),
-        drainAttachmentsForUserMessage: vi.fn(async () => []),
+        drainAttachmentsForUserMessage: vi.fn(async (): Promise<Array<{ data: Uint8Array; mimeType: string; name: string }>> => []),
         downloadAndDecryptAttachment: vi.fn(),
         getMetadata: vi.fn(() => metadata),
         sendSessionEvent: vi.fn(),
@@ -378,6 +379,7 @@ describe('runClaude remote JSONL scanner', () => {
     });
 
     afterEach(() => {
+        vi.unstubAllGlobals();
         for (const key of Object.keys(process.env)) {
             if (!(key in originalEnv)) delete process.env[key];
         }
@@ -1380,6 +1382,274 @@ describe('runClaude remote JSONL scanner', () => {
         expect(queued).toHaveLength(1);
         expect(queued[0].message.startsWith('로그인 버튼이 안 눌려')).toBe(true);
         expect(queued[0].message).toContain(TITLE_INSTRUCTION);
+        await harness.finish();
+    });
+
+    it('keeps legacy no-intent modelSource auto messages persistent', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: {
+                modelSource: 'auto',
+                model: 'claude-opus-5',
+                effort: 'high',
+            },
+        });
+        await userMessageHandler({ content: { text: 'second turn' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(2);
+        expect(queued[0].mode).toMatchObject({ model: 'claude-opus-5', effort: 'high' });
+        expect(queued[1].mode).toMatchObject({ model: 'claude-opus-5', effort: 'high' });
+        await harness.finish();
+    });
+
+    it('uses the client fallback model for a delegated turn when routing authorization validation fails', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new Error('network down');
+        }));
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'first turn' },
+            meta: {
+                modelSource: 'auto',
+                model: 'claude-sonnet-5',
+                effort: 'high',
+                difficultyRoutingAuthorization: 'authorization',
+                difficultyRoutingIntent: {
+                    version: 1,
+                    mode: 'auto',
+                    policy: 'org-shared-difficulty-routing.v1',
+                    clientRequestId: 'request-1',
+                    clientRouteSource: 'default-auto',
+                },
+            },
+        });
+        await userMessageHandler({ content: { text: 'second turn' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(2);
+        expect(queued[0].mode).toMatchObject({ model: 'claude-sonnet-5', effort: 'high' });
+        expect(queued[1].mode.model).not.toBe('claude-sonnet-5');
+        await harness.finish();
+    });
+
+    it('claims attachments at message arrival before queued routing work can delay later turns', async () => {
+        const grantDeferred = createDeferred<Response>();
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        const claimedAttachments: Array<Array<{ name: string; mimeType: string; data: Uint8Array }>> = [
+            [{ name: 'turn-1.png', mimeType: 'image/png', data: new Uint8Array([1]) }],
+            [{ name: 'turn-2.png', mimeType: 'image/png', data: new Uint8Array([2]) }],
+            [{ name: 'turn-3.png', mimeType: 'image/png', data: new Uint8Array([3]) }],
+        ];
+        harness.sessionClient.drainAttachmentsForUserMessage.mockImplementation(async () => (
+            claimedAttachments.shift() ?? []
+        ));
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+        vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+            if (String(url).endsWith('/api/me/difficulty-routing/grant')) return grantDeferred.promise;
+            return Response.json({});
+        }));
+
+        const first = userMessageHandler({
+            content: { text: 'first routed turn' },
+            meta: {
+                modelSource: 'auto',
+                model: 'claude-sonnet-5',
+                effort: 'high',
+                difficultyRoutingAuthorization: 'authorization',
+                difficultyRoutingIntent: {
+                    version: 1,
+                    mode: 'auto',
+                    policy: 'org-shared-difficulty-routing.v1',
+                    clientRequestId: 'request-1',
+                    clientRouteSource: 'default-auto',
+                },
+            },
+        });
+        const second = userMessageHandler({
+            content: { text: 'second legacy turn' },
+            meta: {},
+        });
+
+        expect(harness.sessionClient.drainAttachmentsForUserMessage).toHaveBeenCalledTimes(2);
+        grantDeferred.resolve(Response.json({
+            ok: false,
+            reason: 'host-unavailable',
+            aiModelPolicy: {
+                source: 'unrestricted',
+                allowedSelectionKeys: null,
+                defaultSelectionKey: null,
+            },
+        }));
+        await vi.waitFor(() => {
+            expect(harness.loopOptions.messageQueue.queue).toHaveLength(2);
+        });
+        await Promise.all([first, second]);
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued[0].attachments?.map((attachment: any) => attachment.name)).toEqual(['turn-1.png']);
+        expect(queued[1].attachments?.map((attachment: any) => attachment.name)).toEqual(['turn-2.png']);
+        expect(claimedAttachments.map((bucket) => bucket[0].name)).toEqual(['turn-3.png']);
+        expect(claimedAttachments).toHaveLength(1);
+        await harness.finish();
+    });
+
+    it('keeps difficulty routing sticky state locally when metadata persistence is delayed', async () => {
+        vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => Response.json({
+            ok: true,
+            grant: {
+                version: 1,
+                grantId: 'grant-1',
+                policyRevision: 7,
+                // The client negotiates timing v2, so the server answers with durations and
+                // echoes the turn id back, exactly as the real grant endpoint does.
+                timingVersion: 2,
+                requestId: JSON.parse(init.body).clientRequestId,
+                issuedAt: Date.now(),
+                ttlMs: 10_000,
+                relayTtlMs: 1000,
+                expiresAt: Date.now() + 10_000,
+                sourceMachineId: 'machine-1',
+                hostMachineId: 'host-1',
+                hostProcessKeyId: 'key-1',
+                hostProcessPublicKey: Buffer.from(new Uint8Array(32).fill(1)).toString('base64'),
+                maxInputChars: 8000,
+                modelMaxInputTokens: 512,
+                relayDeadlineAt: Date.now() + 1000,
+            },
+            signedGrant: 'signed-grant',
+            aiModelPolicy: {
+                source: 'unrestricted',
+                allowedSelectionKeys: null,
+                defaultSelectionKey: null,
+            },
+        })));
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        harness.sessionClient.updateMetadata.mockImplementation(vi.fn());
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+        const routedMeta = (clientRequestId: string) => ({
+            modelSource: 'auto',
+            model: 'claude-sonnet-5',
+            effort: 'high',
+            difficultyRoutingAuthorization: 'authorization',
+            difficultyRoutingIntent: {
+                version: 1,
+                mode: 'auto',
+                policy: 'org-shared-difficulty-routing.v1',
+                clientRequestId,
+                clientRouteSource: 'default-auto',
+            },
+        });
+
+        await userMessageHandler({
+            content: { text: 'debug this deadlock in the distributed transaction' },
+            meta: routedMeta('request-1'),
+        });
+        await userMessageHandler({
+            content: { text: 'debug this deadlock in the scheduler too' },
+            meta: routedMeta('request-2'),
+        });
+
+        const metadataUpdaters = harness.sessionClient.updateMetadata.mock.calls
+            .map(([updater]) => updater)
+            .filter((updater) => typeof updater === 'function');
+        const lastMetadata = metadataUpdaters.at(-1)?.({});
+        expect(lastMetadata?.difficultyRoutingState).toMatchObject({
+            difficulty: 'hard',
+            hardTurns: 2,
+        });
+        await harness.finish();
+    });
+
+    it('redacts routing authorization and raw prompts from user message debug logs', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new Error('network down');
+        }));
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'secret visible user text' },
+            meta: {
+                modelSource: 'auto',
+                model: 'claude-sonnet-5',
+                effort: 'high',
+                difficultyRoutingAuthorization: 'secret-authorization-token',
+                difficultyRoutingPrompt: 'original raw mobile prompt',
+                difficultyRoutingIntent: {
+                    version: 1,
+                    mode: 'auto',
+                    policy: 'org-shared-difficulty-routing.v1',
+                    clientRequestId: 'request-1',
+                    clientRouteSource: 'default-auto',
+                },
+            },
+        });
+
+        const userMessageLog = vi.mocked(logger.debugLargeJson).mock.calls.find(([label]) => (
+            label === 'User message pushed to queue:'
+        ));
+        expect(userMessageLog).toBeTruthy();
+        const serialized = JSON.stringify(userMessageLog?.[1]);
+        expect(serialized).not.toContain('secret-authorization-token');
+        expect(serialized).not.toContain('original raw mobile prompt');
+        expect(serialized).not.toContain('secret visible user text');
+        expect(serialized).toContain('hasDifficultyRoutingAuthorization');
+        await harness.finish();
+    });
+
+    it('redacts routing metadata from debug logs even when the intent is not executable', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'legacy message with malformed routing meta' },
+            meta: {
+                modelSource: 'user',
+                difficultyRoutingAuthorization: 'malformed-secret-token',
+                difficultyRoutingIntent: { version: 2, future: true },
+                difficultyRoutingPrompt: 'malformed raw prompt',
+            },
+        });
+
+        const userMessageLog = vi.mocked(logger.debugLargeJson).mock.calls.find(([label]) => (
+            label === 'User message pushed to queue:'
+        ));
+        expect(userMessageLog).toBeTruthy();
+        const serialized = JSON.stringify(userMessageLog?.[1]);
+        expect(serialized).not.toContain('malformed-secret-token');
+        expect(serialized).not.toContain('malformed raw prompt');
+        expect(serialized).not.toContain('legacy message with malformed routing meta');
+        expect(serialized).toContain('hasDifficultyRoutingIntent');
         await harness.finish();
     });
 

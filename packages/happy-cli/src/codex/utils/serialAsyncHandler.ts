@@ -1,7 +1,7 @@
 export function createSerialAsyncHandler<T>(
     handler: (value: T) => Promise<void>,
     onError?: (error: unknown) => void,
-): (value: T) => void {
+): (value: T) => Promise<void> {
     let tail = Promise.resolve();
 
     return (value: T) => {
@@ -10,5 +10,6 @@ export function createSerialAsyncHandler<T>(
             .catch((error) => {
                 onError?.(error);
             });
+        return tail;
     };
 }

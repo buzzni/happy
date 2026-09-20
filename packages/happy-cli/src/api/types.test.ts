@@ -140,3 +140,51 @@ describe('channelSupport approvals capability', () => {
         expect(parsed.success).toBe(false);
     });
 });
+
+describe('MessageMetaSchema axStep', () => {
+  it('accepts plan, design, and free', () => {
+    expect(MessageMetaSchema.parse({ axStep: 'plan' })).toEqual({ axStep: 'plan' });
+    expect(MessageMetaSchema.parse({ axStep: 'design' })).toEqual({ axStep: 'design' });
+    expect(MessageMetaSchema.parse({ axStep: 'free' })).toEqual({ axStep: 'free' });
+  });
+
+  // Same hazard as saycodePromptBlocks above: a strict enum here means a newer app
+  // sending a step this CLI has not learned yet drops the user's turn with no error
+  // anywhere. An unknown step must degrade to "no explicit step", never to silence.
+  it('degrades an unknown step to undefined instead of dropping the message', () => {
+    const parsed = MessageMetaSchema.safeParse({
+      permissionMode: 'default',
+      axStep: 'a-step-from-a-newer-app',
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.permissionMode).toBe('default');
+    expect(parsed.success && parsed.data.axStep).toBeUndefined();
+  });
+});
+
+describe('MessageMetaSchema difficulty routing', () => {
+    it('preserves explicit org shared routing intent and prompt override', () => {
+        const input = {
+            difficultyRoutingIntent: {
+                version: 1,
+                mode: 'auto',
+                policy: 'org-shared-difficulty-routing.v1',
+                clientRequestId: 'client-1',
+                clientRouteSource: 'default-auto',
+            },
+            difficultyRoutingPrompt: 'raw user text',
+            difficultyRoutingAuthorization: 'signed-routing-authorization',
+        };
+        expect(MessageMetaSchema.parse(input)).toEqual(input);
+    });
+
+    it('does not fail the whole message on malformed routing intent', () => {
+        const parsed = MessageMetaSchema.safeParse({
+            permissionMode: 'default',
+            difficultyRoutingIntent: { version: 2 },
+        });
+        expect(parsed.success).toBe(true);
+        expect(parsed.success && parsed.data.permissionMode).toBe('default');
+        expect(parsed.success && parsed.data.difficultyRoutingIntent).toBeUndefined();
+    });
+});

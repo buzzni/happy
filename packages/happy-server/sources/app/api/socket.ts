@@ -6,6 +6,7 @@ import { createAdapter } from "@socket.io/redis-streams-adapter";
 import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
+import { BROWSER_SYNC_EXPIRES_AT, armBrowserSyncDeadline, authenticateBrowserSyncSocket } from "./socket/browserSyncSocketAuth";
 import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamWriteFailuresCounter, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
 import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
 import { usageHandler } from "./socket/usageHandler";
@@ -22,6 +23,7 @@ import { db } from "@/storage/db";
 import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
+import { evictSupersededMachineSockets } from "@/app/events/findMachineSockets";
 import { wrapServerForPreviewSubdomainBypass } from "@/modules/preview/previewEngineIoGuard";
 import { startManagedSocket } from "@/app/api/socket/managed/managedSocketServer";
 import { setManagedRpcServer } from "@/app/api/socket/managed/managedDelivery";
@@ -209,6 +211,40 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             return;
         }
 
+        /*
+         * A browser presents a credential of its own purpose, not the account
+         * bearer. That is what makes "log this browser out" mean something on
+         * the socket: the bearer is one value per account, shared with the CLI
+         * and the phone, and nothing here can withdraw it.
+         *
+         * The credential is short-lived and the web app reissues it only while
+         * that browser's login session is live. So the connection is also given
+         * a deadline — a check that ran only at connect would leave a socket
+         * authenticated by a credential that has since stopped being reissued.
+         */
+        const browserSync = await authenticateBrowserSyncSocket({
+            handshake: { token, clientType },
+            issuer: auth.browserSyncIssuer,
+            now: Date.now(),
+        });
+        if (browserSync) {
+            socket.data.userId = browserSync.accountId;
+            socket.data.clientType = clientType;
+            socket.data.sessionId = sessionId;
+            socket.data.machineId = machineId;
+            socket.data.connectedAt = Date.now();
+            socket.data.happyClient = socket.handshake.auth.happyClient as string
+                || socket.handshake.headers['x-happy-client'] as string
+                || undefined;
+            // 만료 시각만 남기고, 타이머는 connection 에서 건다. 여기서 걸면
+            // connection state recovery 로 되살아난 소켓이 만료 없이 산다 —
+            // 복구는 이 미들웨어를 건너뛰고, 앞선 disconnect 가 타이머를 이미
+            // 지웠기 때문이다. `socket.data` 는 복구 때 그대로 돌아온다.
+            socket.data[BROWSER_SYNC_EXPIRES_AT] = browserSync.expiresAt;
+            next();
+            return;
+        }
+
         const verified = await auth.verifyToken(token);
         if (!verified) {
             // One message for every way authentication can fail. A caller
@@ -273,6 +309,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     }
 
     io.on("connection", (socket) => {
+        // 새 연결과 복구된 연결이 같이 지나는 유일한 지점이다. 자격이 이미
+        // 만료됐으면 여기서 끝난다.
+        if (armBrowserSyncDeadline(socket as never, Date.now()) === 'expired') return;
         const userId = socket.data.userId as string;
         const clientType = socket.data.clientType as 'session-scoped' | 'user-scoped' | 'machine-scoped' | undefined;
         const sessionId = socket.data.sessionId as string | undefined;
@@ -329,6 +368,28 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             // fire-and-forget: 이 쓰기가 실패해도 소켓은 살아 있어야 하고,
             // heartbeat flush 가 최대 35초 안에 같은 상태를 다시 기록한다.
             void markMachineOnline(userId, connection.machineId, connectedAt);
+
+            /*
+             * specs/machine-socket-duplicate-registration/ — one machine, one
+             * socket. Overlapping handshakes from a single daemon can each
+             * complete, and engine.io keeps every one of them in the machine
+             * room until its own ping budget runs out (pingInterval 15s +
+             * pingTimeout 45s). Work routed into a socket the daemon is no
+             * longer reading from is never answered — the caller just waits out
+             * its ack. Close the superseded ones now instead.
+             *
+             * Fire-and-forget: a cluster bus that cannot answer should cost a
+             * stale socket, not this connection.
+             */
+            void evictSupersededMachineSockets(io, userId, connection.machineId, socket.id)
+                .then((evicted) => {
+                    if (evicted > 0) {
+                        log({ module: 'websocket' }, `Evicted ${evicted} superseded machine socket(s) for machine ${connection.machineId}, keeping ${socket.id}`);
+                    }
+                })
+                .catch((error) => {
+                    log({ module: 'websocket', level: 'error' }, `Machine socket eviction failed for ${connection.machineId}: ${error}`);
+                });
         }
 
         // Track app focus state for push notification routing.

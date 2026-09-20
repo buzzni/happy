@@ -1,5 +1,6 @@
 import { isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
 import { hashObject } from '@/utils/deterministicJson';
+import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 import { CHANGE_TITLE_INSTRUCTION } from './constants';
 import type { GeminiMode } from './types';
 
@@ -20,6 +21,7 @@ export function buildGeminiTurnPrompt(input: {
   ) ? input.agentOrchestrationPrompt : undefined;
   return [
     input.isNewSession ? input.appendSystemPrompt : undefined,
+    input.isNewSession && input.saycodeSystemPromptEnabled !== false ? SAYCODE_API_GATEWAY_PROMPT : undefined,
     input.isNewSession ? agentOrchestrationPrompt : undefined,
     input.isNewSession ? input.previousConversationContext?.trim() : undefined,
     input.userText,
@@ -32,6 +34,7 @@ export function hashGeminiMode(mode: GeminiMode): string {
     permissionMode: mode.permissionMode,
     model: mode.model,
     appendSystemPrompt: mode.appendSystemPrompt,
+    apiGatewayGuidanceEnabled: mode.saycodeSystemPromptEnabled !== false,
     agentOrchestrationEnabled: isSaycodePromptBlockEnabled(
       'agentOrchestration',
       mode.saycodePromptBlocks,

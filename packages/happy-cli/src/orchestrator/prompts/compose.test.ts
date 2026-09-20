@@ -86,6 +86,7 @@ describe('composeStepGuide', () => {
         expect(guide).toMatch(/full-stack/i);
         expect(guide).toMatch(/TDD/);
     });
+
 });
 
 describe('composeDynamicContext', () => {

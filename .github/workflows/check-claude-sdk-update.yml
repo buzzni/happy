@@ -1,0 +1,227 @@
+name: Check claude-agent-sdk update
+
+# Weekly check for a newer @anthropic-ai/claude-agent-sdk release. That
+# package bundles the actual Claude Code binary (see manifest.json inside
+# it) — an old pin here means happy-cli ships a Claude Code binary that can
+# start rejecting newer models with "does not support this model; version
+# X or newer is required" (see buzzni/happy#455).
+#
+# This workflow only proposes a draft PR. It never merges, tags, or
+# publishes — that remains a human decision per docs/happy-cli-release.md.
+#
+# CI CAVEAT — why this job runs the tests itself:
+# GitHub does not start workflow runs for events raised with the default
+# GITHUB_TOKEN, so a PR opened under that token gets NO checks:
+# cli-smoke-test.yml never fires even though the bump touches paths it
+# watches. Marking the draft ready does not help either — that raises
+# `ready_for_review`, which is not in the default `pull_request` type set.
+# So this job runs build + the unit suite + the publish-artifact guard
+# itself and only opens a PR if they pass, and the PR is opened as a DRAFT
+# so an unchecked bump cannot be merged casually. If the CI_AUTOMATION_PAT
+# secret is set (a GitHub PAT/App token with repo + PR scope) it is used
+# instead and cli-smoke-test.yml runs on the PR normally; the secret is
+# optional and these expressions fall back to github.token without it.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # Monday 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Pushing under a real PAT is what lets the resulting PR get CI.
+          # Falls back to github.token (no checks — see CI CAVEAT).
+          token: ${{ secrets.CI_AUTOMATION_PAT || github.token }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.11.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Determine current and latest SDK version
+        id: versions
+        run: |
+          CURRENT="$(node -p "require('./packages/happy-cli/package.json').dependencies['@anthropic-ai/claude-agent-sdk'].replace(/^[^0-9]*/, '')")"
+          LATEST="$(npm view @anthropic-ai/claude-agent-sdk version)"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "pinned @anthropic-ai/claude-agent-sdk: $CURRENT (latest on npm: $LATEST)"
+
+      - name: Skip if a bump branch for this version already exists
+        if: steps.versions.outputs.up_to_date == 'false'
+        id: existing
+        run: |
+          BRANCH="chore/bump-claude-agent-sdk-${{ steps.versions.outputs.latest }}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump dependency and lockfile
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const path = 'packages/happy-cli/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.dependencies['@anthropic-ai/claude-agent-sdk'] = '^${{ steps.versions.outputs.latest }}';
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+          # Plain 'install' (not 'update') so only this dependency's resolved
+          # version moves — 'pnpm update' re-resolves the whole workspace and
+          # drags in unrelated bumps (observed while preparing buzzni/happy#455).
+          pnpm install --no-frozen-lockfile --filter @buzzni/happy-cli...
+
+      - name: Bump happy-cli release version
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        id: bump_version
+        run: |
+          NEW_VERSION="$(node -e "
+            const fs = require('node:fs');
+            const path = 'packages/happy-cli/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const match = pkg.version.match(/^(.*-aplus\.)(\d+)$/);
+            if (!match) throw new Error('unexpected version format: ' + pkg.version);
+            const next = match[1] + (parseInt(match[2], 10) + 1);
+            pkg.version = next;
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            process.stdout.write(next);
+          ")"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      # These three stand in for cli-smoke-test.yml, which will not run on the
+      # PR this job opens (see CI CAVEAT). Without them the PR would carry no
+      # verification at all, and a reviewer has nothing to check but a diff.
+      - name: Build happy-cli (typecheck + bundle)
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: pnpm --filter @buzzni/happy-cli run build
+
+      # Packing must happen BEFORE the unit suite. src/commands/browser.test.ts's
+      # resolveExtensionDir block has an afterEach that rmSync's the real
+      # packages/happy-cli/browser-extension build output, so after vitest runs,
+      # prepare-publish-package.cjs dies with "Required publish input is
+      # missing" — a packaging failure that has nothing to do with the bump.
+      - name: Guard the publish artifact
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: |
+          node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"
+          node packages/happy-cli/scripts/guard-publish-artifact.cjs "$RUNNER_TEMP/happy-cli-publish"
+
+      - name: Run happy-cli unit tests
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        run: pnpm --filter @buzzni/happy-cli exec vitest run --project unit
+
+      - name: Commit, push, and open PR
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.CI_AUTOMATION_PAT || github.token }}
+          BRANCH: ${{ steps.existing.outputs.branch }}
+          NEW_VERSION: ${{ steps.bump_version.outputs.new_version }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          CURRENT: ${{ steps.versions.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > /tmp/commit-message.txt <<EOF
+          fix(cli): bump claude-agent-sdk $CURRENT -> $LATEST
+
+          Bundled Claude Code binary moves to whatever manifest.json inside
+          @anthropic-ai/claude-agent-sdk@$LATEST declares. Verify that version
+          before merging (unzip the installed package or check npm) and confirm
+          it still satisfies whatever minimum the Anthropic API is enforcing.
+
+          happy-cli: $NEW_VERSION
+          EOF
+
+          cat > /tmp/pr-body.md <<EOF
+          Automated weekly check found a newer \`@anthropic-ai/claude-agent-sdk\` on npm.
+
+          - Current pin: \`$CURRENT\`
+          - Latest on npm: \`$LATEST\`
+          - happy-cli version bumped to: \`$NEW_VERSION\`
+
+          This only bumps the dependency, lockfile, and happy-cli's own version —
+          it does not merge, tag, or publish. That follows docs/happy-cli-release.md:
+          every external release mutation needs explicit human approval right before
+          it happens.
+
+          **This PR is a draft, and the check list on it is probably empty.**
+          GitHub does not start workflow runs for events raised with the default
+          \`GITHUB_TOKEN\`, so unless the \`CI_AUTOMATION_PAT\` secret is configured,
+          \`cli-smoke-test.yml\` did not fire here — and marking the draft ready will
+          not fire it either (\`ready_for_review\` is not in the default
+          \`pull_request\` type set). An empty check list means "not run", not "passed".
+
+          Instead, the job that opened this PR ran the equivalent checks itself and
+          only opened it because they passed — build (typecheck + bundle), the
+          happy-cli unit suite, and \`guard-publish-artifact.cjs\`. The run log is the
+          evidence: $RUN_URL
+
+          Before marking ready / merging:
+          - [ ] Read the run log above, or re-run \`cli-smoke-test.yml\` on this branch via workflow_dispatch for checks on all three platforms (this job only covers Linux).
+          - [ ] Spot-check the new SDK version's bundled Claude Code binary version (its \`manifest.json\`) didn't jump in a way that suggests a breaking change.
+          - [ ] After merging, follow docs/happy-cli-release.md to tag + publish, then update aplus-dev-studio-desktop's \`config/happy-runtime-pin.json\` (that repo has its own weekly check for this, see \`.github/workflows/check-happy-cli-update.yml\`).
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add packages/happy-cli/package.json pnpm-lock.yaml
+          git commit -F /tmp/commit-message.txt
+          git push origin "$BRANCH"
+
+          # Draft: under github.token this PR carries no checks at all, and a
+          # draft cannot be merged without a deliberate "ready for review".
+          gh pr create --repo buzzni/happy --base main --head "$BRANCH" \
+            --draft \
+            --title "fix(cli): bump claude-agent-sdk $CURRENT -> $LATEST" \
+            --body-file /tmp/pr-body.md
+
+      - name: Open tracking issue if the bump failed
+        # Not keyed on steps.versions outputs: the version lookup is the most
+        # network-fragile step, and if IT fails those outputs are empty, which
+        # would silence this fallback exactly when it is needed.
+        if: failure() && steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CI_AUTOMATION_PAT || github.token }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          CURRENT: ${{ steps.versions.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > /tmp/issue-body.md <<EOF
+          The weekly check-claude-sdk-update workflow failed before a PR could be opened — the bump itself, the build, the unit suite, or the publish-artifact guard did not pass.
+
+          Versions at the point of failure (blank if the lookup itself is what failed): latest \`$LATEST\`, current pin \`$CURRENT\`.
+
+          See the failed run: $RUN_URL
+
+          No branch or PR was pushed — bump manually if needed.
+          EOF
+
+          gh issue create --repo buzzni/happy \
+            --title "claude-agent-sdk auto-bump failed${LATEST:+ (target $LATEST)}" \
+            --body-file /tmp/issue-body.md

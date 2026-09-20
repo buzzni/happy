@@ -262,7 +262,13 @@ function runInstallSmoke(tarball, packageJson) {
             '--prefix',
             prefix,
             '--prefer-online'
-        ]);
+        ], {
+            // The CLI's postinstall otherwise installs its companion CLIs into
+            // this very prefix, and assertProductionDependencyClosure below
+            // reads the whole prefix — a third-party package's dependency
+            // hygiene would surface as a Happy artifact failure.
+            env: { ...process.env, HAPPY_SKIP_COMPANION_TOOLS: '1' }
+        });
 
         const installedRoot = path.join(
             prefix,

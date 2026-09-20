@@ -95,21 +95,28 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 type RoomSockets = RemoteSocket<DefaultEventsMap, any>[];
 
 /**
+ * 방 조회 결과. `ok:false` 는 **모른다**는 뜻이다 — 방이 비었다는 뜻이 아니다.
+ * 둘을 같은 값으로 뭉개면 호출부가 모르는 것을 안다고 답하게 된다.
+ */
+type RoomLookup = { ok: boolean; sockets: RoomSockets };
+
+/**
  * fetchSockets(room) wrapped with a caller-specified timeout. Returns `[]`
  * and logs on failure (cluster-adapter request timeout, peer replica
  * unresponsive). Use RPC_LOOKUP_FETCH_TIMEOUT_MS for daemon lookups (initial
  * + grace window) and RPC_PRESENCE_FETCH_TIMEOUT_MS for in-flight presence
  * polling.
  */
-async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup'): Promise<RoomSockets> {
+async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup'): Promise<RoomLookup> {
     try {
-        return await io.in(room)
-            .timeout(timeoutMs)
-            .fetchSockets();
+        return { ok: true, sockets: await io.in(room).timeout(timeoutMs).fetchSockets() };
     } catch (error) {
         rpcFetchSocketsTimeouts.inc({ context });
         log({ module: 'websocket' }, `fetchSockets failed for ${room} (timeout=${timeoutMs}ms): ${error}`);
-        return [];
+        // `[]` 를 돌려주지 않는다. 그러면 호출부가 "조회를 못 했다" 와
+        // "daemon 이 없다" 를 구분할 수 없고, 어댑터가 느릴 뿐인데 daemon 이
+        // 사라졌다고 판단한다 (2026-09-18 운영 장애, 실패율 42%).
+        return { ok: false, sockets: [] };
     }
 }
 
@@ -119,19 +126,22 @@ async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, con
  * reduce stream pressure when Redis is slow — fewer requests in flight
  * means less amplification of the timeout → retry → timeout spiral.
  */
-async function waitForRoomMember(io: Server, room: string, maxMs: number, metricMethod: string): Promise<RoomSockets> {
+async function waitForRoomMember(io: Server, room: string, maxMs: number, metricMethod: string): Promise<RoomLookup> {
     const deadline = Date.now() + maxMs;
     let polls = 0;
+    // 한 번이라도 조회에 성공했는지. 전부 실패했다면 방이 비었는지 알 수 없다.
+    let anyLookupOk = false;
     while (true) {
         const timeoutMs = RPC_LOOKUP_FETCH_TIMEOUTS_MS[Math.min(polls, RPC_LOOKUP_FETCH_TIMEOUTS_MS.length - 1)];
-        const sockets = await fetchRoomSockets(io, room, timeoutMs);
-        if (sockets.length > 0) {
+        const lookup = await fetchRoomSockets(io, room, timeoutMs);
+        anyLookupOk = anyLookupOk || lookup.ok;
+        if (lookup.sockets.length > 0) {
             rpcLookupRetries.observe({ method: metricMethod }, polls);
-            return sockets;
+            return { ok: anyLookupOk, sockets: lookup.sockets };
         }
         if (Date.now() >= deadline) {
             rpcLookupRetries.observe({ method: metricMethod }, polls);
-            return sockets;
+            return { ok: anyLookupOk, sockets: lookup.sockets };
         }
         polls++;
         await sleep(RPC_RECONNECT_POLL_MS);
@@ -233,12 +243,25 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             // unresponsive — fetchRoomSockets logs and returns []) fall
             // through to the wait-for-reconnect grace window.
             const room = rpcRoom(userId, method);
-            let targets = await fetchRoomSockets(io, room, RPC_LOOKUP_FETCH_TIMEOUTS_MS[0]);
+            const first = await fetchRoomSockets(io, room, RPC_LOOKUP_FETCH_TIMEOUTS_MS[0]);
+            let targets = first.sockets;
+            let anyLookupOk = first.ok;
             if (targets.length === 0) {
-                targets = await waitForRoomMember(io, room, RPC_RECONNECT_GRACE_MS, baseMethodName(method));
+                const waited = await waitForRoomMember(io, room, RPC_RECONNECT_GRACE_MS, baseMethodName(method));
+                targets = waited.sockets;
+                anyLookupOk = anyLookupOk || waited.ok;
             }
 
             if (targets.length === 0) {
+                // 조회가 한 번도 성공하지 못했으면 daemon 이 없는지 **모른다**.
+                // 그때 'RPC method not available' 로 답하면 호출부가 오진한다 —
+                // web-ui 는 그 문구로 daemon-upgrade-required /
+                // daemon-bash-not-supported 를 만든다. 사유를 갈라 준다.
+                if (!anyLookupOk) {
+                    finish('lookup_failed');
+                    callback?.({ ok: false, error: 'RPC lookup unavailable' });
+                    return;
+                }
                 finish('not_available');
                 callback?.({ ok: false, error: 'RPC method not available' });
                 return;
@@ -322,7 +345,12 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                     await sleep(RPC_PRESENCE_POLL_MS);
                     if (!presenceAlive) return;
                     const stillThere = await fetchRoomSockets(io, room, RPC_PRESENCE_FETCH_TIMEOUT_MS, 'presence');
-                    if (!stillThere.some(s => s.id === target.id)) {
+                    // 조회 실패는 **끊겼다는 증거가 아니다.** 예전에는 실패가
+                    // `[]` 로 돌아와 miss 로 세였고, 2회 연속이면 정상 동작 중인
+                    // 호출을 끊었다. 오래 걸리는 작업일수록 폴링이 많아 한 번의
+                    // 오탐으로 죽는다 (2026-09-18 운영 장애).
+                    if (!stillThere.ok) continue;
+                    if (!stillThere.sockets.some(s => s.id === target.id)) {
                         consecutiveMisses++;
                         if (consecutiveMisses >= 2) {
                             throw new Error('RPC target disconnected');

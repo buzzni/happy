@@ -45,8 +45,24 @@ describe('session protocol schemas', () => {
       },
       { t: 'turn-start' },
       { t: 'start', title: 'Research agent' },
-      { t: 'turn-end', status: 'completed' },
-      { t: 'stop' },
+            { t: 'turn-end', status: 'completed' },
+            { t: 'stop' },
+            {
+                t: 'difficulty-routing',
+                result: {
+                    version: 1,
+                    clientRequestId: 'client-1',
+                    mode: 'auto',
+                    policyVersion: 'org-shared-difficulty-routing.v1',
+                    policyRevision: 3,
+                    model: 'claude-opus-5',
+                    effort: 'high',
+                    difficulty: 'hard',
+                    classifierSource: 'p2-org-shared',
+                    remoteStatus: 'ok',
+                    classifierRevision: 'hf-commit',
+                },
+            },
     ];
 
     for (const event of events) {
@@ -102,6 +118,51 @@ describe('session protocol schemas', () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+
+  it('accepts difficulty-routing as a session-owned event', () => {
+    const parsed = sessionEnvelopeSchema.safeParse({
+      id: 'difficulty-routing-1',
+      time: 1234,
+      role: 'session',
+      ev: {
+        t: 'difficulty-routing',
+        result: {
+          version: 1,
+          clientRequestId: 'client-1',
+          mode: 'auto',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: null,
+          model: 'gpt-5.6-terra',
+          effort: 'high',
+          difficulty: 'routine',
+          classifierSource: 'fallback-p1',
+          remoteStatus: 'not-ready',
+        },
+      },
+    });
+
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects difficulty-routing from user or agent roles', () => {
+    const event = {
+      t: 'difficulty-routing',
+      result: {
+        version: 1,
+        clientRequestId: 'client-1',
+        mode: 'auto',
+        policyVersion: 'org-shared-difficulty-routing.v1',
+        policyRevision: 1,
+        model: 'claude-opus-5',
+        effort: 'high',
+        difficulty: 'hard',
+        classifierSource: 'p1-local',
+      },
+    };
+
+    expect(sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev: event }).success).toBe(false);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'u', time: 1, role: 'user', ev: event }).success).toBe(false);
   });
 
   it('rejects start from non-agent role', () => {

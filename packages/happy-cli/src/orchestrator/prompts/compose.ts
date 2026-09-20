@@ -6,8 +6,8 @@
  *
  * - L1 (base): inlined `BASE_PROMPT`, injected into the subprocess via
  *   `--append-system-prompt` (idempotent — see `integrate.ts`).
- * - L2 (step guide): one of `STEP_PLAN`/`STEP_DESIGN`/`STEP_WORK`, injected
- *   each turn.
+ * - L2 (step guide): one of `STEP_PLAN`/`STEP_DESIGN`/`STEP_WORK`/`STEP_FREE`,
+ *   injected each turn.
  * - L3 (dynamic context): a JSON state summary plus references to step-related
  *   md files. File bodies are intentionally not embedded every turn; the agent
  *   can read them from disk when the current task needs them.
