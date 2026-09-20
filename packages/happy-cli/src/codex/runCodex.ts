@@ -86,6 +86,11 @@ import {
     resolveSaycodeAppendSystemPromptForMessage,
 } from '@/prompt/promptProvenance';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
+import type { LessonReviewWorker } from '@/memory/lessonReviewWorker';
+import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
+import type { LessonTurnKind } from '@/memory/lessonTurnEvidence';
+import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
+import type { LessonTurnHost } from '@/memory/lessonTurnHost';
 import {
     buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
@@ -159,6 +164,20 @@ export async function runCodex(opts: {
     noSandbox?: boolean;
     resumeThreadId?: string;
     permissionMode?: PermissionMode;
+    /**
+     * Project lesson recall and background review for this session.
+     *
+     * Supplied by the daemon when it has an open store and an authenticated
+     * identity for the project. Omitted for a managed run, for an install
+     * without CML, and whenever the studio has no lesson host — and when it is
+     * omitted the turn loop behaves exactly as it did before.
+     */
+    lessons?: {
+        turn: LessonTurnHost | null;
+        review: LessonReviewWorker | null;
+        /** Decided by the daemon's markers, not guessed per message. */
+        sessionKind: LessonTurnKind;
+    };
 }): Promise<void> {
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
@@ -726,6 +745,56 @@ export async function runCodex(opts: {
 
     // AbortController is used ONLY to wake messageQueue.waitForMessages when idle.
     // Turn cancellation uses client.interruptTurn() — no AbortController hack needed.
+    /*
+     * The lesson host for this session.
+     *
+     * Absent unless the daemon supplied one: a managed run has no account
+     * bearer and therefore no grant, an install without CML has no store, and
+     * both cases leave these null and the turn loop untouched.
+     */
+    /*
+     * Built here, in the process that runs the turns.
+     *
+     * The daemon's supervisor lives in another process, so this session opens
+     * its own — from the project id the daemon wrote into the spawn context
+     * and a workspace the studio signs. `opts.lessons` stays injectable for
+     * tests; production takes this path.
+     *
+     * Every failure resolves to null and the turn loop then behaves exactly as
+     * it did before lessons existed.
+     */
+    const lessonSession = opts.lessons
+        ? null
+        : createLazyLessonSessionHost({
+            accountToken,
+            machineId: opts.principal?.kind === 'account' ? (machineId ?? null) : null,
+            sessionId: session.sessionId,
+            happyHomeDir: configuration.happyHomeDir,
+        });
+    const lessonTurn = opts.lessons?.turn ?? lessonSession?.turn ?? null;
+    const lessonReview = opts.lessons?.review ?? lessonSession?.review ?? null;
+    // Unknown means automation: a session this host cannot classify must not
+    // be allowed to teach the project.
+    const lessonSessionKind = opts.lessons?.sessionKind ?? lessonSession?.sessionKind ?? 'automation';
+    /*
+     * What this host watched each turn do. Fed from the provider's own
+     * command events; a turn with nothing observed produces no candidate
+     * rather than a procedure assembled from the question alone.
+     */
+    const codexTurnObservations = createLessonTurnObservations();
+    /** Distinguishes turns within this session; also tells the first one apart. */
+    let codexTurnCounter = 0;
+    /**
+     * One id per accepted user input, created once and shared by recall, the
+     * acknowledgement and the evidence.
+     *
+     * Not `sessionId:counter`: a counter restarts at zero on resume, so a
+     * resumed session reuses ids CML has already persisted — the same request
+     * id with a different query is a conflict, and with the same query it
+     * returns a stale cached answer.
+     */
+    let codexTurnId = '';
+
     let abortController = new AbortController();
     let shouldExit = false;
 
@@ -1147,7 +1216,26 @@ export async function runCodex(opts: {
             messageBuffer.addMessage(`[Thinking] ${(msg as any).text.substring(0, 100)}...`, 'system');
         } else if (msg.type === 'exec_command_begin') {
             messageBuffer.addMessage(`Executing: ${(msg as any).command}`, 'tool');
+            codexTurnObservations.commandStarted({
+                callId: (msg as any).call_id ?? (msg as any).callId,
+                command: (msg as any).command,
+                cwd: (msg as any).cwd,
+            });
         } else if (msg.type === 'exec_command_end') {
+            /*
+             * The provider's own exit status, classified there rather than
+             * here. `exit_code` is `item.exitCode ?? null`, so an unknown
+             * exit must not read as a success — a cancelled or declined
+             * command verifies nothing.
+             */
+            codexTurnObservations.commandEnded({
+                callId: (msg as any).call_id ?? (msg as any).callId,
+                command: (msg as any).command,
+                cwd: (msg as any).cwd,
+                exitCode: (msg as any).exit_code,
+                status: (msg as any).status,
+                output: (msg as any).output ?? (msg as any).error,
+            });
             const output = (msg as any).output || (msg as any).error || 'Command completed';
             const truncatedOutput = output.substring(0, 200);
             messageBuffer.addMessage(
@@ -1663,11 +1751,27 @@ export async function runCodex(opts: {
                     });
                     continue;
                 }
+                /*
+                 * Lessons are recalled here, immediately before the input is
+                 * assembled, and on a bounded budget: a slow or unreachable
+                 * memory service costs this turn nothing. `abortController` is
+                 * the loop's own idle wait, so a newly arrived message
+                 * preempts the lookup rather than delaying the turn.
+                 */
+                codexTurnId = `${session.sessionId}:${randomUUID()}`;
+                const lessonRecall = lessonTurn
+                    ? await lessonTurn.recall({
+                        turnId: codexTurnId,
+                        query: message.message,
+                        signal: abortController.signal,
+                    })
+                    : null;
                 const turnPrompt = buildCodexTurnPrompt({
                     message: message.message,
                     mode: message.mode,
                     includeAppendSystemPrompt,
                     hasTitle: session.hasTitle(),
+                    ...(lessonRecall?.outcome === 'selected' ? { lessonBlock: lessonRecall.block } : {}),
                 });
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
@@ -1687,6 +1791,50 @@ export async function runCodex(opts: {
                     // UI handling already done by the event handler (turn_aborted).
                     logger.debug('[Codex] Turn aborted');
                 }
+
+                if (lessonTurn && lessonRecall?.outcome === 'selected' && !result.aborted) {
+                    /*
+                     * The acknowledgement, and only now. `sendTurnAndWait`
+                     * resolving without an abort is the first point at which
+                     * the provider is known to have taken this input —
+                     * assembling the prompt was not, and neither was sending
+                     * it. Recording delivery earlier would claim a delivery
+                     * that an abort could still have prevented.
+                     *
+                     * Its own catch: a memory failure must not fall into the
+                     * turn's error handler, which closes the turn as aborted
+                     * and writes a failure into the transcript.
+                     */
+                    await lessonTurn.acknowledge(lessonRecall.ticket).catch(() => false);
+                }
+                if (lessonReview && !result.aborted) {
+                    const observed = codexTurnObservations.take();
+                    /*
+                     * A normally-ended turn, with what this host actually saw
+                     * of it. The worker refuses on its own if review is off,
+                     * unfunded or unpriced, and refuses again if nothing was
+                     * observed. Not awaited: the conversation must not wait on
+                     * a background review, and the same abort signal stops it
+                     * the moment the user speaks again.
+                     */
+                    void lessonReview.reviewFinishedTurn({
+                        record: {
+                            sessionId: session.sessionId,
+                            turnId: codexTurnId,
+                            // The real kind of this turn. Hard-coding
+                            // `foreground` would let automation and review
+                            // turns teach the project.
+                            kind: lessonSessionKind,
+                            endedNormally: true,
+                            hadPriorAssistantTurn: codexTurnCounter > 0,
+                            userMessages: [message.message],
+                            agentSummary: observed.summary,
+                            recoveredFailures: observed.recoveredFailures,
+                        },
+                        signal: abortController.signal,
+                    }).catch(() => undefined);
+                }
+                codexTurnCounter += 1;
             } catch (error) {
                 // Only actual errors reach here (process crash, connection failure, etc.)
                 // No task_complete/turn_aborted was ever received for this turn, so the
@@ -1784,6 +1932,9 @@ export async function runCodex(opts: {
         }
         logger.debug('[codex]: client.disconnect begin');
         await client.disconnect();
+        // Closes the project store this session opened. Its own catch: memory
+        // cleanup must not be the thing that fails a shutdown.
+        await lessonSession?.close().catch(() => undefined);
         await checkpointComposition.dispose?.();
         logger.debug('[codex]: client.disconnect done');
         // Stop Happy MCP server

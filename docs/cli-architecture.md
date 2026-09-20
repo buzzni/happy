@@ -450,3 +450,154 @@ requests as confidently trivial; Desktop's legacy OFF policy is unchanged.
 Independent synthetic evaluation found a small routing recall improvement, not
 95% P2 acceptance. Revisit the threshold only with separate development data and
 a fresh frozen evaluation; do not retune against the recorded test.
+
+## Project lesson host
+
+A session can be shown procedures verified in earlier work on the same
+project, and can propose new ones for a person to approve. The code lives in
+`packages/happy-cli/src/memory/`.
+
+### Where authority comes from
+
+Nothing in this CLI decides who a caller is. Three credentials already exist
+and each answers a different question; the host uses them and adds one.
+
+| Question | Answered by |
+| --- | --- |
+| Which account is this? | The account bearer (`Credentials.token`) |
+| Does that account own this machine? | happy-server, when the machine socket connects |
+| Does this session belong to this project? | The MCP caller-grant envelope, consumed at spawn |
+| **Did a person just approve this lesson, and which directory may be opened for it?** | **The studio's lesson grant** |
+
+The last one is new because the others cannot answer it. The caller grant binds
+`{machineId, projectId, iat, exp}` and is spent when a session starts — it says
+a session belongs to a project, never that somebody approved anything, and it
+does not name a directory at all. A host that derived the workspace from the
+spawn would let a valid grant for one project open another project's store.
+
+So the studio signs `workspaceDir` off the authorized project row, along with
+the operation and a digest of the exact request. `lessonGrantVerifier.ts`
+checks it with the public half only: a compromised host can check a grant and
+can never mint one.
+
+### Bindings are handles, not data
+
+CML calls a host-supplied `verifyBinding` at every entry and again before each
+write. `lessonBindingIssuer.ts` is the only thing that can satisfy it: `issue`
+returns an opaque handle and keeps the real binding in a `WeakMap`, so an
+object merely *shaped* like a binding has no entry and is refused.
+
+Freshness is re-read on every resolution — release, expiry, whether the runtime
+closed, and the generation, which is the durable settings revision. That last
+one is what makes a settings change anywhere on the machine stop work already
+in flight.
+
+### The two call paths
+
+```
+Desktop UI ──(signed grant)──► machine RPC 'lesson-host-v1'
+                                   apiMachine.ts → lessonHostSupervisor
+                                       → lessonHostRuntime → CML
+
+provider process (runCodex / claudeRemote)
+    createLazyLessonSessionHost  → its own supervisor, same signed-grant rule
+        recall  → before the turn's input is assembled
+        ack     → only once the provider accepted that input
+        review  → after a turn ends normally
+```
+
+The daemon and the provider are different processes, so the provider builds its
+own supervisor rather than reaching into the daemon's. It is allowed to because
+everything it uses is already trusted there: the project id comes from
+`HAPPY_CHECKPOINT_SPAWN_CONTEXT`, which the daemon writes and strips from
+caller-supplied environment, and the workspace still comes from a signature.
+
+Both share one state root. The daemon passes `HAPPY_LESSON_DAEMON_HOME`, and a
+session on a different root reports the host unsupported — its settings file
+and spending ledger would otherwise be a second, private copy.
+
+### Selected is not delivered
+
+`recall` produces a `selected` trace. The acknowledgement is sent only once the
+provider has taken the input: for Codex that is `sendTurnAndWait` resolving
+without an abort, for Claude the first assistant event of that turn. Pushing a
+message onto the SDK queue is not acceptance, and acknowledging there would
+record a delivery an abort could still have prevented.
+
+The whole set of selected lessons is injected or none of it is. CML matches the
+acknowledged list against its own trace exactly, so delivering a prefix while
+acknowledging the full set would record a delivery that did not happen.
+
+### Spending
+
+The review worker refuses before it costs anything unless all of: review is
+enabled, a resolved gateway config and a settled price both exist, the ledger
+can reserve, and this host actually observed what the turn did. Observations
+come from the provider's own command and tool events — a numeric exit `0`
+verifies a success, a numeric non-zero verifies a failure, and `null` or a
+cancelled status verifies neither.
+
+A candidate is never a lesson. The worker holds `lesson.review` and can only
+move a proposal to `reviewed`; `lesson.manage`, which accepts one, is carried
+solely by a grant minted for a person's click.
+
+### One injector per launch
+
+CML's own hooks inject lessons too. They stand down when a launch carries
+`CLAUDE_MEMORY_LESSON_OWNER=host`, which `lessonOwnerMarker.ts` decides and the
+daemon writes into one child's environment — never into user settings.
+
+The decision is made once per provider launch and fixed for that process,
+because the host boots lazily: a marker that tracked readiness would silence
+the native hook halfway through a session, or let both inject across the
+switch.
+
+Claiming requires three things, and the third is the one worth stating:
+
+1. an eligible launch (not managed, authoritative project, configured studio);
+2. an installed CML that states `LESSON_HOST_CAPABILITIES = { version: 1,
+   nativeLessonOwnerMarker: true }` — an older build injects regardless;
+3. a host that could actually be opened for the project, proved by opening it.
+
+Without 3 a marker set on the strength of 1 and 2 leaves a session with *no*
+lessons whenever the host then fails to authenticate — worse than injecting
+twice, and much harder to notice. Any failure leaves the native hook in charge.
+
+The session host honours the same decision from the other side: launched
+without the marker, it does not inject at all.
+
+Point 3 is the daemon's own proof: it opens the project with the daemon's
+credential. That says nothing about a child staged with another user's
+`access.key`, which asks the studio as that user and can be refused — in a
+session whose marker had already silenced the native hook. So a launch whose
+caller token names a different account than the daemon's stays native and CML
+keeps recalling as it always has. A re-issued token for the *same* account is
+the same identity, and so is a relocated `HAPPY_HOME_DIR`: the home moves, the
+account does not.
+
+Both the fresh spawn and the resume go through `lessonLaunchEnvironment.ts`,
+and they have to. A resume rebuilds its environment and then runs the same
+caller sanitizer, which strips every `HAPPY_LESSON_`/`CLAUDE_MEMORY_` key so a
+caller cannot forge one — the daemon's own state root and marker included.
+Re-establishing them after that strip is what keeps a resumed session's host
+alive, and writing the marker explicitly (`native` as well as `host`) is what
+stops one inherited from the daemon's environment deciding for it.
+
+The lazy bootstrap is deliberately unbudgeted. `createLessonSessionHost` gives
+up at a deadline for a caller that needs an answer before it can continue;
+wrapping that in the lazy path would mean one slow studio call left a whole
+session without lessons for good. Nothing waits on it, so a host that arrives
+late simply serves the next turn, and `close()` never waits on a bootstrap
+that may be stuck on the same studio it is shutting down because of.
+
+### What is not wired
+
+- **Managed runtimes have no lesson host.** They hold no account credential.
+  The run credential they do hold is a happy-server session-scoped token, and
+  the studio has no verifier for it — so "I am run X" and "run X acts for user
+  Y" cannot be joined. Accepting a run id from an account bearer instead would
+  let any account inherit any run's actor. The operations runbook states the
+  two ways to close it.
+
+Operator-facing configuration, rollout and rollback live in the studio
+repository (`aplus-dev-studio`) under `docs/runbooks/lesson-host-operations.md`.

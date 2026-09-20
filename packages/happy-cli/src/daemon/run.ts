@@ -175,6 +175,15 @@ import { teardownManagedRuntime as runManagedTeardown } from './managedTeardown'
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
+import { createLessonHostSupervisor } from '@/memory/lessonHostSupervisor';
+import { applyLessonLaunchEnvironment } from '@/memory/lessonLaunchEnvironment';
+import {
+  createLessonReviewOutcomeStore,
+  lessonReviewOutcomePath,
+  lessonSettingsPath,
+} from '@/memory/lessonSettingsStore';
+import { createLessonGrantVerifier, lessonGrantAudience, type LessonGrantVerifier } from '@/memory/lessonGrantVerifier';
+import { fetchLessonGrantPublicKey, requestLessonSnapshotGrant } from '@/memory/lessonHostRuntime';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import {
   decideAutomationAwareHandoff,
@@ -1845,6 +1854,46 @@ export async function startDaemon(): Promise<void> {
             errorMessage
           };
         }
+        /*
+         * The state root and who injects lessons, in one place shared with the
+         * resume path so the two cannot drift.
+         *
+         * Settings, the spending ledger and the review outcome live under the
+         * daemon's home, so a session whose own `HAPPY_HOME_DIR` was relocated
+         * for another user's credentials must still read them there.
+         *
+         * Ownership is decided now and fixed for the child's lifetime: the
+         * host boots lazily, so "ready" moves during a session, and a marker
+         * that followed it would either silence CML's native hook halfway
+         * through or let both inject across the switch.
+         */
+        const lessonLaunch = await applyLessonLaunchEnvironment({
+          environment: extraEnv,
+          // The credential the child will actually authenticate with.
+          callerToken: options.happyToken,
+          daemonToken: credentials.token,
+          daemonHomeDir: configuration.happyHomeDir,
+          projectId: hasAuthoritativeProjectBinding ? mcpConfigProjectId : null,
+          eligible: Boolean(
+            // A managed runtime loads no settings sources, so there is no
+            // native hook to stand down and no account credential to be a
+            // host with.
+            managedIdentity.status !== 'active'
+            && lessonStudioOrigin
+            && machineId,
+          ),
+          /*
+           * Proof, not a prediction: the supervisor opens the project through
+           * the same signed grant a turn would. A `null` here means the studio
+           * refused, the key is missing or the store will not open — all of
+           * which keep supported launches behind the host policy gate.
+           */
+          hostIsReady: async () => Boolean(
+            mcpConfigProjectId && await lessonHosts.ensureOpen(mcpConfigProjectId),
+          ),
+        });
+        logger.debug(`[lesson-host] owner=${lessonLaunch.decision.owner} (${lessonLaunch.decision.reason})`);
+        extraEnv = lessonLaunch.environment;
         extraEnv = injectCheckpointSpawnContext(extraEnv, mcpConfigProjectId && hasAuthoritativeProjectBinding
           ? {
             projectId: mcpConfigProjectId,
@@ -1852,7 +1901,6 @@ export async function startDaemon(): Promise<void> {
             checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
           }
           : undefined);
-
         // Managed credentials are already validated by the credential runtime.
         // Overlay them only after caller variable expansion so secret text such
         // as `${...}` is never interpreted as a daemon environment reference.
@@ -2578,8 +2626,33 @@ export async function startDaemon(): Promise<void> {
         }
         const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
           ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
+        /*
+         * Lesson wiring, re-established for the resumed child.
+         *
+         * `prepareMcpChildEnvironment` above strips every `HAPPY_LESSON_` and
+         * `CLAUDE_MEMORY_` key, because a caller must not be able to forge
+         * them — and that strip takes the daemon's own two with it. Without
+         * this the first resume of any session lost its state root and its
+         * owner marker, so the host went quiet and an inherited marker decided
+         * who injects. Same helper as the fresh spawn, so the two agree.
+         */
+        const resumeLessonLaunch = await applyLessonLaunchEnvironment({
+          environment: mcpEnvironment.environmentVariables,
+          // What the resumed child will actually authenticate with, which the
+          // credential decision above already resolved and verified.
+          callerToken: credentialDecision.token,
+          daemonToken: credentials.token,
+          daemonHomeDir: configuration.happyHomeDir,
+          projectId: authoritativeCheckpointProjectId ?? null,
+          eligible: Boolean(process.env.HAPPY_APLUS_MCP_CONFIG_URL && machineId),
+          hostIsReady: async () => Boolean(
+            authoritativeCheckpointProjectId
+            && await lessonHosts.ensureOpen(authoritativeCheckpointProjectId),
+          ),
+        });
+        logger.debug(`[lesson-host] resume owner=${resumeLessonLaunch.decision.owner} (${resumeLessonLaunch.decision.reason})`);
         const resumedEnvironment = applyAppliedAiAuthSourceEnv(injectCheckpointSpawnContext(
-          mcpEnvironment.environmentVariables,
+          resumeLessonLaunch.environment,
           authoritativeCheckpointProjectId
             ? {
               projectId: authoritativeCheckpointProjectId,
@@ -3870,6 +3943,68 @@ export async function startDaemon(): Promise<void> {
         keyVersion,
       );
     }, scriptWorker ? SCRIPT_AUTOMATION_PROTOCOL_VERSION : AUTOMATION_PROTOCOL_VERSION);
+    /*
+     * The lesson host. The studio origin is the daemon's own configured value
+     * — the same one the MCP config uses — never anything from a request, and
+     * the bearer is this daemon's account credential. Absent either, the
+     * supervisor still answers, and it answers `disabled`.
+     */
+    /*
+     * One verifier for routing, built from the studio key this daemon fetched.
+     * Null until that key is available, and a null verifier refuses every
+     * lesson request rather than routing it on an unverified body.
+     */
+    let lessonRouteVerifier: LessonGrantVerifier | null = null;
+    const lessonStudioOrigin = (() => {
+      const configured = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+      if (!configured) return null;
+      try { return new URL(configured).origin; } catch { return null; }
+    })();
+    if (lessonStudioOrigin && machineId) {
+      const lessonPublicKey = await fetchLessonGrantPublicKey({
+        studioBaseUrl: lessonStudioOrigin,
+        token: credentials.token,
+        machineId,
+      });
+      if (lessonPublicKey) {
+        try {
+          lessonRouteVerifier = createLessonGrantVerifier({
+            publicKeyBase64: lessonPublicKey,
+            machineId,
+            audience: lessonGrantAudience(lessonStudioOrigin),
+          });
+        } catch (error) {
+          logger.debug(`[lesson-host] routing key unusable: ${(error as Error).message}`);
+        }
+      }
+    }
+    const lessonHosts = createLessonHostSupervisor({
+      /*
+       * Routing reads the signed `workspaceDir` out of the envelope. The
+       * daemon deliberately does *not* supply a directory of its own: the MCP
+       * caller grant it consumes at spawn signs a project and a machine but
+       * never a path, so deriving the workspace from a spawn would let a valid
+       * grant for one project open another project's store.
+       */
+      routeVerifier: () => lessonRouteVerifier,
+      // Lets a turn or a review open a project nobody has clicked into yet.
+      // The studio still decides, and still signs the path.
+      requestSnapshotGrant: (projectId) => (lessonStudioOrigin && machineId
+        ? requestLessonSnapshotGrant({
+          studioBaseUrl: lessonStudioOrigin, token: credentials.token, machineId, projectId,
+        })
+        : Promise.resolve(null)),
+      machineId: () => machineId,
+      studioBaseUrl: () => lessonStudioOrigin,
+      studioToken: () => credentials.token,
+      // The shared helper, so the daemon and every session name the same file.
+      settingsPathFor: (projectId) => lessonSettingsPath(configuration.happyHomeDir, projectId),
+      // The worker writes this from the provider process; the UI reads it here.
+      reviewOutcomeFor: (projectId) => createLessonReviewOutcomeStore(
+        lessonReviewOutcomePath(configuration.happyHomeDir, projectId),
+      ).read(),
+    });
+    await apiMachine.setLessonHosts(lessonHosts);
     apiMachine.setServerAutomationCache(serverAutomationCache);
     const serverAutomationTickRunner = createAutomationTickRunner({
       runTick: () => runServerAutomationTick({
@@ -4501,6 +4636,11 @@ export async function startDaemon(): Promise<void> {
       claudeSwapSupervisor.shutdown();
       scriptAutomationTickRunner.pause();
       await stopScriptWorker();
+      // Closes every open project store. Flips its own closed flag first, so a
+      // binding in flight stops resolving before the database goes away.
+      await lessonHosts.close().catch((error) => logger.debug(
+        `[lesson-host] shutdown: ${(error as Error).message}`,
+      ));
 
       // Update daemon state before shutting down
       await apiMachine.updateDaemonState((state: DaemonState | null) => ({

@@ -204,6 +204,8 @@ import {
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
 import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
+import { LESSON_HOST_RPC_METHOD } from '@/memory/lessonHostRuntime';
+import type { LessonHostSupervisor } from '@/memory/lessonHostSupervisor';
 import type { ServerAutomationCache } from '@/daemon/automations/serverAutomationCache';
 import { syncServerAutomationDeltas } from '@/daemon/automations/serverAutomationSync';
 import type { ServerAutomationTransport } from '@/daemon/automations/serverAutomationExecutor';
@@ -654,6 +656,8 @@ export class ApiMachineClient {
     private autonomousQualityGateRpcAvailable = false;
     private lastKnownAutonomousQualityGateRpcAvailable: boolean | null = null;
     private automationKey: MachineAutomationKey | null = null;
+    /** Set once the daemon can resolve projects to workspaces. */
+    private lessonHosts: LessonHostSupervisor | null = null;
     private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
@@ -1586,6 +1590,23 @@ export class ApiMachineClient {
             });
         });
 
+        /*
+         * Lesson host. The desktop sends `{ ...request, grantEnvelope }`; the
+         * envelope is the only authority in it, and everything else is echoed
+         * data this daemon re-derives or refuses.
+         *
+         * Registered unconditionally so the desktop always gets a typed answer.
+         * Before the daemon has resolved a workspace and a studio key there is
+         * no runtime, and `unsupported` is the truthful reply — a missing
+         * handler would instead surface as "RPC method not available", which
+         * reads as a broken daemon rather than a feature that is not set up.
+         */
+        this.rpcHandlerManager.registerHandler(LESSON_HOST_RPC_METHOD, async (params: any) => {
+            const hosts = this.lessonHosts;
+            if (!hosts) return { ok: false, reason: 'unsupported' };
+            return hosts.handle(params);
+        });
+
         // Register stop daemon handler
         this.rpcHandlerManager.registerHandler('stop-daemon', () => {
             logger.debug('[API MACHINE] Received stop-daemon RPC request');
@@ -2085,6 +2106,21 @@ export class ApiMachineClient {
             logger.debug(`[API MACHINE] preview-runtime-lease internal error: ${message}`);
             ack({ type: 'error', code: 'EVIDENCE_UNAVAILABLE', message });
         }
+    }
+
+    /**
+     * Binds the lesson hosts for this daemon.
+     *
+     * Late-bound because resolving a project to a workspace needs the
+     * authoritative bindings the daemon accumulates as sessions start, and the
+     * studio key needs credentials this client does not own. Replacing an
+     * existing supervisor closes it, so a re-bind cannot leave a second store
+     * open on the same project.
+     */
+    async setLessonHosts(hosts: LessonHostSupervisor | null): Promise<void> {
+        const previous = this.lessonHosts;
+        this.lessonHosts = hosts;
+        if (previous && previous !== hosts) await previous.close();
     }
 
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
