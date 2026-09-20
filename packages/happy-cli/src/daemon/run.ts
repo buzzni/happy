@@ -1885,7 +1885,7 @@ export async function startDaemon(): Promise<void> {
            * Proof, not a prediction: the supervisor opens the project through
            * the same signed grant a turn would. A `null` here means the studio
            * refused, the key is missing or the store will not open — all of
-           * which must leave the native hook in charge.
+           * which keep supported launches behind the host policy gate.
            */
           hostIsReady: async () => Boolean(
             mcpConfigProjectId && await lessonHosts.ensureOpen(mcpConfigProjectId),

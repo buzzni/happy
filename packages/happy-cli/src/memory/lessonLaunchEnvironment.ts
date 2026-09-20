@@ -63,15 +63,10 @@ export async function applyLessonLaunchEnvironment(
     input: LessonLaunchInput,
 ): Promise<{ environment: Record<string, string>; decision: LessonOwnerDecision }> {
     const decision = await decideLessonOwner({
-        /*
-         * A different account is not covered by this proof. The child would be
-         * refused its own grant, in a session whose marker had already told
-         * CML's hook to stand down — no lessons at all, which is worse and far
-         * quieter than the duplicate injection the marker prevents.
-         */
-        eligible: input.eligible
-            && Boolean(input.projectId)
-            && lessonCallerSharesIdentity(input.callerToken, input.daemonToken),
+        // Project control and caller support are separate: an unsupported
+        // caller must not escape the host policy boundary through native hooks.
+        eligible: input.eligible && Boolean(input.projectId),
+        callerSupported: lessonCallerSharesIdentity(input.callerToken, input.daemonToken),
         hostIsReady: async () => Boolean(input.projectId) && input.hostIsReady(),
         load: input.load,
     });

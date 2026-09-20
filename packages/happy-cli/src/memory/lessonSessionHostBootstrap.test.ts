@@ -83,10 +83,21 @@ describe('lesson session bootstrap', () => {
 });
 
 describe('single lesson owner', () => {
+    it('does not authenticate or review an explicitly disabled staged caller', async () => {
+        const fetchImpl = vi.fn();
+        (globalThis as { fetch: typeof fetch }).fetch = fetchImpl as unknown as typeof fetch;
+        expect(await createLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap',
+            env: env({ HAPPY_LESSON_HOST_DISABLED: 'unsupported-caller' }),
+        })).toBeNull();
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
     it('does not inject when the launch left injection to the native hook', async () => {
         /*
          * The daemon decided `native` for this launch — because CML is too old
-         * to stand down, or because no host could be opened. A host that
+         * to stand down. A host that
          * injected anyway would put the same lessons in twice.
          */
         const fetchImpl = vi.fn();

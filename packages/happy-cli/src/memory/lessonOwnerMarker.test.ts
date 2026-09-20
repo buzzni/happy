@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
     LESSON_OWNER_ENV,
+    LESSON_HOST_DISABLED_ENV,
     applyLessonOwner,
     decideLessonOwner,
     readLessonOwner,
@@ -48,21 +49,17 @@ describe('supportsNativeOwnerMarker', () => {
 describe('decideLessonOwner', () => {
     const load = async () => loaded(current);
 
-    it('claims only when the store, the capability and a real host all hold', async () => {
+    it('reports a ready host after verifying the ownership capability', async () => {
         const hostIsReady = vi.fn(async () => true);
         expect(await decideLessonOwner({ eligible: true, hostIsReady, load }))
             .toEqual({ owner: 'host', reason: 'claimed' });
     });
 
-    it('leaves the native hook in charge when no host could be opened', async () => {
-        /*
-         * The decisive case. The preconditions all looked right and the store
-         * honours the marker — but the studio refused, or the key is missing,
-         * or the store would not open. Claiming here would silence the native
-         * hook for a session that then has no lessons at all.
-         */
+    it('keeps the host policy gate when readiness is refused', async () => {
+        // Native hooks cannot read Happy OFF settings or recheck Studio ACLs.
+        // A readiness refusal must not bypass that authorization boundary.
         expect(await decideLessonOwner({ eligible: true, hostIsReady: async () => false, load }))
-            .toEqual({ owner: 'native', reason: 'host-not-ready' });
+            .toEqual({ owner: 'host', reason: 'host-not-ready' });
     });
 
     it('treats a thrown readiness check as not ready', async () => {
@@ -70,7 +67,7 @@ describe('decideLessonOwner', () => {
             eligible: true,
             hostIsReady: async () => { throw new Error('studio unreachable'); },
             load,
-        })).toEqual({ owner: 'native', reason: 'host-not-ready' });
+        })).toEqual({ owner: 'host', reason: 'host-not-ready' });
     });
 
     it('does not even ask about readiness when the build cannot stand down', async () => {
@@ -121,19 +118,19 @@ describe('decision deadline', () => {
             load: async () => loaded(current),
             budgetMs: 30,
         });
-        expect(decision.owner).toBe('native');
+        expect(decision.owner).toBe('host');
         // The child has already been launched with this answer; a late yes
         // would leave the two sides disagreeing about who injects.
         resolveReady(true);
         await new Promise((resolve) => setTimeout(resolve, 10));
-        expect(decision).toEqual({ owner: 'native', reason: 'host-not-ready' });
+        expect(decision).toEqual({ owner: 'host', reason: 'host-not-ready' });
     });
 });
 
 describe('applyLessonOwner', () => {
     it('marks a host launch', () => {
         expect(applyLessonOwner({ A: '1' }, { owner: 'host', reason: 'claimed' }))
-            .toEqual({ A: '1', [LESSON_OWNER_ENV]: 'host' });
+            .toEqual({ A: '1', [LESSON_OWNER_ENV]: 'host', [LESSON_HOST_DISABLED_ENV]: '' });
     });
 
     it('writes native explicitly, because deleting the key is not enough', () => {
@@ -143,7 +140,7 @@ describe('applyLessonOwner', () => {
          * decision is what overrides it.
          */
         expect(applyLessonOwner({ A: '1' }, { owner: 'native', reason: 'host-not-ready' }))
-            .toEqual({ A: '1', [LESSON_OWNER_ENV]: 'native' });
+            .toEqual({ A: '1', [LESSON_OWNER_ENV]: 'native', [LESSON_HOST_DISABLED_ENV]: '' });
         expect(readLessonOwner(
             applyLessonOwner({}, { owner: 'native', reason: 'capability-missing' }) as NodeJS.ProcessEnv,
         )).toBe('native');
@@ -153,7 +150,7 @@ describe('applyLessonOwner', () => {
         expect(applyLessonOwner(
             { [LESSON_OWNER_ENV]: 'host', A: '1' },
             { owner: 'native', reason: 'capability-missing' },
-        )).toEqual({ A: '1', [LESSON_OWNER_ENV]: 'native' });
+        )).toEqual({ A: '1', [LESSON_OWNER_ENV]: 'native', [LESSON_HOST_DISABLED_ENV]: '' });
     });
 });
 
@@ -183,6 +180,7 @@ describe('caller-supplied environment', () => {
                 CLAUDE_MEMORY_LESSON_OWNER: 'host',
                 CLAUDE_MEMORY_LESSON_HOST_ROOT: '/tmp/attacker-cml',
                 HAPPY_LESSON_DAEMON_HOME: '/tmp/attacker-home',
+                HAPPY_LESSON_HOST_DISABLED: 'unsupported-caller',
                 KEEP_ME: '1',
             },
         }, consumer);
@@ -191,6 +189,7 @@ describe('caller-supplied environment', () => {
         expect(env).not.toHaveProperty('CLAUDE_MEMORY_LESSON_OWNER');
         expect(env).not.toHaveProperty('CLAUDE_MEMORY_LESSON_HOST_ROOT');
         expect(env).not.toHaveProperty('HAPPY_LESSON_DAEMON_HOME');
+        expect(env).not.toHaveProperty('HAPPY_LESSON_HOST_DISABLED');
         // Ordinary variables still pass through.
         expect(env.KEEP_ME).toBe('1');
     });

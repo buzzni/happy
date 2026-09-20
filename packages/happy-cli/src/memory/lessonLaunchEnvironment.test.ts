@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { applyLessonLaunchEnvironment, lessonCallerSharesIdentity } from './lessonLaunchEnvironment';
-import { LESSON_OWNER_ENV } from './lessonOwnerMarker';
+import { LESSON_OWNER_ENV, LESSON_HOST_DISABLED_ENV } from './lessonOwnerMarker';
 import { LESSON_DAEMON_HOME_ENV } from './lessonSessionHost';
 import { prepareMcpChildEnvironment } from '@/daemon/mcpCallerGrantEnvelope';
 
@@ -40,7 +40,7 @@ describe('applyLessonLaunchEnvironment', () => {
     it('claims for a launch whose child asks as the account the proof was taken with', async () => {
         const { environment, decision } = await applyLessonLaunchEnvironment({
             ...base,
-            environment: { KEEP: '1' },
+            environment: { KEEP: '1', [LESSON_HOST_DISABLED_ENV]: 'unsupported-caller' },
             callerToken: jwt({ sub: 'account-a', iat: 9 }),
             hostIsReady: async () => true,
         });
@@ -49,17 +49,11 @@ describe('applyLessonLaunchEnvironment', () => {
             KEEP: '1',
             [LESSON_DAEMON_HOME_ENV]: '/daemon/home',
             [LESSON_OWNER_ENV]: 'host',
+            [LESSON_HOST_DISABLED_ENV]: '',
         });
     });
 
-    it('leaves a collaborator session with CML\'s own hook rather than nothing', async () => {
-        /*
-         * The readiness proof is the daemon's, taken with the daemon's
-         * credential. This child asks as somebody else, and a collaborator the
-         * project does not grant is refused — in a session whose marker had
-         * already silenced the native hook. Staying native costs a review;
-         * claiming would cost the session its memory.
-         */
+    it('disables both injectors for an unsupported collaborator', async () => {
         const hostIsReady = vi.fn(async () => true);
         const { environment, decision } = await applyLessonLaunchEnvironment({
             ...base,
@@ -67,8 +61,9 @@ describe('applyLessonLaunchEnvironment', () => {
             callerToken: jwt({ sub: 'account-b' }),
             hostIsReady,
         });
-        expect(decision).toEqual({ owner: 'native', reason: 'host-unavailable' });
-        expect(environment[LESSON_OWNER_ENV]).toBe('native');
+        expect(decision).toEqual({ owner: 'disabled', reason: 'unsupported-caller' });
+        expect(environment[LESSON_OWNER_ENV]).toBe('host');
+        expect(environment[LESSON_HOST_DISABLED_ENV]).toBe('unsupported-caller');
         // Not even asked: the answer would not be about this child.
         expect(hostIsReady).not.toHaveBeenCalled();
     });
@@ -80,7 +75,8 @@ describe('applyLessonLaunchEnvironment', () => {
             callerToken: jwt({ sub: 'account-b' }),
             hostIsReady: async () => true,
         });
-        expect(environment[LESSON_OWNER_ENV]).toBe('native');
+        expect(environment[LESSON_OWNER_ENV]).toBe('host');
+        expect(environment[LESSON_HOST_DISABLED_ENV]).toBe('unsupported-caller');
     });
 
     it('stays native without a trusted project binding', async () => {

@@ -381,7 +381,7 @@ async function bootstrapLessonSessionHost(input: {
      * honoured, not re-made.
      */
     if (readLessonOwner(env) !== 'host') {
-        logger.debug('[lesson-host] native owns lesson injection for this launch');
+        logger.debug('[lesson-host] host injection is not enabled for this launch');
         return null;
     }
 
