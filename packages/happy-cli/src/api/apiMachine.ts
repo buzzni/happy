@@ -21,6 +21,10 @@ import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '..
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
+import {
+    MACHINE_RESOURCE_METRICS_RPC,
+    createMachineResourceService,
+} from '@/daemon/machineResourceService';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
@@ -650,6 +654,12 @@ export class ApiMachineClient {
     private serverAutomationCache: ServerAutomationCache | null = null;
     private serverAutomationSyncInFlight: Promise<void> | null = null;
     private rpcHandlerManager: RpcHandlerManager;
+    /**
+     * The machine's only resource sampler. It measures nothing until something
+     * subscribes and stops again when the last subscription goes away, so an
+     * unwatched daemon costs exactly one idle object (specs/machine-resource-metrics).
+     */
+    private readonly machineResourceService = createMachineResourceService();
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
     /**
@@ -802,6 +812,13 @@ export class ApiMachineClient {
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
         this.rpcHandlerManager.registerHandler(
             'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
+        );
+        // Registered, not exempted: on a managed runtime the manager's own
+        // dispatch allowlist still refuses this method, which is the intended
+        // answer there rather than something to work around.
+        this.rpcHandlerManager.registerHandler(
+            MACHINE_RESOURCE_METRICS_RPC,
+            async (params) => this.machineResourceService.handleRequest(params),
         );
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
@@ -3523,6 +3540,7 @@ export class ApiMachineClient {
         // the reconnect cadence right back up.
         this.shuttingDown = true;
         this.stopKeepAlive();
+        this.machineResourceService.stop();
         this.stopConnectionSupervisor();
         for (const cdpPipe of this.browserCdpPipes.values()) cdpPipe.close();
         this.browserCdpPipes.clear();
