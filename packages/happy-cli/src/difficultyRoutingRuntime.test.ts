@@ -485,7 +485,9 @@ describe('grant rejection detail', () => {
     const lines = captureDebug()
     // Rejected because the server's own values disagree, not because of any local clock.
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ expiresAt: Date.now() - 1 }))))
-    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    // Refused as a grant — the relay is never dispatched — so the turn falls back to P1.
+    expect((await resolveDifficultyRouting(baseInput))?.event.ev)
+      .toMatchObject({ result: { classifierSource: 'fallback-p1' } })
     expect(dump(lines)).toContain('ttlMs-mismatch')
 
     const other = captureDebug()
@@ -592,7 +594,9 @@ describe('timing v2 grant negotiation', () => {
     }
   })
 
-  // Server values must agree with each other; that is the only arithmetic left.
+  // Server values must agree with each other; that is the only arithmetic left. Refusing the
+  // grant means refusing to relay against it — the relay is never dispatched — but the turn
+  // still gets the local decision, which needs no grant and no budget.
   it('refuses a grant whose own durations contradict its instants', async () => {
     for (const over of [
       { ttlMs: 59_999 },
@@ -606,7 +610,11 @@ describe('timing v2 grant negotiation', () => {
     ]) {
       const fetchMock = vi.fn(async () => Response.json(v2Grant(Date.now(), over)))
       vi.stubGlobal('fetch', fetchMock)
-      expect(await resolve(baseInput), JSON.stringify(over)).toBeNull()
+      const decision = await resolve(baseInput)
+      expect(fetchMock, JSON.stringify(over)).toHaveBeenCalledTimes(1)
+      expect(decision?.event.ev, JSON.stringify(over)).toMatchObject({
+        result: { classifierSource: 'fallback-p1', policyRevision: null },
+      })
     }
   })
 
@@ -617,8 +625,13 @@ describe('timing v2 grant negotiation', () => {
       const body = grantResponse() as { grant: Record<string, unknown> }
       if (timingVersion === undefined) delete body.grant.timingVersion
       else body.grant.timingVersion = timingVersion
-      vi.stubGlobal('fetch', vi.fn(async () => Response.json(body)))
-      expect(await resolve(baseInput), String(timingVersion)).toBeNull()
+      const fetchMock = vi.fn(async () => Response.json(body))
+      vi.stubGlobal('fetch', fetchMock)
+      const decision = await resolve(baseInput)
+      expect(fetchMock, String(timingVersion)).toHaveBeenCalledTimes(1)
+      expect(decision?.event.ev, String(timingVersion)).toMatchObject({
+        result: { classifierSource: 'fallback-p1' },
+      })
     }
   })
 
@@ -627,7 +640,33 @@ describe('timing v2 grant negotiation', () => {
     for (const field of ['timingVersion', 'requestId', 'issuedAt', 'ttlMs', 'relayTtlMs']) {
       delete legacy.grant[field]
     }
+    const fetchMock = vi.fn(async () => Response.json(legacy))
+    vi.stubGlobal('fetch', fetchMock)
+    const decision = await resolve(baseInput)
+    // No relay: the grant was not accepted.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
+  })
+
+  // The CLI is published to npm and upgraded independently of the aplus API, so a client can
+  // run ahead of the deployment. Refusing the legacy grant is intended; losing routing for the
+  // whole turn because the refusal also threw away the policy snapshot is not.
+  it('keeps routing locally when the server has not shipped the negotiated contract', async () => {
+    const legacy = grantResponse() as { grant: Record<string, unknown> }
+    for (const field of ['timingVersion', 'requestId', 'issuedAt', 'ttlMs', 'relayTtlMs']) {
+      delete legacy.grant[field]
+    }
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(legacy)))
+
+    const decision = await resolve(baseInput)
+    expect(decision).not.toBeNull()
+    expect(decision?.route.source).toBe('p1')
+  })
+
+  // A grant that is malformed outside the timing contract is a broken server, not an older
+  // one, and still carries no authority to route.
+  it('does not read an unrelated validation failure as a contract mismatch', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ hostMachineId: '' }))))
     expect(await resolve(baseInput)).toBeNull()
   })
 
@@ -762,13 +801,29 @@ describe('timing v2 execution budget', () => {
     expect(JSON.stringify(lines)).not.toContain('budget-spent-before-relay')
   })
 
+  // Asserting `not.toMatchObject` on a possibly-undefined event passes when nothing at all is
+  // returned, so it cannot tell "the late answer was dropped" from "the turn lost its routing".
+  // Name the outcome instead: the remote answer is discarded, the local decision still applies.
   it('discards a relay answer that lands after the deadline', async () => {
     for (const relayMs of [750, 900]) {
       const { relayBodies } = wire({ relayMs })
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `relay took ${relayMs}ms`).toHaveLength(1)
-      expect(decision?.event.ev).not.toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+      expect(decision?.event.ev, `relay took ${relayMs}ms`).toMatchObject({
+        result: { classifierSource: 'fallback-p1' },
+      })
     }
+  })
+
+  // A late answer costs the same wall time as no answer, and the branch right below this one
+  // already degrades an unusable answer to the free local decision. Returning null instead
+  // means one slow server turn silently removes routing from the turn entirely.
+  it('keeps routing the turn when the relay answers past the deadline', async () => {
+    const { relayBodies } = wire({ relayMs: 750 })
+    const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayBodies).toHaveLength(1)
+    expect(decision).not.toBeNull()
+    expect(decision?.route.source).toBe('p1')
   })
 
   it('still applies a relay answer that lands just inside the deadline', async () => {
