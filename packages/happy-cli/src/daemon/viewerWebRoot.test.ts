@@ -691,6 +691,26 @@ describe('installViewerClipboardBridge sends Ctrl+C for copy, never noVNC\'s own
         expect(rfb.keys).toEqual([])
     })
 
+    // Ctrl/Cmd+Shift+C is the browser's own element inspector, both locally
+    // and on the remote screen (which runs exactly one application, a
+    // browser). Capturing it would silently turn the inspector into a copy,
+    // and the remote's answering selection would then overwrite the local
+    // clipboard through the copy-out listener. Shift falls through the same
+    // way Alt already does.
+    it('leaves the Shift variant to the browser', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        const stopImmediatePropagation = () => { stopped += 1 }
+        dom.fireKeydown({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'C', code: 'KeyC', metaKey: true, shiftKey: true, stopImmediatePropagation })
+
+        expect(stopped).toBe(0)
+        expect(rfb.keys).toEqual([])
+    })
+
     // Copying does not touch the clipboard-read machinery at all — it only
     // forwards the keystroke. The existing RFB `clipboard` listener already
     // pulls whatever the remote puts on its selection back to the local
