@@ -13,7 +13,6 @@ import {
     readDisplayFromEnviron,
     readFlagFromCmdline,
     viewerProcessMatchesLease,
-    VIEWER_TOOLS,
     resolveViewerProfileDir,
     selectViewerSlot,
     validateViewerKey,
@@ -122,7 +121,7 @@ describe('planViewerInstall', () => {
     })
 
     it('reports a manual command rather than claiming success without sudo', () => {
-        const plan = planViewerInstall({ missing: VIEWER_TOOLS.slice(), canSudo: false, platform: 'linux' })
+        const plan = planViewerInstall({ missing: ['Xvnc', 'websockify'], canSudo: false, platform: 'linux' })
 
         expect(plan.action).toBe('manual')
         expect(plan.command).toContain('sudo')
@@ -366,6 +365,7 @@ describe('selectViewerBackend', () => {
         hasX11vnc: false,
         hasWebsockify: false,
         hasWindowManager: false,
+        hasVncConfig: false,
     }
 
     it('fills the window exactly when the server can resize and a WM can refit the browser', () => {
@@ -398,6 +398,7 @@ describe('selectViewerBackend', () => {
     it('prefers the resizable server when a machine has both stacks', () => {
         const backend = selectViewerBackend({
             hasXvnc: true, hasXvfb: true, hasX11vnc: true, hasWebsockify: true, hasWindowManager: true,
+            hasVncConfig: true,
         })
 
         expect(backend?.kind).toBe('xvnc')
@@ -416,6 +417,7 @@ describe('viewer tool requirements', () => {
         hasX11vnc: true,
         hasWebsockify: true,
         hasWindowManager: false,
+        hasVncConfig: false,
     }
 
     it('blocks the screen only on what it cannot run without', () => {
@@ -426,6 +428,7 @@ describe('viewer tool requirements', () => {
     it('asks for the resizable server when no display server exists', () => {
         const missing = missingViewerTools({
             hasXvnc: false, hasXvfb: false, hasX11vnc: false, hasWebsockify: false, hasWindowManager: false,
+            hasVncConfig: false,
         })
 
         expect(missing).toContain('Xvnc')
@@ -436,8 +439,10 @@ describe('viewer tool requirements', () => {
     // A machine whose screen already works must not be told it is broken —
     // but installing is exactly when it should be upgraded to exact fill.
     it('upgrades a working legacy machine only when the user installs', () => {
-        expect(desiredViewerTools(legacyMachine)).toEqual(['Xvnc', 'openbox'])
-        expect(desiredViewerTools({ ...legacyMachine, hasXvnc: true, hasWindowManager: true })).toEqual([])
+        expect(desiredViewerTools(legacyMachine)).toEqual(['Xvnc', 'openbox', 'vncconfig'])
+        expect(desiredViewerTools({
+            ...legacyMachine, hasXvnc: true, hasWindowManager: true, hasVncConfig: true,
+        })).toEqual([])
     })
 
     it('maps the upgrade tools onto packages that actually provide them', () => {

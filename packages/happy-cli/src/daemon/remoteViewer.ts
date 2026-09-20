@@ -15,14 +15,11 @@ import { join } from 'node:path'
 
 import type { ViewerResizeMode } from './viewerWebRoot'
 
-/** Binaries the remote screen needs, in the order a user should install them. */
-export const VIEWER_TOOLS = ['Xvfb', 'x11vnc', 'websockify'] as const
-export type ViewerTool = (typeof VIEWER_TOOLS)[number]
-
 /** apt package that provides each binary — they do not all match by name. */
 const APT_PACKAGE: Record<string, string> = {
     Xvfb: 'xvfb',
     Xvnc: 'tigervnc-standalone-server',
+    vncconfig: 'tigervnc-common',
     x11vnc: 'x11vnc',
     openbox: 'openbox',
     websockify: 'websockify',
@@ -36,8 +33,13 @@ export type ViewerCapabilities = {
     hasX11vnc: boolean
     hasWebsockify: boolean
     hasWindowManager: boolean
-    /** TigerVNC's clipboard helper — see {@link buildVncConfigArgs}. */
-    hasVncConfig?: boolean
+    /**
+     * TigerVNC's clipboard helper — see {@link buildVncConfigArgs}.
+     *
+     * Required rather than optional on purpose: a caller that leaves it out
+     * would lose pasting into the remote screen and nothing would say so.
+     */
+    hasVncConfig: boolean
 }
 
 export type ViewerBackend = {
@@ -102,6 +104,10 @@ export function desiredViewerTools(capabilities: ViewerCapabilities): string[] {
     const desired = missingViewerTools(capabilities)
     if (!capabilities.hasXvnc && !desired.includes('Xvnc')) desired.push('Xvnc')
     if (!capabilities.hasWindowManager) desired.push('openbox')
+    // Normally arrives with Xvnc's own package, so this only fires on a
+    // machine that lost it — where pasting is broken and nothing else in
+    // this list would bring it back.
+    if (!capabilities.hasVncConfig) desired.push('vncconfig')
     return desired
 }
 
@@ -470,10 +476,6 @@ export async function detectViewerCapabilities(): Promise<ViewerCapabilities> {
     }
 }
 
-/** Which viewer binaries are absent on this machine. */
-export async function detectMissingViewerTools(): Promise<string[]> {
-    return missingViewerTools(await detectViewerCapabilities())
-}
 
 /**
  * Whether that port is actually serving noVNC's client page.

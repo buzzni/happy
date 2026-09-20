@@ -296,8 +296,12 @@ textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드
 
 ### 검증
 
-- 유닛: `viewerWebRoot` 31개(신규), `remoteViewer` 51개, viewer API 35개 —
-  관련 8파일 177개 통과 + CLI 빌드(`tsc --noEmit`) 통과.
+- 유닛: `viewerWebRoot` 31개(신규), `remoteViewer` 51개, viewer API 37개 —
+  관련 8파일 179개 통과 + CLI 빌드(`tsc --noEmit`) 통과. 3라운드에서
+  **스택 기동 시퀀스 자체**에 처음으로 테스트를 붙였다(그전까지 모든 테스트가
+  재사용 경로만 탔다): 슬롯 포트를 테스트가 직접 listen 해 readiness 대기를
+  즉시 끝내고, Xvnc·vncconfig·openbox 가 뜨는지와 서빙되는 페이지의 resize
+  모드를 확인한다.
 - 뮤테이션 11건 전부 kill (셀프 리뷰 2라운드 포함): capture 플래그 /
   `stopImmediatePropagation` / paste 후 포커스 복구 / `index.html` 미패치 /
   도구 누락 시 start 차단 / Xvnc 드레인 인식 / 비라틴 자판 폴백 / 사용 중

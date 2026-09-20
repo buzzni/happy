@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
     browserMocks: {
@@ -152,6 +152,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             hasX11vnc: true,
             hasWebsockify: true,
             hasWindowManager: true,
+            hasVncConfig: true,
         })
         viewerMocks.isViewerServing.mockResolvedValue(true)
         browserMocks.detectChrome.mockResolvedValue({
@@ -208,6 +209,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             hasX11vnc: true,
             hasWebsockify: true,
             hasWindowManager: false,
+            hasVncConfig: true,
         })
         daemonMocks.canSudoWithoutPassword.mockResolvedValue(true)
         daemonMocks.exec.mockImplementation((_command: string, _options: unknown, done: any) => {
@@ -246,6 +248,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             hasX11vnc: false,
             hasWebsockify: true,
             hasWindowManager: false,
+            hasVncConfig: true,
         })
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
@@ -257,13 +260,14 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
     // Xvfb + x11vnc is the older pair; it still runs the screen, so a machine
     // that has it must never be told to install anything.
-    it('starts on a machine that only has the legacy Xvfb and x11vnc pair', async () => {
+    it('does not block a machine that only has the legacy Xvfb and x11vnc pair', async () => {
         viewerMocks.detectViewerCapabilities.mockResolvedValue({
             hasXvnc: false,
             hasXvfb: true,
             hasX11vnc: true,
             hasWebsockify: true,
             hasWindowManager: false,
+            hasVncConfig: true,
         })
         const { ApiMachineClient } = await import('./apiMachine')
         const client = new ApiMachineClient('token', machineClient())
@@ -272,6 +276,83 @@ describe('ApiMachineClient browser viewer RPC', () => {
         const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
         expect(result).toMatchObject({ webPort: 6080, browserReady: true })
+    })
+
+    describe('starting a stack from nothing', () => {
+        // Every other test here reuses a serving stack, so the spawn sequence
+        // itself — which display server, its helpers, and the page that gets
+        // served — was never exercised. Listening on the slot's ports lets the
+        // real readiness waits return at once instead of timing out.
+        const held: Array<() => Promise<void>> = []
+
+        async function holdPort(port: number): Promise<void> {
+            const { createServer } = await import('node:net')
+            await new Promise<void>((resolve) => {
+                const server = createServer()
+                server.once('error', () => resolve())
+                server.listen(port, '127.0.0.1', () => {
+                    held.push(() => new Promise<void>((done) => server.close(() => done())))
+                    resolve()
+                })
+            })
+        }
+
+        beforeEach(async () => {
+            leaseRegistryMocks.records.clear()
+            viewerMocks.isViewerServing.mockResolvedValue(false)
+            await holdPort(5900)
+            await holdPort(6080)
+        })
+
+        afterEach(async () => {
+            while (held.length > 0) await (held.pop() as () => Promise<void>)()
+        })
+
+        it('runs Xvnc with its clipboard helper and a window manager, and serves the resizing page', async () => {
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            const spawned = daemonMocks.spawnDetached.mock.calls.map((call: any[]) => call[0])
+            expect(spawned).toContain('Xvnc')
+            expect(spawned).not.toContain('Xvfb')
+            expect(spawned).not.toContain('x11vnc')
+            // Without vncconfig a paste reaches Xvnc and stops there; without
+            // openbox the resized desktop is wider than the browser window.
+            expect(spawned).toContain('vncconfig')
+            expect(spawned).toContain('openbox')
+            expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
+                expect.objectContaining({ resizeMode: 'remote' }),
+            )
+        })
+
+        it('runs the legacy pair and serves the scaling page when Xvnc is absent', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: false,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: true,
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            const spawned = daemonMocks.spawnDetached.mock.calls.map((call: any[]) => call[0])
+            expect(spawned).toContain('Xvfb')
+            expect(spawned).toContain('x11vnc')
+            expect(spawned).not.toContain('Xvnc')
+            expect(spawned).not.toContain('vncconfig')
+            // x11vnc ignores SetDesktopSize, so asking for it would leave the
+            // screen clipped exactly as before.
+            expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
+                expect.objectContaining({ resizeMode: 'scale' }),
+            )
+        }, 15_000)
     })
 
     it('pairs a reused viewer Chrome on the exact CDP port before reporting bridge readiness', async () => {
@@ -485,6 +566,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             hasX11vnc: true,
             hasWebsockify: true,
             hasWindowManager: true,
+            hasVncConfig: true,
         })
 
         await expect(Promise.all([first, second])).resolves.toHaveLength(2)

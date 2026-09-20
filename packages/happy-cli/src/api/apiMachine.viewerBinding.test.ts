@@ -19,6 +19,7 @@ const { proxyMocks, viewerMocks } = vi.hoisted(() => ({
             hasX11vnc: true,
             hasWebsockify: true,
             hasWindowManager: true,
+            hasVncConfig: true,
         })),
     },
 }))
