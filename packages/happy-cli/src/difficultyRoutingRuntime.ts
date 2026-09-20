@@ -184,7 +184,15 @@ export async function resolveDifficultyRouting(
     if ((grant.reason === 'host-unavailable' || grant.reason === 'unsupported') && grant.aiModelPolicy) {
       const p1 = classifyDifficultyHeuristic(prompt)
       noteRemoteFailure()
-      logRoutingOutcome('grant-rejected-falling-back', { clientRequestId, reason: grant.reason, failureStage: grant.failureStage })
+      // `failed` travels with this outcome too: a timing-contract rejection now degrades here
+      // instead of being skipped, and naming which conditions failed is the only local signal
+      // that tells a version mismatch apart from a server that is answering wrongly.
+      logRoutingOutcome('grant-rejected-falling-back', {
+        clientRequestId,
+        reason: grant.reason,
+        failureStage: grant.failureStage,
+        failed: grant.failed?.join(','),
+      })
       return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.aiModelPolicy), clientRequestId, grant.reason)
     }
     logRoutingOutcome('skipped', {
@@ -239,10 +247,19 @@ export async function resolveDifficultyRouting(
     }, routeDeadline)
     // The answer arrived, but an answer past the deadline is not an answer. A fetch mock or a
     // transport that ignores abort can still resolve late; this is what stops it being applied.
+    // Discarding the stale answer is not a reason to discard the turn's routing too: the
+    // local decision costs no network and no budget, and the wall time is already spent
+    // whichever way this goes. Returning null here made a slow server strictly worse than a
+    // failed one, because the branch directly below already degrades to exactly this.
     if (monotonicNow() >= routeDeadline) {
       noteRemoteFailure()
-      logRoutingOutcome('skipped', { reason: 'relay-result-late', clientRequestId })
-      return null
+      logRoutingOutcome('relay-result-late', { clientRequestId })
+      return logDecision(
+        'fallback-p1',
+        buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, undefined, 'fallback-p1', grant.value.aiModelPolicy),
+        clientRequestId,
+        'relay-result-late',
+      )
     }
     if (relay.status !== 'ok' || !relay.difficulty) {
       noteRemoteFailure()
@@ -414,6 +431,14 @@ async function requestGrant(
       failed: validation.failed,
       expiresInMs: validation.expiresInMs,
       relayDeadlineInMs: validation.relayDeadlineInMs,
+      // A rejection confined to the timing contract says this server has not shipped v2 — it
+      // does not say the response was garbage. The CLI is published to npm and upgraded
+      // independently of the aplus API, so a client can legitimately run ahead of the
+      // deployment; dropping the policy snapshot there turned routing off for every such user
+      // with nothing but a debug line. Carry it, and let the caller degrade to the local
+      // decision the way it already does for an unsupported host.
+      reason: isTimingContractMismatch(validation.failed) ? 'unsupported' : undefined,
+      aiModelPolicy: parseAiModelPolicy(record.aiModelPolicy),
     }
   }
   return { ok: true, value: validation.value }
@@ -492,6 +517,22 @@ type GrantFailureCode =
 type GrantValidation =
   | { ok: true; value: GrantOk }
   | { ok: false; failed: GrantFailureCode[]; expiresInMs?: number; relayDeadlineInMs?: number }
+
+/**
+ * The timing v2 fields plus the two checks derived from them. A server that predates the
+ * contract fails all of these and nothing else, because the derived comparisons cannot hold
+ * when the durations they read are absent.
+ */
+const TIMING_CONTRACT_FAILURES = new Set<GrantFailureCode>([
+  'timingVersion', 'requestId', 'issuedAt', 'ttlMs', 'relayTtlMs',
+  'ttlMs-mismatch', 'relayTtlMs-mismatch',
+])
+
+/** True only when every reported cause is about the timing contract — one wrong field
+ * elsewhere means a broken grant, which carries no authority and gets no degradation. */
+function isTimingContractMismatch(failed: GrantFailureCode[]): boolean {
+  return failed.length > 0 && failed.every((code) => TIMING_CONTRACT_FAILURES.has(code))
+}
 
 /**
  * Validates a negotiated timing v2 grant. Deliberately takes no clock: the previous version
