@@ -172,13 +172,56 @@ describe("sessionRoutes", () => {
         await app.close();
     });
 
-    it("rejects lookup requests without authentication", async () => {
+    it("selects only requested account-owned ids and seq for a seq projection", async () => {
+        dbMock.session.findMany.mockResolvedValue([
+            { id: "session-b", seq: 7 },
+            { id: "session-a", seq: 3 },
+        ]);
         const app = await createApp();
 
         const response = await app.inject({
             method: "POST",
             url: "/v2/sessions/lookup",
-            payload: { ids: ["session-a"] },
+            headers: { "x-user-id": "user-1" },
+            payload: { ids: ["session-a", "session-b", "session-a"], projection: "seq" },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(dbMock.session.findMany).toHaveBeenCalledExactlyOnceWith({
+            where: { accountId: "user-1", id: { in: ["session-a", "session-b"] } },
+            select: { id: true, seq: true },
+        });
+        expect(response.json()).toEqual({
+            sessions: [{ id: "session-a", seq: 3 }, { id: "session-b", seq: 7 }],
+        });
+        await app.close();
+    });
+
+    it.each([
+        { ids: [], projection: "seq" },
+        { ids: [""], projection: "seq" },
+        { ids: Array.from({ length: 201 }, (_, i) => `session-${i}`), projection: "seq" },
+        { ids: ["session-a"], projection: "metadata" },
+    ])("rejects invalid projection lookup input %# before querying sessions", async (payload) => {
+        const app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v2/sessions/lookup",
+            headers: { "x-user-id": "user-1" },
+            payload,
+        });
+        expect(response.statusCode).toBe(400);
+        expect(dbMock.session.findMany).not.toHaveBeenCalled();
+        await app.close();
+    });
+
+    it.each([undefined, "seq"])("rejects lookup requests without authentication (projection %s)", async (projection) => {
+        const app = await createApp();
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/v2/sessions/lookup",
+            payload: { ids: ["session-a"], ...(projection ? { projection } : {}) },
         });
 
         expect(response.statusCode).toBe(401);

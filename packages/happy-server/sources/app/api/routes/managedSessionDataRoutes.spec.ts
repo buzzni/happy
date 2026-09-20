@@ -304,13 +304,17 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
             expect(read.statusCode).toBe(200);
         });
 
-        it('looks itself up, and only itself', async () => {
+        it.each([undefined, 'seq'])('looks itself up, and only itself (projection %s)', async (projection) => {
             const found = await request({
                 method: 'POST', url: '/v2/sessions/lookup',
-                token: scopedToken, body: { ids: [sessionId] },
+                token: scopedToken, body: { ids: [sessionId], ...(projection ? { projection } : {}) },
             });
             expect(found.statusCode).toBe(200);
             expect(found.json().sessions.map((s: { id: string }) => s.id)).toEqual([sessionId]);
+            if (projection) {
+                const stored = await db.session.findUniqueOrThrow({ where: { id: sessionId } });
+                expect(found.json()).toEqual({ sessions: [{ id: sessionId, seq: stored.seq }] });
+            }
         });
 
         it('carries a query string without losing the route decision', async () => {
@@ -377,6 +381,23 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
             if (!minted.ok) throw new Error(`fixture mint failed: ${minted.reason}`);
             return minted.token;
         }
+
+        it('reads only its granted seq projection with a transcript-read bearer', async () => {
+            const readToken = await readBearer();
+            const stored = await db.session.findUniqueOrThrow({ where: { id: sessionId } });
+            const found = await request({
+                method: 'POST', url: '/v2/sessions/lookup', token: readToken,
+                body: { ids: [sessionId], projection: 'seq' },
+            });
+            expect(found.statusCode).toBe(200);
+            expect(found.json()).toEqual({ sessions: [{ id: sessionId, seq: stored.seq }] });
+            for (const ids of [[otherSessionId], [sessionId, otherSessionId]]) {
+                await expectInert(() => request({
+                    method: 'POST', url: '/v2/sessions/lookup', token: readToken,
+                    body: { ids, projection: 'seq' },
+                }), 403);
+            }
+        });
 
         it('stops an older generation\'s bearer over real HTTP the moment the parent moves on', async () => {
             /*
@@ -605,10 +626,11 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
             }), 403);
         });
 
-        it('refuses a lookup that reaches wider than the grant', async () => {
+        it.each([undefined, 'seq'])('refuses a lookup that reaches wider than the grant (projection %s)', async (projection) => {
             for (const ids of [[otherSessionId], [sessionId, otherSessionId]]) {
                 const response = await expectInert(() => request({
-                    method: 'POST', url: '/v2/sessions/lookup', token: scopedToken, body: { ids },
+                    method: 'POST', url: '/v2/sessions/lookup', token: scopedToken,
+                    body: { ids, ...(projection ? { projection } : {}) },
                 }), 403);
                 // Not a filtered answer: nothing comes back at all.
                 expect(response.body).not.toContain(otherSessionId);
@@ -952,22 +974,22 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
             })).statusCode).toBe(200);
         });
 
-        it('looks up several of its own sessions at once', async () => {
+        it.each([undefined, 'seq'])('looks up several of its own sessions at once (projection %s)', async (projection) => {
             const found = await request({
                 method: 'POST', url: '/v2/sessions/lookup',
-                token: accountToken, body: { ids: [sessionId, otherSessionId] },
+                token: accountToken, body: { ids: [sessionId, otherSessionId], ...(projection ? { projection } : {}) },
             });
             expect(found.statusCode).toBe(200);
             expect(found.json().sessions).toHaveLength(2);
         });
 
-        it('still cannot reach another account*s session', async () => {
+        it.each([undefined, 'seq'])('still cannot reach another account*s session (projection %s)', async (projection) => {
             await expectInert(() => request({
                 method: 'GET', url: `/v3/sessions/${sessionId}/messages`, token: otherAccountToken,
             }), 404);
             const found = await request({
                 method: 'POST', url: '/v2/sessions/lookup',
-                token: otherAccountToken, body: { ids: [sessionId] },
+                token: otherAccountToken, body: { ids: [sessionId], ...(projection ? { projection } : {}) },
             });
             expect(found.statusCode).toBe(200);
             expect(found.json().sessions).toEqual([]);

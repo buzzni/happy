@@ -130,12 +130,25 @@ export function sessionRoutes(app: Fastify) {
         preHandler: requireSessionScopeAuth(app) as never,
         schema: {
             body: z.object({
-                ids: z.array(z.string().min(1)).min(1).max(200)
+                ids: z.array(z.string().min(1)).min(1).max(200),
+                projection: z.literal('seq').optional(),
             })
         }
     }, async (request, reply) => {
         const userId = request.userId;
         const uniqueIds = Array.from(new Set(request.body.ids));
+        const order = new Map(uniqueIds.map((id, index) => [id, index]));
+        if (request.body.projection === 'seq') {
+            const sessions = await db.session.findMany({
+                where: { accountId: userId, id: { in: uniqueIds } },
+                select: { id: true, seq: true },
+            });
+            return reply.send({
+                sessions: sessions
+                    .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+                    .map(({ id, seq }) => ({ id, seq })),
+            });
+        }
         /*
          * A viewer reads with its own key envelope.
          *
@@ -184,8 +197,6 @@ export function sessionRoutes(app: Fastify) {
                 lastActiveAt: true,
             }
         });
-        const order = new Map(uniqueIds.map((id, index) => [id, index]));
-
         return reply.send({
             sessions: sessions
                 .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
