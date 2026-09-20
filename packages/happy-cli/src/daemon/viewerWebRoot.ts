@@ -94,6 +94,11 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         win.setTimeout(restoreFocus, FOCUS_RESTORE_MS)
     }
 
+    // Chrome asks for clipboard permission on the first read, and that
+    // prompt is exactly when people press the shortcut again. Without this,
+    // every extra press queues another paste for the moment they allow it.
+    let readingClipboard = false
+
     const isPasteKey = (event: any) => {
         if (event.key === 'v' || event.key === 'V') return true
         // With a Korean (or any non-Latin) layout active the browser can
@@ -115,12 +120,30 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()
         const clipboard = win.navigator && win.navigator.clipboard
         if (clipboard && clipboard.readText) {
+            if (readingClipboard) return
+            readingClipboard = true
+            // A browser that has the method but refuses outright (insecure
+            // context) throws here rather than rejecting. Leaving the flag
+            // set would disable pasting for the rest of the session.
+            let read: Promise<string> | null = null
+            try {
+                read = clipboard.readText()
+            } catch (error) {
+                readingClipboard = false
+                if (win.console) win.console.warn('[aplus] clipboard read refused:', error)
+                armNativePaste()
+                return
+            }
             // Reading the clipboard directly, rather than waiting for the
             // browser's own paste event: Chrome decides the paste target when
             // it handles the shortcut, and a canvas is not editable, so
             // focusing a textarea mid-keydown produces no paste at all
             // (measured in a real Chrome against the live screen).
-            clipboard.readText().then(pasteToRemote, (error: unknown) => {
+            read.then((text: string) => {
+                readingClipboard = false
+                pasteToRemote(text)
+            }, (error: unknown) => {
+                readingClipboard = false
                 if (win.console) win.console.warn('[aplus] clipboard read refused:', error)
                 armNativePaste()
             })
@@ -244,7 +267,10 @@ export function ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode, onFall
         if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) return targetRoot
         rebuilding = true
         rmSync(targetRoot, { recursive: true, force: true })
-        mkdirSync(join(targetRoot, dirname(VIEWER_BRIDGE_PATH)), { recursive: true })
+        // 0700 like everything else under browser-viewers: this call can be
+        // what creates that shared parent, and it must not land looser than
+        // the profile directories beside it.
+        mkdirSync(join(targetRoot, dirname(VIEWER_BRIDGE_PATH)), { recursive: true, mode: 0o700 })
         for (const entry of readdirSync(sourceRoot)) {
             // Our own copies of both, so the page is patched whether it is
             // reached as /vnc.html or as the directory index.

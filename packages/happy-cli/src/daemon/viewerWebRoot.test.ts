@@ -492,3 +492,66 @@ describe('buildViewerBridgeModule ships browser-safe source', () => {
         expect(source).not.toContain('logger')
     })
 })
+
+describe('installViewerClipboardBridge while the clipboard permission prompt is open', () => {
+    // Chrome asks once, and that prompt is exactly when people press the
+    // shortcut again. Every extra press would queue another paste for the
+    // moment they allow it.
+    it('pastes once however many times the shortcut is pressed', async () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        // Granting permission settles every read that was waiting on it, so
+        // the fake has to release all of them — not just the last one.
+        const pending: Array<(text: string) => void> = []
+        dom.win.navigator.clipboard.readText = () => new Promise((resolve) => { pending.push(resolve) })
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        expect(pending.length).toBe(1)
+        for (const resolve of pending) resolve('sts-json')
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.runTimeouts()
+
+        expect(rfb.pasted).toEqual(['sts-json'])
+    })
+
+    it('accepts the next shortcut once the read has settled', async () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = () => Promise.resolve('again')
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.runTimeouts()
+
+        expect(rfb.pasted).toEqual(['again', 'again'])
+    })
+})
+
+describe('installViewerClipboardBridge when the clipboard read throws outright', () => {
+    // An insecure context throws from readText() instead of rejecting. The
+    // in-flight flag must not stay set, or pasting dies for the session.
+    it('falls back and stays usable for the next attempt', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = () => { throw new Error('insecure context') }
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        expect(dom.textarea.focused).toBe(true)
+        expect(dom.warnings.length).toBe(1)
+
+        dom.textarea.focused = false
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+
+        expect(dom.textarea.focused).toBe(true)
+    })
+})

@@ -17,6 +17,8 @@ const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, moc
     daemonMocks: {
         spawnDetached: vi.fn(() => ({ pid: 1234 })),
         ensureViewerWebRoot: vi.fn(() => '/usr/share/novnc'),
+        canSudoWithoutPassword: vi.fn(async () => false),
+        exec: vi.fn(),
     },
     fsMocks: {
         readdir: vi.fn(),
@@ -48,6 +50,13 @@ vi.mock('@/daemon/browserSetup', async (importOriginal) => ({
     detectChrome: browserMocks.detectChrome,
     isCdpReachable: browserMocks.isCdpReachable,
     launchChrome: browserMocks.launchChrome,
+    // The real probe shells out to `sudo -n true` on the test machine.
+    canSudoWithoutPassword: daemonMocks.canSudoWithoutPassword,
+}))
+
+vi.mock('node:child_process', async (importOriginal) => ({
+    ...await importOriginal<typeof import('node:child_process')>(),
+    exec: daemonMocks.exec,
 }))
 
 vi.mock('@/daemon/remoteViewer', async (importOriginal) => ({
@@ -187,6 +196,43 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect(request).toHaveBeenCalledTimes(2)
         } finally {
             now.mockRestore()
+        }
+    })
+
+    // The install button is what turns a scaled screen into an exact fit, so
+    // it installs the whole modern stack — not only what blocks the screen.
+    it('installs the exact-fill stack on a machine whose screen already works', async () => {
+        viewerMocks.detectViewerCapabilities.mockResolvedValue({
+            hasXvnc: false,
+            hasXvfb: true,
+            hasX11vnc: true,
+            hasWebsockify: true,
+            hasWindowManager: false,
+        })
+        daemonMocks.canSudoWithoutPassword.mockResolvedValue(true)
+        daemonMocks.exec.mockImplementation((_command: string, _options: unknown, done: any) => {
+            done(null, '', '')
+        })
+        // The remote screen is a Linux feature; the plan is honest about
+        // having no apt command anywhere else, including this test runner.
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
+        try {
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result: any = await handlersFrom(client).get('machine-1:browser-viewer:install')?.({})
+
+            expect(result.command).toContain('tigervnc-standalone-server')
+            expect(result.command).toContain('openbox')
+            // The install ran and the screen still opens, but the capability
+            // probe says the upgrade did not take. Reporting only `ok` here
+            // would claim a fit the user is not going to get.
+            expect(result.ok).toBe(true)
+            expect(result.upgradable).toEqual(['Xvnc', 'openbox'])
+        } finally {
+            Object.defineProperty(process, 'platform', platform)
         }
     })
 

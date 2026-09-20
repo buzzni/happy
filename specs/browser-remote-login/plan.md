@@ -296,10 +296,15 @@ textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드
 
 ### 검증
 
-- 유닛: `viewerWebRoot` 23개(신규), `remoteViewer` 51개, viewer API 34개 —
-  관련 7파일 137개 통과 + CLI 빌드(`tsc --noEmit`) 통과.
-- 뮤테이션 5건 전부 kill: capture 플래그 / `stopImmediatePropagation` /
-  paste 후 포커스 복구 / `index.html` 미패치 / 도구 누락 시 start 차단.
+- 유닛: `viewerWebRoot` 31개(신규), `remoteViewer` 51개, viewer API 35개 —
+  관련 8파일 177개 통과 + CLI 빌드(`tsc --noEmit`) 통과.
+- 뮤테이션 11건 전부 kill (셀프 리뷰 2라운드 포함): capture 플래그 /
+  `stopImmediatePropagation` / paste 후 포커스 복구 / `index.html` 미패치 /
+  도구 누락 시 start 차단 / Xvnc 드레인 인식 / 비라틴 자판 폴백 / 사용 중
+  미러 보존 / install 이 업그레이드까지 설치 / 프롬프트 중 중복 붙여넣기 방지 /
+  동기 throw 후 상태 복구. 마지막 항목은 1차 시도에서 가짜 통과가 나와
+  (가짜 객체가 프롬프트 승인 시 대기 중 read 를 전부 풀어주지 않았다)
+  테스트를 고친 뒤 kill 을 확인했다.
 - **컨테이너 실기** (debian bookworm + tigervnc-standalone-server·openbox·
   websockify·novnc, 실제 daemon 모듈을 Node 24 타입 스트리핑으로 그대로 실행,
   호스트의 진짜 Chrome 이 클라이언트):
@@ -315,6 +320,11 @@ textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드
 
   주의: TigerVNC 의 확장 클립보드는 **지연 전송**이라 뷰어가 연결돼 있는 동안만
   selection 이 유효하다. 연결을 끊은 뒤 조회하면 비어 보이는 것이 정상이다.
+
+- **비-root 실기**: 체험 머신은 `trial`(uid 10001) 로 돌기 때문에 같은 스택을
+  비특권 사용자로 다시 확인했다 — Xvnc 가 `/tmp/.X11-unix` 를 직접 만들고
+  루프백만 바인드하며(대조군: `-localhost` 없이는 0.0.0.0), openbox·vncconfig
+  도 그대로 뜬다.
 
 ### 알려진 한계
 
