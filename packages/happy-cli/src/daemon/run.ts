@@ -63,16 +63,20 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  AI_AUTH_SELECTION_CAPABILITY,
   applyAppliedAiAuthSourceEnv,
   applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
   buildSpawnRequestEnvironment,
   captureSaycodeAgentEnvironment,
+  honorsManagedAiCredentials,
   overlayManagedCredentialEnvironment,
   SESSION_LINEAGE_ENV_PREFIXES,
   stripManagedCredentialConflicts,
+  verifyAiAuthSelection,
 } from './sessionEnv';
+import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -314,6 +318,7 @@ export const initialMachineMetadata: MachineMetadata = {
     protocolVersion: AUTOMATION_PROTOCOL_VERSION,
   },
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
+  aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
 };
 
 async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest): Promise<boolean> {
@@ -1648,15 +1653,22 @@ export async function startDaemon(): Promise<void> {
           primaryDirectory: directory,
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
-        const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
+        const finishSpawn = async (
+          spawn: Promise<SpawnSessionResult>,
+          appliedAiAuthSource?: AiAuthSource,
+        ): Promise<SpawnSessionResult> => {
           try {
             const result = await spawn;
             if (result.type !== 'success') {
               cleanupStagedDeferredContinuationContext();
             }
-            if (result.type !== 'success' || options.additionalDirectories === undefined) return result;
+            if (result.type !== 'success') return result;
+            const reported: SpawnSessionResult = appliedAiAuthSource === undefined
+              ? result
+              : { ...result, appliedAiAuthSource };
+            if (options.additionalDirectories === undefined) return reported;
             return {
-              ...result,
+              ...reported,
               additionalDirectories: {
                 version: 1,
                 accepted: additionalDirectoryResult.accepted,
@@ -1741,7 +1753,12 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
-        const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(options.agent);
+        // `machine-personal` 은 이 머신의 자기 로그인을 고른 것이다. 관리 자격을
+        // 해석해 두면 overlayManagedCredentialEnvironment 가 마지막에 덮어 항상
+        // 이긴다 — 그래서 해석 자체를 하지 않는다.
+        const managedAiCredentialEnvironment = honorsManagedAiCredentials(options.aiAuthSelection)
+          ? await resolveManagedAiCredentialEnvironment(options.agent)
+          : {};
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables),
@@ -1969,6 +1986,14 @@ export async function startDaemon(): Promise<void> {
             ),
             requireInitialPromptAck,
           ), Object.keys(managedAiCredentialEnvironment).length > 0);
+          // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
+          const tmuxSelection = verifyAiAuthSelection(options.aiAuthSelection, tmuxEnv);
+          if (tmuxSelection.rejection) {
+            return finishSpawn(Promise.resolve({
+              type: 'error',
+              errorMessage: tmuxSelection.rejection,
+            }));
+          }
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -2012,7 +2037,7 @@ export async function startDaemon(): Promise<void> {
               pidToAwaiter,
               label: '(tmux)',
               logger,
-            }));
+            }), tmuxSelection.appliedSource);
           } else {
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
@@ -2064,6 +2089,14 @@ export async function startDaemon(): Promise<void> {
             ),
             requireInitialPromptAck,
           ), Object.keys(managedAiCredentialEnvironment).length > 0);
+          // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
+          const spawnSelection = verifyAiAuthSelection(options.aiAuthSelection, spawnEnvironment);
+          if (spawnSelection.rejection) {
+            return finishSpawn(Promise.resolve({
+              type: 'error',
+              errorMessage: spawnSelection.rejection,
+            }));
+          }
 
           return finishSpawn(spawnTrackedHappyProcess({
             args,
@@ -2072,7 +2105,7 @@ export async function startDaemon(): Promise<void> {
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
-          }));
+          }), spawnSelection.appliedSource);
         }
 
         // This should never be reached, but TypeScript requires a return statement

@@ -29,7 +29,9 @@ import {
 import {
     HAPPY_AI_AUTH_CONNECTION_VERSION_ENV,
     HAPPY_AI_AUTH_SOURCE_ENV,
+    normalizeAiAuthSource,
     resolveAppliedAiAuthSource,
+    type AiAuthSource,
 } from '@/usage/aiAuthSource'
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
@@ -270,4 +272,114 @@ export function applyConfirmedPromptDeliveryFlag(
     if (required) return { ...env, HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' }
     const { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: _removed, ...rest } = env
     return rest
+}
+
+/**
+ * Which credential the requester explicitly chose for **one** BYOS spawn.
+ *
+ * Two kinds only, and the set is closed. A value outside it is rejected rather
+ * than ignored: a silently dropped selection runs the session on whatever the
+ * machine would have used anyway, which is the outcome the person was trying
+ * to avoid by choosing.
+ */
+export const AI_AUTH_SELECTION_KINDS = ['machine-personal', 'org-bundle'] as const
+
+export type AiAuthSelectionKind = (typeof AI_AUTH_SELECTION_KINDS)[number]
+
+export type AiAuthSelection = { kind: AiAuthSelectionKind }
+
+/**
+ * Advertised in `MachineMetadataSchema` so a client can tell this daemon
+ * understands the selection *before* sending one. `spawn-happy-session`
+ * destructures its parameters, so an older daemon drops an unknown field
+ * without a word — the version says which kinds the daemon knows, which the
+ * mere presence of a field cannot.
+ */
+export const AI_AUTH_SELECTION_CAPABILITY = { version: 1 as const }
+
+/** Rejects anything outside the closed set, following the spawn-parameter convention. */
+export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefined {
+    if (value === undefined) return undefined
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('AI auth selection must be an object')
+    }
+    const kind = (value as { kind?: unknown }).kind
+    if (typeof kind !== 'string' || !(AI_AUTH_SELECTION_KINDS as readonly string[]).includes(kind)) {
+        throw new Error(
+            `AI auth selection kind must be one of: ${AI_AUTH_SELECTION_KINDS.join(', ')}`,
+        )
+    }
+    return { kind: kind as AiAuthSelectionKind }
+}
+
+/**
+ * Whether the daemon still overlays its own managed credential on this spawn.
+ *
+ * `machine-personal` means "this machine's own login", so the daemon must not
+ * put its managed credential on top — `overlayManagedCredentialEnvironment`
+ * applies last and would otherwise always win. Without a selection nothing
+ * changes.
+ */
+export function honorsManagedAiCredentials(selection: AiAuthSelection | undefined): boolean {
+    return selection?.kind !== 'machine-personal'
+}
+
+/** A source the daemon applied itself — never the machine's own login. */
+const DAEMON_APPLIED_AI_AUTH_SOURCES: readonly AiAuthSource[] = [
+    'org-bundle',
+    'platform-glm',
+    'platform-gateway',
+]
+
+export type AiAuthSelectionVerdict = {
+    /** What the finished environment says this spawn actually spends. */
+    appliedSource: AiAuthSource
+    /** Set when the spawn must not run; the text is shown to the requester. */
+    rejection?: string
+}
+
+/**
+ * Compares an explicit selection against the **finished** child environment.
+ *
+ * The only signal is `HAPPY_AI_AUTH_SOURCE`, which `applyAppliedAiAuthSourceEnv`
+ * has just written onto that environment. It is the daemon's own statement of
+ * what it applied and the exact value the usage ledger records, so the check
+ * and the ledger can never disagree. Nothing here inspects the machine for
+ * credentials: an organisation Claude bundle is installed into machine-global
+ * files by `cswap` and reaches no environment variable, so a file probe would
+ * be a second, weaker opinion.
+ *
+ * The two directions are not symmetric, because the available evidence is not:
+ *
+ *  - `machine-personal` is confirmed **negatively** — the daemon knows it
+ *    overlaid nothing of its own. `unknown` is that confirmation, not a gap.
+ *    Which personal account is in play stays out of reach (there is no
+ *    secret-free identifier for a BYOS login), and this increment does not
+ *    pretend otherwise.
+ *  - `org-bundle` needs a **positive** statement that the daemon applied an
+ *    organisation bundle. Today no code path produces one, so the selection is
+ *    refused rather than quietly served by whatever else the machine has: a
+ *    substitution is exactly what choosing was meant to prevent.
+ */
+export function verifyAiAuthSelection(
+    selection: AiAuthSelection | undefined,
+    env: Record<string, string>,
+): AiAuthSelectionVerdict {
+    const appliedSource = normalizeAiAuthSource(env[HAPPY_AI_AUTH_SOURCE_ENV])
+    if (selection === undefined) return { appliedSource }
+    if (selection.kind === 'org-bundle') {
+        if (appliedSource === 'org-bundle') return { appliedSource }
+        return {
+            appliedSource,
+            rejection: `AI auth selection 'org-bundle' was requested but this daemon could not`
+                + ` confirm an organisation bundle for the spawn (applied source: '${appliedSource}').`
+                + ` The session is not started with a substitute credential.`,
+        }
+    }
+    if (!DAEMON_APPLIED_AI_AUTH_SOURCES.includes(appliedSource)) return { appliedSource }
+    return {
+        appliedSource,
+        rejection: `AI auth selection 'machine-personal' was requested but the spawn environment`
+            + ` applies '${appliedSource}' credentials instead.`,
+    }
 }

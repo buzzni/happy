@@ -10,6 +10,10 @@ import {
     applyAppliedAiAuthSourceEnv,
     overlayManagedCredentialEnvironment,
     SESSION_LINEAGE_ENV_PREFIXES,
+    AI_AUTH_SELECTION_KINDS,
+    parseAiAuthSelection,
+    honorsManagedAiCredentials,
+    verifyAiAuthSelection,
 } from './sessionEnv'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
@@ -486,5 +490,97 @@ describe('부모 리뷰 수정: 연결 버전 잔재', () => {
         })
         expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
         expect(child.HAPPY_AI_AUTH_CONNECTION_VERSION).toBeUndefined()
+    })
+})
+
+/**
+ * BYOS 인증 원천 선택 (P3 증분 1).
+ *
+ * 검증 신호는 **최종 child env 의 `HAPPY_AI_AUTH_SOURCE`** 하나다. 그 값은
+ * daemon 이 `applyAppliedAiAuthSourceEnv` 로 직접 심은 자기 진술이고, 원장이
+ * 기록하는 값과 같은 값이다. 다른 신호(파일·프로세스 탐지)를 새로 만들면
+ * 원장과 다른 답을 낼 수 있다.
+ */
+describe('parseAiAuthSelection', () => {
+    it('선택이 없으면 undefined 를 돌려준다', () => {
+        expect(parseAiAuthSelection(undefined)).toBeUndefined()
+    })
+
+    it.each(AI_AUTH_SELECTION_KINDS)('닫힌 집합의 %s 를 받는다', (kind) => {
+        expect(parseAiAuthSelection({ kind })).toEqual({ kind })
+    })
+
+    it.each([
+        { label: '닫힌 집합 밖의 종류', value: { kind: 'platform-gateway' } },
+        { label: '대소문자만 다른 값', value: { kind: 'Machine-Personal' } },
+        { label: 'kind 누락', value: {} },
+        { label: '문자열', value: 'machine-personal' },
+        { label: '배열', value: [{ kind: 'machine-personal' }] },
+        { label: 'null', value: null },
+    ])('$label 은 거절한다 — 조용히 무시하면 선택이 없는 것처럼 돈다', ({ value }) => {
+        expect(() => parseAiAuthSelection(value)).toThrow(/AI auth selection/)
+    })
+})
+
+describe('honorsManagedAiCredentials', () => {
+    it('선택이 없으면 기존 동작 그대로 관리 자격이 이긴다', () => {
+        expect(honorsManagedAiCredentials(undefined)).toBe(true)
+    })
+
+    it('org-bundle 을 고르면 관리 자격을 그대로 덮는다', () => {
+        expect(honorsManagedAiCredentials({ kind: 'org-bundle' })).toBe(true)
+    })
+
+    it('machine-personal 을 고르면 관리 자격을 덮지 않는다', () => {
+        expect(honorsManagedAiCredentials({ kind: 'machine-personal' })).toBe(false)
+    })
+})
+
+describe('verifyAiAuthSelection', () => {
+    const envWith = (source?: string): Record<string, string> => (
+        source === undefined ? {} : { HAPPY_AI_AUTH_SOURCE: source }
+    )
+
+    it('선택이 없으면 무엇이 적용됐든 통과한다 (기존 동작)', () => {
+        for (const source of [undefined, 'platform-glm', 'org-bundle', 'personal-api-key']) {
+            expect(verifyAiAuthSelection(undefined, envWith(source)).rejection).toBeUndefined()
+        }
+    })
+
+    it('적용된 원천을 그대로 보고한다', () => {
+        expect(verifyAiAuthSelection(undefined, envWith('platform-glm')).appliedSource).toBe('platform-glm')
+        expect(verifyAiAuthSelection(undefined, envWith()).appliedSource).toBe('unknown')
+    })
+
+    it.each(['platform-glm', 'platform-gateway', 'org-bundle'])(
+        'machine-personal 인데 %s 가 적용됐으면 거절한다',
+        (source) => {
+            const verdict = verifyAiAuthSelection({ kind: 'machine-personal' }, envWith(source))
+            expect(verdict.rejection).toBeDefined()
+            expect(verdict.rejection).toContain(source)
+            expect(verdict.rejection).toContain('machine-personal')
+        },
+    )
+
+    it.each([undefined, 'personal-subscription', 'personal-api-key'])(
+        'machine-personal 에 daemon 이 아무 자격도 안 덮었으면(%s) 통과한다',
+        (source) => {
+            expect(verifyAiAuthSelection({ kind: 'machine-personal' }, envWith(source)).rejection)
+                .toBeUndefined()
+        },
+    )
+
+    it.each([undefined, 'platform-glm', 'personal-api-key'])(
+        'org-bundle 인데 그 자격이 확인되지 않으면(%s) 거절한다 — 대체하지 않는다',
+        (source) => {
+            const verdict = verifyAiAuthSelection({ kind: 'org-bundle' }, envWith(source))
+            expect(verdict.rejection).toBeDefined()
+            expect(verdict.rejection).toContain('org-bundle')
+        },
+    )
+
+    it('org-bundle 이 실제로 적용됐다고 daemon 이 진술하면 통과한다', () => {
+        expect(verifyAiAuthSelection({ kind: 'org-bundle' }, envWith('org-bundle')).rejection)
+            .toBeUndefined()
     })
 })

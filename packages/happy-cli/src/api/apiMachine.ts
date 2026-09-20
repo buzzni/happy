@@ -21,6 +21,7 @@ import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '..
 import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
+import { parseAiAuthSelection } from '@/daemon/sessionEnv';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
@@ -952,6 +953,7 @@ export class ApiMachineClient {
                 bootstrapFiles,
                 initialPrompt,
                 exitAfterFirstTurn,
+                aiAuthSelection,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -968,6 +970,9 @@ export class ApiMachineClient {
                 throw new Error('MCP config project id must be a non-empty string');
             }
             const validExpectedConnectors = readExpectedConnectors(expectedConnectors);
+            // 닫힌 집합 밖의 선택은 거절한다. 조용히 무시하면 선택이 없는 것처럼
+            // 돌아 사용자가 고르지 않은 자격으로 세션이 실행된다.
+            const validAiAuthSelection = parseAiAuthSelection(aiAuthSelection);
             const validAdditionalDirectories = parseAdditionalDirectories(additionalDirectories);
             if (validAdditionalDirectories && agent !== 'claude' && agent !== 'codex') {
                 throw new Error('Additional directories are only supported for Claude and Codex');
@@ -1034,6 +1039,7 @@ export class ApiMachineClient {
                 bootstrapFiles,
                 initialPrompt,
                 exitAfterFirstTurn,
+                aiAuthSelection: validAiAuthSelection,
             });
 
             switch (result.type) {
@@ -1052,6 +1058,9 @@ export class ApiMachineClient {
                         sessionId: result.sessionId,
                         ...(result.additionalDirectories
                             ? { additionalDirectories: result.additionalDirectories }
+                            : {}),
+                        ...(result.appliedAiAuthSource
+                            ? { appliedAiAuthSource: result.appliedAiAuthSource }
                             : {}),
                     };
 

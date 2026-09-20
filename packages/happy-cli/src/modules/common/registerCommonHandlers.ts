@@ -7,6 +7,8 @@ import { dirname, join, basename, extname, resolve } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
+import type { AiAuthSelection } from '@/daemon/sessionEnv';
+import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { validatePath } from './pathSecurity';
 import { ensureDirectory } from './ensureDirectory';
 import { createIgnoreMatcher } from './ignorePresets';
@@ -300,12 +302,26 @@ export interface SpawnSessionOptions {
     filterInheritedCredentials?: boolean;
     /** Restrict an unattended automation session to repository reads. */
     permissionMode?: PermissionMode;
+    /**
+     * Which credential the requester explicitly chose for this spawn.
+     *
+     * Only sent by a client that saw the daemon advertise
+     * `MachineMetadata.aiAuthSelection`. Absent means "whatever the machine
+     * would have used", which is the behaviour that predates the choice.
+     */
+    aiAuthSelection?: AiAuthSelection;
 }
 
 export type SpawnSessionResult =
     | {
         type: 'success';
         sessionId: string;
+        /**
+         * Which credential the daemon actually applied, as the usage ledger
+         * names it. Reported so a requester can tell what ran from what it
+         * asked for; `unknown` is an answer, not a missing value.
+         */
+        appliedAiAuthSource?: AiAuthSource;
         additionalDirectories?: {
             version: 1;
             accepted: string[];
