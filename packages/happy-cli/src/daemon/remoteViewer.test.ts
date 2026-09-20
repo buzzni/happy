@@ -13,10 +13,16 @@ import {
     readDisplayFromEnviron,
     readFlagFromCmdline,
     viewerProcessMatchesLease,
-    VIEWER_TOOLS,
     resolveViewerProfileDir,
     selectViewerSlot,
     validateViewerKey,
+    selectViewerBackend,
+    missingViewerTools,
+    desiredViewerTools,
+    buildXvncArgs,
+    buildOpenboxArgs,
+    buildOpenboxConfig,
+    buildVncConfigArgs,
 } from './remoteViewer'
 
 describe('buildXvfbArgs', () => {
@@ -115,7 +121,7 @@ describe('planViewerInstall', () => {
     })
 
     it('reports a manual command rather than claiming success without sudo', () => {
-        const plan = planViewerInstall({ missing: VIEWER_TOOLS.slice(), canSudo: false, platform: 'linux' })
+        const plan = planViewerInstall({ missing: ['Xvnc', 'websockify'], canSudo: false, platform: 'linux' })
 
         expect(plan.action).toBe('manual')
         expect(plan.command).toContain('sudo')
@@ -349,5 +355,170 @@ describe('viewer process ownership', () => {
             ['/usr/bin/websockify', '127.0.0.1:6081', '127.0.0.1:5901', ''].join('\0'),
             lease,
         )).toBe(false)
+    })
+})
+
+describe('selectViewerBackend', () => {
+    const none = {
+        hasXvnc: false,
+        hasXvfb: false,
+        hasX11vnc: false,
+        hasWebsockify: false,
+        hasWindowManager: false,
+        hasVncConfig: false,
+    }
+
+    it('fills the window exactly when the server can resize and a WM can refit the browser', () => {
+        const backend = selectViewerBackend({
+            ...none, hasXvnc: true, hasWebsockify: true, hasWindowManager: true,
+        })
+
+        expect(backend).toEqual({ kind: 'xvnc', resizeMode: 'remote', windowManager: true })
+    })
+
+    // Resizing the desktop under a browser window nothing can re-maximize
+    // trades letterboxing for a window that no longer covers the screen —
+    // strictly worse than scaling the whole screen down.
+    it('scales instead of resizing when no window manager can follow the change', () => {
+        const backend = selectViewerBackend({ ...none, hasXvnc: true, hasWebsockify: true })
+
+        expect(backend).toEqual({ kind: 'xvnc', resizeMode: 'scale', windowManager: false })
+    })
+
+    it('keeps working on machines that only have the Xvfb/x11vnc pair', () => {
+        const backend = selectViewerBackend({
+            ...none, hasXvfb: true, hasX11vnc: true, hasWebsockify: true, hasWindowManager: true,
+        })
+
+        // x11vnc has no SetDesktopSize hook at all, so asking for a remote
+        // resize there would leave the original clipping in place.
+        expect(backend).toEqual({ kind: 'xvfb-x11vnc', resizeMode: 'scale', windowManager: true })
+    })
+
+    it('prefers the resizable server when a machine has both stacks', () => {
+        const backend = selectViewerBackend({
+            hasXvnc: true, hasXvfb: true, hasX11vnc: true, hasWebsockify: true, hasWindowManager: true,
+            hasVncConfig: true,
+        })
+
+        expect(backend?.kind).toBe('xvnc')
+    })
+
+    it('has no backend at all when no display server is installed', () => {
+        expect(selectViewerBackend({ ...none, hasWebsockify: true })).toBeNull()
+        expect(selectViewerBackend({ ...none, hasXvfb: true, hasWebsockify: true })).toBeNull()
+    })
+})
+
+describe('viewer tool requirements', () => {
+    const legacyMachine = {
+        hasXvnc: false,
+        hasXvfb: true,
+        hasX11vnc: true,
+        hasWebsockify: true,
+        hasWindowManager: false,
+        hasVncConfig: false,
+    }
+
+    it('blocks the screen only on what it cannot run without', () => {
+        expect(missingViewerTools(legacyMachine)).toEqual([])
+        expect(missingViewerTools({ ...legacyMachine, hasWebsockify: false })).toEqual(['websockify'])
+    })
+
+    it('asks for the resizable server when no display server exists', () => {
+        const missing = missingViewerTools({
+            hasXvnc: false, hasXvfb: false, hasX11vnc: false, hasWebsockify: false, hasWindowManager: false,
+            hasVncConfig: false,
+        })
+
+        expect(missing).toContain('Xvnc')
+        expect(missing).toContain('websockify')
+        expect(missing).not.toContain('Xvfb')
+    })
+
+    // A machine whose screen already works must not be told it is broken —
+    // but installing is exactly when it should be upgraded to exact fill.
+    it('upgrades a working legacy machine only when the user installs', () => {
+        expect(desiredViewerTools(legacyMachine)).toEqual(['Xvnc', 'openbox', 'vncconfig'])
+        expect(desiredViewerTools({
+            ...legacyMachine, hasXvnc: true, hasWindowManager: true, hasVncConfig: true,
+        })).toEqual([])
+    })
+
+    it('maps the upgrade tools onto packages that actually provide them', () => {
+        const plan = planViewerInstall({ missing: ['Xvnc', 'openbox'], canSudo: true, platform: 'linux' })
+
+        expect(plan.command).toContain('tigervnc-standalone-server')
+        expect(plan.command).toContain('openbox')
+        expect(plan.command).not.toContain(' Xvnc')
+    })
+})
+
+describe('buildXvncArgs', () => {
+    it('serves the display it creates, on loopback only', () => {
+        const args = buildXvncArgs({ display: ':100', vncPort: 5901, width: 1920, height: 1080 })
+
+        expect(args[0]).toBe(':100')
+        expect(args).toContain('-rfbport')
+        expect(args[args.indexOf('-rfbport') + 1]).toBe('5901')
+        expect(args).toContain('-localhost')
+        expect(args.join(' ')).toContain('-geometry 1920x1080')
+    })
+
+    it('accepts client resize requests — the whole point of this backend', () => {
+        const args = buildXvncArgs({ display: ':99', vncPort: 5900, width: 1920, height: 1080 })
+
+        expect(args).toContain('-AcceptSetDesktopSize=1')
+    })
+
+    // Xvnc's default security type needs a password file the daemon never
+    // creates; without this it exits at startup and the screen never opens.
+    it('runs without VNC authentication, as the relay is the only way in', () => {
+        const args = buildXvncArgs({ display: ':99', vncPort: 5900, width: 1920, height: 1080 })
+
+        expect(args.join(' ')).toContain('-SecurityTypes=None')
+    })
+})
+
+describe('window manager for the viewer display', () => {
+    it('keeps every window maximized and undecorated', () => {
+        const config = buildOpenboxConfig()
+
+        expect(config).toContain('<maximized>yes</maximized>')
+        expect(config).toContain('<decor>no</decor>')
+    })
+
+    it('runs against our own config rather than whatever the machine has', () => {
+        const args = buildOpenboxArgs({ configPath: '/home/u/.happy/browser-viewers/openbox.xml' })
+
+        expect(args).toContain('--config-file')
+        expect(args[args.indexOf('--config-file') + 1]).toBe('/home/u/.happy/browser-viewers/openbox.xml')
+        expect(args).toContain('--sm-disable')
+    })
+})
+
+describe('Xvnc process ownership', () => {
+    it('matches only the Xvnc that serves this lease', () => {
+        const lease = { display: ':100', vncPort: 5901, webPort: 6081 }
+
+        expect(viewerProcessMatchesLease(
+            'xvnc',
+            ['/usr/bin/Xvnc', ':100', '-geometry', '1920x1080', '-rfbport', '5901', ''].join('\0'),
+            lease,
+        )).toBe(true)
+        expect(viewerProcessMatchesLease(
+            'xvnc',
+            ['/usr/bin/Xvnc', ':99', '-geometry', '1920x1080', '-rfbport', '5900', ''].join('\0'),
+            lease,
+        )).toBe(false)
+    })
+})
+
+describe('TigerVNC clipboard helper', () => {
+    // Without vncconfig the paste reaches Xvnc and stops there — measured:
+    // no owner for the X CLIPBOARD selection at all, so xclip reports the
+    // target as unavailable while the viewer believes it pasted.
+    it('runs headless so the helper window never sits on the user\'s screen', () => {
+        expect(buildVncConfigArgs()).toEqual(['-nowin'])
     })
 })
