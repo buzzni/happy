@@ -35,14 +35,19 @@ export interface ChannelTurnEnqueueDeps<T> {
  */
 export function enqueueChannelTurn<T>(
     input: { text: string; requestId: string },
-    mode: T,
+    /**
+     * Read at the push, not before it. Both engines build the mode from live session state that
+     * the continuation prepare and the prompt record above can still move; taking it as a value
+     * at the call site would freeze a mode from before those ran.
+     */
+    mode: () => T,
     deps: ChannelTurnEnqueueDeps<T>,
 ): void {
     const deferredTurn = deps.deferredContinuation.prepare(input.text, { fromChannel: true });
     const queuedText = deferredTurn?.text ?? input.text;
     try {
         if (deferredTurn) deps.onDeferredText?.(queuedText);
-        deps.queue.pushIsolated(queuedText, mode, [], input.requestId);
+        deps.queue.pushIsolated(queuedText, mode(), [], input.requestId);
         deferredTurn?.commit();
     } catch (error) {
         // The continuation must not be consumed by a turn that never reached the queue.

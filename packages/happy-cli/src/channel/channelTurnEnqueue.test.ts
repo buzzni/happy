@@ -25,7 +25,7 @@ describe('enqueueChannelTurn', () => {
         const q = queue();
         q.push('desktop typed this', MODE);
 
-        enqueueChannelTurn({ text: 'from telegram', requestId: 'req-1' }, MODE, {
+        enqueueChannelTurn({ text: 'from telegram', requestId: 'req-1' }, () => MODE, {
             queue: q,
             deferredContinuation: NO_CONTINUATION,
         });
@@ -43,8 +43,8 @@ describe('enqueueChannelTurn', () => {
 
     it('keeps two channel turns apart instead of batching them into one ask', async () => {
         const q = queue();
-        enqueueChannelTurn({ text: 'first', requestId: 'req-1' }, MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
-        enqueueChannelTurn({ text: 'second', requestId: 'req-2' }, MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
+        enqueueChannelTurn({ text: 'first', requestId: 'req-1' }, () => MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
+        enqueueChannelTurn({ text: 'second', requestId: 'req-2' }, () => MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
 
         expect((await q.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-1']);
         expect((await q.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-2']);
@@ -57,7 +57,7 @@ describe('enqueueChannelTurn', () => {
      */
     it('carries the request id to the consumer', async () => {
         const q = queue();
-        enqueueChannelTurn({ text: 'work', requestId: 'req-9' }, MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
+        enqueueChannelTurn({ text: 'work', requestId: 'req-9' }, () => MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
         expect((await q.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-9']);
     });
 
@@ -67,7 +67,7 @@ describe('enqueueChannelTurn', () => {
         const recorded: string[] = [];
         const q = queue();
 
-        enqueueChannelTurn({ text: 'plain', requestId: 'req-1' }, MODE, {
+        enqueueChannelTurn({ text: 'plain', requestId: 'req-1' }, () => MODE, {
             queue: q,
             deferredContinuation: { prepare: () => ({ text: 'transcript + plain', commit, rollback }) },
             onDeferredText: text => recorded.push(text),
@@ -85,7 +85,7 @@ describe('enqueueChannelTurn', () => {
         const q = queue();
         q.close();
 
-        expect(() => enqueueChannelTurn({ text: 'plain', requestId: 'req-1' }, MODE, {
+        expect(() => enqueueChannelTurn({ text: 'plain', requestId: 'req-1' }, () => MODE, {
             queue: q,
             deferredContinuation: { prepare: () => ({ text: 'transcript + plain', commit, rollback }) },
         })).toThrow();
@@ -95,9 +95,36 @@ describe('enqueueChannelTurn', () => {
         expect(commit).not.toHaveBeenCalled();
     });
 
+    /**
+     * The mode is read at the push, not at the call. Both engines build it from live session
+     * state, and the two steps above — preparing the continuation and recording the prompt — run
+     * first and can still move that state. Taking the mode as a value at the call site froze a
+     * mode from before they ran; this pins the order so the refactor cannot drift back.
+     */
+    it('reads the mode after the continuation is prepared, not before', () => {
+        const order: string[] = [];
+        const q = queue();
+
+        enqueueChannelTurn({ text: 'plain', requestId: 'req-1' }, () => {
+            order.push('mode');
+            return MODE;
+        }, {
+            queue: q,
+            deferredContinuation: {
+                prepare: () => {
+                    order.push('prepare');
+                    return { text: 'transcript + plain', commit: () => {}, rollback: () => {} };
+                },
+            },
+            onDeferredText: () => { order.push('record'); },
+        });
+
+        expect(order).toEqual(['prepare', 'record', 'mode']);
+    });
+
     it('asks the continuation consumer to treat the text as channel input', () => {
         const prepare = vi.fn(() => null);
-        enqueueChannelTurn({ text: '/clear', requestId: 'req-1' }, MODE, {
+        enqueueChannelTurn({ text: '/clear', requestId: 'req-1' }, () => MODE, {
             queue: queue(),
             deferredContinuation: { prepare },
         });

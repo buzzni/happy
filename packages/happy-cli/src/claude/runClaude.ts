@@ -931,7 +931,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         // Mirrors the ordinary input path's continuation handling: on the first accepted turn
         // of a resumed session the provider receives the prior transcript, and the visible
         // user row stays the text the person actually wrote.
-        enqueue: (input) => enqueueChannelTurn(input, currentEnhancedMode(), {
+        enqueue: (input) => enqueueChannelTurn(input, currentEnhancedMode, {
             queue: messageQueue,
             deferredContinuation,
             onDeferredText: recordAppPrompt,

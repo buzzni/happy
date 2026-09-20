@@ -1084,14 +1084,14 @@ export async function runCodex(opts: {
             // a close can arrive after the server has already committed the row.
             return outcome.ok ? { ok: true as const } : { ok: false as const, provenNotWritten: false };
         },
-        enqueue: (input) => enqueueChannelTurn(input, {
+        enqueue: (input) => enqueueChannelTurn(input, () => ({
             permissionMode: currentPermissionMode || 'default',
             model: currentModel,
             appendSystemPrompt: currentAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
             saycodePromptBlocks: currentSaycodePromptBlocks,
             effort: currentEffort,
-        }, { queue: messageQueue, deferredContinuation }),
+        }), { queue: messageQueue, deferredContinuation }),
         now: () => Date.now(),
     });
     session.rpcHandlerManager.registerHandler('channel-prompt', async (params: unknown) =>
