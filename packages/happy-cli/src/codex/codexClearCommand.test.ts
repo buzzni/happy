@@ -1,71 +1,35 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import { enqueueCodexUserText } from './codexClearCommand';
+import { shouldHandleCodexClear } from './codexClearCommand';
 
-describe('enqueueCodexUserText', () => {
-    it('queues /clear in isolation instead of batching it into a model prompt', () => {
-        const mode = { permissionMode: 'default' as const };
-        const queue = {
-            push: vi.fn(),
-            pushIsolateAndClear: vi.fn(),
-        };
-
-        const result = enqueueCodexUserText({
-            text: '  /clear  ',
-            mode,
-            queue,
-        });
-
-        expect(result).toBe('clear');
-        expect(queue.pushIsolateAndClear).toHaveBeenCalledWith('  /clear  ', mode, undefined);
-        expect(queue.push).not.toHaveBeenCalled();
+/**
+ * The consumer-side gate (Saycode specs/desktop-messenger-channels — R1/R5).
+ *
+ * A channel turn never passes the enqueue-side parser, so this is the only place left that can
+ * refuse to read relayed text as session control. `/clear` here wipes the Codex thread state —
+ * an external sender must not be able to reach it, and the daemon advertises `codex`, so this
+ * engine is reachable from a channel today.
+ */
+describe('shouldHandleCodexClear', () => {
+    it('handles a local /clear', () => {
+        expect(shouldHandleCodexClear({ message: '/clear' })).toBe(true);
     });
 
-    it('passes attachments to normal queued messages', () => {
-        const mode = { permissionMode: 'default' as const };
-        const attachments = [{
-            data: new Uint8Array([1, 2, 3]),
-            mimeType: 'image/png',
-            name: 'screen.png',
-        }];
-        const queue = {
-            push: vi.fn(),
-            pushIsolateAndClear: vi.fn(),
-        };
-
-        const result = enqueueCodexUserText({
-            text: 'inspect this image',
-            mode,
-            queue,
-            attachments,
-        });
-
-        expect(result).toBe('queued');
-        expect(queue.push).toHaveBeenCalledWith('inspect this image', mode, attachments);
-        expect(queue.pushIsolateAndClear).not.toHaveBeenCalled();
+    it('refuses a channel /clear — the reset an external sender must not reach', () => {
+        expect(shouldHandleCodexClear({ message: '/clear', requestIds: ['req-1'] })).toBe(false);
     });
 
-    it('passes attachments to isolated clear messages', () => {
-        const mode = { permissionMode: 'default' as const };
-        const attachments = [{
-            data: new Uint8Array([4, 5, 6]),
-            mimeType: 'image/jpeg',
-            name: 'photo.jpg',
-        }];
-        const queue = {
-            push: vi.fn(),
-            pushIsolateAndClear: vi.fn(),
-        };
+    it('leaves ordinary channel text alone either way', () => {
+        expect(shouldHandleCodexClear({ message: 'what changed today?', requestIds: ['req-1'] })).toBe(false);
+        expect(shouldHandleCodexClear({ message: 'what changed today?' })).toBe(false);
+    });
 
-        const result = enqueueCodexUserText({
-            text: '/clear',
-            mode,
-            queue,
-            attachments,
-        });
-
-        expect(result).toBe('clear');
-        expect(queue.pushIsolateAndClear).toHaveBeenCalledWith('/clear', mode, attachments);
-        expect(queue.push).not.toHaveBeenCalled();
+    /**
+     * An empty array is not "no channel". It arrives from the same field and means the message
+     * carries no ids *yet*; reading it as local input would restore the hole for anything that
+     * populates `requestIds` after the queue hands the message over.
+     */
+    it('treats an empty id list as local, matching the queue contract', () => {
+        expect(shouldHandleCodexClear({ message: '/clear', requestIds: [] })).toBe(true);
     });
 });

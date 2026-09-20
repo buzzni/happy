@@ -337,6 +337,59 @@ describe('fresh execution approval', () => {
         expect(acceptance.authorize(decision)).toMatchObject({ ok: false });
         expect(acceptance.beginExecution(request.requestId)).toBe(true);
     });
+    /**
+     * A refusal from Core must be a refusal here. The waiter resolves either way, so treating the
+     * decision as "an answer arrived" rather than reading it grants the permit that
+     * `beginExecution` consumes — the request then runs on an explicit deny.
+     */
+    it('refuses to run on a deny, and the deny is final', async () => {
+        let ready!: { requestId: string; runtimeId: string; nonce: string };
+        const { acceptance } = build({ requestApproval: input => { ready = input; } });
+        await acceptance.accept(request);
+        const prepared = acceptance.prepareExecution(request.requestId);
+
+        expect(acceptance.authorize({
+            requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId,
+            nonce: ready.nonce, decision: 'deny',
+        })).toMatchObject({ ok: true, applied: true });
+
+        expect(await prepared).toBe(false);
+        expect(acceptance.beginExecution(request.requestId)).toBe(false);
+        // And a late allow cannot revive it: the round is over, not merely unanswered.
+        expect(acceptance.authorize({
+            requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId,
+            nonce: ready.nonce, decision: 'allow',
+        })).toMatchObject({ ok: false });
+        expect(acceptance.beginExecution(request.requestId)).toBe(false);
+    });
+
+    /**
+     * The nonce is what binds an answer to *this* approval round. Without comparing it, any reply
+     * naming the request answers whichever round is open — including one raised after the reply
+     * was minted. The existing test above changes `expectedRuntimeId`, which exercises the runtime
+     * binding, not this one.
+     */
+    it('refuses a reply whose nonce belongs to no round, and leaves the round open', async () => {
+        let ready!: { requestId: string; runtimeId: string; nonce: string };
+        const { acceptance } = build({ requestApproval: input => { ready = input; } });
+        await acceptance.accept(request);
+        const prepared = acceptance.prepareExecution(request.requestId);
+
+        expect(acceptance.authorize({
+            requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId,
+            nonce: '00000000-0000-4000-8000-000000000000', decision: 'allow',
+        })).toMatchObject({ ok: false });
+        expect(acceptance.beginExecution(request.requestId)).toBe(false);
+
+        // Still open: a bogus reply must not consume the waiter the real one is coming for.
+        expect(acceptance.authorize({
+            requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId,
+            nonce: ready.nonce, decision: 'allow',
+        })).toMatchObject({ ok: true, applied: true });
+        expect(await prepared).toBe(true);
+        expect(acceptance.beginExecution(request.requestId)).toBe(true);
+    });
+
     it('cancellation wins while awaiting Core and after allow but before actual dispatch', async () => {
         let ready!: { nonce: string };
         const { acceptance } = build({ requestApproval: input => { ready = input; } });
@@ -347,6 +400,40 @@ describe('fresh execution approval', () => {
         expect(acceptance.authorize({ requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId, nonce: ready.nonce, decision: 'allow' })).toMatchObject({ ok: false });
         expect(acceptance.beginExecution(request.requestId)).toBe(false);
     });
+    /**
+     * The order that matters most: authority was granted and then withdrawn before anything ran.
+     * The test above cancels *while* Core is still deciding, which the waiter handles; this one
+     * cancels after the permit exists, so only the check at the dispatch boundary can stop it.
+     */
+    it('a cancel that lands after allow still stops the dispatch', async () => {
+        let ready!: { requestId: string; runtimeId: string; nonce: string };
+        const { acceptance } = build({ requestApproval: input => { ready = input; } });
+        await acceptance.accept(request);
+        const prepared = acceptance.prepareExecution(request.requestId);
+        expect(acceptance.authorize({
+            requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId,
+            nonce: ready.nonce, decision: 'allow',
+        })).toMatchObject({ ok: true, applied: true });
+        expect(await prepared).toBe(true);
+
+        expect(acceptance.cancel({ requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId }))
+            .toMatchObject({ ok: true, state: 'cancelled' });
+        expect(acceptance.beginExecution(request.requestId)).toBe(false);
+    });
+
+    /** The opposite order: once the dispatch is claimed, a cancel reports the turn it cannot stop. */
+    it('a cancel that lands after the dispatch reports already-started', async () => {
+        const { acceptance } = build();
+        await acceptance.accept(request);
+        expect(await acceptance.prepareExecution(request.requestId)).toBe(true);
+        expect(acceptance.beginExecution(request.requestId)).toBe(true);
+
+        expect(acceptance.cancel({ requestId: request.requestId, expectedRuntimeId: request.expectedRuntimeId }))
+            .toMatchObject({ ok: true, state: 'already-started' });
+        // And it cannot be started a second time by the cancel having touched the state.
+        expect(acceptance.beginExecution(request.requestId)).toBe(false);
+    });
+
     it('times out offline without running or accepting a late allow', async () => {
         vi.useFakeTimers();
         try {
