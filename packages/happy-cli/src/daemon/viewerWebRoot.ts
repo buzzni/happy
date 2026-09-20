@@ -122,31 +122,30 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         if (clipboard && clipboard.readText) {
             if (readingClipboard) return
             readingClipboard = true
-            // A browser that has the method but refuses outright (insecure
-            // context) throws here rather than rejecting. Leaving the flag
-            // set would disable pasting for the rest of the session.
-            let read: Promise<string> | null = null
-            try {
-                read = clipboard.readText()
-            } catch (error) {
+            const readText = (text: string) => {
+                readingClipboard = false
+                pasteToRemote(text)
+            }
+            const readFailed = (error: unknown) => {
                 readingClipboard = false
                 if (win.console) win.console.warn('[aplus] clipboard read refused:', error)
                 armNativePaste()
-                return
             }
             // Reading the clipboard directly, rather than waiting for the
             // browser's own paste event: Chrome decides the paste target when
             // it handles the shortcut, and a canvas is not editable, so
             // focusing a textarea mid-keydown produces no paste at all
             // (measured in a real Chrome against the live screen).
-            read.then((text: string) => {
-                readingClipboard = false
-                pasteToRemote(text)
-            }, (error: unknown) => {
-                readingClipboard = false
-                if (win.console) win.console.warn('[aplus] clipboard read refused:', error)
-                armNativePaste()
-            })
+            //
+            // The try/catch is not redundant with the rejection handler: a
+            // browser that has the method but refuses outright (insecure
+            // context) throws instead of rejecting, and leaving the in-flight
+            // flag set would disable pasting for the rest of the session.
+            try {
+                clipboard.readText().then(readText, readFailed)
+            } catch (error) {
+                readFailed(error)
+            }
             return
         }
         armNativePaste()

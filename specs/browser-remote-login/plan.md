@@ -297,7 +297,9 @@ textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드
 ### 검증
 
 - 유닛: `viewerWebRoot` 31개(신규), `remoteViewer` 51개, viewer API 37개 —
-  관련 8파일 179개 통과 + CLI 빌드(`tsc --noEmit`) 통과. 3라운드에서
+  관련 8파일 179개 통과 + CLI 빌드(`tsc --noEmit`) 통과 — **빌드는 별도로
+  exit code 를 확인해야 한다**. `src/test-setup.ts` 가 빌드 실패를 삼키고
+  있었다(아래). 3라운드에서
   **스택 기동 시퀀스 자체**에 처음으로 테스트를 붙였다(그전까지 모든 테스트가
   재사용 경로만 탔다): 슬롯 포트를 테스트가 직접 listen 해 readiness 대기를
   즉시 끝내고, Xvnc·vncconfig·openbox 가 뜨는지와 서빙되는 페이지의 resize
@@ -329,6 +331,18 @@ textarea 경로로 내려간다. (Chrome 은 첫 붙여넣기에서 클립보드
   비특권 사용자로 다시 확인했다 — Xvnc 가 `/tmp/.X11-unix` 를 직접 만들고
   루프백만 바인드하며(대조군: `-localhost` 없이는 0.0.0.0), openbox·vncconfig
   도 그대로 뜬다.
+
+### 테스트 하네스가 타입 에러를 삼키고 있었다 (2026-09-20)
+
+이 작업의 셀프 리뷰 2·3라운드에서 "CLI 빌드 통과"라고 두 번 보고했는데
+**사실이 아니었다**. `src/test-setup.ts` 는 `pnpm build` 를 돌리고도 exit
+code 를 보지 않고, stderr 에 `Command failed with exit code` 가 들어 있을
+때만 던진다. `tsc` 는 진단을 stdout 으로 내고 pnpm 은 `Exit status 2` 라고
+쓰므로 **타입 에러는 그 검사에 걸리지 않는다** — 스위트는 낡은 `dist` 로
+전부 통과하고, 실패는 CI 에서야 드러났다(TS18047).
+
+exit code 를 보도록 고쳤고, 같은 타입 에러를 다시 넣어 스위트가 실제로
+멈추는 것을 확인했다.
 
 ### 알려진 한계
 
