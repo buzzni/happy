@@ -39,6 +39,12 @@ function grantResponse(overrides: Record<string, unknown> = {}) {
       maxInputChars: 8000,
       modelMaxInputTokens: 512,
       relayDeadlineAt: Date.now() + 1000,
+      // The client negotiates timing v2, so a compliant server always answers on it.
+      timingVersion: 2,
+      requestId: 'client-1',
+      issuedAt: Date.now(),
+      ttlMs: 60_000,
+      relayTtlMs: 1_000,
       ...overrides,
     },
     aiModelPolicy: {
@@ -451,20 +457,21 @@ describe('grant rejection detail', () => {
 
   // 서버 시계가 앞서면 상한을 넘는다. 클라이언트 시계를 고정하고 발급값만 앞당겨
   // 재현한다 — fake timer 를 전진시키면 TTL 이 줄어들 뿐이라 이 결함이 재현되지 않는다.
-  it('reports how far the deadlines were off when a clock offset pushes them past the ceiling', async () => {
+  // This used to assert the opposite: a server 5s ahead produced `expiresAt-too-far` /
+  // `relayDeadlineAt-too-far` and the whole turn fell back to the plain send path. That
+  // rejection was the production defect, and timing v2 exists to remove it.
+  it('accepts a correctly issued grant from a server whose clock is ahead', async () => {
     const lines = captureDebug()
     const serverNow = Date.now() + 5_000
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({
+      issuedAt: serverNow,
       expiresAt: serverNow + 60_000,
       relayDeadlineAt: serverNow + 1_000,
     }))))
 
-    expect(await resolveDifficultyRouting(baseInput)).toBeNull()
+    expect(await resolveDifficultyRouting(baseInput)).not.toBeNull()
     const text = dump(lines)
-    expect(text).toContain('expiresAt-too-far')
-    expect(text).toContain('relayDeadlineAt-too-far')
-    expect(text).toContain('expiresInMs')
-    expect(text).toContain('relayDeadlineInMs')
+    expect(text).not.toContain('too-far')
   })
 
   it('still accepts a grant issued exactly at the contract TTL', async () => {
@@ -474,11 +481,12 @@ describe('grant rejection detail', () => {
     expect(await resolveDifficultyRouting(baseInput)).not.toBeNull()
   })
 
-  it('rejects an already expired grant and a non-numeric deadline', async () => {
+  it('rejects a self-contradictory grant and a non-numeric deadline', async () => {
     const lines = captureDebug()
+    // Rejected because the server's own values disagree, not because of any local clock.
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ expiresAt: Date.now() - 1 }))))
     expect(await resolveDifficultyRouting(baseInput)).toBeNull()
-    expect(dump(lines)).toContain('expiresAt-past')
+    expect(dump(lines)).toContain('ttlMs-mismatch')
 
     const other = captureDebug()
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ relayDeadlineAt: 'soon' }))))
@@ -500,3 +508,324 @@ describe('grant rejection detail', () => {
   })
 })
 
+/**
+ * The production failure: a correctly issued grant was rejected because the client compared
+ * the server's absolute instants against its own wall clock. With `timingVersion: 2` the
+ * server ships durations and the client only checks server values against each other.
+ */
+describe('timing v2 grant negotiation', () => {
+  const originalConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
+
+  // The circuit breaker is module state and earlier failing tests in this file leave it armed.
+  // A tripped breaker short-circuits to P1 before the relay, which would make these tests pass
+  // without ever exercising what they claim to. Each one starts from a fresh module.
+  let resolve: typeof resolveDifficultyRouting
+
+  beforeEach(async () => {
+    vi.resetModules()
+    resolve = (await import('./difficultyRoutingRuntime')).resolveDifficultyRouting
+    vi.useFakeTimers()
+    vi.setSystemTime(1_700_000_000_000)
+    process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'https://web.example.test/api/me/mcp-config?project_id=p1'
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+    if (originalConfigUrl === undefined) delete process.env.HAPPY_APLUS_MCP_CONFIG_URL
+    else process.env.HAPPY_APLUS_MCP_CONFIG_URL = originalConfigUrl
+  })
+
+  /** Built entirely from the server's own clock, which may sit anywhere relative to ours. */
+  function v2Grant(serverNow: number, over: Record<string, unknown> = {}) {
+    return {
+      ok: true,
+      grant: {
+        version: 1,
+        grantId: 'grant-1',
+        policyRevision: 7,
+        expiresAt: serverNow + 60_000,
+        sourceMachineId: 'source-1',
+        hostMachineId: 'host-1',
+        hostProcessKeyId: 'key-1',
+        hostProcessPublicKey: encodeBase64(new Uint8Array(32).fill(1)),
+        maxInputChars: 8000,
+        modelMaxInputTokens: 512,
+        relayDeadlineAt: serverNow + 1_000,
+        timingVersion: 2,
+        requestId: 'client-1',
+        issuedAt: serverNow,
+        ttlMs: 60_000,
+        relayTtlMs: 1_000,
+        ...over,
+      },
+      aiModelPolicy: { source: 'unrestricted', allowedSelectionKeys: null, defaultSelectionKey: null },
+      signedGrant: 'signed-grant',
+    }
+  }
+
+  function bodyOf(mock: ReturnType<typeof vi.fn>, call = 0) {
+    return JSON.parse((mock.mock.calls[call][1] as { body: string }).body)
+  }
+
+  it('asks for the duration contract', async () => {
+    const fetchMock = vi.fn(async () => Response.json(v2Grant(Date.now())))
+    vi.stubGlobal('fetch', fetchMock)
+    await resolve(baseInput)
+    expect(bodyOf(fetchMock).timingVersion).toBe(2)
+  })
+
+  // The exact production numbers: 60002 / 1002 against ceilings of 60000 / 1000.
+  it('accepts the grant that the absolute-instant check used to reject', async () => {
+    const fetchMock = vi.fn(async () => Response.json(v2Grant(Date.now() + 2)))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const decision = await resolve(baseInput)
+    expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p1-local' } })
+  })
+
+  it('decides the same way however far the two clocks sit apart', async () => {
+    for (const skewMs of [2, -2, 2_000, -2_000, 86_400_000, -86_400_000]) {
+      const fetchMock = vi.fn(async () => Response.json(v2Grant(Date.now() + skewMs)))
+      vi.stubGlobal('fetch', fetchMock)
+      const decision = await resolve(baseInput)
+      expect(decision?.event.ev, `skew ${skewMs}`).toMatchObject({ result: { classifierSource: 'p1-local' } })
+    }
+  })
+
+  // Server values must agree with each other; that is the only arithmetic left.
+  it('refuses a grant whose own durations contradict its instants', async () => {
+    for (const over of [
+      { ttlMs: 59_999 },
+      { relayTtlMs: 999 },
+      { issuedAt: 1 },
+      { ttlMs: 60_001, expiresAt: 1 },
+      { relayTtlMs: 0 },
+      { relayTtlMs: 1_001 },
+      { ttlMs: '60000' },
+      { issuedAt: -1 },
+    ]) {
+      const fetchMock = vi.fn(async () => Response.json(v2Grant(Date.now(), over)))
+      vi.stubGlobal('fetch', fetchMock)
+      expect(await resolve(baseInput), JSON.stringify(over)).toBeNull()
+    }
+  })
+
+  // An old server answers the v2 request on the v1 contract. That is not a negotiated v2
+  // grant, and a client that treated it as one would be back to comparing foreign instants.
+  it('refuses a grant that claims any contract but the negotiated one', async () => {
+    for (const timingVersion of [1, 3, '2', null, undefined]) {
+      const body = grantResponse() as { grant: Record<string, unknown> }
+      if (timingVersion === undefined) delete body.grant.timingVersion
+      else body.grant.timingVersion = timingVersion
+      vi.stubGlobal('fetch', vi.fn(async () => Response.json(body)))
+      expect(await resolve(baseInput), String(timingVersion)).toBeNull()
+    }
+  })
+
+  it('does not read a legacy answer as a successful negotiation', async () => {
+    const legacy = grantResponse() as { grant: Record<string, unknown> }
+    for (const field of ['timingVersion', 'requestId', 'issuedAt', 'ttlMs', 'relayTtlMs']) {
+      delete legacy.grant[field]
+    }
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(legacy)))
+    expect(await resolve(baseInput)).toBeNull()
+  })
+
+  // `unsupported` carries no policy snapshot, so there is no authority for a local override.
+  it('keeps the existing send path when the host cannot speak the contract', async () => {
+    const fetchMock = vi.fn(async () => Response.json({ ok: false, reason: 'unsupported', timingVersion: 2 }))
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await resolve(baseInput)).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * One deadline is taken when the turn starts and is never extended. Everything downstream is
+ * measured against it on the monotonic clock, so a wall-clock adjustment mid-turn cannot buy
+ * or destroy budget, and a result that lands after it is never applied.
+ */
+describe('timing v2 execution budget', () => {
+  const originalConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
+  const RELAY_PROMPT = 'Add a save button to the draft form'
+
+  // The circuit breaker is module state and earlier failing tests in this file leave it armed.
+  // A tripped breaker short-circuits to P1 before the relay, which would make these tests pass
+  // without ever exercising what they claim to. Each one starts from a fresh module.
+  let resolve: typeof resolveDifficultyRouting
+
+  beforeEach(async () => {
+    vi.resetModules()
+    resolve = (await import('./difficultyRoutingRuntime')).resolveDifficultyRouting
+    vi.useFakeTimers()
+    vi.setSystemTime(1_700_000_000_000)
+    process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'https://web.example.test/api/me/mcp-config?project_id=p1'
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+    if (originalConfigUrl === undefined) delete process.env.HAPPY_APLUS_MCP_CONFIG_URL
+    else process.env.HAPPY_APLUS_MCP_CONFIG_URL = originalConfigUrl
+  })
+
+  function relayOk() {
+    return {
+      ok: true,
+      result: {
+        version: 1, timingVersion: 2, requestId: 'client-1', policyRevision: 7,
+        status: 'ok', difficulty: 'hard', classifierRevision: 'rev-1', elapsedMs: 1,
+      },
+    }
+  }
+
+  /** `grantMs` is spent answering the grant, `relayMs` answering the relay. */
+  function wire(over: { grantMs?: number; relayMs?: number; relayBody?: unknown } = {}) {
+    const relayBodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (url: string, init: { body: string }) => {
+      if (String(url).includes('/grant')) {
+        if (over.grantMs) await vi.advanceTimersByTimeAsync(over.grantMs)
+        return Response.json(grantResponse())
+      }
+      relayBodies.push(JSON.parse(init.body))
+      if (over.relayMs) await vi.advanceTimersByTimeAsync(over.relayMs)
+      return Response.json(over.relayBody ?? relayOk())
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return { fetchMock, relayBodies }
+  }
+
+  it('sends the relay a duration, never an instant borrowed from the grant', async () => {
+    const { relayBodies } = wire({ grantMs: 200 })
+    await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+
+    expect(relayBodies).toHaveLength(1)
+    expect(relayBodies[0]).not.toHaveProperty('deadlineAt')
+    expect(relayBodies[0].timingVersion).toBe(2)
+    // 750 total, 200 already spent on the grant, and sealing costs a little more.
+    expect(relayBodies[0].remainingMs).toBeGreaterThan(0)
+    expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(550)
+  })
+
+  // Receiving the grant must not restart the TTL: the server issued it before we saw it.
+  it('does not restart the budget when the grant arrives', async () => {
+    const { relayBodies } = wire({ grantMs: 700 })
+    await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayBodies[0]?.remainingMs).toBeLessThanOrEqual(50)
+  })
+
+  // With the default 1000ms relay budget the 750ms turn deadline always wins, so the
+  // round-trip deduction is invisible. A server that issues a tighter budget exposes it.
+  it('charges the grant round trip against the budget the server issued', async () => {
+    const relayBodies: Record<string, unknown>[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: { body: string }) => {
+      if (String(url).includes('/grant')) {
+        await vi.advanceTimersByTimeAsync(200)
+        const now = Date.now()
+        return Response.json(grantResponse({
+          issuedAt: now, relayTtlMs: 400, relayDeadlineAt: now + 400,
+        }))
+      }
+      relayBodies.push(JSON.parse(init.body))
+      return Response.json(relayOk())
+    }))
+
+    await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayBodies).toHaveLength(1)
+    // 400 issued, 200 already spent on the round trip → at most 200 left, not a fresh 400.
+    expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(200)
+    expect(relayBodies[0].remainingMs).toBeGreaterThan(0)
+  })
+
+  it('never dispatches a relay once the budget is spent', async () => {
+    for (const grantMs of [750, 900]) {
+      const { fetchMock, relayBodies } = wire({ grantMs })
+      const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+      expect(relayBodies, `grant took ${grantMs}ms`).toHaveLength(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(decision).toBeNull()
+    }
+  })
+
+  // The budget is checked when the grant lands and again right before the relay. Asserting
+  // WHICH one fired keeps either from silently covering for the other being deleted.
+  it('stops as soon as the grant itself exhausted the budget', async () => {
+    const lines: unknown[] = []
+    // The runtime under test came from a reset module graph, so it holds a different logger
+    // instance than this file's top-level import. Spy on the one it actually calls.
+    const freshLogger = (await import('./ui/logger')).logger
+    vi.spyOn(freshLogger, 'debug').mockImplementation((message: string, ...args: unknown[]) => {
+      lines.push({ message, args })
+    })
+    wire({ grantMs: 800 })
+    expect(await resolve({ ...baseInput, contentText: RELAY_PROMPT })).toBeNull()
+    expect(JSON.stringify(lines)).toContain('budget-spent')
+    expect(JSON.stringify(lines)).not.toContain('budget-spent-before-relay')
+  })
+
+  it('discards a relay answer that lands after the deadline', async () => {
+    for (const relayMs of [750, 900]) {
+      const { relayBodies } = wire({ relayMs })
+      const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+      expect(relayBodies, `relay took ${relayMs}ms`).toHaveLength(1)
+      expect(decision?.event.ev).not.toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+    }
+  })
+
+  it('still applies a relay answer that lands just inside the deadline', async () => {
+    const { relayBodies } = wire({ relayMs: 700 })
+    const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayBodies).toHaveLength(1)
+    expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+  })
+
+  // The breaker counts real elapsed time, so a wall-clock jump can neither arm nor release it.
+  it('holds the circuit breaker open on the monotonic clock', async () => {
+    const relayCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/classify')).length
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('/grant')) return Response.json(grantResponse())
+      return Response.json({ ok: true, result: { version: 1, timingVersion: 2, requestId: 'client-1', policyRevision: 7, status: 'error' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    for (let i = 0; i < 3; i++) await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayCalls()).toBe(3)
+
+    // Armed: the next turn short-circuits to P1 without a relay.
+    await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayCalls()).toBe(3)
+
+    // A wall clock leap is not elapsed time.
+    vi.setSystemTime(1_700_000_000_000 + 3_600_000)
+    await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayCalls()).toBe(3)
+    vi.setSystemTime(1_700_000_000_000)
+
+    // Real elapsed time does release it.
+    await vi.advanceTimersByTimeAsync(30_001)
+    await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+    expect(relayCalls()).toBe(4)
+  })
+
+  // A wall-clock adjustment mid-turn must not move the deadline in either direction.
+  it('ignores a wall clock jump in the middle of the turn', async () => {
+    for (const jumpMs of [3_600_000, -3_600_000]) {
+      const relayBodies: Record<string, unknown>[] = []
+      vi.stubGlobal('fetch', vi.fn(async (url: string, init: { body: string }) => {
+        if (String(url).includes('/grant')) {
+          await vi.advanceTimersByTimeAsync(200)
+          vi.setSystemTime(1_700_000_000_000 + jumpMs)
+          return Response.json(grantResponse())
+        }
+        relayBodies.push(JSON.parse(init.body))
+        return Response.json(relayOk())
+      }))
+
+      const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
+      expect(relayBodies, `jump ${jumpMs}`).toHaveLength(1)
+      expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(550)
+      expect(relayBodies[0].remainingMs).toBeGreaterThan(400)
+      expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+      vi.setSystemTime(1_700_000_000_000)
+    }
+  })
+})
