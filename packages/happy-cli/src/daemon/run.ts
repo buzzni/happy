@@ -315,7 +315,13 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
 };
 
-async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest): Promise<boolean> {
+/**
+ * The host owns this call's deadline and passes its own signal: recomputing one here from
+ * `request.deadlineAt` would read an absolute instant produced on another machine, and a v2
+ * request has no such field at all. The body echoes the negotiated contract so the server can
+ * refuse a signed v2 grant presented as v1.
+ */
+async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest, signal: AbortSignal): Promise<boolean> {
   try {
     const response = await fetch(`${resolveAplusDifficultyRoutingOrigin()}/api/me/difficulty-routing/validate-grant`, {
       method: 'POST',
@@ -330,8 +336,9 @@ async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelay
         hostMachineId: request.hostMachineId,
         hostProcessKeyId: request.hostProcessKeyId,
         policyRevision: request.policyRevision,
+        ...(request.timingVersion === 2 ? { timingVersion: 2 as const } : {}),
       }),
-      signal: AbortSignal.timeout(Math.max(1, Math.min(250, request.deadlineAt - Date.now()))),
+      signal,
     });
     if (!response.ok) return false;
     const body = await response.json().catch(() => null) as { ok?: unknown } | null;
@@ -918,6 +925,10 @@ export async function startDaemon(): Promise<void> {
         protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
         hostProcessKeyId: difficultyRoutingHostKey.id,
         hostProcessPublicKey: encodeBase64(difficultyRoutingHostKey.publicKey),
+        // Advertised from the base metadata, not only from `host.capability()`: the readiness
+        // refresh rebuilds `difficultyRouting` from this object, so anything missing here is
+        // dropped the first time readiness changes.
+        timingVersions: [1, 2],
         classifier: {
           kind: 'transformers-binary',
           modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
