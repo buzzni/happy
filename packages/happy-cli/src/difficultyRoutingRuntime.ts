@@ -53,6 +53,10 @@ type GrantOk = {
     maxInputChars: 8000
     modelMaxInputTokens: 512
     relayDeadlineAt: number
+    timingVersion: 2
+    issuedAt: number
+    ttlMs: number
+    relayTtlMs: number
   }
   signedGrant: string
   aiModelPolicy: DifficultyRoutingAiModelPolicy
@@ -75,6 +79,16 @@ type RelayResponse = {
 
 const STICKY_IDLE_RESET_MS = 60 * 60 * 1000
 const RUNTIME_ROUTING_DEADLINE_MS = 750
+
+/**
+ * Process-relative and never adjusted, unlike `Date.now()`. Every budget, deadline and
+ * elapsed measurement in this turn rides on it, so a wall-clock adjustment mid-turn can
+ * neither buy nor destroy budget. Logged timestamps and persisted sticky state keep using
+ * the wall clock — those are meant to be comparable across processes.
+ */
+function monotonicNow(): number {
+  return performance.now()
+}
 let circuitBreakerUntil = 0
 let consecutiveFailures = 0
 
@@ -152,7 +166,9 @@ export async function resolveDifficultyRouting(
     logRoutingOutcome('skipped', { reason: 'missing-authorization', sessionId: input.sessionId, clientRequestId })
     return null
   }
-  const deadline = Date.now() + RUNTIME_ROUTING_DEADLINE_MS
+  // Taken once, before the grant request, and never extended.
+  const m0 = monotonicNow()
+  const deadline = m0 + RUNTIME_ROUTING_DEADLINE_MS
   let grant: GrantRequestResult
   try {
     grant = await requestGrant(input, clientRequestId, deadline)
@@ -168,7 +184,15 @@ export async function resolveDifficultyRouting(
     if ((grant.reason === 'host-unavailable' || grant.reason === 'unsupported') && grant.aiModelPolicy) {
       const p1 = classifyDifficultyHeuristic(prompt)
       noteRemoteFailure()
-      logRoutingOutcome('grant-rejected-falling-back', { clientRequestId, reason: grant.reason, failureStage: grant.failureStage })
+      // `failed` travels with this outcome too: a timing-contract rejection now degrades here
+      // instead of being skipped, and naming which conditions failed is the only local signal
+      // that tells a version mismatch apart from a server that is answering wrongly.
+      logRoutingOutcome('grant-rejected-falling-back', {
+        clientRequestId,
+        reason: grant.reason,
+        failureStage: grant.failureStage,
+        failed: grant.failed?.join(','),
+      })
       return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, null, undefined, 'fallback-p1', grant.aiModelPolicy), clientRequestId, grant.reason)
     }
     logRoutingOutcome('skipped', {
@@ -183,13 +207,34 @@ export async function resolveDifficultyRouting(
     return null
   }
 
+  // The server issued this grant BEFORE we saw it, so the round trip is charged against its
+  // life rather than restarting it. `routeDeadline` can only ever shrink the turn deadline.
+  const m1 = monotonicNow()
+  const elapsedMs = m1 - m0
+  const grantLeftMs = Math.max(0, grant.value.grant.ttlMs - elapsedMs)
+  const relayLeftMs = Math.max(0, grant.value.grant.relayTtlMs - elapsedMs)
+  const routeDeadline = Math.min(deadline, m1 + grantLeftMs, m1 + relayLeftMs)
+  if (grantLeftMs <= 0 || relayLeftMs <= 0 || monotonicNow() >= routeDeadline) {
+    logRoutingOutcome('skipped', { reason: 'budget-spent', clientRequestId, elapsedMs: Math.round(elapsedMs) })
+    return null
+  }
+
   const p1 = classifyDifficultyHeuristic(prompt)
-  if (p1.confident || shouldReusePreviousDifficultyForContinuation(prompt, freshPreviousDifficulty(input.state)) || circuitBreakerUntil > Date.now()) {
+  if (p1.confident || shouldReusePreviousDifficultyForContinuation(prompt, freshPreviousDifficulty(input.state)) || circuitBreakerUntil > monotonicNow()) {
     return logDecision('p1-local', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, undefined, 'p1-local', grant.value.aiModelPolicy), clientRequestId)
   }
 
   try {
     const sealedText = sealText(prompt, grant.value.grant.hostProcessPublicKey)
+    // Sealing and serialization cost time too, so the budget is read here and not earlier.
+    // Under fake timers nothing elapses between the check above and this one, so no test
+    // distinguishes deleting this guard — it exists for the real elapsed time of sealing.
+    // It must never become `Math.max(1, …)`: reviving a spent budget sends a dead request.
+    const remainingMs = Math.floor(routeDeadline - monotonicNow())
+    if (remainingMs <= 0) {
+      logRoutingOutcome('skipped', { reason: 'budget-spent-before-relay', clientRequestId })
+      return null
+    }
     const relay = await requestRelay({
       requestId: clientRequestId,
       signedGrant: grant.value.signedGrant,
@@ -197,9 +242,25 @@ export async function resolveDifficultyRouting(
       sourceMachineId: grant.value.grant.sourceMachineId,
       hostMachineId: grant.value.grant.hostMachineId,
       hostProcessKeyId: grant.value.grant.hostProcessKeyId,
-      deadlineAt: Math.min(grant.value.grant.relayDeadlineAt, deadline),
+      remainingMs: Math.min(remainingMs, grant.value.grant.relayTtlMs),
       sealedText,
-    }, deadline)
+    }, routeDeadline)
+    // The answer arrived, but an answer past the deadline is not an answer. A fetch mock or a
+    // transport that ignores abort can still resolve late; this is what stops it being applied.
+    // Discarding the stale answer is not a reason to discard the turn's routing too: the
+    // local decision costs no network and no budget, and the wall time is already spent
+    // whichever way this goes. Returning null here made a slow server strictly worse than a
+    // failed one, because the branch directly below already degrades to exactly this.
+    if (monotonicNow() >= routeDeadline) {
+      noteRemoteFailure()
+      logRoutingOutcome('relay-result-late', { clientRequestId })
+      return logDecision(
+        'fallback-p1',
+        buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, undefined, 'fallback-p1', grant.value.aiModelPolicy),
+        clientRequestId,
+        'relay-result-late',
+      )
+    }
     if (relay.status !== 'ok' || !relay.difficulty) {
       noteRemoteFailure()
       return logDecision('fallback-p1', buildLocalDecision(input, prompt, clientRequestId, p1.difficulty, grant.value.grant.policyRevision, relay.status, 'fallback-p1', grant.value.aiModelPolicy), clientRequestId, relay.status)
@@ -341,8 +402,10 @@ async function requestGrant(
       sessionId: input.sessionId,
       policyVersion: DIFFICULTY_ROUTING_POLICY_VERSION,
       intent: input.meta?.difficultyRoutingIntent,
+      timingVersion: 2,
     }),
-    signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+    // Floored: the monotonic clock is fractional and AbortSignal.timeout rejects non-integers.
+    signal: AbortSignal.timeout(Math.max(1, Math.floor(deadline - monotonicNow()))),
   })
   const body = await response.json().catch(() => null) as unknown
   if (!body || typeof body !== 'object') return { ok: false, failureStage: 'parse' }
@@ -360,7 +423,7 @@ async function requestGrant(
   if (record.ok !== true) {
     return { ok: false, failureStage: 'response', reason, aiModelPolicy: parseAiModelPolicy(record.aiModelPolicy) }
   }
-  const validation = validateGrant(record, { clientRequestId, sourceMachineId: input.sourceMachineId }, Date.now())
+  const validation = validateGrant(record, { clientRequestId, sourceMachineId: input.sourceMachineId })
   if (!validation.ok) {
     return {
       ok: false,
@@ -368,6 +431,14 @@ async function requestGrant(
       failed: validation.failed,
       expiresInMs: validation.expiresInMs,
       relayDeadlineInMs: validation.relayDeadlineInMs,
+      // A rejection confined to the timing contract says this server has not shipped v2 — it
+      // does not say the response was garbage. The CLI is published to npm and upgraded
+      // independently of the aplus API, so a client can legitimately run ahead of the
+      // deployment; dropping the policy snapshot there turned routing off for every such user
+      // with nothing but a debug line. Carry it, and let the caller degrade to the local
+      // decision the way it already does for an unsupported host.
+      reason: isTimingContractMismatch(validation.failed) ? 'unsupported' : undefined,
+      aiModelPolicy: parseAiModelPolicy(record.aiModelPolicy),
     }
   }
   return { ok: true, value: validation.value }
@@ -380,7 +451,7 @@ async function requestRelay(input: {
   sourceMachineId: string
   hostMachineId: string
   hostProcessKeyId: string
-  deadlineAt: number
+  remainingMs: number
   sealedText: ReturnType<typeof sealText>
 }, deadline: number): Promise<RelayResponse> {
   const response = await fetch(`${resolveAplusApiOrigin()}/api/me/difficulty-routing/classify`, {
@@ -398,10 +469,12 @@ async function requestRelay(input: {
       sourceMachineId: input.sourceMachineId,
       hostMachineId: input.hostMachineId,
       hostProcessKeyId: input.hostProcessKeyId,
-      deadlineAt: input.deadlineAt,
+      timingVersion: 2,
+      remainingMs: input.remainingMs,
       sealedText: input.sealedText,
     }),
-    signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+    // Floored: the monotonic clock is fractional and AbortSignal.timeout rejects non-integers.
+    signal: AbortSignal.timeout(Math.max(1, Math.floor(deadline - monotonicNow()))),
   })
   if (!response.ok) return {
     version: 1,
@@ -433,20 +506,42 @@ async function requestRelay(input: {
  */
 type GrantFailureCode =
   | 'ok' | 'signedGrant' | 'grant' | 'version' | 'grantId' | 'policyRevision'
-  | 'expiresAt' | 'expiresAt-past' | 'expiresAt-too-far'
-  | 'sourceMachineId' | 'hostMachineId' | 'hostProcessKeyId' | 'hostProcessPublicKey'
-  | 'maxInputChars' | 'modelMaxInputTokens'
-  | 'relayDeadlineAt' | 'relayDeadlineAt-past' | 'relayDeadlineAt-too-far'
+  | 'expiresAt' | 'sourceMachineId' | 'hostMachineId' | 'hostProcessKeyId' | 'hostProcessPublicKey'
+  | 'maxInputChars' | 'modelMaxInputTokens' | 'relayDeadlineAt'
   | 'aiModelPolicy' | 'clientRequestId'
+  // Timing v2: every one of these compares server values with each other. None of them
+  // reads this machine's clock — that comparison is the defect this contract retires.
+  | 'timingVersion' | 'requestId' | 'issuedAt' | 'ttlMs' | 'relayTtlMs'
+  | 'ttlMs-mismatch' | 'relayTtlMs-mismatch'
 
 type GrantValidation =
   | { ok: true; value: GrantOk }
   | { ok: false; failed: GrantFailureCode[]; expiresInMs?: number; relayDeadlineInMs?: number }
 
+/**
+ * The timing v2 fields plus the two checks derived from them. A server that predates the
+ * contract fails all of these and nothing else, because the derived comparisons cannot hold
+ * when the durations they read are absent.
+ */
+const TIMING_CONTRACT_FAILURES = new Set<GrantFailureCode>([
+  'timingVersion', 'requestId', 'issuedAt', 'ttlMs', 'relayTtlMs',
+  'ttlMs-mismatch', 'relayTtlMs-mismatch',
+])
+
+/** True only when every reported cause is about the timing contract — one wrong field
+ * elsewhere means a broken grant, which carries no authority and gets no degradation. */
+function isTimingContractMismatch(failed: GrantFailureCode[]): boolean {
+  return failed.length > 0 && failed.every((code) => TIMING_CONTRACT_FAILURES.has(code))
+}
+
+/**
+ * Validates a negotiated timing v2 grant. Deliberately takes no clock: the previous version
+ * checked `expiresAt <= now + 60_000` against this machine's wall clock and rejected correctly
+ * issued grants whenever the server sat a couple of milliseconds ahead.
+ */
 function validateGrant(
   value: Record<string, unknown>,
   expected: { clientRequestId: string; sourceMachineId: string },
-  now: number,
 ): GrantValidation {
   const failed: GrantFailureCode[] = []
   const add = (code: GrantFailureCode, pass: boolean) => { if (!pass) failed.push(code) }
@@ -475,10 +570,6 @@ function validateGrant(
     ? record.expiresAt
     : null
   if (expiresAt === null) failed.push('expiresAt')
-  else {
-    add('expiresAt-past', expiresAt > now)
-    add('expiresAt-too-far', expiresAt <= now + 60_000)
-  }
 
   add('sourceMachineId', typeof record.sourceMachineId === 'string'
     && record.sourceMachineId === expected.sourceMachineId)
@@ -497,20 +588,32 @@ function validateGrant(
     ? record.relayDeadlineAt
     : null
   if (relayDeadlineAt === null) failed.push('relayDeadlineAt')
-  else {
-    add('relayDeadlineAt-past', relayDeadlineAt > now)
-    add('relayDeadlineAt-too-far', relayDeadlineAt <= now + 1_000)
-  }
 
-  if (failed.length > 0) {
-    return {
-      ok: false,
-      failed,
-      ...(expiresAt !== null ? { expiresInMs: expiresAt - now } : {}),
-      ...(relayDeadlineAt !== null ? { relayDeadlineInMs: relayDeadlineAt - now } : {}),
-    }
-  }
+  // A legacy answer to a v2 request is not a negotiated grant. Treating it as one would put
+  // this client straight back to comparing a foreign instant against its own clock.
+  add('timingVersion', record.timingVersion === 2)
+  add('requestId', record.requestId === expected.clientRequestId)
+  const issuedAt = nonNegativeSafeInteger(record.issuedAt)
+  const ttlMs = positiveSafeInteger(record.ttlMs)
+  const relayTtlMs = positiveSafeInteger(record.relayTtlMs)
+  add('issuedAt', issuedAt !== null)
+  add('ttlMs', ttlMs !== null && ttlMs <= 60_000)
+  add('relayTtlMs', relayTtlMs !== null && relayTtlMs <= 1_000 && (ttlMs === null || relayTtlMs <= ttlMs))
+  // The only arithmetic left: server values against server values.
+  add('ttlMs-mismatch', issuedAt !== null && ttlMs !== null && expiresAt !== null && expiresAt - issuedAt === ttlMs)
+  add('relayTtlMs-mismatch', issuedAt !== null && relayTtlMs !== null && relayDeadlineAt !== null
+    && relayDeadlineAt - issuedAt === relayTtlMs)
+
+  if (failed.length > 0) return { ok: false, failed }
   return { ok: true, value: value as unknown as GrantOk }
+}
+
+function nonNegativeSafeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+function positiveSafeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
 function parseAiModelPolicy(value: unknown): DifficultyRoutingAiModelPolicy | undefined {
@@ -631,7 +734,7 @@ function isRelayResponse(value: unknown, requestId: string, policyRevision: numb
 function noteRemoteFailure(): void {
   consecutiveFailures += 1
   if (consecutiveFailures >= 3) {
-    circuitBreakerUntil = Date.now() + 30_000
+    circuitBreakerUntil = monotonicNow() + 30_000
     consecutiveFailures = 0
   }
 }
