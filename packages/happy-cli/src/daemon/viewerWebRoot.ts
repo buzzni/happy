@@ -71,6 +71,16 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         if (rfb && typeof rfb.focus === 'function') rfb.focus()
     }
 
+    /** Presses Ctrl+V on the remote end, which is what actually pastes there. */
+    const pressPasteRemotely = () => {
+        const rfb = session()
+        if (!rfb) return
+        rfb.sendKey(CONTROL_L, 'ControlLeft', true)
+        rfb.sendKey(LOWERCASE_V, 'KeyV', true)
+        rfb.sendKey(LOWERCASE_V, 'KeyV', false)
+        rfb.sendKey(CONTROL_L, 'ControlLeft', false)
+    }
+
     const pasteToRemote = (text: string) => {
         const rfb = session()
         if (!rfb || !text) return
@@ -78,20 +88,26 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         // Filling the remote clipboard is only half the job: the focused
         // remote app still has to be told to paste, and ⌘V never reaches it
         // (noVNC maps Meta to Alt for the remote end).
-        win.setTimeout(() => {
-            rfb.sendKey(CONTROL_L, 'ControlLeft', true)
-            rfb.sendKey(LOWERCASE_V, 'KeyV', true)
-            rfb.sendKey(LOWERCASE_V, 'KeyV', false)
-            rfb.sendKey(CONTROL_L, 'ControlLeft', false)
-        }, PASTE_KEY_DELAY_MS)
+        win.setTimeout(pressPasteRemotely, PASTE_KEY_DELAY_MS)
     }
 
+    let nativePasteArrived = false
+
     const armNativePaste = () => {
+        nativePasteArrived = false
         textarea.value = ''
         textarea.focus()
-        // Backstop for browsers that produce no paste event at all: never
-        // strand the keyboard in the hidden textarea.
-        win.setTimeout(restoreFocus, FOCUS_RESTORE_MS)
+        win.setTimeout(() => {
+            // Never strand the keyboard in the hidden textarea.
+            restoreFocus()
+            if (nativePasteArrived) return
+            // No paste event came, so nothing of ours reached the remote end.
+            // Hand the shortcut over rather than drop it: the bridge took it
+            // in the capture phase, and swallowing it also breaks pasting
+            // *within* the remote desktop, which worked before this existed
+            // (reported live 2026-09-20).
+            pressPasteRemotely()
+        }, FOCUS_RESTORE_MS)
     }
 
     // Chrome asks for clipboard permission on the first read, and that
@@ -152,6 +168,7 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
     }, true)
 
     textarea.addEventListener('paste', (event: any) => {
+        nativePasteArrived = true
         const text = event.clipboardData ? event.clipboardData.getData('text') : ''
         if (typeof event.preventDefault === 'function') event.preventDefault()
         restoreFocus()

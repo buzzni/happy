@@ -555,3 +555,67 @@ describe('installViewerClipboardBridge when the clipboard read throws outright',
         expect(dom.textarea.focused).toBe(true)
     })
 })
+
+describe('installViewerClipboardBridge never swallows the shortcut', () => {
+    // Reported live (2026-09-20): after the bridge shipped, pasting *inside*
+    // the remote desktop stopped working too. The bridge takes the shortcut in
+    // the capture phase, and when the clipboard read is refused it produced
+    // nothing at all — so the remote end never even saw Ctrl+V. Intercepting
+    // and dropping is worse than not intercepting.
+    it('hands Ctrl+V to the remote end when the clipboard read is refused', async () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = () => Promise.reject(new Error('denied'))
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.runTimeouts()
+
+        // Nothing was read, so nothing may be pushed into the remote clipboard
+        // — but the keystroke itself has to arrive, or the remote desktop's own
+        // clipboard is unusable.
+        expect(rfb.pasted).toEqual([])
+        expect(rfb.keys).toEqual([
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_V, 'KeyV', true],
+            [LOWERCASE_V, 'KeyV', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    it('hands Ctrl+V over on a browser with no clipboard read at all', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        dom.runTimeouts()
+
+        expect(rfb.keys.length).toBeGreaterThan(0)
+    })
+
+    // The pass-through is a backstop, not a second paste: a browser that does
+    // deliver the paste event must not produce two Ctrl+V presses remotely.
+    it('does not double-press when the native paste event does arrive', async () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = () => Promise.reject(new Error('denied'))
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', ctrlKey: true, stopImmediatePropagation: () => { } })
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.firePaste({ clipboardData: { getData: () => 'from-native-paste' }, preventDefault: () => { } })
+        dom.runTimeouts()
+
+        expect(rfb.pasted).toEqual(['from-native-paste'])
+        expect(rfb.keys).toEqual([
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_V, 'KeyV', true],
+            [LOWERCASE_V, 'KeyV', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+})
