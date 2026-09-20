@@ -38,13 +38,13 @@ function grantResponse(overrides: Record<string, unknown> = {}) {
       hostProcessPublicKey: encodeBase64(new Uint8Array(32).fill(1)),
       maxInputChars: 8000,
       modelMaxInputTokens: 512,
-      relayDeadlineAt: Date.now() + 1000,
+      relayDeadlineAt: Date.now() + 3000,
       // The client negotiates timing v2, so a compliant server always answers on it.
       timingVersion: 2,
       requestId: 'client-1',
       issuedAt: Date.now(),
       ttlMs: 60_000,
-      relayTtlMs: 1_000,
+      relayTtlMs: 3_000,
       ...overrides,
     },
     aiModelPolicy: {
@@ -225,9 +225,9 @@ describe('difficulty routing runtime', () => {
     })
   })
 
-  // R11 은 원격 분류가 더하는 대기의 상한을 정한다. 실행측 몫은 750ms 인데, 이것은
-  // **grant 와 relay 가 나눠 쓰는 하나의 예산**이지 각각의 예산이 아니다. 각자 750ms 를
-  // 가지면 총 추가 대기가 1.5초가 되어 상한이 조용히 두 배가 된다 — 오류가 아니라
+  // R11 은 원격 분류가 더하는 대기의 상한을 정한다. 실행측 몫은 3000ms 인데, 이것은
+  // **grant 와 relay 가 나눠 쓰는 하나의 예산**이지 각각의 예산이 아니다. 각자 3000ms 를
+  // 가지면 총 추가 대기가 6초가 되어 상한이 조용히 두 배가 된다 — 오류가 아니라
   // "앱이 느려졌다"로만 나타난다. relay 에 독립 예산을 주는 변이가 기존 60건을 모두
   // 통과했으므로 여기서 직접 고정한다.
   //
@@ -242,7 +242,7 @@ describe('difficulty routing runtime', () => {
     }) as typeof AbortSignal.timeout)
     const fetchMock = vi.fn(async (url: string) => {
       if (String(url).includes('/grant')) {
-        vi.advanceTimersByTime(700)
+        vi.advanceTimersByTime(2950)
         return Response.json(grantResponse())
       }
       return Response.json({
@@ -257,8 +257,8 @@ describe('difficulty routing runtime', () => {
     // 1개뿐이면 relay 까지 가지 않은 것이므로 조용히 통과시키지 않고 여기서 실패한다.
     expect(timeouts.length).toBeGreaterThanOrEqual(2)
     const [grantBudget, relayBudget] = timeouts
-    expect(grantBudget).toBe(750)
-    // grant 가 700ms 를 썼으므로 relay 에 남은 것은 50ms 뿐이다.
+    expect(grantBudget).toBe(3000)
+    // grant 가 2950ms 를 썼으므로 relay 에 남은 것은 50ms 뿐이다.
     expect(relayBudget).toBeLessThanOrEqual(50)
     // 0 이하로 접히면 relay 가 즉시 중단되어 P2 가 사실상 꺼진다.
     expect(relayBudget).toBeGreaterThan(0)
@@ -267,7 +267,7 @@ describe('difficulty routing runtime', () => {
   it('accepts a server relay deadline computed after grant response latency', async () => {
     const fetchMock = vi.fn(async () => {
       vi.advanceTimersByTime(50)
-      return Response.json(grantResponse({ relayDeadlineAt: Date.now() + 1000 }))
+      return Response.json(grantResponse({ relayDeadlineAt: Date.now() + 3000 }))
     })
     vi.stubGlobal('fetch', fetchMock)
 
@@ -466,7 +466,7 @@ describe('grant rejection detail', () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({
       issuedAt: serverNow,
       expiresAt: serverNow + 60_000,
-      relayDeadlineAt: serverNow + 1_000,
+      relayDeadlineAt: serverNow + 3_000,
     }))))
 
     expect(await resolveDifficultyRouting(baseInput)).not.toBeNull()
@@ -552,12 +552,12 @@ describe('timing v2 grant negotiation', () => {
         hostProcessPublicKey: encodeBase64(new Uint8Array(32).fill(1)),
         maxInputChars: 8000,
         modelMaxInputTokens: 512,
-        relayDeadlineAt: serverNow + 1_000,
+        relayDeadlineAt: serverNow + 3_000,
         timingVersion: 2,
         requestId: 'client-1',
         issuedAt: serverNow,
         ttlMs: 60_000,
-        relayTtlMs: 1_000,
+        relayTtlMs: 3_000,
         ...over,
       },
       aiModelPolicy: { source: 'unrestricted', allowedSelectionKeys: null, defaultSelectionKey: null },
@@ -574,6 +574,7 @@ describe('timing v2 grant negotiation', () => {
     vi.stubGlobal('fetch', fetchMock)
     await resolve(baseInput)
     expect(bodyOf(fetchMock).timingVersion).toBe(2)
+    expect(bodyOf(fetchMock).maxRelayTtlMs).toBe(3000)
   })
 
   // The exact production numbers: 60002 / 1002 against ceilings of 60000 / 1000.
@@ -604,7 +605,7 @@ describe('timing v2 grant negotiation', () => {
       { issuedAt: 1 },
       { ttlMs: 60_001, expiresAt: 1 },
       { relayTtlMs: 0 },
-      { relayTtlMs: 1_001 },
+      { relayTtlMs: 3_001 },
       { ttlMs: '60000' },
       { issuedAt: -1 },
     ]) {
@@ -740,19 +741,19 @@ describe('timing v2 execution budget', () => {
     expect(relayBodies).toHaveLength(1)
     expect(relayBodies[0]).not.toHaveProperty('deadlineAt')
     expect(relayBodies[0].timingVersion).toBe(2)
-    // 750 total, 200 already spent on the grant, and sealing costs a little more.
+    // 3000 total, 200 already spent on the grant, and sealing costs a little more.
     expect(relayBodies[0].remainingMs).toBeGreaterThan(0)
-    expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(550)
+    expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(2800)
   })
 
   // Receiving the grant must not restart the TTL: the server issued it before we saw it.
   it('does not restart the budget when the grant arrives', async () => {
-    const { relayBodies } = wire({ grantMs: 700 })
+    const { relayBodies } = wire({ grantMs: 2950 })
     await resolve({ ...baseInput, contentText: RELAY_PROMPT })
     expect(relayBodies[0]?.remainingMs).toBeLessThanOrEqual(50)
   })
 
-  // With the default 1000ms relay budget the 750ms turn deadline always wins, so the
+  // With the default 3000ms relay budget the 3000ms turn deadline always wins, so the
   // round-trip deduction is invisible. A server that issues a tighter budget exposes it.
   it('charges the grant round trip against the budget the server issued', async () => {
     const relayBodies: Record<string, unknown>[] = []
@@ -776,7 +777,7 @@ describe('timing v2 execution budget', () => {
   })
 
   it('never dispatches a relay once the budget is spent', async () => {
-    for (const grantMs of [750, 900]) {
+    for (const grantMs of [3000, 3200]) {
       const { fetchMock, relayBodies } = wire({ grantMs })
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `grant took ${grantMs}ms`).toHaveLength(0)
@@ -795,7 +796,7 @@ describe('timing v2 execution budget', () => {
     vi.spyOn(freshLogger, 'debug').mockImplementation((message: string, ...args: unknown[]) => {
       lines.push({ message, args })
     })
-    wire({ grantMs: 800 })
+    wire({ grantMs: 3100 })
     expect(await resolve({ ...baseInput, contentText: RELAY_PROMPT })).toBeNull()
     expect(JSON.stringify(lines)).toContain('budget-spent')
     expect(JSON.stringify(lines)).not.toContain('budget-spent-before-relay')
@@ -805,7 +806,7 @@ describe('timing v2 execution budget', () => {
   // returned, so it cannot tell "the late answer was dropped" from "the turn lost its routing".
   // Name the outcome instead: the remote answer is discarded, the local decision still applies.
   it('discards a relay answer that lands after the deadline', async () => {
-    for (const relayMs of [750, 900]) {
+    for (const relayMs of [3000, 3200]) {
       const { relayBodies } = wire({ relayMs })
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `relay took ${relayMs}ms`).toHaveLength(1)
@@ -819,7 +820,7 @@ describe('timing v2 execution budget', () => {
   // already degrades an unusable answer to the free local decision. Returning null instead
   // means one slow server turn silently removes routing from the turn entirely.
   it('keeps routing the turn when the relay answers past the deadline', async () => {
-    const { relayBodies } = wire({ relayMs: 750 })
+    const { relayBodies } = wire({ relayMs: 3000 })
     const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
     expect(relayBodies).toHaveLength(1)
     expect(decision).not.toBeNull()
@@ -827,7 +828,7 @@ describe('timing v2 execution budget', () => {
   })
 
   it('still applies a relay answer that lands just inside the deadline', async () => {
-    const { relayBodies } = wire({ relayMs: 700 })
+    const { relayBodies } = wire({ relayMs: 2900 })
     const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
     expect(relayBodies).toHaveLength(1)
     expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
@@ -877,8 +878,8 @@ describe('timing v2 execution budget', () => {
 
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `jump ${jumpMs}`).toHaveLength(1)
-      expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(550)
-      expect(relayBodies[0].remainingMs).toBeGreaterThan(400)
+      expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(2800)
+      expect(relayBodies[0].remainingMs).toBeGreaterThan(2600)
       expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
       vi.setSystemTime(1_700_000_000_000)
     }

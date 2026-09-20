@@ -78,7 +78,7 @@ type RelayResponse = {
 }
 
 const STICKY_IDLE_RESET_MS = 60 * 60 * 1000
-const RUNTIME_ROUTING_DEADLINE_MS = 750
+const RUNTIME_ROUTING_DEADLINE_MS = 3_000
 
 /**
  * Process-relative and never adjusted, unlike `Date.now()`. Every budget, deadline and
@@ -402,6 +402,7 @@ async function requestGrant(
       sessionId: input.sessionId,
       policyVersion: DIFFICULTY_ROUTING_POLICY_VERSION,
       intent: input.meta?.difficultyRoutingIntent,
+      maxRelayTtlMs: RUNTIME_ROUTING_DEADLINE_MS,
       timingVersion: 2,
     }),
     // Floored: the monotonic clock is fractional and AbortSignal.timeout rejects non-integers.
@@ -598,7 +599,7 @@ function validateGrant(
   const relayTtlMs = positiveSafeInteger(record.relayTtlMs)
   add('issuedAt', issuedAt !== null)
   add('ttlMs', ttlMs !== null && ttlMs <= 60_000)
-  add('relayTtlMs', relayTtlMs !== null && relayTtlMs <= 1_000 && (ttlMs === null || relayTtlMs <= ttlMs))
+  add('relayTtlMs', relayTtlMs !== null && relayTtlMs <= RUNTIME_ROUTING_DEADLINE_MS && (ttlMs === null || relayTtlMs <= ttlMs))
   // The only arithmetic left: server values against server values.
   add('ttlMs-mismatch', issuedAt !== null && ttlMs !== null && expiresAt !== null && expiresAt - issuedAt === ttlMs)
   add('relayTtlMs-mismatch', issuedAt !== null && relayTtlMs !== null && relayDeadlineAt !== null

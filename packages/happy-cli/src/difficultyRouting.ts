@@ -19,6 +19,8 @@ export const DifficultyRoutingCapabilitySchema = z.object({
   hostProcessKeyId: z.string().min(1),
   hostProcessPublicKey: z.string().min(1),
   ready: z.boolean().optional(),
+  /** Maximum v2 relay budget in milliseconds. Absent means the legacy 1000ms ceiling. */
+  maxRelayTtlMs: z.number().int().min(1).max(3000).optional(),
   /**
    * Relay timing contracts this host speaks. Absent means legacy `[1]` — an older daemon has
    * no such field, and the server must not read that silence as v2 support.

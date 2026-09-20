@@ -8,9 +8,9 @@ const text = 'Add a save button to the draft form'
 const input = { agent: 'codex' as const, sourceMachineId: 'source', sessionId: 'session', contentText: 'SYSTEM WRAPPER: ' + text,
   meta: { difficultyRoutingIntent: intent, difficultyRoutingAuthorization: 'turn-authority', difficultyRoutingPrompt: text, modelSource: 'auto', model: 'fallback-model' }, current: { model: 'fallback-model' } }
 let host: DifficultyRoutingClassifierHost | undefined
-afterEach(() => { host?.terminate(); host = undefined; vi.unstubAllGlobals() })
+afterEach(() => { host?.terminate(); host = undefined; vi.unstubAllGlobals(); vi.useRealTimers() })
 
-function setup(options: { revoke?: boolean; wrongResponse?: boolean; serverSkewMs?: number } = {}) {
+function setup(options: { revoke?: boolean; wrongResponse?: boolean; serverSkewMs?: number; workerDelayMs?: number } = {}) {
   const key = createDifficultyRoutingHostKey()
   const received: Record<string, unknown>[] = []
   const worker = new EventEmitter() as EventEmitter & { send: (message: Record<string, unknown>) => void; kill: () => void }
@@ -19,7 +19,9 @@ function setup(options: { revoke?: boolean; wrongResponse?: boolean; serverSkewM
     if (message.type === 'prepare') queueMicrotask(() => worker.emit('message', { type: 'ready', classifierRevision: 'fixed-artifact' }))
     else {
       received.push(message)
-      queueMicrotask(() => worker.emit('message', { type: 'result', requestId: message.requestId, difficulty: 'hard', classifierRevision: 'fixed-artifact' }))
+      const reply = () => worker.emit('message', { type: 'result', requestId: message.requestId, difficulty: 'hard', classifierRevision: 'fixed-artifact' })
+      if (options.workerDelayMs) setTimeout(reply, options.workerDelayMs)
+      else queueMicrotask(reply)
     }
   }
   const authorize = vi.fn(async () => !options.revoke)
@@ -36,14 +38,14 @@ function setup(options: { revoke?: boolean; wrongResponse?: boolean; serverSkewM
       expect(body.timingVersion).toBe(2)
       // Issued entirely on the server's clock, which may sit anywhere relative to ours.
       const issuedAt = Date.now() + (options.serverSkewMs ?? 0)
-      return Response.json({ ok: true, aiModelPolicy: { source: 'unrestricted', allowedSelectionKeys: null, defaultSelectionKey: null }, signedGrant: 'validated-grant', grant: { version: 1, grantId: 'grant-flow', policyRevision: 4, issuedAt, expiresAt: issuedAt + 10000, ttlMs: 10000, relayTtlMs: 750, timingVersion: 2, requestId: 'turn-flow', sourceMachineId: 'source', hostMachineId: 'host', hostProcessKeyId: key.id, hostProcessPublicKey: Buffer.from(key.publicKey).toString('base64'), maxInputChars: 8000, modelMaxInputTokens: 512, relayDeadlineAt: issuedAt + 750 } })
+      return Response.json({ ok: true, aiModelPolicy: { source: 'unrestricted', allowedSelectionKeys: null, defaultSelectionKey: null }, signedGrant: 'validated-grant', grant: { version: 1, grantId: 'grant-flow', policyRevision: 4, issuedAt, expiresAt: issuedAt + 10000, ttlMs: 10000, relayTtlMs: 3000, timingVersion: 2, requestId: 'turn-flow', sourceMachineId: 'source', hostMachineId: 'host', hostProcessKeyId: key.id, hostProcessPublicKey: Buffer.from(key.publicKey).toString('base64'), maxInputChars: 8000, modelMaxInputTokens: 512, relayDeadlineAt: issuedAt + 3000 } })
     }
     expect(path.endsWith('/classify')).toBe(true)
     // The client must hand the host a duration, never an instant from another machine.
     expect(body.timingVersion).toBe(2)
     expect(body.deadlineAt).toBeUndefined()
     expect(body.remainingMs).toBeGreaterThan(0)
-    expect(body.remainingMs).toBeLessThanOrEqual(750)
+    expect(body.remainingMs).toBeLessThanOrEqual(3000)
     const result = await host!.classify(body)
     return Response.json({ ok: true, result: options.wrongResponse ? { ...result, requestId: 'other-turn' } : result })
   }))
@@ -51,6 +53,14 @@ function setup(options: { revoke?: boolean; wrongResponse?: boolean; serverSkewM
 }
 
 describe('sealed shared classifier flow', () => {
+  it('keeps a 2.2 second classifier round trip remote within the shared 3 second budget', async () => {
+    vi.useFakeTimers()
+    setup({ workerDelayMs: 2200 })
+    await vi.advanceTimersByTimeAsync(0)
+    const pending = resolveDifficultyRouting(input)
+    await vi.advanceTimersByTimeAsync(2200)
+    expect((await pending)?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+  })
   it('sends only original text to the native worker and returns its actual model decision', async () => {
     const f = setup()
     const result = await resolveDifficultyRouting(input)
