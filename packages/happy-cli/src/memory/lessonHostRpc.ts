@@ -372,16 +372,16 @@ export function createLessonHostRpc(deps: LessonHostRpcDeps) {
             };
         }
         const binding = issued.handle;
-        /*
-         * The fence value CML compares its stored rows against. Read from the
-         * durable settings revision, not from the handle: the handle is opaque
-         * on purpose, and the issuer re-checks this same value on every
-         * resolution, so another process turning recall off fences this too.
-         */
-        const generation = (await deps.issuer.resolve(binding)).generation;
         const requestId = request.requestId;
 
         try {
+            /*
+             * The fence value CML compares its stored rows against. Read from the
+             * durable settings revision, not from the handle: the handle is opaque
+             * on purpose, and the issuer re-checks this same value on every
+             * resolution, so another process turning recall off fences this too.
+             */
+            const generation = (await deps.issuer.resolve(binding)).generation;
             switch (operation) {
                 case 'snapshot': {
                     const lessonOffset = readOffset(request.lessonOffset);

@@ -117,6 +117,30 @@ async function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('lesson-host-v1', () => {
+    it('maps a binding invalidated between issue and resolve and releases it', async () => {
+        const h = await harness();
+        const originalIssue = h.issuer.issue.bind(h.issuer);
+        const release = vi.fn();
+        vi.spyOn(h.issuer, 'issue').mockImplementation(async (input) => {
+            const issued = await originalIssue(input);
+            await h.settings.write({
+                expectedRevision: 1,
+                recallEnabled: true,
+                reviewEnabled: false,
+                dailyMicroUsd: 0,
+                dailyTokens: 0,
+            });
+            return { ...issued, release: () => { release(); issued.release(); } };
+        });
+
+        await expect(h.handle({
+            ...snapshotRequest,
+            grantEnvelope: grantFor(snapshotRequest, ['lesson.read', 'lesson.manage']),
+        })).resolves.toEqual({ ok: false, reason: 'revision_conflict' });
+        expect(release).toHaveBeenCalledOnce();
+        await rm(h.dir, { recursive: true, force: true });
+    });
+
     it('returns a snapshot whose candidates carry every applicability field', async () => {
         const { handle, dir } = await harness();
         const result = await handle({ ...snapshotRequest, grantEnvelope: grantFor(snapshotRequest, ['lesson.read', 'lesson.manage']) });

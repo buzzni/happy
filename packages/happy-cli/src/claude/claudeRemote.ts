@@ -45,7 +45,7 @@ import {
 } from '@/memory/lessonTurnObservations';
 import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
 
-export type ClaudeActiveInputSender = (text: string) => boolean;
+export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
 
 export async function claudeRemote(opts: {
 
@@ -355,7 +355,7 @@ export async function claudeRemote(opts: {
     let pendingLessonTicket: LessonDeliveryTicket | null = null;
     let claudeTurnCounter = 0;
     /** Text of the user message each turn carried, for the review evidence. */
-    let currentTurnMessage = readTurnText(initial.message);
+    let currentTurnMessages = [readTurnText(initial.message)];
     /**
      * One id per accepted user input, created once and shared by recall, the
      * acknowledgement and the evidence.
@@ -409,10 +409,12 @@ function readTurnText(content: unknown): string {
      * When a block is added it is prepended as one more text block, so an
      * array stays an array and nothing already in it moves.
      */
-    const withLessons = async (
+    const recallWithLessons = async (
         content: string | ContentBlockParam[],
-    ): Promise<string | ContentBlockParam[]> => {
-        if (!lessonTurn) return content;
+        turnId: string,
+        signal: AbortSignal,
+    ): Promise<{ content: string | ContentBlockParam[]; ticket: LessonDeliveryTicket | null }> => {
+        if (!lessonTurn) return { content, ticket: null };
         const query = typeof content === 'string'
             ? content
             : content
@@ -422,24 +424,30 @@ function readTurnText(content: unknown): string {
                 .map((block) => block.text)
                 .join('\n');
         if (!query.trim()) {
-            pendingLessonTicket = null;
-            return content;
+            return { content, ticket: null };
         }
         const outcome = await lessonTurn.recall({
-            turnId: currentTurnId,
+            turnId,
             query,
-            signal: reviewAbort.signal,
+            signal: opts.signal ? AbortSignal.any([signal, opts.signal]) : signal,
         }).catch(() => null);
         if (!outcome || outcome.outcome !== 'selected') {
-            pendingLessonTicket = null;
-            return content;
+            return { content, ticket: null };
         }
-        pendingLessonTicket = outcome.ticket;
         // Prepended, and clearly labelled as reference material — the same
         // shape the Codex path uses.
-        return typeof content === 'string'
-            ? `${outcome.block}\n\n${content}`
-            : [{ type: 'text', text: outcome.block } as ContentBlockParam, ...content];
+        return {
+            content: typeof content === 'string'
+                ? `${outcome.block}\n\n${content}`
+                : [{ type: 'text', text: outcome.block } as ContentBlockParam, ...content],
+            ticket: outcome.ticket,
+        };
+    };
+
+    const withLessons = async (content: string | ContentBlockParam[]) => {
+        const recalled = await recallWithLessons(content, currentTurnId, reviewAbort.signal);
+        pendingLessonTicket = recalled.ticket;
+        return recalled.content;
     };
 
     // Push initial message
@@ -486,17 +494,38 @@ function readTurnText(content: unknown): string {
 
     updateThinking(true);
     let acceptsActiveInput = true;
-    const sendActiveInput: ClaudeActiveInputSender = (text) => {
+    let queryClosed = false;
+    const sendActiveInput: ClaudeActiveInputSender = async (text) => {
         if (!acceptsActiveInput || messages.done || !text.trim()) {
             return false;
         }
-        // Active input is a new user turn too; a review for the last one must
-        // not keep spending.
+        // A steer joins the provider turn already in flight. Its recall trace
+        // is distinct, but its arrival cannot replace the turn whose result is
+        // still pending.
+        const owningTurnId = currentTurnId;
         preemptReview();
+        const steerAbort = reviewAbort;
+        const recalled = await recallWithLessons(
+            text,
+            `${sessionIdForLessons}:${randomUUID()}`,
+            steerAbort.signal,
+        );
+        // A result while local recall was running means the provider never
+        // accepted this steer. A new turn or a newer steer while recall was
+        // pending has the same result. Return false before injection so the
+        // caller can retry or use its normal prompt fallback.
+        if (!acceptsActiveInput || messages.done || opts.signal?.aborted
+            || currentTurnId !== owningTurnId || reviewAbort !== steerAbort) return false;
+        /*
+         * The SDK exposes no event that proves this in-band steer was acted
+         * upon. Keep its selected trace unacknowledged rather than treating an
+         * assistant event for the already-running input as proof of delivery.
+         */
+        currentTurnMessages.push(readTurnText(text));
         messages.push({
             type: 'user',
             parent_tool_use_id: null,
-            message: { role: 'user', content: text },
+            message: { role: 'user', content: recalled.content },
         });
         return true;
     };
@@ -644,11 +673,11 @@ function readTurnText(content: unknown): string {
                             kind: lessonSessionKind,
                             endedNormally: true,
                             hadPriorAssistantTurn: claudeTurnCounter > 0,
-                            userMessages: [currentTurnMessage],
+                            userMessages: currentTurnMessages,
                             agentSummary: observed.summary,
                             recoveredFailures: observed.recoveredFailures,
                         },
-                        signal: reviewAbort.signal,
+                        signal: opts.signal ? AbortSignal.any([reviewAbort.signal, opts.signal]) : reviewAbort.signal,
                     }).catch(() => undefined);
                 }
                 claudeTurnCounter += 1;
@@ -762,6 +791,7 @@ function readTurnText(content: unknown): string {
                 // Background task messages (task_started, task_progress, task_notification)
                 // continue flowing through while we wait for user input.
                 opts.nextMessage().then(async (next) => {
+                    if (queryClosed) return;
                     if (!next) {
                         messages.end();
                     } else {
@@ -788,14 +818,12 @@ function readTurnText(content: unknown): string {
                         // 새어든다.
                         await mcpRecovery.recoverFailedServers();
                         mode = next.mode;
-                        acceptsActiveInput = true;
-                        opts.onActiveInputReady?.(sendActiveInput);
                         // Content can be structured blocks; only plain text is
                         // usable as a recall query or as review evidence — but
                         // the blocks themselves are what gets sent, so recall
                         // runs on the whole message rather than on a flattened
                         // copy that would drop every attachment.
-                        currentTurnMessage = readTurnText(next.message);
+                        currentTurnMessages = [readTurnText(next.message)];
                         // A new turn: stop any review still running for the
                         // previous one before this one starts costing anything.
                         preemptReview();
@@ -807,7 +835,11 @@ function readTurnText(content: unknown): string {
                          * be attached to this one.
                          */
                         const withBlock = await withLessons(next.message);
+                        if (queryClosed || messages.done || opts.signal?.aborted) return;
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: withBlock } });
+                        // Steering may only follow the primary input, never overtake its recall.
+                        acceptsActiveInput = true;
+                        opts.onActiveInputReady?.(sendActiveInput);
                     }
                 }).catch(() => {
                     messages.end();
@@ -849,6 +881,7 @@ function readTurnText(content: unknown): string {
             throw e;
         }
     } finally {
+        queryClosed = true;
         acceptsActiveInput = false;
         opts.onActiveInputReady?.(null);
         opts.onMcpControllerReady?.(null);

@@ -37,6 +37,35 @@ describe('lesson input delivery boundaries', () => {
         expect(deps.host.service.ackDelivery).not.toHaveBeenCalled();
     });
 
+    it('bounds acknowledgement before an identity provider can stall it', async () => {
+        const { deps, host } = fixture();
+        const recalled = await host.recall({ turnId: 't', query: 'port already bound' });
+        expect(recalled.outcome).toBe('selected');
+        (deps as unknown as LessonTurnHostDeps).identity = () => new Promise(() => {});
+
+        const result = await Promise.race([
+            host.acknowledge((recalled as { ticket: LessonDeliveryTicket }).ticket),
+            new Promise(resolve => setTimeout(() => resolve('unbounded'), 80)),
+        ]);
+
+        expect(result).toBe(false);
+        expect(deps.host.service.ackDelivery).not.toHaveBeenCalled();
+    });
+
+    it('releases a binding issued after acknowledgement has already timed out', async () => {
+        const { deps, host } = fixture();
+        const recalled = await host.recall({ turnId: 't', query: 'port already bound' });
+        expect(recalled.outcome).toBe('selected');
+        const release = vi.fn();
+        let complete!: (value: { handle: object; release: () => void }) => void;
+        deps.issuer.issue.mockImplementation(() => new Promise(resolve => { complete = resolve; }));
+        expect(await host.acknowledge((recalled as { ticket: LessonDeliveryTicket }).ticket)).toBe(false);
+        complete({ handle: {}, release });
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(release).toHaveBeenCalledOnce();
+        expect(deps.host.service.ackDelivery).not.toHaveBeenCalled();
+    });
+
     it('releases a late-issued handle without starting a stale recall', async () => {
         const { deps, host } = fixture();
         const release = vi.fn();

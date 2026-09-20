@@ -158,7 +158,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (!text.trim()) {
             return { success: false, error: 'Steer text is required' };
         }
-        if (!activeInputSender?.(text)) {
+        if (!await activeInputSender?.(text)) {
             return { success: false, error: 'No active Claude turn' };
         }
         session.onActiveUserInputAccepted?.(text);

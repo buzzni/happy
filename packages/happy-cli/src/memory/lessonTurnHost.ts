@@ -408,9 +408,6 @@ export function createLessonTurnHost(deps: LessonTurnHostDeps): LessonTurnHost {
 
         async acknowledge(ticket) {
             if (!deps.host || !deps.issuer) return false;
-            const identity = await deps.identity();
-            if (!identity) return false;
-
             /*
              * One deadline over the whole operation, identity included.
              *
@@ -431,14 +428,15 @@ export function createLessonTurnHost(deps: LessonTurnHostDeps): LessonTurnHost {
 
             try {
                 const work = (async (): Promise<boolean> => {
+                    const identity = await deps.identity();
+                    if (expired || !identity) return false;
                     const minted = await deps.issuer!.issue({
                         ...identity, capabilities: ['lesson.read'], ttlMs: 30_000,
                     });
-                    // The deadline may have won while this was being minted.
-                    // Recording it here is what lets the cleanup below release
-                    // a handle that arrived too late to use.
+                    // A late mint arrives after the outer finally has run,
+                    // so it must release itself without starting any work.
+                    if (expired) { minted.release(); return false; }
                     issued = minted;
-                    if (expired) return false;
 
                     const nowIdentity = await deps.issuer!.resolve(minted.handle);
                     if (expired) return false;
@@ -489,11 +487,8 @@ export function createLessonTurnHost(deps: LessonTurnHostDeps): LessonTurnHost {
                 // Cleared on every path, success included: a live timer keeps
                 // a handle on the event loop for no reason.
                 if (timer) clearTimeout(timer);
-                /*
-                 * Releases a handle that arrived after the deadline too. The
-                 * assignment happens inside the async work, so this runs both
-                 * when it completed and when it was abandoned.
-                 */
+                // Handles issued before the deadline are owned here; late
+                // issuance releases itself inside the work above.
                 (issued as { release(): void } | null)?.release();
             }
         },
