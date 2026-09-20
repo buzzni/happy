@@ -51,6 +51,7 @@ export type ViewerResizeMode = 'remote' | 'scale'
 export function installViewerClipboardBridge(UI: any, win: any, doc: any): void {
     const CONTROL_L = 0xffe3
     const LOWERCASE_V = 0x76
+    const LOWERCASE_C = 0x63
     // The remote clipboard is set over the same socket, but x11vnc hands the
     // text to the X selection from its own event loop. Pressing Ctrl+V in the
     // same tick can beat it there and paste the previous contents.
@@ -115,14 +116,47 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
     // every extra press queues another paste for the moment they allow it.
     let readingClipboard = false
 
-    const isPasteKey = (event: any) => {
-        if (event.key === 'v' || event.key === 'V') return true
-        // With a Korean (or any non-Latin) layout active the browser can
-        // report the composed letter instead. Fall back to the physical key,
-        // but only when what it reported is not an ASCII letter of its own —
-        // on Dvorak that same key is a different letter and must stay one.
-        return event.code === 'KeyV' && !/^[a-zA-Z]$/.test(String(event.key))
+    const isPasteKey = (event: any) => matchesLetterKey(event, 'v', 'KeyV')
+    const isCopyKey = (event: any) => matchesLetterKey(event, 'c', 'KeyC')
+
+    // With a Korean (or any non-Latin) layout active the browser can report
+    // the composed letter instead of the Latin one. Fall back to the
+    // physical key, but only when what it reported is not an ASCII letter of
+    // its own — on Dvorak that same key is a different letter and must stay
+    // one.
+    function matchesLetterKey(event: any, letter: string, code: string): boolean {
+        if (event.key === letter || event.key === letter.toUpperCase()) return true
+        return event.code === code && !/^[a-zA-Z]$/.test(String(event.key))
     }
+
+    /**
+     * noVNC remaps macOS's own Cmd (Super) key itself to Alt for the remote
+     * end ("Alt behaves more like AltGraph on macOS" in its keyboard
+     * handler). Left alone, a Mac user's Cmd+C reaches a Linux remote as
+     * Alt+C, which copies nothing — reported live (2026-09-20). The bridge
+     * owns the shortcut instead and always sends Control_L, exactly as it
+     * already does for paste.
+     */
+    const pressCopyRemotely = () => {
+        const rfb = session()
+        if (!rfb) return
+        rfb.sendKey(CONTROL_L, 'ControlLeft', true)
+        rfb.sendKey(LOWERCASE_C, 'KeyC', true)
+        rfb.sendKey(LOWERCASE_C, 'KeyC', false)
+        rfb.sendKey(CONTROL_L, 'ControlLeft', false)
+    }
+
+    win.addEventListener('keydown', (event: any) => {
+        if (!isCopyKey(event)) return
+        if (event.altKey) return
+        if (!event.ctrlKey && !event.metaKey) return
+        if (!session()) return
+        if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()
+        // Only the keystroke is forwarded. Whatever the remote's own
+        // selection holds comes back through the existing RFB `clipboard`
+        // listener below once the remote actually receives a working Ctrl+C.
+        pressCopyRemotely()
+    }, true)
 
     win.addEventListener('keydown', (event: any) => {
         if (!isPasteKey(event)) return
