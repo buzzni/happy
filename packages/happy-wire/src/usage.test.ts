@@ -109,3 +109,43 @@ describe('aiAuth report on a usage event', () => {
         expect(() => ProviderUsageEventV1Schema.parse({ ...providerEvent, aiAuth })).toThrow();
     });
 });
+
+/**
+ * The CLI and happy-server each bundle their own copy of this schema, and it is
+ * `.strict()`. A field that a deployed peer does not know sinks the whole event:
+ * `usageHandler.ts` drops it with a single warn line that does not name the
+ * field. The release runbook fixes the deploy order (server first); this guard
+ * fixes the shape, so the runbook only ever has to cover one direction.
+ */
+describe('wire compatibility guard', () => {
+    /** Exactly the keys a peer must send. Adding one here breaks every older CLI. */
+    const REQUIRED_KEYS = [
+        'source',
+        'sourceEventId',
+        'schemaVersion',
+        'occurredAt',
+        'sessionId',
+        'provider',
+        'agent',
+        'model',
+        'measurement',
+        'tokens',
+        'cost',
+        'quality',
+    ] as const;
+
+    it('parses an event carrying only the required keys — an older CLI still reports', () => {
+        const minimal = Object.fromEntries(
+            REQUIRED_KEYS.map((key) => [key, providerEvent[key]]),
+        );
+        expect(ProviderUsageEventV1Schema.safeParse(minimal).success).toBe(true);
+    });
+
+    it.each(REQUIRED_KEYS)('still requires %s', (key) => {
+        const missing = Object.fromEntries(
+            REQUIRED_KEYS.filter((other) => other !== key).map((other) => [other, providerEvent[other]]),
+        );
+        expect(ProviderUsageEventV1Schema.safeParse(missing).success).toBe(false);
+    });
+
+});
