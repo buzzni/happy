@@ -875,3 +875,178 @@ describe('claudeRemote', () => {
         });
     });
 });
+
+describe('lessons at the provider boundary', () => {
+    /*
+     * These assert what the SDK is actually handed, not what the source says.
+     * The recall/acknowledge wiring is only correct if the emitted user
+     * message keeps its attachments, if the block arrives as an extra block,
+     * and if acknowledgement waits for the provider to accept the turn — none
+     * of which a unit test of the host can see.
+     */
+    type Turn = { sent: unknown; };
+
+    function providerCapturing(emit: (push: (event: unknown) => void) => Promise<void>) {
+        const turns: Turn[] = [];
+        vi.mocked(query).mockImplementation((args: any) => ({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                const queued: unknown[] = [];
+                const push = (event: unknown) => { queued.push(event); };
+                for await (const message of args.prompt) {
+                    turns.push({ sent: (message as any).message.content });
+                    await emit(push);
+                    while (queued.length) yield queued.shift() as any;
+                }
+            },
+        }) as any);
+        return turns;
+    }
+
+    function baseOptions(overrides: Record<string, unknown>) {
+        return {
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            onReady: vi.fn(),
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage: vi.fn(),
+            ...overrides,
+        } as any;
+    }
+
+    const ticket = { id: 'ticket-1' } as any;
+
+    it('prepends the block without disturbing an attachment, and acknowledges only after the assistant starts', async () => {
+        const acknowledged: unknown[] = [];
+        const whenAcknowledged: string[] = [];
+        const turnHost = {
+            recall: vi.fn(async () => ({ outcome: 'selected' as const, block: 'LESSONS', ticket })),
+            acknowledge: vi.fn(async (t: unknown) => {
+                acknowledged.push(t);
+                whenAcknowledged.push('ack');
+                return true;
+            }),
+        };
+        const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } };
+        const turns = providerCapturing(async (push) => {
+            // Queued, and nothing has been yielded to the consumer yet: a
+            // message sitting in the provider's input queue is not acceptance.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(turnHost.acknowledge).not.toHaveBeenCalled();
+            whenAcknowledged.push('assistant');
+            push({ type: 'assistant', message: { content: [] } });
+            push({ type: 'result', subtype: 'success' });
+        });
+
+        await claudeRemote(baseOptions({
+            exitAfterFirstTurn: true,
+            nextMessage: async () => ({ message: [{ type: 'text', text: 'fix this' }, image], mode }),
+            lessons: { sessionId: 'happy-session-1', sessionKind: 'foreground', turn: turnHost },
+        }));
+
+        // The recall query is the text, and the attachment is still there.
+        expect(turnHost.recall).toHaveBeenCalledWith(expect.objectContaining({ query: 'fix this' }));
+        expect(turns[0].sent).toEqual([
+            { type: 'text', text: 'LESSONS' },
+            { type: 'text', text: 'fix this' },
+            image,
+        ]);
+        // Selected is not delivered: the queue push is not acceptance.
+        await vi.waitFor(() => expect(acknowledged).toEqual([ticket]));
+        expect(whenAcknowledged[0]).toBe('assistant');
+    });
+
+    it('sends the message unchanged when nothing was selected', async () => {
+        const turns = providerCapturing(async (push) => {
+            push({ type: 'result', subtype: 'success' });
+        });
+        const turnHost = {
+            recall: vi.fn(async () => ({ outcome: 'none' as const })),
+            acknowledge: vi.fn(async () => true),
+        };
+
+        await claudeRemote(baseOptions({
+            exitAfterFirstTurn: true,
+            nextMessage: async () => ({ message: 'plain text turn', mode }),
+            lessons: { sessionId: 'happy-session-1', sessionKind: 'foreground', turn: turnHost },
+        }));
+
+        expect(turns[0].sent).toBe('plain text turn');
+        expect(turnHost.acknowledge).not.toHaveBeenCalled();
+    });
+
+    it('does not acknowledge a turn the assistant never began', async () => {
+        /*
+         * The provider took the message and ended the turn without ever
+         * starting an assistant message — a refusal, a mode switch, an error
+         * on the way in. Nothing was delivered, so the trace must not say it
+         * was.
+         */
+        const turnHost = {
+            recall: vi.fn(async () => ({ outcome: 'selected' as const, block: 'LESSONS', ticket })),
+            acknowledge: vi.fn(async () => true),
+        };
+        providerCapturing(async (push) => {
+            push({ type: 'result', subtype: 'success' });
+        });
+
+        await claudeRemote(baseOptions({
+            exitAfterFirstTurn: true,
+            nextMessage: async () => ({ message: 'fix this', mode }),
+            lessons: { sessionId: 'happy-session-1', sessionKind: 'foreground', turn: turnHost },
+        }));
+
+        expect(turnHost.recall).toHaveBeenCalled();
+        expect(turnHost.acknowledge).not.toHaveBeenCalled();
+    });
+
+    it('does not review a turn the provider ended with an error', async () => {
+        const review = { reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+        providerCapturing(async (push) => {
+            push({ type: 'result', subtype: 'error_during_execution', is_error: true });
+        });
+
+        await claudeRemote(baseOptions({
+            exitAfterFirstTurn: true,
+            nextMessage: async () => ({ message: 'do the thing', mode }),
+            lessons: { sessionId: 'happy-session-1', sessionKind: 'foreground', review },
+        }));
+
+        // A turn that failed carries no verified procedure, so it must not be
+        // paid for either.
+        expect(review.reviewFinishedTurn).not.toHaveBeenCalled();
+    });
+
+    it('aborts a review still running when the next input arrives', async () => {
+        const signals: AbortSignal[] = [];
+        const review = {
+            reviewFinishedTurn: vi.fn(async ({ signal }: { signal: AbortSignal }) => {
+                signals.push(signal);
+                return 'reviewed' as const;
+            }),
+        };
+        providerCapturing(async (push) => {
+            push({ type: 'result', subtype: 'success' });
+        });
+        let sent = 0;
+
+        await claudeRemote(baseOptions({
+            nextMessage: async () => {
+                sent += 1;
+                return sent <= 2 ? { message: `turn-${sent}`, mode } : null;
+            },
+            lessons: { sessionId: 'happy-session-1', sessionKind: 'foreground', review },
+        }));
+
+        await vi.waitFor(() => expect(signals.length).toBeGreaterThanOrEqual(2));
+        // The first turn's review is not allowed to keep spending once the
+        // conversation has moved on.
+        expect(signals[0].aborted).toBe(true);
+    });
+});

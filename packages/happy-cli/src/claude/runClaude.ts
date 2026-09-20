@@ -82,6 +82,7 @@ import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManage
 import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
+import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -1507,8 +1508,40 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     };
 
     // Create claude loop
-    const exitCode = await loop({
+    /*
+     * The lesson host for this session, built once.
+     *
+     * Bounded on its own budget, so a slow studio delays nothing, and null for
+     * a managed run — which holds no account credential and must not be handed
+     * one. When it is null the loop behaves exactly as it did before.
+     */
+    const lessons = createLazyLessonSessionHost({
+        accountToken,
+        machineId: principal.kind === 'account' ? (machineId ?? null) : null,
+        sessionId: session.sessionId,
+        happyHomeDir: configuration.happyHomeDir,
+    });
+
+    /*
+     * Closed on every exit path — normal, thrown or signalled. Registered
+     * after `lessons` exists so the closure cannot capture it in its temporal
+     * dead zone, and tolerant of a double close.
+     */
+    let lessonsClosed = false;
+    const closeLessons = async () => {
+        if (lessonsClosed) return;
+        lessonsClosed = true;
+        await lessons.close().catch(() => undefined);
+    };
+    const closeLessonsOnSignal = () => { void closeLessons(); };
+    process.once('SIGTERM', closeLessonsOnSignal);
+    process.once('SIGINT', closeLessonsOnSignal);
+
+    let exitCode: number;
+    try {
+        exitCode = await loop({
         path: workingDirectory,
+        ...(lessons ? { lessons } : {}),
         sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,
@@ -1564,6 +1597,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
+    } finally {
+        process.removeListener('SIGTERM', closeLessonsOnSignal);
+        process.removeListener('SIGINT', closeLessonsOnSignal);
+        await closeLessons();
+    }
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak
     // Note: currentSession is set by onSessionReady callback during loop()

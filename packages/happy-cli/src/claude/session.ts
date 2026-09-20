@@ -9,6 +9,8 @@ import type { AplusMcpServersMap } from '@/aplus/fetchAplusMcpServers';
 import type { McpConfigSource } from './mcpConfigSynchronizer';
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 
+import type { LessonSessionHost } from '@/memory/lessonSessionHost';
+
 export class Session {
     readonly path: string;
     readonly logPath: string;
@@ -19,6 +21,15 @@ export class Session {
     readonly managedSettingsLockdown?: boolean;
     /** A managed Cloud run: unbound instruction paths are closed. */
     readonly managedRun?: boolean;
+    /**
+     * Project lesson recall and background review for this session.
+     *
+     * Built once by the runner, from the daemon's trusted spawn context, and
+     * carried here so the remote launcher can hand it to each turn without
+     * rebuilding it per turn. Absent for a managed run and for any
+     * installation without a lesson host.
+     */
+    readonly lessons?: LessonSessionHost;
     claudeArgs?: string[];  // Made mutable to allow filtering
     mcpServers: Record<string, any>;
     readonly mcpConfig?: McpConfigSource;
@@ -57,6 +68,7 @@ export class Session {
         claudeEnvVars?: Record<string, string>,
         managedSettingsLockdown?: boolean,
         managedRun?: boolean,
+        lessons?: LessonSessionHost,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
         mcpConfig?: McpConfigSource,
@@ -87,6 +99,7 @@ export class Session {
         this.claudeEnvVars = opts.claudeEnvVars;
         this.managedSettingsLockdown = opts.managedSettingsLockdown;
         this.managedRun = opts.managedRun;
+        this.lessons = opts.lessons;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
         this.mcpConfig = opts.mcpConfig;

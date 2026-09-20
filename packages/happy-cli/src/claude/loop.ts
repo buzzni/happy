@@ -2,6 +2,7 @@ import { ApiSessionClient } from "@/api/apiSession"
 import { MessageQueue2 } from "@/utils/MessageQueue2"
 import { logger } from "@/ui/logger"
 import { Session } from "./session"
+import type { LessonSessionHost } from '@/memory/lessonSessionHost'
 import { claudeLocalLauncher, LauncherResult } from "./claudeLocalLauncher"
 import { claudeRemoteLauncher } from "./claudeRemoteLauncher"
 import { ApiClient } from "@/lib"
@@ -57,6 +58,8 @@ interface LoopOptions {
     managedSettingsLockdown?: boolean
     /** A managed Cloud run: steering and goal-setting are refused. */
     managedRun?: boolean
+    /** Built by the runner; see `Session.lessons`. */
+    lessons?: LessonSessionHost
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
@@ -102,6 +105,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         jsRuntime: opts.jsRuntime,
         startingMode: opts.startingMode,
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
+        lessons: opts.lessons,
     });
 
     opts.onSessionReady?.(session)

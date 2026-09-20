@@ -34,7 +34,16 @@ import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPr
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
 import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
+import { randomUUID } from 'node:crypto';
+import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
 import { managedSettingSources } from '@/managed/managedStartup';
+import type { LessonReviewWorker } from '@/memory/lessonReviewWorker';
+import type { LessonTurnKind } from '@/memory/lessonTurnEvidence';
+import {
+    createLessonTurnObservations,
+    type LessonTurnObservations,
+} from '@/memory/lessonTurnObservations';
+import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
 
 export type ClaudeActiveInputSender = (text: string) => boolean;
 
@@ -75,6 +84,21 @@ export async function claudeRemote(opts: {
     onQueryReady?: (query: { setPermissionMode: (mode: string) => Promise<void> }) => void,
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     hookSettingsPath: string,
+    /**
+     * Project lesson recall and background review for this session.
+     *
+     * Built by the runner from the daemon's trusted spawn context. Absent for
+     * a managed run and for any installation without a lesson host, and when
+     * it is absent this function behaves exactly as it did before.
+     */
+    lessons?: {
+        turn: LessonTurnHost | null,
+        review: LessonReviewWorker | null,
+        sessionKind: LessonTurnKind,
+        observations: LessonTurnObservations,
+        /** The authoritative Happy session id; absent disables lesson work. */
+        sessionId: string | null,
+    },
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime,
     /** Orchestrator mode: inject worker MCP tools and system prompt */
@@ -298,6 +322,126 @@ export async function claudeRemote(opts: {
         }
     };
 
+    /*
+     * Lesson state for this session's turns.
+     *
+     * `pendingLessonTicket` is what makes "selected" and "delivered" two
+     * different things here: recall fills it before a message is pushed, and
+     * it is only acknowledged once the SDK reports the assistant actually
+     * beginning that turn. A push onto the queue is not acceptance.
+     *
+     * It is turn-local by construction — cleared on acknowledgement and
+     * overwritten by the next recall — so a late result cannot be attached to
+     * a turn it did not belong to.
+     */
+    const lessonTurn = opts.lessons?.sessionId ? (opts.lessons.turn ?? null) : null;
+    const lessonReview = opts.lessons?.sessionId ? (opts.lessons.review ?? null) : null;
+    // Unknown means automation: a session this host cannot classify must not
+    // be allowed to teach the project.
+    const lessonSessionKind: LessonTurnKind = opts.lessons?.sessionKind ?? 'automation';
+    const claudeTurnObservations = opts.lessons?.observations ?? createLessonTurnObservations();
+    /*
+     * The authoritative Happy session id, never a placeholder.
+     *
+     * A constructed one would attribute this session's traces and candidates
+     * to an identity nobody can resolve, so without it there is no lesson work
+     * at all.
+     */
+    const sessionIdForLessons = opts.lessons?.sessionId ?? null;
+    /*
+     * Stops recall and any running review the moment this run is torn down.
+     * `opts.signal` is the caller's own cancellation, so it drives this too.
+     */
+    let pendingLessonTicket: LessonDeliveryTicket | null = null;
+    let claudeTurnCounter = 0;
+    /** Text of the user message each turn carried, for the review evidence. */
+    let currentTurnMessage = readTurnText(initial.message);
+    /**
+     * One id per accepted user input, created once and shared by recall, the
+     * acknowledgement and the evidence.
+     *
+     * Not `sessionId:counter`: a counter restarts at zero on resume, so a
+     * resumed session reuses ids CML has already persisted — the same request
+     * id with a different query is a conflict, and with the same query it
+     * returns a stale cached answer.
+     */
+    let currentTurnId = `${sessionIdForLessons}:${randomUUID()}`;
+    /**
+     * Aborts a running review when the next input arrives.
+     *
+     * Replaced per turn rather than shared for the session: one controller for
+     * the whole session never fires until teardown, so a paid background
+     * review kept running while the user was already typing the next thing.
+     */
+    let reviewAbort = new AbortController();
+    const preemptReview = () => {
+        reviewAbort.abort();
+        reviewAbort = new AbortController();
+        if (opts.signal?.aborted) reviewAbort.abort();
+    };
+
+    /**
+     * Recalls lessons and returns the text to send.
+     *
+     * Bounded and never fatal: a slow or unreachable store yields the message
+     * unchanged and the turn proceeds.
+     */
+/** The plain-text parts of a user message, for a recall query or evidence. */
+function readTurnText(content: unknown): string {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+        .filter((block) => (block as { type?: unknown })?.type === 'text'
+            && typeof (block as { text?: unknown }).text === 'string')
+        .map((block) => (block as { text: string }).text)
+        .join('\n');
+}
+
+    /**
+     * Recalls lessons for a turn and returns the content to send.
+     *
+     * The original content is preserved exactly when nothing is added.
+     * Structured content carries attachments — images, documents — and an
+     * earlier version flattened it to `''` to get a query string, which sent
+     * an empty turn and dropped every attachment. The query is read from the
+     * text blocks; the blocks themselves are never rewritten.
+     *
+     * When a block is added it is prepended as one more text block, so an
+     * array stays an array and nothing already in it moves.
+     */
+    const withLessons = async (
+        content: string | ContentBlockParam[],
+    ): Promise<string | ContentBlockParam[]> => {
+        if (!lessonTurn) return content;
+        const query = typeof content === 'string'
+            ? content
+            : content
+                .filter((block): block is ContentBlockParam & { type: 'text'; text: string } =>
+                    (block as { type?: unknown }).type === 'text'
+                    && typeof (block as { text?: unknown }).text === 'string')
+                .map((block) => block.text)
+                .join('\n');
+        if (!query.trim()) {
+            pendingLessonTicket = null;
+            return content;
+        }
+        const outcome = await lessonTurn.recall({
+            turnId: currentTurnId,
+            query,
+            signal: reviewAbort.signal,
+        }).catch(() => null);
+        if (!outcome || outcome.outcome !== 'selected') {
+            pendingLessonTicket = null;
+            return content;
+        }
+        pendingLessonTicket = outcome.ticket;
+        // Prepended, and clearly labelled as reference material — the same
+        // shape the Codex path uses.
+        return typeof content === 'string'
+            ? `${outcome.block}\n\n${content}`
+            : [{ type: 'text', text: outcome.block } as ContentBlockParam, ...content];
+    };
+
     // Push initial message
     let messages = new PushableAsyncIterable<SDKUserMessage>();
     messages.push({
@@ -305,7 +449,7 @@ export async function claudeRemote(opts: {
         parent_tool_use_id: null,
         message: {
             role: 'user',
-            content: initial.message,
+            content: await withLessons(initial.message),
         },
     });
 
@@ -346,6 +490,9 @@ export async function claudeRemote(opts: {
         if (!acceptsActiveInput || messages.done || !text.trim()) {
             return false;
         }
+        // Active input is a new user turn too; a review for the last one must
+        // not keep spending.
+        preemptReview();
         messages.push({
             type: 'user',
             parent_tool_use_id: null,
@@ -360,6 +507,44 @@ export async function claudeRemote(opts: {
 
         for await (const message of response) {
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
+
+            /*
+             * The first provider event of this turn — the assistant starting
+             * to answer — is the earliest point at which the input is known to
+             * have been accepted. Acknowledging when the message was queued
+             * would record a delivery that a failure before this point could
+             * still have prevented.
+             *
+             * Its own catch: a memory failure must not enter the turn's error
+             * handling, which would close the turn and write a failure into
+             * the transcript.
+             */
+            /*
+             * Tool calls the assistant is starting. Paired with their results
+             * by `tool_use_id`, so parallel calls never cross — the same rule
+             * the Codex path follows with `call_id`.
+             */
+            if (message.type === 'assistant' && Array.isArray((message as { message?: { content?: unknown } }).message?.content)) {
+                for (const block of (message as { message: { content: unknown[] } }).message.content) {
+                    const call = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
+                    if (call.type !== 'tool_use' || typeof call.id !== 'string') continue;
+                    const input = call.input as { command?: unknown; cwd?: unknown } | undefined;
+                    claudeTurnObservations.commandStarted({
+                        callId: call.id,
+                        // A tool's command when it has one, its name otherwise:
+                        // "the same check ran twice" has to mean something for
+                        // tools that are not shell commands too.
+                        command: input?.command ?? call.name,
+                        cwd: input?.cwd,
+                    });
+                }
+            }
+
+            if (pendingLessonTicket && lessonTurn && message.type === 'assistant') {
+                const ticket = pendingLessonTicket;
+                pendingLessonTicket = null;
+                await lessonTurn.acknowledge(ticket).catch(() => false);
+            }
 
             if (message.type === 'prompt_suggestion') {
                 if (acceptsPromptSuggestion) {
@@ -437,6 +622,36 @@ export async function claudeRemote(opts: {
                 opts.onActiveInputReady?.(null);
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received');
+
+                /*
+                 * A turn that reached a result ended normally. The worker
+                 * decides whether there is anything to review and refuses on
+                 * its own when review is off, unfunded, unpriced or when this
+                 * host observed nothing. Not awaited: the conversation must
+                 * not wait on a background review.
+                 */
+                /*
+                 * Always taken, so nothing carries into the next turn — and
+                 * discarded when the turn errored, because a turn that failed
+                 * has no verified procedure in it.
+                 */
+                const observed = claudeTurnObservations.take();
+                if (lessonReview && !(message as { is_error?: boolean }).is_error) {
+                    void lessonReview.reviewFinishedTurn({
+                        record: {
+                            sessionId: sessionIdForLessons!,
+                            turnId: currentTurnId,
+                            kind: lessonSessionKind,
+                            endedNormally: true,
+                            hadPriorAssistantTurn: claudeTurnCounter > 0,
+                            userMessages: [currentTurnMessage],
+                            agentSummary: observed.summary,
+                            recoveredFailures: observed.recoveredFailures,
+                        },
+                        signal: reviewAbort.signal,
+                    }).catch(() => undefined);
+                }
+                claudeTurnCounter += 1;
                 opts.onMcpControllerReady?.(mcpRecovery);
 
                 await mcpRecovery.recoverFailedServers();
@@ -575,7 +790,24 @@ export async function claudeRemote(opts: {
                         mode = next.mode;
                         acceptsActiveInput = true;
                         opts.onActiveInputReady?.(sendActiveInput);
-                        messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: next.message } });
+                        // Content can be structured blocks; only plain text is
+                        // usable as a recall query or as review evidence — but
+                        // the blocks themselves are what gets sent, so recall
+                        // runs on the whole message rather than on a flattened
+                        // copy that would drop every attachment.
+                        currentTurnMessage = readTurnText(next.message);
+                        // A new turn: stop any review still running for the
+                        // previous one before this one starts costing anything.
+                        preemptReview();
+                        currentTurnId = `${sessionIdForLessons}:${randomUUID()}`;
+                        /*
+                         * After the `acceptsPromptSuggestion` flip and the MCP
+                         * recovery, for the reason the comment above gives: a
+                         * result that arrives from the previous turn must not
+                         * be attached to this one.
+                         */
+                        const withBlock = await withLessons(next.message);
+                        messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: withBlock } });
                     }
                 }).catch(() => {
                     messages.end();
@@ -587,6 +819,20 @@ export async function claudeRemote(opts: {
                 const msg = message as SDKUserMessage;
                 if (msg.message.role === 'user' && Array.isArray(msg.message.content)) {
                     for (let c of msg.message.content) {
+                        /*
+                         * The provider's own verdict on a tool call. `is_error`
+                         * is what Claude reports; reading the result text and
+                         * guessing would invent successes the agent never had.
+                         * An aborted call verifies nothing either way.
+                         */
+                        if (c.type === 'tool_result' && c.tool_use_id) {
+                            claudeTurnObservations.commandEnded({
+                                callId: c.tool_use_id,
+                                status: opts.isAborted(c.tool_use_id) ? 'cancelled' : 'completed',
+                                exitCode: c.is_error === true ? 1 : 0,
+                                output: typeof c.content === 'string' ? c.content : undefined,
+                            });
+                        }
                         if (c.type === 'tool_result' && c.tool_use_id && opts.isAborted(c.tool_use_id)) {
                             logger.debug('[claudeRemote] Tool aborted, exiting claudeRemote');
                             return;

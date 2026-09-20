@@ -38,8 +38,13 @@ interface PermissionsField {
     allowedTools?: string[];
 }
 
+import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
+
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
+
+    // Survives generation restarts within this session; see the call below.
+    const lessonObservations = createLessonTurnObservations();
 
     // Check if we have a TTY for UI rendering
     const hasTTY = process.stdout.isTTY && process.stdin.isTTY;
@@ -437,6 +442,30 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
+                    /*
+                     * One host for the whole session, one observation buffer
+                     * for the whole session. A fresh buffer per generation
+                     * would drop a failure observed just before a restart and
+                     * with it the recovery it was half of.
+                     */
+                    ...(session.lessons
+                        ? {
+                            lessons: {
+                                turn: session.lessons.turn,
+                                review: session.lessons.review,
+                                sessionKind: session.lessons.sessionKind,
+                                observations: lessonObservations,
+                                /*
+                                 * The authoritative Happy session id, not the
+                                 * Claude provider one — that is null here on a
+                                 * fresh session, and a placeholder would
+                                 * attribute traces to an identity nobody can
+                                 * resolve.
+                                 */
+                                sessionId: session.client.sessionId ?? null,
+                            },
+                        }
+                        : {}),
                     path: session.path,
                     managedSettingsLockdown: session.managedSettingsLockdown,
                     managedRun: session.managedRun,
