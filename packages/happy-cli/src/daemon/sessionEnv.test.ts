@@ -15,6 +15,7 @@ import {
     honorsManagedAiCredentials,
     verifyAiAuthSelection,
 } from './sessionEnv'
+import { readAiAuthConnectionVersion } from '../usage/aiAuthSource'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
 
 describe('scrubSessionLineageEnv', () => {
@@ -481,15 +482,28 @@ describe('applyAppliedAiAuthSourceEnv', () => {
 })
 
 describe('부모 리뷰 수정: 연결 버전 잔재', () => {
-    it('원천을 새로 적을 때 이전 연결 버전을 남기지 않는다', () => {
-        // tmux 는 -e 로 덧씌울 뿐 전달하지 않은 변수를 지우지 않는다. 이전 세션의
-        // 버전이 남으면 새 원천과 옛 버전이 한 이벤트에 실린다.
+    it('연결 버전 키를 생략하지 않고 **명시적으로 비운다** — tmux 는 생략 키를 안 지운다', () => {
+        // tmux 는 전달한 키만 `-e` 로 덮고, 넘기지 않은 키는 tmux 서버 환경에
+        // 그대로 남긴다. 객체에서 delete 하면 평범한 spawn 에서는 사라지지만
+        // tmux 경로에서는 이전 세션 값이 새 child 에 그대로 상속된다.
+        const child = applyAppliedAiAuthSourceEnv({ PATH: '/usr/bin' })
+        expect(Object.prototype.hasOwnProperty.call(child, 'HAPPY_AI_AUTH_CONNECTION_VERSION')).toBe(true)
+        expect(child.HAPPY_AI_AUTH_CONNECTION_VERSION).toBe('')
+    })
+
+    it('비운 값은 읽기 측에서 버전 없음으로 읽힌다', () => {
+        const child = applyAppliedAiAuthSourceEnv({ HAPPY_AI_AUTH_CONNECTION_VERSION: '99' })
+        expect(readAiAuthConnectionVersion(child)).toBeNull()
+    })
+
+    it('원천을 새로 적을 때 이전 연결 버전이 새 child 로 넘어가지 않는다', () => {
         const child = applyAppliedAiAuthSourceEnv({
             PATH: '/usr/bin',
             HAPPY_AI_AUTH_CONNECTION_VERSION: '99',
         })
         expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
-        expect(child.HAPPY_AI_AUTH_CONNECTION_VERSION).toBeUndefined()
+        expect(readAiAuthConnectionVersion(child)).toBeNull()
+        expect(child.PATH).toBe('/usr/bin')
     })
 })
 

@@ -240,16 +240,21 @@ export function applyAppliedAiAuthSourceEnv(
     platformLeaseApplied = false,
 ): Record<string, string> {
     /*
-     * The version is dropped, not carried. tmux overlays `-e` onto an existing
-     * window environment and never deletes what the overlay omits, so a value
-     * left by an earlier session would ride along and pair a fresh source with
-     * a stale connection. Only a managed run has a version, and it writes its
-     * own (`applyManagedAiAuthReporting`).
+     * The version is **written empty, not omitted**.
+     *
+     * tmux only applies the keys it is handed (`-e KEY=VALUE`); a key left out
+     * stays in the tmux server environment and is inherited by the next child.
+     * Deleting it from this object therefore clears it on a plain spawn and
+     * leaves it standing on the tmux path, where an earlier session's version
+     * would pair with this session's freshly written source. Writing it empty
+     * overwrites on both paths, and `readAiAuthConnectionVersion` reads an
+     * empty string as "no version" — only a managed run writes a real one
+     * (`applyManagedAiAuthReporting`).
      */
-    const { [HAPPY_AI_AUTH_CONNECTION_VERSION_ENV]: _stale, ...rest } = env
     return {
-        ...rest,
+        ...env,
         [HAPPY_AI_AUTH_SOURCE_ENV]: resolveAppliedAiAuthSource({ env, platformLeaseApplied }),
+        [HAPPY_AI_AUTH_CONNECTION_VERSION_ENV]: '',
     }
 }
 
