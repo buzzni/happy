@@ -171,6 +171,14 @@ export const MachineMetadataSchema = z.object({
     access: z.literal('read-write'),
   }).optional(),
   difficultyRouting: DifficultyRoutingCapabilitySchema.optional(),
+  /**
+   * 이 daemon 이 spawn param `aiAuthSelection` 을 이해한다고 광고한다.
+   *
+   * `spawn-happy-session` 은 파라미터를 구조분해만 하므로 구형 daemon 은 선택을
+   * 조용히 버린다. 클라이언트는 이 필드를 보고 나서만 선택을 보낸다. 버전을 두는
+   * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
+   */
+  aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>

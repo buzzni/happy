@@ -31,6 +31,27 @@ export const UsageCostV1Schema = z.object({
     pricingVersion: z.string().trim().min(1).max(128).nullable(),
 }).strict();
 
+/**
+ * Which credential the run that produced this usage was actually spent on.
+ *
+ * `appliedSource` is a loose string on purpose. The closed set of tokens lives
+ * on the receiving side (the ledger downgrades anything it does not know to
+ * `unknown`); a closed enum here would mean a newer CLI reporting a source
+ * this schema predates loses the whole event, tokens and cost included. The
+ * value is permissive, the type is not: a number is still a refusal.
+ *
+ * Additive and optional, so `schemaVersion` stays at 1 — a CLI that does not
+ * report a source keeps parsing unchanged.
+ *
+ * Mirrors `packages/web-ui/server/aiUsageContract.ts` in aplus-dev-studio.
+ */
+export const AiAuthReportV1Schema = z.object({
+    appliedSource: z.string().trim().max(64).nullish(),
+    // 상한은 수신 측 저장 컬럼(PostgreSQL INTEGER)에 맞춘다. 더 넓으면 부가
+    // metadata 하나 때문에 그 이벤트의 토큰 사용량까지 통째로 잃는다.
+    connectionVersion: nonNegativeSafeInteger.max(2_147_483_647).nullish(),
+}).strict();
+
 const providerUsageEventShape = {
     source: z.literal('happy-cli'),
     sourceEventId: z.string().trim().min(1).max(512),
@@ -44,6 +65,7 @@ const providerUsageEventShape = {
     tokens: UsageTokenBreakdownV1Schema,
     cost: UsageCostV1Schema.nullable(),
     quality: z.enum(['exact', 'estimated']),
+    aiAuth: AiAuthReportV1Schema.nullish(),
 } as const;
 
 export const ProviderUsageEventV1Schema = z.object(providerUsageEventShape).strict();
@@ -55,5 +77,6 @@ export const AiUsageEventV1Schema = z.object({
 
 export type UsageTokenBreakdownV1 = z.infer<typeof UsageTokenBreakdownV1Schema>;
 export type UsageCostV1 = z.infer<typeof UsageCostV1Schema>;
+export type AiAuthReportV1 = z.infer<typeof AiAuthReportV1Schema>;
 export type ProviderUsageEventV1 = z.infer<typeof ProviderUsageEventV1Schema>;
 export type AiUsageEventV1 = z.infer<typeof AiUsageEventV1Schema>;
