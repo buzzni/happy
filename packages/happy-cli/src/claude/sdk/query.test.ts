@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,8 +12,121 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 import { query } from './query';
 
 describe('query adapter', () => {
+    let configDirectory: string;
     beforeEach(() => {
         sdkQuery.mockClear();
+        configDirectory = mkdtempSync(join(tmpdir(), 'happy-plugin-config-'));
+        vi.stubEnv('CLAUDE_CONFIG_DIR', configDirectory);
+    });
+    afterEach(() => {
+        vi.unstubAllEnvs();
+        rmSync(configDirectory, { recursive: true, force: true });
+    });
+
+    function writePlugin(servers: Record<string, unknown>, name = 'sales') {
+        const directory = join(configDirectory, 'plugins', 'synced', 'account', name);
+        mkdirSync(join(directory, '.claude-plugin'), { recursive: true });
+        writeFileSync(join(directory, '.claude-plugin', 'plugin.json'), JSON.stringify({ name }));
+        const config = join(directory, '.mcp.json');
+        writeFileSync(config, JSON.stringify({ mcpServers: servers }));
+        return config;
+    }
+
+    function sdkSettings() {
+        const calls = sdkQuery.mock.calls as unknown as Array<Array<any>>;
+        return JSON.parse(calls.at(-1)![0].options.settings);
+    }
+
+    it('excludes only synced HTTP/SSE plugins with blank URLs before starting the SDK', () => {
+        const config = writePlugin({
+            gmail: { type: 'http', url: '' },
+            calendar: { type: 'sse', url: '  \n' },
+            configured: { type: 'http', url: 'https://example.com/mcp' },
+            stdio: { command: 'node', args: ['server.js'] },
+            missing: { type: 'http' },
+        });
+        const original = readFileSync(config, 'utf8');
+        const mcpServers = { gmail: { type: 'http' as const, url: 'https://gateway.example/mcp' } };
+        query({ prompt: 'continue', options: { mcpServers } });
+        expect(sdkSettings().deniedMcpServers).toEqual([
+            { serverName: 'plugin:sales:gmail' },
+            { serverName: 'plugin:sales:calendar' },
+        ]);
+        expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ mcpServers }),
+        }));
+        expect(readFileSync(config, 'utf8')).toBe(original);
+    });
+
+    it('preserves hook settings, existing MCP exclusions and tool deny rules', () => {
+        writePlugin({ gmail: { type: 'http', url: '' } });
+        const settingsPath = join(configDirectory, 'hooks.json');
+        const hooks = { SessionStart: [{ matcher: '*' }] };
+        writeFileSync(settingsPath, JSON.stringify({ hooks, deniedMcpServers: [{ serverName: 'blocked' }] }));
+        query({ prompt: 'continue', options: { settingsPath, permissionsDeny: ['Read(/private/**)'] } });
+        expect(sdkSettings()).toEqual({
+            hooks,
+            deniedMcpServers: [{ serverName: 'blocked' }, { serverName: 'plugin:sales:gmail' }],
+            permissions: { deny: ['Read(/private/**)'] },
+        });
+    });
+
+    it('allows a repaired plugin URL on the next query instead of persisting a disable flag', () => {
+        writePlugin({ gmail: { type: 'http', url: '' } });
+        query({ prompt: 'continue' });
+        expect(sdkSettings().deniedMcpServers).toHaveLength(1);
+        writePlugin({ gmail: { type: 'http', url: 'https://example.com/mcp' } });
+        query({ prompt: 'continue' });
+        expect(sdkQuery).toHaveBeenLastCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ settings: undefined }),
+        }));
+    });
+
+    it('keeps usable definitions when another account caches the same server with a blank URL', () => {
+        writePlugin({ gmail: { type: 'http', url: '' }, calendar: { type: 'http', url: '' } });
+        const other = join(configDirectory, 'plugins', 'synced', 'other-account', 'sales');
+        mkdirSync(join(other, '.claude-plugin'), { recursive: true });
+        writeFileSync(join(other, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'sales' }));
+        writeFileSync(join(other, '.mcp.json'), JSON.stringify({
+            gmail: { type: 'http', url: 'https://example.com/mcp' },
+            calendar: { type: 'http', url: '' },
+        }));
+        query({ prompt: 'continue' });
+        expect(sdkSettings().deniedMcpServers).toEqual([{ serverName: 'plugin:sales:calendar' }]);
+    });
+
+    it('does not exclude explicitly supplied servers with the same name as a synced placeholder', () => {
+        writePlugin({ gmail: { type: 'http', url: '' } });
+        query({ prompt: 'continue', options: { mcpServers: {
+            'plugin:sales:gmail': { type: 'http', url: 'https://example.com/mcp' },
+        } } });
+        expect(sdkQuery).toHaveBeenLastCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ settings: undefined }),
+        }));
+    });
+
+    it('leaves an ambiguous plugin alone when another account has custom MCP definitions', () => {
+        writePlugin({ gmail: { type: 'http', url: '' } });
+        const other = join(configDirectory, 'plugins', 'synced', 'other-account', 'sales', '.claude-plugin');
+        mkdirSync(other, { recursive: true });
+        writeFileSync(join(other, 'plugin.json'), JSON.stringify({ name: 'sales', mcpServers: './other.json' }));
+        query({ prompt: 'continue' });
+        expect(sdkQuery).toHaveBeenLastCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ settings: undefined }),
+        }));
+    });
+
+    it('does not guess exclusions from malformed files or custom manifest MCP definitions', () => {
+        const malformed = writePlugin({ gmail: { type: 'http', url: '' } });
+        writeFileSync(malformed, '{');
+        const custom = writePlugin({ gmail: { type: 'http', url: '' } }, 'custom');
+        writeFileSync(join(custom, '..', '.claude-plugin', 'plugin.json'), JSON.stringify({
+            name: 'custom', mcpServers: './configured-mcp.json',
+        }));
+        query({ prompt: 'continue' });
+        expect(sdkQuery).toHaveBeenLastCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ settings: undefined }),
+        }));
     });
 
     it('forwards the built-in tool allowance, including the empty list that disables them', () => {

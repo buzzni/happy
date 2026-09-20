@@ -125,6 +125,10 @@ export class McpRuntimeRecovery {
                 const current = (await this.query.mcpServerStatus()).find((status) => status.name === serverName);
                 if (current) {
                     this.emit(current);
+                    // Disabled is an intentional state, not a failed recovery to retry.
+                    if (current.status === 'disabled') {
+                        return { serverName, status: 'not_available' };
+                    }
                     if (current.status === 'connected' || current.status === 'needs-auth') {
                         this.cooldownUntil.delete(serverName);
                         return current.status === 'connected'
@@ -146,9 +150,7 @@ export class McpRuntimeRecovery {
     private emit(status: Pick<McpServerStatus, 'name' | 'status' | 'error'>): void {
         let mappedStatus: McpRuntimeServerStatus['status'] = status.status === 'pending'
             ? 'reconnecting'
-            : status.status === 'disabled'
-                ? 'failed'
-                : status.status;
+            : status.status;
         if (this.connectorNames.has(status.name)) {
             if (mappedStatus === 'failed') mappedStatus = 'connector-runtime-failed';
             if (mappedStatus === 'needs-auth') mappedStatus = 'connector-needs-auth';
