@@ -69,11 +69,12 @@ describe('difficulty routing machine metadata advertised by the daemon', () => {
   // drops the machine back to legacy and every v2 request is answered `unsupported`.
   it("keeps this run's timing contracts through a readiness refresh", () => {
     const stored = { difficultyRouting: capability('RUN-1-KEY', 'RUN-1-PUB') } as unknown as MachineMetadata
-    const baseMetadata = { difficultyRouting: capability('RUN-2-KEY', 'RUN-2-PUB', [1, 2]) } as unknown as MachineMetadata
+    const baseMetadata = { difficultyRouting: { ...capability('RUN-2-KEY', 'RUN-2-PUB', [1, 2]), maxRelayTtlMs: 3000 } } as unknown as MachineMetadata
 
     for (const ready of [true, false]) {
       const published = buildDifficultyRoutingMetadataUpdate({ stored, baseMetadata, ready })
       expect(published.difficultyRouting?.timingVersions, `ready=${ready}`).toEqual([1, 2])
+      expect(published.difficultyRouting?.maxRelayTtlMs).toBe(3000)
     }
   })
 

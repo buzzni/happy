@@ -342,7 +342,7 @@ async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelay
         hostMachineId: request.hostMachineId,
         hostProcessKeyId: request.hostProcessKeyId,
         policyRevision: request.policyRevision,
-        ...(request.timingVersion === 2 ? { timingVersion: 2 as const } : {}),
+        ...(request.timingVersion === 2 ? { timingVersion: 2 as const, remainingMs: request.remainingMs } : {}),
       }),
       signal,
     });
@@ -935,6 +935,7 @@ export async function startDaemon(): Promise<void> {
         // refresh rebuilds `difficultyRouting` from this object, so anything missing here is
         // dropped the first time readiness changes.
         timingVersions: [1, 2],
+        maxRelayTtlMs: 3000,
         classifier: {
           kind: 'transformers-binary',
           modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,

@@ -121,7 +121,9 @@ describe('capability timing contracts survive the schema', () => {
   }
 
   it('keeps the advertised contracts through parse and re-serialization', () => {
-    const parsed = DifficultyRoutingCapabilitySchema.parse({ ...base, timingVersions: [1, 2] })
+    const parsed = DifficultyRoutingCapabilitySchema.parse({ ...base, timingVersions: [1, 2], maxRelayTtlMs: 3000 })
+    expect(parsed.maxRelayTtlMs).toBe(3000)
+    expect(JSON.parse(JSON.stringify(parsed)).maxRelayTtlMs).toBe(3000)
     expect(parsed.timingVersions).toEqual([1, 2])
     expect(JSON.parse(JSON.stringify(parsed)).timingVersions).toEqual([1, 2])
   })

@@ -61,6 +61,24 @@ function ready(f: ReturnType<typeof setup>) {
   f.worker.emit('message', { type: 'ready', classifierRevision: 'rev' })
 }
 describe('native classifier lifecycle and trust boundary', () => {
+  it('keeps the default worker warm past 15 minutes and releases it after 60 idle minutes', async () => {
+    const f = setup({ idleMs: undefined }); ready(f)
+    await vi.advanceTimersByTimeAsync(59 * 60000)
+    expect(f.worker.connected).toBe(true)
+    expect(f.spawnWorker).toHaveBeenCalledTimes(1)
+    const pending = f.host.classify(request(f.key))
+    await vi.advanceTimersByTimeAsync(0)
+    f.worker.emit('message', { type: 'result', requestId: 'req-1', difficulty: 'hard', classifierRevision: 'rev' })
+    await expect(pending).resolves.toMatchObject({ status: 'ok' })
+    expect(f.spawnWorker).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(59 * 60000)
+    expect(f.worker.connected).toBe(true)
+    await vi.advanceTimersByTimeAsync(60000)
+    expect(f.worker.connected).toBe(false)
+    expect(f.host.capability().ready).toBe(false)
+    f.host.terminate()
+  })
+
   it('does not spawn while OFF and returns immediately while preparing', async () => {
     const f = setup()
     await expect(f.host.classify(request(f.key))).resolves.toMatchObject({ status: 'revoked' })
@@ -159,7 +177,7 @@ describe('timing v2 wire and clock independence', () => {
       { deadlineAt: Date.now() + 800 },
       { remainingMs: undefined },
       { remainingMs: 0 },
-      { remainingMs: 1001 },
+      { remainingMs: 3001 },
       { remainingMs: 1.5 },
       { remainingMs: '500' },
       { remainingMs: null },
@@ -183,7 +201,7 @@ describe('timing v2 wire and clock independence', () => {
   })
 
   it('accepts both edges of the allowed budget and echoes the contract back', async () => {
-    for (const remainingMs of [1, 1000]) {
+    for (const remainingMs of [1, 3000]) {
       const f = setup(); ready(f)
       const pending = f.host.classify(v2(f.key, { remainingMs }))
       await vi.advanceTimersByTimeAsync(0)
