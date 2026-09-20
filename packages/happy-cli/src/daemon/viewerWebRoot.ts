@@ -50,6 +50,7 @@ export type ViewerResizeMode = 'remote' | 'scale'
  */
 export function installViewerClipboardBridge(UI: any, win: any, doc: any): void {
     const CONTROL_L = 0xffe3
+    const ALT_L = 0xffe9
     const LOWERCASE_V = 0x76
     const LOWERCASE_C = 0x63
     // The remote clipboard is set over the same socket, but x11vnc hands the
@@ -73,28 +74,36 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
     }
 
     /** Presses Ctrl+V on the remote end, which is what actually pastes there. */
-    const pressPasteRemotely = () => {
+    const pressPasteRemotely = (fromMeta: boolean) => {
         const rfb = session()
         if (!rfb) return
+        // Same Meta->Alt translation as copy. Paste only escapes it when the
+        // user happens to let Cmd go inside the delay below, which is luck,
+        // not a guarantee.
+        if (fromMeta) releaseMetaAlt(rfb)
         rfb.sendKey(CONTROL_L, 'ControlLeft', true)
         rfb.sendKey(LOWERCASE_V, 'KeyV', true)
         rfb.sendKey(LOWERCASE_V, 'KeyV', false)
         rfb.sendKey(CONTROL_L, 'ControlLeft', false)
     }
 
-    const pasteToRemote = (text: string) => {
+    const pasteToRemote = (text: string, fromMeta: boolean) => {
         const rfb = session()
         if (!rfb || !text) return
         rfb.clipboardPasteFrom(text)
         // Filling the remote clipboard is only half the job: the focused
         // remote app still has to be told to paste, and ⌘V never reaches it
         // (noVNC maps Meta to Alt for the remote end).
-        win.setTimeout(pressPasteRemotely, PASTE_KEY_DELAY_MS)
+        win.setTimeout(() => pressPasteRemotely(fromMeta), PASTE_KEY_DELAY_MS)
     }
 
     let nativePasteArrived = false
+    // 네이티브 paste 이벤트에는 modifier 가 실리지 않는다. 이 폴백을 무장시킨
+    // 단축키가 Cmd 였는지 기억해 두지 않으면, 그 경로만 Meta-Alt 를 못 푼다.
+    let nativePasteFromMeta = false
 
-    const armNativePaste = () => {
+    const armNativePaste = (fromMeta: boolean) => {
+        nativePasteFromMeta = fromMeta
         nativePasteArrived = false
         textarea.value = ''
         textarea.focus()
@@ -107,7 +116,7 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
             // in the capture phase, and swallowing it also breaks pasting
             // *within* the remote desktop, which worked before this existed
             // (reported live 2026-09-20).
-            pressPasteRemotely()
+            pressPasteRemotely(fromMeta)
         }, FOCUS_RESTORE_MS)
     }
 
@@ -137,9 +146,31 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
      * owns the shortcut instead and always sends Control_L, exactly as it
      * already does for paste.
      */
-    const pressCopyRemotely = () => {
+    /**
+     * Lets go of the Alt noVNC put down for the Cmd key.
+     *
+     * Measured against real noVNC 1.7.0 in Chromium on macOS (2026-09-20):
+     * pressing Cmd sends `Alt_L` **down** to the remote and leaves it down
+     * until Cmd is released — `keyboard.js` rewrites `XK_Super_L` to
+     * `XK_Alt_L`, and the macOS special case right below it excludes the Meta
+     * key itself (`code !== 'MetaLeft'`). Injecting Ctrl+C on top of that
+     * makes the remote see `Alt_L+Control_L+c`, which copies nothing on a
+     * Linux remote — the very thing the bridge exists to prevent.
+     *
+     * Only called for Meta-triggered shortcuts, so the Alt being released is
+     * always noVNC's translation: a real Option press is turned away earlier
+     * by the `event.altKey` guard. The key is not pressed again afterwards —
+     * noVNC still sends its own `Alt_L` up when Cmd is released, and a
+     * release of an unpressed key is a no-op for the X server.
+     */
+    const releaseMetaAlt = (rfb: any) => {
+        rfb.sendKey(ALT_L, 'AltLeft', false)
+    }
+
+    const pressCopyRemotely = (fromMeta: boolean) => {
         const rfb = session()
         if (!rfb) return
+        if (fromMeta) releaseMetaAlt(rfb)
         rfb.sendKey(CONTROL_L, 'ControlLeft', true)
         rfb.sendKey(LOWERCASE_C, 'KeyC', true)
         rfb.sendKey(LOWERCASE_C, 'KeyC', false)
@@ -155,7 +186,7 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         // Only the keystroke is forwarded. Whatever the remote's own
         // selection holds comes back through the existing RFB `clipboard`
         // listener below once the remote actually receives a working Ctrl+C.
-        pressCopyRemotely()
+        pressCopyRemotely(Boolean(event.metaKey))
     }, true)
 
     win.addEventListener('keydown', (event: any) => {
@@ -174,12 +205,12 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
             readingClipboard = true
             const readText = (text: string) => {
                 readingClipboard = false
-                pasteToRemote(text)
+                pasteToRemote(text, Boolean(event.metaKey))
             }
             const readFailed = (error: unknown) => {
                 readingClipboard = false
                 if (win.console) win.console.warn('[aplus] clipboard read refused:', error)
-                armNativePaste()
+                armNativePaste(Boolean(event.metaKey))
             }
             // Reading the clipboard directly, rather than waiting for the
             // browser's own paste event: Chrome decides the paste target when
@@ -198,7 +229,7 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
             }
             return
         }
-        armNativePaste()
+        armNativePaste(Boolean(event.metaKey))
     }, true)
 
     textarea.addEventListener('paste', (event: any) => {
@@ -206,7 +237,7 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
         const text = event.clipboardData ? event.clipboardData.getData('text') : ''
         if (typeof event.preventDefault === 'function') event.preventDefault()
         restoreFocus()
-        pasteToRemote(text)
+        pasteToRemote(text, nativePasteFromMeta)
     })
 
     let attached: any = null
