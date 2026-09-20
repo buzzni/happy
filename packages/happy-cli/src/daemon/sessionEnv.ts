@@ -339,27 +339,33 @@ export type AiAuthSelectionVerdict = {
 }
 
 /**
- * Compares an explicit selection against the **finished** child environment.
+ * Compares an explicit selection against what the daemon can **prove** about
+ * the credential this spawn will spend.
  *
- * The only signal is `HAPPY_AI_AUTH_SOURCE`, which `applyAppliedAiAuthSourceEnv`
- * has just written onto that environment. It is the daemon's own statement of
- * what it applied and the exact value the usage ledger records, so the check
- * and the ledger can never disagree. Nothing here inspects the machine for
- * credentials: an organisation Claude bundle is installed into machine-global
- * files by `cswap` and reaches no environment variable, so a file probe would
- * be a second, weaker opinion.
+ * An earlier revision accepted `machine-personal` on a negative confirmation —
+ * "the daemon overlaid nothing of its own". That reasoning was wrong, and
+ * three things it cannot see prove it:
  *
- * The two directions are not symmetric, because the available evidence is not:
+ *  - an `ANTHROPIC_API_KEY` inherited from the daemon's own environment, or
+ *    injected by the project, is somebody's credential and leaves the check
+ *    untouched;
+ *  - an organisation Claude bundle is installed by `cswap` into machine-global
+ *    files and reaches no environment variable at all — worse, `cswap import`
+ *    **removes every account not in the bundle**, so on such a machine the
+ *    personal login the selection names does not exist any more;
+ *  - a gateway token and base URL left by any earlier layer look the same.
  *
- *  - `machine-personal` is confirmed **negatively** — the daemon knows it
- *    overlaid nothing of its own. `unknown` is that confirmation, not a gap.
- *    Which personal account is in play stays out of reach (there is no
- *    secret-free identifier for a BYOS login), and this increment does not
- *    pretend otherwise.
- *  - `org-bundle` needs a **positive** statement that the daemon applied an
- *    organisation bundle. Today no code path produces one, so the selection is
- *    refused rather than quietly served by whatever else the machine has: a
- *    substitution is exactly what choosing was meant to prevent.
+ * All three ran green against the old rule. "I added nothing" is not "the run
+ * spends your own login": it is the absence of one kind of evidence, not the
+ * presence of another. Passing it silently is the failure this feature exists
+ * to prevent — a selected session metered against a credential the user did
+ * not choose.
+ *
+ * So both kinds now require a **positive** statement that the daemon applied
+ * the named credential. Today no code path produces one for either kind, so
+ * every explicit selection is refused. That is the state of the evidence, not
+ * a special case: when a path does write `HAPPY_AI_AUTH_SOURCE` from a proven
+ * application, the same comparison starts passing with no change here.
  */
 export function verifyAiAuthSelection(
     selection: AiAuthSelection | undefined,
@@ -367,19 +373,16 @@ export function verifyAiAuthSelection(
 ): AiAuthSelectionVerdict {
     const appliedSource = normalizeAiAuthSource(env[HAPPY_AI_AUTH_SOURCE_ENV])
     if (selection === undefined) return { appliedSource }
-    if (selection.kind === 'org-bundle') {
-        if (appliedSource === 'org-bundle') return { appliedSource }
-        return {
-            appliedSource,
-            rejection: `AI auth selection 'org-bundle' was requested but this daemon could not`
-                + ` confirm an organisation bundle for the spawn (applied source: '${appliedSource}').`
-                + ` The session is not started with a substitute credential.`,
-        }
-    }
-    if (!DAEMON_APPLIED_AI_AUTH_SOURCES.includes(appliedSource)) return { appliedSource }
+    if (appliedSource === selectionAppliedSource(selection.kind)) return { appliedSource }
     return {
         appliedSource,
-        rejection: `AI auth selection 'machine-personal' was requested but the spawn environment`
-            + ` applies '${appliedSource}' credentials instead.`,
+        rejection: `AI auth selection '${selection.kind}' was requested but this daemon could not`
+            + ` confirm that credential for the spawn (applied source: '${appliedSource}').`
+            + ` The session is not started with a substitute credential.`,
     }
+}
+
+/** The applied source that would prove a selection was honoured. */
+function selectionAppliedSource(kind: AiAuthSelectionKind): AiAuthSource {
+    return kind === 'org-bundle' ? 'org-bundle' : 'personal-subscription'
 }

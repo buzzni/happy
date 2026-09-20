@@ -562,11 +562,20 @@ describe('verifyAiAuthSelection', () => {
         },
     )
 
-    it.each([undefined, 'personal-subscription', 'personal-api-key'])(
-        'machine-personal 에 daemon 이 아무 자격도 안 덮었으면(%s) 통과한다',
+    // 이 테스트는 원래 `undefined`·`personal-api-key` 도 통과시켰다. 음성 확인이
+    // 개인 자격의 증거라는 전제였는데, 상속 키·프로젝트 주입 키·cswap 이 갈아끼운
+    // 머신 전역 자격이 전부 그 검사에 안 걸리는 것으로 반증됐다. 이제 daemon 이
+    // 개인 구독을 적용했다고 **진술한 경우에만** 통과한다.
+    it('machine-personal 은 daemon 이 개인 구독 적용을 진술했을 때만 통과한다', () => {
+        expect(verifyAiAuthSelection({ kind: 'machine-personal' }, envWith('personal-subscription')).rejection)
+            .toBeUndefined()
+    })
+
+    it.each([undefined, 'personal-api-key'])(
+        'machine-personal 은 확인되지 않은 상태(%s)에서 거절한다',
         (source) => {
             expect(verifyAiAuthSelection({ kind: 'machine-personal' }, envWith(source)).rejection)
-                .toBeUndefined()
+                .toBeDefined()
         },
     )
 
@@ -581,6 +590,39 @@ describe('verifyAiAuthSelection', () => {
 
     it('org-bundle 이 실제로 적용됐다고 daemon 이 진술하면 통과한다', () => {
         expect(verifyAiAuthSelection({ kind: 'org-bundle' }, envWith('org-bundle')).rejection)
+            .toBeUndefined()
+    })
+})
+
+describe('리뷰 수정: 확인할 수 없는 선택은 통과시키지 않는다', () => {
+    it('machine-personal 은 상속된 남의 API 키 위에서 통과하면 안 된다', () => {
+        // 음성 확인("내가 안 덮었다")은 개인 자격의 증거가 아니다. 상속 env·프로젝트
+        // 주입 키·cswap 이 갈아끼운 머신 전역 자격이 전부 보이지 않는다.
+        const verdict = verifyAiAuthSelection({ kind: 'machine-personal' }, {
+            HAPPY_AI_AUTH_SOURCE: 'unknown',
+            ANTHROPIC_API_KEY: 'sk-ant-somebody-elses',
+        })
+        expect(verdict.rejection).toBeDefined()
+    })
+
+    it('machine-personal 은 조직 자격이 머신 전역에 있을 때도 통과하면 안 된다', () => {
+        // cswap import 는 번들에 없는 계정을 제거한다 — 조직 번들이 배포된 머신에는
+        // 개인 로그인이 남아 있지 않다. env 에는 아무 흔적도 없다.
+        const verdict = verifyAiAuthSelection({ kind: 'machine-personal' }, {
+            HAPPY_AI_AUTH_SOURCE: 'unknown',
+        })
+        expect(verdict.rejection).toBeDefined()
+    })
+
+    it('org-bundle 도 확인 신호가 없어 거절된다', () => {
+        const verdict = verifyAiAuthSelection({ kind: 'org-bundle' }, {
+            HAPPY_AI_AUTH_SOURCE: 'unknown',
+        })
+        expect(verdict.rejection).toBeDefined()
+    })
+
+    it('선택이 없으면 기존 동작 그대로 통과한다', () => {
+        expect(verifyAiAuthSelection(undefined, { HAPPY_AI_AUTH_SOURCE: 'unknown' }).rejection)
             .toBeUndefined()
     })
 })
