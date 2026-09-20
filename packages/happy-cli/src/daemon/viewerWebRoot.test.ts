@@ -211,6 +211,7 @@ function fakeRfb() {
 
 const CONTROL_L = 0xffe3
 const LOWERCASE_V = 0x76
+const LOWERCASE_C = 0x63
 
 describe('installViewerClipboardBridge', () => {
     it('intercepts the paste shortcut before noVNC swallows the keystroke', () => {
@@ -284,8 +285,12 @@ describe('installViewerClipboardBridge', () => {
         let stopped = 0
         const stopImmediatePropagation = () => { stopped += 1 }
         dom.fireKeydown({ key: 'v', stopImmediatePropagation })
-        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'a', metaKey: true, stopImmediatePropagation })
         dom.fireKeydown({ key: 'v', ctrlKey: true, altKey: true, stopImmediatePropagation })
+        // Cmd+C and Ctrl+C are copy — the bridge owns those too (see the
+        // dedicated describe block below) precisely so this one stays
+        // untouched.
+        dom.fireKeydown({ key: 'c', ctrlKey: true, altKey: true, stopImmediatePropagation })
 
         expect(stopped).toBe(0)
         expect(dom.textarea.focused).toBe(false)
@@ -617,5 +622,87 @@ describe('installViewerClipboardBridge never swallows the shortcut', () => {
             [LOWERCASE_V, 'KeyV', false],
             [CONTROL_L, 'ControlLeft', false],
         ])
+    })
+})
+
+describe('installViewerClipboardBridge sends Ctrl+C for copy, never noVNC\'s own remap', () => {
+    // noVNC remaps macOS's own Cmd (Super) key to Alt for the remote end
+    // (core/input/keyboard.js: "Alt behaves more like AltGraph on macOS").
+    // Left alone, a Mac user's Cmd+C arrives on the (Linux) remote as Alt+C,
+    // which copies nothing. The bridge must own the shortcut itself and
+    // always send Control_L, the same way it already does for paste.
+    it('sends Control_L + KeyC to the remote on Cmd+C', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation: () => { stopped += 1 } })
+
+        expect(dom.keydownIsCapturing()).toBe(true)
+        expect(stopped).toBe(1)
+        expect(rfb.keys).toEqual([
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_C, 'KeyC', true],
+            [LOWERCASE_C, 'KeyC', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    it('sends the same Control_L + KeyC on Ctrl+C (Windows/Linux)', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', ctrlKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys).toEqual([
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_C, 'KeyC', true],
+            [LOWERCASE_C, 'KeyC', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    // Same non-Latin-layout fallback as paste: a Korean layout can report a
+    // composed letter for the physical C key.
+    it('accepts the physical C key when the reported letter is not Latin', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'ㅊ', code: 'KeyC', metaKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys.length).toBeGreaterThan(0)
+    })
+
+    it('leaves every other Cmd/Ctrl shortcut alone', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        const stopImmediatePropagation = () => { stopped += 1 }
+        dom.fireKeydown({ key: 'a', metaKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'c', altKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'c', stopImmediatePropagation })
+
+        expect(stopped).toBe(0)
+        expect(rfb.keys).toEqual([])
+    })
+
+    // Copying does not touch the clipboard-read machinery at all — it only
+    // forwards the keystroke. The existing RFB `clipboard` listener already
+    // pulls whatever the remote puts on its selection back to the local
+    // clipboard once the remote actually receives a working Ctrl+C.
+    it('does not read or write the local clipboard on its own', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = () => Promise.reject(new Error('should not be called'))
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation: () => { } })
+
+        expect(dom.written).toEqual([])
     })
 })
