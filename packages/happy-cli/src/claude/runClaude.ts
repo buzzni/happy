@@ -32,6 +32,7 @@ import {
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
 import { ChannelPromptAcceptance, CHANNEL_ACK_DEADLINE_MS } from '@/channel/channelPromptAcceptance';
+import { enqueueChannelTurn } from '@/channel/channelTurnEnqueue';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
 import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
@@ -927,27 +928,14 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
              */
             return { ok: false as const, provenNotWritten: false };
         },
-        enqueue: ({ text, requestId }) => {
-            // Mirrors the ordinary input path's continuation handling: on the first accepted turn
-            // of a resumed session the provider receives the prior transcript, and the visible
-            // user row stays the text the person actually wrote.
-            const deferredTurn = deferredContinuation.prepare(text, { fromChannel: true });
-            const queuedText = deferredTurn?.text ?? text;
-            try {
-                if (deferredTurn) recordAppPrompt(queuedText);
-                // Isolated, not `push`: batching would fold an external request together with
-                // whatever the Desktop user was typing — one turn, two askers. It still preserves
-                // everything already queued, unlike `pushIsolateAndClear`.
-                //
-                // The insert also wakes a local-mode session: the queue's `onMessage` handler asks
-                // local Claude to hand control back so remote mode can take this turn.
-                messageQueue.pushIsolated(queuedText, currentEnhancedMode(), [], requestId);
-                deferredTurn?.commit();
-            } catch (error) {
-                deferredTurn?.rollback();
-                throw error;
-            }
-        },
+        // Mirrors the ordinary input path's continuation handling: on the first accepted turn
+        // of a resumed session the provider receives the prior transcript, and the visible
+        // user row stays the text the person actually wrote.
+        enqueue: (input) => enqueueChannelTurn(input, currentEnhancedMode(), {
+            queue: messageQueue,
+            deferredContinuation,
+            onDeferredText: recordAppPrompt,
+        }),
         now: () => Date.now(),
     });
     session.rpcHandlerManager.registerHandler('channel-prompt', async (params: unknown) =>

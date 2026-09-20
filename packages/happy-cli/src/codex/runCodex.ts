@@ -34,6 +34,7 @@ import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2, type PendingAttachment } from '@/utils/MessageQueue2';
 import { ChannelPromptAcceptance, CHANNEL_ACK_DEADLINE_MS } from '@/channel/channelPromptAcceptance';
+import { enqueueChannelTurn } from '@/channel/channelTurnEnqueue';
 import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
@@ -1083,25 +1084,14 @@ export async function runCodex(opts: {
             // a close can arrive after the server has already committed the row.
             return outcome.ok ? { ok: true as const } : { ok: false as const, provenNotWritten: false };
         },
-        enqueue: ({ text, requestId }) => {
-            const deferredTurn = deferredContinuation.prepare(text, { fromChannel: true });
-            try {
-                // Isolated so an external request is never folded into the same turn as whatever
-                // the Desktop user was typing, while everything already queued is preserved.
-                messageQueue.pushIsolated(deferredTurn?.text ?? text, {
-                    permissionMode: currentPermissionMode || 'default',
-                    model: currentModel,
-                    appendSystemPrompt: currentAppendSystemPrompt,
-                    saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
-                    saycodePromptBlocks: currentSaycodePromptBlocks,
-                    effort: currentEffort,
-                }, [], requestId);
-                deferredTurn?.commit();
-            } catch (error) {
-                deferredTurn?.rollback();
-                throw error;
-            }
-        },
+        enqueue: (input) => enqueueChannelTurn(input, {
+            permissionMode: currentPermissionMode || 'default',
+            model: currentModel,
+            appendSystemPrompt: currentAppendSystemPrompt,
+            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+            saycodePromptBlocks: currentSaycodePromptBlocks,
+            effort: currentEffort,
+        }, { queue: messageQueue, deferredContinuation }),
         now: () => Date.now(),
     });
     session.rpcHandlerManager.registerHandler('channel-prompt', async (params: unknown) =>
