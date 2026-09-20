@@ -78,7 +78,7 @@ import {
     CodexMcpRuntimeRecovery,
 } from './codexMcpRuntimeRecovery';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
-import { enqueueCodexUserText, isCodexClearText } from './codexClearCommand';
+import { enqueueCodexUserText, isCodexClearText, shouldHandleCodexClear } from './codexClearCommand';
 import { createEnvelope } from '@slopus/happy-wire';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
@@ -1565,8 +1565,7 @@ export async function runCodex(opts: {
              * wipes the Codex thread state. Gating only the enqueue side would leave an external
              * sender able to reset a session's context (Saycode specs/desktop-messenger-channels).
              */
-            const fromChannel = (message.requestIds?.length ?? 0) > 0;
-            if (!fromChannel && isCodexClearText(message.message)) {
+            if (shouldHandleCodexClear(message)) {
                 logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
                 client.clearThreadState();
                 currentTurnId = null;
