@@ -210,6 +210,7 @@ function fakeRfb() {
 }
 
 const CONTROL_L = 0xffe3
+const ALT_L = 0xffe9
 const LOWERCASE_V = 0x76
 const LOWERCASE_C = 0x63
 
@@ -321,8 +322,11 @@ describe('installViewerClipboardBridge', () => {
         expect(rfb.pasted).toEqual(['aws-secret'])
         // Copying the text into the remote clipboard is only half of it: the
         // focused remote app still has to be told to paste, and ⌘V never
-        // reaches it (noVNC maps Meta to Alt for the remote end).
+        // reaches it (noVNC maps Meta to Alt for the remote end). That same
+        // remap also leaves Alt down, so it is released first — the dedicated
+        // test below pins why.
         expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
             [CONTROL_L, 'ControlLeft', true],
             [LOWERCASE_V, 'KeyV', true],
             [LOWERCASE_V, 'KeyV', false],
@@ -625,6 +629,33 @@ describe('installViewerClipboardBridge never swallows the shortcut', () => {
     })
 })
 
+describe('installViewerClipboardBridge clears the Meta-Alt before pasting too', () => {
+    /**
+     * 붙여넣기도 같은 구조다 — Cmd+V 면 noVNC 가 이미 Alt_L 을 내려놨고, 60ms
+     * 뒤 주입되는 Ctrl+V 는 그 위에 얹힌다. 복사보다 늦게 터질 뿐(그 사이
+     * 사용자가 Cmd 를 떼면 우연히 통과) 같은 결함이다.
+     */
+    it('releases the Alt noVNC sent for Cmd before pressing Ctrl+V', async () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = async () => 'hello'
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', metaKey: true, stopImmediatePropagation: () => { } })
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.runTimeouts()
+
+        expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_V, 'KeyV', true],
+            [LOWERCASE_V, 'KeyV', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+})
+
 describe('installViewerClipboardBridge sends Ctrl+C for copy, never noVNC\'s own remap', () => {
     // noVNC remaps macOS's own Cmd (Super) key to Alt for the remote end
     // (core/input/keyboard.js: "Alt behaves more like AltGraph on macOS").
@@ -641,12 +672,56 @@ describe('installViewerClipboardBridge sends Ctrl+C for copy, never noVNC\'s own
 
         expect(dom.keydownIsCapturing()).toBe(true)
         expect(stopped).toBe(1)
+        // 앞머리의 Alt 해제는 아래 전용 테스트가 이유까지 고정한다 — 여기서는
+        // 브리지가 가로채 **자기가** Control_L 을 보낸다는 것이 요지다.
         expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
             [CONTROL_L, 'ControlLeft', true],
             [LOWERCASE_C, 'KeyC', true],
             [LOWERCASE_C, 'KeyC', false],
             [CONTROL_L, 'ControlLeft', false],
         ])
+    })
+
+    /**
+     * 실측(2026-09-20, 실제 Chromium on macOS + noVNC 1.7.0): Cmd 를 누르는
+     * 순간 noVNC 가 원격에 `Alt_L` **keydown** 을 보내고, Cmd 를 뗄 때까지
+     * 눌린 채로 둔다 — `keyboard.js` 의 `case XK_Super_L: keysym = XK_Alt_L`
+     * 이고, 바로 아래 macOS 특례는 `code !== 'MetaLeft'` 로 Meta 키 자신을
+     * 제외하기 때문이다.
+     *
+     * 그래서 브리지가 C 만 가로채 Ctrl+C 를 주입하면 원격이 실제로 받는 것은
+     * `Alt_L+Control_L+c` 다. 리눅스 원격에서 이 조합은 복사가 아니다.
+     * 주입 전에 그 Alt 를 풀어야 한다.
+     *
+     * 이 시점의 Alt 는 언제나 noVNC 의 Meta 변환분이다 — 사용자가 진짜 Option
+     * 을 누르고 있으면 위의 `event.altKey` 가드가 먼저 돌려보낸다.
+     */
+    it('releases the Alt noVNC sent for Cmd before pressing Ctrl+C', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_C, 'KeyC', true],
+            [LOWERCASE_C, 'KeyC', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    /** Ctrl+C 에는 Alt 가 끼어들지 않는다 — 그 경로는 한 줄도 바뀌면 안 된다. */
+    it('does not touch Alt when the shortcut came from Ctrl, not Cmd', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', ctrlKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys.some(([keysym]: any[]) => keysym === ALT_L)).toBe(false)
     })
 
     it('sends the same Control_L + KeyC on Ctrl+C (Windows/Linux)', () => {
