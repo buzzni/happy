@@ -34,6 +34,8 @@ export function lessonGrantAudience(baseUrl: string): string {
     return `${LESSON_GRANT_PROTOCOL}@${new URL(baseUrl).origin}`;
 }
 export const LESSON_GRANT_MAX_TTL_MS = 60_000;
+// Studio and host clocks can differ; tolerate issue-time skew without extending expiry.
+const LESSON_GRANT_CLOCK_SKEW_MS = 5_000;
 
 export type LessonCapability = 'lesson.read' | 'lesson.review' | 'lesson.manage';
 export const LESSON_OPERATIONS = ['snapshot', 'approve', 'reject', 'set-recall-enabled', 'configure'] as const;
@@ -211,15 +213,15 @@ export function createLessonGrantVerifier(options: LessonGrantVerifierOptions): 
         if (!claims) return { ok: false, reason: 'malformed' };
 
         if (claims.aud !== audience) return { ok: false, reason: 'wrong-audience' };
-        // An expiry at or before issue is not a window, and an issue time in the
-        // future would let a grant outlive the cap by however far it was dated
-        // forward. Both are malformed rather than merely expired.
+        // A signed window stays bounded. Small clock skew is allowed only for
+        // issuance; the signed expiry and maximum lifetime remain unchanged.
+        const checkedAt = now();
         if (claims.expiresAt <= claims.iat) return { ok: false, reason: 'malformed' };
-        if (claims.iat > now()) return { ok: false, reason: 'malformed' };
+        if (claims.iat - checkedAt > LESSON_GRANT_CLOCK_SKEW_MS) return { ok: false, reason: 'malformed' };
         if (claims.expiresAt - claims.iat > LESSON_GRANT_MAX_TTL_MS) return { ok: false, reason: 'lifetime-too-long' };
         // The boundary itself is refused: an expiry is the first instant the
         // grant is no longer valid, not the last instant it is.
-        if (now() >= claims.expiresAt) return { ok: false, reason: 'expired' };
+        if (checkedAt >= claims.expiresAt) return { ok: false, reason: 'expired' };
         if (claims.machineId !== options.machineId) return { ok: false, reason: 'wrong-machine' };
 
         const request = input.request;

@@ -154,6 +154,27 @@ describe('createLessonGrantVerifier', () => {
             .toEqual({ ok: false, reason: 'malformed' });
     });
 
+    it.each([91, 5_000])('accepts a signed issue time %i ms ahead without extending its expiry', (offset) => {
+        const { publicKeyBase64, sign } = issuer();
+        const iat = 1_500 + offset;
+        const expiresAt = iat + 60_000;
+        const envelope = sign(claimsFor(snapshot, { iat, expiresAt }));
+        expect(verifierFor(publicKeyBase64).verify({ envelope, request: snapshot }))
+            .toMatchObject({ ok: true, claims: { iat, expiresAt } });
+        expect(verifierFor(publicKeyBase64, expiresAt).verify({ envelope, request: snapshot }))
+            .toEqual({ ok: false, reason: 'expired' });
+    });
+
+    it('bounds future clock skew and retains the maximum signed lifetime', () => {
+        const { publicKeyBase64, sign } = issuer();
+        const future = sign(claimsFor(snapshot, { iat: 6_501, expiresAt: 66_501 }));
+        expect(verifierFor(publicKeyBase64).verify({ envelope: future, request: snapshot }))
+            .toEqual({ ok: false, reason: 'malformed' });
+        const overlong = sign(claimsFor(snapshot, { iat: 6_500, expiresAt: 66_501 }));
+        expect(verifierFor(publicKeyBase64).verify({ envelope: overlong, request: snapshot }))
+            .toEqual({ ok: false, reason: 'lifetime-too-long' });
+    });
+
     it('refuses a grant issued in the future or with no window', () => {
         const { publicKeyBase64, sign } = issuer();
         const future = sign(claimsFor(snapshot, { iat: 9_000, expiresAt: 69_000 }));
