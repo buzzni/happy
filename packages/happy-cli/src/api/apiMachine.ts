@@ -2331,7 +2331,15 @@ export class ApiMachineClient {
         }
 
         const persisted = await this.isolatedViewerRegistry.get(viewerKey);
-        if (persisted && await isViewerServing(persisted.webPort)) {
+        // A miss here leads straight to SIGTERM and SIGKILL of this viewer's
+        // own stack. Reopening a screen is consent to replace a dead one — not
+        // a live one that lost a 1.5s probe on a loaded machine — so the
+        // reuse check owes the same second look every other decision gets.
+        const persistedAlive = persisted !== null && (
+            await isViewerServing(persisted.webPort)
+            || (await waitForViewerServing(persisted.webPort, VIEWER_CONFIRM_DEAD_MS, { pollMs: 500 })).ready
+        );
+        if (persisted && persistedAlive) {
             const browser = await this.ensureViewerBrowser(
                 persisted.display,
                 false,

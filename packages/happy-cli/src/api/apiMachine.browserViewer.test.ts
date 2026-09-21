@@ -519,6 +519,35 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect(aliceAgain).toMatchObject({ webPort: 6081 })
         })
 
+        // Reopening a screen is consent to replace a dead one, not a live one
+        // that missed a 1.5s probe on a loaded machine. On a miss the next
+        // step is SIGTERM then SIGKILL of the user's own session, so the
+        // reuse check owes the same second look every other decision gets.
+        it('reuses its own live screen when it answers on a second look', async () => {
+            leaseRegistryMocks.records.set(ALICE_KEY, {
+                ...lease(ALICE_KEY, 0),
+                processIds: { websockify: 777030 },
+            })
+            serveFlakyNovnc(6080)
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777030/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(result).toMatchObject({ webPort: 6080, reused: true })
+                expect(kill).not.toHaveBeenCalledWith(-777030, 'SIGTERM')
+            } finally {
+                kill.mockRestore()
+            }
+        }, 15_000)
+
         // The lease is about to be rewritten with a new slot, so these pids are
         // the last record of the stack holding the old one. Giving up on
         // SIGTERM strands that slot for the life of the machine.
