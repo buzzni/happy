@@ -6,6 +6,7 @@ import { fetchAutomationProjectEnvironment } from './automationProjectEnvironmen
 import { exchangeAutomationMcpCallerGrant } from './automationMcpCallerGrant'
 import { preflightAutomationConnectors } from './automationConnectorPreflight'
 import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers'
+import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance'
 import { buildClaudeSystemPromptOptions } from '@/claude/claudePrompt'
 
@@ -1826,7 +1827,7 @@ describe('runServerAutomationTick', () => {
     }))
   })
 
-  it.each(['ready', 'empty', 'failed', 'unbound', 'reserved', 'http'] as const)('reviews in the dispatched worktree with project environment: %s', async (mode) => {
+  it.each(['ready', 'empty', 'failed', 'unbound', 'reserved', 'expansion', 'http'] as const)('reviews in the dispatched worktree with project environment: %s', async (mode) => {
     // 2026-09-01 프로덕션 — PR #317 리뷰가 "대상 SHA 테스트를 실행하지 못했다" 고
     // 보고했다. AgentTask 워커만 프로젝트 디렉터리에서 그대로 돌아 HEAD 가 사용자가
     // 마지막에 둔 커밋이었기 때문이다(start-session 리뷰는 전용 worktree 를 받는다).
@@ -1887,6 +1888,13 @@ describe('runServerAutomationTick', () => {
         APLUS_AGENT_TASK_CLAIM_TOKEN: 'injected', GH_TOKEN: 'injected',
         ANTHROPIC_AUTH_TOKEN: 'injected', OPENAI_API_KEY: 'injected', openai_api_key: 'injected',
         OPENAI_TEST_MODEL: 'test-model', GITHUB_WEBHOOK_SECRET: 'app-secret',
+      } }))
+    } else if (mode === 'expansion') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({ ok: true as const, environmentVariables: {
+        PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value',
+        LEAKED_PROVIDER_KEY: '${ANTHROPIC_API_KEY}',
+        LEAKED_GITHUB_TOKEN: 'x-${GH_TOKEN}-y',
+        MAIL_FROM: '${APP_NAME} <no-reply@example.test>',
       } }))
     }
     let server: ReturnType<typeof createServer> | undefined
@@ -1973,6 +1981,21 @@ describe('runServerAutomationTick', () => {
       expect(workerEnv).not.toHaveProperty(key)
     }
     if (mode === 'empty') expect(workerEnv).not.toHaveProperty('PROJECT_SECRET')
+    if (mode === 'expansion') {
+      // 프로젝트 값은 데몬 환경을 가리키는 참조가 아니다. run.ts 의 spawnSession 은
+      // 받은 env 를 바로 이 함수로 데몬 process.env 에 대해 확장하므로, ${VAR} 를
+      // 실은 값이 그대로 실리면 위의 키 필터가 막아 둔 데몬 자격증명을 값 한 단계로
+      // 되읽는다. 남은 ${ 는 같은 통과의 미해결 검사에 걸려 리뷰 spawn 을 죽인다.
+      const expanded = expandEnvironmentVariables(workerEnv, {
+        ANTHROPIC_API_KEY: 'daemon-anthropic-key',
+        GH_TOKEN: 'daemon-github-token',
+      })
+      expect(JSON.stringify(expanded)).not.toContain('daemon-anthropic-key')
+      expect(JSON.stringify(expanded)).not.toContain('daemon-github-token')
+      for (const value of Object.values(expanded)) expect(value).not.toContain('${')
+      // 확장 입력이 되지 않는 평범한 프로젝트 값은 그대로 남는다.
+      expect(workerEnv).toMatchObject({ PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' })
+    }
     expect(input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-token' })
     expect(JSON.stringify(store.state())).not.toContain('project-value')
     expect(spawnSession.mock.calls[0]![0].initialPrompt).not.toContain('## 예약 자동화 진단 지침')
