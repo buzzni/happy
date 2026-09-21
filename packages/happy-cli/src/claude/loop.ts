@@ -1,3 +1,4 @@
+import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { ApiSessionClient } from "@/api/apiSession"
 import { MessageQueue2 } from "@/utils/MessageQueue2"
 import { logger } from "@/ui/logger"
@@ -60,6 +61,7 @@ interface LoopOptions {
     managedRun?: boolean
     /** Built by the runner; see `Session.lessons`. */
     lessons?: LessonSessionHost
+    lessonProposalTurn?: LessonProposalTurn
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
@@ -106,6 +108,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         startingMode: opts.startingMode,
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
         lessons: opts.lessons,
+        lessonProposalTurn: opts.lessonProposalTurn,
     });
 
     opts.onSessionReady?.(session)

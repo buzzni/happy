@@ -65,6 +65,7 @@ export interface LessonSnapshot {
     candidates: unknown[];
     settings: LessonSettings;
     reviewOutcome: string;
+    reviewExecution?: 'session';
     pagination: LessonSnapshotPagination;
 }
 
@@ -304,6 +305,7 @@ export function createLessonHostRpc(deps: LessonHostRpcDeps) {
                 .map(flattenCandidate).filter((row): row is object => row !== null),
             settings,
             reviewOutcome: await deps.reviewOutcome(),
+            reviewExecution: 'session',
             pagination: {
                 lessonOffset: offsets.lessonOffset,
                 candidateOffset: offsets.candidateOffset,
@@ -424,8 +426,10 @@ export function createLessonHostRpc(deps: LessonHostRpcDeps) {
                         expectedRevision: request.expectedRevision as number,
                         recallEnabled: request.recallEnabled as boolean,
                         reviewEnabled: request.reviewEnabled as boolean,
-                        dailyMicroUsd: request.dailyMicroUsd as number,
-                        dailyTokens: request.dailyTokens as number,
+                        // Older running workers share these settings. Zero the
+                        // paid budget so enabling session review cannot fund them.
+                        dailyMicroUsd: 0,
+                        dailyTokens: 0,
                     });
                     if (!written.ok) return { ok: false, reason: written.reason };
                     /*

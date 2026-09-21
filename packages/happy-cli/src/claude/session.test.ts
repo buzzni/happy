@@ -50,3 +50,27 @@ describe('Session mode', () => {
         session.cleanup();
     });
 });
+
+
+describe('Session lesson lifecycle', () => {
+    it('cancels pending review on new input without forgetting completed responses', () => {
+        const { session } = createSession();
+        const signal = session.lessonReviewLifecycle.controller.signal;
+        session.lessonReviewLifecycle.completedAssistantTurns = 2;
+        session.cancelLessonReview();
+        expect(signal.aborted).toBe(true);
+        expect(session.lessonReviewLifecycle.completedAssistantTurns).toBe(2);
+        session.cleanup();
+    });
+    it('clears prior-response history on conversation reset and cancels review on cleanup', () => {
+        const { session } = createSession();
+        session.lessonReviewLifecycle.completedAssistantTurns = 2;
+        session.clearSessionId();
+        expect(session.lessonReviewLifecycle.completedAssistantTurns).toBe(0);
+        expect(session.lessonReviewLifecycle.controller.signal.aborted).toBe(true);
+        session.lessonReviewLifecycle.controller = new AbortController();
+        const signal = session.lessonReviewLifecycle.controller.signal;
+        session.cleanup();
+        expect(signal.aborted).toBe(true);
+    });
+});

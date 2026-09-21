@@ -1,3 +1,5 @@
+import type { ClaudeLessonReviewLifecycle } from './session';
+import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { EnhancedMode } from "./loop";
 import { endManagedTurnInput } from '@/managed/managedGracefulStop';
 
@@ -85,12 +87,14 @@ export async function claudeRemote(opts: {
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     hookSettingsPath: string,
     /**
-     * Project lesson recall and background review for this session.
+     * Project lesson recall and foreground candidate review for this session.
      *
      * Built by the runner from the daemon's trusted spawn context. Absent for
      * a managed run and for any installation without a lesson host, and when
      * it is absent this function behaves exactly as it did before.
      */
+    lessonProposalTurn?: LessonProposalTurn,
+    lessonReviewLifecycle?: ClaudeLessonReviewLifecycle,
     lessons?: {
         turn: LessonTurnHost | null,
         review: LessonReviewWorker | null,
@@ -171,11 +175,25 @@ export async function claudeRemote(opts: {
         });
     }
 
+    // Retained by Session across checkpoint/mode generations; each accepted input replaces its controller.
+    const reviewLifecycle = opts.lessonReviewLifecycle ?? {
+        controller: new AbortController(), completedAssistantTurns: 0,
+    };
+    let reviewAbort = reviewLifecycle.controller;
+    const preemptReview = () => {
+        opts.lessonProposalTurn?.cancel();
+        reviewLifecycle.controller.abort();
+        reviewAbort = new AbortController();
+        reviewLifecycle.controller = reviewAbort;
+        if (opts.signal?.aborted) reviewAbort.abort();
+    };
+
     // Get initial message
     const initial = await opts.nextMessage();
     if (!initial) { // No initial message - exit
         return 'not-started' as const;
     }
+    preemptReview();
     opts.onPromptSuggestionChange?.(null);
 
     // Handle special commands (extract text for parsing when content is a block array)
@@ -186,6 +204,7 @@ export async function claudeRemote(opts: {
 
     // Handle /clear command
     if (specialCommand.type === 'clear') {
+        reviewLifecycle.completedAssistantTurns = 0;
         if (opts.onCompletionEvent) {
             opts.onCompletionEvent('Context was reset');
         }
@@ -338,6 +357,8 @@ export async function claudeRemote(opts: {
     const lessonReview = opts.lessons?.sessionId ? (opts.lessons.review ?? null) : null;
     // Unknown means automation: a session this host cannot classify must not
     // be allowed to teach the project.
+    const cancelProposal = () => opts.lessonProposalTurn?.cancel();
+    opts.signal?.addEventListener('abort', cancelProposal, { once: true });
     const lessonSessionKind: LessonTurnKind = opts.lessons?.sessionKind ?? 'automation';
     const claudeTurnObservations = opts.lessons?.observations ?? createLessonTurnObservations();
     /*
@@ -353,7 +374,7 @@ export async function claudeRemote(opts: {
      * `opts.signal` is the caller's own cancellation, so it drives this too.
      */
     let pendingLessonTicket: LessonDeliveryTicket | null = null;
-    let claudeTurnCounter = 0;
+    const proposalToolCallIds = new Set<string>();
     /** Text of the user message each turn carried, for the review evidence. */
     let currentTurnMessages = [readTurnText(initial.message)];
     /**
@@ -366,20 +387,6 @@ export async function claudeRemote(opts: {
      * returns a stale cached answer.
      */
     let currentTurnId = `${sessionIdForLessons}:${randomUUID()}`;
-    /**
-     * Aborts a running review when the next input arrives.
-     *
-     * Replaced per turn rather than shared for the session: one controller for
-     * the whole session never fires until teardown, so a paid background
-     * review kept running while the user was already typing the next thing.
-     */
-    let reviewAbort = new AbortController();
-    const preemptReview = () => {
-        reviewAbort.abort();
-        reviewAbort = new AbortController();
-        if (opts.signal?.aborted) reviewAbort.abort();
-    };
-
     /**
      * Recalls lessons and returns the text to send.
      *
@@ -444,10 +451,28 @@ function readTurnText(content: unknown): string {
         };
     };
 
+    const isCommandInput = (content: unknown) => /^\/\S/.test(readTurnText(content).trimStart());
+    let queryClosed = false;
     const withLessons = async (content: string | ContentBlockParam[]) => {
-        const recalled = await recallWithLessons(content, currentTurnId, reviewAbort.signal);
+        // Native slash commands must remain the first provider input token.
+        if (isCommandInput(content)) {
+            pendingLessonTicket = null;
+            opts.lessonProposalTurn?.cancel();
+            return content;
+        }
+        const owningTurnId = currentTurnId;
+        const owningSignal = reviewAbort.signal;
+        const current = () => !queryClosed && currentTurnId === owningTurnId && !owningSignal.aborted && !opts.signal?.aborted;
+        const recalled = await recallWithLessons(content, owningTurnId, owningSignal);
+        if (!current()) return content;
         pendingLessonTicket = recalled.ticket;
-        return recalled.content;
+        opts.lessonProposalTurn?.cancel();
+        const instruction = lessonSessionKind === 'foreground' && !opts.signal?.aborted && lessonReview?.prepareReviewTurn && opts.lessonProposalTurn
+            ? await opts.lessonProposalTurn.prepare(owningTurnId, () => lessonReview.prepareReviewTurn!()) : '';
+        if (!current()) return content;
+        if (!instruction) return recalled.content;
+        return typeof recalled.content === 'string' ? `${instruction}\n\n${recalled.content}`
+            : [{ type: 'text' as const, text: instruction }, ...recalled.content];
     };
 
     // Push initial message
@@ -494,7 +519,6 @@ function readTurnText(content: unknown): string {
 
     updateThinking(true);
     let acceptsActiveInput = true;
-    let queryClosed = false;
     const sendActiveInput: ClaudeActiveInputSender = async (text) => {
         if (!acceptsActiveInput || messages.done || !text.trim()) {
             return false;
@@ -505,17 +529,23 @@ function readTurnText(content: unknown): string {
         const owningTurnId = currentTurnId;
         preemptReview();
         const steerAbort = reviewAbort;
-        const recalled = await recallWithLessons(
+        const commandInput = isCommandInput(text);
+        const recalled = commandInput ? { content: text, ticket: null } : await recallWithLessons(
             text,
             `${sessionIdForLessons}:${randomUUID()}`,
             steerAbort.signal,
         );
-        // A result while local recall was running means the provider never
-        // accepted this steer. A new turn or a newer steer while recall was
-        // pending has the same result. Return false before injection so the
-        // caller can retry or use its normal prompt fallback.
-        if (!acceptsActiveInput || messages.done || opts.signal?.aborted
-            || currentTurnId !== owningTurnId || reviewAbort !== steerAbort) return false;
+        // A steer joins this same provider turn, but invalidates its previous
+        // draft. Re-authorize and send a fresh token for the corrected work.
+        const current = () => acceptsActiveInput && !messages.done && !opts.signal?.aborted
+            && !steerAbort.signal.aborted && currentTurnId === owningTurnId && reviewAbort === steerAbort;
+        if (!current()) return false;
+        const instruction = !commandInput && lessonSessionKind === 'foreground' && lessonReview?.prepareReviewTurn && opts.lessonProposalTurn
+            ? await opts.lessonProposalTurn.prepare(owningTurnId, async () => {
+                const prepared = await lessonReview.prepareReviewTurn!();
+                return current() ? prepared : null;
+            }) : '';
+        if (!current()) return false;
         /*
          * The SDK exposes no event that proves this in-band steer was acted
          * upon. Keep its selected trace unacknowledged rather than treating an
@@ -525,7 +555,7 @@ function readTurnText(content: unknown): string {
         messages.push({
             type: 'user',
             parent_tool_use_id: null,
-            message: { role: 'user', content: recalled.content },
+            message: { role: 'user', content: instruction ? `${instruction}\n\n${recalled.content}` : recalled.content },
         });
         return true;
     };
@@ -557,6 +587,7 @@ function readTurnText(content: unknown): string {
                 for (const block of (message as { message: { content: unknown[] } }).message.content) {
                     const call = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
                     if (call.type !== 'tool_use' || typeof call.id !== 'string') continue;
+                    if (call.name === 'mcp__happy__propose_lesson') { proposalToolCallIds.add(call.id); continue; }
                     const input = call.input as { command?: unknown; cwd?: unknown } | undefined;
                     claudeTurnObservations.commandStarted({
                         callId: call.id,
@@ -654,10 +685,9 @@ function readTurnText(content: unknown): string {
 
                 /*
                  * A turn that reached a result ended normally. The worker
-                 * decides whether there is anything to review and refuses on
-                 * its own when review is off, unfunded, unpriced or when this
-                 * host observed nothing. Not awaited: the conversation must
-                 * not wait on a background review.
+                 * validates a proposal produced by this same provider turn
+                 * against its observed evidence, permissions and settings.
+                 * Not awaited: candidate persistence never blocks the chat.
                  */
                 /*
                  * Always taken, so nothing carries into the next turn — and
@@ -665,22 +695,27 @@ function readTurnText(content: unknown): string {
                  * has no verified procedure in it.
                  */
                 const observed = claudeTurnObservations.take();
-                if (lessonReview && !(message as { is_error?: boolean }).is_error) {
-                    void lessonReview.reviewFinishedTurn({
-                        record: {
-                            sessionId: sessionIdForLessons!,
-                            turnId: currentTurnId,
-                            kind: lessonSessionKind,
-                            endedNormally: true,
-                            hadPriorAssistantTurn: claudeTurnCounter > 0,
-                            userMessages: currentTurnMessages,
-                            agentSummary: observed.summary,
-                            recoveredFailures: observed.recoveredFailures,
-                        },
-                        signal: opts.signal ? AbortSignal.any([reviewAbort.signal, opts.signal]) : reviewAbort.signal,
-                    }).catch(() => undefined);
-                }
-                claudeTurnCounter += 1;
+                const proposal = opts.lessonProposalTurn?.take(currentTurnId) ?? {};
+                const hadPriorAssistantTurn = reviewLifecycle.completedAssistantTurns > 0;
+                const finishLessonReview = () => {
+                    if (!(message as { is_error?: boolean }).is_error) reviewLifecycle.completedAssistantTurns += 1;
+                    if (lessonReview && !(message as { is_error?: boolean }).is_error) {
+                        void lessonReview.reviewFinishedTurn({
+                            ...proposal,
+                            record: {
+                                sessionId: sessionIdForLessons!,
+                                turnId: currentTurnId,
+                                kind: lessonSessionKind,
+                                endedNormally: true,
+                                hadPriorAssistantTurn,
+                                userMessages: currentTurnMessages,
+                                agentSummary: observed.summary,
+                                recoveredFailures: observed.recoveredFailures,
+                            },
+                            signal: opts.signal ? AbortSignal.any([reviewAbort.signal, opts.signal]) : reviewAbort.signal,
+                        }).catch(() => undefined);
+                    }
+                };
                 opts.onMcpControllerReady?.(mcpRecovery);
 
                 await mcpRecovery.recoverFailedServers();
@@ -755,12 +790,16 @@ function readTurnText(content: unknown): string {
                     if (applyResult.status !== 'completed') {
                         throw new Error('checkpoint turn apply did not complete');
                     }
+                    finishLessonReview();
                     opts.onReady();
                     return opts.exitAfterFirstTurn
                         ? 'turn-complete' as const
                         : 'protected-turn-complete' as const;
                 }
 
+                // Without checkpoint protection, the provider result is the
+                // completion boundary. Protected turns must apply first.
+                finishLessonReview();
                 // Send ready event
                 opts.onReady();
 
@@ -795,6 +834,7 @@ function readTurnText(content: unknown): string {
                     if (!next) {
                         messages.end();
                     } else {
+                        preemptReview();
                         await mcpConfigSynchronizer?.sync();
                         try {
                             const nextTurn = await opts.beforeTurn?.();
@@ -824,9 +864,6 @@ function readTurnText(content: unknown): string {
                         // runs on the whole message rather than on a flattened
                         // copy that would drop every attachment.
                         currentTurnMessages = [readTurnText(next.message)];
-                        // A new turn: stop any review still running for the
-                        // previous one before this one starts costing anything.
-                        preemptReview();
                         currentTurnId = `${sessionIdForLessons}:${randomUUID()}`;
                         /*
                          * After the `acceptsPromptSuggestion` flip and the MCP
@@ -857,7 +894,7 @@ function readTurnText(content: unknown): string {
                          * guessing would invent successes the agent never had.
                          * An aborted call verifies nothing either way.
                          */
-                        if (c.type === 'tool_result' && c.tool_use_id) {
+                        if (c.type === 'tool_result' && c.tool_use_id && !proposalToolCallIds.delete(c.tool_use_id)) {
                             claudeTurnObservations.commandEnded({
                                 callId: c.tool_use_id,
                                 status: opts.isAborted(c.tool_use_id) ? 'cancelled' : 'completed',
@@ -881,11 +918,15 @@ function readTurnText(content: unknown): string {
             throw e;
         }
     } finally {
+        opts.lessonProposalTurn?.cancel();
+        opts.signal?.removeEventListener('abort', cancelProposal);
         queryClosed = true;
         acceptsActiveInput = false;
         opts.onActiveInputReady?.(null);
         opts.onMcpControllerReady?.(null);
         updateThinking(false);
+        claudeTurnObservations.take();
+        proposalToolCallIds.clear();
     }
     return undefined;
 }

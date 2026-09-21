@@ -7,7 +7,7 @@ const amount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const entrySchema = z.object({
     requestId: z.string().min(1), evidenceKey: z.string().min(1), projectId: z.string().min(1), sessionId: z.string().min(1),
     day: z.string(), createdAt: amount, state: z.enum(['reserved', 'settled', 'unknown']),
-    microUsd: amount, tokens: amount,
+    microUsd: amount, tokens: amount, execution: z.literal('session').optional(),
 });
 type Entry = z.infer<typeof entrySchema>;
 const ledgerSchema = z.object({ version: z.literal(1), entries: z.array(entrySchema) });
@@ -41,6 +41,37 @@ export class LessonReviewBudget {
             if (temp) await unlink(temp).catch(() => {});
             await lock.close(); await unlink(`${this.path}.lock`);
         }
+    }
+
+    /** Foreground work has already consumed the session's normal usage. This is a
+     * durable rate/deduplication claim, never a fabricated price or invoice. */
+    async claimSession(input: Pick<ReviewReservation, 'requestId' | 'evidenceKey' | 'projectId' | 'sessionId' | 'cooldownMs'>): Promise<ReviewBudgetResult> {
+        if (!Number.isSafeInteger(input.cooldownMs) || input.cooldownMs <= 0
+            || ![input.requestId, input.evidenceKey, input.projectId, input.sessionId].every(v => typeof v === 'string' && v.length > 0 && v.length <= 512)) {
+            return { ok: false, reason: 'invalid_budget' };
+        }
+        try {
+            return await this.transaction<ReviewBudgetResult>((entries) => {
+                const now = this.now();
+                if (entries.some(e => e.requestId === input.requestId || (e.projectId === input.projectId && e.evidenceKey === input.evidenceKey))) return { ok: false, reason: 'duplicate' };
+                if (entries.some(e => e.projectId === input.projectId && e.sessionId === input.sessionId && now - e.createdAt < input.cooldownMs)) return { ok: false, reason: 'cooldown' };
+                entries.push({ ...input, day: new Date(now).toISOString().slice(0, 10), createdAt: now,
+                    state: 'settled', microUsd: 0, tokens: 0, execution: 'session' });
+                return { ok: true };
+            });
+        } catch (error) { return { ok: false, reason: (error as NodeJS.ErrnoException).code === 'EEXIST' ? 'busy' : 'storage_error' }; }
+    }
+
+    /** Release only our zero-cost claim before candidate enqueue has begun. */
+    async cancelSessionClaim(requestId: string): Promise<boolean> {
+        try {
+            return await this.transaction(entries => {
+                const index = entries.findIndex(e => e.requestId === requestId && e.execution === 'session');
+                if (index < 0) return false;
+                entries.splice(index, 1);
+                return true;
+            });
+        } catch { return false; }
     }
 
     async reserve(input: ReviewReservation): Promise<ReviewBudgetResult> {

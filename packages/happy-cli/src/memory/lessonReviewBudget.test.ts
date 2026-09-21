@@ -47,3 +47,21 @@ describe('durable lesson review budget', () => {
     expect(results.filter(r => r.ok)).toHaveLength(1);
   });
 });
+
+ it('claims foreground proposals without a paid budget, preserving durable deduplication and cooldown', async () => {
+    const f = await fixture(); const a = new LessonReviewBudget(f.path, f.clock);
+    expect(await a.claimSession(input)).toEqual({ ok: true });
+    const b = new LessonReviewBudget(f.path, f.clock);
+    expect(await b.claimSession(input)).toEqual({ ok: false, reason: 'duplicate' });
+    expect(await b.claimSession({ ...input, requestId: 'two', evidenceKey: 'e2' })).toEqual({ ok: false, reason: 'cooldown' });
+ });
+
+ it('releases only undispatched session claims, never a paid reservation', async () => {
+    const f = await fixture(); const a = new LessonReviewBudget(f.path, f.clock);
+    await a.reserve(input);
+    expect(await a.cancelSessionClaim(input.requestId)).toBe(false);
+    await a.cancelUndispatched(input.requestId);
+    await a.claimSession(input);
+    expect(await a.cancelSessionClaim(input.requestId)).toBe(true);
+    expect(await a.claimSession(input)).toEqual({ ok: true });
+ });

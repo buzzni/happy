@@ -1,3 +1,4 @@
+import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { render } from "ink";
 import {
     createManagedGracefulStop,
@@ -473,6 +474,22 @@ export async function runCodex(opts: {
         logger.debug('[Codex] Reset turn-scoped options after abort');
     };
 
+    const lessonProposalTurn = createLessonProposalTurn();
+    // Independent of provider/queue cancellation: a new message must stop an old
+    // candidate write without interrupting the conversation it was queued behind.
+    let lessonReviewAbort = new AbortController();
+    let activeLessonTurn: {
+        turnId: string;
+        userMessages: string[];
+        controller: AbortController;
+        acceptingSteer: boolean;
+        pendingSteer: boolean;
+    } | null = null;
+    const preemptLessonReview = () => {
+        lessonReviewAbort.abort();
+        lessonProposalTurn.cancel();
+    };
+
     const handleUserMessage = createSerialAsyncHandler<ClaimedUserMessage>(async ({ message, attachmentsPromise }) => {
         const delegatedDifficultyRoutingMessage = isDelegatedDifficultyRoutingMessage(message);
 
@@ -635,6 +652,7 @@ export async function runCodex(opts: {
             logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
             return;
         }
+        preemptLessonReview();
         const attachmentsPromise = session.drainAttachmentsForUserMessage();
         return handleUserMessage({ message, attachmentsPromise });
     });
@@ -805,6 +823,7 @@ export async function runCodex(opts: {
      * happening but keeps the session alive for new prompts.
      */
     async function handleAbort() {
+        preemptLessonReview();
         if (abortInProgress) {
             await abortInProgress;
             return;
@@ -1000,7 +1019,35 @@ export async function runCodex(opts: {
     );
 
     registerCodexSteerHandler({
-        client,
+        client: {
+            steerTurn: async (text) => {
+                const frame = activeLessonTurn;
+                preemptLessonReview();
+                if (!frame?.acceptingSteer) {
+                    await client.steerTurn(text);
+                    return;
+                }
+                const controller = new AbortController();
+                lessonReviewAbort = controller;
+                frame.controller = controller;
+                frame.pendingSteer = true;
+                const current = () => activeLessonTurn === frame && frame.acceptingSteer
+                    && frame.controller === controller && !controller.signal.aborted;
+                const instruction = lessonSessionKind === 'foreground' && lessonReview?.prepareReviewTurn
+                    ? await lessonProposalTurn.prepare(frame.turnId, async () => {
+                        const prepared = await lessonReview.prepareReviewTurn!();
+                        return current() ? prepared : null;
+                    }) : '';
+                if (!current()) throw new Error('The owning turn ended before steering was accepted');
+                try {
+                    await client.steerTurn(instruction ? `${instruction}\n\n${text}` : text);
+                    if (current()) { frame.userMessages.push(text); frame.pendingSteer = false; }
+                } catch (error) {
+                    if (current()) preemptLessonReview();
+                    throw error;
+                }
+            },
+        },
         session,
         managedRun: managedStartup !== null,
         onFailure: (message) => {
@@ -1353,6 +1400,7 @@ export async function runCodex(opts: {
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
+        ...(accountToken !== null ? { proposeLesson: lessonProposalTurn.submit } : {}),
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
     });
@@ -1567,6 +1615,11 @@ export async function runCodex(opts: {
                 break;
             }
 
+            preemptLessonReview();
+            lessonReviewAbort = new AbortController();
+            const owningReviewSignal = lessonReviewAbort.signal;
+            const owningForegroundSignal = abortController.signal;
+
             if (isCodexClearText(message.message)) {
                 logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
                 client.clearThreadState();
@@ -1755,19 +1808,29 @@ export async function runCodex(opts: {
                 /*
                  * Lessons are recalled here, immediately before the input is
                  * assembled, and on a bounded budget: a slow or unreachable
-                 * memory service costs this turn nothing. `abortController` is
-                 * the loop's own idle wait, so a newly arrived message
-                 * preempts the lookup rather than delaying the turn.
+                 * memory service costs this turn nothing. The review signal
+                 * stops memory work when a new message arrives without
+                 * aborting the provider's foreground turn.
                  */
+                lessonProposalTurn.cancel();
                 codexTurnId = `${session.sessionId}:${randomUUID()}`;
+                const lessonFrame = {
+                    turnId: codexTurnId, userMessages: [message.message],
+                    controller: lessonReviewAbort, acceptingSteer: false, pendingSteer: false,
+                };
+                activeLessonTurn = lessonFrame;
                 const lessonRecall = lessonTurn
                     ? await lessonTurn.recall({
                         turnId: codexTurnId,
                         query: message.message,
-                        signal: abortController.signal,
+                        signal: owningReviewSignal,
                     })
                     : null;
-                const turnPrompt = buildCodexTurnPrompt({
+                let reviewInstruction = lessonSessionKind === 'foreground' && !owningReviewSignal.aborted && lessonReview?.prepareReviewTurn
+                    ? await lessonProposalTurn.prepare(codexTurnId, () => lessonReview.prepareReviewTurn!()) : '';
+                if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
+                if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
+                const turnPrompt = (reviewInstruction ? `${reviewInstruction}\n\n` : '') + buildCodexTurnPrompt({
                     message: message.message,
                     mode: message.mode,
                     includeAppendSystemPrompt,
@@ -1775,6 +1838,7 @@ export async function runCodex(opts: {
                     ...(lessonRecall?.outcome === 'selected' ? { lessonBlock: lessonRecall.block } : {}),
                 });
 
+                lessonFrame.acceptingSteer = true;
                 const result = await client.sendTurnAndWait(turnPrompt, {
                     model: message.mode.model,
                     approvalPolicy: executionPolicy.approvalPolicy,
@@ -1783,6 +1847,8 @@ export async function runCodex(opts: {
                     effort: message.mode.effort,
                     extraInputItems: imageInputs.inputItems,
                 });
+                lessonFrame.acceptingSteer = false;
+                if (lessonFrame.pendingSteer) preemptLessonReview();
                 if (includeAppendSystemPrompt) {
                     appendSystemPromptInjected = true;
                 }
@@ -1808,17 +1874,18 @@ export async function runCodex(opts: {
                      */
                     await lessonTurn.acknowledge(lessonRecall.ticket).catch(() => false);
                 }
+                if (result.aborted) preemptLessonReview();
                 if (lessonReview && !result.aborted) {
                     const observed = codexTurnObservations.take();
                     /*
                      * A normally-ended turn, with what this host actually saw
-                     * of it. The worker refuses on its own if review is off,
-                     * unfunded or unpriced, and refuses again if nothing was
-                     * observed. Not awaited: the conversation must not wait on
-                     * a background review, and the same abort signal stops it
-                     * the moment the user speaks again.
+                     * of it. The worker validates this turn's proposal against
+                     * its evidence, permissions and settings. Not awaited:
+                     * candidate persistence never blocks the chat, and the
+                     * same abort signal stops it when the user speaks again.
                      */
                     void lessonReview.reviewFinishedTurn({
+                        ...lessonProposalTurn.take(codexTurnId),
                         record: {
                             sessionId: session.sessionId,
                             turnId: codexTurnId,
@@ -1828,15 +1895,16 @@ export async function runCodex(opts: {
                             kind: lessonSessionKind,
                             endedNormally: true,
                             hadPriorAssistantTurn: codexTurnCounter > 0,
-                            userMessages: [message.message],
+                            userMessages: [...lessonFrame.userMessages],
                             agentSummary: observed.summary,
                             recoveredFailures: observed.recoveredFailures,
                         },
-                        signal: abortController.signal,
+                        signal: lessonFrame.controller.signal,
                     }).catch(() => undefined);
                 }
                 codexTurnCounter += 1;
             } catch (error) {
+                preemptLessonReview();
                 // Only actual errors reach here (process crash, connection failure, etc.)
                 // No task_complete/turn_aborted was ever received for this turn, so the
                 // session-protocol mapper's turn state is left open. Without an explicit
@@ -1871,6 +1939,8 @@ export async function runCodex(opts: {
                     session.sendSessionProtocolMessage(envelope);
                 }
             } finally {
+                activeLessonTurn = null;
+                lessonProposalTurn.cancel();
                 // specs/linux-checkpoint-enforcement-backend R4 — the checkpoint turn is opened before
                 // codex is spawned, so a message that never reached completeTurn (refused turn, resume
                 // failure, thrown dispatch) would otherwise leave the turn open and block the next gate.
@@ -1897,11 +1967,15 @@ export async function runCodex(opts: {
                     logger.debug('[codex]: Automation turn completed, exiting run-once session');
                     shouldExit = true;
                 }
+                // Clear after checkpoint cleanup: it may finish pending command events.
+                // Aborted/failed turns must not teach a recovery in the next turn.
+                codexTurnObservations.take();
                 logActiveHandles('after-turn');
             }
         }
 
     } finally {
+        preemptLessonReview();
         await reportManagedStop();
         /*
          * The bridge points at this run's loop. Left registered, a stop

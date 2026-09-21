@@ -7,8 +7,8 @@
  * on. Every write therefore names the revision it believes it is replacing,
  * and a mismatch is refused rather than merged.
  *
- * These settings live on the host, not in CML: they govern whether this daemon
- * spends money and runs a background worker, which is a host responsibility.
+ * These settings live on the host, not in CML: they govern host recall and proposal capture. Legacy budget fields remain
+ * readable so older clients can safely coexist.
  * CML owns lessons and candidates.
  */
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
@@ -40,8 +40,8 @@ export function lessonSettingsPath(happyHomeDir: string, projectId: string): str
  * The last review outcome for a project, written by whichever process ran it.
  *
  * Separate from the settings file on purpose: settings are a
- * compare-and-set record a person edits, and this is a status the background
- * worker overwrites. Sharing the file would make every worker tick contend
+ * compare-and-set record a person edits, and this is a status the
+ * proposal worker overwrites. Sharing the file would make every worker tick contend
  * with the UI's revision and lose.
  *
  * A file rather than a table: the worker and the UI are different processes on
@@ -131,17 +131,12 @@ const settingsSchema = z.object({
 
 export type LessonSettings = z.infer<typeof settingsSchema>;
 
-/**
- * Recall on, review off, no budget.
- *
- * Reading existing lessons costs nothing and is the point of the feature;
- * background review spends money, so it stays off until somebody turns it on
- * and funds it. A zero budget is a real state, not a missing one.
- */
+/** New projects use foreground lesson proposals by default. Existing explicit
+ * settings, including review off and gateway budgets, remain unchanged. */
 export const LESSON_SETTINGS_DEFAULT: LessonSettings = {
     revision: LESSON_SETTINGS_INITIAL_REVISION,
     recallEnabled: true,
-    reviewEnabled: false,
+    reviewEnabled: true,
     dailyMicroUsd: 0,
     dailyTokens: 0,
 };

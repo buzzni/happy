@@ -1,3 +1,4 @@
+import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
@@ -662,8 +663,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onTranscriptEvent: updateClaudeGoalState,
     });
 
+    const lessonProposalTurn = createLessonProposalTurn();
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        ...(principal.kind === 'account' ? { proposeLesson: lessonProposalTurn.submit } : {}),
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
     });
@@ -1313,6 +1316,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
             return;
         }
+        currentSession?.cancelLessonReview();
         const attachmentsPromise = session.drainAttachmentsForUserMessage();
         return handleUserMessage({ message, attachmentsPromise });
     });
@@ -1543,6 +1547,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         exitCode = await loop({
         path: workingDirectory,
         ...(lessons ? { lessons } : {}),
+        lessonProposalTurn,
         sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,
