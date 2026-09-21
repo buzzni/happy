@@ -2360,10 +2360,12 @@ export class ApiMachineClient {
         }
         for (const slot of VIEWER_SLOTS) {
             if (occupiedSlots.has(slot.slot)) continue;
-            const ownedByCurrent = persisted?.slot === slot.slot;
-            if (!ownedByCurrent && await isViewerServing(slot.webPort)) {
-                occupiedSlots.add(slot.slot);
-            }
+            // Not "is someone serving noVNC here" but "can websockify bind
+            // this at all". A port held by a listener that answers nothing
+            // passes the serving probe as free and then refuses the bind, so
+            // the slot was handed out again on every retry — including to the
+            // viewer that already owned it (2026-09-21, walter-gpu slot 1).
+            if (!(await isPortFree(slot.webPort))) occupiedSlots.add(slot.slot);
         }
 
         const persistedSlot = persisted

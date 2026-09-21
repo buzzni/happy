@@ -287,11 +287,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
         // the real readiness waits return at once instead of timing out.
         const held: Array<() => Promise<void>> = []
 
-        /** The VNC port: bound, speaks no HTTP — all its wait asks for. */
+        /** A port taken by something that accepts and then says nothing. */
         async function holdPort(port: number): Promise<void> {
             const { createServer } = await import('node:net')
             await new Promise<void>((resolve) => {
-                const server = createServer()
+                const server = createServer((socket) => socket.destroy())
                 server.once('error', () => resolve())
                 server.listen(port, '127.0.0.1', () => {
                     held.push(() => new Promise<void>((done) => server.close(() => done())))
@@ -332,7 +332,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
                 if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
                 return { pid: 1234, exit: null }
             })
-            await holdPort(5900)
+            // The display server is mocked too, so its port is opened here —
+            // for every slot, since which one the daemon picks is part of
+            // what these tests check.
+            for (const vncPort of [5900, 5901, 5902]) await holdPort(vncPort)
         })
 
         afterEach(async () => {
@@ -358,6 +361,20 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
                 expect.objectContaining({ resizeMode: 'remote' }),
             )
+        })
+
+        // The other half of the same outage: the slot was judged free because
+        // nothing was serving noVNC on it, but websockify could not bind it
+        // either, so every retry landed on the one port that could not work.
+        it('skips a slot whose port is held by something that answers nothing', async () => {
+            await holdPort(6080)
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(result).toMatchObject({ webPort: 6081, ready: true })
         })
 
         // 2026-09-21, walter-gpu: a second user pushed this viewer onto slot 1,
