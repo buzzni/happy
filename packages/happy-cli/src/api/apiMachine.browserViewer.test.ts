@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DetachedProcess } from '@/daemon/remoteViewer'
+import { VIEWER_VNC_PORTS, VIEWER_WEB_PORTS, isPortFree, type DetachedProcess } from '@/daemon/remoteViewer'
 
 const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
     browserMocks: {
@@ -290,14 +290,30 @@ describe('ApiMachineClient browser viewer RPC', () => {
         /** A port taken by something that accepts and then says nothing. */
         async function holdPort(port: number): Promise<void> {
             const { createServer } = await import('node:net')
-            await new Promise<void>((resolve) => {
+            await new Promise<void>((resolve, reject) => {
                 const server = createServer((socket) => socket.destroy())
-                server.once('error', () => resolve())
+                // Swallowing EADDRINUSE here would let the test run against a
+                // slot it does not actually control and report the resulting
+                // slot choice as a logic failure.
+                server.once('error', reject)
                 server.listen(port, '127.0.0.1', () => {
                     held.push(() => new Promise<void>((done) => server.close(() => done())))
                     resolve()
                 })
             })
+        }
+
+        /**
+         * These tests drive the daemon's fixed slots (5900-5902 / 6080-6082),
+         * which are real ports on this host. A viewer actually running here
+         * would change which slot the daemon picks, so say that outright
+         * rather than let it surface as a wrong webPort.
+         */
+        async function assertViewerPortsFree(): Promise<void> {
+            for (const port of [...VIEWER_VNC_PORTS, ...VIEWER_WEB_PORTS]) {
+                if (await isPortFree(port)) continue
+                throw new Error(`viewer port ${port} is in use on this host; these tests need the daemon's fixed slots`)
+            }
         }
 
         /**
@@ -332,10 +348,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
                 if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
                 return { pid: 1234, exit: null }
             })
+            await assertViewerPortsFree()
             // The display server is mocked too, so its port is opened here —
             // for every slot, since which one the daemon picks is part of
             // what these tests check.
-            for (const vncPort of [5900, 5901, 5902]) await holdPort(vncPort)
+            for (const vncPort of VIEWER_VNC_PORTS) await holdPort(vncPort)
         })
 
         afterEach(async () => {
@@ -443,6 +460,38 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect(aliceAgain).not.toMatchObject({ webPort: 6080 })
             expect(aliceAgain).toMatchObject({ webPort: 6082 })
         })
+
+        // The lease is about to be rewritten with a new slot, so these pids are
+        // the last record of the stack holding the old one. Giving up on
+        // SIGTERM strands that slot for the life of the machine.
+        it('escalates to SIGKILL when its own stack ignores SIGTERM', async () => {
+            leaseRegistryMocks.records.set(ALICE_KEY, {
+                ...lease(ALICE_KEY, 0),
+                processIds: { websockify: 777001 },
+            })
+            await holdPort(6080)
+            const releaseWebPort = held[held.length - 1]
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777001/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
+                if (pid === -777001 && signal === 'SIGKILL') void releaseWebPort()
+                return true
+            })
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).toHaveBeenCalledWith(-777001, 'SIGKILL')
+                expect(result).toMatchObject({ webPort: 6080, ready: true })
+            } finally {
+                kill.mockRestore()
+            }
+        }, 20_000)
 
         // The other half of the same outage: the slot was judged free because
         // nothing was serving noVNC on it, but websockify could not bind it

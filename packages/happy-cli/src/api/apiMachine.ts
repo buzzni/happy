@@ -2356,7 +2356,15 @@ export class ApiMachineClient {
             // below reads "still bound" as "occupied" — so without waiting,
             // the reap frees a slot and then declines to use it.
             if (!await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
-                logger.warn(`[viewer] slot ${persisted.slot} (${persisted.display}): 127.0.0.1:${persisted.webPort} still held ${VIEWER_STOP_RELEASE_TIMEOUT_MS}ms after SIGTERM`);
+                // The lease is about to be rewritten with whichever slot this
+                // start lands on, and these pids are the only record of the
+                // stack still holding the old one. Nothing would ever reap it
+                // again, and with three slots on a machine that is a third of
+                // the capacity gone until it reboots.
+                await this.stopIsolatedViewerProcesses(persisted, 'SIGKILL');
+                if (!await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
+                    logger.warn(`[viewer] slot ${persisted.slot} (${persisted.display}): 127.0.0.1:${persisted.webPort} survived SIGKILL; abandoning the slot`);
+                }
             }
         }
 
@@ -2555,7 +2563,10 @@ export class ApiMachineClient {
     }
 
     /** @returns whether any process was actually signalled. */
-    private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<boolean> {
+    private async stopIsolatedViewerProcesses(
+        lease: BrowserViewerLeaseRecord,
+        signal: NodeJS.Signals = 'SIGTERM',
+    ): Promise<boolean> {
         let signalled = false;
         for (const [kind, pid] of Object.entries(lease.processIds ?? {}) as Array<[
             'xvfb' | 'xvnc' | 'x11vnc' | 'websockify',
@@ -2567,7 +2578,7 @@ export class ApiMachineClient {
                 if (!viewerProcessMatchesLease(kind, cmdline, lease)) continue;
                 // Viewer processes are detached process-group leaders. Targeting
                 // that exact group avoids touching another user's slot.
-                process.kill(-pid, 'SIGTERM');
+                process.kill(-pid, signal);
                 signalled = true;
             } catch {
                 // Already exited is an idempotent stop success.
