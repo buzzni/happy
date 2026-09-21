@@ -493,6 +493,64 @@ describe('ApiMachineClient browser viewer RPC', () => {
             }
         }, 20_000)
 
+        // Releasing a record is the last moment its pids are known, for other
+        // viewers exactly as for our own. A port still bound after its screen
+        // stopped answering is a stack nobody can reach and nobody can reap —
+        // its owner least of all, since the lease naming it was just dropped.
+        it('reaps another viewer whose released slot is still bound', async () => {
+            leaseRegistryMocks.records.set(BOB_KEY, {
+                ...lease(BOB_KEY, 1),
+                processIds: { websockify: 777010 },
+            })
+            await holdPort(6081)
+            const releaseBob = held[held.length - 1]
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777010/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
+                if (pid === -777010) void releaseBob()
+                return true
+            })
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).toHaveBeenCalledWith(-777010, 'SIGTERM')
+                expect(await isPortFree(6081)).toBe(true)
+            } finally {
+                kill.mockRestore()
+            }
+        })
+
+        // Nothing is holding the slot, so there is nothing to reclaim — and the
+        // pids on a released record may belong to anything by now.
+        it('does not signal a released viewer whose port is already free', async () => {
+            leaseRegistryMocks.records.set(BOB_KEY, {
+                ...lease(BOB_KEY, 1),
+                processIds: { websockify: 777010 },
+            })
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777010/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).not.toHaveBeenCalledWith(-777010, 'SIGTERM')
+            } finally {
+                kill.mockRestore()
+            }
+        })
+
         // The other half of the same outage: the slot was judged free because
         // nothing was serving noVNC on it, but websockify could not bind it
         // either, so every retry landed on the one port that could not work.

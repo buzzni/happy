@@ -2348,25 +2348,9 @@ export class ApiMachineClient {
         // Its screen is gone, and this is the last moment its pids are known:
         // a websockify that is bound but no longer serving would otherwise
         // hold the slot for good, now that an unbindable port counts as
-        // occupied. Only this viewer's own stack — reopening their screen is
-        // consent to replace it, and a slow probe on someone else's live
-        // viewer must never become a kill.
-        if (persisted && await this.stopIsolatedViewerProcesses(persisted)) {
-            // SIGTERM returns long before the port is released, and the loop
-            // below reads "still bound" as "occupied" — so without waiting,
-            // the reap frees a slot and then declines to use it.
-            if (!await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
-                // The lease is about to be rewritten with whichever slot this
-                // start lands on, and these pids are the only record of the
-                // stack still holding the old one. Nothing would ever reap it
-                // again, and with three slots on a machine that is a third of
-                // the capacity gone until it reboots.
-                await this.stopIsolatedViewerProcesses(persisted, 'SIGKILL');
-                if (!await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
-                    logger.warn(`[viewer] slot ${persisted.slot} (${persisted.display}): 127.0.0.1:${persisted.webPort} survived SIGKILL; abandoning the slot`);
-                }
-            }
-        }
+        // occupied. Reopening a screen is consent to replace it, so this one
+        // needs no second opinion — unlike the records below.
+        if (persisted) await this.reapViewerStack(persisted);
 
         const records = await this.isolatedViewerRegistry.list();
         const occupiedSlots = new Set<number>();
@@ -2378,6 +2362,15 @@ export class ApiMachineClient {
             // reuse path above would return their live screen to its former
             // owner.
             await this.isolatedViewerRegistry.delete(record.viewerKey);
+            // And with the record goes the only note of its pids. A port left
+            // bound after its screen stopped answering is a stack nobody can
+            // reach and nobody can reap, its owner least of all — the slot
+            // would be occupied for the life of the machine. Asked twice
+            // before signalling, because this screen is not ours: a probe
+            // that lost a race must not end someone's live session.
+            if (await isPortFree(record.webPort)) continue;
+            if (await isViewerServing(record.webPort)) { occupiedSlots.add(record.slot); continue; }
+            await this.reapViewerStack(record);
         }
         for (const slot of VIEWER_SLOTS) {
             if (occupiedSlots.has(slot.slot)) continue;
@@ -2560,6 +2553,25 @@ export class ApiMachineClient {
             : `nothing answered within ${VIEWER_SERVING_TIMEOUT_MS}ms`;
         logger.warn(`[viewer] ${label}: noVNC never came up on 127.0.0.1:${webPort} — ${cause}`);
         return false;
+    }
+
+    /**
+     * Ends a viewer stack and waits for its web port to come free.
+     *
+     * SIGTERM returns long before the port is released, and slot selection
+     * reads "still bound" as "occupied" — so without the wait a reap frees a
+     * slot and then declines to use it. The escalation is what keeps the slot
+     * recoverable at all: once the lease naming these pids is gone, nothing
+     * else knows what is holding the port, and with three slots on a machine
+     * that is a third of its capacity until it reboots.
+     */
+    private async reapViewerStack(lease: BrowserViewerLeaseRecord): Promise<void> {
+        if (!await this.stopIsolatedViewerProcesses(lease)) return;
+        if (await waitForPortRelease(lease.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) return;
+        await this.stopIsolatedViewerProcesses(lease, 'SIGKILL');
+        if (!await waitForPortRelease(lease.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
+            logger.warn(`[viewer] slot ${lease.slot} (${lease.display}): 127.0.0.1:${lease.webPort} survived SIGKILL; abandoning the slot`);
+        }
     }
 
     /** @returns whether any process was actually signalled. */
