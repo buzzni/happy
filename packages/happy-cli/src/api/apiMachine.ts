@@ -2351,6 +2351,14 @@ export class ApiMachineClient {
             };
         }
 
+        // Its screen is gone, and this is the last moment its pids are known:
+        // a websockify that is bound but no longer serving would otherwise
+        // hold the slot for good, now that an unbindable port counts as
+        // occupied. Only this viewer's own stack — reopening their screen is
+        // consent to replace it, and a slow probe on someone else's live
+        // viewer must never become a kill.
+        if (persisted) await this.stopIsolatedViewerProcesses(persisted);
+
         const records = await this.isolatedViewerRegistry.list();
         const occupiedSlots = new Set<number>();
         for (const record of records) {

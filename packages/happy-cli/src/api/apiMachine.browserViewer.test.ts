@@ -363,6 +363,35 @@ describe('ApiMachineClient browser viewer RPC', () => {
             )
         })
 
+        // Now that an unbindable port counts as occupied, a websockify that
+        // is bound but no longer serving would hold its slot for good. The
+        // moment its owner reopens the screen is the last one where its pids
+        // are still known, so that is where the stack is reaped.
+        it('reaps its own stale viewer processes before re-allocating', async () => {
+            leaseRegistryMocks.records.set(ALICE_KEY, {
+                ...lease(ALICE_KEY, 0),
+                processIds: { websockify: 777001, xvnc: 777002 },
+            })
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777001/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
+                if (path === '/proc/777002/cmdline') return 'Xvnc\x00:99\x00-rfbport\x005900\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).toHaveBeenCalledWith(-777001, 'SIGTERM')
+                expect(kill).toHaveBeenCalledWith(-777002, 'SIGTERM')
+            } finally {
+                kill.mockRestore()
+            }
+        })
+
         // The other half of the same outage: the slot was judged free because
         // nothing was serving noVNC on it, but websockify could not bind it
         // either, so every retry landed on the one port that could not work.
