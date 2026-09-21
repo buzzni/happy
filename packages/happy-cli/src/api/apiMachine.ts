@@ -1536,9 +1536,17 @@ export class ApiMachineClient {
                 if (!response.ok) throw new Error(response.code);
                 return response.lease;
             }
-            const lease = this.isolatedViewerLeases.get(viewerKey)
-                ?? await this.isolatedViewerRegistry.get(viewerKey);
-            if (!lease) return null;
+            // The registry decides whether this viewer still holds a slot.
+            // Reading the cache first would answer for a lease another start
+            // has released: the slot can belong to someone else by now, and
+            // reporting it ready — then writing it back — hands its former
+            // owner their screen. Every write puts the registry first, so the
+            // cache is never ahead of it.
+            const lease = await this.isolatedViewerRegistry.get(viewerKey);
+            if (!lease) {
+                this.isolatedViewerLeases.delete(viewerKey);
+                return null;
+            }
             const ready = await isViewerServing(lease.webPort);
             const touched = { ...lease, lastUsedAt: Date.now() };
             if (ready) {
@@ -2361,7 +2369,9 @@ export class ApiMachineClient {
             // SIGTERM returns long before the port is released, and the loop
             // below reads "still bound" as "occupied" — so without waiting,
             // the reap frees a slot and then declines to use it.
-            await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS);
+            if (!await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
+                logger.warn(`[viewer] slot ${persisted.slot} (${persisted.display}): 127.0.0.1:${persisted.webPort} still held ${VIEWER_STOP_RELEASE_TIMEOUT_MS}ms after SIGTERM`);
+            }
         }
 
         const records = await this.isolatedViewerRegistry.list();

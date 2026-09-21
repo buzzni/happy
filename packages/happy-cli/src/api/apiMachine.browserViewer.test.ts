@@ -403,6 +403,25 @@ describe('ApiMachineClient browser viewer RPC', () => {
             }
         })
 
+        // Same hazard through the other door: lookup re-registers the lease it
+        // was handed, so a cached one whose record was already released would
+        // put it back — pointing at a slot its former owner no longer holds.
+        it('reports no lease once its registry record has been released', async () => {
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+            const handlers = handlersFrom(client)
+
+            await handlers.get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+            leaseRegistryMocks.records.delete(ALICE_KEY)
+            viewerMocks.isViewerServing.mockResolvedValue(true)
+
+            const looked = await handlers.get('machine-1:browser-viewer:lookup')?.({ viewerKey: ALICE_KEY })
+
+            expect(looked).toBeNull()
+            expect(leaseRegistryMocks.records.has(ALICE_KEY)).toBe(false)
+        })
+
         // A lease deleted from the registry must not come back from the
         // daemon's own cache: the slot may already belong to someone else, and
         // the reuse path would hand this viewer their live screen.
