@@ -1614,7 +1614,8 @@ export async function startDaemon(): Promise<void> {
         + ` callerGrant=${trustedMcpContext ? 'automation' : options.mcpCallerGrantEnvelope ? 'envelope' : 'absent'}`,
       );
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
+      // Lesson eligibility uses the registered daemon machine, not an optional RPC field.
+      const { directory, sessionId, approvedNewDirectoryCreation = true } = options;
       let directoryCreated = false;
 
       try {
@@ -1874,6 +1875,7 @@ export async function startDaemon(): Promise<void> {
           daemonToken: credentials.token,
           daemonHomeDir: configuration.happyHomeDir,
           projectId: hasAuthoritativeProjectBinding ? mcpConfigProjectId : null,
+          hasSessionAuthority: hasAuthoritativeProjectBinding && Boolean(mcpCallerGrant),
           eligible: Boolean(
             // A managed runtime loads no settings sources, so there is no
             // native hook to stand down and no account credential to be a
@@ -2644,6 +2646,8 @@ export async function startDaemon(): Promise<void> {
           daemonToken: credentials.token,
           daemonHomeDir: configuration.happyHomeDir,
           projectId: authoritativeCheckpointProjectId ?? null,
+          hasSessionAuthority: Boolean(authoritativeCheckpointProjectId
+            && mcpEnvironment.environmentVariables.HAPPY_APLUS_MCP_CALLER_GRANT),
           eligible: Boolean(process.env.HAPPY_APLUS_MCP_CONFIG_URL && machineId),
           hostIsReady: async () => Boolean(
             authoritativeCheckpointProjectId
@@ -3987,6 +3991,17 @@ export async function startDaemon(): Promise<void> {
        * grant for one project open another project's store.
        */
       routeVerifier: () => lessonRouteVerifier,
+      loadRouteVerifier: async () => {
+        if (!lessonStudioOrigin || !machineId) return null;
+        const key = await fetchLessonGrantPublicKey({
+          studioBaseUrl: lessonStudioOrigin, token: credentials.token, machineId,
+        });
+        if (!key) return null;
+        lessonRouteVerifier = createLessonGrantVerifier({
+          publicKeyBase64: key, machineId, audience: lessonGrantAudience(lessonStudioOrigin),
+        });
+        return lessonRouteVerifier;
+      },
       // Lets a turn or a review open a project nobody has clicked into yet.
       // The studio still decides, and still signs the path.
       requestSnapshotGrant: (projectId) => (lessonStudioOrigin && machineId

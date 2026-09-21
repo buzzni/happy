@@ -83,6 +83,7 @@ import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficu
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
+import { readLessonOwner } from '@/memory/lessonOwnerMarker';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -1576,7 +1577,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
                 const token = requireAccountToken(accountToken);
                 const account = requireAccountMachineId(machineId);
-                await refreshMcpCallerGrantIfExpiring(token, account);
+                await refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
                 return fetchAplusMcpServersResult(
                     token,
                     account,

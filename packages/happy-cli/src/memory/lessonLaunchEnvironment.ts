@@ -38,6 +38,8 @@ export type LessonLaunchInput = {
     projectId: string | null | undefined;
     /** Cheap preconditions the caller already resolved. */
     eligible: boolean;
+    /** Consumed server caller grant; actual session authority is checked after registration. */
+    hasSessionAuthority?: boolean;
     /** Opens the project through a signed grant; `false` means no host. */
     hostIsReady: () => Promise<boolean>;
     /** The installed package probe, for tests. Production passes nothing. */
@@ -67,7 +69,9 @@ export async function applyLessonLaunchEnvironment(
         // caller must not escape the host policy boundary through native hooks.
         eligible: input.eligible && Boolean(input.projectId),
         callerSupported: lessonCallerSharesIdentity(input.callerToken, input.daemonToken),
-        hostIsReady: async () => Boolean(input.projectId) && input.hostIsReady(),
+        // Never open as the daemon on behalf of a session caller. The provider
+        // obtains its own signed path and identity after its session is registered.
+        hostIsReady: async () => !input.hasSessionAuthority && Boolean(input.projectId) && input.hostIsReady(),
         load: input.load,
     });
     return {

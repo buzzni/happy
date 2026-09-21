@@ -227,6 +227,72 @@ describe('lazy bootstrap boundaries', () => {
         return host as LessonSessionHost & { closed: number };
     }
 
+    it.each(['recall', 'review'] as const)('retries a failed bootstrap on later %s with backoff and singleflight', async (surface) => {
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+        const built = stub();
+        let land!: (host: LessonSessionHost | null) => void;
+        const bootstrap = vi.fn<() => Promise<LessonSessionHost | null>>()
+            .mockResolvedValueOnce(null)
+            .mockImplementation(() => new Promise((resolve) => { land = resolve; }));
+        const host = createLazyLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), bootstrap,
+        });
+        const call = () => surface === 'recall'
+            ? host.turn!.recall({ turnId: 't', query: 'x' })
+            : host.review!.reviewFinishedTurn({} as never);
+        try {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            await call();
+            expect(bootstrap).toHaveBeenCalledTimes(1);
+            clock.mockReturnValue(6_000);
+            await Promise.all([call(), call(), call()]);
+            expect(bootstrap).toHaveBeenCalledTimes(2);
+            clock.mockReturnValue(60_000);
+            await call();
+            expect(bootstrap).toHaveBeenCalledTimes(2);
+            land(built);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(await host.turn!.acknowledge({} as never)).toBe(true);
+            await host.close();
+            await call();
+            expect(bootstrap).toHaveBeenCalledTimes(2);
+            expect(built.closed).toBe(1);
+        } finally {
+            clock.mockRestore();
+            await host.close();
+        }
+    });
+
+    it('closes a retry that lands after disposal and never restarts it', async () => {
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+        const built = stub();
+        let land!: (host: LessonSessionHost) => void;
+        const bootstrap = vi.fn<() => Promise<LessonSessionHost | null>>()
+            .mockRejectedValueOnce(new Error('temporary key failure'))
+            .mockImplementation(() => new Promise((resolve) => { land = resolve; }));
+        const host = createLazyLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), bootstrap,
+        });
+        try {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            clock.mockReturnValue(6_000);
+            await host.turn!.recall({ turnId: 't', query: 'x' });
+            expect(bootstrap).toHaveBeenCalledTimes(2);
+            await host.close();
+            land(built);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            clock.mockReturnValue(60_000);
+            expect(await host.turn!.recall({ turnId: 't', query: 'x' })).toEqual({ outcome: 'unsupported' });
+            expect(bootstrap).toHaveBeenCalledTimes(2);
+            expect(built.closed).toBe(1);
+        } finally {
+            clock.mockRestore();
+            await host.close();
+        }
+    });
+
     it('serves a host that took longer than the bootstrap budget to arrive', async () => {
         /*
          * The budgeted bootstrap answers null at its deadline and closes what

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import ts from 'typescript';
 
 import { applyLessonLaunchEnvironment, lessonCallerSharesIdentity } from './lessonLaunchEnvironment';
 import { LESSON_OWNER_ENV, LESSON_HOST_DISABLED_ENV } from './lessonOwnerMarker';
@@ -37,6 +39,59 @@ describe('lessonCallerSharesIdentity', () => {
 });
 
 describe('applyLessonLaunchEnvironment', () => {
+    it('keeps lesson ownership when the spawn RPC omits its optional machineId', async () => {
+        // Execute the real spawn binding and eligibility expression without
+        // starting a daemon or importing its CLI side effects.
+        const source = readFileSync(new URL('../daemon/run.ts', import.meta.url), 'utf8');
+        const parsed = ts.createSourceFile('run.ts', source, ts.ScriptTarget.Latest, true);
+        let spawn: ts.ArrowFunction | undefined;
+        const findSpawn = (node: ts.Node) => {
+            if (ts.isVariableDeclaration(node) && node.name.getText(parsed) === 'spawnSession'
+                && node.initializer && ts.isArrowFunction(node.initializer)) spawn = node.initializer;
+            ts.forEachChild(node, findSpawn);
+        };
+        findSpawn(parsed);
+        let binding = '';
+        let eligibility = '';
+        const findInputs = (node: ts.Node) => {
+            if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name)
+                && node.initializer?.getText(parsed) === 'options') binding = node.getText(parsed);
+            if (ts.isVariableDeclaration(node) && node.name.getText(parsed) === 'lessonLaunch'
+                && node.initializer && ts.isAwaitExpression(node.initializer)
+                && ts.isCallExpression(node.initializer.expression)) {
+                const argument = node.initializer.expression.arguments[0];
+                if (ts.isObjectLiteralExpression(argument)) {
+                    const property = argument.properties.find((item) =>
+                        ts.isPropertyAssignment(item) && item.name.getText(parsed) === 'eligible');
+                    if (property && ts.isPropertyAssignment(property)) eligibility = property.initializer.getText(parsed);
+                }
+            }
+            ts.forEachChild(node, findInputs);
+        };
+        expect(spawn).toBeDefined();
+        findInputs(spawn!);
+        expect(binding).not.toBe('');
+        expect(eligibility).not.toBe('');
+        const eligible = new Function('machineId', 'options', 'managedIdentity', 'lessonStudioOrigin',
+            `return (() => { const ${binding}; return ${eligibility}; })();`
+        )('daemon-machine', { directory: '/workspace' }, { status: 'inactive' }, 'https://studio.example');
+        const { decision } = await applyLessonLaunchEnvironment({
+            ...base, environment: {}, callerToken: base.daemonToken, eligible, hasSessionAuthority: true,
+            hostIsReady: async () => false,
+        });
+        expect(decision).toEqual({ owner: 'host', reason: 'host-not-ready' });
+    });
+
+    it('keeps a verified session caller behind the host gate before session registration', async () => {
+        const hostIsReady = vi.fn(async () => false);
+        const { decision } = await applyLessonLaunchEnvironment({
+            ...base, environment: {}, callerToken: jwt({ sub: 'account-a' }),
+            hasSessionAuthority: true, hostIsReady,
+        });
+        expect(decision).toEqual({ owner: 'host', reason: 'host-not-ready' });
+        expect(hostIsReady).not.toHaveBeenCalled();
+    });
+
     it('claims for a launch whose child asks as the account the proof was taken with', async () => {
         const { environment, decision } = await applyLessonLaunchEnvironment({
             ...base,
@@ -59,6 +114,7 @@ describe('applyLessonLaunchEnvironment', () => {
             ...base,
             environment: {},
             callerToken: jwt({ sub: 'account-b' }),
+            hasSessionAuthority: true,
             hostIsReady,
         });
         expect(decision).toEqual({ owner: 'disabled', reason: 'unsupported-caller' });

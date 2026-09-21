@@ -88,6 +88,7 @@ import {
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import type { LessonReviewWorker } from '@/memory/lessonReviewWorker';
 import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
+import { readLessonOwner } from '@/memory/lessonOwnerMarker';
 import type { LessonTurnKind } from '@/memory/lessonTurnEvidence';
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
 import type { LessonTurnHost } from '@/memory/lessonTurnHost';
@@ -1407,7 +1408,7 @@ export async function runCodex(opts: {
             // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
             // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
             const account = requireAccountMachineId(machineId);
-            await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account);
+            await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
             return fetchAplusMcpServersResult(
                 requireAccountToken(accountToken),
                 account,

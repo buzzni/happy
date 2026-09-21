@@ -40,6 +40,20 @@ function supervisorFor(open: ReturnType<typeof vi.fn>) {
 }
 
 describe('createLessonHostSupervisor routing', () => {
+    it('retries an unavailable routing key without trusting an unsigned request', async () => {
+        const loadRouteVerifier = vi.fn(async () => null);
+        const supervisor = createLessonHostSupervisor({
+            routeVerifier: () => null, loadRouteVerifier,
+            machineId: () => 'm1', studioBaseUrl: () => 'https://studio.example',
+            studioToken: () => 'token', settingsPathFor: () => '/tmp/not-opened.json',
+        });
+        expect(await supervisor.handle(snapshot)).toEqual({ ok: false, reason: 'permission_denied' });
+        expect(loadRouteVerifier).toHaveBeenCalledOnce();
+        await supervisor.handle(snapshot);
+        expect(loadRouteVerifier).toHaveBeenCalledOnce();
+        await supervisor.close();
+    });
+
     it('refuses a request with no verifiable grant rather than routing on its body', async () => {
         const supervisor = supervisorFor(vi.fn());
         expect(await supervisor.handle({ ...snapshot, grantEnvelope: 'nonsense' }))
@@ -164,6 +178,50 @@ describe('authorization lease', () => {
     it('refuses to authorize a project that was never opened', async () => {
         const supervisor = leaseFixture(async () => null);
         expect(await supervisor.authorize('p1', 50)).toBeNull();
+        await supervisor.close();
+    });
+
+    it('uses a recovered routing key for cold open and expired lease renewal', async () => {
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+        const loadRouteVerifier = vi.fn(async () => createLessonGrantVerifier({
+            publicKeyBase64, machineId: 'm1', audience: AUDIENCE,
+        }));
+        const requestSnapshotGrant = vi.fn(async (projectId: string) => grant(
+            { ...openRequest, projectId },
+            { projectId, workspaceDir: '/ws/p1', expiresAt: Date.now() + 1_000 },
+        ));
+        const supervisor = createLessonHostSupervisor({
+            routeVerifier: () => null, loadRouteVerifier, requestSnapshotGrant,
+            machineId: () => 'm1', studioBaseUrl: () => 'https://studio.example',
+            studioToken: () => 'token', settingsPathFor: () => '/tmp/recovered-key.json',
+        });
+        try {
+            await supervisor.ensureOpen('p1');
+            expect(loadRouteVerifier).toHaveBeenCalledOnce();
+            expect(supervisor.openedUserId('p1')).toBe('u1');
+            clock.mockReturnValue(12_000);
+            expect(await supervisor.authorize('p1', 200)).toBe('u1');
+            expect(requestSnapshotGrant).toHaveBeenCalledTimes(2);
+            expect(loadRouteVerifier).toHaveBeenCalledOnce();
+        } finally {
+            clock.mockRestore();
+            await supervisor.close();
+        }
+    });
+
+    it('renews an expired read lease using the exact signed snapshot request', async () => {
+        let issued = 0;
+        const supervisor = leaseFixture(async (projectId) => {
+            issued += 1;
+            return grant({ ...openRequest, projectId }, {
+                projectId, workspaceDir: '/ws/p1',
+                iat: Date.now(), expiresAt: Date.now() + (issued === 1 ? 30 : 30_000),
+            });
+        });
+        await supervisor.ensureOpen('p1');
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        expect(await supervisor.authorize('p1', 200)).toBe('u1');
+        expect(issued).toBe(2);
         await supervisor.close();
     });
 

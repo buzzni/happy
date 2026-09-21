@@ -11,8 +11,9 @@
  *    only writes when it had an authoritative project binding;
  *  - the **workspace** is never taken from `cwd` or from that context. It is
  *    requested from the studio, which signs the project's own directory;
- *  - the **identity** is this run's account bearer, so a managed run — which
- *    has no account credential — gets nothing at all.
+ *  - shared-machine sessions combine their machine account bearer with the
+ *    daemon-verified caller grant and registered session. Studio resolves the
+ *    actual caller; a managed run without an account credential is unsupported.
  *
  * Every absence returns `null`. A session without a lesson host runs exactly
  * as it did before this existed.
@@ -20,6 +21,7 @@
 import { resolve } from 'node:path';
 
 import { logger } from '@/ui/logger';
+import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import { readLessonOwner } from './lessonOwnerMarker';
 import { readCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
 
@@ -150,9 +152,10 @@ async function readGateway(input: {
     projectId: string;
     /** The caller this session acts as; the studio's answer must agree. */
     userId: string;
+    sessionAuthority?: { sessionId: string; callerGrant: string };
 }): Promise<{ config: LessonGatewayConfig; quote: LessonPriceQuote; defaultModel: string } | null> {
     const url = new URL(
-        `/api/projects/${encodeURIComponent(input.projectId)}/lesson-gateway/config`,
+        `/api/projects/${encodeURIComponent(input.projectId)}/${input.sessionAuthority ? 'lesson-host/gateway' : 'lesson-gateway/config'}`,
         input.studioBaseUrl,
     );
     if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null;
@@ -169,6 +172,7 @@ async function readGateway(input: {
                 'X-Aplus-Machine-Id': input.machineId,
                 'Content-Type': 'application/json',
             },
+            ...(input.sessionAuthority ? { body: JSON.stringify({ machineId: input.machineId, ...input.sessionAuthority }) } : {}),
         });
         if (!response.ok) return null;
         const body = await response.json() as {
@@ -242,18 +246,35 @@ export function createLazyLessonSessionHost(
      * waiting on this, so it runs to whatever conclusion it reaches and the
      * turn after it lands is the first one that recalls.
      */
-    const pending = (input.bootstrap ?? (() => bootstrapLessonSessionHost(input)))().then((built) => {
-        if (built && disposed) {
-            // Disposed while starting: close it rather than leak the store.
-            void built.close().catch(() => undefined);
-            return null;
-        }
-        ready = built;
-        return built;
-    }).catch(() => null);
+    let starting = false;
+    let retryAt = 0;
+    const start = () => {
+        if (disposed || ready || starting || Date.now() < retryAt) return;
+        starting = true;
+        // Failure is retried only by later turns, never a background timer.
+        void (async () => {
+            try {
+                const built = await (input.bootstrap ?? (() => bootstrapLessonSessionHost(input)))();
+                if (built && disposed) {
+                    await built.close().catch(() => undefined);
+                } else if (!disposed) {
+                    ready = built;
+                }
+            } catch {
+                // A transient network failure must not disable this session forever.
+            } finally {
+                retryAt = Date.now() + 5_000;
+                starting = false;
+            }
+        })();
+    };
+    start();
 
-    /** Resolves to the ready host, or null while it is still starting. */
-    const settled = () => ready;
+    /** Starts a bounded retry without putting its network work on the turn path. */
+    const settled = () => {
+        start();
+        return ready;
+    };
 
     return {
         // Read once at construction from the same environment; it does not
@@ -265,7 +286,7 @@ export function createLazyLessonSessionHost(
                 return host ? host.recall(args) : { outcome: 'unsupported' as const };
             },
             async acknowledge(ticket) {
-                const host = settled()?.turn;
+                const host = ready?.turn;
                 return host ? host.acknowledge(ticket) : false;
             },
         },
@@ -284,12 +305,11 @@ export function createLazyLessonSessionHost(
              * became ready — awaiting it would hold shutdown open for as long
              * as that call takes. Setting `disposed` first is what makes the
              * wait unnecessary: whatever the bootstrap produces afterwards
-             * sees it and closes itself in the `then` above.
+             * sees it and closes itself in the bootstrap above.
              */
             disposed = true;
             const built = ready;
             ready = null;
-            void pending;
             await built?.close().catch(() => undefined);
         },
     };
@@ -401,11 +421,24 @@ async function bootstrapLessonSessionHost(input: {
         return null;
     }
 
+    // The daemon strips caller environment and forwards only the consumed grant.
+    // The server still verifies its user/project/machine and actual session binding.
+    const sessionBound = Boolean(env.HAPPY_APLUS_MCP_CALLER_GRANT);
+    const sessionAuthority = () => sessionBound
+        ? { sessionId: input.sessionId, callerGrant: env.HAPPY_APLUS_MCP_CALLER_GRANT ?? '' }
+        : undefined;
+
     const supervisor = createLessonHostSupervisor({
         routeVerifier: () => verifier,
-        requestSnapshotGrant: (project) => requestLessonSnapshotGrant({
-            studioBaseUrl: origin, token: input.accountToken!, machineId: input.machineId!, projectId: project,
-        }),
+        requestSnapshotGrant: async (project) => {
+            if (sessionBound) await refreshMcpCallerGrantIfExpiring(input.accountToken!, input.machineId!, {
+                projectId: project, sessionId: input.sessionId,
+            });
+            return requestLessonSnapshotGrant({
+                studioBaseUrl: origin, token: input.accountToken!, machineId: input.machineId!, projectId: project,
+                sessionAuthority: sessionAuthority(),
+            });
+        },
         machineId: () => input.machineId,
         studioBaseUrl: () => origin,
         studioToken: () => input.accountToken,
@@ -480,7 +513,7 @@ async function bootstrapLessonSessionHost(input: {
             gateway: async () => {
                 const resolved = await readGateway({
                     studioBaseUrl: origin, token: input.accountToken!, machineId: input.machineId!,
-                    projectId, userId,
+                    projectId, userId, sessionAuthority: sessionAuthority(),
                 });
                 if (!resolved) return null;
                 /*
