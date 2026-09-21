@@ -417,12 +417,15 @@ export function ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode, onFallbac
             if (!isNameClash(error)) throw error
             // Either another start won the race with an identical build —
             // keep theirs — or what sits there carries this revision's name
-            // without its contents, which no correct viewer can be serving.
+            // without its contents. "Not current" is not "not in use": a root
+            // missing only index.html still serves /vnc.html to every session
+            // on it, so it is moved aside rather than removed. A rename keeps
+            // the inode, and a websockify chdir'd into it keeps serving.
             if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) {
                 rmSync(staging, { recursive: true, force: true })
                 return targetRoot
             }
-            rmSync(targetRoot, { recursive: true, force: true })
+            renameSync(targetRoot, `${targetRoot}.stale.${randomUUID()}`)
             renameSync(staging, targetRoot)
         }
         return targetRoot

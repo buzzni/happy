@@ -587,6 +587,43 @@ describe('waitForViewerServing', () => {
         }
     })
 
+    // Two allocators can pick the same port; the loser's websockify dies on
+    // bind while the winner answers. Reporting the loser ready records a
+    // dead pid in its lease, which the relay's evidence check then rejects.
+    it('does not call a dead process ready because someone else answers', async () => {
+        const winner = createHttpServer((req, res) => {
+            res.writeHead(req.url === '/vnc.html' ? 200 : 404)
+            res.end('<!DOCTYPE html>')
+        })
+        const port = await listenOnLoopback(winner)
+        try {
+            const result = await waitForViewerServing(port, 2_000, {
+                pollMs: 50,
+                process: { pid: 4242, exit: { kind: 'exit', code: 1, signal: null } },
+            })
+
+            expect(result).toMatchObject({ ready: false, reason: 'process-exited' })
+        } finally {
+            await closeServer(winner)
+        }
+    })
+
+    // The budget is the budget. A probe that accepts and never answers must
+    // not push the wait past it by a full probe timeout.
+    it('never overruns its budget by a whole probe', async () => {
+        const silent = createTcpServer(() => undefined)
+        const port = await listenOnLoopback(silent)
+        try {
+            const started = Date.now()
+            const result = await waitForViewerServing(port, 1_000, { pollMs: 100 })
+
+            expect(result).toEqual({ ready: false, reason: 'timeout' })
+            expect(Date.now() - started).toBeLessThan(1_400)
+        } finally {
+            silent.close()
+        }
+    })
+
     it('stops waiting once the process it is waiting for is gone', async () => {
         // Without this, websockify losing its port to someone else costs the
         // full readiness budget and then reports an indistinguishable timeout.

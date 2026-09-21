@@ -485,10 +485,12 @@ export async function detectViewerCapabilities(): Promise<ViewerCapabilities> {
  * whether we hand this port to the user as their browser screen, and an
  * unrelated service that happens to hold 6080 must not qualify.
  */
-export async function isViewerServing(webPort: number): Promise<boolean> {
+export const VIEWER_PROBE_TIMEOUT_MS = 1500
+
+export async function isViewerServing(webPort: number, timeoutMs: number = VIEWER_PROBE_TIMEOUT_MS): Promise<boolean> {
     try {
         const response = await fetch(`http://127.0.0.1:${webPort}/vnc.html`, {
-            signal: AbortSignal.timeout(1500),
+            signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
         })
         return response.ok
     } catch {
@@ -576,13 +578,25 @@ export async function waitForViewerServing(
 ): Promise<ViewerServingWait> {
     const pollMs = options.pollMs ?? 300
     const deadline = Date.now() + timeoutMs
-    for (;;) {
-        if (await isViewerServing(webPort)) return { ready: true }
-        // Checked after the probe, never before it: a process that served and
-        // then exited within the same tick still leaves a working screen for
-        // whoever else is holding it open.
+    const exited = () => {
         const exit = options.process?.exit
-        if (exit) return { ready: false, reason: 'process-exited', detail: describeDetachedExit(exit) }
+        return exit ? { ready: false as const, reason: 'process-exited' as const, detail: describeDetachedExit(exit) } : null
+    }
+    for (;;) {
+        // The process is checked on both sides of the probe. websockify does
+        // not serve and then quit on its own, so if ours is gone, whatever
+        // answers on the port is somebody else's — and a lease naming a dead
+        // pid is one the relay's evidence check refuses anyway. The second
+        // look is for the exit event that lands during the probe's round trip.
+        const before = exited()
+        if (before) return before
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) return { ready: false, reason: 'timeout' }
+        // Each probe is capped at what is left, so the wait never overruns
+        // its budget by a whole probe timeout.
+        if (await isViewerServing(webPort, Math.min(VIEWER_PROBE_TIMEOUT_MS, remaining))) {
+            return exited() ?? { ready: true }
+        }
         if (Date.now() + pollMs >= deadline) return { ready: false, reason: 'timeout' }
         await new Promise((resolve) => setTimeout(resolve, pollMs))
     }

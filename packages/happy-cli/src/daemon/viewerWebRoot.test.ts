@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import {
     buildViewerBridgeModule,
@@ -422,15 +422,24 @@ describe('ensureViewerWebRoot idempotence', () => {
 
     // The rename-collision branch: the name is right but what is under it is
     // not, which no correct viewer can be serving, so it is rebuilt in place.
-    it('repairs a root that carries the right name with the wrong contents', () => {
+    // "Not current" is not "not in use": a root with only index.html gone
+    // still serves /vnc.html to every session on it. Repair has to publish a
+    // fresh directory under the name and move the old one aside — a rename
+    // keeps its inode, so a websockify chdir'd into it keeps working — never
+    // delete it, which is the outage.
+    it('repairs a root that carries the right name with the wrong contents without deleting it', () => {
         const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
-        writeFileSync(join(root, 'vnc.html'), 'corrupted')
+        writeFileSync(join(root, 'index.html'), 'corrupted')
 
         const again = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
         expect(again).toBe(root)
-        expect(readFileSync(join(root, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
-        expect(readdirSync(baseDir).some((entry) => entry.endsWith('.tmp'))).toBe(false)
+        expect(readFileSync(join(root, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        const entries = readdirSync(baseDir)
+        expect(entries.some((entry) => entry.endsWith('.tmp'))).toBe(false)
+        const movedAside = entries.find((entry) => entry !== basename(root))
+        expect(movedAside).toBeDefined()
+        expect(readFileSync(join(baseDir, movedAside as string, 'index.html'), 'utf8')).toBe('corrupted')
     })
 
     // Every asset in the mirror is a symlink into the install it was built
@@ -516,24 +525,26 @@ describe('ensureViewerWebRoot failure handling', () => {
         expect(existsSync(join(inUse, 'vnc.html'))).toBe(true)
     })
 
-    // A failure partway through assembly must not leave a directory that the
-    // next start would mistake for a finished mirror.
-    it('leaves nothing behind under the mirror name when assembly fails', () => {
+    // A failure partway through assembly must fall back, remove its own
+    // staging, and leave every existing root alone. The failure is real: the
+    // bridge lives under `aplus/`, and a source entry of that name collides
+    // with the directory assembly made for it — after staging exists.
+    it('falls back and cleans only its own staging when assembly fails', () => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-partial-'))
         const sourceRoot = join(base, 'novnc')
         const baseDir = join(base, 'mirror')
-        mkdirSync(sourceRoot, { recursive: true })
+        mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
-        // A dangling entry: readdir lists it, symlink of it still works, but
-        // the mirror is built against a name the source cannot supply.
-        symlinkSync(join(base, 'missing'), join(sourceRoot, 'app'))
-        mkdirSync(baseDir, { recursive: true })
-        writeFileSync(join(baseDir, 'remote-collision'), 'not a directory')
+        const healthy = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        mkdirSync(join(sourceRoot, dirname(VIEWER_BRIDGE_PATH)))
+        const reasons: string[] = []
 
-        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote', onFallback: (r) => reasons.push(r) })
 
+        expect(root).toBe(sourceRoot)
+        expect(reasons).toHaveLength(1)
         expect(readdirSync(baseDir).some((entry) => entry.endsWith('.tmp'))).toBe(false)
-        expect(typeof root).toBe('string')
+        expect(readFileSync(join(healthy, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 })
 
