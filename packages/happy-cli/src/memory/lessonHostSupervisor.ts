@@ -32,6 +32,8 @@ export interface LessonHostSupervisorOptions {
      * mutation grant before the request that needs it runs.
      */
     routeVerifier: () => LessonGrantVerifier | null;
+    /** Retry a missing startup key, from the daemon-owned Studio origin only. */
+    loadRouteVerifier?: () => Promise<LessonGrantVerifier | null>;
     machineId: () => string | null;
     /** Daemon-owned studio origin; never a value from a request. */
     studioBaseUrl: () => string | null;
@@ -137,6 +139,23 @@ export function createLessonHostSupervisor(options: LessonHostSupervisorOptions)
     const refreshing = new Map<string, Promise<string | null>>();
     const opening = new Map<string, { workspaceDir: string; promise: Promise<LessonHostRuntime | null> }>();
     let closed = false;
+    let recoveredVerifier: LessonGrantVerifier | null = null;
+    let loadingVerifier: Promise<void> | null = null;
+    let retryVerifierAt = 0;
+    const verifier = () => options.routeVerifier() ?? recoveredVerifier;
+    async function refreshVerifier(): Promise<void> {
+        if (closed || verifier() || !options.loadRouteVerifier) return;
+        if (loadingVerifier) return loadingVerifier;
+        if (Date.now() < retryVerifierAt) return;
+        loadingVerifier = options.loadRouteVerifier().then((loaded) => {
+            if (!closed) recoveredVerifier = loaded;
+        }).catch(() => undefined).finally(() => {
+            retryVerifierAt = Date.now() + 5_000;
+            loadingVerifier = null;
+        });
+        return loadingVerifier;
+    }
+
 
     async function open(
         projectId: string,
@@ -174,7 +193,7 @@ export function createLessonHostSupervisor(options: LessonHostSupervisorOptions)
                 settingsPath: options.settingsPathFor(projectId),
                 // Reuses the routing verifier rather than fetching the same
                 // public key again on the path a first turn waits on.
-                verifier: options.routeVerifier(),
+                verifier: verifier(),
                 ...(options.reviewOutcomeFor
                     ? { reviewOutcome: () => options.reviewOutcomeFor!(projectId) }
                     : {}),
@@ -202,7 +221,9 @@ export function createLessonHostSupervisor(options: LessonHostSupervisorOptions)
     return {
         async handle(params) {
             if (closed) return { ok: false, reason: 'unsupported' };
-            const route = routeFor(params, options.routeVerifier());
+            await refreshVerifier();
+            if (closed) return { ok: false, reason: 'unsupported' };
+            const route = routeFor(params, verifier());
             /*
              * No verifiable route means no store. `permission_denied` rather
              * than `unsupported`: the envelope is what names the project and
@@ -248,12 +269,12 @@ export function createLessonHostSupervisor(options: LessonHostSupervisorOptions)
             if (!options.requestSnapshotGrant) return null;
             const refresh = refreshing.get(projectId) ?? (async (): Promise<string | null> => {
                 const envelope = await options.requestSnapshotGrant!(projectId).catch(() => null);
-                const verifier = options.routeVerifier();
-                if (!envelope || !verifier) return null;
-                const verified = verifier.verify({
+                const currentVerifier = verifier();
+                if (!envelope || !currentVerifier) return null;
+                const verified = currentVerifier.verify({
                     envelope,
                     request: {
-                        version: 1, projectId, requestId: `renew:${projectId}`, operation: 'snapshot',
+                        version: 1, projectId, requestId: `open:${projectId}`, operation: 'snapshot',
                     },
                 });
                 if (!verified.ok || verified.claims.projectId !== projectId) return null;
@@ -291,6 +312,8 @@ export function createLessonHostSupervisor(options: LessonHostSupervisorOptions)
         },
         async ensureOpen(projectId) {
             if (closed) return null;
+            await refreshVerifier();
+            if (closed) return null;
             const already = runtimes.get(projectId);
             if (already) return already.runtime;
             if (!options.requestSnapshotGrant) return null;
@@ -301,9 +324,9 @@ export function createLessonHostSupervisor(options: LessonHostSupervisorOptions)
              * studio is the only thing that decides which path this project
              * may open, and the check is the same one an RPC gets.
              */
-            const verifier = options.routeVerifier();
-            if (!verifier) return null;
-            const verified = verifier.verify({
+            const currentVerifier = verifier();
+            if (!currentVerifier) return null;
+            const verified = currentVerifier.verify({
                 envelope,
                 request: { version: 1, projectId, requestId: `open:${projectId}`, operation: 'snapshot' },
             });

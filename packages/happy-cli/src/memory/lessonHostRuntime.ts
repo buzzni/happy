@@ -91,12 +91,13 @@ export async function requestLessonSnapshotGrant(input: {
     token: string;
     machineId: string;
     projectId: string;
+    sessionAuthority?: { sessionId: string; callerGrant: string };
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
 }): Promise<string | null> {
     if (!input.token || !input.machineId || !input.projectId) return null;
     const url = new URL(
-        `/api/projects/${encodeURIComponent(input.projectId)}/lesson-grant`, input.studioBaseUrl,
+        `/api/projects/${encodeURIComponent(input.projectId)}/${input.sessionAuthority ? 'lesson-host/snapshot' : 'lesson-grant'}`, input.studioBaseUrl,
     );
     if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null;
     const controller = new AbortController();
@@ -114,6 +115,7 @@ export async function requestLessonSnapshotGrant(input: {
             },
             body: JSON.stringify({
                 machineId: input.machineId,
+                ...input.sessionAuthority,
                 request: {
                     version: 1, projectId: input.projectId,
                     requestId: `open:${input.projectId}`, operation: 'snapshot',
