@@ -506,13 +506,84 @@ export function isPortFree(port: number): Promise<boolean> {
     })
 }
 
-/** Spawns a long-lived viewer process detached so it outlives the daemon. */
-export function spawnDetached(command: string, args: string[], env?: NodeJS.ProcessEnv): { pid: number | undefined } {
+/** How a detached viewer process ended, once it has. */
+export type DetachedProcessExit =
+    | { kind: 'exit'; code: number | null; signal: NodeJS.Signals | null }
+    | { kind: 'spawn-error'; message: string }
+
+export type DetachedProcess = {
+    pid: number | undefined
+    /**
+     * `null` while the process is still running.
+     *
+     * Read rather than awaited, so a caller that never looks (openbox,
+     * vncconfig) pays nothing for it.
+     */
+    exit: DetachedProcessExit | null
+}
+
+/** Describes an exit in one line, for the log that has to explain it. */
+export function describeDetachedExit(exit: DetachedProcessExit): string {
+    if (exit.kind === 'spawn-error') return `spawn failed: ${exit.message}`
+    if (exit.signal) return `killed by ${exit.signal}`
+    return `exit code ${exit.code}`
+}
+
+/**
+ * Spawns a long-lived viewer process detached so it outlives the daemon.
+ *
+ * `stdio` is ignored because these processes outlive us, which means their
+ * own diagnostics are gone: websockify losing a race for its port exits
+ * within milliseconds and leaves nothing behind at all. The exit is recorded
+ * here so the readiness wait can say *why* a screen never came up instead of
+ * timing out with nothing to show (prod 2026-09-21).
+ */
+export function spawnDetached(command: string, args: string[], env?: NodeJS.ProcessEnv): DetachedProcess {
     const child = spawn(command, args, {
         detached: true,
         stdio: 'ignore',
         env: env ? { ...process.env, ...env } : process.env,
     })
+    const handle: DetachedProcess = { pid: child.pid, exit: null }
+    child.once('exit', (code, signal) => { handle.exit = { kind: 'exit', code, signal } })
+    // A missing binary arrives as an 'error' event, and an unlistened one
+    // throws out of an unrelated tick rather than failing this start.
+    child.once('error', (error) => { handle.exit = { kind: 'spawn-error', message: error.message } })
     child.unref()
-    return { pid: child.pid }
+    return handle
+}
+
+export type ViewerServingWait =
+    | { ready: true }
+    | { ready: false; reason: 'process-exited'; detail: string }
+    | { ready: false; reason: 'timeout' }
+
+/**
+ * Whether the viewer's web port came up, judged by what the user will do
+ * with it: fetching noVNC's client page.
+ *
+ * Deliberately not "is the port bound". A port held by a listener that
+ * answers nothing satisfies a bind check, so the daemon would report a
+ * ready screen, hand out a relay URL, and every request would come back as
+ * `UPSTREAM_ERROR: read ECONNRESET` — the whole of the 2026-09-21 outage.
+ * The strong check already existed for slot selection; this is the same one,
+ * applied to the moment the answer is handed to a user.
+ */
+export async function waitForViewerServing(
+    webPort: number,
+    timeoutMs: number,
+    options: { pollMs?: number; process?: DetachedProcess } = {},
+): Promise<ViewerServingWait> {
+    const pollMs = options.pollMs ?? 300
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+        if (await isViewerServing(webPort)) return { ready: true }
+        // Checked after the probe, never before it: a process that served and
+        // then exited within the same tick still leaves a working screen for
+        // whoever else is holding it open.
+        const exit = options.process?.exit
+        if (exit) return { ready: false, reason: 'process-exited', detail: describeDetachedExit(exit) }
+        if (Date.now() + pollMs >= deadline) return { ready: false, reason: 'timeout' }
+        await new Promise((resolve) => setTimeout(resolve, pollMs))
+    }
 }

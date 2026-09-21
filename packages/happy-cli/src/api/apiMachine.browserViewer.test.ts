@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DetachedProcess } from '@/daemon/remoteViewer'
 
 const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, mockRunPairing } = vi.hoisted(() => ({
     browserMocks: {
@@ -15,7 +16,7 @@ const { browserMocks, viewerMocks, fsMocks, daemonMocks, leaseRegistryMocks, moc
         isViewerServing: vi.fn(),
     },
     daemonMocks: {
-        spawnDetached: vi.fn(() => ({ pid: 1234 })),
+        spawnDetached: vi.fn((..._args: any[]): DetachedProcess => ({ pid: 1234, exit: null })),
         ensureViewerWebRoot: vi.fn(() => '/usr/share/novnc'),
         canSudoWithoutPassword: vi.fn(async () => false),
         exec: vi.fn(),
@@ -281,10 +282,12 @@ describe('ApiMachineClient browser viewer RPC', () => {
     describe('starting a stack from nothing', () => {
         // Every other test here reuses a serving stack, so the spawn sequence
         // itself — which display server, its helpers, and the page that gets
-        // served — was never exercised. Listening on the slot's ports lets the
-        // real readiness waits return at once instead of timing out.
+        // served — was never exercised. The spawns are mocked, so the ports
+        // they would have opened are opened here instead, which is what lets
+        // the real readiness waits return at once instead of timing out.
         const held: Array<() => Promise<void>> = []
 
+        /** The VNC port: bound, speaks no HTTP — all its wait asks for. */
         async function holdPort(port: number): Promise<void> {
             const { createServer } = await import('node:net')
             await new Promise<void>((resolve) => {
@@ -297,14 +300,43 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
         }
 
+        /**
+         * The web port, answering noVNC's page like a live websockify.
+         *
+         * A bound-but-silent socket used to be enough here, because the wait
+         * only asked whether the port was taken. That is the dead listener
+         * the 2026-09-21 outage handed to users, so the stand-in now has to
+         * do what the real thing does.
+         */
+        function serveNovnc(port: number): void {
+            void (async () => {
+                const { createServer } = await import('node:http')
+                const server = createServer((req, res) => {
+                    if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
+                    res.writeHead(200, { 'Content-Type': 'text/html' })
+                    res.end('<!DOCTYPE html>')
+                })
+                server.once('error', () => undefined)
+                server.listen(port, '127.0.0.1', () => {
+                    held.push(() => new Promise<void>((done) => server.close(() => done())))
+                })
+            })()
+        }
+
         beforeEach(async () => {
             leaseRegistryMocks.records.clear()
             viewerMocks.isViewerServing.mockResolvedValue(false)
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command, args] = call as [string, string[]]
+                // buildWebsockifyArgs: ['--web', root, '127.0.0.1:<web>', '127.0.0.1:<vnc>']
+                if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
+                return { pid: 1234, exit: null }
+            })
             await holdPort(5900)
-            await holdPort(6080)
         })
 
         afterEach(async () => {
+            daemonMocks.spawnDetached.mockImplementation((..._call: any[]): DetachedProcess => ({ pid: 1234, exit: null }))
             while (held.length > 0) await (held.pop() as () => Promise<void>)()
         })
 
@@ -326,6 +358,26 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
                 expect.objectContaining({ resizeMode: 'remote' }),
             )
+        })
+
+        // 2026-09-21, walter-gpu: a second user pushed this viewer onto slot 1,
+        // websockify lost 6081 to something already holding it and exited, and
+        // a bind check still called the screen ready. The studio minted a relay
+        // URL onto that port and every request came back ECONNRESET.
+        it('refuses to call the screen ready when websockify dies on startup', async () => {
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command] = call as [string]
+                return command === 'websockify'
+                    ? { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                    : { pid: 1234, exit: null }
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(result).toMatchObject({ ready: false })
         })
 
         it('runs the legacy pair and serves the scaling page when Xvnc is absent', async () => {

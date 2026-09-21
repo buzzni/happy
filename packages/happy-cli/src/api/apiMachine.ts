@@ -153,6 +153,8 @@ import {
     type ViewerBackend,
     isPortFree,
     isViewerServing,
+    waitForViewerServing,
+    type DetachedProcess,
     planViewerInstall,
     resolveViewerProfileDir,
     selectViewerSlot,
@@ -2235,10 +2237,10 @@ export class ApiMachineClient {
             throw new Error('원격 화면에 쓸 포트를 찾지 못했습니다.');
         }
         const shared = await this.startViewerDisplay(display, vncPort);
-        spawnDetached('websockify', buildWebsockifyArgs({
+        const websockify = spawnDetached('websockify', buildWebsockifyArgs({
             webPort, vncPort, webRoot: shared.webRoot,
         }));
-        const ready = await waitForPort(webPort, 15_000);
+        const ready = await this.awaitViewerServing(webPort, websockify, display);
         this.viewer = { display, vncPort, webPort };
         const browser = await this.ensureViewerBrowser(display, options.callerWillLaunchBrowser ?? false);
         return { display, vncPort, webPort, ready, reused: false, ...browser };
@@ -2380,7 +2382,7 @@ export class ApiMachineClient {
             vncPort: slot.vncPort,
             webRoot: isolated.webRoot,
         }));
-        const ready = await waitForPort(slot.webPort, 15_000);
+        const ready = await this.awaitViewerServing(slot.webPort, websockify, `slot ${slot.slot} (${slot.display})`);
         const browser = await this.ensureViewerBrowser(slot.display, false, profileDir, viewerKey);
         const lease: BrowserViewerLeaseRecord = {
             viewerKey,
@@ -2508,6 +2510,34 @@ export class ApiMachineClient {
             onFallback: (reason) => logger.debug(`[viewer] serving stock noVNC: web root mirror failed: ${reason}`),
         });
         return { backend, webRoot, processIds };
+    }
+
+    /**
+     * Whether the noVNC port actually answers, and a log line when it does
+     * not.
+     *
+     * The caller turns a false here into `ready: false`, which the studio
+     * surfaces as "원격 화면이 응답하지 않습니다" rather than opening a relay
+     * URL onto a port that resets every connection. Logged at warn because
+     * the whole of the 2026-09-21 outage left no daemon-side trace at all:
+     * the failure was only visible three layers away, as ECONNRESET in the
+     * server's relay log.
+     */
+    private async awaitViewerServing(
+        webPort: number,
+        websockify: DetachedProcess,
+        /** Which screen this was, for the log — never the viewer key. */
+        label: string,
+    ): Promise<boolean> {
+        const outcome = await waitForViewerServing(webPort, VIEWER_SERVING_TIMEOUT_MS, {
+            process: websockify,
+        });
+        if (outcome.ready) return true;
+        const cause = outcome.reason === 'process-exited'
+            ? `websockify ${outcome.detail}`
+            : `nothing answered within ${VIEWER_SERVING_TIMEOUT_MS}ms`;
+        logger.warn(`[viewer] ${label}: noVNC never came up on 127.0.0.1:${webPort} — ${cause}`);
+        return false;
     }
 
     private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<void> {
@@ -3713,6 +3743,9 @@ export class ApiMachineClient {
     }
 }
 
+/** How long a freshly spawned websockify gets to answer on its web port. */
+const VIEWER_SERVING_TIMEOUT_MS = 15_000;
+
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
 
@@ -3812,7 +3845,15 @@ async function findRunningViewer(): Promise<{ webPort: number } | null> {
     return null;
 }
 
-/** Whether something is listening yet — websockify takes a moment to bind. */
+/**
+ * Whether something is listening yet — the display server takes a moment to
+ * bind.
+ *
+ * Only for the VNC port, which speaks no HTTP and so cannot be probed for
+ * content. The noVNC web port has a real answer to ask for and uses
+ * {@link waitForViewerServing} instead: a bind check there called a dead
+ * listener ready and handed the user a screen that reset on open.
+ */
 async function waitForPort(port: number, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
