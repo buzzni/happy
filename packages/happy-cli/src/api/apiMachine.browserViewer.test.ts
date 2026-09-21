@@ -460,6 +460,39 @@ describe('ApiMachineClient browser viewer RPC', () => {
             expect(leaseRegistryMocks.records.has(ALICE_KEY)).toBe(false)
         })
 
+        // lookup runs outside the start/stop mutation. Writing back what it
+        // read can land after the records loop released that very record,
+        // putting a lease back on a slot the loop is about to hand out. The
+        // only thing it wrote was a timestamp nothing reads.
+        it('lookup is a read: it writes nothing back to the registry', async () => {
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+            const handlers = handlersFrom(client)
+            await handlers.get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+            const stored = leaseRegistryMocks.records.get(ALICE_KEY)
+            viewerMocks.isViewerServing.mockResolvedValue(true)
+
+            await handlers.get('machine-1:browser-viewer:lookup')?.({ viewerKey: ALICE_KEY })
+
+            expect(leaseRegistryMocks.records.get(ALICE_KEY)).toBe(stored)
+        })
+
+        // The relay-token route refuses the screen on `ready: false`, and one
+        // 1.5s probe is all a loaded machine needs to fail. A live viewer
+        // must not read as gone to the user who is looking at it.
+        it('lookup reports a viewer ready when it answers on a second look', async () => {
+            leaseRegistryMocks.records.set(ALICE_KEY, lease(ALICE_KEY, 0))
+            serveFlakyNovnc(6080)
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const looked = await handlersFrom(client).get('machine-1:browser-viewer:lookup')?.({ viewerKey: ALICE_KEY })
+
+            expect(looked).toMatchObject({ webPort: 6080, ready: true })
+        }, 15_000)
+
         // A lease deleted from the registry must not come back from the
         // daemon's own cache: the slot may already belong to someone else, and
         // the reuse path would hand this viewer their live screen.

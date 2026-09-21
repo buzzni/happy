@@ -1543,10 +1543,19 @@ export class ApiMachineClient {
             // cache is never ahead of it.
             const lease = await this.isolatedViewerRegistry.get(viewerKey);
             if (!lease) return null;
-            const ready = await isViewerServing(lease.webPort);
-            const touched = { ...lease, lastUsedAt: Date.now() };
-            if (ready) await this.isolatedViewerRegistry.set(touched);
-            return { ...touched, ready };
+            // A read, and only a read. This handler runs outside the start/stop
+            // mutation, so a write-back could land after the records loop had
+            // released this very record — putting a lease back on a slot the
+            // loop is about to hand out. All it ever wrote was a timestamp
+            // nothing reads.
+            //
+            // `ready` is the only signal the relay-token route has, and it
+            // refuses the screen on false. One 1.5s probe is all a loaded
+            // machine needs to miss, so a miss gets a second, patient look
+            // before a live viewer is reported gone to the person watching it.
+            const ready = await isViewerServing(lease.webPort)
+                || (await waitForViewerServing(lease.webPort, VIEWER_CONFIRM_DEAD_MS, { pollMs: 500 })).ready;
+            return { ...lease, ready };
         });
 
         this.rpcHandlerManager.registerHandler('browser-viewer:stop', async (params: any) => {
