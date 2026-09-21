@@ -152,6 +152,8 @@ import {
     selectViewerBackend,
     type ViewerBackend,
     VIEWER_PROCESS_KINDS,
+    viewerEnvironClaimsSlot,
+    viewerOwnerEnv,
     describeDetachedExit,
     readProcessGroupId,
     isPortFree,
@@ -161,6 +163,7 @@ import {
     planViewerInstall,
     resolveViewerProfileDir,
     selectViewerSlot,
+    type ViewerSlot,
     spawnDetached,
     validateViewerKey,
     viewerProcessMatchesLease,
@@ -2262,7 +2265,7 @@ export class ApiMachineClient {
         const shared = await this.startViewerDisplay(display, vncPort, webPort);
         const websockify = spawnDetached('websockify', buildWebsockifyArgs({
             webPort, vncPort, webRoot: shared.webRoot,
-        }));
+        }), viewerOwnerEnv(display));
         const ready = await this.awaitViewerServing(webPort, websockify, display);
         this.viewer = { display, vncPort, webPort };
         const browser = await this.ensureViewerBrowser(display, options.callerWillLaunchBrowser ?? false);
@@ -2434,7 +2437,7 @@ export class ApiMachineClient {
             // And an Xvfb has no port at all. One left on this slot's display
             // still carries the previous user's Chrome, and an x11vnc started
             // here would attach to it and stream their windows.
-            if ((await this.viewerProcessGroups(slot)).length > 0) occupiedSlots.add(slot.slot);
+            if ((await this.viewerSlotPids(slot)).length > 0) occupiedSlots.add(slot.slot);
         }
 
         const persistedSlot = persisted
@@ -2444,38 +2447,40 @@ export class ApiMachineClient {
             ? persistedSlot
             : selectViewerSlot(occupiedSlots);
         if (!slot) throw new Error('viewer-capacity-exhausted');
+        let chosen: ViewerSlot = slot;
 
         const profileDir = resolveViewerProfileDir(configuration.happyHomeDir, viewerKey);
         mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-        const isolated = await this.startViewerDisplay(slot.display, slot.vncPort, slot.webPort);
+        const isolated = await this.startViewerDisplayOnSlot(chosen, occupiedSlots, persistedSlot);
+        chosen = isolated.slot;
         const websockify = spawnDetached('websockify', buildWebsockifyArgs({
-            webPort: slot.webPort,
-            vncPort: slot.vncPort,
-            webRoot: isolated.webRoot,
-        }));
-        const ready = await this.awaitViewerServing(slot.webPort, websockify, `slot ${slot.slot} (${slot.display})`);
-        const browser = await this.ensureViewerBrowser(slot.display, false, profileDir, viewerKey);
+            webPort: chosen.webPort,
+            vncPort: chosen.vncPort,
+            webRoot: isolated.started.webRoot,
+        }), viewerOwnerEnv(chosen.display));
+        const ready = await this.awaitViewerServing(chosen.webPort, websockify, `slot ${chosen.slot} (${chosen.display})`);
+        const browser = await this.ensureViewerBrowser(chosen.display, false, profileDir, viewerKey);
         const lease: BrowserViewerLeaseRecord = {
             viewerKey,
-            slot: slot.slot,
-            display: slot.display,
-            vncPort: slot.vncPort,
-            webPort: slot.webPort,
+            slot: chosen.slot,
+            display: chosen.display,
+            vncPort: chosen.vncPort,
+            webPort: chosen.webPort,
             cdpPort: browser.browserReady ? browser.cdpPort : null,
             profileDir,
             lastUsedAt: Date.now(),
             processIds: {
-                ...isolated.processIds,
+                ...isolated.started.processIds,
                 ...(websockify.pid ? { websockify: websockify.pid } : {}),
             },
         };
         await this.isolatedViewerRegistry.set(lease);
         return {
             viewerKey,
-            slot: slot.slot,
-            display: slot.display,
-            vncPort: slot.vncPort,
-            webPort: slot.webPort,
+            slot: chosen.slot,
+            display: chosen.display,
+            vncPort: chosen.vncPort,
+            webPort: chosen.webPort,
             profileDir,
             ready,
             reused: false,
@@ -2498,6 +2503,36 @@ export class ApiMachineClient {
      * resize at all, so `selectViewerBackend` only asks for remote resizing
      * when openbox is there to refit the window.
      */
+    /**
+     * The display for this slot, or the next slot that will have one.
+     *
+     * A display can be refused for reasons no port reveals — another X server
+     * already on it, its pids recorded nowhere. Failing the whole start there
+     * would turn one unusable slot into no remote screen at all, so the slot
+     * is marked taken and the next is tried. `slot` is reassigned, so the
+     * caller records the lease against the one that actually opened.
+     */
+    private async startViewerDisplayOnSlot(
+        slot: ViewerSlot,
+        occupiedSlots: Set<number>,
+        persistedSlot: ViewerSlot | null,
+    ): Promise<{ slot: ViewerSlot; started: Awaited<ReturnType<ApiMachineClient['startViewerDisplay']>> }> {
+        for (let candidate: ViewerSlot | null = slot; candidate; ) {
+            try {
+                return { slot: candidate, started: await this.startViewerDisplay(candidate.display, candidate.vncPort, candidate.webPort) };
+            } catch (error) {
+                occupiedSlots.add(candidate.slot);
+                const next = persistedSlot && !occupiedSlots.has(persistedSlot.slot)
+                    ? persistedSlot
+                    : selectViewerSlot(occupiedSlots);
+                if (!next) throw error;
+                logger.warn(`[viewer] slot ${candidate.slot} (${candidate.display}) would not start: ${error instanceof Error ? error.message : String(error)}; trying ${next.display}`);
+                candidate = next;
+            }
+        }
+        throw new Error('viewer-capacity-exhausted');
+    }
+
     private async startViewerDisplay(display: string, vncPort: number, webPort: number): Promise<{
         backend: ViewerBackend;
         webRoot: string;
@@ -2510,6 +2545,25 @@ export class ApiMachineClient {
         }
 
         const processIds: { xvnc?: number; xvfb?: number; x11vnc?: number } = {};
+        try {
+            return await this.startViewerDisplayOnce(display, vncPort, preferred, capabilities, processIds);
+        } catch (error) {
+            // Anything spawned before the failure is up with its pids in
+            // nobody's lease, so nothing would ever come back for it and the
+            // slot would be held for the life of the machine. Every throw
+            // below is inside this, including the port waits.
+            await this.reapViewerStack({ display, vncPort, webPort, processIds });
+            throw error;
+        }
+    }
+
+    private async startViewerDisplayOnce(
+        display: string,
+        vncPort: number,
+        preferred: ViewerBackend,
+        capabilities: Awaited<ReturnType<typeof detectViewerCapabilities>>,
+        processIds: { xvnc?: number; xvfb?: number; x11vnc?: number },
+    ): Promise<{ backend: ViewerBackend; webRoot: string; processIds: typeof processIds }> {
         let backend = preferred;
         let serving = false;
         if (preferred.kind === 'xvnc') {
@@ -2519,8 +2573,8 @@ export class ApiMachineClient {
             if (!(await isPortFree(vncPort))) {
                 throw new Error(`원격 화면의 VNC 포트 ${vncPort} 가 이미 사용 중입니다 (${display}).`);
             }
-            const xvnc = spawnDetached('Xvnc', buildXvncArgs({ display, vncPort, ...VIEWER_SCREEN }));
-            serving = await waitForPort(vncPort, 8_000);
+            const xvnc = spawnDetached('Xvnc', buildXvncArgs({ display, vncPort, ...VIEWER_SCREEN }), viewerOwnerEnv(display));
+            serving = await waitForPort(vncPort, 8_000) && !xvnc.exit;
             if (serving) {
                 if (xvnc.pid) processIds.xvnc = xvnc.pid;
                 if (capabilities.hasVncConfig) {
@@ -2547,7 +2601,7 @@ export class ApiMachineClient {
             if (!capabilities.hasXvfb || !capabilities.hasX11vnc) {
                 throw new Error('원격 화면의 디스플레이 서버를 시작하지 못했습니다.');
             }
-            const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display, ...VIEWER_SCREEN }));
+            const xvfb = spawnDetached('Xvfb', buildXvfbArgs({ display, ...VIEWER_SCREEN }), viewerOwnerEnv(display));
             await delay(1500);
             if (xvfb.pid) processIds.xvfb = xvfb.pid;
             // An X server refuses a display that is already taken and exits.
@@ -2557,9 +2611,12 @@ export class ApiMachineClient {
             if (xvfb.exit) {
                 throw new Error(`원격 화면의 디스플레이 ${display} 를 시작하지 못했습니다 (${describeDetachedExit(xvfb.exit)}).`);
             }
-            const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }));
+            const x11vnc = spawnDetached('x11vnc', buildX11vncArgs({ display, vncPort }), viewerOwnerEnv(display));
             if (x11vnc.pid) processIds.x11vnc = x11vnc.pid;
-            if (!await waitForPort(vncPort, 8_000)) {
+            // The port being up is not proof it is ours: another stack can
+            // already be on this display, and then this viewer would be
+            // proxied onto their screen.
+            if (!await waitForPort(vncPort, 8_000) || x11vnc.exit) {
                 throw new Error(`원격 화면의 VNC 서버가 ${vncPort} 를 열지 못했습니다 (${display}).`);
             }
             backend = {
@@ -2569,15 +2626,7 @@ export class ApiMachineClient {
             };
         }
 
-        try {
-            return { backend, webRoot: this.buildViewerWebRoot(display, backend), processIds };
-        } catch (error) {
-            // The display is up and its pids are in nobody's lease yet, so
-            // nothing would ever come back for it — the slot would be held
-            // for the life of the machine by a screen with no owner.
-            await this.reapViewerStack({ display, vncPort, webPort, processIds });
-            throw error;
-        }
+        return { backend, webRoot: this.buildViewerWebRoot(display, backend), processIds };
     }
 
     private buildViewerWebRoot(display: string, backend: ViewerBackend): string {
@@ -2642,7 +2691,7 @@ export class ApiMachineClient {
      * that is a third of its capacity until it reboots.
      */
     private async reapViewerStack(slot: ViewerSlotProcesses): Promise<void> {
-        if ((await this.viewerProcessGroups(slot)).length === 0) return;
+        if ((await this.ownedViewerGroups(slot)).length === 0) return;
         await this.signalViewerGroups(slot, 'SIGTERM');
         if (await this.waitForViewerStackGone(slot)) return;
         // Re-derived, never a list saved at SIGTERM: a pgid is a number, and a
@@ -2655,7 +2704,7 @@ export class ApiMachineClient {
     }
 
     private async signalViewerGroups(slot: ViewerSlotProcesses, signal: NodeJS.Signals): Promise<void> {
-        for (const pgid of await this.viewerProcessGroups(slot)) {
+        for (const pgid of await this.ownedViewerGroups(slot)) {
             // Viewer processes are detached process-group leaders. Targeting
             // that exact group avoids touching another user's slot.
             try { process.kill(-pgid, signal); } catch { /* group already empty */ }
@@ -2671,7 +2720,7 @@ export class ApiMachineClient {
     private async waitForViewerStackGone(slot: ViewerSlotProcesses): Promise<boolean> {
         const deadline = Date.now() + VIEWER_STOP_RELEASE_TIMEOUT_MS;
         for (;;) {
-            const done = (await this.viewerProcessGroups(slot)).length === 0
+            const done = (await this.viewerSlotPids(slot)).length === 0
                 && await isPortFree(slot.webPort)
                 && await isPortFree(slot.vncPort);
             if (done) return true;
@@ -2681,35 +2730,60 @@ export class ApiMachineClient {
     }
 
     /**
-     * Every process group still running this slot's stack.
+     * Every pid that looks like it is running this slot's stack.
      *
      * Two sources, because neither alone is enough. The lease's own pids are
      * the cheap answer, but a leader can exit while the worker it forked keeps
      * the listener — websockify does exactly that — and then `/proc/<leader>`
      * is gone. So `/proc` is swept as well, which finds a group through any
      * surviving member and also finds a stack whose pids were never recorded.
-     * Both sources verify the command line against the slot before returning a
-     * kill target, which is what keeps a recycled pid out of it.
+     *
+     * Deliberately generous: this answers "is this slot taken", where a false
+     * positive costs a slot and a false negative costs a user their screen.
+     * It is not enough to kill on — see {@link ownedViewerGroups}.
      */
-    private async viewerProcessGroups(slot: ViewerSlotProcesses): Promise<number[]> {
-        const groups = new Set<number>();
+    private async viewerSlotPids(slot: ViewerSlotProcesses): Promise<number[]> {
+        const pids = new Set<number>();
         const matchesSlot = (cmdline: string) =>
             VIEWER_PROCESS_KINDS.some((kind) => viewerProcessMatchesLease(kind, cmdline, slot));
         for (const pid of Object.values(slot.processIds ?? {}) as Array<number | undefined>) {
             if (!pid) continue;
             try {
-                if (matchesSlot(await readFile(`/proc/${pid}/cmdline`, 'utf8'))) groups.add(pid);
+                if (matchesSlot(await readFile(`/proc/${pid}/cmdline`, 'utf8'))) pids.add(pid);
             } catch { /* already exited */ }
         }
         let entries: string[];
-        try { entries = await readdir('/proc'); } catch { return [...groups]; }
+        try { entries = await readdir('/proc'); } catch { return [...pids]; }
         for (const entry of entries) {
             if (!/^\d+$/.test(entry)) continue;
             try {
-                if (!matchesSlot(await readFile(`/proc/${entry}/cmdline`, 'utf8'))) continue;
-                const pgid = readProcessGroupId(await readFile(`/proc/${entry}/stat`, 'utf8'));
+                if (matchesSlot(await readFile(`/proc/${entry}/cmdline`, 'utf8'))) pids.add(Number(entry));
+            } catch { /* vanished mid-sweep, or another user's */ }
+        }
+        return [...pids];
+    }
+
+    /**
+     * The process groups this daemon may end for a slot.
+     *
+     * A command line says which slot a process is on, not who started it:
+     * `Xvfb :99` is a command anyone here can run, and the match is loose
+     * enough that `tail -f /tmp/Xvfb :99` satisfies it. Good enough to
+     * reserve a slot, nowhere near good enough to signal a process group —
+     * which reaches that process's siblings too. So every candidate has to
+     * carry this daemon's marker in its environment before its group becomes
+     * a target. A viewer from an older CLI has no marker and is left alone:
+     * its slot reads occupied, which loses a screen rather than someone
+     * else's work.
+     */
+    private async ownedViewerGroups(slot: ViewerSlotProcesses): Promise<number[]> {
+        const groups = new Set<number>();
+        for (const pid of await this.viewerSlotPids(slot)) {
+            try {
+                if (!viewerEnvironClaimsSlot(await readFile(`/proc/${pid}/environ`, 'utf8'), slot.display)) continue;
+                const pgid = readProcessGroupId(await readFile(`/proc/${pid}/stat`, 'utf8'));
                 if (pgid !== null) groups.add(pgid);
-            } catch { /* vanished mid-sweep */ }
+            } catch { /* vanished, or not ours to read */ }
         }
         return [...groups];
     }

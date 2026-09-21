@@ -498,6 +498,28 @@ export async function isViewerServing(webPort: number, timeoutMs: number = VIEWE
     }
 }
 
+/**
+ * Put into every viewer process's environment, and read back out of
+ * `/proc/<pid>/environ` before anything is signalled.
+ *
+ * Matching a command line finds a slot's processes; it does not establish
+ * that they are ours. `Xvfb :99` is a command anyone on this machine can run,
+ * and the match is loose enough that `tail -f /tmp/Xvfb :99` satisfies it —
+ * harmless for deciding a slot is taken, not harmless for deciding what to
+ * kill. Only this daemon sets this variable, so only what carries it is ended.
+ */
+export const VIEWER_OWNER_ENV = 'HAPPY_VIEWER_SLOT'
+
+/** The environment a viewer process is spawned with, so it can be claimed later. */
+export function viewerOwnerEnv(display: string): NodeJS.ProcessEnv {
+    return { [VIEWER_OWNER_ENV]: display }
+}
+
+/** Whether a `/proc/<pid>/environ` blob claims this slot for this daemon. */
+export function viewerEnvironClaimsSlot(environ: string, display: string): boolean {
+    return environ.split('\0').includes(`${VIEWER_OWNER_ENV}=${display}`)
+}
+
 /** Every kind of process a viewer slot owns. */
 export const VIEWER_PROCESS_KINDS = ['xvfb', 'xvnc', 'x11vnc', 'websockify'] as const
 
@@ -515,7 +537,9 @@ export function readProcessGroupId(stat: string): number | null {
     const rest = stat.slice(close + 1).trim().split(/\s+/)
     // After comm: state, ppid, pgrp — pgrp is the third.
     const pgrp = Number(rest[2])
-    return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null
+    // Above 1, never 1: `kill(-1, …)` is not "group 1", it is every process
+    // the sender is permitted to signal.
+    return Number.isInteger(pgrp) && pgrp > 1 ? pgrp : null
 }
 
 /** Whether a port can still be bound on loopback — nobody is holding it. */

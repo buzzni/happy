@@ -307,7 +307,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
          * What the daemon's /proc sweep sees. `stat` carries the group id so
          * a group can be found through a member when its leader is gone.
          */
-        function procHas(processes: Array<{ pid: number; pgid: number; cmdline: string }>): void {
+        function procHas(processes: Array<{ pid: number; pgid: number; cmdline: string; display?: string }>): void {
             fsMocks.readdir.mockResolvedValue(processes.map((p) => String(p.pid)))
             fsMocks.readFile.mockImplementation(async (path: string) => {
                 const match = path.match(/^\/proc\/(\d+)\/(stat|cmdline|environ)$/)
@@ -315,12 +315,15 @@ describe('ApiMachineClient browser viewer RPC', () => {
                 const found = processes.find((p) => String(p.pid) === match[1])
                 if (!found) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
                 if (match[2] === 'stat') return `${found.pid} (proc) S 1 ${found.pgid} ${found.pgid} 0 -1 4194304`
-                if (match[2] === 'environ') return 'PATH=/usr/bin\x00'
+                if (match[2] === 'environ') return ours(found.display ?? ':99')
                 return found.cmdline
             })
         }
 
         const WEBSOCKIFY_SLOT1 = 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
+
+        /** What this daemon's own viewer processes carry in their environment. */
+        const ours = (display: string) => `PATH=/usr/bin\x00HAPPY_VIEWER_SLOT=${display}\x00`
 
         /**
          * A live viewer that loses its first probe, which is all a loaded
@@ -328,19 +331,16 @@ describe('ApiMachineClient browser viewer RPC', () => {
          */
         function serveFlakyNovnc(port: number): void {
             let seen = 0
-            void (async () => {
-                const { createServer } = await import('node:http')
-                const server = createServer((req, res) => {
-                    if (seen++ === 0) { res.destroy(); return }
-                    if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
-                    res.writeHead(200, { 'Content-Type': 'text/html' })
-                    res.end('<!DOCTYPE html>')
-                })
-                server.once('error', () => undefined)
-                server.listen(port, '127.0.0.1', () => {
-                    held.push(() => new Promise<void>((done) => server.close(() => done())))
-                })
-            })()
+            const { createServer } = require('node:http') as typeof import('node:http')
+            const server = createServer((req, res) => {
+                if (seen++ === 0) { res.destroy(); return }
+                if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
+                res.writeHead(200, { 'Content-Type': 'text/html' })
+                res.end('<!DOCTYPE html>')
+            })
+            held.push(() => new Promise<void>((done) => server.close(() => done())))
+            server.once('error', () => undefined)
+            server.listen(port, '127.0.0.1')
         }
 
         /**
@@ -365,18 +365,18 @@ describe('ApiMachineClient browser viewer RPC', () => {
          * do what the real thing does.
          */
         function serveNovnc(port: number): void {
-            void (async () => {
-                const { createServer } = await import('node:http')
-                const server = createServer((req, res) => {
-                    if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
-                    res.writeHead(200, { 'Content-Type': 'text/html' })
-                    res.end('<!DOCTYPE html>')
-                })
-                server.once('error', () => undefined)
-                server.listen(port, '127.0.0.1', () => {
-                    held.push(() => new Promise<void>((done) => server.close(() => done())))
-                })
-            })()
+            const { createServer } = require('node:http') as typeof import('node:http')
+            const server = createServer((req, res) => {
+                if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
+                res.writeHead(200, { 'Content-Type': 'text/html' })
+                res.end('<!DOCTYPE html>')
+            })
+            // Queued before listen(), never inside its callback: a test that
+            // ends before the callback runs would leak the listener into the
+            // next one, where it looks like the host holding a viewer port.
+            held.push(() => new Promise<void>((done) => server.close(() => done())))
+            server.once('error', () => undefined)
+            server.listen(port, '127.0.0.1')
         }
 
         /**
@@ -448,10 +448,12 @@ describe('ApiMachineClient browser viewer RPC', () => {
             const releaseWebPort = held[held.length - 1]
             let gone = false
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (gone && path.startsWith('/proc/7770')) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
                 if (path === '/proc/777001/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
                 if (path === '/proc/777002/cmdline') return 'Xvnc\x00:99\x00-rfbport\x005900\x00'
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':99')
             })
             // SIGTERM returns before the process is gone, so the port is only
             // free a moment later — exactly the gap the reap has to wait out.
@@ -593,6 +595,8 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
             serveFlakyNovnc(6080)
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (path === '/proc/777030/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
                 return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
             })
@@ -626,7 +630,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             await holdPort(6081)
             const releaseWebPort = held[held.length - 1]
             // The leader (777010) is gone; its worker (777012) holds the port.
-            procHas([{ pid: 777012, pgid: 777010, cmdline: WEBSOCKIFY_SLOT1 }])
+            procHas([{ pid: 777012, pgid: 777010, cmdline: WEBSOCKIFY_SLOT1, display: ':100' }])
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
                 if (pid === -777010) void releaseWebPort()
                 return true
@@ -661,7 +665,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
                 const found = members.find((m) => String(m.pid) === match[1])
                 if (!found) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
                 if (match[2] === 'stat') return `${found.pid} (proc) S 1 ${found.pgid} ${found.pgid} 0 -1 4194304`
-                if (match[2] === 'environ') return 'PATH=/usr/bin\x00'
+                if (match[2] === 'environ') return ours(':100')
                 return found.cmdline
             })
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
@@ -692,8 +696,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
             await holdPort(6080)
             const releaseWebPort = held[held.length - 1]
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (path === '/proc/777001/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':99')
             })
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
                 if (pid === -777001 && signal === 'SIGKILL') void releaseWebPort()
@@ -725,8 +731,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
             await holdPort(6081)
             const releaseBob = held[held.length - 1]
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (path === '/proc/777010/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':100')
             })
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
                 if (pid === -777010) void releaseBob()
@@ -756,8 +764,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
             await holdPort(6080)
             const releaseWebPort = held[held.length - 1]
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (path === '/proc/777020/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':99')
             })
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
                 if (pid === -777020 && signal === 'SIGKILL') void releaseWebPort()
@@ -788,8 +798,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
             serveFlakyNovnc(6081)
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (path === '/proc/777010/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':100')
             })
             const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
             try {
@@ -821,8 +833,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
             openVncPort(5901)
             const releaseVnc = held[held.length - 1]
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
                 if (path === '/proc/777011/cmdline') return 'Xvnc\x00:100\x00-rfbport\x005901\x00'
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':100')
             })
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
                 if (pid === -777011) void releaseVnc()
@@ -842,6 +856,39 @@ describe('ApiMachineClient browser viewer RPC', () => {
             }
         }, 15_000)
 
+        // A command line says which slot a process is on, not who started it.
+        // `Xvfb :99` is a command anyone here can run, and the matcher is
+        // loose enough that `tail -f /tmp/Xvfb :99` satisfies it. Signalling
+        // its group would reach that job's siblings too.
+        it('will not end a process on the slot that is not this daemon\'s', async () => {
+            leaseRegistryMocks.records.set(BOB_KEY, lease(BOB_KEY, 1))
+            await holdPort(6081)
+            fsMocks.readdir.mockResolvedValue(['900'])
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                const statPid = path.match(/^\/proc\/(\d+)\/stat$/)
+                if (statPid) return `${statPid[1]} (proc) S 1 ${statPid[1]} ${statPid[1]} 0 -1 4194304`
+                if (path === '/proc/900/cmdline') return 'tail\x00-f\x00/tmp/Xvfb\x00:100\x00'
+                if (path === '/proc/900/stat') return '900 (tail) S 1 900 900 0 -1 4194304'
+                // Somebody else's job: no marker of ours anywhere in it.
+                if (path === '/proc/900/environ') return 'PATH=/usr/bin\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).not.toHaveBeenCalled()
+                // Left alone, but not handed out either: the slot is taken.
+                expect(result).toMatchObject({ webPort: 6080 })
+            } finally {
+                kill.mockRestore()
+            }
+        }, 20_000)
+
         // The pids on a released record may belong to anything by now. The
         // cmdline check is what keeps a recycled pid from being signalled.
         it('does not signal a recorded pid whose cmdline is no longer the viewer', async () => {
@@ -851,6 +898,7 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
             fsMocks.readFile.mockImplementation(async (path: string) =>
                 path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00')
+            fsMocks.readdir.mockResolvedValue([])
             const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
             try {
                 const { ApiMachineClient } = await import('./apiMachine')
@@ -896,8 +944,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
             daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
                 const [command, args] = call as [string, string[]]
-                // Xvfb exits at once: the display is already someone else's.
-                if (command === 'Xvfb') return { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                // :99 is already someone else's, so Xvfb exits at once there.
+                if (command === 'Xvfb') {
+                    if (args.includes(':99')) return { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                    return { pid: 1234, exit: null }
+                }
                 if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
                 const rfb = args.indexOf('-rfbport')
                 if (rfb >= 0) openVncPort(Number(args[rfb + 1]))
@@ -907,9 +958,35 @@ describe('ApiMachineClient browser viewer RPC', () => {
             const client = new ApiMachineClient('token', machineClient())
             client.setRPCHandlers(rpcHandlers())
 
+            // Slot 0's display is someone else's; 1 and 2 are not.
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(result).toMatchObject({ webPort: 6081, ready: true })
+        }, 20_000)
+
+        // Every slot's display refuses us: there is nowhere to put the screen
+        // and saying so beats handing back one that shows someone else's.
+        it('gives up when no slot will take a display', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: false,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: false,
+                hasVncConfig: true,
+            })
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command] = call as [string]
+                if (command === 'Xvfb') return { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                return { pid: 1234, exit: null }
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
             await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
-                .rejects.toThrow(/:99/)
-        }, 15_000)
+                .rejects.toThrow(/디스플레이/)
+        }, 30_000)
 
         // x11vnc is what puts a port on the display. Without one there is
         // nothing for websockify to proxy, and the screen would open black.
@@ -924,17 +1001,74 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
             daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
                 const [command, args] = call as [string, string[]]
-                // Everything starts; only x11vnc fails to take its port.
                 if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
+                // Everything starts; only slot 0's x11vnc fails to take its port.
+                const rfb = args.indexOf('-rfbport')
+                if (rfb >= 0 && args[rfb + 1] !== '5900') openVncPort(Number(args[rfb + 1]))
                 return { pid: 1234, exit: null }
             })
             const { ApiMachineClient } = await import('./apiMachine')
             const client = new ApiMachineClient('token', machineClient())
             client.setRPCHandlers(rpcHandlers())
 
-            await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
-                .rejects.toThrow(/5900/)
-        }, 20_000)
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(result).toMatchObject({ webPort: 6081, ready: true })
+        }, 30_000)
+
+        // A VNC port that is up is not proof it is ours. Another stack can
+        // already be on this display, and adopting its port would proxy this
+        // viewer onto their screen.
+        it('does not adopt a VNC port its own Xvnc failed to open', async () => {
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command, args] = call as [string, string[]]
+                if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
+                const rfb = args.indexOf('-rfbport')
+                // The port comes up either way — it is someone else's server.
+                if (rfb >= 0) openVncPort(Number(args[rfb + 1]))
+                if (command === 'Xvnc') return { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                return { pid: 1234, exit: null }
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            // Fell back to the legacy pair instead of serving Xvnc's page.
+            expect(daemonMocks.ensureViewerWebRoot).toHaveBeenCalledWith(
+                expect.objectContaining({ resizeMode: 'scale' }),
+            )
+        }, 30_000)
+
+        it('does not adopt a VNC port its own x11vnc failed to open', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: false,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: false,
+                hasVncConfig: true,
+            })
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command, args] = call as [string, string[]]
+                if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
+                const rfb = args.indexOf('-rfbport')
+                if (rfb >= 0) openVncPort(Number(args[rfb + 1]))
+                // Slot 0's x11vnc dies; the port there is somebody else's.
+                if (command === 'x11vnc' && args[rfb + 1] === '5900') {
+                    return { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                }
+                return { pid: 1234, exit: null }
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(result).toMatchObject({ webPort: 6081, ready: true })
+        }, 30_000)
 
         // Alice's Xvfb is on the slot's display with no port of its own and
         // no record naming it. The sweep is what finds it.
@@ -955,10 +1089,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
             // Recorded, not swept: a process visible to the sweep before the
             // start would make its slot occupied and send it elsewhere.
             fsMocks.readdir.mockResolvedValue([])
-            fsMocks.readFile.mockImplementation(async (path: string) =>
-                path === '/proc/1234/cmdline'
-                    ? 'Xvnc\x00:99\x00-rfbport\x005900\x00'
-                    : path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00')
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/1234/stat') return '1234 (Xvnc) S 1 1234 1234 0 -1 4194304'
+                if (path === '/proc/1234/cmdline') return 'Xvnc\x00:99\x00-rfbport\x005900\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : ours(':99')
+            })
             daemonMocks.ensureViewerWebRoot.mockImplementationOnce(() => { throw new Error('ENOSPC') })
             const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
             try {
@@ -966,10 +1101,11 @@ describe('ApiMachineClient browser viewer RPC', () => {
                 const client = new ApiMachineClient('token', machineClient())
                 client.setRPCHandlers(rpcHandlers())
 
-                await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
-                    .rejects.toThrow(/ENOSPC/)
+                const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
+                // Its display was taken back before the next slot was tried.
                 expect(kill).toHaveBeenCalledWith(-1234, 'SIGTERM')
+                expect(result).toMatchObject({ webPort: 6081 })
             } finally {
                 kill.mockRestore()
             }

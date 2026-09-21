@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest'
 import {
     isPortFree,
     readProcessGroupId,
+    viewerEnvironClaimsSlot,
+    viewerOwnerEnv,
     spawnDetached,
     waitForViewerServing,
     VIEWER_SLOTS,
@@ -700,5 +702,30 @@ describe('readProcessGroupId', () => {
     it('refuses a line it cannot parse rather than guessing', () => {
         expect(readProcessGroupId('nonsense')).toBeNull()
         expect(readProcessGroupId('4242 (websockify) S 1')).toBeNull()
+    })
+
+    // kill(-1, …) is not "group 1" — it is every process the sender may
+    // signal. A stat line that parses to 1 has to come back as no target.
+    it('refuses group 1, which is not a group but a broadcast', () => {
+        expect(readProcessGroupId('4242 (init) S 0 1 1 0 -1')).toBeNull()
+        expect(readProcessGroupId('4242 (x) S 0 0 0 0 -1')).toBeNull()
+    })
+})
+
+describe('viewer process ownership marker', () => {
+    // Matching a command line finds a slot's processes; it does not say they
+    // are ours. The marker is what separates "occupied" from "ours to end".
+    it('claims only the slot it was spawned for', () => {
+        const environ = `PATH=/usr/bin\0${Object.entries(viewerOwnerEnv(':99'))[0].join('=')}\0HOME=/root\0`
+
+        expect(viewerEnvironClaimsSlot(environ, ':99')).toBe(true)
+        expect(viewerEnvironClaimsSlot(environ, ':100')).toBe(false)
+        expect(viewerEnvironClaimsSlot('PATH=/usr/bin\0', ':99')).toBe(false)
+    })
+
+    // A value that merely contains the display must not pass for it.
+    it('does not accept a prefix or a substring of the marker', () => {
+        expect(viewerEnvironClaimsSlot('HAPPY_VIEWER_SLOT=:990\0', ':99')).toBe(false)
+        expect(viewerEnvironClaimsSlot('NOT_HAPPY_VIEWER_SLOT=:99\0', ':99')).toBe(false)
     })
 })
