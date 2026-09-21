@@ -239,13 +239,14 @@ export function stripProviderCredentialOverrides(
     if (!overrides) return overrides;
     const kept: Record<string, string> = {};
     for (const [key, value] of Object.entries(overrides)) {
-        if (PROVIDER_CREDENTIAL_ENV.includes(key)) continue;
+        const canonicalKey = key.toUpperCase();
+        if (PROVIDER_CREDENTIAL_ENV.includes(canonicalKey)) continue;
         // An override naming an auth home is the same substitution by another
         // route: it would point this run at a login it was not admitted on.
-        if (PROVIDER_AUTH_HOME_ENV.includes(key)) continue;
+        if (PROVIDER_AUTH_HOME_ENV.includes(canonicalKey)) continue;
         // Not a credential, but the same substitution one layer over: it names
         // whose credential this run is billed to.
-        if (key.startsWith(AI_AUTH_REPORTING_ENV_PREFIX)) continue;
+        if (canonicalKey.startsWith(AI_AUTH_REPORTING_ENV_PREFIX)) continue;
         kept[key] = value;
     }
     return kept;
