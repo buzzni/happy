@@ -371,6 +371,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         let pending: {
             message: MessageParam['content'];
             mode: EnhancedMode;
+            hash: string;
         } | null = null;
 
         /*
@@ -520,6 +521,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (pending) {
                             let p = pending;
                             pending = null;
+                            // This message starts the new provider. Seed its comparison
+                            // baseline too, or the next model/effort change is missed.
+                            modeHash = p.hash;
+                            mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
                             return p;
                         }
