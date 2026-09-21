@@ -498,6 +498,26 @@ export async function isViewerServing(webPort: number, timeoutMs: number = VIEWE
     }
 }
 
+/** Every kind of process a viewer slot owns. */
+export const VIEWER_PROCESS_KINDS = ['xvfb', 'xvnc', 'x11vnc', 'websockify'] as const
+
+/**
+ * The process group id out of a `/proc/<pid>/stat` line.
+ *
+ * Field 2 is the executable name in parentheses and may contain spaces and
+ * parentheses of its own, so the fields are counted from the last `)` rather
+ * than split on whitespace. Returns null rather than a guess: the number is
+ * used as a kill target.
+ */
+export function readProcessGroupId(stat: string): number | null {
+    const close = stat.lastIndexOf(')')
+    if (close < 0) return null
+    const rest = stat.slice(close + 1).trim().split(/\s+/)
+    // After comm: state, ppid, pgrp — pgrp is the third.
+    const pgrp = Number(rest[2])
+    return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null
+}
+
 /** Whether a port can still be bound on loopback — nobody is holding it. */
 export function isPortFree(port: number): Promise<boolean> {
     return new Promise((resolve) => {
@@ -525,7 +545,7 @@ export type DetachedProcess = {
 }
 
 /** Describes an exit in one line, for the log that has to explain it. */
-function describeDetachedExit(exit: DetachedProcessExit): string {
+export function describeDetachedExit(exit: DetachedProcessExit): string {
     if (exit.kind === 'spawn-error') return `spawn failed: ${exit.message}`
     if (exit.signal) return `killed by ${exit.signal}`
     return `exit code ${exit.code}`

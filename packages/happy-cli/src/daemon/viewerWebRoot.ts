@@ -365,11 +365,16 @@ function viewerWebRootRevision({ sourceRoot, html, bridge }: {
  * what did that on 2026-09-21: the first start after a CLI upgrade rebuilt
  * the mirror and took every live screen on the machine down with it.
  *
- * Nothing prunes the old roots. They cost three small files and a set of
- * symlinks each, and there is one per (noVNC build x resize mode x bridge
- * version) — bounded by upgrades, not by users or uptime. Deleting one is
- * exactly the operation that caused the outage, so it is not worth doing
- * cheaply.
+ * Nothing prunes the old roots. The named ones cost three small files and a
+ * set of symlinks each, and there is one per (noVNC build x resize mode x
+ * bridge version) — bounded by upgrades, not by users or uptime. The
+ * `.stale.*` ones a repair moves aside are bounded by repairs instead, which
+ * is not a bound at all, only a rate: each needs a root to have been found
+ * corrupt. Deleting either is exactly the operation that caused the outage,
+ * and a directory a process has chdir'd into cannot be told apart from one
+ * nobody is serving without reading the cwd link of every live process
+ * — so they are left,
+ * and the cost of leaving them is three files.
  *
  * Falls back to the distribution root when anything about that install is
  * not what we expect: losing the enhancements is a much smaller failure

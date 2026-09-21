@@ -3,6 +3,7 @@ import { createServer as createTcpServer, type AddressInfo, type Server } from '
 import { describe, expect, it } from 'vitest'
 import {
     isPortFree,
+    readProcessGroupId,
     spawnDetached,
     waitForViewerServing,
     VIEWER_SLOTS,
@@ -678,5 +679,26 @@ describe('spawnDetached', () => {
         const handle = spawnDetached(process.execPath, ['-e', 'process.exit(0)'])
 
         expect(typeof handle.pid).toBe('number')
+    })
+})
+
+
+describe('readProcessGroupId', () => {
+    // /proc/<pid>/stat field 5 is pgrp, but field 2 is the executable name in
+    // parentheses and may contain spaces and parentheses of its own — so the
+    // fields are counted from the last ')', never split on whitespace.
+    it('reads the group id past a comm containing spaces and parentheses', () => {
+        const stat = '4242 (we ird) (name) S 4200 777001 777001 0 -1 4194304'
+
+        expect(readProcessGroupId(stat)).toBe(777001)
+    })
+
+    it('reads an ordinary stat line', () => {
+        expect(readProcessGroupId('4242 (websockify) S 1 4242 4242 0 -1')).toBe(4242)
+    })
+
+    it('refuses a line it cannot parse rather than guessing', () => {
+        expect(readProcessGroupId('nonsense')).toBeNull()
+        expect(readProcessGroupId('4242 (websockify) S 1')).toBeNull()
     })
 })

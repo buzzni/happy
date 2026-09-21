@@ -304,6 +304,25 @@ describe('ApiMachineClient browser viewer RPC', () => {
         }
 
         /**
+         * What the daemon's /proc sweep sees. `stat` carries the group id so
+         * a group can be found through a member when its leader is gone.
+         */
+        function procHas(processes: Array<{ pid: number; pgid: number; cmdline: string }>): void {
+            fsMocks.readdir.mockResolvedValue(processes.map((p) => String(p.pid)))
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                const match = path.match(/^\/proc\/(\d+)\/(stat|cmdline|environ)$/)
+                if (!match) return 'PATH=/usr/bin\x00'
+                const found = processes.find((p) => String(p.pid) === match[1])
+                if (!found) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+                if (match[2] === 'stat') return `${found.pid} (proc) S 1 ${found.pgid} ${found.pgid} 0 -1 4194304`
+                if (match[2] === 'environ') return 'PATH=/usr/bin\x00'
+                return found.cmdline
+            })
+        }
+
+        const WEBSOCKIFY_SLOT1 = 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
+
+        /**
          * A live viewer that loses its first probe, which is all a loaded
          * machine needs to do — `isViewerServing` gives up after 1.5s.
          */
@@ -427,7 +446,9 @@ describe('ApiMachineClient browser viewer RPC', () => {
             })
             await holdPort(6080)
             const releaseWebPort = held[held.length - 1]
+            let gone = false
             fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (gone && path.startsWith('/proc/7770')) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
                 if (path === '/proc/777001/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
                 if (path === '/proc/777002/cmdline') return 'Xvnc\x00:99\x00-rfbport\x005900\x00'
                 return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
@@ -435,7 +456,10 @@ describe('ApiMachineClient browser viewer RPC', () => {
             // SIGTERM returns before the process is gone, so the port is only
             // free a moment later — exactly the gap the reap has to wait out.
             const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
-                if (pid === -777001) setTimeout(() => void releaseWebPort(), 150)
+                if (pid === -777001) {
+                    gone = true
+                    setTimeout(() => void releaseWebPort(), 150)
+                }
                 return true
             })
             try {
@@ -590,27 +614,21 @@ describe('ApiMachineClient browser viewer RPC', () => {
         // The lease is about to be rewritten with a new slot, so these pids are
         // the last record of the stack holding the old one. Giving up on
         // SIGTERM strands that slot for the life of the machine.
-        // websockify forks a worker that inherits the listener. SIGTERM can
-        // take the leader and leave the worker holding the port; the group
-        // is still there, and `/proc/<leader>/cmdline` is not.
-        it('escalates to the process group even after its leader has exited', async () => {
-            leaseRegistryMocks.records.set(ALICE_KEY, {
-                ...lease(ALICE_KEY, 0),
-                processIds: { websockify: 777001 },
+        // websockify forks a worker that inherits the listener, and the leader
+        // can already be gone when cleanup runs — /proc/<leader> with it. The
+        // group is still there, reachable through the worker, and the lease
+        // is about to be rewritten, so this is the last chance to end it.
+        it('finds the group through a surviving member when its leader is gone', async () => {
+            leaseRegistryMocks.records.set(BOB_KEY, {
+                ...lease(BOB_KEY, 1),
+                processIds: { websockify: 777010 },
             })
-            await holdPort(6080)
+            await holdPort(6081)
             const releaseWebPort = held[held.length - 1]
-            let leaderAlive = true
-            fsMocks.readFile.mockImplementation(async (path: string) => {
-                if (path === '/proc/777001/cmdline') {
-                    if (!leaderAlive) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
-                    return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
-                }
-                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
-            })
-            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
-                if (pid === -777001 && signal === 'SIGTERM') leaderAlive = false
-                if (pid === -777001 && signal === 'SIGKILL') void releaseWebPort()
+            // The leader (777010) is gone; its worker (777012) holds the port.
+            procHas([{ pid: 777012, pgid: 777010, cmdline: WEBSOCKIFY_SLOT1 }])
+            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
+                if (pid === -777010) void releaseWebPort()
                 return true
             })
             try {
@@ -618,10 +636,49 @@ describe('ApiMachineClient browser viewer RPC', () => {
                 const client = new ApiMachineClient('token', machineClient())
                 client.setRPCHandlers(rpcHandlers())
 
-                const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
-                expect(kill).toHaveBeenCalledWith(-777001, 'SIGKILL')
-                expect(result).toMatchObject({ webPort: 6080, ready: true })
+                expect(kill).toHaveBeenCalledWith(-777010, 'SIGTERM')
+            } finally {
+                kill.mockRestore()
+            }
+        }, 20_000)
+
+        // #2: a pgid saved at SIGTERM is a number, and numbers are reused. The
+        // escalation re-derives the groups from what is alive right then, so a
+        // group that let go in between is never signalled again.
+        it('does not escalate against a group that has already gone', async () => {
+            leaseRegistryMocks.records.set(BOB_KEY, {
+                ...lease(BOB_KEY, 1),
+                processIds: { websockify: 777010 },
+            })
+            await holdPort(6081)
+            let members = [{ pid: 777012, pgid: 777010, cmdline: WEBSOCKIFY_SLOT1 }]
+            fsMocks.readdir.mockImplementation(async () => members.map((m) => String(m.pid)))
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                const match = path.match(/^\/proc\/(\d+)\/(stat|cmdline|environ)$/)
+                if (!match) return 'PATH=/usr/bin\x00'
+                const found = members.find((m) => String(m.pid) === match[1])
+                if (!found) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+                if (match[2] === 'stat') return `${found.pid} (proc) S 1 ${found.pgid} ${found.pgid} 0 -1 4194304`
+                if (match[2] === 'environ') return 'PATH=/usr/bin\x00'
+                return found.cmdline
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
+                // The group ends on SIGTERM — but the port stays bound by
+                // something that is not this lease's, so the wait times out.
+                if (pid === -777010 && signal === 'SIGTERM') members = []
+                return true
+            })
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).toHaveBeenCalledWith(-777010, 'SIGTERM')
+                expect(kill).not.toHaveBeenCalledWith(-777010, 'SIGKILL')
             } finally {
                 kill.mockRestore()
             }
@@ -822,6 +879,101 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
             expect(result).toMatchObject({ webPort: 6081, ready: true })
         })
+
+        // Alice's websockify and x11vnc exit while her Xvfb survives. Both TCP
+        // ports are then free, so nothing says the slot is taken — but her
+        // Chrome is still on :99, and Bob's x11vnc would attach to her
+        // display and stream her windows. Bob's own Xvfb cannot start there,
+        // and that is the signal.
+        it('refuses to start a display whose Xvfb could not take it', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: false,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: false,
+                hasVncConfig: true,
+            })
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command, args] = call as [string, string[]]
+                // Xvfb exits at once: the display is already someone else's.
+                if (command === 'Xvfb') return { pid: 1234, exit: { kind: 'exit', code: 1, signal: null } }
+                if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
+                const rfb = args.indexOf('-rfbport')
+                if (rfb >= 0) openVncPort(Number(args[rfb + 1]))
+                return { pid: 1234, exit: null }
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
+                .rejects.toThrow(/:99/)
+        }, 15_000)
+
+        // x11vnc is what puts a port on the display. Without one there is
+        // nothing for websockify to proxy, and the screen would open black.
+        it('refuses to start a display whose x11vnc never opened its port', async () => {
+            viewerMocks.detectViewerCapabilities.mockResolvedValue({
+                hasXvnc: false,
+                hasXvfb: true,
+                hasX11vnc: true,
+                hasWebsockify: true,
+                hasWindowManager: false,
+                hasVncConfig: true,
+            })
+            daemonMocks.spawnDetached.mockImplementation((...call: any[]): DetachedProcess => {
+                const [command, args] = call as [string, string[]]
+                // Everything starts; only x11vnc fails to take its port.
+                if (command === 'websockify') serveNovnc(Number(args[2].split(':')[1]))
+                return { pid: 1234, exit: null }
+            })
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
+                .rejects.toThrow(/5900/)
+        }, 20_000)
+
+        // Alice's Xvfb is on the slot's display with no port of its own and
+        // no record naming it. The sweep is what finds it.
+        it('skips a slot whose display still has a viewer process on it', async () => {
+            procHas([{ pid: 900, pgid: 900, cmdline: 'Xvfb\x00:99\x00-screen\x000\x001920x1080x24\x00' }])
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+
+            const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+            expect(result).toMatchObject({ webPort: 6081, ready: true })
+        }, 15_000)
+
+        // #4: the display is up and its pid is not written down anywhere yet.
+        // Throwing here without taking it back strands the slot for good.
+        it('takes its own display back when start fails after spawning it', async () => {
+            // Recorded, not swept: a process visible to the sweep before the
+            // start would make its slot occupied and send it elsewhere.
+            fsMocks.readdir.mockResolvedValue([])
+            fsMocks.readFile.mockImplementation(async (path: string) =>
+                path === '/proc/1234/cmdline'
+                    ? 'Xvnc\x00:99\x00-rfbport\x005900\x00'
+                    : path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00')
+            daemonMocks.ensureViewerWebRoot.mockImplementationOnce(() => { throw new Error('ENOSPC') })
+            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                await expect(handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY }))
+                    .rejects.toThrow(/ENOSPC/)
+
+                expect(kill).toHaveBeenCalledWith(-1234, 'SIGTERM')
+            } finally {
+                kill.mockRestore()
+            }
+        }, 15_000)
 
         // The other half of the same outage: the slot was judged free because
         // nothing was serving noVNC on it, but websockify could not bind it
