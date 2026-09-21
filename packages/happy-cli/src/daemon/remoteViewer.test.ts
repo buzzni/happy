@@ -1,5 +1,13 @@
+import { createServer as createHttpServer } from 'node:http'
+import { createServer as createTcpServer, type AddressInfo, type Server } from 'node:net'
 import { describe, expect, it } from 'vitest'
 import {
+    isPortFree,
+    readProcessGroupId,
+    viewerEnvironClaimsSlot,
+    viewerOwnerEnv,
+    spawnDetached,
+    waitForViewerServing,
     VIEWER_SLOTS,
     VIEWER_WEB_PORTS,
     decideViewerBrowserAction,
@@ -520,5 +528,204 @@ describe('TigerVNC clipboard helper', () => {
     // target as unavailable while the viewer believes it pasted.
     it('runs headless so the helper window never sits on the user\'s screen', () => {
         expect(buildVncConfigArgs()).toEqual(['-nowin'])
+    })
+})
+
+
+/** Binds on an ephemeral loopback port and reports which one it got. */
+async function listenOnLoopback(server: Server): Promise<number> {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    return (server.address() as AddressInfo).port
+}
+
+async function closeServer(server: Server): Promise<void> {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+}
+
+/** A port nothing is listening on, obtained by binding and letting go. */
+async function borrowFreePort(): Promise<number> {
+    const server = createTcpServer()
+    const port = await listenOnLoopback(server)
+    await closeServer(server)
+    return port
+}
+
+async function settleWithin(timeoutMs: number, condition: () => boolean): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+        if (condition()) return
+        await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+}
+
+describe('waitForViewerServing', () => {
+    it('refuses a port that is bound but answers nothing', async () => {
+        // The 2026-09-21 outage on walter-gpu slot 1 (6081): something held
+        // the port and closed every connection unanswered, so a bind check
+        // called it ready and the user got a screen that reset on open.
+        const deadListener = createTcpServer((socket) => socket.destroy())
+        const port = await listenOnLoopback(deadListener)
+        try {
+            expect(await isPortFree(port)).toBe(false)
+
+            const result = await waitForViewerServing(port, 400, { pollMs: 50 })
+
+            expect(result.ready).toBe(false)
+        } finally {
+            await closeServer(deadListener)
+        }
+    })
+
+    it('accepts a port that serves the noVNC client page', async () => {
+        const novnc = createHttpServer((req, res) => {
+            if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
+            res.writeHead(200, { 'Content-Type': 'text/html' })
+            res.end('<!DOCTYPE html>')
+        })
+        const port = await listenOnLoopback(novnc)
+        try {
+            expect(await waitForViewerServing(port, 2_000, { pollMs: 50 })).toEqual({ ready: true })
+        } finally {
+            await closeServer(novnc)
+        }
+    })
+
+    // Two allocators can pick the same port; the loser's websockify dies on
+    // bind while the winner answers. Reporting the loser ready records a
+    // dead pid in its lease, which the relay's evidence check then rejects.
+    it('does not call a dead process ready because someone else answers', async () => {
+        const winner = createHttpServer((req, res) => {
+            res.writeHead(req.url === '/vnc.html' ? 200 : 404)
+            res.end('<!DOCTYPE html>')
+        })
+        const port = await listenOnLoopback(winner)
+        try {
+            const result = await waitForViewerServing(port, 2_000, {
+                pollMs: 50,
+                process: { pid: 4242, exit: { kind: 'exit', code: 1, signal: null } },
+            })
+
+            expect(result).toMatchObject({ ready: false, reason: 'process-exited' })
+        } finally {
+            await closeServer(winner)
+        }
+    })
+
+    // The budget is the budget. A probe that accepts and never answers must
+    // not push the wait past it by a full probe timeout.
+    it('never overruns its budget by a whole probe', async () => {
+        const silent = createTcpServer(() => undefined)
+        const port = await listenOnLoopback(silent)
+        try {
+            const started = Date.now()
+            const result = await waitForViewerServing(port, 1_000, { pollMs: 100 })
+
+            expect(result).toEqual({ ready: false, reason: 'timeout' })
+            expect(Date.now() - started).toBeLessThan(1_400)
+        } finally {
+            silent.close()
+        }
+    })
+
+    it('stops waiting once the process it is waiting for is gone', async () => {
+        // Without this, websockify losing its port to someone else costs the
+        // full readiness budget and then reports an indistinguishable timeout.
+        const port = await borrowFreePort()
+        const started = Date.now()
+
+        const result = await waitForViewerServing(port, 10_000, {
+            pollMs: 50,
+            process: { pid: 4242, exit: { kind: 'exit', code: 1, signal: null } },
+        })
+
+        expect(result).toEqual({
+            ready: false,
+            reason: 'process-exited',
+            detail: 'exit code 1',
+        })
+        expect(Date.now() - started).toBeLessThan(2_000)
+    })
+
+    it('reports a timeout when nothing ever answers and the process is still alive', async () => {
+        const port = await borrowFreePort()
+
+        const result = await waitForViewerServing(port, 300, {
+            pollMs: 50,
+            process: { pid: 4242, exit: null },
+        })
+
+        expect(result).toEqual({ ready: false, reason: 'timeout' })
+    })
+})
+
+describe('spawnDetached', () => {
+    it('records the exit of a process that dies on startup', async () => {
+        // websockify losing a race for its port exits within milliseconds and,
+        // with stdio ignored, leaves no other trace at all.
+        const handle = spawnDetached(process.execPath, ['-e', 'process.exit(3)'])
+
+        await settleWithin(5_000, () => handle.exit !== null)
+
+        expect(handle.exit).toEqual({ kind: 'exit', code: 3, signal: null })
+    })
+
+    it('records a missing binary instead of raising an unhandled error event', async () => {
+        const handle = spawnDetached('aplus-viewer-binary-that-does-not-exist', [])
+
+        await settleWithin(5_000, () => handle.exit !== null)
+
+        expect(handle.exit?.kind).toBe('spawn-error')
+    })
+
+    it('still reports the pid its callers record in the lease', async () => {
+        const handle = spawnDetached(process.execPath, ['-e', 'process.exit(0)'])
+
+        expect(typeof handle.pid).toBe('number')
+    })
+})
+
+
+describe('readProcessGroupId', () => {
+    // /proc/<pid>/stat field 5 is pgrp, but field 2 is the executable name in
+    // parentheses and may contain spaces and parentheses of its own — so the
+    // fields are counted from the last ')', never split on whitespace.
+    it('reads the group id past a comm containing spaces and parentheses', () => {
+        const stat = '4242 (we ird) (name) S 4200 777001 777001 0 -1 4194304'
+
+        expect(readProcessGroupId(stat)).toBe(777001)
+    })
+
+    it('reads an ordinary stat line', () => {
+        expect(readProcessGroupId('4242 (websockify) S 1 4242 4242 0 -1')).toBe(4242)
+    })
+
+    it('refuses a line it cannot parse rather than guessing', () => {
+        expect(readProcessGroupId('nonsense')).toBeNull()
+        expect(readProcessGroupId('4242 (websockify) S 1')).toBeNull()
+    })
+
+    // kill(-1, …) is not "group 1" — it is every process the sender may
+    // signal. A stat line that parses to 1 has to come back as no target.
+    it('refuses group 1, which is not a group but a broadcast', () => {
+        expect(readProcessGroupId('4242 (init) S 0 1 1 0 -1')).toBeNull()
+        expect(readProcessGroupId('4242 (x) S 0 0 0 0 -1')).toBeNull()
+    })
+})
+
+describe('viewer process ownership marker', () => {
+    // Matching a command line finds a slot's processes; it does not say they
+    // are ours. The marker is what separates "occupied" from "ours to end".
+    it('claims only the slot it was spawned for', () => {
+        const environ = `PATH=/usr/bin\0${Object.entries(viewerOwnerEnv(':99'))[0].join('=')}\0HOME=/root\0`
+
+        expect(viewerEnvironClaimsSlot(environ, ':99')).toBe(true)
+        expect(viewerEnvironClaimsSlot(environ, ':100')).toBe(false)
+        expect(viewerEnvironClaimsSlot('PATH=/usr/bin\0', ':99')).toBe(false)
+    })
+
+    // A value that merely contains the display must not pass for it.
+    it('does not accept a prefix or a substring of the marker', () => {
+        expect(viewerEnvironClaimsSlot('HAPPY_VIEWER_SLOT=:990\0', ':99')).toBe(false)
+        expect(viewerEnvironClaimsSlot('NOT_HAPPY_VIEWER_SLOT=:99\0', ':99')).toBe(false)
     })
 })
