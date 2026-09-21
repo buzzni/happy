@@ -718,7 +718,6 @@ export class ApiMachineClient {
     } | null = null;
     /** Set only on a verified managed runtime; null on every BYOS machine. */
     private managedHandlers: ManagedRpcHandlers | null = null;
-    private isolatedViewerLeases = new Map<string, BrowserViewerLeaseRecord>();
     private isolatedViewerStarts = new Map<string, Promise<IsolatedViewerStartResult>>();
     private isolatedViewerMutation: Promise<void> = Promise.resolve();
     private isolatedViewerRegistry = new BrowserViewerLeaseRegistry(
@@ -1543,16 +1542,10 @@ export class ApiMachineClient {
             // owner their screen. Every write puts the registry first, so the
             // cache is never ahead of it.
             const lease = await this.isolatedViewerRegistry.get(viewerKey);
-            if (!lease) {
-                this.isolatedViewerLeases.delete(viewerKey);
-                return null;
-            }
+            if (!lease) return null;
             const ready = await isViewerServing(lease.webPort);
             const touched = { ...lease, lastUsedAt: Date.now() };
-            if (ready) {
-                this.isolatedViewerLeases.set(viewerKey, touched);
-                await this.isolatedViewerRegistry.set(touched);
-            }
+            if (ready) await this.isolatedViewerRegistry.set(touched);
             return { ...touched, ready };
         });
 
@@ -1565,15 +1558,13 @@ export class ApiMachineClient {
                 return { viewerKey, stopped: response.stopped === true };
             }
             return this.withIsolatedViewerMutation(async () => {
-                const lease = this.isolatedViewerLeases.get(viewerKey)
-                    ?? await this.isolatedViewerRegistry.get(viewerKey);
+                const lease = await this.isolatedViewerRegistry.get(viewerKey);
                 if (!lease) return { viewerKey, stopped: false };
                 await this.stopIsolatedViewerProcesses(lease);
                 if (lease.cdpPort !== null) {
                     this.browserCdpPipes.get(lease.cdpPort)?.close();
                     this.browserCdpPipes.delete(lease.cdpPort);
                 }
-                this.isolatedViewerLeases.delete(viewerKey);
                 await this.isolatedViewerRegistry.delete(viewerKey);
                 return { viewerKey, stopped: true };
             });
@@ -1824,13 +1815,11 @@ export class ApiMachineClient {
             });
         }
         return resolveNativeViewerEvidence(request, {
-                    // Registry first, cache second: the on-disk record is what
-                    // survives a daemon restart, and verification must not be
-                    // decided by whatever this process happens to remember.
+                    // The on-disk record is what survives a daemon restart,
+                    // and verification must not be decided by whatever this
+                    // process happens to remember.
                     getViewerLease: async (viewerKey) =>
-                        (await this.isolatedViewerRegistry.get(viewerKey))
-                        ?? this.isolatedViewerLeases.get(viewerKey)
-                        ?? null,
+                        (await this.isolatedViewerRegistry.get(viewerKey)) ?? null,
                     // Viewer-only prober. The generic project probe reports
                     // "2 processes listen on 127.0.0.1:<port>" for a healthy
                     // viewer under load — websockify forks a worker that
@@ -2329,10 +2318,8 @@ export class ApiMachineClient {
             throw new Error(`원격 화면에 필요한 프로그램이 없습니다: ${missing.join(', ')}`);
         }
 
-        const persisted = this.isolatedViewerLeases.get(viewerKey)
-            ?? await this.isolatedViewerRegistry.get(viewerKey);
+        const persisted = await this.isolatedViewerRegistry.get(viewerKey);
         if (persisted && await isViewerServing(persisted.webPort)) {
-            this.isolatedViewerLeases.set(viewerKey, persisted);
             const browser = await this.ensureViewerBrowser(
                 persisted.display,
                 false,
@@ -2345,7 +2332,6 @@ export class ApiMachineClient {
                 lastUsedAt: Date.now(),
             };
             await this.isolatedViewerRegistry.set(next);
-            this.isolatedViewerLeases.set(viewerKey, next);
             return {
                 viewerKey,
                 slot: next.slot,
@@ -2379,12 +2365,11 @@ export class ApiMachineClient {
         for (const record of records) {
             if (record.viewerKey === viewerKey) continue;
             if (await isViewerServing(record.webPort)) { occupiedSlots.add(record.slot); continue; }
-            // Both stores, or the cache resurrects a lease this just released:
-            // the slot can be handed to someone else in the meantime, and the
-            // reuse path above would then return their live screen to its
-            // former owner.
+            // The slot can be handed to someone else right after this, so
+            // nothing may keep answering for the record it releases — the
+            // reuse path above would return their live screen to its former
+            // owner.
             await this.isolatedViewerRegistry.delete(record.viewerKey);
-            this.isolatedViewerLeases.delete(record.viewerKey);
         }
         for (const slot of VIEWER_SLOTS) {
             if (occupiedSlots.has(slot.slot)) continue;
@@ -2429,7 +2414,6 @@ export class ApiMachineClient {
             },
         };
         await this.isolatedViewerRegistry.set(lease);
-        this.isolatedViewerLeases.set(viewerKey, lease);
         return {
             viewerKey,
             slot: slot.slot,
