@@ -22,7 +22,8 @@
  * very object the UI drives — no fork of noVNC, no patched vendor tree.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /** Where the bridge module lives inside the mirrored web root. */
@@ -321,53 +322,103 @@ function viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge }: {
 }
 
 /**
+ * Names the mirror after what is in it.
+ *
+ * Every input that changes a byte of the mirror is in the digest, so a root
+ * that exists under this name is a root that does not need rebuilding —
+ * which is what lets a rebuild be an addition rather than a replacement.
+ */
+function viewerWebRootRevision({ sourceRoot, html, bridge }: {
+    sourceRoot: string
+    html: string
+    bridge: string
+}): string {
+    return createHash('sha256')
+        .update(html).update('\0')
+        .update(bridge).update('\0')
+        .update(readdirSync(sourceRoot).sort().join('\0'))
+        .digest('hex')
+        .slice(0, 16)
+}
+
+/**
  * Builds the mirrored web root, returning the directory websockify should
  * serve.
+ *
+ * Each distinct mirror gets its own directory, named after its contents,
+ * and an existing one is never torn down. websockify `chdir()`s into its
+ * web root once at startup and resolves every request against that working
+ * directory, so deleting a root out from under a running one leaves it
+ * bound to its port and unable to answer anything — the screen comes back
+ * as `read ECONNRESET` on every path, and only a restart of that process
+ * fixes it. One mutable directory shared by every viewer on the machine is
+ * what did that on 2026-09-21: the first start after a CLI upgrade rebuilt
+ * the mirror and took every live screen on the machine down with it.
+ *
+ * Nothing prunes the old roots. They cost three small files and a set of
+ * symlinks each, and there is one per (noVNC build x resize mode x bridge
+ * version) — bounded by upgrades, not by users or uptime. Deleting one is
+ * exactly the operation that caused the outage, so it is not worth doing
+ * cheaply.
  *
  * Falls back to the distribution root when anything about that install is
  * not what we expect: losing the enhancements is a much smaller failure
  * than losing the remote screen, but it is logged rather than swallowed.
  */
-export function ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode, onFallback }: {
+export function ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode, onFallback }: {
     sourceRoot: string
-    targetRoot: string
+    baseDir: string
     resizeMode: ViewerResizeMode
     /** Called with the reason when the mirror could not be built. */
     onFallback?: (reason: string) => void
 }): string {
-    let rebuilding = false
+    let staging: string | null = null
     try {
         const html = buildViewerIndexHtml({
             sourceHtml: readFileSync(join(sourceRoot, 'vnc.html'), 'utf8'),
             resizeMode,
         })
         const bridge = buildViewerBridgeModule()
-        // Another slot's websockify may be serving this very directory, and
-        // it opens files per request: rebuilding one that is already correct
-        // would 404 whatever asset is in flight for no gain.
+        const targetRoot = join(baseDir, `${resizeMode}-${viewerWebRootRevision({ sourceRoot, html, bridge })}`)
         if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) return targetRoot
-        rebuilding = true
-        rmSync(targetRoot, { recursive: true, force: true })
+        // Assembled aside and moved in whole: a half-built directory under
+        // the final name would be served as one by the next start.
+        staging = `${targetRoot}.${randomUUID()}.tmp`
         // 0700 like everything else under browser-viewers: this call can be
         // what creates that shared parent, and it must not land looser than
         // the profile directories beside it.
-        mkdirSync(join(targetRoot, dirname(VIEWER_BRIDGE_PATH)), { recursive: true, mode: 0o700 })
+        mkdirSync(join(staging, dirname(VIEWER_BRIDGE_PATH)), { recursive: true, mode: 0o700 })
         for (const entry of readdirSync(sourceRoot)) {
             // Our own copies of both, so the page is patched whether it is
             // reached as /vnc.html or as the directory index.
             if (entry === 'vnc.html' || entry === 'index.html') continue
-            symlinkSync(join(sourceRoot, entry), join(targetRoot, entry))
+            symlinkSync(join(sourceRoot, entry), join(staging, entry))
         }
-        writeFileSync(join(targetRoot, 'vnc.html'), html)
-        writeFileSync(join(targetRoot, 'index.html'), html)
-        writeFileSync(join(targetRoot, VIEWER_BRIDGE_PATH), bridge)
+        writeFileSync(join(staging, 'vnc.html'), html)
+        writeFileSync(join(staging, 'index.html'), html)
+        writeFileSync(join(staging, VIEWER_BRIDGE_PATH), bridge)
+        try {
+            renameSync(staging, targetRoot)
+        } catch {
+            // The name is taken. Either another start won the race with an
+            // identical build — keep theirs — or what sits there carries this
+            // revision's name without its contents, which no correct viewer
+            // can be serving.
+            if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) {
+                rmSync(staging, { recursive: true, force: true })
+                return targetRoot
+            }
+            rmSync(targetRoot, { recursive: true, force: true })
+            renameSync(staging, targetRoot)
+        }
         return targetRoot
     } catch (error) {
         onFallback?.(String(error))
-        // Only clean up a mirror this call was in the middle of building. A
-        // read failure before that leaves the previous mirror alone — another
-        // slot's websockify may be serving it right now.
-        if (rebuilding && existsSync(targetRoot)) rmSync(targetRoot, { recursive: true, force: true })
+        // Only ever the half-built directory this call owns. Existing roots
+        // are left alone unconditionally: a websockify may be serving one
+        // right now, and taking it away is the failure this design exists to
+        // prevent.
+        if (staging) rmSync(staging, { recursive: true, force: true })
         return sourceRoot
     }
 }

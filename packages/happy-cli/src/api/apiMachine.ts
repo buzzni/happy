@@ -2507,7 +2507,7 @@ export class ApiMachineClient {
 
         const webRoot = ensureViewerWebRoot({
             sourceRoot: resolveNovncWebRoot(),
-            targetRoot: join(configuration.happyHomeDir, 'browser-viewers', 'novnc-web', backend.resizeMode),
+            baseDir: join(configuration.happyHomeDir, 'browser-viewers', 'novnc-web'),
             resizeMode: backend.resizeMode,
             onFallback: (reason) => logger.debug(`[viewer] serving stock noVNC: web root mirror failed: ${reason}`),
         });
