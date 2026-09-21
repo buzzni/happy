@@ -2357,14 +2357,24 @@ export class ApiMachineClient {
         // occupied. Only this viewer's own stack — reopening their screen is
         // consent to replace it, and a slow probe on someone else's live
         // viewer must never become a kill.
-        if (persisted) await this.stopIsolatedViewerProcesses(persisted);
+        if (persisted && await this.stopIsolatedViewerProcesses(persisted)) {
+            // SIGTERM returns long before the port is released, and the loop
+            // below reads "still bound" as "occupied" — so without waiting,
+            // the reap frees a slot and then declines to use it.
+            await waitForPortRelease(persisted.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS);
+        }
 
         const records = await this.isolatedViewerRegistry.list();
         const occupiedSlots = new Set<number>();
         for (const record of records) {
             if (record.viewerKey === viewerKey) continue;
-            if (await isViewerServing(record.webPort)) occupiedSlots.add(record.slot);
-            else await this.isolatedViewerRegistry.delete(record.viewerKey);
+            if (await isViewerServing(record.webPort)) { occupiedSlots.add(record.slot); continue; }
+            // Both stores, or the cache resurrects a lease this just released:
+            // the slot can be handed to someone else in the meantime, and the
+            // reuse path above would then return their live screen to its
+            // former owner.
+            await this.isolatedViewerRegistry.delete(record.viewerKey);
+            this.isolatedViewerLeases.delete(record.viewerKey);
         }
         for (const slot of VIEWER_SLOTS) {
             if (occupiedSlots.has(slot.slot)) continue;
@@ -2550,7 +2560,9 @@ export class ApiMachineClient {
         return false;
     }
 
-    private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<void> {
+    /** @returns whether any process was actually signalled. */
+    private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<boolean> {
+        let signalled = false;
         for (const [kind, pid] of Object.entries(lease.processIds ?? {}) as Array<[
             'xvfb' | 'xvnc' | 'x11vnc' | 'websockify',
             number,
@@ -2562,10 +2574,12 @@ export class ApiMachineClient {
                 // Viewer processes are detached process-group leaders. Targeting
                 // that exact group avoids touching another user's slot.
                 process.kill(-pid, 'SIGTERM');
+                signalled = true;
             } catch {
                 // Already exited is an idempotent stop success.
             }
         }
+        return signalled;
     }
 
     /**
@@ -3756,6 +3770,9 @@ export class ApiMachineClient {
 /** How long a freshly spawned websockify gets to answer on its web port. */
 const VIEWER_SERVING_TIMEOUT_MS = 15_000;
 
+/** How long a signalled viewer process gets to let go of its port. */
+const VIEWER_STOP_RELEASE_TIMEOUT_MS = 3_000;
+
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
 
@@ -3864,6 +3881,16 @@ async function findRunningViewer(): Promise<{ webPort: number } | null> {
  * {@link waitForViewerServing} instead: a bind check there called a dead
  * listener ready and handed the user a screen that reset on open.
  */
+/** The other direction: waits for a signalled holder to let a port go. */
+async function waitForPortRelease(port: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if (await isPortFree(port)) return true;
+        if (Date.now() >= deadline) return false;
+        await delay(100);
+    }
+}
+
 async function waitForPort(port: number, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {

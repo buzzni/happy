@@ -367,29 +367,62 @@ describe('ApiMachineClient browser viewer RPC', () => {
         // is bound but no longer serving would hold its slot for good. The
         // moment its owner reopens the screen is the last one where its pids
         // are still known, so that is where the stack is reaped.
-        it('reaps its own stale viewer processes before re-allocating', async () => {
+        it('reaps its own stale viewer processes and takes the slot back', async () => {
             leaseRegistryMocks.records.set(ALICE_KEY, {
                 ...lease(ALICE_KEY, 0),
                 processIds: { websockify: 777001, xvnc: 777002 },
             })
+            await holdPort(6080)
+            const releaseWebPort = held[held.length - 1]
             fsMocks.readFile.mockImplementation(async (path: string) => {
                 if (path === '/proc/777001/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
                 if (path === '/proc/777002/cmdline') return 'Xvnc\x00:99\x00-rfbport\x005900\x00'
                 return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
             })
-            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            // SIGTERM returns before the process is gone, so the port is only
+            // free a moment later — exactly the gap the reap has to wait out.
+            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number) => {
+                if (pid === -777001) setTimeout(() => void releaseWebPort(), 150)
+                return true
+            })
             try {
                 const { ApiMachineClient } = await import('./apiMachine')
                 const client = new ApiMachineClient('token', machineClient())
                 client.setRPCHandlers(rpcHandlers())
 
-                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+                const result = await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
 
                 expect(kill).toHaveBeenCalledWith(-777001, 'SIGTERM')
                 expect(kill).toHaveBeenCalledWith(-777002, 'SIGTERM')
+                // Reclaiming the slot is the point: without waiting for the
+                // port, the loop below still reads it as occupied and the
+                // viewer is pushed onto a fresh slot for nothing.
+                expect(result).toMatchObject({ webPort: 6080, ready: true })
             } finally {
                 kill.mockRestore()
             }
+        })
+
+        // A lease deleted from the registry must not come back from the
+        // daemon's own cache: the slot may already belong to someone else, and
+        // the reuse path would hand this viewer their live screen.
+        it('does not resurrect a lease another viewer has taken over', async () => {
+            const { ApiMachineClient } = await import('./apiMachine')
+            const client = new ApiMachineClient('token', machineClient())
+            client.setRPCHandlers(rpcHandlers())
+            const start = handlersFrom(client).get('machine-1:browser-viewer:start')!
+
+            const alice = await start({ viewerKey: ALICE_KEY })
+            expect(alice).toMatchObject({ webPort: 6080 })
+            // Alice's screen dies; Bob's start releases her registry record.
+            const bob = await start({ viewerKey: BOB_KEY })
+            expect(bob).toMatchObject({ webPort: 6081 })
+
+            viewerMocks.isViewerServing.mockResolvedValue(true)
+            const aliceAgain = await start({ viewerKey: ALICE_KEY })
+
+            expect(aliceAgain).not.toMatchObject({ webPort: 6080 })
+            expect(aliceAgain).toMatchObject({ webPort: 6082 })
         })
 
         // The other half of the same outage: the slot was judged free because
