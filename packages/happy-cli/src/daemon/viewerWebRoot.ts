@@ -321,6 +321,12 @@ function viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge }: {
     }
 }
 
+/** Whether a rename failed because something already holds the name. */
+function isNameClash(error: unknown): boolean {
+    const code = (error as NodeJS.ErrnoException | null)?.code
+    return code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'ENOTDIR'
+}
+
 /**
  * Names the mirror after what is in it.
  *
@@ -403,11 +409,15 @@ export function ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode, onFallbac
         writeFileSync(join(staging, VIEWER_BRIDGE_PATH), bridge)
         try {
             renameSync(staging, targetRoot)
-        } catch {
-            // The name is taken. Either another start won the race with an
-            // identical build — keep theirs — or what sits there carries this
-            // revision's name without its contents, which no correct viewer
-            // can be serving.
+        } catch (error) {
+            // Only a name clash earns a second attempt. Any other reason to
+            // fail here (no space, no permission) says nothing about what is
+            // already under that name, and clearing the way would be the very
+            // deletion this design exists to avoid.
+            if (!isNameClash(error)) throw error
+            // Either another start won the race with an identical build —
+            // keep theirs — or what sits there carries this revision's name
+            // without its contents, which no correct viewer can be serving.
             if (viewerWebRootIsCurrent({ sourceRoot, targetRoot, html, bridge })) {
                 rmSync(staging, { recursive: true, force: true })
                 return targetRoot

@@ -420,6 +420,19 @@ describe('ensureViewerWebRoot idempotence', () => {
         expect(existsSync(witness)).toBe(true)
     })
 
+    // The rename-collision branch: the name is right but what is under it is
+    // not, which no correct viewer can be serving, so it is rebuilt in place.
+    it('repairs a root that carries the right name with the wrong contents', () => {
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        writeFileSync(join(root, 'vnc.html'), 'corrupted')
+
+        const again = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+
+        expect(again).toBe(root)
+        expect(readFileSync(join(root, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        expect(readdirSync(baseDir).some((entry) => entry.endsWith('.tmp'))).toBe(false)
+    })
+
     // Every asset in the mirror is a symlink into the install it was built
     // from, so reusing a root across installs would serve symlinks pointing
     // at a path that may no longer exist.
