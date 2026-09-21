@@ -114,7 +114,6 @@ import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTermi
 import { validatePath } from '@/modules/common/pathSecurity';
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { readDaemonState } from '@/persistence';
@@ -152,6 +151,7 @@ import {
     missingViewerTools,
     selectViewerBackend,
     type ViewerBackend,
+    isPortFree,
     isViewerServing,
     planViewerInstall,
     resolveViewerProfileDir,
@@ -3715,15 +3715,6 @@ export class ApiMachineClient {
 
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
-
-function isPortFree(port: number): Promise<boolean> {
-    return new Promise((resolve) => {
-        const server = createServer();
-        server.once('error', () => resolve(false));
-        server.once('listening', () => server.close(() => resolve(true)));
-        server.listen(port, '127.0.0.1');
-    });
-}
 
 /**
  * A distinct CDP port per profile. Reusing one port makes the second Chrome

@@ -11,6 +11,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { createServer } from 'node:net'
 import { join } from 'node:path'
 
 import type { ViewerResizeMode } from './viewerWebRoot'
@@ -493,6 +494,16 @@ export async function isViewerServing(webPort: number): Promise<boolean> {
     } catch {
         return false
     }
+}
+
+/** Whether a port can still be bound on loopback — nobody is holding it. */
+export function isPortFree(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const server = createServer()
+        server.once('error', () => resolve(false))
+        server.once('listening', () => server.close(() => resolve(true)))
+        server.listen(port, '127.0.0.1')
+    })
 }
 
 /** Spawns a long-lived viewer process detached so it outlives the daemon. */
