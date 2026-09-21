@@ -1560,7 +1560,10 @@ export class ApiMachineClient {
             return this.withIsolatedViewerMutation(async () => {
                 const lease = await this.isolatedViewerRegistry.get(viewerKey);
                 if (!lease) return { viewerKey, stopped: false };
-                await this.stopIsolatedViewerProcesses(lease);
+                // Releasing the record drops the only note of these pids, so
+                // a stack that shrugged off SIGTERM would hold its slot with
+                // nothing left able to reach it. See it out first.
+                await this.reapViewerStack(lease);
                 if (lease.cdpPort !== null) {
                     this.browserCdpPipes.get(lease.cdpPort)?.close();
                     this.browserCdpPipes.delete(lease.cdpPort);

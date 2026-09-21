@@ -551,6 +551,38 @@ describe('ApiMachineClient browser viewer RPC', () => {
             }
         }, 15_000)
 
+        // `stop` releases the lease too, so it is the third place where the
+        // pids holding a port stop being written down anywhere.
+        it('sees its own stack out before releasing the lease that names it', async () => {
+            leaseRegistryMocks.records.set(ALICE_KEY, {
+                ...lease(ALICE_KEY, 0),
+                processIds: { websockify: 777020 },
+            })
+            await holdPort(6080)
+            const releaseWebPort = held[held.length - 1]
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777020/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6080\x00127.0.0.1:5900\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: unknown) => {
+                if (pid === -777020 && signal === 'SIGKILL') void releaseWebPort()
+                return true
+            })
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                const result = await handlersFrom(client).get('machine-1:browser-viewer:stop')?.({ viewerKey: ALICE_KEY })
+
+                expect(result).toMatchObject({ stopped: true })
+                expect(kill).toHaveBeenCalledWith(-777020, 'SIGKILL')
+                expect(await isPortFree(6080)).toBe(true)
+            } finally {
+                kill.mockRestore()
+            }
+        }, 20_000)
+
         // Ending someone else's stack and dropping their lease are both
         // destructive, and `isViewerServing` gives up after 1.5s — which a
         // loaded machine can eat. One lost probe must not be the proof.
