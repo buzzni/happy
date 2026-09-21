@@ -304,6 +304,27 @@ describe('ApiMachineClient browser viewer RPC', () => {
         }
 
         /**
+         * A live viewer that loses its first probe, which is all a loaded
+         * machine needs to do — `isViewerServing` gives up after 1.5s.
+         */
+        function serveFlakyNovnc(port: number): void {
+            let seen = 0
+            void (async () => {
+                const { createServer } = await import('node:http')
+                const server = createServer((req, res) => {
+                    if (seen++ === 0) { res.destroy(); return }
+                    if (req.url !== '/vnc.html') { res.writeHead(404); res.end(); return }
+                    res.writeHead(200, { 'Content-Type': 'text/html' })
+                    res.end('<!DOCTYPE html>')
+                })
+                server.once('error', () => undefined)
+                server.listen(port, '127.0.0.1', () => {
+                    held.push(() => new Promise<void>((done) => server.close(() => done())))
+                })
+            })()
+        }
+
+        /**
          * These tests drive the daemon's fixed slots (5900-5902 / 6080-6082),
          * which are real ports on this host. A viewer actually running here
          * would change which slot the daemon picks, so say that outright
@@ -450,15 +471,19 @@ describe('ApiMachineClient browser viewer RPC', () => {
 
             const alice = await start({ viewerKey: ALICE_KEY })
             expect(alice).toMatchObject({ webPort: 6080 })
-            // Alice's screen dies; Bob's start releases her registry record.
+            // Her screen has to stop serving for real, not only in the probe:
+            // the daemon asks the port again before acting on anyone's record.
+            await (held.pop() as () => Promise<void>)()
+
+            // Bob's start releases her record and takes the slot she had.
             const bob = await start({ viewerKey: BOB_KEY })
-            expect(bob).toMatchObject({ webPort: 6081 })
+            expect(bob).toMatchObject({ webPort: 6080 })
 
             viewerMocks.isViewerServing.mockResolvedValue(true)
             const aliceAgain = await start({ viewerKey: ALICE_KEY })
 
             expect(aliceAgain).not.toMatchObject({ webPort: 6080 })
-            expect(aliceAgain).toMatchObject({ webPort: 6082 })
+            expect(aliceAgain).toMatchObject({ webPort: 6081 })
         })
 
         // The lease is about to be rewritten with a new slot, so these pids are
@@ -524,7 +549,37 @@ describe('ApiMachineClient browser viewer RPC', () => {
             } finally {
                 kill.mockRestore()
             }
-        })
+        }, 15_000)
+
+        // Ending someone else's stack and dropping their lease are both
+        // destructive, and `isViewerServing` gives up after 1.5s — which a
+        // loaded machine can eat. One lost probe must not be the proof.
+        it('leaves another viewer alone when it answers on a second look', async () => {
+            leaseRegistryMocks.records.set(BOB_KEY, {
+                ...lease(BOB_KEY, 1),
+                processIds: { websockify: 777010 },
+            })
+            serveFlakyNovnc(6081)
+            fsMocks.readFile.mockImplementation(async (path: string) => {
+                if (path === '/proc/777010/cmdline') return 'websockify\x00--web\x00/root\x00127.0.0.1:6081\x00127.0.0.1:5901\x00'
+                return path.endsWith('/cmdline') ? '/usr/bin/google-chrome\x00' : 'PATH=/usr/bin\x00'
+            })
+            const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+            try {
+                const { ApiMachineClient } = await import('./apiMachine')
+                const client = new ApiMachineClient('token', machineClient())
+                client.setRPCHandlers(rpcHandlers())
+
+                await handlersFrom(client).get('machine-1:browser-viewer:start')?.({ viewerKey: ALICE_KEY })
+
+                expect(kill).not.toHaveBeenCalledWith(-777010, 'SIGTERM')
+                // Its lease is what names those pids; dropping it on the same
+                // lost probe would leave the stack unreapable by anyone.
+                expect(leaseRegistryMocks.records.has(BOB_KEY)).toBe(true)
+            } finally {
+                kill.mockRestore()
+            }
+        }, 15_000)
 
         // Nothing is holding the slot, so there is nothing to reclaim — and the
         // pids on a released record may belong to anything by now.

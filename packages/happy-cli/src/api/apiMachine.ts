@@ -2357,19 +2357,27 @@ export class ApiMachineClient {
         for (const record of records) {
             if (record.viewerKey === viewerKey) continue;
             if (await isViewerServing(record.webPort)) { occupiedSlots.add(record.slot); continue; }
-            // The slot can be handed to someone else right after this, so
-            // nothing may keep answering for the record it releases — the
-            // reuse path above would return their live screen to its former
-            // owner.
+            // Nothing is there at all, so there is nothing to confirm and
+            // nothing to reclaim. Releasing the record is all that is left —
+            // and the pids it names may belong to anything by now.
+            if (await isPortFree(record.webPort)) {
+                await this.isolatedViewerRegistry.delete(record.viewerKey);
+                continue;
+            }
+            // Bound but not answering. Both of the things that follow —
+            // dropping someone else's lease and ending their stack — are
+            // destructive, and `isViewerServing` gives up after 1.5s, which a
+            // loaded machine can eat. Ask again, patiently, before treating
+            // one lost probe as proof that a screen is gone.
+            if ((await waitForViewerServing(record.webPort, VIEWER_CONFIRM_DEAD_MS, { pollMs: 500 })).ready) {
+                occupiedSlots.add(record.slot);
+                continue;
+            }
+            // The record is the only note of the pids holding this port, so
+            // the stack has to end with it. Nobody could reap it afterwards —
+            // its owner least of all — and the slot would be occupied for the
+            // life of the machine.
             await this.isolatedViewerRegistry.delete(record.viewerKey);
-            // And with the record goes the only note of its pids. A port left
-            // bound after its screen stopped answering is a stack nobody can
-            // reach and nobody can reap, its owner least of all — the slot
-            // would be occupied for the life of the machine. Asked twice
-            // before signalling, because this screen is not ours: a probe
-            // that lost a race must not end someone's live session.
-            if (await isPortFree(record.webPort)) continue;
-            if (await isViewerServing(record.webPort)) { occupiedSlots.add(record.slot); continue; }
             await this.reapViewerStack(record);
         }
         for (const slot of VIEWER_SLOTS) {
@@ -3789,6 +3797,9 @@ const VIEWER_SERVING_TIMEOUT_MS = 15_000;
 
 /** How long a signalled viewer process gets to let go of its port. */
 const VIEWER_STOP_RELEASE_TIMEOUT_MS = 3_000;
+
+/** How long another viewer's screen gets to prove it is still there. */
+const VIEWER_CONFIRM_DEAD_MS = 3_000;
 
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
