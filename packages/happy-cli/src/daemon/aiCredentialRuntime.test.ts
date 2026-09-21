@@ -37,7 +37,7 @@ function codexMultiAuthBundle() {
   return {
     version: 1,
     kind: 'codex-multi-auth',
-    packageVersion: '2.8.5',
+    packageVersion: '2.15.0',
     accounts: {
       version: 3,
       activeIndex: 0,
@@ -56,7 +56,7 @@ function setup(
 ) {
   const calls: Array<{ command: string; args: string[] }> = []
   const files = new Map<string, string>()
-  files.set('/global/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.8.5' }))
+  files.set('/global/node_modules/codex-multi-auth/package.json', JSON.stringify({ version: '2.15.0' }))
   const execFile = vi.fn(async (
     command: string,
     args: string[],
@@ -81,7 +81,7 @@ function setup(
       }
     }
     if (command === 'codex-multi-auth' && args[0] === '--version') {
-      return { stdout: '2.8.5\n', stderr: '' }
+      return { stdout: '2.15.0\n', stderr: '' }
     }
     if (command === 'claude' && args[0] === '--print') {
       return { stdout: JSON.stringify({ result: 'CLAUDE_AUTH_OK' }), stderr: '' }
@@ -786,11 +786,11 @@ describe('AI credential machine runtime', () => {
     })
   })
 
-  it('pins Codex multi-auth 2.8.5 and applies least-remaining 5% rotation settings', async () => {
+  it('pins Codex multi-auth 2.15.0 and applies least-remaining 5% rotation settings', async () => {
     let files!: Map<string, string>
     const execFile = vi.fn(async (command: string, args: string[]) => {
       if (command === 'codex-multi-auth' && args[0] === '--version') {
-        return { stdout: '2.8.5\n', stderr: '' }
+        return { stdout: '2.15.0\n', stderr: '' }
       }
       if (command === 'npm' && args[0] === 'root') {
         return { stdout: '/global/node_modules\n', stderr: '' }
@@ -850,7 +850,7 @@ describe('AI credential machine runtime', () => {
     let files!: Map<string, string>
     const execFile = vi.fn(async (command: string, args: string[]) => {
       if (command === 'codex-multi-auth' && args[0] === '--version') {
-        return { stdout: '2.8.5\n', stderr: '' }
+        return { stdout: '2.15.0\n', stderr: '' }
       }
       if (command === 'npm' && args[0] === 'root') {
         return { stdout: '/global/node_modules\n', stderr: '' }
@@ -904,7 +904,7 @@ describe('AI credential machine runtime', () => {
       provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()),
     })).rejects.toMatchObject({ kind: 'CODEX_MULTI_AUTH_VERSION_MISMATCH' })
     expect(execFile).toHaveBeenCalledWith('npm', [
-      'install', '--global', 'codex-multi-auth@2.8.5',
+      'install', '--global', 'codex-multi-auth@2.15.0',
     ], expect.anything())
   })
 
@@ -912,14 +912,14 @@ describe('AI credential machine runtime', () => {
     let files!: Map<string, string>
     const execFile = vi.fn(async (command: string, args: string[]) => {
       if (command === 'codex-multi-auth' && args[0] === '--version') {
-        return { stdout: '2.8.5\n', stderr: '' }
+        return { stdout: '2.15.0\n', stderr: '' }
       }
       if (command === 'npm' && args[0] === 'root') {
         return { stdout: '/alternate/global/node_modules\n', stderr: '' }
       }
       if (command === 'npm' && args[0] === 'install') {
         files.set('/alternate/global/node_modules/codex-multi-auth/package.json', JSON.stringify({
-          version: '2.8.5',
+          version: '2.15.0',
         }))
       }
       return { stdout: '', stderr: '' }
@@ -932,7 +932,7 @@ describe('AI credential machine runtime', () => {
     })
 
     expect(execFile).toHaveBeenCalledWith('npm', [
-      'install', '--global', 'codex-multi-auth@2.8.5',
+      'install', '--global', 'codex-multi-auth@2.15.0',
     ], expect.anything())
   })
 
@@ -1481,7 +1481,7 @@ describe('AI credential machine runtime', () => {
     expect(captured.provider).toBe('codex')
     expect(JSON.parse(captured.payload)).toMatchObject({
       kind: 'codex-multi-auth',
-      packageVersion: '2.8.5',
+      packageVersion: '2.15.0',
       accounts: { version: 3 },
       settings: { pluginConfig: { schedulingStrategy: 'sequential' } },
     })
@@ -1624,7 +1624,7 @@ describe('AI credential machine runtime', () => {
       codexProxyStatus: vi.fn(() => ({ activeRoutes: 1 })),
       execFile: vi.fn(async (command: string, args: string[]) => {
         if (command === 'codex-multi-auth' && args[0] === '--version') {
-          return { stdout: '2.8.5\n', stderr: '' }
+          return { stdout: '2.15.0\n', stderr: '' }
         }
         if (command === 'npm' && args[0] === 'root') {
           return { stdout: '/global/node_modules\n', stderr: '' }

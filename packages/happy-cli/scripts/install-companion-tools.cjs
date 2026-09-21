@@ -56,7 +56,7 @@ const { spawnSync } = require('node:child_process');
 const IS_WINDOWS = process.platform === 'win32';
 
 // Must equal the same-named constants in src/daemon/aiCredentialRuntime.ts.
-const CODEX_MULTI_AUTH_VERSION = '2.8.5';
+const CODEX_MULTI_AUTH_VERSION = '2.15.0';
 const CLAUDE_SWAP_VERSION = '0.25.0';
 
 // An unbounded child here would hang `npm install -g happy` itself. Matches the
