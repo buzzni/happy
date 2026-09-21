@@ -1555,6 +1555,12 @@ export class ApiMachineClient {
             // before a live viewer is reported gone to the person watching it.
             const ready = await isViewerServing(lease.webPort)
                 || (await waitForViewerServing(lease.webPort, VIEWER_CONFIRM_DEAD_MS, { pollMs: 500 })).ready;
+            // The probe ran outside the mutation. In that window stop/start
+            // can release this slot and hand it to someone else — the probe
+            // then answered for *their* screen, and the lease captured before
+            // it would mint a token onto it. Ownership has to still hold now.
+            const still = await this.isolatedViewerRegistry.get(viewerKey);
+            if (!still || !sameViewerLease(still, lease)) return null;
             return { ...lease, ready };
         });
 
@@ -2377,11 +2383,14 @@ export class ApiMachineClient {
         for (const record of records) {
             if (record.viewerKey === viewerKey) continue;
             if (await isViewerServing(record.webPort)) { occupiedSlots.add(record.slot); continue; }
-            // Nothing is there at all, so there is nothing to confirm and
-            // nothing to reclaim. Releasing the record is all that is left —
-            // and the pids it names may belong to anything by now.
+            // A free web port means websockify is gone, not that the display
+            // is: an Xvnc left on the VNC port still carries this user's
+            // Chrome, and the released record is the last thing that knows
+            // its pids. The cmdline check inside the reap is what keeps a
+            // recycled pid from being signalled.
             if (await isPortFree(record.webPort)) {
                 await this.isolatedViewerRegistry.delete(record.viewerKey);
+                await this.reapViewerStack(record);
                 continue;
             }
             // Bound but not answering. Both of the things that follow —
@@ -2402,12 +2411,17 @@ export class ApiMachineClient {
         }
         for (const slot of VIEWER_SLOTS) {
             if (occupiedSlots.has(slot.slot)) continue;
-            // Not "is someone serving noVNC here" but "can websockify bind
-            // this at all". A port held by a listener that answers nothing
-            // passes the serving probe as free and then refuses the bind, so
-            // the slot was handed out again on every retry — including to the
-            // viewer that already owned it (2026-09-21, walter-gpu slot 1).
-            if (!(await isPortFree(slot.webPort))) occupiedSlots.add(slot.slot);
+            // Not "is someone serving noVNC here" but "can this slot's ports
+            // be bound at all". A web port held by a listener that answers
+            // nothing passes the serving probe as free and then refuses the
+            // bind, so the slot was handed out again on every retry (walter-gpu
+            // slot 1, 2026-09-21). And a free web port says nothing about the
+            // display: an Xvnc still up on the VNC port has the previous
+            // user's Chrome on it, and a viewer landing here would be proxied
+            // straight onto their screen.
+            if (!(await isPortFree(slot.webPort)) || !(await isPortFree(slot.vncPort))) {
+                occupiedSlots.add(slot.slot);
+            }
         }
 
         const persistedSlot = persisted
@@ -2487,9 +2501,10 @@ export class ApiMachineClient {
         let serving = false;
         if (preferred.kind === 'xvnc') {
             // Whoever holds it, a busy port makes the wait below meaningless:
-            // it would report someone else's server as ours.
+            // it would report someone else's server as ours — and route this
+            // viewer onto whatever display that server is showing.
             if (!(await isPortFree(vncPort))) {
-                logger.debug(`[viewer] ${vncPort} was already in use before starting Xvnc on ${display}`);
+                throw new Error(`원격 화면의 VNC 포트 ${vncPort} 가 이미 사용 중입니다 (${display}).`);
             }
             const xvnc = spawnDetached('Xvnc', buildXvncArgs({ display, vncPort, ...VIEWER_SCREEN }));
             serving = await waitForPort(vncPort, 8_000);
@@ -2594,20 +2609,41 @@ export class ApiMachineClient {
      * that is a third of its capacity until it reboots.
      */
     private async reapViewerStack(lease: BrowserViewerLeaseRecord): Promise<void> {
-        if (!await this.stopIsolatedViewerProcesses(lease)) return;
-        if (await waitForPortRelease(lease.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) return;
-        await this.stopIsolatedViewerProcesses(lease, 'SIGKILL');
-        if (!await waitForPortRelease(lease.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS)) {
-            logger.warn(`[viewer] slot ${lease.slot} (${lease.display}): 127.0.0.1:${lease.webPort} survived SIGKILL; abandoning the slot`);
+        const groups = await this.stopIsolatedViewerProcesses(lease);
+        if (groups.length === 0) return;
+        if (await this.viewerPortsReleased(lease)) return;
+        // websockify forks a worker that inherits the listener, so SIGTERM
+        // can take the leader and leave the worker holding the port. The
+        // group outlives its leader, and a pgid is not recycled while any
+        // member is alive — so the groups verified a moment ago are signalled
+        // as groups, not re-verified through a leader that may be gone.
+        for (const pgid of groups) {
+            try { process.kill(-pgid, 'SIGKILL'); } catch { /* group already empty */ }
+        }
+        if (!await this.viewerPortsReleased(lease)) {
+            logger.warn(`[viewer] slot ${lease.slot} (${lease.display}): web ${lease.webPort} / vnc ${lease.vncPort} still held after SIGKILL; abandoning the slot`);
         }
     }
 
-    /** @returns whether any process was actually signalled. */
-    private async stopIsolatedViewerProcesses(
-        lease: BrowserViewerLeaseRecord,
-        signal: NodeJS.Signals = 'SIGTERM',
-    ): Promise<boolean> {
-        let signalled = false;
+    /**
+     * Both of a slot's ports, not just the web one: a stack whose websockify
+     * let go while its Xvnc did not still has this user's Chrome on the
+     * display the next occupant would be proxied onto.
+     */
+    private async viewerPortsReleased(lease: BrowserViewerLeaseRecord): Promise<boolean> {
+        const web = await waitForPortRelease(lease.webPort, VIEWER_STOP_RELEASE_TIMEOUT_MS);
+        const vnc = await waitForPortRelease(lease.vncPort, VIEWER_STOP_RELEASE_TIMEOUT_MS);
+        return web && vnc;
+    }
+
+    /**
+     * Sends SIGTERM to every process the lease names that still is what the
+     * lease says it is.
+     *
+     * @returns the process groups that were verified and signalled.
+     */
+    private async stopIsolatedViewerProcesses(lease: BrowserViewerLeaseRecord): Promise<number[]> {
+        const groups: number[] = [];
         for (const [kind, pid] of Object.entries(lease.processIds ?? {}) as Array<[
             'xvfb' | 'xvnc' | 'x11vnc' | 'websockify',
             number,
@@ -2618,13 +2654,13 @@ export class ApiMachineClient {
                 if (!viewerProcessMatchesLease(kind, cmdline, lease)) continue;
                 // Viewer processes are detached process-group leaders. Targeting
                 // that exact group avoids touching another user's slot.
-                process.kill(-pid, signal);
-                signalled = true;
+                process.kill(-pid, 'SIGTERM');
+                groups.push(pid);
             } catch {
                 // Already exited is an idempotent stop success.
             }
         }
-        return signalled;
+        return groups;
     }
 
     /**
@@ -3929,6 +3965,15 @@ async function findRunningViewer(): Promise<{ webPort: number } | null> {
  * {@link waitForViewerServing} instead: a bind check there called a dead
  * listener ready and handed the user a screen that reset on open.
  */
+/** The facts a relay token is minted on: which slot, and which websockify. */
+function sameViewerLease(a: BrowserViewerLeaseRecord, b: BrowserViewerLeaseRecord): boolean {
+    return a.viewerKey === b.viewerKey
+        && a.slot === b.slot
+        && a.webPort === b.webPort
+        && a.display === b.display
+        && a.processIds?.websockify === b.processIds?.websockify;
+}
+
 /** The other direction: waits for a signalled holder to let a port go. */
 async function waitForPortRelease(port: number, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
