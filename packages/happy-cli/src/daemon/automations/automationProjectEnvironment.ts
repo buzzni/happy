@@ -1,6 +1,6 @@
 export type AutomationProjectEnvironmentResult =
   | { ok: true; environmentVariables: Record<string, string> }
-  | { ok: false; error: string }
+  | { ok: false; error: string; code?: 'EXECUTION_PRINCIPAL_UNBOUND' }
 
 /** Run-scoped secrets stay in memory; never put response bodies in diagnostics. */
 export async function fetchAutomationProjectEnvironment(input: {
@@ -25,7 +25,19 @@ export async function fetchAutomationProjectEnvironment(input: {
       body: JSON.stringify({ machineId: input.machineId, runId: input.runId, claimToken: input.claimToken }),
       signal: AbortSignal.timeout(10_000),
     })
-    if (!response.ok) return { ok: false, error: `project environment request returned ${response.status}` }
+    if (!response.ok) {
+      if (response.status === 409) {
+        const body = await response.json().catch(() => null) as { error?: unknown } | null
+        if (body?.error === 'AUTOMATION_EXECUTION_UNBOUND') {
+          return {
+            ok: false,
+            error: 'project environment execution principal is unbound',
+            code: 'EXECUTION_PRINCIPAL_UNBOUND',
+          }
+        }
+      }
+      return { ok: false, error: `project environment request returned ${response.status}` }
+    }
     const body: unknown = await response.json()
     if (body && typeof body === 'object' && !Array.isArray(body)) {
       const { projectId, environmentVariables } = body as Record<string, unknown>

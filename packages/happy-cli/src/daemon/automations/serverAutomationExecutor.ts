@@ -1278,8 +1278,12 @@ async function executeStartedRun(
       // dispatched task without a worker, nor consume its pending GitHub event.
       const projectEnvironment = await input.resolveProjectEnvironment(run)
       if (!projectEnvironment.ok) {
-        input.logDebug?.(`[server-automation] run=${run.runId} precondition=PROJECT_ENVIRONMENT_UNAVAILABLE detail=${projectEnvironment.error}`)
-        return { outcome: 'ERROR', sessionId: null, failureCode: 'PROJECT_ENVIRONMENT_UNAVAILABLE' }
+        const failureCode = projectEnvironment.code ?? 'PROJECT_ENVIRONMENT_UNAVAILABLE'
+        input.logDebug?.(`[server-automation] run=${run.runId} precondition=${failureCode} detail=${projectEnvironment.error}`)
+        return {
+          outcome: 'ERROR', sessionId: null,
+          failureCode,
+        }
       }
       const bridged = await input.dispatchAgentTask({
         runId: run.runId,

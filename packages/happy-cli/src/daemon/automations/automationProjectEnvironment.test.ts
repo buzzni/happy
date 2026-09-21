@@ -36,6 +36,21 @@ describe('fetchAutomationProjectEnvironment', () => {
     await expect(fetchAutomationProjectEnvironment(input)).resolves.toEqual({ ok: false, error: `project environment request returned ${status}` })
   })
 
+  it('preserves the execution-unbound signal without exposing unrelated response details', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: 'AUTOMATION_EXECUTION_UNBOUND',
+      projectId: 'P-1',
+      automationId: 'A-1',
+      detail: 'sensitive-detail',
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(fetchAutomationProjectEnvironment(input)).resolves.toEqual({
+      ok: false,
+      error: 'project environment execution principal is unbound',
+      code: 'EXECUTION_PRINCIPAL_UNBOUND',
+    })
+  })
+
   it('fails on absent configuration or network errors instead of returning an empty environment', async () => {
     const request = vi.fn(async () => { throw new Error('sensitive-detail') })
     vi.stubGlobal('fetch', request)

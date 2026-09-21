@@ -1826,7 +1826,7 @@ describe('runServerAutomationTick', () => {
     }))
   })
 
-  it.each(['ready', 'empty', 'failed', 'reserved', 'http'] as const)('reviews in the dispatched worktree with project environment: %s', async (mode) => {
+  it.each(['ready', 'empty', 'failed', 'unbound', 'reserved', 'http'] as const)('reviews in the dispatched worktree with project environment: %s', async (mode) => {
     // 2026-09-01 프로덕션 — PR #317 리뷰가 "대상 SHA 테스트를 실행하지 못했다" 고
     // 보고했다. AgentTask 워커만 프로젝트 디렉터리에서 그대로 돌아 HEAD 가 사용자가
     // 마지막에 둔 커밋이었기 때문이다(start-session 리뷰는 전용 worktree 를 받는다).
@@ -1871,6 +1871,12 @@ describe('runServerAutomationTick', () => {
 
     if (mode === 'failed') {
       input.resolveProjectEnvironment = vi.fn(async () => ({ ok: false as const, error: 'lookup failed' }))
+    } else if (mode === 'unbound') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({
+        ok: false as const,
+        error: 'project environment execution principal is unbound',
+        code: 'EXECUTION_PRINCIPAL_UNBOUND' as const,
+      }))
     } else if (mode === 'empty') {
       input.resolveProjectEnvironment = vi.fn(async () => ({ ok: true as const, environmentVariables: {} }))
     } else if (mode === 'reserved') {
@@ -1931,12 +1937,16 @@ describe('runServerAutomationTick', () => {
         body: { machineId: 'M-1', runId: 'run-1', claimToken: 'claim-token' },
       })
     }
-    if (mode === 'failed') {
+    if (mode === 'failed' || mode === 'unbound') {
       expect(result).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
       expect(dispatchAgentTask).not.toHaveBeenCalled()
       expect(spawnSession).not.toHaveBeenCalled()
       expect(input.resumeSession).not.toHaveBeenCalled()
-      expect(input.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'PROJECT_ENVIRONMENT_UNAVAILABLE' }))
+      expect(input.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+        failureCode: mode === 'unbound'
+          ? 'EXECUTION_PRINCIPAL_UNBOUND'
+          : 'PROJECT_ENVIRONMENT_UNAVAILABLE',
+      }))
       return
     }
 
