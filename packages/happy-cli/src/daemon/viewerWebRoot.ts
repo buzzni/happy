@@ -23,7 +23,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /** Where the bridge module lives inside the mirrored web root. */
@@ -334,6 +334,10 @@ function viewerWebRootRevision({ sourceRoot, html, bridge }: {
     bridge: string
 }): string {
     return createHash('sha256')
+        // Every asset in the mirror is a symlink into sourceRoot, so a root
+        // built against a different install is a different root even when
+        // the page and the file names come out identical.
+        .update(sourceRoot).update('\0')
         .update(html).update('\0')
         .update(bridge).update('\0')
         .update(readdirSync(sourceRoot).sort().join('\0'))

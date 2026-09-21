@@ -420,6 +420,22 @@ describe('ensureViewerWebRoot idempotence', () => {
         expect(existsSync(witness)).toBe(true)
     })
 
+    // Every asset in the mirror is a symlink into the install it was built
+    // from, so reusing a root across installs would serve symlinks pointing
+    // at a path that may no longer exist.
+    it('does not reuse a root built against a different noVNC install', () => {
+        const other = join(baseDir, '..', 'novnc-moved')
+        mkdirSync(join(other, 'app'), { recursive: true })
+        writeFileSync(join(other, 'vnc.html'), STOCK_HTML)
+        writeFileSync(join(other, 'app', 'ui.js'), 'export default {}')
+
+        const fromFirst = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const fromOther = ensureViewerWebRoot({ sourceRoot: other, baseDir, resizeMode: 'remote' })
+
+        expect(fromOther).not.toBe(fromFirst)
+        expect(readlinkSync(join(fromOther, 'app'))).toBe(join(other, 'app'))
+    })
+
     // 2026-09-21, walter-gpu: one mutable directory was shared by every live
     // websockify, and a rebuild deleted it out from under them. websockify
     // chdir()s into its web root at startup, so once that inode is gone the

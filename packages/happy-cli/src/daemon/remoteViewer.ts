@@ -523,7 +523,7 @@ export type DetachedProcess = {
 }
 
 /** Describes an exit in one line, for the log that has to explain it. */
-export function describeDetachedExit(exit: DetachedProcessExit): string {
+function describeDetachedExit(exit: DetachedProcessExit): string {
     if (exit.kind === 'spawn-error') return `spawn failed: ${exit.message}`
     if (exit.signal) return `killed by ${exit.signal}`
     return `exit code ${exit.code}`
