@@ -179,6 +179,8 @@ export const MachineMetadataSchema = z.object({
    * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
+  /** Current tracked-child presence via encrypted machine RPC (BYOS only). */
+  daemonSessionState: z.object({ version: z.literal(1) }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
