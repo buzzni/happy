@@ -1,3 +1,5 @@
+import type { RpcLatencySnapshot } from '@slopus/happy-wire';
+
 /**
  * Common RPC types and interfaces for both session and machine clients
  */
@@ -28,7 +30,7 @@ export interface RpcRequest {
 /**
  * RPC response callback
  */
-export type RpcResponseCallback = (response: string) => void;
+export type RpcResponseCallback = (response: string | { result: string; rpcLatency: RpcLatencySnapshot }) => void;
 
 /**
  * Configuration for RPC handler manager
