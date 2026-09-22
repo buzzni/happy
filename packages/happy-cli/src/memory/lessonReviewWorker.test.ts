@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,7 +45,7 @@ function hostFor(
             await push('enqueueCandidate', input);
             return { outcome: 'pending', candidateId: 'c1', revision: 1, payloadHash: 'h', status: 'pending' };
         },
-        markReviewed: async (input: any) => { await push('markReviewed', input); return {}; },
+        markReviewed: async (input: any) => { await push('markReviewed', input); return { outcome: 'reviewed' }; },
         recall: async () => ({}), get: async () => ({}), recordRead: async () => ({}),
         ackDelivery: async () => ({}), approveCandidate: async () => ({}), rejectCandidate: async () => ({}),
         setRecallEnabled: async () => ({}), listCandidates: async () => ({}), listLessons: async () => ({}),
@@ -64,10 +64,10 @@ function hostFor(
 async function harness(overrides: Partial<LessonReviewWorkerDeps> = {}, reviewEnabled = true) {
     const dir = await mkdtemp(join(tmpdir(), 'lesson-review-'));
     const settings = createLessonSettingsStore(join(dir, 'settings.json'));
-    if (reviewEnabled) {
+    {
         await settings.write({
-            expectedRevision: 1, recallEnabled: true, reviewEnabled: true,
-            dailyMicroUsd: 1_000_000, dailyTokens: 500_000,
+            expectedRevision: 1, recallEnabled: true, reviewEnabled,
+            dailyMicroUsd: 0, dailyTokens: 0,
         });
     }
     let issuerRef: ReturnType<typeof createLessonBindingIssuer> | undefined;
@@ -86,278 +86,151 @@ async function harness(overrides: Partial<LessonReviewWorkerDeps> = {}, reviewEn
         issuer,
         settings,
         budget: new LessonReviewBudget(join(dir, 'ledger.json')),
-        gateway: async () => ({
-            config: { baseUrl: 'https://gw.example/v1', apiKey: 'k', projectId: 'p1', model: 'm' },
-            quote: {
-                model: 'm', inputMicroUsdPerMillion: 300, outputMicroUsdPerMillion: 1500,
-                expiresAt: Date.now() + 600_000, source: 'vendor-doc',
-            },
-        }),
         identity: () => ({ userId: 'u1', projectId: 'p1', machineId: 'm1' }),
         ...overrides,
     };
     return { worker: createLessonReviewWorker(deps), host, settings, dir, deps };
 }
 
-function gatewayResponse(content: unknown) {
-    return vi.fn(async () => new Response(JSON.stringify({
-        model: 'm',
-        choices: [{ message: { content: JSON.stringify(content) } }],
-        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-}
+afterEach(() => vi.unstubAllGlobals());
+const input = () => ({ record, proposal, settingsRevision: 2, signal: new AbortController().signal });
 
-describe('createLessonReviewWorker', () => {
-    it('refuses without a store, before anything else is considered', async () => {
-        const h = await harness({ host: null });
-        const gateway = vi.fn();
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('unsupported');
-        expect(gateway).not.toHaveBeenCalled();
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('refuses an aborted turn as cancelled, not as a failure', async () => {
+describe('foreground lesson proposals', () => {
+    it('persists a candidate with zero budgets, only review authority and store-owned evidence', async () => {
+        const network = vi.fn(() => { throw new Error('unexpected network'); });
+        vi.stubGlobal('fetch', network);
         const h = await harness();
-        expect(await h.worker.reviewFinishedTurn({
-            record: { ...record, endedNormally: false },
-            signal: new AbortController().signal,
-        })).toBe('cancelled');
+        expect(await h.worker.prepareReviewTurn!()).toEqual({ revision: 2 });
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('reviewed');
+        expect(network).not.toHaveBeenCalled();
+        const call = h.host.calls.find(c => c.name === 'enqueueCandidate')!;
+        expect(call.input.candidate).toMatchObject({ sourceEventIds: ['evt-1'], sourceSessionIds: ['s1'], confidence: 0.5 });
+        expect(call.identity).toMatchObject({ capabilities: ['lesson.review'], machineId: 'm1' });
+        expect(h.host.calls.map(c => c.name)).toEqual(['appendNormalEndEvidence', 'enqueueCandidate', 'markReviewed']);
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('never calls the gateway when review is switched off', async () => {
-        const gateway = vi.fn(async () => null);
-        const h = await harness({ gateway }, false);
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('disabled');
-        expect(gateway).not.toHaveBeenCalled();
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('spends nothing when no settled price exists', async () => {
-        const h = await harness({ gateway: async () => null });
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('price_unknown');
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('refuses when the store did not persist the evidence, rather than inventing an id', async () => {
-        const empty = hostFor({
-            appendNormalEndEvidence: async () => ({ outcome: 'refused' }),
-        } as never);
-        const h = await harness({ host: empty.handle });
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('not-eligible');
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('reports unsupported when the installed build has no evidence entry point', async () => {
-        const old = hostFor();
-        delete (old.handle.service as unknown as Record<string, unknown>).appendNormalEndEvidence;
-        const h = await harness({ host: old.handle });
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('unsupported');
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('anchors the candidate on the ids the store actually returned', async () => {
-        (globalThis as { fetch: typeof fetch }).fetch =
-            gatewayResponse({ proposal }) as unknown as typeof fetch;
+    it('does not call a gateway or persist evidence when no proposal was supplied', async () => {
+        const network = vi.fn(); vi.stubGlobal('fetch', network);
         const h = await harness();
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('reviewed');
-        expect(h.host.calls.find((call) => call.name === 'enqueueCandidate')!.input.candidate)
-            .toMatchObject({ sourceEventIds: ['evt-1'], sourceSessionIds: ['s1'] });
-        // The host asserts the normal end, inside the binding.
-        const identity = h.host.calls.find((call) => call.name === 'appendNormalEndEvidence')!.identity as
-            { normalEndSessionIds?: string[] };
-        expect(identity.normalEndSessionIds).toEqual(['s1']);
-    });
-
-    it('stops when the foreground preempts it', async () => {
-        const controller = new AbortController();
-        controller.abort();
-        const h = await harness();
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: controller.signal,
-        })).toBe('cancelled');
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: undefined })).toBe('no-lesson');
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: null })).toBe('no-lesson');
+        expect(network).not.toHaveBeenCalled(); expect(h.host.calls).toHaveLength(0);
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('enqueues and reviews a proposal with review authority only', async () => {
-        const fetchImpl = gatewayResponse({ proposal });
-        const h = await harness();
-        (globalThis as { fetch: typeof fetch }).fetch = fetchImpl as unknown as typeof fetch;
-        const outcome = await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        });
-        expect(outcome).toBe('reviewed');
-        const enqueue = h.host.calls.find((call) => call.name === 'enqueueCandidate')!;
-        const identity = enqueue.identity as { capabilities: string[] };
-        // The worker proposes; only a person's grant can accept.
-        expect(identity.capabilities).toEqual(['lesson.review']);
-        expect(identity.capabilities).not.toContain('lesson.manage');
-        expect(h.host.calls.some((call) => call.name === 'markReviewed')).toBe(true);
-        expect(enqueue.input.candidate).toMatchObject({
-            scope: 'this repo', validation: ['npm run test:e2e'], reconsiderWhen: 'the build output moves',
-        });
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('does not write a candidate when review was switched off during the call', async () => {
-        const h = await harness();
-        (globalThis as { fetch: typeof fetch }).fetch = (async () => {
-            // Another window turns review off while the provider is answering.
-            await h.settings.write({
-                expectedRevision: 2, recallEnabled: true, reviewEnabled: false,
-                dailyMicroUsd: 1_000_000, dailyTokens: 500_000,
-            });
-            return new Response(JSON.stringify({
-                model: 'm', choices: [{ message: { content: JSON.stringify({ proposal }) } }],
-                usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
-            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        }) as unknown as typeof fetch;
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('stale_settings');
-        expect(h.host.calls.some((call) => call.name === 'enqueueCandidate')).toBe(false);
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('keeps the applicability conditions the review produced', async () => {
-        (globalThis as { fetch: typeof fetch }).fetch = gatewayResponse({
-            proposal: { ...proposal, validVersions: ['cml 2.4.0'] },
-        }) as unknown as typeof fetch;
-        const h = await harness();
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('reviewed');
-        const enqueued = h.host.calls.find((call) => call.name === 'enqueueCandidate')!.input.candidate;
-        expect(enqueued).toMatchObject({
-            validVersions: ['cml 2.4.0'], failureModes: ['a stale out/ passes locally'],
-        });
-        await rm(h.dir, { recursive: true, force: true });
-    });
-
-    it('binds the worker to the real machine, not to a placeholder', async () => {
-        (globalThis as { fetch: typeof fetch }).fetch =
-            gatewayResponse({ proposal }) as unknown as typeof fetch;
-        const h = await harness();
-        await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        });
-        const identity = h.host.calls.find((call) => call.name === 'enqueueCandidate')!.identity as
-            { machineId: string };
-        expect(identity.machineId).toBe('m1');
-    });
-
-    it('spends nothing when the settings file is unreadable', async () => {
-        const h = await harness();
-        // The user had switched review off; the file is then corrupted. Reading
-        // it back as the defaults would turn review on again.
-        await writeFile(join(h.dir, 'settings.json'), '{ not json');
-        const fetchImpl = vi.fn();
-        (globalThis as { fetch: typeof fetch }).fetch = fetchImpl as unknown as typeof fetch;
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('settings_unreadable');
-        expect(fetchImpl).not.toHaveBeenCalled();
+    it('preserves explicit off and fails closed on corrupt settings', async () => {
+        const h = await harness({}, false);
+        expect(await h.worker.prepareReviewTurn!()).toBeNull();
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('disabled');
+        await writeFile(join(h.dir, 'settings.json'), '{ broken');
+        expect(await h.worker.prepareReviewTurn!()).toBeNull();
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('settings_unreadable');
         expect(h.host.calls).toHaveLength(0);
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('treats an explicit no-lesson as a successful review', async () => {
-        (globalThis as { fetch: typeof fetch }).fetch =
-            gatewayResponse({ proposal: null }) as unknown as typeof fetch;
-        const h = await harness();
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('no-lesson');
-        // Evidence is appended before the provider is asked; nothing after it ran.
-        expect(h.host.calls.map((call) => call.name)).toEqual(['appendNormalEndEvidence']);
+    it('defaults new projects on without overwriting an explicit off', async () => {
+        const h = await harness({}, false);
+        expect((await h.settings.read()).reviewEnabled).toBe(false);
+        await rm(join(h.dir, 'settings.json'));
+        expect(await h.worker.prepareReviewTurn!()).toEqual({ revision: 1 });
+        expect(await h.worker.reviewFinishedTurn({ ...input(), settingsRevision: 1 })).toBe('reviewed');
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('refuses a proposal missing its scope or validation', async () => {
-        const { scope: _scope, ...withoutScope } = proposal;
-        (globalThis as { fetch: typeof fetch }).fetch =
-            gatewayResponse({ proposal: withoutScope }) as unknown as typeof fetch;
+    it.each([
+        ['cancelled', { record: { ...record, endedNormally: false } }],
+        ['not-eligible', { record: { ...record, kind: 'automation' } }],
+        ['stale_settings', { settingsRevision: undefined }],
+        ['stale_settings', { settingsRevision: 1 }],
+        ['invalid_proposal', { proposal: { ...proposal, scope: '' } }],
+        ['invalid_proposal', { proposal: { ...proposal, trigger: 'x'.repeat(17000) } }],
+    ])('refuses %s before storage', async (outcome, patch) => {
         const h = await harness();
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('invalid_proposal');
-        expect(h.host.calls.map((call) => call.name)).toEqual(['appendNormalEndEvidence']);
+        expect(await h.worker.reviewFinishedTurn({ ...input(), ...patch } as Parameters<typeof h.worker.reviewFinishedTurn>[0])).toBe(outcome);
+        expect(h.host.calls).toHaveLength(0);
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('reports a candidate that already exists rather than reviewing it twice', async () => {
-        (globalThis as { fetch: typeof fetch }).fetch =
-            gatewayResponse({ proposal }) as unknown as typeof fetch;
-        const existing = hostFor({
-            enqueueCandidate: async () => ({
-                outcome: 'reviewed', candidateId: 'c1', revision: 3, payloadHash: 'h', status: 'reviewed',
-            }),
+    it('requires available host and real actor', async () => {
+        for (const [overrides, outcome] of [[{ host: null }, 'unsupported'], [{ identity: () => null }, 'permission_denied']] as const) {
+            const h = await harness(overrides);
+            expect(await h.worker.prepareReviewTurn!()).toBeNull();
+            expect(await h.worker.reviewFinishedTurn(input())).toBe(outcome);
+            await rm(h.dir, { recursive: true, force: true });
+        }
+    });
+    it('cancels preempted turns', async () => {
+        const h = await harness(); const controller = new AbortController(); controller.abort();
+        expect(await h.worker.reviewFinishedTurn({ ...input(), signal: controller.signal })).toBe('cancelled');
+        expect(h.host.calls).toHaveLength(0);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('keeps applicability and ignores forged authority fields', async () => {
+        const h = await harness();
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, validVersions: ['cml 2.4.3'],
+            confidence: 1, skillCandidate: true, sourceEventIds: ['forged'] } })).toBe('reviewed');
+        expect(h.host.calls.find(c => c.name === 'enqueueCandidate')!.input.candidate).toMatchObject({
+            validVersions: ['cml 2.4.3'], confidence: 0.5, skillCandidate: false, sourceEventIds: ['evt-1'],
         });
-        const h = await harness({ host: existing.handle });
-        h.host.calls.length = 0;
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('duplicate');
-        expect(existing.calls.some((call) => call.name === 'markReviewed')).toBe(false);
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('enqueues once for the same turn seen twice', async () => {
-        (globalThis as { fetch: typeof fetch }).fetch =
-            gatewayResponse({ proposal }) as unknown as typeof fetch;
+    it('deduplicates and rate limits across worker restarts', async () => {
         const h = await harness();
-        const signal = new AbortController().signal;
-        expect(await h.worker.reviewFinishedTurn({ record, signal })).toBe('reviewed');
-        // The ledger recognises the same evidence key and refuses to pay again.
-        expect(await h.worker.reviewFinishedTurn({ record, signal })).toBe('duplicate');
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('reviewed');
+        const restarted = createLessonReviewWorker(h.deps);
+        expect(await restarted.reviewFinishedTurn(input())).toBe('duplicate');
+        expect(await restarted.reviewFinishedTurn({ ...input(), record: { ...record, turnId: 't2', agentSummary: 'a distinct verified fix' } })).toBe('cooldown');
         await rm(h.dir, { recursive: true, force: true });
     });
-});
-
-describe('authorization withdrawn mid-review', () => {
-    it('writes nothing when the caller is no longer authorized', async () => {
+    it('never invents evidence after store refusal', async () => {
+        const host = hostFor({ appendNormalEndEvidence: async () => ({ outcome: 'refused' }) } as never);
+        const h = await harness({ host: host.handle });
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('not-eligible');
+        expect(host.calls).toHaveLength(0);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('releases a claim when evidence fails before enqueue, allowing a safe retry', async () => {
         const h = await harness();
-        let authorized = true;
-        // The lease lapses while the provider is still answering.
-        (h.deps as { identity: () => unknown }).identity = () =>
-            (authorized ? { userId: 'u1', projectId: 'p1', machineId: 'm1' } : null);
-        (globalThis as { fetch: typeof fetch }).fetch = (async () => {
-            authorized = false;
-            return new Response(JSON.stringify({
-                model: 'm', choices: [{ message: { content: JSON.stringify({ proposal }) } }],
-                usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
-            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        }) as unknown as typeof fetch;
-
-        const outcome = await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        });
-        expect(outcome).toBe('stale_settings');
-        expect(h.host.calls.some((call) => call.name === 'enqueueCandidate')).toBe(false);
-        expect(h.host.calls.some((call) => call.name === 'markReviewed')).toBe(false);
+        const original = h.deps.host!.service.appendNormalEndEvidence;
+        h.deps.host!.service.appendNormalEndEvidence = (async () => ({ outcome: 'refused' })) as never;
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('not-eligible');
+        h.deps.host!.service.appendNormalEndEvidence = original;
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('reviewed');
         await rm(h.dir, { recursive: true, force: true });
     });
-
-    it('spends nothing when authorization is already gone', async () => {
-        const h = await harness({ identity: () => null });
-        const fetchImpl = vi.fn();
-        (globalThis as { fetch: typeof fetch }).fetch = fetchImpl as unknown as typeof fetch;
-        expect(await h.worker.reviewFinishedTurn({
-            record, signal: new AbortController().signal,
-        })).toBe('permission_denied');
-        expect(fetchImpl).not.toHaveBeenCalled();
+    it('does not report reviewed when the store refuses the transition', async () => {
+        const h = await harness();
+        h.deps.host!.service.markReviewed = async () => ({ outcome: 'unsupported_version' });
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('runtime_error');
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('keeps the claim when enqueue throws because the write may already have committed', async () => {
+        const h = await harness();
+        h.deps.host!.service.enqueueCandidate = async () => { throw new Error('lost response'); };
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('runtime_error');
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('duplicate');
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('revokes the CML write binding immediately when foreground aborts inside enqueue', async () => {
+        const h = await harness(); const controller = new AbortController();
+        h.deps.host!.service.enqueueCandidate = async (request: any) => {
+            await Promise.resolve();
+            controller.abort();
+            await expect(h.deps.issuer!.resolve(request.binding)).rejects.toThrow();
+            throw new Error('binding revoked');
+        };
+        expect(await h.worker.reviewFinishedTurn({ ...input(), signal: controller.signal })).toBe('cancelled');
+        expect(h.host.calls.some(c => c.name === 'markReviewed')).toBe(false);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it.each(['settings', 'identity', 'abort'] as const)('fences %s revoked while evidence is being persisted', async reason => {
+        let authorized = true; const controller = new AbortController();
+        const h = await harness({ identity: () => authorized ? { userId: 'u1', projectId: 'p1', machineId: 'm1' } : null });
+        h.deps.host!.service.appendNormalEndEvidence = (async () => {
+            if (reason === 'settings') await h.settings.write({ expectedRevision: 2, recallEnabled: true, reviewEnabled: false, dailyMicroUsd: 0, dailyTokens: 0 });
+            if (reason === 'identity') authorized = false;
+            if (reason === 'abort') controller.abort();
+            return { outcome: 'persisted', eventId: 'evt-1' };
+        }) as never;
+        expect(await h.worker.reviewFinishedTurn({ ...input(), signal: controller.signal })).toBe(reason === 'abort' ? 'cancelled' : 'stale_settings');
+        expect(h.host.calls.some(c => c.name === 'enqueueCandidate')).toBe(false);
         await rm(h.dir, { recursive: true, force: true });
     });
 });

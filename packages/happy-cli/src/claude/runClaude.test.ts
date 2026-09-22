@@ -260,7 +260,7 @@ async function startRemoteRunClaudeHarness(opts: {
         await stopRun();
         throw new Error('runClaude harness did not start');
     }
-    const runtimeSession = { thinking: false, cleanup: vi.fn() };
+    const runtimeSession = { thinking: false, cleanup: vi.fn(), cancelLessonReview: vi.fn() };
     loopOptions.onSessionReady(runtimeSession);
     const goalActionHandler = registerHandler.mock.calls.find(([method]) => method === 'goal-action')?.[1];
 
@@ -1488,6 +1488,8 @@ describe('runClaude remote JSONL scanner', () => {
             meta: {},
         });
 
+        expect(harness.runtimeSession.cancelLessonReview).toHaveBeenCalledTimes(2);
+        expect(harness.runtimeSession.cancelLessonReview.mock.invocationCallOrder[1]).toBeLessThan(harness.sessionClient.drainAttachmentsForUserMessage.mock.invocationCallOrder[1]);
         expect(harness.sessionClient.drainAttachmentsForUserMessage).toHaveBeenCalledTimes(2);
         grantDeferred.resolve(Response.json({
             ok: false,

@@ -112,6 +112,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const startedGeneration = (): GenerationProof | null => generationProofs.current();
 
     async function abort() {
+        session.cancelLessonReview();
         if (abortController && !abortController.signal.aborted) {
             /*
              * Recorded before the abort, not after. A provider that handles
@@ -443,11 +444,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
+                    lessonProposalTurn: session.lessonProposalTurn,
+                    lessonReviewLifecycle: session.lessonReviewLifecycle,
                     /*
-                     * One host for the whole session, one observation buffer
-                     * for the whole session. A fresh buffer per generation
-                     * would drop a failure observed just before a restart and
-                     * with it the recovery it was half of.
+                     * The host and completed-turn history belong to the session.
+                     * The shared observation buffer is drained at every turn and
+                     * generation boundary; interrupted work is never evidence
+                     * for a later successful turn.
                      */
                     ...(session.lessons
                         ? {
@@ -783,6 +786,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+        session.cancelLessonReview();
         /*
          * The verdict for this run, reported once, and only for a run that was
          * asked to stop.

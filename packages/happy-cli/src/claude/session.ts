@@ -1,3 +1,4 @@
+import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { ApiClient, ApiSessionClient } from "@/lib";
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { EnhancedMode } from "./loop";
@@ -10,6 +11,12 @@ import type { McpConfigSource } from './mcpConfigSynchronizer';
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 
 import type { LessonSessionHost } from '@/memory/lessonSessionHost';
+
+/** Survives SDK generations, but is reset with the actual conversation. */
+export interface ClaudeLessonReviewLifecycle {
+    controller: AbortController;
+    completedAssistantTurns: number;
+}
 
 export class Session {
     readonly path: string;
@@ -30,6 +37,14 @@ export class Session {
      * installation without a lesson host.
      */
     readonly lessons?: LessonSessionHost;
+    readonly lessonProposalTurn?: LessonProposalTurn;
+    readonly lessonReviewLifecycle: ClaudeLessonReviewLifecycle = {
+        controller: new AbortController(), completedAssistantTurns: 0,
+    };
+    cancelLessonReview = (): void => {
+        this.lessonReviewLifecycle.controller.abort();
+        this.lessonProposalTurn?.cancel();
+    };
     claudeArgs?: string[];  // Made mutable to allow filtering
     mcpServers: Record<string, any>;
     readonly mcpConfig?: McpConfigSource;
@@ -69,6 +84,7 @@ export class Session {
         managedSettingsLockdown?: boolean,
         managedRun?: boolean,
         lessons?: LessonSessionHost,
+        lessonProposalTurn?: LessonProposalTurn,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
         mcpConfig?: McpConfigSource,
@@ -100,6 +116,7 @@ export class Session {
         this.managedSettingsLockdown = opts.managedSettingsLockdown;
         this.managedRun = opts.managedRun;
         this.lessons = opts.lessons;
+        this.lessonProposalTurn = opts.lessonProposalTurn;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
         this.mcpConfig = opts.mcpConfig;
@@ -133,6 +150,7 @@ export class Session {
      * Cleanup resources (call when session is no longer needed)
      */
     cleanup = (): void => {
+        this.cancelLessonReview();
         clearInterval(this.keepAliveInterval);
         this.sessionFoundCallbacks = [];
         logger.debug('[Session] Cleaned up resources');
@@ -201,6 +219,8 @@ export class Session {
      * Clear the current session ID (used by /clear command)
      */
     clearSessionId = (): void => {
+        this.cancelLessonReview();
+        this.lessonReviewLifecycle.completedAssistantTurns = 0;
         this.sessionId = null;
         logger.debug('[Session] Session ID cleared');
     }

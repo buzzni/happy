@@ -102,6 +102,23 @@ describe('createLessonBindingIssuer', () => {
         await expect(issuer.verifier()(handle)).rejects.toMatchObject({ reason: 'project-mismatch' });
     });
 
+    it.each(['released', 'expired', 'runtime-closed'] as const)('rejects %s while generation lookup is pending', async reason => {
+        let resume: ((generation: number) => void) | undefined;
+        let pause = false;
+        const { issuer, state } = issuerFor({ generation: () => pause
+            ? new Promise<number>(resolve => { resume = resolve; })
+            : Promise.resolve(1) });
+        const issued = await issuer.issue(identity);
+        pause = true;
+        const pending = issuer.verifier()(issued.handle);
+        expect(resume).toBeTypeOf('function');
+        if (reason === 'released') issued.release();
+        if (reason === 'expired') state.clock += identity.ttlMs;
+        if (reason === 'runtime-closed') state.closed = true;
+        resume!(1);
+        await expect(pending).rejects.toMatchObject({ reason });
+    });
+
     it('never lets a caller choose its own actor id or project hash', async () => {
         const { issuer } = issuerFor();
         const { handle } = await issuer.issue({

@@ -45,7 +45,6 @@ import {
     lessonReviewOutcomePath,
     lessonSettingsPath,
 } from './lessonSettingsStore';
-import type { LessonGatewayConfig, LessonPriceQuote } from './lessonReviewGateway';
 import type { LessonTurnKind } from './lessonTurnEvidence';
 
 /**
@@ -140,79 +139,6 @@ function studioOrigin(env: NodeJS.ProcessEnv): string | null {
 }
 
 /**
- * Asks the studio for this project's gateway and its settled price.
- *
- * Returns null on anything short of a complete, priced answer: an unpriced
- * gateway is not a cheaper gateway, it is one nothing may be spent against.
- */
-async function readGateway(input: {
-    studioBaseUrl: string;
-    token: string;
-    machineId: string;
-    projectId: string;
-    /** The caller this session acts as; the studio's answer must agree. */
-    userId: string;
-    sessionAuthority?: { sessionId: string; callerGrant: string };
-}): Promise<{ config: LessonGatewayConfig; quote: LessonPriceQuote; defaultModel: string } | null> {
-    const url = new URL(
-        `/api/projects/${encodeURIComponent(input.projectId)}/${input.sessionAuthority ? 'lesson-host/gateway' : 'lesson-gateway/config'}`,
-        input.studioBaseUrl,
-    );
-    if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5_000);
-    timer.unref?.();
-    try {
-        const response = await fetch(url.toString(), {
-            method: 'POST',
-            redirect: 'error',
-            signal: controller.signal,
-            headers: {
-                Authorization: `Bearer ${input.token}`,
-                'X-Aplus-Machine-Id': input.machineId,
-                'Content-Type': 'application/json',
-            },
-            ...(input.sessionAuthority ? { body: JSON.stringify({ machineId: input.machineId, ...input.sessionAuthority }) } : {}),
-        });
-        if (!response.ok) return null;
-        const body = await response.json() as {
-            configured?: unknown;
-            gateway?: { baseUrl?: unknown; model?: unknown; apiKey?: unknown; gatewayProjectId?: unknown; actorUserId?: unknown };
-            quote?: LessonPriceQuote;
-        };
-        if (body.configured !== true || !body.gateway || !body.quote) return null;
-        const { baseUrl, model, apiKey, gatewayProjectId, actorUserId } = body.gateway;
-        if (typeof baseUrl !== 'string' || typeof apiKey !== 'string'
-            || typeof gatewayProjectId !== 'string' || typeof model !== 'string') return null;
-        /*
-         * The studio says which caller it resolved this config for. If that is
-         * not the caller this session runs as, the credential belongs to a
-         * different attribution and must not be used here.
-         */
-        if (actorUserId !== input.userId) return null;
-        /*
-         * `model` is dropped from the config on purpose.
-         *
-         * It is the gateway's registered default, and it is needed to check
-         * that a price exists for what will actually be called — which the
-         * caller does below, against the quote. Sending it as the request
-         * model would pin every review to that value even after an operator
-         * changes the default, so the request omits it and the gateway applies
-         * its own.
-         */
-        return {
-            config: { baseUrl, apiKey, projectId: gatewayProjectId },
-            quote: body.quote,
-            defaultModel: model,
-        };
-    } catch {
-        return null;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-/**
  * Starts the bootstrap in the background and returns a host immediately.
  *
  * The bootstrap makes three authenticated calls. Awaiting them before the
@@ -291,6 +217,9 @@ export function createLazyLessonSessionHost(
             },
         },
         review: {
+            async prepareReviewTurn() {
+                return await settled()?.review?.prepareReviewTurn?.() ?? null;
+            },
             async reviewFinishedTurn(args) {
                 const host = settled()?.review;
                 return host ? host.reviewFinishedTurn(args) : 'unsupported';
@@ -510,24 +439,6 @@ async function bootstrapLessonSessionHost(input: {
             issuer,
             settings,
             budget: new LessonReviewBudget(lessonReviewLedgerPath(stateRoot)),
-            gateway: async () => {
-                const resolved = await readGateway({
-                    studioBaseUrl: origin, token: input.accountToken!, machineId: input.machineId!,
-                    projectId, userId, sessionAuthority: sessionAuthority(),
-                });
-                if (!resolved) return null;
-                /*
-                 * The quote must price the model the gateway will actually
-                 * use. The request omits the model, so the registered default
-                 * is what gets called — and a quote for anything else prices a
-                 * call that will not happen.
-                 */
-                if (resolved.quote.model !== resolved.defaultModel) return null;
-                // The gateway spec pins `X-Project-Id` to the project's real
-                // id; a different one would attribute spend elsewhere.
-                if (resolved.config.projectId !== projectId) return null;
-                return { config: resolved.config, quote: resolved.quote };
-            },
             identity: liveIdentity,
             onOutcome: (outcome) => {
                 logger.debug(`[lesson-review] ${outcome}`);

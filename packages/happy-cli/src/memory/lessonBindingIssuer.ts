@@ -147,6 +147,12 @@ export function createLessonBindingIssuer(options: LessonBindingIssuerOptions): 
         if (entry.binding.generation !== await options.generation()) {
             throw new LessonBindingError('stale-generation');
         }
+        // Reading the durable generation yields. A foreground abort can release
+        // this handle while that read is pending, so validate liveness again at
+        // the final synchronous boundary CML uses immediately before a write.
+        if (entry.released) throw new LessonBindingError('released');
+        if (now() >= entry.expiresAt) throw new LessonBindingError('expired');
+        if (options.closed()) throw new LessonBindingError('runtime-closed');
         const projectHash = options.projectHash();
         if (!projectHash || projectHash !== entry.binding.projectHash) {
             throw new LessonBindingError('project-mismatch');

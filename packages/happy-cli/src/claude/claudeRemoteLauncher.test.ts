@@ -43,7 +43,10 @@ describe('Claude model changes across provider restarts', () => {
             return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
         });
         queue.push('turn-0', modes[0]);
+        const lessonReviewLifecycle = { controller: new AbortController(), completedAssistantTurns: 0 };
+        const cancelLessonReview = vi.fn(() => lessonReviewLifecycle.controller.abort());
         const session = {
+            lessonReviewLifecycle, cancelLessonReview,
             sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
             consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
@@ -51,6 +54,9 @@ describe('Claude model changes across provider restarts', () => {
         await claudeRemoteLauncher(session);
         expect(received).toEqual(modes.map((mode, index) => ({ text: `turn-${index}`, model: mode.model, effort: mode.effort })));
         expect(launches).toHaveLength(3);
+        expect(lessonReviewLifecycle.completedAssistantTurns).toBe(modes.length);
+        expect(cancelLessonReview).toHaveBeenCalled();
+        expect(lessonReviewLifecycle.controller.signal.aborted).toBe(true);
         expect(client.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'Process exited unexpectedly' }));
     });
 });

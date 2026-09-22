@@ -163,6 +163,7 @@ describe('lesson-host-v1', () => {
             lessonOffset: 0, candidateOffset: 0, nextLessonOffset: 100, nextCandidateOffset: null,
         });
         expect((result as any).snapshot.settings).toEqual(LESSON_SETTINGS_DEFAULT);
+        expect((result as any).snapshot.reviewExecution).toBe('session');
         await rm(dir, { recursive: true, force: true });
     });
 
@@ -396,12 +397,12 @@ describe('lesson-host-v1', () => {
             recallEnabled: true, reviewEnabled, dailyMicroUsd: 500, dailyTokens: 10_000,
         });
 
-        it('writes settings and fences in-flight work by bumping the generation', async () => {
+        it('writes session settings, clears legacy paid budgets and fences in-flight work', async () => {
             const { handle, dir, generation } = await harness();
             const request = configure(1);
             const result = await handle({ ...request, grantEnvelope: grantFor(request, ['lesson.manage']) });
             expect(result.ok).toBe(true);
-            expect((result as any).snapshot.settings).toMatchObject({ revision: 2, reviewEnabled: true, dailyMicroUsd: 500 });
+            expect((result as any).snapshot.settings).toMatchObject({ revision: 2, reviewEnabled: true, dailyMicroUsd: 0, dailyTokens: 0 });
             // The durable revision *is* the fence; there is no separate counter.
             expect(await generation()).toBe(2);
             await rm(dir, { recursive: true, force: true });

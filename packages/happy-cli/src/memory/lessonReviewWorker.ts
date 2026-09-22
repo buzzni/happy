@@ -1,26 +1,5 @@
-/**
- * Turns an eligible finished turn into a reviewed candidate — or into a typed
- * reason why it did not.
- *
- * The order is deliberate and every step can stop the run:
- *
- *  1. review must be enabled in the durable settings;
- *  2. the foreground must not be waiting (the abort signal is the turn loop's
- *     own idle wait, so a newly arrived message preempts this immediately);
- *  3. a resolved gateway config and a settled price must both exist — no
- *     price, no paid call, and "unknown" is never read as free;
- *  4. the budget ledger must reserve, which is also what makes a retried turn
- *     idempotent and what enforces the cooldown;
- *  5. only then is a provider called, exactly once, with no retry.
- *
- * The proposal that comes back is never a lesson. It is enqueued as a
- * candidate and marked reviewed, which is a proposal a person still has to
- * approve. This worker holds `lesson.review` and never `lesson.manage`, so it
- * could not persist a lesson even if it tried.
- */
 import { logger } from '@/ui/logger';
 
-import { reviewLessonWithGateway, type LessonGatewayConfig, type LessonPriceQuote } from './lessonReviewGateway';
 import type { LessonReviewBudget } from './lessonReviewBudget';
 import type { LessonBindingIssuer } from './lessonBindingIssuer';
 import type { LessonHostHandle } from './cmlLessonHost';
@@ -56,19 +35,16 @@ export interface LessonReviewWorkerDeps {
     issuer: LessonBindingIssuer | null;
     settings: LessonSettingsStore;
     budget: LessonReviewBudget;
-    /** Resolved by authenticated Core config retrieval; never from env. */
-    gateway(): Promise<{ config: LessonGatewayConfig; quote: LessonPriceQuote } | null>;
     /**
      * Who this worker acts as.
      *
      * `machineId` is the daemon's real machine, not a placeholder: the binding
      * issuer records it and CML stores it on the trace, so an empty string
-     * would attribute every background candidate to no machine at all.
+     * would attribute every candidate to no machine at all.
      */
     identity(): Promise<{ projectId: string; userId: string; machineId: string } | null>
         | { projectId: string; userId: string; machineId: string } | null;
     onOutcome?(outcome: LessonReviewOutcome): void;
-    now?: () => number;
 }
 
 /** Shapes the model's proposal into CML's candidate payload, or refuses it. */
@@ -88,7 +64,7 @@ function toCandidate(
         if (Array.isArray(item)) {
             return item.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
         }
-        // The gateway instruction asks for an array; a single string is
+        // The proposal instruction asks for an array; a single string is
         // accepted rather than dropped, because dropping it would silently
         // produce a candidate with no validation at all.
         return typeof item === 'string' && item.trim().length > 0 ? [item.trim()] : [];
@@ -126,271 +102,120 @@ function toCandidate(
 }
 
 export interface LessonReviewWorker {
-    /**
-     * Called when a turn ends normally.
-     *
-     * The evidence is appended to the store first, and the ids that come back
-     * are what anchor the candidate. No caller supplies them.
-     */
+    /** Optional for compatibility with older provider host adapters. */
+    prepareReviewTurn?(): Promise<{ revision: number } | null>;
     reviewFinishedTurn(input: {
         record: LessonTurnRecord;
-        /** The turn loop's idle wait; a new foreground message aborts it. */
         signal: AbortSignal;
+        /** Untrusted model proposal; never a lesson or permission grant. */
+        proposal?: unknown;
+        /** Captured before this foreground turn, not supplied by the model. */
+        settingsRevision?: number;
     }): Promise<LessonReviewOutcome>;
 }
 
-/** How often a running review re-reads the settings it was planned against. */
-const SETTINGS_POLL_MS = 1_000;
-
+/** Persists bounded foreground proposals. Never starts another model/API call. */
 export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonReviewWorker {
-    const now = deps.now ?? Date.now;
     let running = false;
-
-    function report(outcome: LessonReviewOutcome): LessonReviewOutcome {
+    const report = (outcome: LessonReviewOutcome): LessonReviewOutcome => {
         deps.onOutcome?.(outcome);
         return outcome;
-    }
-
+    };
     return {
-        async reviewFinishedTurn({ record, signal }) {
+        async prepareReviewTurn() {
+            try {
+                if (!deps.host || !deps.issuer || !(await deps.identity())) return null;
+                const settings = await deps.settings.read();
+                return settings.reviewEnabled ? { revision: settings.revision } : null;
+            } catch { return null; }
+        },
+        async reviewFinishedTurn({ record, signal, proposal, settingsRevision }) {
             if (!deps.host || !deps.issuer) return report('unsupported');
-            // One review at a time per project; the ledger enforces the same
-            // thing across processes, this just avoids the wasted work.
             if (running) return report('busy');
-
-            /*
-             * Re-confirmed before anything is spent. A review that began under
-             * an authorization since revoked would charge an account the
-             * studio no longer associates with this project.
-             */
-            const identity = await deps.identity();
-            if (!identity) return report('permission_denied');
-            const decision = evaluateLessonTurn(record, identity.projectId);
-            if (!decision.eligible) {
-                return report(decision.reason === 'aborted' ? 'cancelled' : 'not-eligible');
-            }
-            let settings;
-            try {
-                settings = await deps.settings.read();
-            } catch (error) {
-                // Unreadable settings are not permission to spend.
-                return report(error instanceof LessonSettingsError ? 'settings_unreadable' : 'runtime_error');
-            }
-            if (!settings.reviewEnabled) return report('disabled');
-            // The revision this run is planned against. Every later step is
-            // checked against it, so a change mid-run stops the run rather
-            // than committing under settings nobody chose.
-            const plannedRevision = settings.revision;
-            if (signal.aborted) return report('cancelled');
-            // An install without the evidence entry point cannot anchor a
-            // candidate, and nothing here will invent an id to work around it.
-            if (!deps.host.service.appendNormalEndEvidence) return report('unsupported');
-
+            // Claim before awaits so overlapping callbacks cannot both begin.
             running = true;
-            /*
-             * Issued before anything is paid for, and held for the whole run.
-             *
-             * This is what actually enforces "settings changed, stop": the
-             * issuer's generation is the durable settings revision, so a
-             * `configure` anywhere — this process or another — makes every
-             * later `resolve` of this handle fail. Checking `signal.aborted`
-             * alone would only catch the foreground, never a settings change.
-             */
-            let issued;
+            let claimToRelease: string | undefined;
+            let releaseOnAbort: (() => void) | undefined;
+            let issued: Awaited<ReturnType<LessonBindingIssuer['issue']>> | undefined;
             try {
+                const identity = await deps.identity();
+                if (!identity) return report('permission_denied');
+                const decision = evaluateLessonTurn(record, identity.projectId);
+                if (!decision.eligible) return report(decision.reason === 'aborted' ? 'cancelled' : 'not-eligible');
+                const settings = await deps.settings.read();
+                if (!settings.reviewEnabled) return report('disabled');
+                if (signal.aborted) return report('cancelled');
+                // No proposal is not permission to fall back to a paid gateway.
+                if (proposal === undefined || proposal === null) return report('no-lesson');
+                if (settingsRevision !== settings.revision) return report('stale_settings');
+                if (!deps.host.service.appendNormalEndEvidence) return report('unsupported');
+                // Bound untrusted model output before passing it into storage.
+                let serialized: string;
+                try { serialized = JSON.stringify(proposal); } catch { return report('invalid_proposal'); }
+                if (!serialized || Buffer.byteLength(serialized, 'utf8') > 16_384
+                    || !toCandidate(proposal, record, [])) return report('invalid_proposal');
+                const plannedRevision = settings.revision;
                 issued = await deps.issuer.issue({
-                    projectId: identity.projectId,
-                    userId: identity.userId,
-                    machineId: identity.machineId,
-                    sessionId: record.sessionId,
-                    // Review only. The transition to `accepted` needs
-                    // `lesson.manage`, which only a person's grant carries.
-                    capabilities: ['lesson.review'],
-                    /*
-                     * This host watched this turn end normally, and says so
-                     * here rather than in the request. CML checks the session
-                     * against this list, so a caller cannot assert its own
-                     * completion — which is the whole point of the check.
-                     */
-                    normalEndSessionIds: [record.sessionId],
-                    ttlMs: 120_000,
+                    ...identity, sessionId: record.sessionId, capabilities: ['lesson.review'],
+                    normalEndSessionIds: [record.sessionId], ttlMs: 120_000,
                 });
-            } catch {
-                running = false;
-                return report('permission_denied');
-            }
-            /**
-             * True only while this run may still act.
-             *
-             * Three things, not one. The settings revision catches a change to
-             * the configuration, but the binding was minted for two minutes
-             * and its identity was read once — so a signed lease that expires
-             * or an ACL withdrawn mid-call would otherwise let a slow gateway
-             * response still enqueue. Re-reading the identity is what makes
-             * "revoked" mean "no late write", which is the requirement.
-             */
-            const stillCurrent = async (): Promise<boolean> => {
-                if (signal.aborted) return false;
-                try {
-                    if ((await deps.issuer!.resolve(issued.handle)).generation !== plannedRevision) {
-                        return false;
-                    }
-                } catch {
-                    return false;
-                }
-                // Goes through the same bounded authorization path a turn uses;
-                // a refused or lapsed lease answers null.
-                const now = await Promise.resolve(deps.identity()).catch(() => null);
-                if (!now) return false;
-                return now.userId === identity.userId
-                    && now.projectId === identity.projectId
-                    && now.machineId === identity.machineId;
-            };
-            /*
-             * One controller for both reasons a run must stop.
-             *
-             * The foreground aborts it directly. A settings change cannot —
-             * there is no event for it — so it is polled, and the poll aborts
-             * the same controller. Without this the provider call runs to
-             * completion after the user switched review off and the money is
-             * already spent; fencing the write afterwards stops the record but
-             * not the charge, and the user asked for both.
-             */
-            const controller = new AbortController();
-            const stopForeground = () => controller.abort();
-            signal.addEventListener('abort', stopForeground, { once: true });
-            const poll = setInterval(() => {
-                void stillCurrent().then((live) => { if (!live) controller.abort(); });
-            }, SETTINGS_POLL_MS);
-            poll.unref?.();
-            try {
-                /*
-                 * Evidence first, provider second. The ids CML returns are the
-                 * anchor for the candidate, and appending costs nothing — so a
-                 * turn whose evidence will not persist is found out before any
-                 * money is spent rather than after.
-                 */
-                const appended = await deps.host.service.appendNormalEndEvidence({
-                    version: 1,
-                    requestId: `evidence:${decision.evidence.evidenceKey}`,
-                    binding: issued.handle,
-                    generation: plannedRevision,
-                    evidenceKey: decision.evidence.evidenceKey,
-                    sessionId: record.sessionId,
-                    content: decision.evidence.transcript,
-                }) as { outcome?: string; eventId?: unknown };
-                // One persisted event, and only when CML says it persisted.
-                if (appended?.outcome !== 'persisted' || typeof appended.eventId !== 'string' || !appended.eventId) {
-                    return report('not-eligible');
-                }
-                const sourceEventIds = [appended.eventId];
-
-                const gateway = await deps.gateway();
-                // No config and no price are the same answer to the only
-                // question that matters: may this spend? It may not.
-                if (!gateway) return report('price_unknown');
-
+                releaseOnAbort = () => issued?.release();
+                signal.addEventListener('abort', releaseOnAbort, { once: true });
+                if (signal.aborted) releaseOnAbort();
+                const binding = issued.handle;
+                const stillCurrent = async () => {
+                    if (signal.aborted) return false;
+                    try {
+                        if ((await deps.issuer!.resolve(binding)).generation !== plannedRevision) return false;
+                        const current = await deps.settings.read();
+                        if (!current.reviewEnabled || current.revision !== plannedRevision) return false;
+                        const actor = await deps.identity();
+                        return !signal.aborted && actor?.projectId === identity.projectId && actor.userId === identity.userId
+                            && actor.machineId === identity.machineId;
+                    } catch { return false; }
+                };
+                const stale = () => report(signal.aborted ? 'cancelled' : 'stale_settings');
+                if (!(await stillCurrent())) return stale();
                 const requestId = `review:${decision.evidence.evidenceKey}`;
-                let fenced = false;
-                if (!(await stillCurrent())) return report('stale_settings');
-                const result = await reviewLessonWithGateway({
-                    enabled: settings.reviewEnabled,
-                    // Re-read on every internal checkpoint, so a settings change
-                    // or a foreground message stops an in-flight review.
-                    /*
-                     * Synchronous by contract, so it reports the last observed
-                     * state rather than pretending to re-read the settings file
-                     * here. The authoritative re-check happens at each await
-                     * boundary below, through `stillCurrent()`.
-                     */
-                    // Reports the controller, which both the foreground and
-                    // the settings poll drive.
-                    current: () => !controller.signal.aborted && !fenced,
-                    signal: controller.signal,
-                    gateway: gateway.config,
-                    quote: gateway.quote,
-                    identity: {
-                        userId: identity.userId,
-                        projectId: identity.projectId,
-                        sessionId: record.sessionId,
-                    },
-                    budget: deps.budget,
-                    requestId,
+                const claim = await deps.budget.claimSession({ requestId, evidenceKey: decision.evidence.evidenceKey,
+                    projectId: identity.projectId, sessionId: record.sessionId, cooldownMs: 30 * 60_000 });
+                if (!claim.ok) return report(['duplicate', 'cooldown', 'busy'].includes(claim.reason)
+                    ? claim.reason as LessonReviewOutcome : 'runtime_error');
+                claimToRelease = requestId;
+                if (!(await stillCurrent())) return stale();
+                const appended = await deps.host.service.appendNormalEndEvidence({
+                    version: 1, requestId: `evidence:${decision.evidence.evidenceKey}`, binding,
+                    generation: plannedRevision, evidenceKey: decision.evidence.evidenceKey,
+                    sessionId: record.sessionId, content: decision.evidence.transcript,
+                }) as { outcome?: string; eventId?: unknown };
+                if (appended?.outcome !== 'persisted' || typeof appended.eventId !== 'string' || !appended.eventId) return report('not-eligible');
+                if (!(await stillCurrent())) return stale();
+                const candidate = toCandidate(proposal, record, [appended.eventId])!;
+                // Once enqueue starts, keep the claim even if its result is lost.
+                claimToRelease = undefined;
+                const enqueued = await deps.host.service.enqueueCandidate({
+                    version: 1, requestId, binding, generation: plannedRevision,
                     evidenceKey: decision.evidence.evidenceKey,
-                    evidence: decision.evidence.transcript,
-                    limits: { dailyMicroUsd: settings.dailyMicroUsd, dailyTokens: settings.dailyTokens },
-                    now,
-                });
-                if (!result.ok) {
-                    const known: readonly LessonReviewOutcome[] = [
-                        'disabled', 'cancelled', 'price_unknown', 'budget_exceeded',
-                        'usage_unknown', 'duplicate', 'busy', 'cooldown', 'invalid_proposal',
-                        // Each of these is a specific refusal the gateway made.
-                        // Flattening them into `runtime_error` would tell a user
-                        // "something broke" when the truth is "the evidence was
-                        // private", "it did not fit" or "the gateway is wrong".
-                        'evidence_budget', 'private_evidence', 'usage_exceeded',
-                        'invalid_gateway', 'permission_denied',
-                    ];
-                    const reason = result.reason as LessonReviewOutcome;
-                    // A reason this worker does not know is reported as a
-                    // runtime error rather than mapped onto a nearby one.
-                    return report(known.includes(reason) ? reason : 'runtime_error');
-                }
-                // `{"proposal": null}` is the model saying there is nothing
-                // reusable here. That is a successful review, not a failure.
-                if (result.proposal === null) return report('no-lesson');
-
-                const candidate = toCandidate(result.proposal, record, sourceEventIds);
-                if (!candidate) return report('invalid_proposal');
-                /*
-                 * The decisive check. The provider call took time, and review
-                 * may have been switched off during it — writing a candidate
-                 * now would persist work the user already stopped.
-                 */
-                if (!(await stillCurrent())) {
-                    fenced = true;
-                    return report(signal.aborted ? 'cancelled' : 'stale_settings');
-                }
-
-                {
-                    const generation = (await deps.issuer.resolve(issued.handle)).generation;
-                    const enqueued = await deps.host.service.enqueueCandidate({
-                        version: 1, requestId, binding: issued.handle, generation,
-                        evidenceKey: decision.evidence.evidenceKey,
-                        payloadHash: deps.host.hashCandidatePayload(candidate),
-                        candidate,
-                    }) as { candidateId?: string; revision?: number; payloadHash?: string; status?: string };
-                    if (!enqueued?.candidateId || typeof enqueued.revision !== 'number' || !enqueued.payloadHash) {
-                        return report('runtime_error');
-                    }
-                    // Already past `pending` — a restart re-observing the same
-                    // turn must not review it twice.
-                    if (enqueued.status !== 'pending') return report('duplicate');
-
-                    await deps.host.service.markReviewed({
-                        version: 1, requestId: `${requestId}:reviewed`, binding: issued.handle, generation,
-                        candidateId: enqueued.candidateId,
-                        expectedRevision: enqueued.revision,
-                        payloadHash: enqueued.payloadHash,
-                    });
-                    return report('reviewed');
-                }
+                    payloadHash: deps.host.hashCandidatePayload(candidate), candidate,
+                }) as { candidateId?: string; revision?: number; payloadHash?: string; status?: string };
+                if (!enqueued?.candidateId || typeof enqueued.revision !== 'number' || !enqueued.payloadHash) return report('runtime_error');
+                if (enqueued.status !== 'pending') return report('duplicate');
+                if (!(await stillCurrent())) return stale();
+                const reviewed = await deps.host.service.markReviewed({
+                    version: 1, requestId: `${requestId}:reviewed`, binding, generation: plannedRevision,
+                    candidateId: enqueued.candidateId, expectedRevision: enqueued.revision, payloadHash: enqueued.payloadHash,
+                }) as { outcome?: string };
+                return report(reviewed?.outcome === 'reviewed' ? 'reviewed' : 'runtime_error');
             } catch (error) {
-                const message = (error as Error).message ?? '';
-                if (/private|credential|forbidden instruction/i.test(message)) return report('rejected_content');
-                /*
-                 * The classification only, never the message. A CML or Zod
-                 * error quotes the value it rejected, which here is candidate
-                 * text — possibly the very content that was refused for being
-                 * private. Logging it would write it to disk.
-                 */
+                if (signal.aborted) return report('cancelled');
+                if (error instanceof LessonSettingsError) return report('settings_unreadable');
+                if (/private|credential|forbidden instruction/i.test((error as Error).message ?? '')) return report('rejected_content');
                 logger.debug('[lesson-review] review failed; see the reported outcome');
                 return report('runtime_error');
             } finally {
-                clearInterval(poll);
-                signal.removeEventListener('abort', stopForeground);
-                issued.release();
+                if (claimToRelease) await deps.budget.cancelSessionClaim(claimToRelease);
+                if (releaseOnAbort) signal.removeEventListener('abort', releaseOnAbort);
+                issued?.release();
                 running = false;
             }
         },
