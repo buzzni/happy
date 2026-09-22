@@ -1,6 +1,7 @@
 import type { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { delimiter, join } from 'node:path'
+import { homedir } from 'node:os'
 import { describe, expect, it, vi } from 'vitest'
 import {
   AiCredentialRuntimeError,
@@ -1981,6 +1982,74 @@ describe('AI credential machine runtime', () => {
     await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
       kind: 'CLAUDE_STATUS_INVALID',
     })
+  })
+
+  it('applies Claude credentials when uv is installed outside the daemon PATH', async () => {
+    const baseline = setup()
+    const environment = { Path: join(homedir(), 'system-bin'), UV_TOOL_BIN_DIR: '/separate-tools' }
+    const spawnCommand = vi.fn((_command, _args, options) => {
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
+      })
+      queueMicrotask(() => {
+        if (!options.env?.Path?.split(delimiter).includes(join(homedir(), '.local', 'bin'))) {
+          child.emit('error', Object.assign(new Error('uv not found'), { code: 'ENOENT' }))
+        } else {
+          child.emit('close', 0)
+        }
+      })
+      return child
+    }) as unknown as typeof spawn
+    const { runtime, supervisor } = setup({
+      execFile: (command, args, options) => command === 'uv'
+        ? runAiCredentialCommand(command, args, { ...options, environment }, spawnCommand)
+        : baseline.execFile(command, args, options),
+    })
+
+    await expect(runtime.apply({ provider: 'claude', payload: '{"token":"never-in-argv"}' }))
+      .resolves.toMatchObject({ provider: 'claude', configured: true })
+    expect(supervisor.enable).toHaveBeenCalledOnce()
+    expect(environment.Path).toBe(join(homedir(), 'system-bin'))
+  })
+
+  it.each([
+    ['uv', {}, join(homedir(), '.local', 'bin')],
+    ['uv', { UV_INSTALL_DIR: '/uv-bin', UV_TOOL_BIN_DIR: '/tool-bin' }, '/uv-bin'],
+    ['uv', { XDG_BIN_HOME: '/xdg-bin', UV_TOOL_BIN_DIR: '/tool-bin' }, '/xdg-bin'],
+    ['cswap', { UV_INSTALL_DIR: '/uv-bin', UV_TOOL_BIN_DIR: '/tool-bin' }, '/tool-bin'],
+  ] as const)('resolves %s using its own installation directory (%j)', async (command, overrides, binDir) => {
+    const environment = { Path: ['/system-bin', binDir].join(delimiter), ...overrides }
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+    const result = runAiCredentialCommand(command, ['--version'], { environment }, spawnCommand)
+    child.emit('close', 0)
+    await result
+
+    expect(spawnCommand).toHaveBeenCalledWith(command, ['--version'], expect.objectContaining({
+      env: { ...environment, Path: [binDir, '/system-bin'].join(delimiter) },
+      windowsHide: true,
+    }))
+    expect(environment.Path).toBe(['/system-bin', binDir].join(delimiter))
+  })
+
+  it.each([
+    ['ENOENT', 'COMMAND_NOT_AVAILABLE'],
+    ['EACCES', 'COMMAND_FAILED'],
+    ['EPERM', 'COMMAND_FAILED'],
+    ['EINVAL', 'COMMAND_FAILED'],
+  ])('reports %s from credential command startup as %s without leaking output', async (code, kind) => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+    const result = runAiCredentialCommand('uv', ['--version'], {}, spawnCommand)
+    child.stderr.emit('data', Buffer.from('secret-from-stderr'))
+    child.emit('error', Object.assign(new Error('secret-from-error'), { code }))
+
+    await expect(result).rejects.toMatchObject({ kind, message: `AI credential operation failed (${kind})` })
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL')
   })
 
   it('terminates commands that exceed their timeout without returning process output', async () => {
