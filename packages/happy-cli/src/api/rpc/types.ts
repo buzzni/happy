@@ -22,6 +22,7 @@ export type RpcHandlerMap = Map<string, RpcHandler>;
 export interface RpcRequest {
     method: string;
     params: string; // Base64 encoded encrypted params
+    rpcLatency?: unknown; // Optional versioned diagnostics, never authority.
 }
 
 /**
