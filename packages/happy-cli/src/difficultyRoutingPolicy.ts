@@ -4,6 +4,9 @@
 // package can replace the snapshot; do not import Desktop runtime paths.
 // Shared-only quality v2 removes bare CJK explanation trivial shortcuts;
 // Desktop OFF behavior is intentionally unchanged.
+// 2026-09-23: Desktop 이 hard/trivial 목적지를 GPT-6 세대와 Opus 5.5 로 옮겨 같이 따라간다.
+// routine 이 gpt-5.6-terra 에 남은 것도 Desktop 과 같다 — GPT-6 에 terra 대응 등급이 없다.
+// 세 모델 모두 최신 CLI 에서만 실행된다 (Claude Code 2.1.280+, Codex 0.157.0+).
 
 export type RoutableAgent = 'claude' | 'codex'
 export type Difficulty = 'trivial' | 'routine' | 'hard' | 'escalated'
@@ -26,13 +29,13 @@ export const USER_REQUEST_MODELS: Record<RoutableAgent, Record<Difficulty, Route
   claude: {
     trivial: { model: 'claude-haiku-4-5', effort: 'low' },
     routine: { model: 'claude-sonnet-5', effort: 'high' },
-    hard: { model: 'claude-opus-5', effort: 'high' },
+    hard: { model: 'claude-opus-5-5', effort: 'high' },
     escalated: { model: 'claude-fable-5-1', effort: 'high' },
   },
   codex: {
-    trivial: { model: 'gpt-5.6-luna', effort: 'low' },
+    trivial: { model: 'gpt-6-luna', effort: 'low' },
     routine: { model: 'gpt-5.6-terra', effort: 'high' },
-    hard: { model: 'gpt-5.6-sol', effort: 'high' },
+    hard: { model: 'gpt-6-sol', effort: 'high' },
     escalated: { model: 'gpt-6-astra', effort: 'medium' },
   },
 }
