@@ -2,7 +2,7 @@ import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
 import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { Server } from "socket.io";
-import { createAdapter } from "@socket.io/redis-streams-adapter";
+import { createIsolatedRedisAdapter } from "./socket/createIsolatedRedisAdapter";
 import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
@@ -101,12 +101,12 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             }
         });
 
-        io.adapter(createAdapter(streamClient, { maxLen: 200000, readCount: 2000 }));
+        io.adapter(createIsolatedRedisAdapter(streamClient, createRedisClient(), { maxLen: 200000, readCount: 2000 }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
         // Terminal sessions must be resolvable from the replica the daemon is
         // attached to, which is not necessarily the one that opened them.
-        // Uses its own client: the adapter's is parked in a blocking XREAD.
+        // Uses its own client independently of the cluster bus reader/writer.
         setTerminalSessionBackend(createRedisClient() as unknown as TerminalSessionBackend);
 
         // Track stream reader lag: wrap onRawMessage to capture last-read offset,
@@ -286,10 +286,10 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     // server that looks healthy while managed access is silently missing.
     const managedIo = startManagedSocket(app.server, {
         issuer: managedControl?.scopedTokens ?? null,
-        adapter: isRedisConfigured(process.env)
+        adapter: managedControl && isRedisConfigured(process.env)
             // Its own stream: managed traffic and legacy traffic must not share
             // a bus that either side can read.
-            ? createAdapter(createRedisClient(), {
+            ? createIsolatedRedisAdapter(createRedisClient(), createRedisClient(), {
                 streamName: 'socket.io.managed', maxLen: 200000, readCount: 2000,
             }) as never
             : undefined,
@@ -500,6 +500,6 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     });
 
     onShutdown('api', async () => {
-        await io.close();
+        await Promise.all([io.close(), managedIo?.close()]);
     });
 }
