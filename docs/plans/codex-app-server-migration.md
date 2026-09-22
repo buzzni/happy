@@ -82,3 +82,28 @@ The app-server sends ~60 event types we ignore. Notable ones for future:
 
 - [Codex app-server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
 - [experimental_resume broken — issue #4393](https://github.com/openai/codex/issues/4393)
+
+
+## Explicit login recovery (2026-09-22)
+
+`runCodex` exposes session-scoped `codex-auth-status` and `codex-auth-recover` v1 RPCs.
+The live status contains a runtime nonce, recovery generation, bounded authentication source,
+state, and availability. Recovery requests bind those values to an operation ID. A normal
+resume still reuses a live runner; it is not an authentication reload.
+
+`CodexAuthRecovery` serializes recovery against turn admission and rejects active provider
+requests, approvals, queued input, and managed/shared-machine authentication. During recovery,
+newly arriving input waits. Failed recovery keeps dispatch blocked until an explicit retry
+succeeds; goal-control RPCs are also blocked. No user prompt is replayed by recovery.
+
+`reconnectForAuth` waits for the old app-server process to exit, rebuilds the proxy/connection,
+checks `account/read` and ChatGPT `account/rateLimits/read`, then resumes the same thread with
+its saved defaults. Failure preserves the original thread and configuration. Proxy and API-key
+payers cannot be verified by these ChatGPT APIs and are reported as unverified, never as a
+confirmed account switch. Authentication data and raw provider errors stay out of recovery DTOs.
+
+The user must switch login at the session's actual authentication source. A separate Codex home
+or a proxy pool is not automatically changed by a default terminal login. The action does not
+change the Happy session owner or introduce another credential store. Deploy only after testing
+an actual two-account continuation and the released artifact; source-level tests are not proof
+that a running older session has this capability.
