@@ -211,11 +211,21 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             const currentTrace = trace;
             const end = currentTrace.begin('server-total');
             const originalCallback = callback;
+            let completionSent = false;
             callback = (response) => {
                 end(response?.ok ? 'resolved' : 'rejected');
-                originalCallback?.({ ...response, rpcLatency: {
+                const rpcLatency = {
                     ...requestTrace, server: currentTrace.snapshot(), daemon: daemonTiming, target: targetLocation,
-                } });
+                };
+                if (!completionSent && data?.rpcLatency?.completionEvent === true) {
+                    completionSent = true;
+                    // Send before the ACK: a preceding ACK write can make a volatile
+                    // packet unwritable. Best effort, requester only, never persisted
+                    // for connection recovery and never includes the RPC result.
+                    try { socket.volatile.emit('rpc-latency-complete', rpcLatency); }
+                    catch { /* Optional diagnostics must not prevent the original ACK. */ }
+                }
+                originalCallback?.({ ...response, rpcLatency });
             };
         }
 
