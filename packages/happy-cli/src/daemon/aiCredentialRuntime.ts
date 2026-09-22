@@ -362,6 +362,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     await purgeManagedProvider('zai')
     const apiKeyTargetEmail = claudeApiKeyTargetEmail(payload)
     const importedAccountIdentities = claudeImportedAccountIdentities(payload)
+    const verifyImportedAccounts = (details: ClaudeListDetails) => {
+      if (importedAccountIdentities === null) return
+      const remainingIdentities = new Set(details.accounts.map(claudeListAccountIdentity))
+      if (details.accounts.length !== importedAccountIdentities.size
+        || remainingIdentities.size !== importedAccountIdentities.size
+        || [...importedAccountIdentities].some((identity) => !remainingIdentities.has(identity))) {
+        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      }
+    }
     if (importedAccountIdentities !== null) await deps.supervisor.stop()
     await ensureClaudeSwap()
     const tempDir = await deps.makeTempDir()
@@ -398,11 +407,27 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         })
         details = parseClaudeListDetails(status.stdout)
       }
-      const remainingIdentities = new Set(details.accounts.map(claudeListAccountIdentity))
-      if (details.accounts.length !== importedAccountIdentities.size
-        || remainingIdentities.size !== importedAccountIdentities.size
-        || [...importedAccountIdentities].some((identity) => !remainingIdentities.has(identity))) {
-        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      verifyImportedAccounts(details)
+      const active = details.accounts.find((account) => (
+        account.number === details.activeAccountNumber && account.disabled !== true
+      ))
+      if (active) {
+        // Import replaces the stored backup, not the live credential (including
+        // macOS Keychain). Even an "ok" or "relogin_required" active slot still
+        // describes the old login. Force activation skips backing that login
+        // up over the imported credential; use the resolved local slot number.
+        await deps.execFile('cswap', [
+          'switch', String(active.number), '--force', '--json',
+        ], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+        verifyImportedAccounts(details)
+        if (details.activeAccountNumber !== active.number) {
+          throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+        }
       }
     }
     if (apiKeyTargetEmail !== null) {
@@ -422,6 +447,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
         })
         details = parseClaudeListDetails(status.stdout)
+        verifyImportedAccounts(details)
         target = details.accounts.find((account) => (
           account.email === apiKeyTargetEmail
           && account.usageStatus === 'api_key'
@@ -450,6 +476,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
       details = parseClaudeListDetails(status.stdout)
+      verifyImportedAccounts(details)
       if (!details.activeUsable) {
         throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
       }
