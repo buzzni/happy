@@ -9,3 +9,4 @@ export * from './scriptCrypto';
 export * from './sessionFollowup';
 export * from './promptProvenance';
 export * from './usage';
+export * from './rpcLatency';

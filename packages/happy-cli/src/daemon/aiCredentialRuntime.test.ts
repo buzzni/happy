@@ -1,6 +1,7 @@
 import type { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { delimiter, join } from 'node:path'
+import { homedir } from 'node:os'
 import { describe, expect, it, vi } from 'vitest'
 import {
   AiCredentialRuntimeError,
@@ -988,6 +989,120 @@ describe('AI credential machine runtime', () => {
     expect(supervisor.enable).toHaveBeenCalledOnce()
   })
 
+  it.each(['relogin_required', 'ok', 'no_credentials'])(
+    'activates imported credentials even when the existing live slot reports %s',
+    async (previousUsageStatus) => {
+      let activated = false
+      const execFile = vi.fn(async (command: string, args: string[]) => {
+        if (command === 'cswap' && args[0] === '--version') {
+          return { stdout: 'cswap 0.25.0', stderr: '' }
+        }
+        if (command === 'cswap' && args[0] === 'switch') {
+          // Import resolves by identity, so exported slot 1 is local slot 7.
+          if (args[1] === '7' && args.includes('--force')) activated = true
+        }
+        if (command === 'cswap' && args[0] === 'list') {
+          return {
+            stdout: JSON.stringify({
+              schemaVersion: 1,
+              activeAccountNumber: 7,
+              accounts: [{
+                number: 7, email: 'owner@example.com', organizationUuid: 'org-a',
+                usageStatus: activated ? 'ok' : previousUsageStatus,
+              }],
+            }),
+            stderr: '',
+          }
+        }
+        return { stdout: '', stderr: '' }
+      })
+      const { runtime, supervisor, files } = setup({ execFile })
+
+      await expect(runtime.apply({
+        provider: 'claude',
+        payload: claudeOauthPayload([{ email: 'owner@example.com', organizationUuid: 'org-a' }]),
+      })).resolves.toMatchObject({ provider: 'claude', configured: true })
+
+      expect(activated).toBe(true)
+      expect(execFile).toHaveBeenCalledWith(
+        'cswap', ['switch', '7', '--force', '--json'], expect.anything(),
+      )
+      const switchIndex = execFile.mock.calls.findIndex(([, args]) => args[0] === 'switch')
+      expect(execFile.mock.calls.slice(switchIndex + 1).some(([, args]) => args[0] === 'list')).toBe(true)
+      expect(supervisor.enable).toHaveBeenCalledOnce()
+      expect(files.has('/tmp/happy-ai-credential-fixed/claude-swap.json')).toBe(false)
+    },
+  )
+
+  it.each(['relogin_required', 'wrong_slot', 'command_failure', 'foreign_identity', 'extra_account'])(
+    'does not report an imported active credential as applied after %s',
+    async (failure) => {
+      let activationAttempted = false
+      const execFile = vi.fn(async (command: string, args: string[]) => {
+        if (command === 'cswap' && args[0] === '--version') {
+          return { stdout: 'cswap 0.25.0', stderr: '' }
+        }
+        if (command === 'cswap' && args[0] === 'switch') {
+          activationAttempted = true
+          if (failure === 'command_failure') throw new Error('secret-command-output')
+        }
+        if (command === 'cswap' && args[0] === 'list') {
+          return {
+            stdout: JSON.stringify({
+              schemaVersion: 1,
+              activeAccountNumber: activationAttempted && failure === 'wrong_slot' ? null : 1,
+              accounts: [{
+                number: 1, email: 'owner@example.com',
+                organizationUuid: activationAttempted && failure === 'foreign_identity' ? 'foreign-org' : '',
+                usageStatus: activationAttempted && failure === 'relogin_required' ? failure : 'ok',
+              }, ...(activationAttempted && failure === 'extra_account'
+                ? [{ number: 2, email: 'foreign@example.com', organizationUuid: '', usageStatus: 'ok' }]
+                : [])],
+            }),
+            stderr: '',
+          }
+        }
+        return { stdout: '', stderr: '' }
+      })
+      const { runtime, supervisor, files } = setup({ execFile })
+
+      await expect(runtime.apply({
+        provider: 'claude', payload: claudeOauthPayload([{ email: 'owner@example.com' }]),
+      })).rejects.toMatchObject({
+        kind: failure === 'command_failure' ? 'CLAUDE_APPLY_FAILED' : 'CLAUDE_APPLY_VERIFICATION_FAILED',
+        message: expect.not.stringContaining('secret-command-output'),
+      })
+
+      expect(activationAttempted).toBe(true)
+      expect(supervisor.enable).not.toHaveBeenCalled()
+      expect(files.has('/tmp/happy-ai-credential-fixed/claude-swap.json')).toBe(false)
+    },
+  )
+
+  it('activates a replacement API key even when the same local account is already active', async () => {
+    const { runtime, execFile, supervisor } = setup()
+    const payload = JSON.parse(claudeOauthPayload([{ email: 'owner@example.com' }]))
+    payload.accounts[0].credentials = `sk-ant-api${'a'.repeat(20)}`
+    execFile.mockImplementation(async (_command, args) => ({
+      stdout: args[0] === 'list'
+        ? JSON.stringify({
+          schemaVersion: 1,
+          activeAccountNumber: 1,
+          accounts: [{ number: 1, email: 'owner@example.com', usageStatus: 'api_key' }],
+        })
+        : '',
+      stderr: '',
+    }))
+
+    await expect(runtime.apply({ provider: 'claude', payload: JSON.stringify(payload) }))
+      .resolves.toMatchObject({ provider: 'claude', configured: true, credentialKind: 'api_key' })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '1', '--force', '--json'], expect.anything(),
+    )
+    expect(supervisor.enable).not.toHaveBeenCalled()
+  })
+
   it('activates a usable Claude account when import leaves no active account', async () => {
     let switched = false
     const execFile = vi.fn(async (command: string, args: string[]) => {
@@ -1867,6 +1982,74 @@ describe('AI credential machine runtime', () => {
     await expect(runtime.status({ provider: 'claude' })).rejects.toMatchObject({
       kind: 'CLAUDE_STATUS_INVALID',
     })
+  })
+
+  it('applies Claude credentials when uv is installed outside the daemon PATH', async () => {
+    const baseline = setup()
+    const environment = { Path: join(homedir(), 'system-bin'), UV_TOOL_BIN_DIR: '/separate-tools' }
+    const spawnCommand = vi.fn((_command, _args, options) => {
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
+      })
+      queueMicrotask(() => {
+        if (!options.env?.Path?.split(delimiter).includes(join(homedir(), '.local', 'bin'))) {
+          child.emit('error', Object.assign(new Error('uv not found'), { code: 'ENOENT' }))
+        } else {
+          child.emit('close', 0)
+        }
+      })
+      return child
+    }) as unknown as typeof spawn
+    const { runtime, supervisor } = setup({
+      execFile: (command, args, options) => command === 'uv'
+        ? runAiCredentialCommand(command, args, { ...options, environment }, spawnCommand)
+        : baseline.execFile(command, args, options),
+    })
+
+    await expect(runtime.apply({ provider: 'claude', payload: '{"token":"never-in-argv"}' }))
+      .resolves.toMatchObject({ provider: 'claude', configured: true })
+    expect(supervisor.enable).toHaveBeenCalledOnce()
+    expect(environment.Path).toBe(join(homedir(), 'system-bin'))
+  })
+
+  it.each([
+    ['uv', {}, join(homedir(), '.local', 'bin')],
+    ['uv', { UV_INSTALL_DIR: '/uv-bin', UV_TOOL_BIN_DIR: '/tool-bin' }, '/uv-bin'],
+    ['uv', { XDG_BIN_HOME: '/xdg-bin', UV_TOOL_BIN_DIR: '/tool-bin' }, '/xdg-bin'],
+    ['cswap', { UV_INSTALL_DIR: '/uv-bin', UV_TOOL_BIN_DIR: '/tool-bin' }, '/tool-bin'],
+  ] as const)('resolves %s using its own installation directory (%j)', async (command, overrides, binDir) => {
+    const environment = { Path: ['/system-bin', binDir].join(delimiter), ...overrides }
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+    const result = runAiCredentialCommand(command, ['--version'], { environment }, spawnCommand)
+    child.emit('close', 0)
+    await result
+
+    expect(spawnCommand).toHaveBeenCalledWith(command, ['--version'], expect.objectContaining({
+      env: { ...environment, Path: [binDir, '/system-bin'].join(delimiter) },
+      windowsHide: true,
+    }))
+    expect(environment.Path).toBe(['/system-bin', binDir].join(delimiter))
+  })
+
+  it.each([
+    ['ENOENT', 'COMMAND_NOT_AVAILABLE'],
+    ['EACCES', 'COMMAND_FAILED'],
+    ['EPERM', 'COMMAND_FAILED'],
+    ['EINVAL', 'COMMAND_FAILED'],
+  ])('reports %s from credential command startup as %s without leaking output', async (code, kind) => {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
+    })
+    const spawnCommand = vi.fn(() => child) as unknown as typeof spawn
+    const result = runAiCredentialCommand('uv', ['--version'], {}, spawnCommand)
+    child.stderr.emit('data', Buffer.from('secret-from-stderr'))
+    child.emit('error', Object.assign(new Error('secret-from-error'), { code }))
+
+    await expect(result).rejects.toMatchObject({ kind, message: `AI credential operation failed (${kind})` })
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL')
   })
 
   it('terminates commands that exceed their timeout without returning process output', async () => {

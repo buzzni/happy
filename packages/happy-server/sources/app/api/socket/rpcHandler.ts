@@ -1,3 +1,4 @@
+import { createRpcLatency, parseRpcLatencyRequest, parseRpcLatencySnapshot, type RpcLatencySnapshot } from '@slopus/happy-wire';
 import { log } from "@/utils/log";
 import { Server, Socket } from "socket.io";
 import type { RemoteSocket } from "socket.io";
@@ -107,10 +108,14 @@ type RoomLookup = { ok: boolean; sockets: RoomSockets };
  * + grace window) and RPC_PRESENCE_FETCH_TIMEOUT_MS for in-flight presence
  * polling.
  */
-async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup'): Promise<RoomLookup> {
+async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup', trace?: ReturnType<typeof createRpcLatency>): Promise<RoomLookup> {
+    const end = trace?.begin('server-lookup');
     try {
-        return { ok: true, sockets: await io.in(room).timeout(timeoutMs).fetchSockets() };
+        const sockets = await io.in(room).timeout(timeoutMs).fetchSockets();
+        end?.('resolved', sockets.length > 0 ? 'found' : 'empty');
+        return { ok: true, sockets };
     } catch (error) {
+        end?.('rejected');
         rpcFetchSocketsTimeouts.inc({ context });
         log({ module: 'websocket' }, `fetchSockets failed for ${room} (timeout=${timeoutMs}ms): ${error}`);
         // `[]` 를 돌려주지 않는다. 그러면 호출부가 "조회를 못 했다" 와
@@ -126,14 +131,14 @@ async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, con
  * reduce stream pressure when Redis is slow — fewer requests in flight
  * means less amplification of the timeout → retry → timeout spiral.
  */
-async function waitForRoomMember(io: Server, room: string, maxMs: number, metricMethod: string): Promise<RoomLookup> {
+async function waitForRoomMember(io: Server, room: string, maxMs: number, metricMethod: string, trace?: ReturnType<typeof createRpcLatency>): Promise<RoomLookup> {
     const deadline = Date.now() + maxMs;
     let polls = 0;
     // 한 번이라도 조회에 성공했는지. 전부 실패했다면 방이 비었는지 알 수 없다.
     let anyLookupOk = false;
     while (true) {
         const timeoutMs = RPC_LOOKUP_FETCH_TIMEOUTS_MS[Math.min(polls, RPC_LOOKUP_FETCH_TIMEOUTS_MS.length - 1)];
-        const lookup = await fetchRoomSockets(io, room, timeoutMs);
+        const lookup = await fetchRoomSockets(io, room, timeoutMs, 'lookup', trace);
         anyLookupOk = anyLookupOk || lookup.ok;
         if (lookup.sockets.length > 0) {
             rpcLookupRetries.observe({ method: metricMethod }, polls);
@@ -149,6 +154,9 @@ async function waitForRoomMember(io: Server, room: string, maxMs: number, metric
 }
 
 export function rpcHandler(userId: string, socket: Socket, io: Server) {
+    // Bounded per authenticated socket; diagnostic opt-in never gates the RPC itself.
+    let diagnosticWindow = 0;
+    let diagnosticCount = 0;
 
     socket.on('rpc-register', (data: any) => {
         try {
@@ -183,6 +191,43 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
     socket.on('rpc-call', async (data: any, callback: (response: any) => void) => {
         const startTime = Date.now();
         const { method, params } = data ?? {};
+        let trace: ReturnType<typeof createRpcLatency> | undefined;
+        let requestTrace: ReturnType<typeof parseRpcLatencyRequest>;
+        try {
+            if (process.env.HAPPY_RPC_LATENCY_DIAGNOSTICS === '1'
+                && typeof method === 'string' && method.endsWith(':daemon-session-state')) {
+                requestTrace = parseRpcLatencyRequest(data?.rpcLatency);
+                const now = performance.now();
+                if (now - diagnosticWindow >= 60_000) { diagnosticWindow = now; diagnosticCount = 0; }
+                if (requestTrace && diagnosticCount < 10) {
+                    trace = createRpcLatency(requestTrace);
+                    diagnosticCount++;
+                }
+            }
+        } catch { /* Diagnostic setup must not change dispatch. */ }
+        let daemonTiming: RpcLatencySnapshot | null = null;
+        let targetLocation: 'local' | 'remote' | 'unknown' = 'unknown';
+        if (trace) {
+            const currentTrace = trace;
+            const end = currentTrace.begin('server-total');
+            const originalCallback = callback;
+            let completionSent = false;
+            callback = (response) => {
+                end(response?.ok ? 'resolved' : 'rejected');
+                const rpcLatency = {
+                    ...requestTrace, server: currentTrace.snapshot(), daemon: daemonTiming, target: targetLocation,
+                };
+                if (!completionSent && data?.rpcLatency?.completionEvent === true) {
+                    completionSent = true;
+                    // Send before the ACK: a preceding ACK write can make a volatile
+                    // packet unwritable. Best effort, requester only, never persisted
+                    // for connection recovery and never includes the RPC result.
+                    try { socket.volatile.emit('rpc-latency-complete', rpcLatency); }
+                    catch { /* Optional diagnostics must not prevent the original ACK. */ }
+                }
+                originalCallback?.({ ...response, rpcLatency });
+            };
+        }
 
         const finish = (result: string) => {
             const durationSec = (Date.now() - startTime) / 1000;
@@ -207,7 +252,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             // name now. `isManagedSessionId` is durable for exactly that
             // reason: the answer does not change when the child goes away.
             const parsed = splitRpcMethod(method);
-            if (parsed && await isManagedSessionId(parsed.sessionId)) {
+            if (parsed && await (trace ? trace.measure('server-managed-check', () => isManagedSessionId(parsed.sessionId)) : isManagedSessionId(parsed.sessionId))) {
                 const dispatched = await dispatchManagedRpc(managedRpcServer(), {
                     sessionId: parsed.sessionId,
                     accountId: userId,
@@ -243,11 +288,11 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             // unresponsive — fetchRoomSockets logs and returns []) fall
             // through to the wait-for-reconnect grace window.
             const room = rpcRoom(userId, method);
-            const first = await fetchRoomSockets(io, room, RPC_LOOKUP_FETCH_TIMEOUTS_MS[0]);
+            const first = await fetchRoomSockets(io, room, RPC_LOOKUP_FETCH_TIMEOUTS_MS[0], 'lookup', trace);
             let targets = first.sockets;
             let anyLookupOk = first.ok;
             if (targets.length === 0) {
-                const waited = await waitForRoomMember(io, room, RPC_RECONNECT_GRACE_MS, baseMethodName(method));
+                const waited = await waitForRoomMember(io, room, RPC_RECONNECT_GRACE_MS, baseMethodName(method), trace);
                 targets = waited.sockets;
                 anyLookupOk = anyLookupOk || waited.ok;
             }
@@ -277,6 +322,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 candidate.data?.clientType === 'machine-scoped'
                 && candidate.data.machineId === machineId);
             const target = newestMachineSocket(machineCandidates) ?? targets[0];
+            if (trace && io.sockets?.sockets) targetLocation = io.sockets.sockets.has(target.id) ? 'local' : 'remote';
             if (targets.length > 1) {
                 log({ module: 'websocket', level: 'warn' },
                     `Multiple sockets in ${room} (${targets.length}); using ${machineCandidates.length > 0 ? 'newest machine socket' : 'first'} ${target.id}`);
@@ -335,8 +381,9 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             //
             // Requires 2 consecutive empty polls before declaring disconnect
             // to avoid false positives from transient Redis/adapter timeouts.
+            const endRelay = trace?.begin('server-relay');
             const ackPromise = target.timeout(timeoutMs)
-                .emitWithAck('rpc-request', { method, params });
+                .emitWithAck('rpc-request', { method, params, ...(trace ? { rpcLatency: requestTrace } : {}) });
 
             let presenceAlive = true;
             const presencePoll = (async () => {
@@ -363,9 +410,17 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
 
             try {
                 const response = await Promise.race([ackPromise, presencePoll]);
+                endRelay?.('resolved');
+                let result = response;
+                if (trace && response && typeof response === 'object' && typeof response.result === 'string') {
+                    // New daemon timing wraps its encrypted result; old daemons return the string directly.
+                    result = response.result;
+                    daemonTiming = parseRpcLatencySnapshot(response.rpcLatency, requestTrace!.id) ?? null;
+                }
                 finish('success');
-                callback?.({ ok: true, result: response });
+                callback?.({ ok: true, result });
             } catch (error) {
+                endRelay?.('rejected');
                 const errorMsg = error instanceof Error ? error.message : 'RPC call failed';
                 finish(/timeout|timed out/i.test(errorMsg) ? 'timeout' : 'failed');
                 callback?.({ ok: false, error: errorMsg });

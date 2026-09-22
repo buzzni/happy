@@ -1,4 +1,5 @@
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
+import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
 import {
     createManagedGracefulStop,
@@ -1018,6 +1019,10 @@ export async function runCodex(opts: {
         checkpointComposition.markTurnDispatched,
     );
 
+    const authRecovery = new CodexAuthRecovery(client, () => shouldExit || thinking || messageQueue.size() > 0);
+    session.rpcHandlerManager.registerHandler('codex-auth-status', async () => authRecovery.status());
+    session.rpcHandlerManager.registerHandler('codex-auth-recover', async (params: Record<string, unknown>) => authRecovery.recover(params));
+
     registerCodexSteerHandler({
         client: {
             steerTurn: async (text) => {
@@ -1155,6 +1160,7 @@ export async function runCodex(opts: {
     }));
 
     session.rpcHandlerManager.registerHandler('goal-action', async (params: Record<string, unknown>) => {
+        authRecovery.assertReady();
         const command = parseCodexGoalActionParams(params);
         if (!command) {
             throw new Error('Unsupported Codex goal action');
@@ -1620,7 +1626,10 @@ export async function runCodex(opts: {
             const owningReviewSignal = lessonReviewAbort.signal;
             const owningForegroundSignal = abortController.signal;
 
-            if (isCodexClearText(message.message)) {
+            await authRecovery.beginTurn();
+            if (shouldExit) { authRecovery.endTurn(); break; }
+            if (isCodexClearText(message.message) && authRecovery.status().state !== 'failed') {
+                authRecovery.endTurn();
                 logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
                 client.clearThreadState();
                 currentTurnId = null;
@@ -1656,6 +1665,7 @@ export async function runCodex(opts: {
             }
 
             try {
+                authRecovery.assertReady();
                 if (checkpointComposition.completeTurn) {
                     // specs/linux-checkpoint-enforcement-backend R4 — open the checkpoint turn (and
                     // materialize its workspace) before codex is wrapped and spawned. On Linux bwrap
@@ -1951,6 +1961,7 @@ export async function runCodex(opts: {
                 } catch (error) {
                     logger.debug('[codex]: checkpoint abortTurn failed', error);
                 }
+                authRecovery.endTurn();
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls

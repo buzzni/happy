@@ -1,3 +1,4 @@
+import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 /**
  * WebSocket client for machine/daemon communication with Happy server
@@ -8,6 +9,7 @@ import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
+import type { DaemonSessionStateResponse } from '@/daemon/daemonSessionState';
 import {
     registerCommonHandlers,
     type RecoverSessionOptions,
@@ -249,7 +251,7 @@ interface ServerToDaemonEvents {
     update: (data: Update) => void;
     // `callback` is optional because socket.io does not guarantee an ack on
     // every delivered packet — see createRpcRequestListener.
-    'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void;
+    'rpc-request': (data: RpcRequest, callback?: RpcResponseCallback) => void;
     'proxy-http-request': (
         params: {
             port: number;
@@ -518,6 +520,7 @@ type IsolatedViewerStartResult = {
 } & ViewerBrowserState;
 
 type MachineRpcHandlers = {
+    daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     resumeSession?: (sessionId: string, options?: {
         model?: string;
@@ -724,6 +727,7 @@ export class ApiMachineClient {
     } | null = null;
     /** Set only on a verified managed runtime; null on every BYOS machine. */
     private managedHandlers: ManagedRpcHandlers | null = null;
+    private daemonSessionStateRpcAvailable = false;
     private isolatedViewerStarts = new Map<string, Promise<IsolatedViewerStartResult>>();
     private isolatedViewerMutation: Promise<void> = Promise.resolve();
     private isolatedViewerRegistry = new BrowserViewerLeaseRegistry(
@@ -874,6 +878,7 @@ export class ApiMachineClient {
     }
 
     setRPCHandlers({
+        daemonSessionState,
         spawnSession,
         resumeSession,
         recoverSession,
@@ -889,6 +894,10 @@ export class ApiMachineClient {
         linkSpawnedSession,
         difficultyRouting,
     }: MachineRpcHandlers) {
+        this.daemonSessionStateRpcAvailable = !!daemonSessionState;
+        if (daemonSessionState) {
+            this.rpcHandlerManager.registerHandler('daemon-session-state', daemonSessionState);
+        }
         this.previewPortRegistry = portRegistry;
         this.resumeSessionHandler = resumeSession ?? null;
         this.recoverSessionHandler = recoverSession ?? null;
@@ -3779,10 +3788,13 @@ export class ApiMachineClient {
             const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
+            const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
+            const daemonSessionStateChanged = this.machine.metadata?.daemonSessionState?.version
+                !== (daemonSessionStateAvailable ? 1 : undefined);
 
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged) {
+            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -3805,6 +3817,7 @@ export class ApiMachineClient {
                         rpcAvailable: this.autonomousQualityGateRpcAvailable,
                     },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
+                    daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);

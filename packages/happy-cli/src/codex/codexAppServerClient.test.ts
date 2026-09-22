@@ -4605,3 +4605,127 @@ describe('CodexAppServerClient for a managed Cloud run', () => {
         expect(args).toContain('model_provider="codex-multi-auth"');
     });
 });
+
+
+describe('explicit authentication recovery', () => {
+    beforeEach(() => {
+        mockSpawn.mockReset();
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
+        mockExecSync.mockReturnValue('codex-cli 0.140.0');
+    });
+    it('waits for the old process to exit and preserves the original thread after failed resume', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        let exited = false;
+        const old = createMockProcess({ exitDelayMs: 30, onExit: () => { exited = true; } });
+        const requests: MockRpcMessage[] = [];
+        const next = createMockProcess({ onRequest: (msg, stdout) => {
+            requests.push(msg);
+            if (msg.method === 'account/read') pushJsonLine(stdout, { id: msg.id, result: { account: { type: 'chatgpt' }, requiresOpenaiAuth: true } });
+            if (msg.method === 'account/rateLimits/read') pushJsonLine(stdout, { id: msg.id, result: { rateLimits: { primary: { usedPercent: 20 } } } });
+            if (msg.method === 'thread/resume') pushJsonLine(stdout, { id: msg.id, error: { code: -1, message: 'cannot resume' } });
+        } });
+        mockSpawn.mockReturnValueOnce(old).mockImplementationOnce(() => {
+            expect(exited).toBe(true);
+            return next;
+        });
+        const client = new CodexAppServerClient();
+        await client.connect();
+        (client as any)._threadId = 'original';
+        (client as any).threadDefaults = { model: 'gpt-6-astra', cwd: '/project', approvalPolicy: 'never', mcpServers: { local: {} } };
+        await expect(client.reconnectForAuth()).rejects.toThrow('resume-failed');
+        expect(client.threadId).toBe('original');
+        expect(requests.find(x => x.method === 'thread/resume')?.params).toMatchObject({ threadId: 'original', model: 'gpt-6-astra', cwd: '/project', approvalPolicy: 'never' });
+        expect(requests.some(x => x.method === 'thread/start' || x.method === 'turn/start')).toBe(false);
+        await client.disconnect();
+    });
+
+    it('does not report recovery when the replacement ChatGPT account is also exhausted', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const methods: string[] = [];
+        mockSpawn.mockReturnValueOnce(createMockProcess()).mockReturnValueOnce(createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method) methods.push(msg.method);
+            if (msg.method === 'account/read') pushJsonLine(stdout, { id: msg.id, result: { account: { type: 'chatgpt' }, requiresOpenaiAuth: true } });
+            if (msg.method === 'account/rateLimits/read') pushJsonLine(stdout, { id: msg.id, result: { rateLimits: { primary: { usedPercent: 100 }, secondary: null } } });
+            if (msg.method === 'thread/resume') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'original' }, model: 'gpt-6-astra' } });
+        } }));
+        const client = new CodexAppServerClient();
+        await client.connect();
+        (client as any)._threadId = 'original';
+        await expect(client.reconnectForAuth()).rejects.toThrow('limit-reached');
+        expect(methods).not.toContain('thread/resume');
+        expect(client.threadId).toBe('original');
+        await client.disconnect();
+    });
+
+    it('resumes the same thread after checking the replacement account and its quota', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockReturnValueOnce(createMockProcess()).mockReturnValueOnce(createMockProcess({ onRequest: (msg, stdout) => {
+            requests.push(msg);
+            if (msg.method === 'account/read') pushJsonLine(stdout, { id: msg.id, result: { account: { type: 'chatgpt' }, requiresOpenaiAuth: true } });
+            if (msg.method === 'account/rateLimits/read') pushJsonLine(stdout, { id: msg.id, result: { rateLimits: { primary: { usedPercent: 25 } } } });
+            if (msg.method === 'thread/resume') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'original' }, model: 'gpt-6-astra' } });
+        } }));
+        const client = new CodexAppServerClient();
+        await client.connect();
+        (client as any)._threadId = 'original';
+        await expect(client.reconnectForAuth()).resolves.toBe('authenticated');
+        expect(client.threadId).toBe('original');
+        expect(requests.map(x => x.method)).toEqual(['initialize', 'initialized', 'account/read', 'account/rateLimits/read', 'thread/resume']);
+        expect(mockPrepareCodexMultiAuthProxy).toHaveBeenCalled();
+        await client.disconnect();
+    });
+
+    it('does not spawn a replacement when the old process cannot be confirmed dead', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const old = createMockProcess();
+        old.kill.mockImplementation(() => true);
+        mockSpawn.mockReturnValue(old);
+        const client = new CodexAppServerClient();
+        await client.connect();
+        (client as any)._threadId = 'original';
+        const timeout = (CodexAppServerClient as any).PROCESS_EXIT_WAIT_MS;
+        (CodexAppServerClient as any).PROCESS_EXIT_WAIT_MS = 20;
+        try {
+            await expect(client.reconnectForAuth()).rejects.toThrow('restart-failed');
+            expect(mockSpawn).toHaveBeenCalledTimes(1);
+            expect(client.threadId).toBe('original');
+        } finally {
+            (CodexAppServerClient as any).PROCESS_EXIT_WAIT_MS = timeout;
+            old.exitCode = 0;
+            old.emit('exit', 0, null);
+            await client.disconnect();
+        }
+    });
+
+    it('refuses recovery while a goal-control RPC is still pending', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        let reply!: () => void;
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'thread/goal/set') reply = () => pushJsonLine(stdout, { id: msg.id, result: { goal: {} } });
+        } });
+        mockSpawn.mockReturnValue(proc);
+        const client = new CodexAppServerClient();
+        await client.connect();
+        (client as any)._threadId = 'original';
+        const goal = client.setGoal({ threadId: 'original', objective: 'test' });
+        await expect(client.reconnectForAuth()).rejects.toThrow('restart-failed');
+        expect(proc.kill).not.toHaveBeenCalled();
+        reply();
+        await goal;
+        await client.disconnect();
+    });
+
+    it('fails closed when the new process has no authenticated account', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        mockSpawn.mockReturnValueOnce(createMockProcess()).mockReturnValueOnce(createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'account/read') pushJsonLine(stdout, { id: msg.id, result: { account: null, requiresOpenaiAuth: true } });
+        } }));
+        const client = new CodexAppServerClient();
+        await client.connect();
+        (client as any)._threadId = 'original';
+        await expect(client.reconnectForAuth()).rejects.toThrow('authentication-required');
+        expect(client.threadId).toBe('original');
+        await client.disconnect();
+    });
+});
