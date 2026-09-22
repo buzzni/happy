@@ -14,8 +14,12 @@ describe('buildConnectorToolGuidance', () => {
         expect(guidance).not.toContain('account');
     });
 
-    it('omits guidance when no personal connector is expected', () => {
-        expect(buildConnectorToolGuidance([])).toBe('');
+    it('keeps platform diagnosis guidance when the expected inventory is unknown', () => {
+        const guidance = buildConnectorToolGuidance([]);
+        expect(guidance).toContain('deferred MCP tool discovery');
+        expect(guidance).toContain('installed: false');
+        expect(guidance).not.toContain('expects these connected');
+        expect(guidance).toContain('does not establish that no services are connected');
     });
 
     it('combines personal connectors and runtime MCP services while excluding internal servers', () => {
