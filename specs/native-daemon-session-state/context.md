@@ -30,3 +30,7 @@ Presence is exactly current daemon tracking, as `/list` was; it is not a complet
 - `git diff --check` passed.
 
 No CLI version bump, commit, push, release, publish, install, active daemon restart, or runtime policy change was performed. Source changes still require the authorized release/deployment workflow before an installed daemon can advertise this capability.
+
+## Release candidate 2026-09-22
+
+Rebased onto main 84df0800 (.227). Resolved apiMachine field conflict by preserving main removal of isolatedViewerLeases and adding only daemonSessionStateRpcAvailable. Candidate .228: 260 targeted tests, tsc --noEmit, and CLI build passed; existing pkgroll warnings remain. Tag/registry/runtime verification pending.
