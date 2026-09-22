@@ -102,7 +102,7 @@ describe('sendEventBodySchema', () => {
         timestamp: 1_788_111_000_000,
     } as const;
 
-    it('requires validated server-visible metadata for checkpoint events', () => {
+    it('validates server-visible metadata when supplied for checkpoint events', () => {
         expect(sendEventBodySchema.parse({
             eventType: 'checkpoint-snapshot',
             content: 'encrypted-detail',
@@ -116,7 +116,7 @@ describe('sendEventBodySchema', () => {
         expect(sendEventBodySchema.safeParse({
             eventType: 'checkpoint-snapshot',
             content: 'encrypted-detail',
-        }).success).toBe(false);
+        }).success).toBe(true);
     });
 
     it('rejects checkpoint metadata on unrelated session events', () => {
@@ -150,6 +150,68 @@ describe('checkpoint session event route', () => {
     } as const;
 
     beforeEach(() => vi.clearAllMocks());
+
+    it.each(['checkpoint-snapshot', 'checkpoint-rewind'])('persists and reads legacy %s without fabricating protection metadata', async (eventType) => {
+        const createdAt = new Date('2026-09-23T00:00:00Z');
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.persistEvent.mockResolvedValue({ id: 'legacy-1', seq: 4, createdAt });
+        mocks.findEvents.mockResolvedValue([{
+            id: 'legacy-1', seq: 4, eventType, checkpoint: null,
+            content: { t: 'encrypted', c: 'encrypted-web-history' },
+            createdAt, updatedAt: createdAt,
+        }]);
+        const app = await createApp();
+        const response = await app.inject({
+            method: 'POST', url: '/v3/sessions/session-1/events',
+            headers: { 'x-user-id': 'account-1' },
+            payload: { eventType, content: 'encrypted-web-history' },
+        });
+        expect(response.statusCode).toBe(200);
+        expect(mocks.persistEvent).toHaveBeenCalledWith({
+            sessionId: 'session-1', eventType, content: 'encrypted-web-history',
+        });
+        expect(mocks.persistCheckpointEvent).not.toHaveBeenCalled();
+        expect(response.json().event).not.toHaveProperty('idempotent');
+        const history = await app.inject({
+            method: 'GET', url: `/v3/sessions/session-1/events?type=${eventType}`,
+            headers: { 'x-user-id': 'account-1' },
+        });
+        expect(history.statusCode).toBe(200);
+        expect(history.json().events[0]).toMatchObject({
+            id: 'legacy-1', eventType, content: { t: 'encrypted', c: 'encrypted-web-history' },
+        });
+        expect(history.json().events[0]).not.toHaveProperty('checkpoint');
+        await app.close();
+    });
+
+    it.each([null, {}, { ...checkpoint, schemaVersion: 2 }, { ...checkpoint, filePath: '/private/file' }])(
+        'does not downgrade invalid checkpoint metadata to legacy persistence (%j)', async (invalidCheckpoint) => {
+            const app = await createApp();
+            const response = await app.inject({
+                method: 'POST', url: '/v3/sessions/session-1/events',
+                headers: { 'x-user-id': 'account-1' },
+                payload: { eventType: 'checkpoint-snapshot', content: 'cipher', checkpoint: invalidCheckpoint },
+            });
+            expect(response.statusCode).toBe(400);
+            expect(mocks.persistEvent).not.toHaveBeenCalled();
+            expect(mocks.persistCheckpointEvent).not.toHaveBeenCalled();
+            await app.close();
+        },
+    );
+
+    it.each([undefined, 'account-1'])('denies legacy writes without session ownership (%s)', async (userId) => {
+        mocks.findSession.mockResolvedValue(null);
+        const app = await createApp();
+        const response = await app.inject({
+            method: 'POST', url: '/v3/sessions/foreign/events',
+            headers: userId ? { 'x-user-id': userId } : {},
+            payload: { eventType: 'checkpoint-rewind', content: 'cipher' },
+        });
+        expect(response.statusCode).toBe(userId ? 404 : 401);
+        expect(mocks.persistEvent).not.toHaveBeenCalled();
+        expect(mocks.persistCheckpointEvent).not.toHaveBeenCalled();
+        await app.close();
+    });
 
     it('persists a checkpoint event only under the authenticated session owner', async () => {
         const createdAt = new Date('2026-09-02T00:00:00.000Z');

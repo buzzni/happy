@@ -24,6 +24,14 @@ export const sendEventBodySchema = z.union([
         content: z.string(),
         checkpoint: checkpointEventEnvelopeSchema,
     }).strict(),
+    // COMPAT(web-checkpoint-history): added 2026-09; remove only after web
+    // history producers and stored legacy events have migrated to a distinct type.
+    // Missing metadata is legacy history, never a protected checkpoint receipt.
+    z.object({
+        eventType: z.enum(checkpointEventTypeValues),
+        content: z.string(),
+        checkpoint: z.never().optional(),
+    }).strict(),
     z.object({
         eventType: z.enum(legacyEventTypeValues),
         content: z.string(),
