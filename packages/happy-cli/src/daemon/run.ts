@@ -154,6 +154,7 @@ import {
   mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
 import { resolveManagedRuntimeIdentity, managedProvisioningPath } from './managedRuntimeIdentity';
+import { createDaemonSessionStateHandler } from './daemonSessionState';
 import { acquireManagedWriterLock } from './managedWriterLock';
 import {
     inspectManagedDaemonStateLayout,
@@ -4267,6 +4268,7 @@ export async function startDaemon(): Promise<void> {
 
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
       spawnSession,

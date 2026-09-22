@@ -365,6 +365,22 @@ describe('ApiMachineClient socket reconnection', () => {
         );
     });
 
+    it('registers the daemon session state reader on the machine RPC surface', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const daemonSessionState = vi.fn();
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(() => ({ stopped: true as const })),
+            requestShutdown: vi.fn(),
+            portRegistry: {} as any,
+            aiCredentialRuntime: {} as any,
+            daemonSessionState,
+        });
+        expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+            'daemon-session-state', daemonSessionState,
+        );
+    });
+
     it('registers the checkpoint daemon RPC surface', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const manager = (client as any).rpcHandlerManager;
@@ -748,6 +764,35 @@ describe('ApiMachineClient socket reconnection', () => {
             activeAutomationCount: 1,
             reportedAt: 20_000,
         });
+        client.shutdown();
+    });
+
+    it.each(['available', 'absent', 'managed'])('publishes daemon session state capability only with a usable reader: %s', async (mode) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        // Stale metadata must be cleared when this process cannot serve the RPC.
+        if (mode !== 'available') machine.metadata!.daemonSessionState = { version: 1 };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.setRPCHandlers({
+            spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(),
+            portRegistry: {} as any, aiCredentialRuntime: {} as any,
+            ...(mode !== 'absent' ? { daemonSessionState: vi.fn() } : {}),
+        });
+        // The dispatch allowlist is exercised with the real manager in daemonSessionState.test.ts.
+        if (mode === 'managed') client.setManagedRuntime({} as any);
+        client.connect();
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.daemonSessionState).toEqual(
+            mode === 'available' ? { version: 1 } : undefined,
+        ));
         client.shutdown();
     });
 

@@ -1,0 +1,4 @@
+- [x] Inspect list and authorization paths
+- [x] Reproduce missing RPC/capability with failing tests
+- [x] Implement lookup, machine handler and metadata
+- [x] Run regression checks and record limits
