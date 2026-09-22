@@ -1,3 +1,4 @@
+import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 /**
  * WebSocket client for machine/daemon communication with Happy server
@@ -250,7 +251,7 @@ interface ServerToDaemonEvents {
     update: (data: Update) => void;
     // `callback` is optional because socket.io does not guarantee an ack on
     // every delivered packet — see createRpcRequestListener.
-    'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void;
+    'rpc-request': (data: RpcRequest, callback?: RpcResponseCallback) => void;
     'proxy-http-request': (
         params: {
             port: number;

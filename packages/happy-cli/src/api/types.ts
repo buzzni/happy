@@ -1,3 +1,4 @@
+import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
@@ -48,7 +49,7 @@ export interface ServerToClientEvents {
   update: (data: Update) => void
   // `callback` is optional because socket.io does not guarantee an ack on
   // every delivered packet — see createRpcRequestListener.
-  'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void
+  'rpc-request': (data: RpcRequest, callback?: RpcResponseCallback) => void
   'rpc-registered': (data: { method: string }) => void
   'rpc-unregistered': (data: { method: string }) => void
   'rpc-error': (data: { type: string, error: string }) => void

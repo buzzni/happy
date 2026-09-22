@@ -342,3 +342,93 @@ describe('rpcHandler adapter lookup failures', () => {
         }
     });
 });
+
+describe('opt-in native RPC timing', () => {
+    const rpcLatency = { version: 1, id: '11111111-1111-4111-8111-111111111111' };
+    it('correlates server phases, unwraps new daemon ACKs and preserves the relay timeout', async () => {
+        vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+        try {
+            const caller = new FakeSocket('caller');
+            const target = new FakeSocket('target');
+            const daemon = { ...rpcLatency, spans: [{ stage: 'daemon-handler', durationMs: 1, outcome: 'resolved' }], droppedSpans: 0, clockFailures: 0 };
+            const emit = vi.fn(async () => ({ result: 'encrypted-result', rpcLatency: daemon }));
+            target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+            rpcHandler('u1', caller as any, fakeIo([target]) as any);
+            const callback = vi.fn();
+            await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+            expect(emit).toHaveBeenCalledExactlyOnceWith('rpc-request', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency });
+            expect(target.timeout).toHaveBeenCalledWith(30000);
+            const reply = callback.mock.calls[0][0];
+            expect(reply.result).toBe('encrypted-result');
+            expect(reply.rpcLatency.id).toBe(rpcLatency.id);
+            expect(reply.rpcLatency.daemon).toEqual(daemon);
+            expect(reply.rpcLatency.server.spans.map((s: any) => s.stage)).toEqual(['server-total', 'server-managed-check', 'server-lookup', 'server-relay']);
+            expect(JSON.stringify(reply.rpcLatency)).not.toMatch(/machine-1|encrypted|u1|params/);
+        } finally { vi.unstubAllEnvs(); }
+    });
+    it('accepts old daemon strings, caps requests and ignores tracing when disabled', async () => {
+        vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+        try {
+            const caller = new FakeSocket('caller');
+            const target = new FakeSocket('target');
+            const emit = vi.fn(async (_event: string, _payload: unknown) => 'old-encrypted-result');
+            target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+            rpcHandler('u1', caller as any, fakeIo([target]) as any);
+            const callback = vi.fn();
+            for (let i = 0; i < 11; i++) await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+            expect(callback.mock.calls[0][0]).toMatchObject({ ok: true, result: 'old-encrypted-result', rpcLatency: { daemon: null } });
+            expect(callback.mock.calls[10][0]).toEqual({ ok: true, result: 'old-encrypted-result' });
+            expect(emit).toHaveBeenCalledTimes(11);
+            expect(emit.mock.calls[10][1]).not.toHaveProperty('rpcLatency');
+            vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '0');
+            await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+            expect(callback.mock.calls[11][0]).toEqual({ ok: true, result: 'old-encrypted-result' });
+        } finally { vi.unstubAllEnvs(); }
+    });
+});
+
+it('records failed initial lookup then successful retry without replaying the native call', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    try {
+        const caller = new FakeSocket('caller');
+        const target = new FakeSocket('target');
+        const emit = vi.fn(async () => 'encrypted-result');
+        target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+        const fetchSockets = vi.fn()
+            .mockImplementationOnce(() => new Promise((_, reject) => setTimeout(() => reject(new Error('lookup timeout')), 2000)))
+            .mockResolvedValue([target]);
+        const io = { in: () => ({ timeout: () => ({ fetchSockets }) }), sockets: { sockets: new Map([['target', target]]) } };
+        rpcHandler('u1', caller as any, io as any);
+        const callback = vi.fn();
+        const rpcLatency = { version: 1, id: '11111111-1111-4111-8111-111111111111' };
+        const pending = caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+        await vi.advanceTimersByTimeAsync(2000);
+        await pending;
+        const reply = callback.mock.calls[0][0];
+        expect(reply).toMatchObject({ ok: true, result: 'encrypted-result', rpcLatency: { target: 'local' } });
+        expect(reply.rpcLatency.server.spans.filter((s: any) => s.stage === 'server-lookup').map((s: any) => [s.outcome, s.lookupResult])).toEqual([['rejected', undefined], ['resolved', 'found']]);
+        expect(fetchSockets).toHaveBeenCalledTimes(2);
+        expect(emit).toHaveBeenCalledTimes(1);
+        // ACK completed before the 2s presence poll, which must not delay delivery.
+        expect(callback).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); vi.unstubAllEnvs(); }
+});
+
+it.each([
+    ['machine-1:bash', { version: 1, id: '11111111-1111-4111-8111-111111111111' }],
+    ['machine-1:daemon-session-state', { version: 1, id: 'private-session' }],
+])('ignores diagnostics for ineligible method or invalid ID: %s', async (method, rpcLatency) => {
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    try {
+        const caller = new FakeSocket('caller');
+        const target = new FakeSocket('target');
+        const emit = vi.fn(async (_event: string, _payload: unknown) => 'encrypted');
+        target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method, params: 'input', rpcLatency }, callback);
+        expect(emit).toHaveBeenCalledExactlyOnceWith('rpc-request', { method, params: 'input' });
+        expect(callback).toHaveBeenCalledExactlyOnceWith({ ok: true, result: 'encrypted' });
+    } finally { vi.unstubAllEnvs(); }
+});
