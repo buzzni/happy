@@ -26,6 +26,7 @@ import {
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
 import { inTx } from '@/storage/inTx';
+import { db } from '@/storage/db';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
 import type { Fastify } from '../types';
@@ -137,12 +138,13 @@ export function automationRoutes(app: Fastify) {
         return reply.send(result.value);
     });
 
+    // Read-only views use independent queries; write routes retain Serializable transactions.
     app.get('/v1/projects/:projectId/automation-target', {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
-        const result = await inTx((tx) => getAutomationTarget(tx, request.userId, request.params.projectId));
+        const result = await getAutomationTarget(db, request.userId, request.params.projectId);
         if (!result.ok) return sendError(reply, result);
         return reply.send({
             target: {
@@ -207,7 +209,7 @@ export function automationRoutes(app: Fastify) {
         schema: { params: paramsSchema },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
-        const result = await inTx((tx) => listAutomations(tx, request.userId, request.params.projectId));
+        const result = await listAutomations(db, request.userId, request.params.projectId);
         if (!result.ok) return sendError(reply, result);
         return reply.send({ automations: result.value.map(serializeAutomation) });
     });
@@ -223,7 +225,7 @@ export function automationRoutes(app: Fastify) {
         },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;
-        const result = await inTx((tx) => listAutomationRuns(tx, request.userId, request.params.projectId, request.query));
+        const result = await listAutomationRuns(db, request.userId, request.params.projectId, request.query);
         if (!result.ok) return sendError(reply, result);
         return reply.send({ runs: result.value.map(serializeRun) });
     });
