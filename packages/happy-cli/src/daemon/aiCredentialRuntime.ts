@@ -1439,9 +1439,11 @@ export function runAiCredentialCommand(
   spawnCommand: typeof spawn = spawn,
 ): Promise<AiCredentialCommandResult> {
   return new Promise((resolve, reject) => {
+    const environment = options.environment ?? process.env
     const child = spawnCommand(command, args, {
-      env: options.environment
-        ?? (command === 'cswap' ? withUvToolBinOnPath() : process.env),
+      env: command === 'uv' || command === 'cswap'
+        ? withUvToolBinOnPath(environment, homedir(), command)
+        : environment,
       stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -1470,7 +1472,9 @@ export function runAiCredentialCommand(
     }
     child.stdout!.on('data', collect(stdout))
     child.stderr!.on('data', collect(stderr))
-    child.on('error', () => fail('COMMAND_NOT_AVAILABLE'))
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      fail(error.code === 'ENOENT' ? 'COMMAND_NOT_AVAILABLE' : 'COMMAND_FAILED')
+    })
     child.on('close', (code) => {
       if (settled) return
       settled = true
@@ -1498,8 +1502,9 @@ export function runAiCredentialCommand(
 export function withUvToolBinOnPath(
   environment: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
+  command: 'uv' | 'cswap' = 'cswap',
 ): NodeJS.ProcessEnv {
-  const toolBin = environment.UV_TOOL_BIN_DIR
+  const toolBin = (command === 'uv' ? environment.UV_INSTALL_DIR : environment.UV_TOOL_BIN_DIR)
     || environment.XDG_BIN_HOME
     || (environment.XDG_DATA_HOME
       ? join(environment.XDG_DATA_HOME, '..', 'bin')
