@@ -1528,6 +1528,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         machineId: principal.kind === 'account' ? (machineId ?? null) : null,
         sessionId: session.sessionId,
         happyHomeDir: configuration.happyHomeDir,
+        announceCandidate: (envelope) => session.sendSessionProtocolMessage(envelope),
     });
 
     /*
