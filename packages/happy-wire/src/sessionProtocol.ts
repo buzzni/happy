@@ -131,8 +131,11 @@ export const sessionDifficultyRoutingEventSchema = z.object({
 // model, so it is session-owned. The identifiers are exactly what an approve or
 // reject request must name; the lesson body is untrusted model text that a
 // client shows as plain text only.
-const lessonText = z.string().min(1).max(4000);
-const lessonList = z.array(z.string().min(1).max(4000)).max(50);
+// Bounded by the whole-proposal limit happy-cli enforces (16,384 bytes), not
+// per field: a tighter field bound would leave a stored candidate with no card.
+const LESSON_PROPOSAL_MAX = 16_384;
+const lessonText = z.string().min(1).max(LESSON_PROPOSAL_MAX);
+const lessonList = z.array(z.string().min(1).max(LESSON_PROPOSAL_MAX)).max(LESSON_PROPOSAL_MAX);
 
 export const sessionLessonCandidateEventSchema = z.object({
   t: z.literal('lesson-candidate'),
