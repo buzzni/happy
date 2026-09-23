@@ -1302,3 +1302,20 @@ describe('duplicate request ids within a batch', () => {
     expect(applied.state.escalation?.hardTurns).toBe(1)
   })
 })
+
+describe('opaque pending request ids', () => {
+  it.each(['constructor', 'toString', '__proto__'])('does not treat inherited %s as an accepted request', (id) => {
+    const state = recordPendingDecision(normalizeRoutingSessionState(undefined, 'claude'), pending())
+    expect(pendingDecision(state, id)).toBeUndefined()
+    expect(discardPendingDecisions(state, [id], 'cancelled')).toBe(state)
+    expect(commitAppliedRouting(state, { clientRequestIds: [id], executionId: 'exec', now: NOW })).toEqual({ state, applied: null })
+  })
+  it('restores and commits a literal __proto__ request id', () => {
+    const queued = recordPendingDecision(normalizeRoutingSessionState(undefined, 'claude'), pending({ clientRequestId: '__proto__' }))
+    const restored = normalizeRoutingSessionState(JSON.parse(JSON.stringify(queued)), 'claude')
+    expect(Object.keys(restored.pending ?? {})).toEqual(['__proto__'])
+    const result = commitAppliedRouting(restored, { clientRequestIds: ['__proto__'], executionId: 'exec', now: NOW })
+    expect(result.applied?.clientRequestId).toBe('__proto__')
+    expect(result.state.appliedRequestIds).toEqual(['__proto__'])
+  })
+})

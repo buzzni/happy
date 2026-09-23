@@ -24,6 +24,7 @@ import {
   discardPendingDecisions,
   normalizeRoutingSessionState,
   recordPendingDecision,
+  pendingDecision,
   requestRoutingEpoch,
   isFloorRaiseBlockedByPolicy,
   resolveEngineBoundaryRoute,
@@ -64,7 +65,7 @@ export class DifficultyRoutingCommitter {
     const applied = new Set(this.state.appliedRequestIds ?? [])
     return selectBatchWinner((clientRequestIds ?? [])
       .filter((id) => !applied.has(id))
-      .map((id) => this.state.pending?.[id])
+      .map((id) => pendingDecision(this.state, id))
       .filter((entry): entry is RoutingPendingDecision => Boolean(entry)))
   }
 
@@ -75,7 +76,7 @@ export class DifficultyRoutingCommitter {
    */
   recordPending(next: DifficultyRoutingSessionState): void {
     if (!canPersistRoutingState(this.state)) return
-    const pending = { ...this.state.pending }
+    const pending: Record<string, RoutingPendingDecision> = Object.assign(Object.create(null), this.state.pending)
     for (const [id, decision] of Object.entries(next.pending ?? {})) {
       if (!this.alreadyApplied(id)) pending[id] = decision
     }

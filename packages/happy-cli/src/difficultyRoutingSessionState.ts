@@ -433,7 +433,7 @@ function readEscalation(value: unknown): RoutingEscalationState | null {
 
 function readPending(value: unknown): Record<string, RoutingPendingDecision> | null {
   if (!isRecord(value)) return null
-  const out: Record<string, RoutingPendingDecision> = {}
+  const out: Record<string, RoutingPendingDecision> = Object.create(null)
   for (const [key, entry] of Object.entries(value)) {
     const parsed = readPendingDecision(entry, key)
     if (parsed) out[key] = parsed
@@ -543,7 +543,10 @@ export function pendingDecision(
   state: DifficultyRoutingSessionState,
   clientRequestId: string,
 ): RoutingPendingDecision | undefined {
-  return state.pending?.[clientRequestId]
+  const pending = state.pending
+  return pending && Object.prototype.hasOwnProperty.call(pending, clientRequestId)
+    ? pending[clientRequestId]
+    : undefined
 }
 
 /**
@@ -580,7 +583,7 @@ export function discardPendingDecisions(
   const remaining = { ...pending }
   let removed = false
   for (const id of clientRequestIds) {
-    if (id in remaining) {
+    if (Object.prototype.hasOwnProperty.call(remaining, id)) {
       delete remaining[id]
       removed = true
     }
@@ -645,7 +648,7 @@ export function commitAppliedRouting(
   const alreadyApplied = new Set(state.appliedRequestIds ?? [])
   const matched = [...new Set(input.clientRequestIds)]
     .filter((id) => !alreadyApplied.has(id))
-    .map((id) => pending[id])
+    .map((id) => pendingDecision(state, id))
     .filter((entry): entry is RoutingPendingDecision => Boolean(entry))
   if (matched.length === 0) return { state, applied: null }
 

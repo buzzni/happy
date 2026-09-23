@@ -435,3 +435,21 @@ describe('applied event accuracy at the boundary (R4, R8)', () => {
     expect(revised).toEqual({ model: 'claude-opus-5-5', effort: 'high' })
   })
 })
+
+describe('committer opaque request ids', () => {
+  it('accepts and commits a literal __proto__ id without changing the map prototype', () => {
+    const { committer } = makeCommitter()
+    committer.recordPending(acceptedState(committer, pending({ clientRequestId: '__proto__' })))
+    expect(Object.keys(committer.current().pending ?? {})).toEqual(['__proto__'])
+    committer.commitApplied(['__proto__'], 'exec')
+    expect(committer.current().appliedRequestIds).toEqual(['__proto__'])
+  })
+  it.each(['constructor', 'toString', '__proto__'])('ignores unaccepted %s at preview and commit', (id) => {
+    const { committer } = makeCommitter()
+    committer.recordPending(acceptedState(committer))
+    const before = structuredClone(committer.current())
+    expect(committer.previewAppliedRoute([id])).toBeNull()
+    expect(committer.commitApplied([id], 'exec')).toBeNull()
+    expect(committer.current()).toEqual(before)
+  })
+})
