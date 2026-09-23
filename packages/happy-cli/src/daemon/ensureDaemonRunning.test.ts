@@ -5,6 +5,8 @@ const mocks = vi.hoisted(() => ({
   mockIsDaemonRunningCurrentlyInstalledHappyVersion: vi.fn(),
   mockCheckIfDaemonRunningAndCleanupStaleState: vi.fn(),
   mockSpawnHappyCLI: vi.fn(),
+  mockReadSettings: vi.fn(),
+  mockUpdateSettings: vi.fn(),
 }))
 
 vi.mock('@/ui/logger', () => ({
@@ -26,6 +28,11 @@ vi.mock('@/utils/spawnHappyCLI', () => ({
   captureSpawnOutputStdio: () => 'ignore',
 }))
 
+vi.mock('@/persistence', () => ({
+  readSettings: mocks.mockReadSettings,
+  updateSettings: mocks.mockUpdateSettings,
+}))
+
 import { ensureDaemonRunning } from './ensureDaemonRunning'
 
 describe('ensureDaemonRunning', () => {
@@ -35,6 +42,10 @@ describe('ensureDaemonRunning', () => {
       unref: vi.fn(),
     })
     mocks.mockCheckIfDaemonRunningAndCleanupStaleState.mockResolvedValue(true)
+    mocks.mockReadSettings.mockResolvedValue({
+      schemaVersion: 2,
+      onboardingCompleted: true,
+    })
   })
 
   it('returns without spawning when the daemon is already running', async () => {
@@ -70,5 +81,28 @@ describe('ensureDaemonRunning', () => {
     expect(mocks.mockCheckIfDaemonRunningAndCleanupStaleState).toHaveBeenCalledTimes(2)
     expect(mocks.mockLoggerDebug).toHaveBeenCalledWith('Starting Happy background service...')
     expect(mocks.mockLoggerDebug).toHaveBeenCalledWith('Happy background service is ready')
+  })
+
+  it('restores the persisted Aplus MCP config URL when the caller environment omits it', async () => {
+    const originalConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
+    delete process.env.HAPPY_APLUS_MCP_CONFIG_URL
+    mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockResolvedValue(false)
+    mocks.mockReadSettings.mockResolvedValue({
+      schemaVersion: 2,
+      onboardingCompleted: true,
+      aplusMcpConfigUrl: 'https://saycode.example/api/me/mcp-config',
+    })
+
+    try {
+      await ensureDaemonRunning()
+
+      expect(mocks.mockSpawnHappyCLI).toHaveBeenCalledTimes(1)
+      expect(mocks.mockSpawnHappyCLI.mock.calls[0]?.[1]?.env?.HAPPY_APLUS_MCP_CONFIG_URL).toBe(
+        'https://saycode.example/api/me/mcp-config',
+      )
+    } finally {
+      if (originalConfigUrl === undefined) delete process.env.HAPPY_APLUS_MCP_CONFIG_URL
+      else process.env.HAPPY_APLUS_MCP_CONFIG_URL = originalConfigUrl
+    }
   })
 })
