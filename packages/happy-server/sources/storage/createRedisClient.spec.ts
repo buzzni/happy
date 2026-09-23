@@ -1,5 +1,13 @@
-import { describe, expect, it } from 'vitest';
-import { isRedisConfigured, resolveRedisClientOptions } from './createRedisClient';
+import net from 'node:net';
+import { afterEach, describe, expect, it } from 'vitest';
+import type { Redis } from 'ioredis';
+import { createRedisClient, isRedisConfigured, resolveRedisClientOptions } from './createRedisClient';
+import { redisClientErrorsCounter } from '@/app/monitoring/metrics2';
+
+async function stallCount(): Promise<number> {
+    const { values } = await redisClientErrorsCounter.get();
+    return values.find(value => value.labels.code === 'STALL')?.value ?? 0;
+}
 
 describe('isRedisConfigured', () => {
     it('shouldBeFalseWhenNoRedisEnvVarsSet', () => {
@@ -66,5 +74,164 @@ describe('resolveRedisClientOptions', () => {
         const reconnectOnError = options.reconnectOnError!;
         expect(reconnectOnError(new Error('READONLY You can\'t write against a read only replica.'))).toBe(2);
         expect(reconnectOnError(new Error('ECONNRESET'))).toBe(false);
+    });
+});
+
+/**
+ * A Redis stand-in that answers PING/GET and the handshake, and can stop
+ * answering on its open connections while keeping the TCP sockets open —
+ * what a half-open connection looks like from the client (2026-09-23 prod:
+ * ~17 minutes until the kernel gave up and ECONNRESET arrived). It can also
+ * answer late instead of never, which is the ordinary slow moment (an RDB
+ * fork, a long single-threaded command) a stall must not be confused with.
+ * Late replies still go out in order, as a real server's do.
+ */
+async function startFakeRedis() {
+    const connections: net.Socket[] = [];
+    const stalled = new Set<net.Socket>();
+    const received = new Map<net.Socket, string[]>();
+    let lateReplies = 0;
+    let replyDelayMs = 0;
+    const server = net.createServer(socket => {
+        connections.push(socket);
+        let buffer = '';
+        const pending: string[] = [];
+        let waiting = false;
+        socket.on('data', chunk => {
+            buffer += chunk.toString('utf8');
+            for (;;) {
+                const command = takeCommand();
+                if (!command) break;
+                received.set(socket, [...(received.get(socket) ?? []), command.join(' ')]);
+                if (stalled.has(socket)) continue;
+                const name = command[0].toUpperCase();
+                if (name === 'INFO') pending.push('$9\r\nloading:0\r\n');
+                else if (name === 'PING') pending.push('+PONG\r\n');
+                else pending.push('$-1\r\n');
+            }
+            drain();
+        });
+        socket.on('error', () => {});
+        function drain() {
+            if (waiting) return;
+            const reply = pending.shift();
+            if (reply === undefined) return;
+            const delay = lateReplies > 0 ? (lateReplies--, replyDelayMs) : 0;
+            if (delay === 0) {
+                if (!socket.destroyed) socket.write(reply);
+                drain();
+                return;
+            }
+            waiting = true;
+            setTimeout(() => {
+                waiting = false;
+                if (!socket.destroyed) socket.write(reply);
+                drain();
+            }, delay).unref();
+        }
+        function takeCommand(): string[] | null {
+            const header = /^\*(\d+)\r\n/.exec(buffer);
+            if (!header) return null;
+            let at = header[0].length;
+            const parts: string[] = [];
+            for (let i = 0; i < Number(header[1]); i++) {
+                const length = /^\$(\d+)\r\n/.exec(buffer.slice(at));
+                if (!length) return null;
+                const start = at + length[0].length;
+                const end = start + Number(length[1]);
+                if (buffer.length < end + 2) return null;
+                parts.push(buffer.slice(start, end));
+                at = end + 2;
+            }
+            buffer = buffer.slice(at);
+            return parts;
+        }
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as net.AddressInfo;
+    return {
+        url: `redis://127.0.0.1:${port}`,
+        connectionCount: () => connections.length,
+        commandsOnConnection: (index: number) => received.get(connections[index]) ?? [],
+        stallOpenConnections: () => { for (const socket of connections) stalled.add(socket); },
+        answerNextRepliesLate: (count: number, delayMs: number) => { lateReplies = count; replyDelayMs = delayMs; },
+        close: () => {
+            for (const socket of connections) socket.destroy();
+            return new Promise<void>(resolve => server.close(() => resolve()));
+        },
+    };
+}
+
+async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (condition()) return true;
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    return condition();
+}
+
+describe('createRedisClient on a stalled connection', () => {
+    const timing = { commandTimeoutMs: 250, stallCheckIntervalMs: 100 };
+    const cleanups: Array<() => Promise<void> | void> = [];
+    afterEach(async () => {
+        while (cleanups.length) await cleanups.pop()!();
+    });
+
+    async function connect(): Promise<{ client: Redis; fake: Awaited<ReturnType<typeof startFakeRedis>> }> {
+        const fake = await startFakeRedis();
+        cleanups.push(fake.close);
+        const client = createRedisClient({ REDIS_URL: fake.url }, timing);
+        cleanups.push(() => { client.disconnect(); });
+        expect(await waitFor(() => client.status === 'ready', 2_000)).toBe(true);
+        return { client, fake };
+    }
+
+    it('shouldFailACommandInsteadOfWaitingForeverWhenRedisStopsAnswering', async () => {
+        const { client, fake } = await connect();
+        fake.stallOpenConnections();
+        await expect(client.get('key')).rejects.toThrow('Command timed out');
+    });
+
+    it('shouldReplaceAConnectionThatStoppedAnsweringWithoutWaitingForTheKernel', async () => {
+        const { client, fake } = await connect();
+        const stallsBefore = await stallCount();
+        fake.stallOpenConnections();
+        expect(await waitFor(() => fake.connectionCount() === 2 && client.status === 'ready', 3_000)).toBe(true);
+        await expect(client.ping()).resolves.toBe('PONG');
+        expect(await stallCount()).toBe(stallsBefore + 1);
+    });
+
+    it('shouldNotReplayACommandAlreadyReportedAsTimedOutOnTheReplacementConnection', async () => {
+        const { client, fake } = await connect();
+        fake.stallOpenConnections();
+        await expect(client.set('replay-probe', 'v')).rejects.toThrow('Command timed out');
+        expect(await waitFor(() => fake.connectionCount() === 2 && client.status === 'ready', 3_000)).toBe(true);
+        await expect(client.ping()).resolves.toBe('PONG');
+        expect(fake.commandsOnConnection(0)).toContain('set replay-probe v');
+        expect(fake.commandsOnConnection(1).filter(command => command.startsWith('set'))).toEqual([]);
+    });
+
+    /*
+     * A single command over the deadline is a slow moment, not a stall: the
+     * connection is live and the next command answers. Replacing it costs a
+     * window in which the client is not `ready` and every command waits in
+     * the offline queue for its own timeout, and buys nothing.
+     */
+    it('shouldKeepAConnectionThatWasOnlySlowForOneCommand', async () => {
+        const { client, fake } = await connect();
+        const stallsBefore = await stallCount();
+        fake.answerNextRepliesLate(1, timing.commandTimeoutMs * 2);
+        await new Promise(resolve => setTimeout(resolve, timing.commandTimeoutMs * 4));
+        expect(fake.connectionCount()).toBe(1);
+        expect(await stallCount()).toBe(stallsBefore);
+        await expect(client.ping()).resolves.toBe('PONG');
+    });
+
+    it('shouldKeepAHealthyConnection', async () => {
+        const { client, fake } = await connect();
+        await new Promise(resolve => setTimeout(resolve, timing.stallCheckIntervalMs * 5));
+        expect(fake.connectionCount()).toBe(1);
+        await expect(client.ping()).resolves.toBe('PONG');
     });
 });

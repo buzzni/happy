@@ -69,6 +69,18 @@ export const CLIENT_REATTACH_GRACE_MS = 30_000;
  */
 const reattachTimers = new Map<string, NodeJS.Timeout>();
 
+/**
+ * Session cleanup runs where nothing is waiting for it: a socket.io listener
+ * whose returned promise is dropped, and a timer callback. Since Redis
+ * commands gained a deadline these paths can reject, and an unhandled
+ * rejection ends in process.exit(1) (main.ts) — the terminal record is left
+ * to the store's own TTL instead.
+ */
+function reportCleanupFailure(error: unknown): void {
+    log({ module: 'terminal-relay', level: 'error' },
+        `[REMOTE-TERMINAL] session cleanup failed, leaving the record to its TTL: ${error}`);
+}
+
 function cancelReattachTimer(sessionId: string): void {
     const timer = reattachTimers.get(sessionId);
     if (!timer) return;
@@ -322,7 +334,7 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] close session=${session.id} exit=${data?.code} signal=${data?.signal}`);
     });
 
-    socket.on('disconnect', async () => {
+    const cleanUpAfterDisconnect = async () => {
         const sessions = await findTerminalSessionsBySocketId(socket.id);
         if (sessions.length === 0) return;
         for (const session of sessions) {
@@ -378,12 +390,22 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                     }
                     await removeTerminalSession(current.id);
                     log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] close session=${current.id} (client did not return)`);
-                })();
+                })().catch(reportCleanupFailure);
             }, CLIENT_REATTACH_GRACE_MS);
             // Never hold the process open for a terminal nobody is watching.
             timer.unref?.();
             reattachTimers.set(session.id, timer);
             log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] client detached session=${session.id} — ${CLIENT_REATTACH_GRACE_MS}ms to re-attach`);
         }
+    };
+    socket.on('disconnect', () => {
+        // socket.io drops whatever a listener returns, and main.ts ends an
+        // unhandled rejection in process.exit(1). These lookups now reach
+        // Redis with a command deadline, so one that fails while a client
+        // disconnects must not take the replica down. Still returned, for
+        // callers that do await the handler.
+        const cleanup = cleanUpAfterDisconnect();
+        cleanup.catch(reportCleanupFailure);
+        return cleanup;
     });
 }
