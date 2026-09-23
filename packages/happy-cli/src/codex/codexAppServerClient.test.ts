@@ -4728,4 +4728,43 @@ describe('explicit authentication recovery', () => {
         expect(client.threadId).toBe('original');
         await client.disconnect();
     });
+    it.each([false, true])('finishes an authoritative turn with background work (query fails=%s)', async (unavailable) => {
+        const events: Array<Record<string, unknown>> = [];
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'thread/start') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'bg-thread' } } });
+            if (msg.method === 'thread/backgroundTerminals/list') {
+                pushJsonLine(stdout, unavailable
+                    ? { id: msg.id, error: { code: -32601, message: 'not supported' } }
+                    : { id: msg.id, result: { data: [{ itemId: 'bg-cmd', processId: '42', command: 'vite' }], nextCursor: null } });
+            }
+            if (msg.method === 'turn/start') setTimeout(() => {
+                pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'bg-turn' } } });
+                pushJsonLine(stdout, { method: 'turn/started', params: { threadId: 'bg-thread', turn: { id: 'bg-turn' } } });
+                pushJsonLine(stdout, { method: 'item/started', params: { threadId: 'bg-thread', turnId: 'bg-turn', item: { type: 'commandExecution', id: 'bg-cmd', command: 'vite' } } });
+                // Interleaved text is not a terminal signal.
+                pushJsonLine(stdout, { method: 'item/completed', params: { threadId: 'bg-thread', turnId: 'bg-turn', item: { type: 'agentMessage', id: 'text', text: 'server started', phase: 'commentary' } } });
+                setTimeout(() => pushJsonLine(stdout, { method: 'turn/completed', params: { threadId: 'bg-thread', turn: { id: 'bg-turn', status: 'completed' } } }), 30);
+            }, 0);
+        } });
+        mockSpawn.mockImplementation(() => proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setEventHandler(event => events.push(event as Record<string, unknown>));
+        await client.connect();
+        await client.startThread({ model: 'gpt-test', cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        const turn = client.sendTurnAndWait('start server');
+        await waitFor(() => events.some(event => event.type === 'agent_message'));
+        expect(events.some(event => event.type === 'task_complete')).toBe(false);
+        await waitFor(() => events.some(event => event.type === 'task_complete'), 2500);
+        await expect(turn).resolves.toEqual({ aborted: false });
+        expect(events).toContainEqual(expect.objectContaining({ type: 'background_tasks', tasks: [expect.objectContaining({ callId: 'bg-cmd', status: unavailable ? 'unknown' : 'running' })] }));
+        // Transferring ownership is not a fabricated successful process exit.
+        expect(events.some(event => event.type === 'exec_command_end')).toBe(false);
+        pushJsonLine(proc.stdout, { method: 'item/completed', params: { threadId: 'bg-thread', turnId: 'bg-turn', item: { type: 'commandExecution', id: 'bg-cmd', exitCode: 0, status: 'completed' } } });
+        await waitFor(() => events.some(event => event.type === 'exec_command_end'));
+        expect(events.filter(event => event.type === 'background_tasks').at(-1)?.tasks).toEqual([]);
+        expect(events.filter(event => event.type === 'task_complete')).toHaveLength(1);
+        await client.disconnect();
+    });
+
 });

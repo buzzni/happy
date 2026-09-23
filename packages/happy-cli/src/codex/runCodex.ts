@@ -1,3 +1,4 @@
+import type { CodexBackgroundTask } from './codexBackgroundTasks';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
@@ -1233,6 +1234,11 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
         }
 
+        if (msg.type === 'background_tasks') {
+            const tasks = msg.tasks as CodexBackgroundTask[];
+            session.updateMetadata(current => ({ ...current, codexBackgroundTasks: tasks }));
+            return;
+        }
         if (msg.type === 'codex_usage') {
             try {
                 session.sendProviderUsageEvent(createCodexUsageEvent({
@@ -1403,6 +1409,9 @@ export async function runCodex(opts: {
             }
         }
     });
+
+    const previousBackgroundTasks = session.getMetadata()?.codexBackgroundTasks;
+    if (previousBackgroundTasks?.length) client.restoreBackgroundTasks(previousBackgroundTasks);
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
