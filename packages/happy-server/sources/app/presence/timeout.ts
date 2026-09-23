@@ -6,7 +6,7 @@ import { buildMachineActivityEphemeral, buildSessionActivityEphemeral, eventRout
 
 export function startTimeout() {
     forever('session-timeout', async () => {
-        while (true) {
+        while (!shutdownSignal.aborted) {
             // Find timed out sessions
             const sessions = await db.session.findMany({
                 where: {
