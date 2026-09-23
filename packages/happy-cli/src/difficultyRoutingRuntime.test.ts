@@ -317,7 +317,7 @@ describe('difficulty routing runtime', () => {
     expect(decision?.route).toMatchObject({
       difficulty: 'hard',
       rawDifficulty: 'hard',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       effort: 'high',
     })
     expect(decision?.event.ev).toMatchObject({
