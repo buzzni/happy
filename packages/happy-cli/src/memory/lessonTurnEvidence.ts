@@ -4,8 +4,9 @@
  * Two judgements, kept apart from anything that spends money:
  *
  * **Eligibility.** A turn is a candidate only when it ended normally *and*
- * shows one of two things: the user corrected the agent, or the agent recovered
- * from a failure it had actually verified. A plain success teaches nothing new,
+ * shows one of three things: the user corrected the agent, the agent recovered
+ * from a failure it had actually verified, or the agent itself proposed a
+ * lesson from work this host observed. A plain success teaches nothing new,
  * an abort teaches nothing at all, and an automation or review turn is not a
  * person working — those are excluded by rule rather than left to the model.
  *
@@ -68,7 +69,7 @@ export interface LessonTurnRecord {
 export type LessonEvidence = {
     evidenceKey: string;
     /** What made this turn interesting; carried into the review prompt. */
-    signal: 'user-correction' | 'verified-recovery';
+    signal: 'user-correction' | 'verified-recovery' | 'agent-proposal';
     transcript: string;
 };
 
@@ -142,6 +143,18 @@ export function lessonEvidenceKey(input: {
 export function evaluateLessonTurn(
     record: LessonTurnRecord,
     projectId: string,
+    options: {
+        /**
+         * The foreground agent submitted a well-formed proposal this turn.
+         *
+         * The narrow patterns above miss most turns that teach something (the
+         * agent verified a fix nobody had to correct), so every one of them was
+         * refused as `no-signal` while the model was invited to propose each
+         * turn. A proposal is its own signal; it still needs observed work
+         * below, and still goes to approval before anything recalls it.
+         */
+        agentProposal?: boolean;
+    } = {},
 ): LessonEvidenceDecision {
     // An abort says the user changed their mind, not that the agent learned
     // something. A review or automation turn is not a person working.
@@ -167,7 +180,8 @@ export function evaluateLessonTurn(
         (message) => CORRECTION_PATTERNS.some((pattern) => pattern.test(message)),
     );
     const recovered = record.recoveredFailures.length > 0;
-    if (!corrected && !recovered) return { eligible: false, reason: 'no-signal' };
+    const proposed = options.agentProposal === true;
+    if (!corrected && !recovered && !proposed) return { eligible: false, reason: 'no-signal' };
     /*
      * A signal is not evidence. With no observed actions and no observed
      * failures there is only the user's words, and a review of that can
@@ -190,7 +204,7 @@ export function evaluateLessonTurn(
         eligible: true,
         evidence: {
             // Both signals can hold; recovery is the stronger one to review.
-            signal: recovered ? 'verified-recovery' : 'user-correction',
+            signal: recovered ? 'verified-recovery' : (corrected ? 'user-correction' : 'agent-proposal'),
             evidenceKey: lessonEvidenceKey({ projectId, sessionId: record.sessionId, content: transcript }),
             transcript,
         },

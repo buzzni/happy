@@ -44,7 +44,8 @@ export interface LessonReviewWorkerDeps {
      */
     identity(): Promise<{ projectId: string; userId: string; machineId: string } | null>
         | { projectId: string; userId: string; machineId: string } | null;
-    onOutcome?(outcome: LessonReviewOutcome): void;
+    /** `reason` names which eligibility rule refused a `not-eligible` turn. */
+    onOutcome?(outcome: LessonReviewOutcome, reason?: string): void;
 }
 
 /** Shapes the model's proposal into CML's candidate payload, or refuses it. */
@@ -117,8 +118,8 @@ export interface LessonReviewWorker {
 /** Persists bounded foreground proposals. Never starts another model/API call. */
 export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonReviewWorker {
     let running = false;
-    const report = (outcome: LessonReviewOutcome): LessonReviewOutcome => {
-        deps.onOutcome?.(outcome);
+    const report = (outcome: LessonReviewOutcome, reason?: string): LessonReviewOutcome => {
+        deps.onOutcome?.(outcome, reason);
         return outcome;
     };
     return {
@@ -156,16 +157,17 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
             try {
                 const identity = await deps.identity();
                 if (!identity) return report('permission_denied');
-                const decision = evaluateLessonTurn(record, identity.projectId);
+                const proposalSubmitted = proposal !== undefined && proposal !== null;
+                const decision = evaluateLessonTurn(record, identity.projectId, { agentProposal: proposalSubmitted });
                 if (!decision.eligible) {
                     logger.debug('[lesson-review-evidence]', {
                         reason: decision.reason, kind: record.kind,
                         hadPriorAssistantTurn: record.hadPriorAssistantTurn,
                         hasObservedActions: Boolean(record.agentSummary.trim()),
                         hasVerifiedRecovery: record.recoveredFailures.length > 0,
-                        proposalSubmitted: proposal !== undefined && proposal !== null,
+                        proposalSubmitted,
                     });
-                    return report(decision.reason === 'aborted' ? 'cancelled' : 'not-eligible');
+                    return decision.reason === 'aborted' ? report('cancelled') : report('not-eligible', decision.reason);
                 }
                 const settings = await deps.settings.read();
                 if (!settings.reviewEnabled) return report('disabled');
@@ -213,7 +215,9 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                     generation: plannedRevision, evidenceKey: decision.evidence.evidenceKey,
                     sessionId: record.sessionId, content: decision.evidence.transcript,
                 }) as { outcome?: string; eventId?: unknown };
-                if (appended?.outcome !== 'persisted' || typeof appended.eventId !== 'string' || !appended.eventId) return report('not-eligible');
+                if (appended?.outcome !== 'persisted' || typeof appended.eventId !== 'string' || !appended.eventId) {
+                    return report('not-eligible', 'evidence-refused');
+                }
                 if (!(await stillCurrent())) return stale();
                 const candidate = toCandidate(proposal, record, [appended.eventId])!;
                 // Once enqueue starts, keep the claim even if its result is lost.

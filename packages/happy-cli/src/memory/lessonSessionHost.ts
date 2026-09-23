@@ -440,15 +440,15 @@ async function bootstrapLessonSessionHost(input: {
             settings,
             budget: new LessonReviewBudget(lessonReviewLedgerPath(stateRoot)),
             identity: liveIdentity,
-            onOutcome: (outcome) => {
-                logger.debug(`[lesson-review] ${outcome}`);
+            onOutcome: (outcome, reason) => {
+                logger.debug(`[lesson-review] ${outcome}${reason ? ` (${reason})` : ''}`);
                 /*
                  * Written where the UI can read it. The worker runs in the
                  * provider process and the snapshot is served by the daemon,
                  * so an in-memory value would leave the UI reporting a state
                  * nothing ever updates.
                  */
-                void outcomes.record(outcome);
+                void outcomes.record(outcome, reason);
             },
         }),
         close: () => supervisor.close(),

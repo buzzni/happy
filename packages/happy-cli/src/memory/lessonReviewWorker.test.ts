@@ -119,24 +119,38 @@ describe('foreground lesson proposals', () => {
         } finally { log.mockRestore(); await rm(h.dir, { recursive: true, force: true }); }
     });
     it.each([
-        ['no-signal', false, 'observed task', []],
-        ['no-evidence', true, '', []],
-    ] as const)('reports bounded %s diagnostics without recording content', async (reason, prior, summary, failures) => {
+        ['no-signal', false, 'observed task', [], false],
+        ['no-evidence', true, '', [], true],
+    ] as const)('reports bounded %s diagnostics without recording content', async (reason, prior, summary, failures, proposed) => {
         const log = vi.spyOn(logger, 'debug').mockImplementation(() => {});
         const h = await harness();
         try {
-            const result = await h.worker.reviewFinishedTurn({ ...input(), record: {
+            const result = await h.worker.reviewFinishedTurn({ ...input(), proposal: proposed ? proposal : undefined, record: {
                 ...record, hadPriorAssistantTurn: prior, userMessages: ['아니 secret-value'],
                 agentSummary: summary, recoveredFailures: failures,
             } });
             expect(result).toBe('not-eligible');
             expect(log).toHaveBeenCalledWith('[lesson-review-evidence]', {
                 reason, kind: 'foreground', hadPriorAssistantTurn: prior,
-                hasObservedActions: Boolean(summary), hasVerifiedRecovery: false, proposalSubmitted: true,
+                hasObservedActions: Boolean(summary), hasVerifiedRecovery: false, proposalSubmitted: proposed,
             });
             expect(JSON.stringify(log.mock.calls)).not.toContain('secret-value');
             expect(h.host.calls).toHaveLength(0);
         } finally { log.mockRestore(); await rm(h.dir, { recursive: true, force: true }); }
+    });
+    it('persists a proposal from a plain successful turn that observed the agent working', async () => {
+        const h = await harness();
+        const plain = { ...record, recoveredFailures: [] };
+        expect(await h.worker.reviewFinishedTurn({ ...input(), record: plain })).toBe('reviewed');
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('reports why a turn was not eligible', async () => {
+        const reported: Array<[string, string | undefined]> = [];
+        const h = await harness({ onOutcome: (outcome, reason) => { reported.push([outcome, reason]); } });
+        const unobserved = { ...record, recoveredFailures: [], agentSummary: '' };
+        expect(await h.worker.reviewFinishedTurn({ ...input(), record: unobserved })).toBe('not-eligible');
+        expect(reported).toEqual([['not-eligible', 'no-evidence']]);
+        await rm(h.dir, { recursive: true, force: true });
     });
     it('does not call a gateway or persist evidence when no proposal was supplied', async () => {
         const network = vi.fn(); vi.stubGlobal('fetch', network);
