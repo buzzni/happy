@@ -161,7 +161,7 @@ describe('RPC names', () => {
     }
 
     it('allows the session lifecycle handlers Claude and Codex register', () => {
-        for (const name of ['permission', 'abort', 'goal-action', 'killSession', 'mcp-reconnect']) {
+        for (const name of ['permission', 'abort', 'goal-action', 'killSession', 'mcp-reconnect', 'mcp-status']) {
             expect(rpc(`${SID}:${name}`), name).toEqual(allow);
         }
     });
