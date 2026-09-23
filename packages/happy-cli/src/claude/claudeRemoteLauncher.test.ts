@@ -21,19 +21,36 @@ describe('Claude model changes across provider restarts', () => {
         const received: Array<{ text: unknown; model: Options['model']; effort: Options['effort'] }> = [];
         const launches: Options[] = [];
         const onModeApplied = vi.fn();
+        let metadata: Record<string, any> = {};
+        const snapshots: any[] = [];
         const client = {
             sessionId: 'model-switch-test',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
-            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            updateAgentState: vi.fn(), updateMetadata: vi.fn((update) => {
+                metadata = update(metadata);
+                if (metadata.claudeBackgroundTasks) snapshots.push(metadata.claudeBackgroundTasks);
+            }), getMetadata: () => metadata,
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
             launches.push(options!);
+            const generation = launches.length;
             const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
                 for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
                     received.push({ text: message.message.content, model: options?.model, effort: options?.effort });
-                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: `result-${received.length}` };
+                    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [
+                        { task_id: `bg-${generation}`, task_type: 'local_bash', description: 'server' },
+                        { task_id: 'watcher', task_type: 'local_bash', description: 'watch', ambient: true },
+                    ] };
+                    if (generation > 1) {
+                        // No task_notification: the full empty snapshot must clear it.
+                        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+                        // Bookends may arrive after a newer full snapshot; do not resurrect it.
+                        yield { type: 'system', subtype: 'task_started', task_id: `bg-${generation}`, description: 'server' };
+                    }
+                    yield { type: 'result', subtype: 'success' , result: '', is_error: false, uuid: `result-${received.length}` };
                     if (received.length === modes.length) {
                         void handlers.get('switch')!();
                         return;
@@ -57,6 +74,10 @@ describe('Claude model changes across provider restarts', () => {
         expect(launches).toHaveLength(3);
         expect(onModeApplied.mock.calls.map(([ids]) => ids)).toEqual(modes.map((_, i) => [`req-${i}`]));
         expect(new Set(onModeApplied.mock.calls.map(([, id]) => id)).size).toBe(modes.length);
+        expect(snapshots.filter(s => s.tasks === null && s.available).length).toBeGreaterThanOrEqual(3);
+        expect(snapshots).toContainEqual(expect.objectContaining({ tasks: [{ taskId: 'bg-1', label: 'server', kind: 'shell' }], available: true }));
+        expect(snapshots).toContainEqual(expect.objectContaining({ tasks: [{ taskId: 'bg-1', label: 'server', kind: 'shell' }], available: false }));
+        expect(snapshots.at(-1)).toEqual(expect.objectContaining({ tasks: [], available: false }));
         expect(lessonReviewLifecycle.completedAssistantTurns).toBe(modes.length);
         expect(cancelLessonReview).toHaveBeenCalled();
         expect(lessonReviewLifecycle.controller.signal.aborted).toBe(true);

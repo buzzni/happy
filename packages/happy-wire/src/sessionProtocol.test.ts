@@ -251,6 +251,52 @@ describe('session protocol schemas', () => {
     expect(sessionEnvelopeSchema.safeParse({ id: 'u', time: 1, role: 'user', ev: event }).success).toBe(false);
   });
 
+  it('accepts lesson-candidate only as a session-owned event', () => {
+    const event = {
+      t: 'lesson-candidate',
+      candidateId: 'cand-1',
+      revision: 2,
+      payloadHash: 'hash-1',
+      lesson: {
+        name: 'rebuild before e2e',
+        trigger: 'e2e fails with missing out/',
+        steps: ['run the build', 'rerun the suite'],
+        scope: 'this repo',
+        validation: ['npm run test:e2e'],
+        reconsiderWhen: 'the build output moves',
+        failureModes: [],
+      },
+    };
+
+    expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev: event }).success).toBe(true);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev: event }).success).toBe(false);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'u', time: 1, role: 'user', ev: event }).success).toBe(false);
+  });
+
+  it('accepts any lesson body the 16KB proposal limit allows', () => {
+    // happy-cli refuses a proposal over 16,384 bytes as a whole; a single long
+    // field inside that must still announce, or the stored candidate has no card.
+    const lesson = {
+      name: 'n', trigger: 't'.repeat(10_000), steps: Array.from({ length: 120 }, (_, i) => `step ${i}`), scope: 'x',
+      validation: ['v'], reconsiderWhen: 'r', failureModes: [],
+    };
+    const ev = { t: 'lesson-candidate', candidateId: 'c', revision: 1, payloadHash: 'h', lesson };
+    expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev }).success).toBe(true);
+  });
+
+  it('rejects a lesson-candidate without the identifiers approval needs', () => {
+    const lesson = {
+      name: 'n', trigger: 't', steps: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [],
+    };
+    const parse = (ev: Record<string, unknown>) =>
+      sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev: { t: 'lesson-candidate', ...ev } }).success;
+
+    expect(parse({ revision: 1, payloadHash: 'h', lesson })).toBe(false);
+    expect(parse({ candidateId: 'c', payloadHash: 'h', lesson })).toBe(false);
+    expect(parse({ candidateId: 'c', revision: 1, lesson })).toBe(false);
+    expect(parse({ candidateId: 'c', revision: 1, payloadHash: 'h', lesson: { ...lesson, steps: [] } })).toBe(false);
+  });
+
   it('rejects start from non-agent role', () => {
     const subagent = createId();
     const parsed = sessionEnvelopeSchema.safeParse({

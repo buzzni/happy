@@ -17,7 +17,15 @@ import { overlayManagedCredentialEnvironment } from './sessionEnv'
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
-const CODEX_MULTI_AUTH_VERSION = '2.15.0'
+const CODEX_MULTI_AUTH_VERSION = '2.16.0'
+// Bundles captured by an earlier pin stay deployable when that release wrote
+// the same account (v3) and settings (v1) files. 2.15.0 and 2.16.0 ship an
+// identical `dist/lib/storage`, so a vault bundle captured before this bump
+// must not start failing apply the moment machines update.
+const READABLE_CODEX_MULTI_AUTH_BUNDLE_VERSIONS: ReadonlySet<string> = new Set([
+  '2.15.0',
+  CODEX_MULTI_AUTH_VERSION,
+])
 const CODEX_MULTI_AUTH_THRESHOLD = 5
 
 export type AiCredentialProvider = 'claude' | 'codex' | 'zai'
@@ -1190,7 +1198,7 @@ type CodexMultiAuthAccount = CodexAccountIdentity & {
 type CodexMultiAuthBundle = {
   version: 1
   kind: 'codex-multi-auth'
-  packageVersion: typeof CODEX_MULTI_AUTH_VERSION
+  packageVersion: string
   accounts: {
     version: 3
     accounts: CodexMultiAuthAccount[]
@@ -1215,7 +1223,8 @@ function parseCodexMultiAuthBundle(payload: string): CodexMultiAuthBundle | null
   }
   if (!isObject(parsed) || parsed.kind !== 'codex-multi-auth') return null
   if (parsed.version !== 1
-    || parsed.packageVersion !== CODEX_MULTI_AUTH_VERSION
+    || typeof parsed.packageVersion !== 'string'
+    || !READABLE_CODEX_MULTI_AUTH_BUNDLE_VERSIONS.has(parsed.packageVersion)
     || !isObject(parsed.accounts)
     || parsed.accounts.version !== 3
     || !Array.isArray(parsed.accounts.accounts)

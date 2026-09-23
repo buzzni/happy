@@ -1,7 +1,18 @@
 import { installRpcPeerDiagnostics } from './rpcPeerDiagnostics';
 import { log } from '@/utils/log';
+import { createLogThrottle } from '@/app/monitoring/redisHealth';
 import { createAdapter } from '@socket.io/redis-streams-adapter';
 import type { Redis } from 'ioredis';
+
+/*
+ * socket.io awaits `restoreSession` before auth middleware for every client
+ * that reconnects with a pid, and a Redis command on a half-open connection
+ * never settles. On 2026-09-23 that held every reconnect in prod until the
+ * client's 20s connect timeout, for ~17 minutes. Past this deadline the client
+ * connects without recovery (missed events are re-fetched over REST) instead
+ * of not connecting at all.
+ */
+export const RESTORE_SESSION_TIMEOUT_MS = 3_000;
 
 export function createIsolatedRedisAdapter(
     writer: Redis,
@@ -13,10 +24,51 @@ export function createIsolatedRedisAdapter(
     // replicas. These dedicated clients share configuration, not a connection.
     // Leave all writes/recovery operations (including instrumented xadd) intact.
     writer.xread = reader.xread.bind(reader);
+    /*
+     * The adapter's persistSession() is declared `: void` and drops the
+     * promise of its SET (0.2.3 dist/adapter.js:147-152), and socket.io calls
+     * persistSession un-awaited for every recoverable disconnect
+     * (dist/socket.js:544). That write used to stay pending forever on a
+     * stalled connection; with `commandTimeout` it rejects, with nothing
+     * holding it — and main.ts turns an unhandled rejection into
+     * process.exit(1), so one client disconnecting during a Redis stall would
+     * take the replica down. Attach a handler where the promise is still
+     * reachable. The promise itself is returned untouched, so a caller that
+     * does await this write still sees the failure.
+     */
+    const shouldLogPersistFailure = createLogThrottle(60_000);
+    const set = writer.set.bind(writer) as (...args: unknown[]) => Promise<unknown>;
+    writer.set = ((...args: unknown[]) => {
+        const written = set(...args);
+        written.catch((error: unknown) => {
+            if (shouldLogPersistFailure('persist')) {
+                log({ module: 'websocket', level: 'warn' },
+                    `session state write failed (throttled to 1/min) — that client reconnects without recovery: ${error}`);
+            }
+        });
+        return written;
+    }) as unknown as Redis['set'];
     const create = createAdapter(writer, options);
     const active = new Set<ReturnType<typeof create>>();
+    const shouldLogRestoreTimeout = createLogThrottle(60_000);
     return function (namespace) {
         const adapter = create(namespace);
+        const restoreSession = adapter.restoreSession.bind(adapter);
+        adapter.restoreSession = (pid, offset) => {
+            let timer: NodeJS.Timeout | undefined;
+            // Rejecting is how the adapter itself reports "nothing to restore";
+            // socket.io catches it and connects the client fresh.
+            const deadline = new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                    if (shouldLogRestoreTimeout('restore')) {
+                        log({ module: 'websocket', level: 'warn' },
+                            `restoreSession exceeded ${RESTORE_SESSION_TIMEOUT_MS}ms (throttled to 1/min) — connecting without recovery; Redis may be stalled`);
+                    }
+                    reject(new Error('restoreSession timed out'));
+                }, RESTORE_SESSION_TIMEOUT_MS);
+            });
+            return Promise.race([restoreSession(pid, offset), deadline]).finally(() => clearTimeout(timer));
+        };
         installRpcPeerDiagnostics(adapter, row => log({ module: 'rpc-peer-diagnostics' }, JSON.stringify(row)));
         active.add(adapter);
         const close = adapter.close.bind(adapter);

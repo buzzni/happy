@@ -52,7 +52,7 @@ describe('normalizeRoutingSessionState', () => {
     )
     expect(state.base).toMatchObject({
       difficulty: 'hard',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       effort: 'high',
       provenance: 'legacy-selection',
     })

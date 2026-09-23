@@ -186,6 +186,34 @@ export const sessionDifficultyRoutingEventSchema = z.object({
   result: difficultyRoutingResultSchema,
 });
 
+// specs/lesson-inline-approval (Desktop) — a lesson candidate the session's
+// lesson host has just stored as `reviewed`. Emitted by the host, never by the
+// model, so it is session-owned. The identifiers are exactly what an approve or
+// reject request must name; the lesson body is untrusted model text that a
+// client shows as plain text only.
+// Bounded by the whole-proposal limit happy-cli enforces (16,384 bytes), not
+// per field: a tighter field bound would leave a stored candidate with no card.
+const LESSON_PROPOSAL_MAX = 16_384;
+const lessonText = z.string().min(1).max(LESSON_PROPOSAL_MAX);
+const lessonList = z.array(z.string().min(1).max(LESSON_PROPOSAL_MAX)).max(LESSON_PROPOSAL_MAX);
+
+export const sessionLessonCandidateEventSchema = z.object({
+  t: z.literal('lesson-candidate'),
+  candidateId: z.string().min(1).max(256),
+  revision: z.number().int().min(0),
+  payloadHash: z.string().min(1).max(256),
+  lesson: z.object({
+    name: lessonText,
+    trigger: lessonText,
+    steps: lessonList.min(1),
+    scope: lessonText,
+    validation: lessonList.min(1),
+    reconsiderWhen: lessonText,
+    failureModes: lessonList,
+    validVersions: lessonList.optional(),
+  }),
+});
+
 export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionTextEventSchema,
   sessionServiceMessageEventSchema,
@@ -198,6 +226,7 @@ export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionTurnEndEventSchema,
   sessionStopEventSchema,
   sessionDifficultyRoutingEventSchema,
+  sessionLessonCandidateEventSchema,
 ]);
 
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
@@ -238,14 +267,15 @@ export const sessionEnvelopeSchema = z
         path: ['role'],
       });
     }
-    if (envelope.ev.t === 'difficulty-routing' && envelope.role !== 'session') {
+    const sessionOwned = envelope.ev.t === 'difficulty-routing' || envelope.ev.t === 'lesson-candidate';
+    if (sessionOwned && envelope.role !== 'session') {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'difficulty-routing events must use role "session"',
+        message: `${envelope.ev.t} events must use role "session"`,
         path: ['role'],
       });
     }
-    if (envelope.ev.t !== 'difficulty-routing' && envelope.role === 'session') {
+    if (!sessionOwned && envelope.role === 'session') {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'session role is reserved for session-owned events',

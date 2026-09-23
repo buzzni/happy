@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
 import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver'
@@ -217,7 +218,33 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
+    let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
+    function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
+        backgroundTasks = next;
+        session.client.updateMetadata(current => ({ ...current, claudeBackgroundTasks: next }));
+    }
+
     function onMessage(message: SDKMessage) {
+        if (message.type === 'system' && message.subtype === 'init') {
+            // The level signal is per provider process. Until its first full
+            // snapshot, older CLIs still use this generation's transcript.
+            publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });
+        }
+        if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
+            publishBackgroundTasks({
+                startedAt: backgroundTasks?.startedAt ?? Date.now(),
+                available: true,
+                // REPLACE, including empty: edge bookends can arrive out of
+                // order and must never resurrect a task removed by this list.
+                tasks: message.tasks.filter(task => !task.ambient).map(task => ({
+                    taskId: task.task_id,
+                    label: task.description,
+                    kind: task.task_type.includes('bash') ? 'shell' : 'agent',
+                })),
+            });
+            return;
+        }
+
 
         // Write to message log
         formatClaudeMessageForInk(message, messageBuffer);
@@ -811,6 +838,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     continue;
                 }
             } finally {
+                if (backgroundTasks) {
+                    publishBackgroundTasks({ ...backgroundTasks, available: false });
+                    backgroundTasks = undefined;
+                }
 
                 mcpController = null;
                 mcpStatusReader = null;

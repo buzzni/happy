@@ -1,3 +1,4 @@
+import type { CodexBackgroundTask } from './codexBackgroundTasks';
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { CodexAuthRecovery } from './codexAuthRecovery';
 import { render } from "ink";
@@ -44,6 +45,7 @@ import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
+    isConnectorPlatformConfigured,
     readExpectedConnectors,
     readExpectedMcpServices,
     resolveMcpFloorServerNames,
@@ -891,6 +893,7 @@ export async function runCodex(opts: {
             machineId: opts.principal?.kind === 'account' ? (machineId ?? null) : null,
             sessionId: session.sessionId,
             happyHomeDir: configuration.happyHomeDir,
+            announceCandidate: (envelope) => session.sendSessionProtocolMessage(envelope),
         });
     const lessonTurn = opts.lessons?.turn ?? lessonSession?.turn ?? null;
     const lessonReview = opts.lessons?.review ?? lessonSession?.review ?? null;
@@ -1334,6 +1337,11 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] Event: ${JSON.stringify(msg)}`);
         }
 
+        if (msg.type === 'background_tasks') {
+            const tasks = msg.tasks as CodexBackgroundTask[];
+            session.updateMetadata(current => ({ ...current, codexBackgroundTasks: tasks }));
+            return;
+        }
         if (msg.type === 'codex_usage') {
             try {
                 session.sendProviderUsageEvent(createCodexUsageEvent({
@@ -1505,6 +1513,9 @@ export async function runCodex(opts: {
         }
     });
 
+    const previousBackgroundTasks = session.getMetadata()?.codexBackgroundTasks;
+    if (previousBackgroundTasks?.length) client.restoreBackgroundTasks(previousBackgroundTasks);
+
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
         ...(accountToken !== null ? { proposeLesson: lessonProposalTurn.submit } : {}),
@@ -1552,10 +1563,14 @@ export async function runCodex(opts: {
         expectedMcpServices: [],
         configuredServerNames: Object.keys(mcpServers),
     });
-    let currentDeveloperInstructions: string | undefined = buildConnectorToolGuidance(listExternalServices({
+    const buildConnectorGuidance = (mcpServers: Record<string, unknown>) => buildConnectorToolGuidance(
+        listExternalServices(mcpServers),
+        { connectorPlatformConfigured: isConnectorPlatformConfigured() },
+    );
+    let currentDeveloperInstructions: string | undefined = buildConnectorGuidance({
         ...baseMcpServers,
         ...initialAplusMcpServers,
-    }));
+    });
     const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
@@ -1588,11 +1603,21 @@ export async function runCodex(opts: {
     const reportMcpStatuses = async () => {
         const threadId = client.threadId;
         if (!threadId) return [];
-        const runtimeStatuses = await mcpRuntimeRecovery.readStatuses({
-            threadId,
-            mcpServers: mcpConfigSynchronizer.mcpServers,
-            expectedServerNames: listConfiguredExternalServices(mcpConfigSynchronizer.mcpServers),
-        });
+        // Reporting status is informational. It runs on the turn path, where a
+        // rejection would land in the turn's catch, be reported to the user as
+        // 'Process exited unexpectedly' and silently discard their prompt -- so
+        // an unknown status degrades to no update, never to a lost turn.
+        let runtimeStatuses;
+        try {
+            runtimeStatuses = await mcpRuntimeRecovery.readStatuses({
+                threadId,
+                mcpServers: mcpConfigSynchronizer.mcpServers,
+                expectedServerNames: listConfiguredExternalServices(mcpConfigSynchronizer.mcpServers),
+            });
+        } catch (error) {
+            logger.debug('[codex]: MCP status probe failed, leaving statuses unchanged', error);
+            return [];
+        }
         const statuses = [
             ...runtimeStatuses.filter((entry) => !configStatuses.some(({ name }) => name === entry.name)),
             ...configStatuses,
@@ -1844,7 +1869,7 @@ export async function runCodex(opts: {
                     resumeThread: client.threadId
                         ? async ({ threadId, mcpServers }) => {
                             const nextDeveloperInstructions = buildCodexDeveloperInstructions({
-                                connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpServers)),
+                                connectorGuidance: buildConnectorGuidance(mcpServers),
                                 agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                                 mode: message.mode,
                             });
@@ -1861,7 +1886,7 @@ export async function runCodex(opts: {
                 });
 
                 const nextDeveloperInstructions = buildCodexDeveloperInstructions({
-                    connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpSync.mcpServers)),
+                    connectorGuidance: buildConnectorGuidance(mcpSync.mcpServers),
                     agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                     mode: message.mode,
                 });

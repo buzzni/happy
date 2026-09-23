@@ -12,13 +12,13 @@ describe('difficulty routing policy parity snapshot', () => {
       claude: {
         trivial: { model: 'claude-haiku-4-5', effort: 'low' },
         routine: { model: 'claude-sonnet-5', effort: 'high' },
-        hard: { model: 'claude-opus-5', effort: 'high' },
+        hard: { model: 'claude-opus-5-5', effort: 'high' },
         escalated: { model: 'claude-fable-5-1', effort: 'high' },
       },
       codex: {
-        trivial: { model: 'gpt-5.6-luna', effort: 'low' },
+        trivial: { model: 'gpt-6-luna', effort: 'low' },
         routine: { model: 'gpt-5.6-terra', effort: 'high' },
-        hard: { model: 'gpt-5.6-sol', effort: 'high' },
+        hard: { model: 'gpt-6-sol', effort: 'high' },
         escalated: { model: 'gpt-6-astra', effort: 'medium' },
       },
     })
@@ -34,7 +34,7 @@ describe('difficulty routing policy parity snapshot', () => {
     )).toMatchObject({
       difficulty: 'hard',
       rawDifficulty: 'trivial',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       effort: 'high',
     })
   })
@@ -50,7 +50,7 @@ describe('difficulty routing policy parity snapshot', () => {
     expect(routed).toMatchObject({
       difficulty: 'hard',
       rawDifficulty: 'hard',
-      model: 'gpt-5.6-sol',
+      model: 'gpt-6-sol',
       effort: 'high',
     })
     expect(routed).not.toHaveProperty('source')
@@ -77,7 +77,7 @@ describe('difficulty routing policy parity snapshot', () => {
       stickyDifficulty: 'hard',
       routed: {
         difficulty: 'hard',
-        model: 'gpt-5.6-sol',
+        model: 'gpt-6-sol',
         effort: 'high',
       },
     })

@@ -318,7 +318,7 @@ describe('difficulty routing runtime', () => {
 
     expect(asDecision(decision).route).toMatchObject({
       difficulty: 'hard',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       effort: 'high',
     })
     expect(asDecision(decision).pending.hardTurns).toBe(0)
@@ -463,7 +463,7 @@ describe('difficulty routing runtime', () => {
 
     expect(asDecision(decision).route.model).toBe('claude-fable-5-1')
     expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
-    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5' })
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5-5' })
     expect(asDecision(decision).pending.decisionReasons).toContain('temporary-escalation')
   })
 
@@ -578,7 +578,7 @@ describe('difficulty routing runtime', () => {
     expect(asDecision(decision).route).toMatchObject({
       difficulty: 'hard',
       rawDifficulty: 'hard',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       effort: 'high',
     })
     expect(asDecision(decision).event.ev).toMatchObject({

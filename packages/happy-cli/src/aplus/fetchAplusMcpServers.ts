@@ -115,6 +115,18 @@ export function readExpectedMcpServices(): string[] {
 }
 
 /**
+ * 이 세션 뒤에 Saycode 커넥터 플랫폼이 있는지.
+ *
+ * 설정 URL 은 데몬이 소유해 주입하므로(injectMcpCallerGrant), 값이 있다는 것은
+ * 게이트웨이가 붙은 세션이라는 뜻이다. 반대로 값이 없으면 커넥터가 하나도
+ * 없는 순수 로컬 실행이며, 진단할 플랫폼 자체가 존재하지 않는다.
+ * 기대 목록이 비어 있는 두 상태를 구분하는 데 쓴다.
+ */
+export function isConnectorPlatformConfigured(): boolean {
+    return Boolean(process.env.HAPPY_APLUS_MCP_CONFIG_URL)
+}
+
+/**
  * 대화를 열 때 있던 MCP 중 세션 동안 지켜야 할 이름.
  *
  * 조직 등록 MCP 는 외부 URL 을 정적 헤더로 직접 호출하므로, 조직이 사용을

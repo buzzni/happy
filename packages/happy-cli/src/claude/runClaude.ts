@@ -575,7 +575,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         for (let i = 0; i < recentAppPrompts.length; i++) {
             const entry = recentAppPrompts[i];
             if (entry.addedAt < cutoff) continue;
-            if (entry.text === text) {
+            // claudeRemote may prepend recalled lessons or the lesson-proposal
+            // instruction to the prompt it hands the SDK, so the JSONL copy
+            // can end with the recorded text rather than equal it.
+            if (entry.text === text || text.endsWith(`\n\n${entry.text}`)) {
                 recentAppPrompts.splice(i, 1);
                 return true;
             }
@@ -1651,6 +1654,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         machineId: principal.kind === 'account' ? (machineId ?? null) : null,
         sessionId: session.sessionId,
         happyHomeDir: configuration.happyHomeDir,
+        announceCandidate: (envelope) => session.sendSessionProtocolMessage(envelope),
     });
 
     /*

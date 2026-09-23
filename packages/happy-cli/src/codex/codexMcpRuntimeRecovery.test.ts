@@ -589,7 +589,7 @@ describe('Codex MCP status reporting', () => {
             ] })),
             resumeThread: vi.fn(),
         };
-        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 123 });
+        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 123, connectorNames: [] });
         expect(await recovery.readStatuses(input)).toEqual([
             { name: 'argos', status: 'connected', checkedAt: 123 },
             { name: 'notion', status: 'connected', checkedAt: 123 },
@@ -604,7 +604,7 @@ describe('Codex MCP status reporting', () => {
                 { name: 'notion', authStatus: 'notLoggedIn', tools: {} },
             ] })), resumeThread: vi.fn(),
         };
-        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 123 });
+        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 123, connectorNames: [] });
         expect(await recovery.readStatuses(input)).toEqual([
             { name: 'argos', status: 'reconnecting', checkedAt: 123 },
             { name: 'notion', status: 'needs-auth', checkedAt: 123 },
@@ -623,7 +623,72 @@ it('does not mark an empty inventory entry with unknown auth as connected', asyn
         getMcpStartupStatuses: () => [],
         listMcpServerStatus: async () => ({ data: [{ name: 'argos', authStatus: 'unknown', tools: {} }] }),
         resumeThread: vi.fn(),
-    });
+    }, { connectorNames: [] });
     expect(await recovery.readStatuses({ threadId: 't', mcpServers: {}, expectedServerNames: ['argos'] }))
         .toEqual([{ name: 'argos', status: 'reconnecting', checkedAt: expect.any(Number) }]);
+});
+
+describe('Codex MCP status reporting agrees with the recovery path', () => {
+    const input = { threadId: 't', mcpServers: {}, expectedServerNames: ['notion'] };
+
+    it('calls a settled inventory entry connected even when it publishes no tools', async () => {
+        // A resource- or prompt-only server is present and authenticated. The
+        // recovery path already reads this state as ready and therefore never
+        // writes a correcting row, so anything but `connected` here leaves the
+        // server showing as connecting for the rest of the session.
+        const client = {
+            getMcpStartupStatuses: () => [],
+            listMcpServerStatus: vi.fn(async () => ({ data: [
+                { name: 'notion', authStatus: 'unsupported', tools: {} },
+            ] })),
+            resumeThread: vi.fn(),
+        };
+        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 5, connectorNames: [] });
+        expect(await recovery.readStatuses(input)).toEqual([
+            { name: 'notion', status: 'connected', checkedAt: 5 },
+        ]);
+        expect(await recovery.recoverBeforeTurn(input)).toEqual({ status: 'ready', affectedServers: [] });
+        expect(client.resumeThread).not.toHaveBeenCalled();
+    });
+
+    it('qualifies connector names the way every other publisher does', async () => {
+        const client = {
+            getMcpStartupStatuses: () => [],
+            listMcpServerStatus: async () => ({ data: [
+                { name: 'notion', authStatus: 'notLoggedIn', tools: {} },
+            ] }),
+            resumeThread: vi.fn(),
+        };
+        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 5, connectorNames: ['notion'] });
+        expect(await recovery.readStatuses(input)).toEqual([
+            { name: 'notion', status: 'connector-needs-auth', checkedAt: 5 },
+        ]);
+        expect(buildCodexMcpRecoveryMetadataStatuses({
+            recovery: { status: 'needs-auth', affectedServers: ['notion'] },
+            connectorNames: ['notion'],
+            checkedAt: 5,
+        })[0].status).toBe('connector-needs-auth');
+    });
+
+    it('reports an unknown status instead of throwing when the probe misbehaves', async () => {
+        // readStatuses runs on the turn path; a rejection there is reported to
+        // the user as a process crash and drops their prompt.
+        const missingTools = new CodexMcpRuntimeRecovery({
+            getMcpStartupStatuses: () => [],
+            listMcpServerStatus: async () => ({ data: [{ name: 'notion', authStatus: 'unknown' } as never] }),
+            resumeThread: vi.fn(),
+        }, { now: () => 5, connectorNames: [] });
+        expect(await missingTools.readStatuses(input)).toEqual([
+            { name: 'notion', status: 'reconnecting', checkedAt: 5 },
+        ]);
+
+        const throwingStartup = new CodexMcpRuntimeRecovery({
+            getMcpStartupStatuses: () => { throw new Error('app-server went away'); },
+            listMcpServerStatus: async () => ({ data: [] }),
+            resumeThread: vi.fn(),
+        }, { now: () => 5, connectorNames: [] });
+        expect(await throwingStartup.readStatuses(input)).toEqual([
+            { name: 'notion', status: 'failed', checkedAt: 5 },
+        ]);
+    });
 });

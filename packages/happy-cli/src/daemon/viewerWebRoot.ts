@@ -181,6 +181,11 @@ export function installViewerClipboardBridge(UI: any, win: any, doc: any): void 
     win.addEventListener('keydown', (event: any) => {
         if (!isCopyKey(event)) return
         if (event.altKey) return
+        // Ctrl/Cmd+Shift+C is the element inspector, on both ends — the
+        // remote screen runs a browser too. Taking it would rewrite the
+        // inspector into a copy and let the remote's answering selection
+        // overwrite the local clipboard below. Fall through like Alt does.
+        if (event.shiftKey) return
         if (!event.ctrlKey && !event.metaKey) return
         if (!session()) return
         if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()

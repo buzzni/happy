@@ -1,3 +1,4 @@
+import { logger } from '@/ui/logger';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 
 import { LessonReviewBudget } from './lessonReviewBudget';
 import { createLessonBindingIssuer } from './lessonBindingIssuer';
-import { createLessonReviewWorker, type LessonReviewWorkerDeps } from './lessonReviewWorker';
+import { createLessonReviewWorker, lessonCandidateEnvelope, type LessonReviewWorkerDeps } from './lessonReviewWorker';
 import { createLessonSettingsStore } from './lessonSettingsStore';
 import type { LessonHostHandle } from './cmlLessonHost';
 import type { LessonTurnRecord } from './lessonTurnEvidence';
@@ -107,6 +108,85 @@ describe('foreground lesson proposals', () => {
         expect(call.input.candidate).toMatchObject({ sourceEventIds: ['evt-1'], sourceSessionIds: ['s1'], confidence: 0.5 });
         expect(call.identity).toMatchObject({ capabilities: ['lesson.review'], machineId: 'm1' });
         expect(h.host.calls.map(c => c.name)).toEqual(['appendNormalEndEvidence', 'enqueueCandidate', 'markReviewed']);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('distinguishes authorization refusal while preparing a proposal', async () => {
+        const log = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        const h = await harness({ identity: () => null });
+        try {
+            expect(await h.worker.prepareReviewTurn!()).toBeNull();
+            expect(log).toHaveBeenCalledWith('[lesson-review-prepare] permission_denied');
+        } finally { log.mockRestore(); await rm(h.dir, { recursive: true, force: true }); }
+    });
+    it.each([
+        ['no-signal', false, 'observed task', [], false],
+        ['no-evidence', true, '', [], true],
+    ] as const)('reports bounded %s diagnostics without recording content', async (reason, prior, summary, failures, proposed) => {
+        const log = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        const h = await harness();
+        try {
+            const result = await h.worker.reviewFinishedTurn({ ...input(), proposal: proposed ? proposal : undefined, record: {
+                ...record, hadPriorAssistantTurn: prior, userMessages: ['아니 secret-value'],
+                agentSummary: summary, recoveredFailures: failures,
+            } });
+            expect(result).toBe('not-eligible');
+            expect(log).toHaveBeenCalledWith('[lesson-review-evidence]', {
+                reason, kind: 'foreground', hadPriorAssistantTurn: prior,
+                hasObservedActions: Boolean(summary), hasVerifiedRecovery: false, proposalSubmitted: proposed,
+            });
+            expect(JSON.stringify(log.mock.calls)).not.toContain('secret-value');
+            expect(h.host.calls).toHaveLength(0);
+        } finally { log.mockRestore(); await rm(h.dir, { recursive: true, force: true }); }
+    });
+    it('persists a proposal from a plain successful turn that observed the agent working', async () => {
+        const h = await harness();
+        const plain = { ...record, recoveredFailures: [] };
+        expect(await h.worker.reviewFinishedTurn({ ...input(), record: plain })).toBe('reviewed');
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('reports why a turn was not eligible', async () => {
+        const reported: Array<[string, string | undefined]> = [];
+        const h = await harness({ onOutcome: (outcome, reason) => { reported.push([outcome, reason]); } });
+        const unobserved = { ...record, recoveredFailures: [], agentSummary: '' };
+        expect(await h.worker.reviewFinishedTurn({ ...input(), record: unobserved })).toBe('not-eligible');
+        expect(reported).toEqual([['not-eligible', 'no-evidence']]);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('announces a stored candidate once, with the identifiers approval needs', async () => {
+        const announced: unknown[] = [];
+        const h = await harness({ onCandidate: (candidate) => { announced.push(candidate); } });
+        h.deps.host!.service.markReviewed = (async () => ({
+            outcome: 'reviewed', candidateId: 'c1', revision: 2, payloadHash: 'h', status: 'reviewed',
+        })) as never;
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('reviewed');
+        expect(announced).toEqual([{
+            candidateId: 'c1', revision: 2, payloadHash: 'h',
+            lesson: {
+                name: proposal.name, trigger: proposal.trigger, steps: proposal.steps, scope: proposal.scope,
+                validation: proposal.validation, reconsiderWhen: proposal.reconsiderWhen, failureModes: proposal.failureModes,
+            },
+        }]);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('wraps an announcement in a session-owned lesson-candidate envelope', () => {
+        const envelope = lessonCandidateEnvelope({
+            candidateId: 'c1', revision: 2, payloadHash: 'h',
+            lesson: { name: 'n', trigger: 't', steps: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [] },
+        });
+        expect(envelope.role).toBe('session');
+        expect(envelope.ev).toMatchObject({ t: 'lesson-candidate', candidateId: 'c1', revision: 2, payloadHash: 'h' });
+    });
+    it('announces nothing when the candidate was not stored as reviewed', async () => {
+        const announced: unknown[] = [];
+        const h = await harness({ onCandidate: (candidate) => { announced.push(candidate); } });
+        // The revision after review is unknown: announcing a guessed one would
+        // hand the user a card whose approval can only fail.
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('reviewed');
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: undefined })).toBe('no-lesson');
+        h.deps.host!.service.markReviewed = (async () => ({ outcome: 'unsupported_version' })) as never;
+        expect(await h.worker.reviewFinishedTurn({ ...input(), record: { ...record, turnId: 't9', agentSummary: 'other' } }))
+            .not.toBe('reviewed');
+        expect(announced).toEqual([]);
         await rm(h.dir, { recursive: true, force: true });
     });
     it('does not call a gateway or persist evidence when no proposal was supplied', async () => {

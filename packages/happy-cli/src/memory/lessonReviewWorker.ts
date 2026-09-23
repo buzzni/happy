@@ -1,3 +1,5 @@
+import { createEnvelope, type SessionEnvelope, type SessionEvent } from '@slopus/happy-wire';
+
 import { logger } from '@/ui/logger';
 
 import type { LessonReviewBudget } from './lessonReviewBudget';
@@ -30,6 +32,14 @@ export type LessonReviewOutcome =
     | 'rejected_content'
     | 'runtime_error';
 
+/** What a client needs to show a stored candidate and ask for its approval. */
+export type LessonCandidateAnnouncement = Omit<Extract<SessionEvent, { t: 'lesson-candidate' }>, 't'>;
+
+/** The session-owned envelope a client renders as an inline approval card. */
+export function lessonCandidateEnvelope(candidate: LessonCandidateAnnouncement): SessionEnvelope {
+    return createEnvelope('session', { t: 'lesson-candidate', ...candidate });
+}
+
 export interface LessonReviewWorkerDeps {
     host: LessonHostHandle | null;
     issuer: LessonBindingIssuer | null;
@@ -44,15 +54,28 @@ export interface LessonReviewWorkerDeps {
      */
     identity(): Promise<{ projectId: string; userId: string; machineId: string } | null>
         | { projectId: string; userId: string; machineId: string } | null;
-    onOutcome?(outcome: LessonReviewOutcome): void;
+    /** `reason` names which eligibility rule refused a `not-eligible` turn. */
+    onOutcome?(outcome: LessonReviewOutcome, reason?: string): void;
+    /**
+     * Called once when a candidate is stored as `reviewed`, with the revision
+     * the store reported after that transition — the one an approval must name.
+     */
+    onCandidate?(candidate: LessonCandidateAnnouncement): void;
 }
+
+type CandidatePayload = LessonCandidateAnnouncement['lesson'] & {
+    confidence: number;
+    skillCandidate: boolean;
+    sourceSessionIds: string[];
+    sourceEventIds: string[];
+};
 
 /** Shapes the model's proposal into CML's candidate payload, or refuses it. */
 function toCandidate(
     proposal: unknown,
     record: LessonTurnRecord,
     sourceEventIds: readonly string[],
-): Record<string, unknown> | null {
+): CandidatePayload | null {
     if (!proposal || typeof proposal !== 'object') return null;
     const value = proposal as Record<string, unknown>;
     const text = (key: string): string | null => {
@@ -117,17 +140,33 @@ export interface LessonReviewWorker {
 /** Persists bounded foreground proposals. Never starts another model/API call. */
 export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonReviewWorker {
     let running = false;
-    const report = (outcome: LessonReviewOutcome): LessonReviewOutcome => {
-        deps.onOutcome?.(outcome);
+    const report = (outcome: LessonReviewOutcome, reason?: string): LessonReviewOutcome => {
+        deps.onOutcome?.(outcome, reason);
         return outcome;
     };
     return {
         async prepareReviewTurn() {
             try {
-                if (!deps.host || !deps.issuer || !(await deps.identity())) return null;
+                if (!deps.host || !deps.issuer) {
+                    logger.debug('[lesson-review-prepare] unsupported');
+                    return null;
+                }
+                if (!(await deps.identity())) {
+                    logger.debug('[lesson-review-prepare] permission_denied');
+                    return null;
+                }
                 const settings = await deps.settings.read();
-                return settings.reviewEnabled ? { revision: settings.revision } : null;
-            } catch { return null; }
+                if (!settings.reviewEnabled) {
+                    logger.debug('[lesson-review-prepare] disabled');
+                    return null;
+                }
+                return { revision: settings.revision };
+            } catch (error) {
+                logger.debug(error instanceof LessonSettingsError
+                    ? '[lesson-review-prepare] settings_unreadable'
+                    : '[lesson-review-prepare] runtime_error');
+                return null;
+            }
         },
         async reviewFinishedTurn({ record, signal, proposal, settingsRevision }) {
             if (!deps.host || !deps.issuer) return report('unsupported');
@@ -140,8 +179,18 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
             try {
                 const identity = await deps.identity();
                 if (!identity) return report('permission_denied');
-                const decision = evaluateLessonTurn(record, identity.projectId);
-                if (!decision.eligible) return report(decision.reason === 'aborted' ? 'cancelled' : 'not-eligible');
+                const proposalSubmitted = proposal !== undefined && proposal !== null;
+                const decision = evaluateLessonTurn(record, identity.projectId, { agentProposal: proposalSubmitted });
+                if (!decision.eligible) {
+                    logger.debug('[lesson-review-evidence]', {
+                        reason: decision.reason, kind: record.kind,
+                        hadPriorAssistantTurn: record.hadPriorAssistantTurn,
+                        hasObservedActions: Boolean(record.agentSummary.trim()),
+                        hasVerifiedRecovery: record.recoveredFailures.length > 0,
+                        proposalSubmitted,
+                    });
+                    return decision.reason === 'aborted' ? report('cancelled') : report('not-eligible', decision.reason);
+                }
                 const settings = await deps.settings.read();
                 if (!settings.reviewEnabled) return report('disabled');
                 if (signal.aborted) return report('cancelled');
@@ -188,7 +237,9 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                     generation: plannedRevision, evidenceKey: decision.evidence.evidenceKey,
                     sessionId: record.sessionId, content: decision.evidence.transcript,
                 }) as { outcome?: string; eventId?: unknown };
-                if (appended?.outcome !== 'persisted' || typeof appended.eventId !== 'string' || !appended.eventId) return report('not-eligible');
+                if (appended?.outcome !== 'persisted' || typeof appended.eventId !== 'string' || !appended.eventId) {
+                    return report('not-eligible', 'evidence-refused');
+                }
                 if (!(await stillCurrent())) return stale();
                 const candidate = toCandidate(proposal, record, [appended.eventId])!;
                 // Once enqueue starts, keep the claim even if its result is lost.
@@ -204,8 +255,30 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                 const reviewed = await deps.host.service.markReviewed({
                     version: 1, requestId: `${requestId}:reviewed`, binding, generation: plannedRevision,
                     candidateId: enqueued.candidateId, expectedRevision: enqueued.revision, payloadHash: enqueued.payloadHash,
-                }) as { outcome?: string };
-                return report(reviewed?.outcome === 'reviewed' ? 'reviewed' : 'runtime_error');
+                }) as { outcome?: string; revision?: unknown; payloadHash?: unknown };
+                if (reviewed?.outcome !== 'reviewed') return report('runtime_error');
+                // No reported revision, no announcement: a guessed one would
+                // give the user a card whose approval can only fail.
+                if (typeof reviewed.revision === 'number') {
+                    try {
+                        deps.onCandidate?.({
+                            candidateId: enqueued.candidateId,
+                            revision: reviewed.revision,
+                            payloadHash: typeof reviewed.payloadHash === 'string' ? reviewed.payloadHash : enqueued.payloadHash,
+                            lesson: {
+                                name: candidate.name,
+                                trigger: candidate.trigger,
+                                steps: candidate.steps,
+                                scope: candidate.scope,
+                                validation: candidate.validation,
+                                reconsiderWhen: candidate.reconsiderWhen,
+                                failureModes: candidate.failureModes,
+                                ...(candidate.validVersions ? { validVersions: candidate.validVersions } : {}),
+                            },
+                        });
+                    } catch { /* The candidate is stored; a lost announcement is not a failed review. */ }
+                }
+                return report('reviewed');
             } catch (error) {
                 if (signal.aborted) return report('cancelled');
                 if (error instanceof LessonSettingsError) return report('settings_unreadable');

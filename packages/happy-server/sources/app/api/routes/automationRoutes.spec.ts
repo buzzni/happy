@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
     emitProjectAutomationUpdate: vi.fn(),
 }));
 
+vi.mock('@/storage/db', () => ({ db: {} }));
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 vi.mock('@/app/automation/automationService', () => mocks);
 vi.mock('@/app/automation/automationExecutionService', () => ({
