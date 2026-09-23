@@ -124,10 +124,26 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
     return {
         async prepareReviewTurn() {
             try {
-                if (!deps.host || !deps.issuer || !(await deps.identity())) return null;
+                if (!deps.host || !deps.issuer) {
+                    logger.debug('[lesson-review-prepare] unsupported');
+                    return null;
+                }
+                if (!(await deps.identity())) {
+                    logger.debug('[lesson-review-prepare] permission_denied');
+                    return null;
+                }
                 const settings = await deps.settings.read();
-                return settings.reviewEnabled ? { revision: settings.revision } : null;
-            } catch { return null; }
+                if (!settings.reviewEnabled) {
+                    logger.debug('[lesson-review-prepare] disabled');
+                    return null;
+                }
+                return { revision: settings.revision };
+            } catch (error) {
+                logger.debug(error instanceof LessonSettingsError
+                    ? '[lesson-review-prepare] settings_unreadable'
+                    : '[lesson-review-prepare] runtime_error');
+                return null;
+            }
         },
         async reviewFinishedTurn({ record, signal, proposal, settingsRevision }) {
             if (!deps.host || !deps.issuer) return report('unsupported');
@@ -141,7 +157,16 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                 const identity = await deps.identity();
                 if (!identity) return report('permission_denied');
                 const decision = evaluateLessonTurn(record, identity.projectId);
-                if (!decision.eligible) return report(decision.reason === 'aborted' ? 'cancelled' : 'not-eligible');
+                if (!decision.eligible) {
+                    logger.debug('[lesson-review-evidence]', {
+                        reason: decision.reason, kind: record.kind,
+                        hadPriorAssistantTurn: record.hadPriorAssistantTurn,
+                        hasObservedActions: Boolean(record.agentSummary.trim()),
+                        hasVerifiedRecovery: record.recoveredFailures.length > 0,
+                        proposalSubmitted: proposal !== undefined && proposal !== null,
+                    });
+                    return report(decision.reason === 'aborted' ? 'cancelled' : 'not-eligible');
+                }
                 const settings = await deps.settings.read();
                 if (!settings.reviewEnabled) return report('disabled');
                 if (signal.aborted) return report('cancelled');
