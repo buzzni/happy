@@ -16,9 +16,16 @@
   `Worktree 기준 branch를 확인하지 못했습니다. RPC method not available` 이
   표시됐다. daemon 을 재시작하면 새 프로세스는 `pid` 가 없어 이 단계를
   건너뛰므로 바로 붙었다.
-- 17분이라는 길이: 요청이 항상 in-flight(adapter 가 100ms 마다 `XREAD`)라
-  TCP keepalive 가 적용되지 않는다. 커널 재전송 한도(`tcp_retries2`)까지 버틴 것과
-  일치한다. 그래서 keepalive 설정으로는 해결되지 않는다.
+- 22:32 에 소켓 재연결은 풀렸지만 **replica 간 버스는 계속 죽어 있었다.**
+  23:14 에 두 파드 모두 `socketio_cluster_peers=0`, `redis_stream_lag_ms≈61분`이었다.
+  adapter 의 `XREAD` 폴링이 응답 없는 명령을 기다린 채 멈춰 있었고, 각 파드는
+  자기 파드에 붙은 소켓만 봤다. 그래서 daemon 과 다른 파드에 붙은 호출은
+  `RPC method not available` 을 받았다. desktop 은 호출마다 새 소켓을 열어서
+  이 증상이 잦았다. 23:20 에 파드를 하나씩 재시작하자 복구됐다.
+- TCP 수준 감지로는 부족하다. 보낸 데이터가 ACK 되지 않은 경우에는 커널
+  재전송 한도(~15분)까지 버틴다. 요청이 ACK 됐는데 응답만 오지 않는 경우에는
+  keepalive 가 적용되지만, OS 기본값이 2시간이다. 어느 쪽이든 명령 수준 시한이
+  필요하다.
 - Redis 가 왜 멈췄는지는 확인하지 못했다. sentinel-0/2 가 사고 전부터 tilt 모드를
   반복하고 있었지만 직접 원인이라고 단정할 수 없다.
 
