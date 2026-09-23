@@ -169,11 +169,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    let mcpStatusReader: Pick<McpRuntimeRecovery, 'readStatuses'> | null = null;
     let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
     registerMcpReconnectHandler(
         session.client.rpcHandlerManager,
         session.client.sessionId,
         () => mcpController,
+        () => mcpStatusReader,
     );
 
     // Drop any permission requests left over in agent state from a
@@ -671,6 +673,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             await q.setPermissionMode(mode);
                         });
                     },
+                    onMcpStatusReaderReady: (reader) => { mcpStatusReader = reader; },
                     onMcpControllerReady: (controller) => {
                         mcpController = controller;
                     },
@@ -752,6 +755,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             } finally {
 
                 mcpController = null;
+                mcpStatusReader = null;
                 // The process is gone: whatever text is still buffered can
                 // never be completed, so ship it as-is rather than let it
                 // leak into the next launch's frames.

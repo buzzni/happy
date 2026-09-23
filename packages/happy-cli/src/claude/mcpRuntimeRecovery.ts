@@ -48,6 +48,11 @@ export class McpRuntimeRecovery {
         this.connectorNames = new Set(options.connectorNames ?? readExpectedConnectors());
     }
 
+    async readStatuses(): Promise<McpRuntimeServerStatus[]> {
+        const statuses = await this.query.mcpServerStatus();
+        return statuses.map((status) => this.emit(status));
+    }
+
     async recoverFailedServers(): Promise<void> {
         let statuses: McpServerStatus[];
         try {
@@ -147,7 +152,7 @@ export class McpRuntimeRecovery {
         return { serverName, status: 'failed', error: lastError };
     }
 
-    private emit(status: Pick<McpServerStatus, 'name' | 'status' | 'error'>): void {
+    private emit(status: Pick<McpServerStatus, 'name' | 'status' | 'error'>): McpRuntimeServerStatus {
         let mappedStatus: McpRuntimeServerStatus['status'] = status.status === 'pending'
             ? 'reconnecting'
             : status.status;
@@ -155,11 +160,13 @@ export class McpRuntimeRecovery {
             if (mappedStatus === 'failed') mappedStatus = 'connector-runtime-failed';
             if (mappedStatus === 'needs-auth') mappedStatus = 'connector-needs-auth';
         }
-        this.onStatus?.({
+        const reported: McpRuntimeServerStatus = {
             name: status.name,
             status: mappedStatus,
             error: status.error ? sanitizeMcpError(status.error) : undefined,
             checkedAt: this.now(),
-        });
+        };
+        this.onStatus?.(reported);
+        return reported;
     }
 }

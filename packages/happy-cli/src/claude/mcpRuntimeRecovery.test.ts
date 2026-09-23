@@ -183,3 +183,14 @@ describe('sanitizeMcpError', () => {
         );
     });
 });
+
+
+it('reads healthy Claude SDK status without reconnecting and reports live changes', async () => {
+    const mcpServerStatus = vi.fn().mockResolvedValue([{ name: 'qa', status: 'connected' }]);
+    const reconnectMcpServer = vi.fn();
+    const recovery = new McpRuntimeRecovery({ mcpServerStatus, reconnectMcpServer }, { now: () => 123 });
+    expect(await recovery.readStatuses()).toEqual([{ name: 'qa', status: 'connected', error: undefined, checkedAt: 123 }]);
+    mcpServerStatus.mockResolvedValue([{ name: 'qa', status: 'failed', error: 'Bearer secret' }]);
+    expect(await recovery.readStatuses()).toEqual([{ name: 'qa', status: 'failed', error: 'Bearer [REDACTED]', checkedAt: 123 }]);
+    expect(reconnectMcpServer).not.toHaveBeenCalled();
+});
