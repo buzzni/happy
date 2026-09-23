@@ -50,9 +50,26 @@ export function resolveRedisClientOptions(env: RedisClientEnv): RedisOptions | s
     throw new Error('REDIS_URL or REDIS_SENTINELS+REDIS_SENTINEL_MASTER_NAME must be set');
 }
 
-export function createRedisClient(env: RedisClientEnv = process.env): Redis {
+/*
+ * A half-open connection never answers and never errors: with requests always
+ * in flight (the streams adapter polls every 100ms) TCP keepalive does not
+ * apply, and the kernel only gives up after its retransmission limit — ~17
+ * minutes on 2026-09-23, during which every Redis-backed path in prod hung.
+ * `commandTimeout` bounds each caller; the stall check replaces the
+ * connection, because a timed-out command alone leaves it in place.
+ */
+export interface RedisStallTiming {
+    commandTimeoutMs: number;
+    stallCheckIntervalMs: number;
+}
+
+const DEFAULT_STALL_TIMING: RedisStallTiming = { commandTimeoutMs: 5_000, stallCheckIntervalMs: 5_000 };
+
+export function createRedisClient(env: RedisClientEnv = process.env, timing: RedisStallTiming = DEFAULT_STALL_TIMING): Redis {
     const options = resolveRedisClientOptions(env);
-    const client = typeof options === 'string' ? new Redis(options) : new Redis(options);
+    const client = typeof options === 'string'
+        ? new Redis(options, { commandTimeout: timing.commandTimeoutMs })
+        : new Redis({ ...options, commandTimeout: timing.commandTimeoutMs });
 
     // ioredis emits `error` for connection-level failures. Without a listener
     // these were entirely invisible — the server logged one Redis line in 10
@@ -67,6 +84,28 @@ export function createRedisClient(env: RedisClientEnv = process.env): Redis {
             log({ module: 'redis', level: 'error' }, `redis client error (${code}, throttled to 1/min): ${error}`);
         }
     });
+
+    const shouldLogStall = createLogThrottle(60_000);
+    let checking = false;
+    const stallCheck = setInterval(() => {
+        if (checking || client.status !== 'ready') return;
+        checking = true;
+        client.ping().catch((error: unknown) => {
+            // Any other failure is a live connection reporting an error, or
+            // one already being torn down; only silence means a stall.
+            if (!(error instanceof Error && error.message === 'Command timed out') || client.status !== 'ready') return;
+            if (shouldLogStall('stall')) {
+                log({ module: 'redis', level: 'error' },
+                    `redis connection stopped answering for ${timing.commandTimeoutMs}ms (throttled to 1/min) — reconnecting`);
+            }
+            // Ends the socket, destroying it after `disconnectTimeout` if the
+            // peer never acknowledges; the close then reconnects (and, under
+            // Sentinel, re-resolves the master).
+            client.disconnect(true);
+        }).finally(() => { checking = false; });
+    }, timing.stallCheckIntervalMs);
+    stallCheck.unref();
+    client.on('end', () => clearInterval(stallCheck));
 
     return client;
 }
