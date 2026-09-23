@@ -791,6 +791,7 @@ export async function runCodex(opts: {
             machineId: opts.principal?.kind === 'account' ? (machineId ?? null) : null,
             sessionId: session.sessionId,
             happyHomeDir: configuration.happyHomeDir,
+            announceCandidate: (envelope) => session.sendSessionProtocolMessage(envelope),
         });
     const lessonTurn = opts.lessons?.turn ?? lessonSession?.turn ?? null;
     const lessonReview = opts.lessons?.review ?? lessonSession?.review ?? null;

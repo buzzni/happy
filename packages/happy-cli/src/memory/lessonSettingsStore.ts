@@ -55,6 +55,8 @@ export function lessonReviewOutcomePath(happyHomeDir: string, projectId: string)
 
 const outcomeSchema = z.object({
     outcome: z.string().min(1).max(64),
+    /** Which rule refused the turn, for diagnosis; never shown as the status. */
+    reason: z.string().min(1).max(64).optional(),
     at: z.number().int().nonnegative(),
 }).strict();
 
@@ -72,7 +74,7 @@ export const LESSON_REVIEW_OUTCOME_TTL_MS = 24 * 60 * 60_000;
 export interface LessonReviewOutcomeStore {
     /** `'unknown'` when nothing was recorded, unreadable, or too old. */
     read(): Promise<string>;
-    record(outcome: string): Promise<void>;
+    record(outcome: string, reason?: string): Promise<void>;
 }
 
 export function createLessonReviewOutcomeStore(
@@ -94,13 +96,17 @@ export function createLessonReviewOutcomeStore(
                 return 'unknown';
             }
         },
-        async record(outcome) {
+        async record(outcome, reason) {
             try {
                 await mkdir(dirname(path), { recursive: true, mode: 0o700 });
                 const temp = `${path}.${randomUUID()}.tmp`;
                 const file = await open(temp, 'wx', 0o600);
                 try {
-                    await file.writeFile(JSON.stringify({ outcome: outcome.slice(0, 64), at: now() }));
+                    await file.writeFile(JSON.stringify({
+                        outcome: outcome.slice(0, 64),
+                        ...(reason ? { reason: reason.slice(0, 64) } : {}),
+                        at: now(),
+                    }));
                     await file.sync();
                 } finally {
                     await file.close();

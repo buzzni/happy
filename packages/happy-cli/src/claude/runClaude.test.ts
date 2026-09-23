@@ -414,6 +414,23 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('does not forward an app prompt that claudeRemote prefixed with lesson text', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+
+        harness.loopOptions.onActiveUserInputAccepted('apply this now');
+        harness.scannerOptions.onMessage({
+            type: 'user',
+            message: { content: 'If this turn corrects an earlier mistake, use token="t".\n\napply this now' },
+        });
+        expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+
+        const terminalPrompt = { type: 'user', message: { content: 'typed in the terminal' } };
+        harness.scannerOptions.onMessage(terminalPrompt);
+        expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(terminalPrompt);
+
+        await harness.finish();
+    });
+
     it('injects the protected composition into Claude remote before its loop starts', async () => {
         const checkpointProtection = {
             secretPatterns: ['.env*'],

@@ -35,6 +35,17 @@ describe('evaluateLessonTurn', () => {
             .toEqual({ eligible: false, reason: 'no-signal' });
     });
 
+    it('accepts a plain success when the agent itself proposed a lesson from observed work', () => {
+        const decision = evaluateLessonTurn(turn(), 'p1', { agentProposal: true });
+        expect(decision.eligible).toBe(true);
+        expect(decision.eligible && decision.evidence.signal).toBe('agent-proposal');
+    });
+
+    it('still refuses an agent proposal when nothing the agent did was observed', () => {
+        expect(evaluateLessonTurn(turn({ agentSummary: '' }), 'p1', { agentProposal: true }))
+            .toEqual({ eligible: false, reason: 'no-evidence' });
+    });
+
     it('does not read the opening request as a correction', () => {
         // "do not" in the request is the request, not the user turning the
         // agent around; treating it as one would review almost every turn.

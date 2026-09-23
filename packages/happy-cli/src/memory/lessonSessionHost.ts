@@ -20,6 +20,8 @@
  */
 import { resolve } from 'node:path';
 
+import type { SessionEnvelope } from '@slopus/happy-wire';
+
 import { logger } from '@/ui/logger';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import { readLessonOwner } from './lessonOwnerMarker';
@@ -36,7 +38,7 @@ import {
     type LessonHostRuntime,
 } from './lessonHostRuntime';
 import { createLessonTurnHost, type LessonTurnHost } from './lessonTurnHost';
-import { createLessonReviewWorker, type LessonReviewWorker } from './lessonReviewWorker';
+import { createLessonReviewWorker, lessonCandidateEnvelope, type LessonReviewWorker } from './lessonReviewWorker';
 import { LessonReviewBudget } from './lessonReviewBudget';
 import {
     createLessonReviewOutcomeStore,
@@ -252,6 +254,8 @@ export async function createLessonSessionHost(input: {
     happyHomeDir: string;
     env?: NodeJS.ProcessEnv;
     budgetMs?: number;
+    /** Sends a stored candidate to this session's transcript for inline approval. */
+    announceCandidate?: (envelope: SessionEnvelope) => void;
 }): Promise<LessonSessionHost | null> {
     /*
      * Bounded as a whole, not step by step.
@@ -301,6 +305,7 @@ async function bootstrapLessonSessionHost(input: {
      */
     happyHomeDir: string;
     env?: NodeJS.ProcessEnv;
+    announceCandidate?: (envelope: SessionEnvelope) => void;
 }): Promise<LessonSessionHost | null> {
     const env = input.env ?? process.env;
     const origin = studioOrigin(env);
@@ -440,16 +445,19 @@ async function bootstrapLessonSessionHost(input: {
             settings,
             budget: new LessonReviewBudget(lessonReviewLedgerPath(stateRoot)),
             identity: liveIdentity,
-            onOutcome: (outcome) => {
-                logger.debug(`[lesson-review] ${outcome}`);
+            onOutcome: (outcome, reason) => {
+                logger.debug(`[lesson-review] ${outcome}${reason ? ` (${reason})` : ''}`);
                 /*
                  * Written where the UI can read it. The worker runs in the
                  * provider process and the snapshot is served by the daemon,
                  * so an in-memory value would leave the UI reporting a state
                  * nothing ever updates.
                  */
-                void outcomes.record(outcome);
+                void outcomes.record(outcome, reason);
             },
+            ...(input.announceCandidate
+                ? { onCandidate: (candidate) => input.announceCandidate!(lessonCandidateEnvelope(candidate)) }
+                : {}),
         }),
         close: () => supervisor.close(),
     };
