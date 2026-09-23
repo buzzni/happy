@@ -847,6 +847,33 @@ describe('AI credential machine runtime', () => {
     expect(JSON.stringify(execFile.mock.calls)).not.toContain('refresh-a')
   })
 
+  it('applies a Codex bundle captured by the previous 2.15.0 pin because its storage format is unchanged', async () => {
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'codex-multi-auth' && args[0] === '--version') {
+        return { stdout: '2.16.0\n', stderr: '' }
+      }
+      if (command === 'npm' && args[0] === 'root') {
+        return { stdout: '/global/node_modules\n', stderr: '' }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'codex',
+      payload: JSON.stringify({ ...codexMultiAuthBundle(), packageVersion: '2.15.0' }),
+    })).resolves.toMatchObject({ provider: 'codex', configured: true, accountCount: 3 })
+  })
+
+  it('rejects a Codex bundle captured by a codex-multi-auth version it cannot read', async () => {
+    const { runtime } = setup()
+
+    await expect(runtime.apply({
+      provider: 'codex',
+      payload: JSON.stringify({ ...codexMultiAuthBundle(), packageVersion: '2.8.5' }),
+    })).rejects.toMatchObject({ kind: 'CODEX_MULTI_AUTH_PAYLOAD_INVALID' })
+  })
+
   it('preserves OAuth tokens refreshed by the live quota forecast when sorting accounts', async () => {
     let files!: Map<string, string>
     const execFile = vi.fn(async (command: string, args: string[]) => {
