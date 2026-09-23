@@ -326,6 +326,8 @@ describe('a registered api key', () => {
             ANTHROPIC_API_KEY: 'substituted',
             ANTHROPIC_AUTH_TOKEN: 'substituted',
             OPENAI_API_KEY: 'substituted',
+            openai_api_key: 'substituted',
+            claude_config_dir: '/another-user',
             CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude',
             CODEX_HOME: '/workspace/.auth/another-connection/codex',
             HAPPY_SOMETHING_ELSE: 'kept',

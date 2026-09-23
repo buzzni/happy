@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import { standaloneControl } from "@/utils/standaloneControl";
 
 // Patch crypto.subtle.importKey to normalize base64 → base64url in JWK data.
 // privacy-kit uses standard base64 for Ed25519 JWK keys, but Bun (correctly per spec)
@@ -109,6 +110,9 @@ export async function runMigrations(opts: { pgliteDir: string; migrationsDir?: s
 }
 
 async function serve() {
+    // Capture parent EOF/commands before asynchronous initialization; drain only after startup.
+    const control = process.env.HAPPY_STANDALONE_CONTROL === "stdin-v1"
+        ? standaloneControl(process.stdin) : undefined;
     // Ensure DB_PROVIDER is set for db.ts
     process.env.DB_PROVIDER = process.env.DB_PROVIDER || "pglite";
     process.env.PGLITE_DIR = process.env.PGLITE_DIR || pgliteDir;
@@ -142,7 +146,16 @@ async function serve() {
 
     // Block until shutdown so the process stays alive.
     const { awaitShutdown } = await import("./utils/shutdown");
-    await awaitShutdown();
+    try {
+        await awaitShutdown(control ? {
+            requested: control.requested,
+            finalize: async () => {
+                const { getPGlite } = await import("./storage/db");
+                const pg = getPGlite();
+                if (pg && !pg.closed) await pg.close();
+            },
+        } : undefined);
+    } finally { control?.dispose(); }
     process.exit(0);
 }
 
