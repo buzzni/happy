@@ -135,6 +135,11 @@ const ALLOWED_RPC_NAMES: readonly string[] = [
     'goal-action',
     'killSession',
     'mcp-reconnect',
+    // Read-only companion to `mcp-reconnect`: the bearer's own session
+    // answering what its MCP servers are doing. Without it the child's
+    // registration is refused on every socket reconnect and a managed run
+    // never reports connector status at all.
+    'mcp-status',
 
     'bash',
     'copyFile',

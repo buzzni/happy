@@ -1487,11 +1487,21 @@ export async function runCodex(opts: {
     const reportMcpStatuses = async () => {
         const threadId = client.threadId;
         if (!threadId) return [];
-        const runtimeStatuses = await mcpRuntimeRecovery.readStatuses({
-            threadId,
-            mcpServers: mcpConfigSynchronizer.mcpServers,
-            expectedServerNames: listConfiguredExternalServices(mcpConfigSynchronizer.mcpServers),
-        });
+        // Reporting status is informational. It runs on the turn path, where a
+        // rejection would land in the turn's catch, be reported to the user as
+        // 'Process exited unexpectedly' and silently discard their prompt -- so
+        // an unknown status degrades to no update, never to a lost turn.
+        let runtimeStatuses;
+        try {
+            runtimeStatuses = await mcpRuntimeRecovery.readStatuses({
+                threadId,
+                mcpServers: mcpConfigSynchronizer.mcpServers,
+                expectedServerNames: listConfiguredExternalServices(mcpConfigSynchronizer.mcpServers),
+            });
+        } catch (error) {
+            logger.debug('[codex]: MCP status probe failed, leaving statuses unchanged', error);
+            return [];
+        }
         const statuses = [
             ...runtimeStatuses.filter((entry) => !configStatuses.some(({ name }) => name === entry.name)),
             ...configStatuses,
