@@ -24,6 +24,30 @@ export function createIsolatedRedisAdapter(
     // replicas. These dedicated clients share configuration, not a connection.
     // Leave all writes/recovery operations (including instrumented xadd) intact.
     writer.xread = reader.xread.bind(reader);
+    /*
+     * The adapter's persistSession() is declared `: void` and drops the
+     * promise of its SET (0.2.3 dist/adapter.js:147-152), and socket.io calls
+     * persistSession un-awaited for every recoverable disconnect
+     * (dist/socket.js:544). That write used to stay pending forever on a
+     * stalled connection; with `commandTimeout` it rejects, with nothing
+     * holding it — and main.ts turns an unhandled rejection into
+     * process.exit(1), so one client disconnecting during a Redis stall would
+     * take the replica down. Attach a handler where the promise is still
+     * reachable. The promise itself is returned untouched, so a caller that
+     * does await this write still sees the failure.
+     */
+    const shouldLogPersistFailure = createLogThrottle(60_000);
+    const set = writer.set.bind(writer) as (...args: unknown[]) => Promise<unknown>;
+    writer.set = ((...args: unknown[]) => {
+        const written = set(...args);
+        written.catch((error: unknown) => {
+            if (shouldLogPersistFailure('persist')) {
+                log({ module: 'websocket', level: 'warn' },
+                    `session state write failed (throttled to 1/min) — that client reconnects without recovery: ${error}`);
+            }
+        });
+        return written;
+    }) as unknown as Redis['set'];
     const create = createAdapter(writer, options);
     const active = new Set<ReturnType<typeof create>>();
     const shouldLogRestoreTimeout = createLogThrottle(60_000);

@@ -81,29 +81,54 @@ describe('resolveRedisClientOptions', () => {
  * A Redis stand-in that answers PING/GET and the handshake, and can stop
  * answering on its open connections while keeping the TCP sockets open —
  * what a half-open connection looks like from the client (2026-09-23 prod:
- * ~17 minutes until the kernel gave up and ECONNRESET arrived).
+ * ~17 minutes until the kernel gave up and ECONNRESET arrived). It can also
+ * answer late instead of never, which is the ordinary slow moment (an RDB
+ * fork, a long single-threaded command) a stall must not be confused with.
+ * Late replies still go out in order, as a real server's do.
  */
 async function startFakeRedis() {
     const connections: net.Socket[] = [];
     const stalled = new Set<net.Socket>();
     const received = new Map<net.Socket, string[]>();
+    let lateReplies = 0;
+    let replyDelayMs = 0;
     const server = net.createServer(socket => {
         connections.push(socket);
         let buffer = '';
+        const pending: string[] = [];
+        let waiting = false;
         socket.on('data', chunk => {
             buffer += chunk.toString('utf8');
             for (;;) {
                 const command = takeCommand();
-                if (!command) return;
+                if (!command) break;
                 received.set(socket, [...(received.get(socket) ?? []), command.join(' ')]);
                 if (stalled.has(socket)) continue;
                 const name = command[0].toUpperCase();
-                if (name === 'INFO') socket.write('$9\r\nloading:0\r\n');
-                else if (name === 'PING') socket.write('+PONG\r\n');
-                else socket.write('$-1\r\n');
+                if (name === 'INFO') pending.push('$9\r\nloading:0\r\n');
+                else if (name === 'PING') pending.push('+PONG\r\n');
+                else pending.push('$-1\r\n');
             }
+            drain();
         });
         socket.on('error', () => {});
+        function drain() {
+            if (waiting) return;
+            const reply = pending.shift();
+            if (reply === undefined) return;
+            const delay = lateReplies > 0 ? (lateReplies--, replyDelayMs) : 0;
+            if (delay === 0) {
+                if (!socket.destroyed) socket.write(reply);
+                drain();
+                return;
+            }
+            waiting = true;
+            setTimeout(() => {
+                waiting = false;
+                if (!socket.destroyed) socket.write(reply);
+                drain();
+            }, delay).unref();
+        }
         function takeCommand(): string[] | null {
             const header = /^\*(\d+)\r\n/.exec(buffer);
             if (!header) return null;
@@ -129,6 +154,7 @@ async function startFakeRedis() {
         connectionCount: () => connections.length,
         commandsOnConnection: (index: number) => received.get(connections[index]) ?? [],
         stallOpenConnections: () => { for (const socket of connections) stalled.add(socket); },
+        answerNextRepliesLate: (count: number, delayMs: number) => { lateReplies = count; replyDelayMs = delayMs; },
         close: () => {
             for (const socket of connections) socket.destroy();
             return new Promise<void>(resolve => server.close(() => resolve()));
@@ -184,6 +210,22 @@ describe('createRedisClient on a stalled connection', () => {
         await expect(client.ping()).resolves.toBe('PONG');
         expect(fake.commandsOnConnection(0)).toContain('set replay-probe v');
         expect(fake.commandsOnConnection(1).filter(command => command.startsWith('set'))).toEqual([]);
+    });
+
+    /*
+     * A single command over the deadline is a slow moment, not a stall: the
+     * connection is live and the next command answers. Replacing it costs a
+     * window in which the client is not `ready` and every command waits in
+     * the offline queue for its own timeout, and buys nothing.
+     */
+    it('shouldKeepAConnectionThatWasOnlySlowForOneCommand', async () => {
+        const { client, fake } = await connect();
+        const stallsBefore = await stallCount();
+        fake.answerNextRepliesLate(1, timing.commandTimeoutMs * 2);
+        await new Promise(resolve => setTimeout(resolve, timing.commandTimeoutMs * 4));
+        expect(fake.connectionCount()).toBe(1);
+        expect(await stallCount()).toBe(stallsBefore);
+        await expect(client.ping()).resolves.toBe('PONG');
     });
 
     it('shouldKeepAHealthyConnection', async () => {

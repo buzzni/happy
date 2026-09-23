@@ -36,10 +36,13 @@
    진행한다. 빠진 이벤트는 클라이언트의 기존 REST 재조회 경로가 메운다.
 2. 모든 `createRedisClient()` 클라이언트는 명령 시한(`commandTimeout` 5초)을 갖는다.
    어떤 호출자도 멈춘 연결에서 무기한 기다리지 않는다.
-3. `ready` 상태의 클라이언트는 5초마다 PING 한다. PING 이 명령 시한을 넘기면
-   연결을 교체(`disconnect(true)`)한다. `disconnectTimeout` 뒤 소켓을 destroy 하므로
-   half-open 에서도 멈추지 않고, Sentinel 모드에선 master 를 다시 묻는다.
+3. `ready` 상태의 클라이언트는 5초마다 PING 한다. PING 이 **연속 3번** 명령 시한을
+   넘기면 연결을 교체(`disconnect(true)`)한다. `disconnectTimeout` 뒤 소켓을 destroy
+   하므로 half-open 에서도 멈추지 않고, Sentinel 모드에선 master 를 다시 묻는다.
    명령 시한만으로는 연결이 그대로 남기 때문에 이 교체가 필요하다.
+   한 번 늦은 응답(RDB fork, 오래 걸리는 단일 명령, GC)은 멈춤이 아니다. 그걸로
+   연결을 버리면 `ready` 가 아닌 구간이 생겨 그동안 명령이 offline 큐에서 각자의
+   시한까지 기다리기만 한다. 멈춤은 지속되는 침묵이므로 연속 실패만 센다.
 4. 두 경로 모두 1분에 한 번으로 제한된 로그를 남긴다 (AGENTS.md §1.13).
 5. 끊긴 연결에서 응답을 받지 못한 명령은 새 연결에서 다시 보내지 않는다
    (`autoResendUnfulfilledCommands: false`). ioredis 는 기본적으로 이미
@@ -55,4 +58,12 @@
   실패를 삼키고 `cluster bus write failed` 로 센다.
 - `main.ts` 의 기동 시 `redis.ping()` 도 Redis 연결이 5초 넘게 걸리면 실패해
   파드가 재시작된다.
+- 명령 시한이 생기면서 ioredis 의 접속 직후 ready check(`INFO`)도 시한에 걸릴 수
+  있다. 시한보다 느린 Redis 를 만나면 ioredis 가 스스로
+  `recoverFromFatalError` → 재접속을 반복한다. 이건 멈춤 감지와 무관한
+  `commandTimeout` 자체의 결과이며, 무기한 대기 대신 택한 값이다.
+- 명령을 던지는 쪽이 결과를 기다리지 않는 경로는 이제 거절을 받을 수 있다.
+  `main.ts` 는 처리되지 않은 거절에서 `process.exit(1)` 하므로, 그런 경로마다
+  처리자를 달아야 한다 (streams adapter 의 `persistSession` 쓰기,
+  터미널 세션 정리).
 

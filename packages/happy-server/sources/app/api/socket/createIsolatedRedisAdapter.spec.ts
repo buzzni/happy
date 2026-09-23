@@ -11,7 +11,13 @@ function redisConnection(restore: { exec: () => Promise<unknown>; xrange: () => 
     let unblock!: () => void;
     const pendingRead = new Promise<null>(resolve => { unblock = () => resolve(null); });
     const published: unknown[][] = [];
+    let setResult: () => Promise<unknown> = async () => 'OK';
+    // A plain function, not vi.fn(): vitest attaches its own handlers to a
+    // mock's returned promise to record how it settled, which would mark a
+    // rejection as handled and make the assertion below vacuous.
+    const setCalls: unknown[][] = [];
     const client = {
+        set: (...args: unknown[]) => { setCalls.push(args); return setResult(); },
         xread: vi.fn(() => { blocked = true; return pendingRead; }),
         xadd: vi.fn(async (...args: unknown[]) => {
             if (blocked) await pendingRead;
@@ -23,7 +29,8 @@ function redisConnection(restore: { exec: () => Promise<unknown>; xrange: () => 
         xrange: vi.fn(restore.xrange),
     };
     return { client: client as unknown as Redis, xread: client.xread,
-        disconnect: client.disconnect, published };
+        disconnect: client.disconnect, published, setCalls,
+        rejectSetWith: (error: Error) => { setResult = () => Promise.reject(error); } };
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 
@@ -93,6 +100,37 @@ describe('createIsolatedRedisAdapter', () => {
             expect(outcome).toEqual(new Error('restoreSession timed out'));
         } finally {
             vi.useRealTimers();
+            io.of('/').adapter.close();
+            reader.client.disconnect();
+            writer.client.disconnect();
+        }
+    });
+
+    /*
+     * The adapter's persistSession() drops the promise of its session-state
+     * SET, and socket.io calls persistSession un-awaited for every recoverable
+     * disconnect. main.ts ends an unhandled rejection in process.exit(1), so
+     * once Redis commands have a deadline one disconnecting client during a
+     * stall would take the whole replica down.
+     */
+    it('does not leave a failed session-state write unhandled', async () => {
+        const writer = redisConnection();
+        const reader = redisConnection();
+        const io = new Server({
+            connectionStateRecovery: { maxDisconnectionDuration: 60_000, skipMiddlewares: true },
+            adapter: createIsolatedRedisAdapter(writer.client, reader.client, {}),
+        });
+        const unhandled: string[] = [];
+        const onUnhandledRejection = (reason: unknown) => { unhandled.push(String(reason)); };
+        process.on('unhandledRejection', onUnhandledRejection);
+        try {
+            writer.rejectSetWith(new Error('Command timed out'));
+            io.of('/').adapter.persistSession({ sid: 's1', pid: 'p1', rooms: new Set(), data: {} } as never);
+            await new Promise(resolve => setTimeout(resolve, 20));
+            expect(writer.setCalls).toHaveLength(1);
+            expect(unhandled).toEqual([]);
+        } finally {
+            process.off('unhandledRejection', onUnhandledRejection);
             io.of('/').adapter.close();
             reader.client.disconnect();
             writer.client.disconnect();
