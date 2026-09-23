@@ -217,6 +217,7 @@ import {
   decryptServerAutomationPayload,
 } from './automations/serverAutomationCache';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
+import { fetchAutomationProjectEnvironment } from './automations/automationProjectEnvironment';
 import {
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
@@ -4079,6 +4080,13 @@ export async function startDaemon(): Promise<void> {
             },
           });
         },
+        resolveProjectEnvironment: ({ runId, claimToken }) => fetchAutomationProjectEnvironment({
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          runId,
+          claimToken,
+        }),
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,

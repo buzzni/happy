@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
+import { execFileSync } from 'node:child_process'
+import { fetchAutomationProjectEnvironment } from './automationProjectEnvironment'
 import { exchangeAutomationMcpCallerGrant } from './automationMcpCallerGrant'
 import { preflightAutomationConnectors } from './automationConnectorPreflight'
 import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers'
+import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance'
 import { buildClaudeSystemPromptOptions } from '@/claude/claudePrompt'
 
@@ -100,6 +103,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     error: 'target session unavailable',
     shouldFallback: true,
   }))
+  const resolveProjectEnvironment = vi.fn(async () => ({ ok: true as const, environmentVariables: { PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' } }))
   const resolveMcpSpawnContext = vi.fn(async (): Promise<AutomationMcpCallerGrantResult> => ({
     ok: true as const,
     value: {
@@ -149,6 +153,7 @@ function setup(options: { generation?: number; migrationPending?: boolean; claim
     dispatchAgentTask,
     ensureReviewObjects,
     maintainAgentTaskLease,
+    resolveProjectEnvironment,
     resolveMcpSpawnContext,
     preflightMcpConnectors,
     linkSession,
@@ -1822,7 +1827,7 @@ describe('runServerAutomationTick', () => {
     }))
   })
 
-  it('reviews in a worktree checked out at the dispatched head sha', async () => {
+  it.each(['ready', 'empty', 'failed', 'unbound', 'reserved', 'expansion', 'http'] as const)('reviews in the dispatched worktree with project environment: %s', async (mode) => {
     // 2026-09-01 프로덕션 — PR #317 리뷰가 "대상 SHA 테스트를 실행하지 못했다" 고
     // 보고했다. AgentTask 워커만 프로젝트 디렉터리에서 그대로 돌아 HEAD 가 사용자가
     // 마지막에 둔 커밋이었기 때문이다(start-session 리뷰는 전용 worktree 를 받는다).
@@ -1865,7 +1870,99 @@ describe('runServerAutomationTick', () => {
       },
     })
 
-    await runServerAutomationTick(input)
+    if (mode === 'failed') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({ ok: false as const, error: 'lookup failed' }))
+    } else if (mode === 'unbound') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({
+        ok: false as const,
+        error: 'project environment execution principal is unbound',
+        code: 'EXECUTION_PRINCIPAL_UNBOUND' as const,
+      }))
+    } else if (mode === 'empty') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({ ok: true as const, environmentVariables: {} }))
+    } else if (mode === 'reserved') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({ ok: true as const, environmentVariables: {
+        PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value',
+        HAPPY_HOME_DIR: '/untrusted', HAPPY_PROJECT_SANDBOX_CONFIG: '{}',
+        HAPPY_APLUS_MCP_CALLER_GRANT: 'injected', SAYCODE_AGENT_ROOT: '/untrusted',
+        APLUS_AGENT_TASK_CLAIM_TOKEN: 'injected', GH_TOKEN: 'injected',
+        ANTHROPIC_AUTH_TOKEN: 'injected', OPENAI_API_KEY: 'injected', openai_api_key: 'injected',
+        OPENAI_TEST_MODEL: 'test-model', GITHUB_WEBHOOK_SECRET: 'app-secret',
+      } }))
+    } else if (mode === 'expansion') {
+      input.resolveProjectEnvironment = vi.fn(async () => ({ ok: true as const, environmentVariables: {
+        PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value',
+        LEAKED_PROVIDER_KEY: '${ANTHROPIC_API_KEY}',
+        LEAKED_GITHUB_TOKEN: 'x-${GH_TOKEN}-y',
+        MAIL_FROM: '${APP_NAME} <no-reply@example.test>',
+      } }))
+    }
+    let server: ReturnType<typeof createServer> | undefined
+    const requests: unknown[] = []
+    const childEnvironments: unknown[] = []
+    if (mode === 'http') {
+      server = createServer((req, res) => {
+        void (async () => {
+          const chunks: Buffer[] = []
+          for await (const chunk of req) chunks.push(Buffer.from(chunk))
+          requests.push({ url: req.url, authorization: req.headers.authorization, body: JSON.parse(Buffer.concat(chunks).toString()) })
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ projectId: 'P-1', environmentVariables: { PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' } }))
+        })().catch(() => res.writeHead(500).end())
+      })
+      server.listen(0, '127.0.0.1')
+      await once(server, 'listening')
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('fixture did not listen')
+      input.resolveProjectEnvironment = vi.fn((run) => fetchAutomationProjectEnvironment({
+        ...run, configUrl: `http://127.0.0.1:${address.port}/api/me/mcp-config`,
+        machineId: 'M-1', machineToken: 'fixture-machine-token',
+      }))
+      spawnSession.mockImplementation(async ({ environmentVariables }) => {
+        // A real subprocess verifies that the resolved values survive the spawn
+        // environment boundary. The model and Git worktree creation are fixtures.
+        const actual = execFileSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify([process.env.PROJECT_SECRET, process.env.GROUP_ONLY]))'], { env: environmentVariables, encoding: 'utf8' })
+        childEnvironments.push(JSON.parse(actual))
+        return { ok: true, sessionId: 'session-1' }
+      })
+    }
+    let result
+    try {
+      result = await runServerAutomationTick(input)
+    } finally {
+      if (server) {
+        server.closeAllConnections()
+        await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()))
+      }
+    }
+    if (mode === 'http') {
+      expect(childEnvironments).toHaveLength(spawnSession.mock.calls.length)
+      for (const actual of childEnvironments) expect(actual).toEqual(['project-value', 'group-value'])
+      expect(requests.length).toBeGreaterThan(0)
+      expect(requests).toHaveLength(vi.mocked(input.resolveProjectEnvironment).mock.calls.length)
+      for (const request of requests) expect(request).toEqual({
+        url: '/api/automation/project-environment', authorization: 'Bearer fixture-machine-token',
+        body: { machineId: 'M-1', runId: 'run-1', claimToken: 'claim-token' },
+      })
+    }
+    if (mode === 'failed' || mode === 'unbound') {
+      expect(result).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+      expect(dispatchAgentTask).not.toHaveBeenCalled()
+      expect(spawnSession).not.toHaveBeenCalled()
+      expect(input.resumeSession).not.toHaveBeenCalled()
+      expect(input.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+        failureCode: mode === 'unbound'
+          ? 'EXECUTION_PRINCIPAL_UNBOUND'
+          : 'PROJECT_ENVIRONMENT_UNAVAILABLE',
+      }))
+      return
+    }
+
+    expect(result!.length).toBeGreaterThan(0)
+    for (const outcome of result!) expect(outcome).toEqual({ automationId: 'automation-1', outcome: 'WOKE' })
+    if (mode === 'reserved') expect(spawnSession.mock.calls[0]![0].environmentVariables).toMatchObject({
+      OPENAI_TEST_MODEL: 'test-model', GITHUB_WEBHOOK_SECRET: 'app-secret',
+    })
 
     // 이벤트가 아니라 dispatch 가 준 SHA 여야 한다 — 큐에서 나온 task 는 지금
     // planned 이벤트와 다른 PR 일 수 있다.
@@ -1875,7 +1972,32 @@ describe('runServerAutomationTick', () => {
     }))
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       directory: '/isolated/run-1',
+      environmentVariables: expect.objectContaining(mode === 'empty' ? {} : { PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' }),
     }))
+    const workerEnv = spawnSession.mock.calls[0]![0].environmentVariables!
+    expect(workerEnv.APLUS_AGENT_TASK_CLAIM_TOKEN).toBe('claim-secret')
+    expect(JSON.parse(workerEnv.HAPPY_PROJECT_SANDBOX_CONFIG)).toMatchObject({ enabled: true, sessionIsolation: 'strict', denyWritePaths: ['.env'] })
+    for (const key of ['HAPPY_HOME_DIR', 'HAPPY_APLUS_MCP_CALLER_GRANT', 'SAYCODE_AGENT_ROOT', 'GH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY', 'openai_api_key']) {
+      expect(workerEnv).not.toHaveProperty(key)
+    }
+    if (mode === 'empty') expect(workerEnv).not.toHaveProperty('PROJECT_SECRET')
+    if (mode === 'expansion') {
+      // 프로젝트 값은 데몬 환경을 가리키는 참조가 아니다. run.ts 의 spawnSession 은
+      // 받은 env 를 바로 이 함수로 데몬 process.env 에 대해 확장하므로, ${VAR} 를
+      // 실은 값이 그대로 실리면 위의 키 필터가 막아 둔 데몬 자격증명을 값 한 단계로
+      // 되읽는다. 남은 ${ 는 같은 통과의 미해결 검사에 걸려 리뷰 spawn 을 죽인다.
+      const expanded = expandEnvironmentVariables(workerEnv, {
+        ANTHROPIC_API_KEY: 'daemon-anthropic-key',
+        GH_TOKEN: 'daemon-github-token',
+      })
+      expect(JSON.stringify(expanded)).not.toContain('daemon-anthropic-key')
+      expect(JSON.stringify(expanded)).not.toContain('daemon-github-token')
+      for (const value of Object.values(expanded)) expect(value).not.toContain('${')
+      // 확장 입력이 되지 않는 평범한 프로젝트 값은 그대로 남는다.
+      expect(workerEnv).toMatchObject({ PROJECT_SECRET: 'project-value', GROUP_ONLY: 'group-value' })
+    }
+    expect(input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-token' })
+    expect(JSON.stringify(store.state())).not.toContain('project-value')
     expect(spawnSession.mock.calls[0]![0].initialPrompt).not.toContain('## 예약 자동화 진단 지침')
   })
 
@@ -2267,6 +2389,7 @@ describe('runServerAutomationTick', () => {
       sessionId: 'creator-session', directory: '/repo', exitAfterFirstTurn: true,
       initialPrompt: expect.stringContaining('Task ID: apply-1'),
       environmentVariables: expect.objectContaining({
+        PROJECT_SECRET: 'project-value',
         APLUS_AGENT_TASK_ID: 'apply-1',
         APLUS_AGENT_TASK_CLAIM_TOKEN: 'claim-secret',
         GH_TOKEN: 'github-secret',
