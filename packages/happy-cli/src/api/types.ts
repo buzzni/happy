@@ -390,6 +390,12 @@ export type Metadata = {
   codexThreadId?: string, // Codex app-server thread ID
   tools?: string[],
   slashCommands?: string[],
+  claudeBackgroundTasks?: {
+    startedAt: number;
+    available: boolean;
+    tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent' }> | null;
+  },
+  codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown' }>,
   mcpServers?: Array<{ name: string; status: string; error?: string; checkedAt?: number }>,
   skills?: string[],
   plugins?: Array<{ name: string; path: string }>,
