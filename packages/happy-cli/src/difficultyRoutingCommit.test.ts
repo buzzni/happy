@@ -51,6 +51,26 @@ function resultOf(envelope: SessionEnvelope): Record<string, unknown> {
 }
 
 describe('DifficultyRoutingCommitter', () => {
+  it('previews the boundary model without committing a queued request', () => {
+    const { committer, persisted, emitted } = makeCommitter()
+    committer.recordPending(acceptedState(committer))
+    committer.commitApplied(['req-1'], 'exec-1')
+    committer.recordLocalPending(pending({
+      clientRequestId: 'cheap', candidateDifficulty: 'trivial', selectedDifficulty: 'trivial',
+      selected: { model: 'claude-haiku-4-5', effort: 'low' },
+      base: { difficulty: 'trivial', model: 'claude-haiku-4-5', effort: 'low' },
+    }))
+    const before = structuredClone(committer.current())
+    const persistCount = persisted.length
+    const emitCount = emitted.length
+    expect(committer.previewAppliedRoute(['cheap'])).toMatchObject({ model: 'claude-opus-5', effort: 'high' })
+    expect(committer.current()).toEqual(before)
+    expect(persisted).toHaveLength(persistCount)
+    expect(emitted).toHaveLength(emitCount)
+    committer.discardPending(['cheap'], 'cancelled')
+    expect(committer.current().appliedRequestIds).toEqual(['req-1'])
+  })
+
   it('emits each boundary correction reason once from the committed decision', () => {
     const { committer, emitted } = makeCommitter()
     committer.recordPending(acceptedState(committer))

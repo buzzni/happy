@@ -642,7 +642,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
                         // Check if mode has changed
                         if (msg) {
-                            if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
+                            // Preview without committing: a changed engine setting needs a
+                            // fresh SDK query before this request can be marked applied.
+                            const resolved = session.onModeResolved?.(msg.requestIds);
+                            if (resolved) {
+                                msg = { ...msg, mode: { ...msg.mode, model: resolved.model,
+                                    effort: (resolved.effort ?? undefined) as EnhancedMode['effort'] } };
+                            }
+                            const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort);
+                            if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
                                 logger.debug('[remote]: mode has changed, pending message');
                                 pending = msg;
                                 return null;

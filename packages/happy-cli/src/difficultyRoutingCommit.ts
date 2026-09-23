@@ -55,6 +55,19 @@ export class DifficultyRoutingCommitter {
     return this.state
   }
 
+  previewAppliedRoute(clientRequestIds: readonly string[] | undefined): { model: string; effort: string | null } | null {
+    const winner = this.pendingWinner(clientRequestIds)
+    return winner ? resolveEngineBoundaryRoute(this.state, winner, this.opts.agent, this.now()) : null
+  }
+
+  private pendingWinner(clientRequestIds: readonly string[] | undefined): RoutingPendingDecision | null {
+    const applied = new Set(this.state.appliedRequestIds ?? [])
+    return selectBatchWinner((clientRequestIds ?? [])
+      .filter((id) => !applied.has(id))
+      .map((id) => this.state.pending?.[id])
+      .filter((entry): entry is RoutingPendingDecision => Boolean(entry)))
+  }
+
   /**
    * Adopts the state the decision already carries (it contains the pending
    * entry). Persisted so a restart before the engine boundary still knows a
@@ -103,14 +116,7 @@ export class DifficultyRoutingCommitter {
      * it into the engine's actual settings. Recording it here while the turn ran
      * on the stale model would make the state a claim rather than a record.
      */
-    const alreadyApplied = new Set(this.state.appliedRequestIds ?? [])
-    const queued = clientRequestIds
-      .filter((id) => !alreadyApplied.has(id))
-      .map((id) => this.state.pending?.[id])
-      .filter((entry): entry is RoutingPendingDecision => Boolean(entry))
-    // The same winner rule the commit will use. Picking differently here would
-    // let the engine run one decision's model while the state recorded another.
-    const winner = selectBatchWinner(queued)
+    const winner = this.pendingWinner(clientRequestIds)
     const revised = winner ? resolveEngineBoundaryRoute(this.state, winner, this.opts.agent, this.now()) : null
     // The floor outranks this turn but this turn's policy forbids the floor's
     // model, so it runs lower deliberately. Recorded as such, never as the

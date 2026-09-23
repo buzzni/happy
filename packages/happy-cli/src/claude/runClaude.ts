@@ -1672,6 +1672,22 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     process.once('SIGTERM', closeLessonsOnSignal);
     process.once('SIGINT', closeLessonsOnSignal);
 
+    const normalizeBoundaryRoute = (revised: { model: string; effort: string | null } | null) => {
+        if (!revised) return null;
+        // Run the revision through the same runtime normalization an
+        // accepted turn gets, or a Z.AI-style substitution would be skipped
+        // for exactly the turns the boundary repaired.
+        const model = defaultClaudeModelForRuntime(
+            process.env,
+            normalizeClaudeModelForRuntime(revised.model, process.env),
+        );
+        if (!model) return null;
+        const effort = revised.effort && VALID_CLAUDE_EFFORTS.has(revised.effort)
+            ? revised.effort
+            : null;
+        return { model, effort };
+    };
+
     let exitCode: number;
     try {
         exitCode = await loop({
@@ -1703,22 +1719,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
          * mode becomes the settings of an SDK query — the first moment the
          * conversation genuinely runs on the routed model.
          */
-        onModeApplied: (requestIds, executionId) => {
-            const revised = difficultyRoutingCommitter.commitApplied(requestIds, executionId);
-            if (!revised) return null;
-            // Run the revision through the same runtime normalization an
-            // accepted turn gets, or a Z.AI-style substitution would be skipped
-            // for exactly the turns the boundary repaired.
-            const model = defaultClaudeModelForRuntime(
-                process.env,
-                normalizeClaudeModelForRuntime(revised.model, process.env),
-            );
-            if (!model) return null;
-            const effort = revised.effort && VALID_CLAUDE_EFFORTS.has(revised.effort)
-                ? revised.effort
-                : null;
-            return { model, effort };
-        },
+        onModeResolved: (requestIds) => normalizeBoundaryRoute(difficultyRoutingCommitter.previewAppliedRoute(requestIds)),
+        onModeApplied: (requestIds, executionId) => normalizeBoundaryRoute(difficultyRoutingCommitter.commitApplied(requestIds, executionId)),
         onActiveUserInputAccepted: (text) => {
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));

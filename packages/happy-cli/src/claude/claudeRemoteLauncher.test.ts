@@ -12,15 +12,19 @@ vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
 }));
 
 describe('Claude model changes across provider restarts', () => {
-    it.each(['model', 'effort'] as const)('applies consecutive %s changes at the SDK boundary', async (field) => {
-        const modes: EnhancedMode[] = field === 'model'
+    it.each(['model', 'effort', 'boundary-model', 'boundary-effort'] as const)('applies consecutive %s changes at the SDK boundary', async (field) => {
+        const modes: EnhancedMode[] = field.endsWith('model')
             ? ['claude-sonnet-5', 'claude-fable-5-1', 'claude-opus-5', 'claude-opus-5'].map(model => ({ permissionMode: 'default', model }))
             : ['low', 'high', 'medium', 'medium'].map(effort => ({ permissionMode: 'default', model: 'claude-opus-5', effort: effort as EnhancedMode['effort'] }));
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const received: Array<{ text: unknown; model: Options['model']; effort: Options['effort'] }> = [];
         const launches: Options[] = [];
-        const onModeApplied = vi.fn();
+        const boundary = field.startsWith('boundary-');
+        const resolveMode = () => boundary ? { model: modes[received.length].model!, effort: modes[received.length].effort ?? null } : null;
+        const onModeApplied = vi.fn((_ids: string[] | undefined, _executionId: string) => resolveMode());
+        const onModeResolved = vi.fn(resolveMode);
+        const queuedMode = (index: number) => boundary ? modes[0] : modes[index];
         let metadata: Record<string, any> = {};
         const snapshots: any[] = [];
         const client = {
@@ -55,19 +59,19 @@ describe('Claude model changes across provider restarts', () => {
                         void handlers.get('switch')!();
                         return;
                     }
-                    queue.push(`turn-${received.length}`, modes[received.length], undefined, [`req-${received.length}`]);
+                    queue.push(`turn-${received.length}`, queuedMode(received.length), undefined, [`req-${received.length}`]);
                 }
             })();
             return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
         });
-        queue.push('turn-0', modes[0], undefined, ['req-0']);
+        queue.push('turn-0', queuedMode(0), undefined, ['req-0']);
         const lessonReviewLifecycle = { controller: new AbortController(), completedAssistantTurns: 0 };
         const cancelLessonReview = vi.fn(() => lessonReviewLifecycle.controller.abort());
         const session = {
             lessonReviewLifecycle, cancelLessonReview,
             sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onModeApplied,
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onModeApplied, onModeResolved,
         } as unknown as Session;
         await claudeRemoteLauncher(session);
         expect(received).toEqual(modes.map((mode, index) => ({ text: `turn-${index}`, model: mode.model, effort: mode.effort })));
