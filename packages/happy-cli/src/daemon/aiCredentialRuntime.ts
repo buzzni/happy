@@ -17,7 +17,7 @@ import { overlayManagedCredentialEnvironment } from './sessionEnv'
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
-const CODEX_MULTI_AUTH_VERSION = '2.15.0'
+const CODEX_MULTI_AUTH_VERSION = '2.16.0'
 const CODEX_MULTI_AUTH_THRESHOLD = 5
 
 export type AiCredentialProvider = 'claude' | 'codex' | 'zai'
