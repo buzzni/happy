@@ -2,6 +2,12 @@ import net from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Redis } from 'ioredis';
 import { createRedisClient, isRedisConfigured, resolveRedisClientOptions } from './createRedisClient';
+import { redisClientErrorsCounter } from '@/app/monitoring/metrics2';
+
+async function stallCount(): Promise<number> {
+    const { values } = await redisClientErrorsCounter.get();
+    return values.find(value => value.labels.code === 'STALL')?.value ?? 0;
+}
 
 describe('isRedisConfigured', () => {
     it('shouldBeFalseWhenNoRedisEnvVarsSet', () => {
@@ -80,6 +86,7 @@ describe('resolveRedisClientOptions', () => {
 async function startFakeRedis() {
     const connections: net.Socket[] = [];
     const stalled = new Set<net.Socket>();
+    const received = new Map<net.Socket, string[]>();
     const server = net.createServer(socket => {
         connections.push(socket);
         let buffer = '';
@@ -88,6 +95,7 @@ async function startFakeRedis() {
             for (;;) {
                 const command = takeCommand();
                 if (!command) return;
+                received.set(socket, [...(received.get(socket) ?? []), command.join(' ')]);
                 if (stalled.has(socket)) continue;
                 const name = command[0].toUpperCase();
                 if (name === 'INFO') socket.write('$9\r\nloading:0\r\n');
@@ -119,6 +127,7 @@ async function startFakeRedis() {
     return {
         url: `redis://127.0.0.1:${port}`,
         connectionCount: () => connections.length,
+        commandsOnConnection: (index: number) => received.get(connections[index]) ?? [],
         stallOpenConnections: () => { for (const socket of connections) stalled.add(socket); },
         close: () => {
             for (const socket of connections) socket.destroy();
@@ -137,7 +146,7 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boo
 }
 
 describe('createRedisClient on a stalled connection', () => {
-    const timing = { commandTimeoutMs: 100, stallCheckIntervalMs: 100 };
+    const timing = { commandTimeoutMs: 250, stallCheckIntervalMs: 100 };
     const cleanups: Array<() => Promise<void> | void> = [];
     afterEach(async () => {
         while (cleanups.length) await cleanups.pop()!();
@@ -160,9 +169,21 @@ describe('createRedisClient on a stalled connection', () => {
 
     it('shouldReplaceAConnectionThatStoppedAnsweringWithoutWaitingForTheKernel', async () => {
         const { client, fake } = await connect();
+        const stallsBefore = await stallCount();
         fake.stallOpenConnections();
         expect(await waitFor(() => fake.connectionCount() === 2 && client.status === 'ready', 3_000)).toBe(true);
         await expect(client.ping()).resolves.toBe('PONG');
+        expect(await stallCount()).toBe(stallsBefore + 1);
+    });
+
+    it('shouldNotReplayACommandAlreadyReportedAsTimedOutOnTheReplacementConnection', async () => {
+        const { client, fake } = await connect();
+        fake.stallOpenConnections();
+        await expect(client.set('replay-probe', 'v')).rejects.toThrow('Command timed out');
+        expect(await waitFor(() => fake.connectionCount() === 2 && client.status === 'ready', 3_000)).toBe(true);
+        await expect(client.ping()).resolves.toBe('PONG');
+        expect(fake.commandsOnConnection(0)).toContain('set replay-probe v');
+        expect(fake.commandsOnConnection(1).filter(command => command.startsWith('set'))).toEqual([]);
     });
 
     it('shouldKeepAHealthyConnection', async () => {

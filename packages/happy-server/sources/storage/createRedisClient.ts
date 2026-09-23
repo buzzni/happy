@@ -67,9 +67,17 @@ const DEFAULT_STALL_TIMING: RedisStallTiming = { commandTimeoutMs: 5_000, stallC
 
 export function createRedisClient(env: RedisClientEnv = process.env, timing: RedisStallTiming = DEFAULT_STALL_TIMING): Redis {
     const options = resolveRedisClientOptions(env);
+    const stallOptions = {
+        commandTimeout: timing.commandTimeoutMs,
+        // ioredis would otherwise resend, on the next connection, every command
+        // the dropped one never answered — including ones `commandTimeout`
+        // already reported as failed. A caller told "failed" must not have its
+        // bus message (e.g. an RPC request) delivered seconds later.
+        autoResendUnfulfilledCommands: false,
+    };
     const client = typeof options === 'string'
-        ? new Redis(options, { commandTimeout: timing.commandTimeoutMs })
-        : new Redis({ ...options, commandTimeout: timing.commandTimeoutMs });
+        ? new Redis(options, stallOptions)
+        : new Redis({ ...options, ...stallOptions });
 
     // ioredis emits `error` for connection-level failures. Without a listener
     // these were entirely invisible — the server logged one Redis line in 10
@@ -94,6 +102,7 @@ export function createRedisClient(env: RedisClientEnv = process.env, timing: Red
             // Any other failure is a live connection reporting an error, or
             // one already being torn down; only silence means a stall.
             if (!(error instanceof Error && error.message === 'Command timed out') || client.status !== 'ready') return;
+            redisClientErrorsCounter.inc({ code: 'STALL' });
             if (shouldLogStall('stall')) {
                 log({ module: 'redis', level: 'error' },
                     `redis connection stopped answering for ${timing.commandTimeoutMs}ms (throttled to 1/min) — reconnecting`);
