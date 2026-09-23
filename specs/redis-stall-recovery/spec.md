@@ -34,3 +34,18 @@
    half-open 에서도 멈추지 않고, Sentinel 모드에선 master 를 다시 묻는다.
    명령 시한만으로는 연결이 그대로 남기 때문에 이 교체가 필요하다.
 4. 두 경로 모두 1분에 한 번으로 제한된 로그를 남긴다 (AGENTS.md §1.13).
+5. 끊긴 연결에서 응답을 받지 못한 명령은 새 연결에서 다시 보내지 않는다
+   (`autoResendUnfulfilledCommands: false`). ioredis 는 기본적으로 이미
+   `commandTimeout` 으로 실패를 알린 명령까지 다시 보낸다. 그러면 호출자가 포기한
+   버스 메시지(RPC 요청 등)가 뒤늦게 전달된다. resend 를 꺼도 모든 클라이언트에
+   명령 시한이 있으므로, 끊긴 연결의 명령이 영원히 pending 으로 남지 않는다.
+6. 멈춤 감지로 인한 재연결은 `redis_client_errors_total{code="STALL"}` 로 센다.
+
+## 트레이드오프
+
+- Sentinel failover 중에 나간 명령은 예전에는 기다렸다가 성공했지만, 이제는 5초에
+  실패한다. 무기한 대기보다 제한된 실패를 택했다. 버스 publish 는 adapter 가
+  실패를 삼키고 `cluster bus write failed` 로 센다.
+- `main.ts` 의 기동 시 `redis.ping()` 도 Redis 연결이 5초 넘게 걸리면 실패해
+  파드가 재시작된다.
+
