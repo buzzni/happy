@@ -20,6 +20,7 @@ describe('Claude model changes across provider restarts', () => {
         const handlers = new Map<string, () => Promise<unknown>>();
         const received: Array<{ text: unknown; model: Options['model']; effort: Options['effort'] }> = [];
         const launches: Options[] = [];
+        const onModeApplied = vi.fn();
         const client = {
             sessionId: 'model-switch-test',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
@@ -37,23 +38,25 @@ describe('Claude model changes across provider restarts', () => {
                         void handlers.get('switch')!();
                         return;
                     }
-                    queue.push(`turn-${received.length}`, modes[received.length]);
+                    queue.push(`turn-${received.length}`, modes[received.length], undefined, [`req-${received.length}`]);
                 }
             })();
             return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
         });
-        queue.push('turn-0', modes[0]);
+        queue.push('turn-0', modes[0], undefined, ['req-0']);
         const lessonReviewLifecycle = { controller: new AbortController(), completedAssistantTurns: 0 };
         const cancelLessonReview = vi.fn(() => lessonReviewLifecycle.controller.abort());
         const session = {
             lessonReviewLifecycle, cancelLessonReview,
             sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onModeApplied,
         } as unknown as Session;
         await claudeRemoteLauncher(session);
         expect(received).toEqual(modes.map((mode, index) => ({ text: `turn-${index}`, model: mode.model, effort: mode.effort })));
         expect(launches).toHaveLength(3);
+        expect(onModeApplied.mock.calls.map(([ids]) => ids)).toEqual(modes.map((_, i) => [`req-${i}`]));
+        expect(new Set(onModeApplied.mock.calls.map(([, id]) => id)).size).toBe(modes.length);
         expect(lessonReviewLifecycle.completedAssistantTurns).toBe(modes.length);
         expect(cancelLessonReview).toHaveBeenCalled();
         expect(lessonReviewLifecycle.controller.signal.aborted).toBe(true);

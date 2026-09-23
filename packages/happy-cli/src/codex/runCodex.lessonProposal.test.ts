@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fixture = vi.hoisted(() => ({
     submit: null as null | ((input: { token: string; proposal: unknown }) => { accepted: boolean }),
     aborted: false,
     token: '',
+    requestIds: undefined as string[] | undefined,
     steerText: '',
     emit: null as null | ((event: unknown) => void),
     closeQueue: null as null | (() => void),
@@ -26,6 +27,10 @@ vi.mock('@/utils/MessageQueue2', async (original) => {
     const actual = await original<typeof import('@/utils/MessageQueue2')>();
     return { ...actual, MessageQueue2: class<T> extends actual.MessageQueue2<T> {
         constructor(hash: (mode: T) => string) { super(hash); fixture.closeQueue = () => this.close(); }
+        async waitForMessagesAndGetAsString(signal?: AbortSignal) {
+            const batch = await super.waitForMessagesAndGetAsString(signal);
+            return batch && fixture.requestIds ? { ...batch, requestIds: fixture.requestIds } : batch;
+        }
     } };
 });
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
@@ -56,8 +61,8 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     startThread = async () => { this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     abortPreparedTurn = vi.fn();
     abortTurnWithFallback = async () => ({ forcedRestart: false });
-    sendTurnAndWait = async (prompt: string) => {
-        fixture.send(prompt);
+    sendTurnAndWait = async (prompt: string, options: unknown) => {
+        fixture.send(prompt, options);
         fixture.token = prompt.match(/token="([^"]+)"/)![1];
         expect(fixture.submit?.({ token: fixture.token, proposal: fixture.proposal })).toEqual({ accepted: true });
         await fixture.onSend?.();
@@ -65,9 +70,63 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     };
 } }));
 
-afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; });
+const signalListeners = new Map<'SIGINT' | 'SIGTERM', Set<(...args: any[]) => void>>();
+beforeEach(() => {
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) signalListeners.set(signal, new Set(process.listeners(signal)));
+});
+afterEach(() => {
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+        for (const listener of process.listeners(signal)) {
+            if (!signalListeners.get(signal)?.has(listener)) process.removeListener(signal, listener);
+        }
+    }
+    fixture.requestIds = undefined; vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; });
 
 describe('Codex foreground lesson proposal wiring', () => {
+    it('preserves durable local-auto request ids through a merged Codex batch', async () => {
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        fixture.aborted = false;
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'First request');
+        const { DifficultyRoutingCommitter } = await import('@/difficultyRoutingCommit');
+        const commit = vi.spyOn(DifficultyRoutingCommitter.prototype, 'commitApplied');
+        let turns = 0;
+        fixture.onSend = async () => {
+            if (++turns === 1) {
+                const receive = fixture.session.onUserMessage.mock.calls[0][0] as (message: unknown) => Promise<unknown>;
+                for (const serverMessageId of ['durable-1', 'durable-1', 'durable-2']) {
+                    await receive({ serverMessageId, content: { text: 'same content' },
+                        meta: { modelSource: 'auto', model: 'gpt-5.6-sol', effort: 'high' } });
+                }
+            } else fixture.closeQueue?.();
+        };
+        const review = { prepareReviewTurn: vi.fn(async () => ({ revision: 9 })), reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+        const { runCodex } = await import('./runCodex');
+        await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+            noSandbox: true, lessons: { turn: null, review, sessionKind: 'foreground' } });
+        expect(commit).toHaveBeenCalledWith(['message:durable-1', 'message:durable-1', 'message:durable-2'], expect.any(String));
+    });
+
+    it.each(['high', null])('dispatches the boundary model and exact effort without rollback on provider failure (effort=%s)', async (effort) => {
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        fixture.aborted = false;
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'Continue the request');
+        const { DifficultyRoutingCommitter } = await import('@/difficultyRoutingCommit');
+        vi.spyOn(DifficultyRoutingCommitter.prototype, 'commitApplied').mockReturnValue({ model: 'gpt-5.4', effort });
+        fixture.onSend = async () => { throw new Error('provider unavailable after apply'); };
+        const discard = vi.spyOn(DifficultyRoutingCommitter.prototype, 'discardPending');
+        const review = { prepareReviewTurn: vi.fn(async () => ({ revision: 9 })), reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+        const { runCodex } = await import('./runCodex');
+        await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+            noSandbox: true, lessons: { turn: null, review, sessionKind: 'foreground' } });
+        expect(fixture.send).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ model: 'gpt-5.4', effort: effort ?? undefined }));
+        expect(discard).not.toHaveBeenCalled();
+    });
+
     it('does not carry an aborted turn failure into the next turn recovery evidence', async () => {
         for (const key of Object.keys(process.env)) {
             if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -193,6 +252,9 @@ describe('Codex foreground lesson proposal wiring', () => {
     });
 
     it('does not dispatch a cancelled prompt when explicit abort arrives during lesson preparation', async () => {
+        const { DifficultyRoutingCommitter } = await import('@/difficultyRoutingCommit');
+        const discard = vi.spyOn(DifficultyRoutingCommitter.prototype, 'discardPending');
+        fixture.requestIds = ['cancelled-request', 'merged-request'];
         fixture.aborted = false;
         for (const key of Object.keys(process.env)) {
             if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -210,6 +272,7 @@ describe('Codex foreground lesson proposal wiring', () => {
         const { runCodex } = await import('./runCodex');
         await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
             noSandbox: true, lessons: { turn: null, review, sessionKind: 'foreground' } });
+        expect(discard).toHaveBeenCalledWith(['cancelled-request', 'merged-request'], 'cancelled');
         expect(review.prepareReviewTurn).toHaveBeenCalledOnce();
         expect(fixture.send).not.toHaveBeenCalled();
         expect(review.reviewFinishedTurn).not.toHaveBeenCalled();
