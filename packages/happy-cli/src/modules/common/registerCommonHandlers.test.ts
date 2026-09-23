@@ -96,3 +96,23 @@ describe('registerCommonHandlers readFileChunk', () => {
         });
     });
 });
+
+describe('project-scoped file RPCs', () => {
+    it('reads project files and returns structured absence without using legacy handlers', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'spec.md');
+        await writeFile(path, '# scoped');
+        await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: workingDirectory, path: workingDirectory })).resolves.toMatchObject({
+            success: true, entries: [expect.objectContaining({ name: 'spec.md', type: 'file', size: 8 })],
+        });
+        await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: workingDirectory, path })).resolves.toEqual({
+            success: true, content: Buffer.from('# scoped').toString('base64'),
+        });
+        await expect(handlers.get('readWorkspaceFile')?.({ workspaceRoot: workingDirectory, path: join(workingDirectory, 'missing') })).resolves.toMatchObject({
+            success: false, errorCode: 'ENOENT',
+        });
+        await expect(handlers.get('listWorkspaceDirectory')?.({ path: workingDirectory })).resolves.toMatchObject({
+            success: false, errorCode: 'WORKSPACE_PATH_DENIED',
+        });
+    });
+});
