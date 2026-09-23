@@ -1,3 +1,4 @@
+import { withRpcPeerDiagnostics } from './rpcPeerDiagnostics';
 import { createRpcLatency, parseRpcLatencyRequest, parseRpcLatencySnapshot, type RpcLatencySnapshot } from '@slopus/happy-wire';
 import { log } from "@/utils/log";
 import { Server, Socket } from "socket.io";
@@ -111,7 +112,7 @@ type RoomLookup = { ok: boolean; sockets: RoomSockets };
 async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup', trace?: ReturnType<typeof createRpcLatency>): Promise<RoomLookup> {
     const end = trace?.begin('server-lookup');
     try {
-        const sockets = await io.in(room).timeout(timeoutMs).fetchSockets();
+        const sockets = await withRpcPeerDiagnostics(trace?.snapshot().id, () => io.in(room).timeout(timeoutMs).fetchSockets());
         end?.('resolved', sockets.length > 0 ? 'found' : 'empty');
         return { ok: true, sockets };
     } catch (error) {
