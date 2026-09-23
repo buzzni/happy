@@ -1,3 +1,5 @@
+import { installRpcPeerDiagnostics } from './rpcPeerDiagnostics';
+import { log } from '@/utils/log';
 import { createAdapter } from '@socket.io/redis-streams-adapter';
 import type { Redis } from 'ioredis';
 
@@ -15,6 +17,7 @@ export function createIsolatedRedisAdapter(
     const active = new Set<ReturnType<typeof create>>();
     return function (namespace) {
         const adapter = create(namespace);
+        installRpcPeerDiagnostics(adapter, row => log({ module: 'rpc-peer-diagnostics' }, JSON.stringify(row)));
         active.add(adapter);
         const close = adapter.close.bind(adapter);
         adapter.close = () => {
