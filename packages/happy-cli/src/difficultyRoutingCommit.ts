@@ -17,7 +17,7 @@
 
 import { logger } from '@/ui/logger'
 import type { SessionEnvelope } from '@slopus/happy-wire'
-import { createDifficultyRoutingAppliedEvent } from './difficultyRoutingRuntime'
+import { createDifficultyRoutingAppliedEvent, reconcileDecisionWithAppliedSettings } from './difficultyRoutingRuntime'
 import {
   canPersistRoutingState,
   commitAppliedRouting,
@@ -107,6 +107,7 @@ export class DifficultyRoutingCommitter {
   commitApplied(
     clientRequestIds: readonly string[] | undefined,
     executionId: string,
+    normalize?: (route: { model: string; effort: string | null }) => { model: string; effort: string | null } | null,
   ): { model: string; effort: string | null } | null {
     if (!clientRequestIds || clientRequestIds.length === 0) return null
 
@@ -129,7 +130,7 @@ export class DifficultyRoutingCommitter {
     // Captured before the commit overwrites it — this is the route the PREVIOUS
     // execution ran on, which is what a reader of this event needs.
     const previousApplied = this.state.lastAppliedRoute
-    const { state, applied } = commitAppliedRouting(this.state, {
+    let { state, applied } = commitAppliedRouting(this.state, {
       clientRequestIds,
       executionId,
       now: this.now(),
@@ -137,6 +138,27 @@ export class DifficultyRoutingCommitter {
       ...(policyBlocked ? { policyBlocked } : {}),
     })
     if (!applied) return null
+    const normalized = normalize?.(applied.selected)
+    if (normalized && (normalized.model !== applied.selected.model || normalized.effort !== applied.selected.effort)) {
+      const reconciled = reconcileDecisionWithAppliedSettings(applied, normalized, this.opts.agent)
+      if (!reconciled) {
+        this.discardPending(clientRequestIds, 'superseded')
+        logger.debug('[difficultyRouting] apply-untracked', { reason: 'runtime-pair-unknown' })
+        return normalized
+      }
+      // Recompute the transition from the original state: the first result was
+      // a pure preview, never persisted or emitted under the pre-rewrite model.
+      const committed = commitAppliedRouting(this.state, {
+        clientRequestIds, executionId, now: this.now(),
+        appliedDecision: {
+          ...reconciled,
+          decisionReasons: [...new Set([...reconciled.decisionReasons, 'policy-fallback' as const])],
+        },
+      })
+      state = committed.state
+      applied = committed.applied
+      if (!applied) return normalized
+    }
     this.state = state
     this.persist()
 
@@ -173,14 +195,14 @@ export class DifficultyRoutingCommitter {
       executionId,
       kind: applied.kind ?? 'auto',
       requestCount: clientRequestIds.length,
-      model: revised?.model ?? applied.selected.model,
-      effort: revised?.effort ?? applied.selected.effort,
+      model: applied.selected.model,
+      effort: applied.selected.effort,
       baseDifficulty: applied.base.difficulty,
       temporaryEscalation: applied.temporaryEscalation,
       revisedAtBoundary: Boolean(revised),
       policyBlockedAtBoundary: policyBlocked,
     })
-    return revised ? { model: revised.model, effort: revised.effort } : null
+    return normalized ?? (revised ? { model: revised.model, effort: revised.effort } : null)
   }
 
   /**

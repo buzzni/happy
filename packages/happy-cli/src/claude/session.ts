@@ -56,6 +56,7 @@ export class Session {
     readonly _onModeChange: (mode: 'local' | 'remote') => void;
     readonly _onAbort?: () => void;
     readonly onActiveUserInputAccepted?: (text: string) => void;
+    readonly onSessionReset?: () => void;
     readonly onModeResolved?: (requestIds: string[] | undefined) => { model: string; effort: string | null } | null;
     readonly onModeApplied?: (requestIds: string[] | undefined, executionId: string) => { model: string; effort: string | null } | null;
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
@@ -94,6 +95,7 @@ export class Session {
         onModeChange: (mode: 'local' | 'remote') => void,
         onAbort?: () => void,
         onActiveUserInputAccepted?: (text: string) => void,
+        onSessionReset?: () => void,
         onModeResolved?: (requestIds: string[] | undefined) => { model: string; effort: string | null } | null,
         onModeApplied?: (requestIds: string[] | undefined, executionId: string) => { model: string; effort: string | null } | null,
         allowedTools?: string[],
@@ -133,6 +135,7 @@ export class Session {
         this.onActiveUserInputAccepted = opts.onActiveUserInputAccepted;
         this.onModeResolved = opts.onModeResolved;
         this.onModeApplied = opts.onModeApplied;
+        this.onSessionReset = opts.onSessionReset;
         this.hookSettingsPath = opts.hookSettingsPath;
         this.jsRuntime = opts.jsRuntime ?? 'node';
         this.mode = opts.startingMode ?? 'local';

@@ -1634,6 +1634,21 @@ describe('runClaude remote JSONL scanner', () => {
         expect(applied?.base).toMatchObject({ difficulty: 'hard', provenance: 'engine-applied' });
         expect(applied?.escalation?.hardTurns).toBe(1);
         expect(applied?.pending).toBeUndefined();
+
+        await userMessageHandler({ content: { text: '/clear' }, meta: {} });
+        expect(readState()?.base).toEqual(applied?.base);
+        await userMessageHandler({
+            content: { text: 'debug another deadlock after the reset' },
+            meta: routedMeta('request-after-clear'),
+        });
+        expect(Object.keys(readState()?.pending ?? {})).toEqual(['request-after-clear']);
+        harness.loopOptions.onSessionReset();
+        expect(readState()?.base).toBeUndefined();
+        expect(readState()?.escalation).toBeUndefined();
+        expect(Object.keys(readState()?.pending ?? {})).toEqual(['request-after-clear']);
+        harness.loopOptions.onModeApplied(['request-after-clear'], 'exec-after-clear');
+        expect(readState()?.base).toMatchObject({ difficulty: 'hard', provenance: 'engine-applied' });
+        expect(readState()?.escalation?.hardTurns).toBe(1);
         await harness.finish();
     });
 

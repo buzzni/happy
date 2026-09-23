@@ -176,10 +176,11 @@ export type DifficultyRoutingSessionState = {
   pending?: Record<string, RoutingPendingDecision>
   lastApplied?: { executionId: string; clientRequestIds: string[]; at: number }
   /**
-   * Bounded FIFO of requests already applied in this epoch. `lastApplied` only
+   * Requests already applied in this epoch. `lastApplied` only
    * remembers the newest execution, so a replay separated by another execution
    * used to slip past it and move the counters twice for one user request.
-   * Bounded because this lives in session metadata.
+   * Kept until an explicit provider-context reset; no size truncation, because
+   * an older replay must remain idempotent throughout the same epoch.
    */
   appliedRequestIds?: string[]
   /**
@@ -596,6 +597,8 @@ export function discardPendingDecisions(
 }
 
 export type CommitAppliedInput = {
+  /** The selected batch winner reconciled to the runtime's actual settings. */
+  appliedDecision?: RoutingPendingDecision
   /** Every client request merged into this one execution. */
   clientRequestIds: readonly string[]
   /** Identifies the execution attempt, so a replayed commit is a no-op. */
@@ -671,7 +674,7 @@ export function commitAppliedRouting(
   }
 
   const policyBlockedReasons: RoutingDecisionReason[] = input.policyBlocked ? ['policy-fallback'] : []
-  const recorded: RoutingPendingDecision = input.revised
+  const recorded: RoutingPendingDecision = input.appliedDecision ?? (input.revised
     ? {
       ...winner,
       selectedDifficulty: input.revised.difficulty,
@@ -687,7 +690,7 @@ export function commitAppliedRouting(
     }
     : policyBlockedReasons.length > 0
       ? { ...winner, decisionReasons: [...winner.decisionReasons, ...policyBlockedReasons] }
-      : winner
+      : winner)
 
   // Recorded for every kind, from the route that actually reached the engine.
   next.lastAppliedRoute = {

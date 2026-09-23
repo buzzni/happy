@@ -1714,13 +1714,14 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             currentSession = sessionInstance;
         },
         onAbort: resetTurnScopedOptions,
+        onSessionReset: () => difficultyRoutingCommitter.startEpoch(),
         /**
          * The engine-applied boundary. The launcher calls this when a batch's
          * mode becomes the settings of an SDK query — the first moment the
          * conversation genuinely runs on the routed model.
          */
         onModeResolved: (requestIds) => normalizeBoundaryRoute(difficultyRoutingCommitter.previewAppliedRoute(requestIds)),
-        onModeApplied: (requestIds, executionId) => normalizeBoundaryRoute(difficultyRoutingCommitter.commitApplied(requestIds, executionId)),
+        onModeApplied: (requestIds, executionId) => difficultyRoutingCommitter.commitApplied(requestIds, executionId, normalizeBoundaryRoute),
         onActiveUserInputAccepted: (text) => {
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));

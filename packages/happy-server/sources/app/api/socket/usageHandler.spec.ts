@@ -31,6 +31,7 @@ vi.mock('@/app/events/eventRouter', async (importOriginal) => {
 vi.mock('@/app/events/persistSessionEvent', () => ({ persistSessionEvent: vi.fn(async () => undefined) }));
 
 import { usageHandler } from './usageHandler';
+import { ApiEphemeralUpdateSchema, ApiEphemeralUsageUpdateSchema } from '../../../../../happy-app/sources/sync/apiTypes';
 
 const providerEvent = {
     source: 'happy-cli',
@@ -125,7 +126,7 @@ describe('provider-usage-report socket handler', () => {
         expect(events.buildUsageEphemeral).toHaveBeenCalledWith(
             'session-1',
             'provider-session',
-            { total: 470, input: 100, output: 20, cache_read: 300, cache_write: 40, reasoning: 10 },
+            { total: 470, input: 100, output: 20, cache_read: 300, cache_creation: 40 },
             null,
             'session-1:openai:response-1',
         );
@@ -133,11 +134,16 @@ describe('provider-usage-report socket handler', () => {
             userId: 'account-1',
             payload: {
                 type: 'usage', id: 'session-1', key: 'provider-session',
-                tokens: { total: 470, input: 100, output: 20, cache_read: 300, cache_write: 40, reasoning: 10 },
+                tokens: { total: 470, input: 100, output: 20, cache_read: 300, cache_creation: 40 },
                 cost: null, sourceEventId: 'session-1:openai:response-1', timestamp: expect.any(Number),
             },
             recipientFilter: { type: 'user-scoped-only' },
         });
+        const parsed = ApiEphemeralUsageUpdateSchema.parse(events.emitEphemeral.mock.calls[0][0].payload);
+        expect(parsed.sourceEventId).toBe(codexEvent.sourceEventId);
+        expect(parsed.tokens.cache_creation).toBe(40);
+        expect(parsed.cost).toBeNull();
+        expect(ApiEphemeralUpdateSchema.parse(events.emitEphemeral.mock.calls[0][0].payload)).toEqual(parsed);
     });
 
     it('acknowledges durable usage even if the optional UI relay fails', async () => {
@@ -232,5 +238,11 @@ describe('usage-report socket handler', () => {
         expect(events.buildUsageEphemeral).toHaveBeenNthCalledWith(
             2, 'session-1', 'claude-session', base.tokens, base.cost, undefined,
         );
+        const identified = ApiEphemeralUsageUpdateSchema.parse(events.emitEphemeral.mock.calls[0][0].payload);
+        const legacy = ApiEphemeralUsageUpdateSchema.parse(events.emitEphemeral.mock.calls[1][0].payload);
+        expect(identified.sourceEventId).toBe('session-1:anthropic:msg-1');
+        expect(legacy.sourceEventId).toBeUndefined();
+        expect(legacy.tokens).toEqual(base.tokens);
+        expect(legacy.cost).toEqual(base.cost);
     });
 });

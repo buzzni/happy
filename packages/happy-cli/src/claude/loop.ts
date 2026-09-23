@@ -69,6 +69,8 @@ interface LoopOptions {
     checkpointComposition?: CheckpointSessionComposition
     onSessionReady?: (session: Session) => void
     onAbort?: () => void
+    /** Called after /clear actually resets the provider context. */
+    onSessionReset?: () => void
     onActiveUserInputAccepted?: (text: string) => void
     /**
      * Called when a collected batch's mode becomes the settings of an engine
@@ -112,6 +114,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         onActiveUserInputAccepted: opts.onActiveUserInputAccepted,
         onModeResolved: opts.onModeResolved,
         onModeApplied: opts.onModeApplied,
+        onSessionReset: opts.onSessionReset,
         hookSettingsPath: opts.hookSettingsPath,
         jsRuntime: opts.jsRuntime,
         startingMode: opts.startingMode,

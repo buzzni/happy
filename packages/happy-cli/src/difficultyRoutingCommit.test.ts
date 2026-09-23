@@ -453,3 +453,35 @@ describe('committer opaque request ids', () => {
     expect(committer.current()).toEqual(before)
   })
 })
+
+describe('runtime normalization before durable apply', () => {
+  it('records the normalized known pair before persisting or emitting', () => {
+    const { committer, persisted, emitted } = makeCommitter()
+    committer.recordPending(acceptedState(committer))
+    const route = committer.commitApplied(['req-1'], 'normalized', () => ({ model: 'claude-haiku-4-5', effort: 'low' }))
+    expect(route).toEqual({ model: 'claude-haiku-4-5', effort: 'low' })
+    expect(persisted.at(-1)?.base).toMatchObject({ model: 'claude-haiku-4-5', effort: 'low', difficulty: 'trivial' })
+    expect(resultOf(emitted[0])).toMatchObject({ model: 'claude-haiku-4-5', baseRoute: { model: 'claude-haiku-4-5' } })
+  })
+  it('keeps the chosen batch winner when normalization lowers its tier', () => {
+    const { committer, emitted } = makeCommitter()
+    committer.recordLocalPending(pending({ clientRequestId: 'hard' }))
+    committer.recordLocalPending(pending({
+      clientRequestId: 'routine', selectedDifficulty: 'routine',
+      selected: { model: 'claude-sonnet-5', effort: 'high' },
+      base: { difficulty: 'routine', model: 'claude-sonnet-5', effort: 'high' },
+    }))
+    committer.commitApplied(['hard', 'routine'], 'batch', () => ({ model: 'claude-haiku-4-5', effort: 'low' }))
+    expect(resultOf(emitted[0])).toMatchObject({ clientRequestId: 'hard', model: 'claude-haiku-4-5' })
+    expect(committer.current().appliedRequestIds).toEqual(['hard', 'routine'])
+  })
+  it('runs an unknown runtime pair without recording a fabricated floor', () => {
+    const { committer, emitted } = makeCommitter()
+    committer.recordPending(acceptedState(committer))
+    expect(committer.commitApplied(['req-1'], 'zai', () => ({ model: 'glm-5', effort: 'high' }))).toEqual({ model: 'glm-5', effort: 'high' })
+    expect(committer.current().base).toBeUndefined()
+    expect(committer.current().lastApplied).toBeUndefined()
+    expect(committer.current().pending).toBeUndefined()
+    expect(emitted).toHaveLength(0)
+  })
+})

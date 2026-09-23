@@ -794,6 +794,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onSessionReset: () => {
                         logger.debug('[remote]: Session reset');
                         session.clearSessionId();
+                        session.onSessionReset?.();
                     },
                     onReady: () => {
                         session.client.closeClaudeSessionTurn('completed');

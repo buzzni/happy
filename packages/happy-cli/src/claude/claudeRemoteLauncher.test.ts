@@ -12,6 +12,33 @@ vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
 }));
 
 describe('Claude model changes across provider restarts', () => {
+    it('reports a routing epoch reset only when the queued clear resets the provider session', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const clearSessionId = vi.fn(() => { void handlers.get('switch')!(); });
+        const onSessionReset = vi.fn(() => {
+            expect(clearSessionId).toHaveBeenCalledOnce();
+        });
+        const client = {
+            sessionId: 'clear-epoch-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        queue.pushIsolated('/clear', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), clearSessionId, onSessionReset,
+        } as unknown as Session;
+        expect(onSessionReset).not.toHaveBeenCalled();
+        await claudeRemoteLauncher(session);
+        expect(onSessionReset).toHaveBeenCalledOnce();
+    });
+
     it.each(['model', 'effort', 'boundary-model', 'boundary-effort'] as const)('applies consecutive %s changes at the SDK boundary', async (field) => {
         const modes: EnhancedMode[] = field.endsWith('model')
             ? ['claude-sonnet-5', 'claude-fable-5-1', 'claude-opus-5', 'claude-opus-5'].map(model => ({ permissionMode: 'default', model }))
