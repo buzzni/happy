@@ -10,6 +10,7 @@ const fixture = vi.hoisted(() => ({
     onSend: null as null | (() => Promise<void>),
     onSteer: null as null | (() => Promise<void>),
     proposal: { name: 'Verified recovery' },
+    statusProbeFails: false,
     send: vi.fn(),
     session: {
         sessionId: 'lesson-session', getMetadata: () => ({ path: '/tmp/lesson-test' }),
@@ -38,7 +39,13 @@ vi.mock('@/checkpoint/checkpointSessionComposition', () => ({ createCheckpointSe
 vi.mock('@/codex/codexSkills', () => ({ discoverCodexSkillCommands: vi.fn(async () => []) }));
 vi.mock('@/aplus/fetchAplusMcpServers', async (original) => ({ ...await original<typeof import('@/aplus/fetchAplusMcpServers')>(), fetchAplusMcpConfigSnapshot: vi.fn(async () => null) }));
 vi.mock('@/codex/codexMcpConfigSynchronizer', () => ({ CodexMcpConfigSynchronizer: class { mcpServers = {}; sync = async () => ({ mcpServers: this.mcpServers }); } }));
-vi.mock('@/codex/codexMcpRuntimeRecovery', () => ({ CodexMcpRuntimeRecovery: class { recoverBeforeTurn = async () => ({ status: 'ready' }); readStatuses = async () => []; } }));
+vi.mock('@/codex/codexMcpRuntimeRecovery', () => ({ CodexMcpRuntimeRecovery: class {
+    recoverBeforeTurn = async () => ({ status: 'ready' });
+    readStatuses = async () => {
+        if (fixture.statusProbeFails) throw new Error('app-server status probe failed');
+        return [];
+    };
+} }));
 vi.mock('@/claude/utils/startHappyServer', () => ({ startHappyServer: vi.fn(async (_session, options) => {
     fixture.submit = options.proposeLesson;
     return { url: 'http://127.0.0.1:1', toolNames: ['propose_lesson'], stop: vi.fn() };
@@ -65,7 +72,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     };
 } }));
 
-afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; });
+afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.submit = null; fixture.onSend = null; fixture.onSteer = null; fixture.steerText = ''; fixture.statusProbeFails = false; });
 
 describe('Codex foreground lesson proposal wiring', () => {
     it('does not carry an aborted turn failure into the next turn recovery evidence', async () => {
@@ -262,5 +269,26 @@ describe('Codex foreground lesson proposal wiring', () => {
         if (aborted) expect(review.reviewFinishedTurn).not.toHaveBeenCalled();
         else expect(review.reviewFinishedTurn).toHaveBeenCalledWith(expect.objectContaining({ proposal: fixture.proposal, settingsRevision: 9 }));
         expect(fixture.submit?.({ token: fixture.token, proposal: {} })).toEqual({ accepted: false });
+    });
+
+    it('still dispatches the turn when the MCP status probe fails', async () => {
+        // Status reporting is informational. A rejection from it used to reach
+        // the turn's catch, which discards the prompt and reports a crash the
+        // Codex process never had.
+        fixture.statusProbeFails = true;
+        fixture.aborted = false;
+        for (const key of Object.keys(process.env)) {
+            if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
+        }
+        vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'Recover and verify the failed operation');
+        const review = { prepareReviewTurn: vi.fn(async () => ({ revision: 9 })), reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+        const { runCodex } = await import('./runCodex');
+        await runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+            noSandbox: true, lessons: { turn: null, review, sessionKind: 'foreground' } });
+        expect(fixture.send).toHaveBeenCalledOnce();
+        expect(review.reviewFinishedTurn).toHaveBeenCalledOnce();
+        expect(fixture.session.sendSessionEvent.mock.calls.map(([event]) => event))
+            .not.toContainEqual({ type: 'message', message: 'Process exited unexpectedly' });
     });
 });
