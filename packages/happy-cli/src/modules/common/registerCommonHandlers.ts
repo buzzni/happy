@@ -1,3 +1,4 @@
+import { listWorkspaceDirectory, readWorkspaceFile } from './workspaceFileBoundary';
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
@@ -626,6 +627,25 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     });
 
     // List directory handler
+    // Separate method names are the capability gate: old daemons must not
+    // silently ignore workspaceRoot and execute a machine-wide read.
+    for (const operation of ['listWorkspaceDirectory', 'readWorkspaceFile'] as const) {
+        rpcHandlerManager.registerHandler<{ workspaceRoot: string; path: string }, object>(operation, async (data) => {
+            try {
+                if (operation === 'listWorkspaceDirectory') {
+                    return { success: true, entries: await listWorkspaceDirectory(workingDirectory, data.workspaceRoot, data.path) };
+                }
+                return { success: true, content: (await readWorkspaceFile(workingDirectory, data.workspaceRoot, data.path)).toString('base64') };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error instanceof Error ? error.message : 'Workspace read failed',
+                    errorCode: error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'WORKSPACE_READ_FAILED',
+                };
+            }
+        });
+    }
+
     rpcHandlerManager.registerHandler<ListDirectoryRequest, ListDirectoryResponse>('listDirectory', async (data) => {
         logger.debug('List directory request:', data.path);
 
