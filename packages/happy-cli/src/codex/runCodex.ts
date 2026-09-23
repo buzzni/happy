@@ -42,6 +42,7 @@ import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
+    isConnectorPlatformConfigured,
     readExpectedConnectors,
     readExpectedMcpServices,
     resolveMcpFloorServerNames,
@@ -1396,10 +1397,14 @@ export async function runCodex(opts: {
         expectedMcpServices: [],
         configuredServerNames: Object.keys(mcpServers),
     });
-    let currentDeveloperInstructions: string | undefined = buildConnectorToolGuidance(listExternalServices({
+    const buildConnectorGuidance = (mcpServers: Record<string, unknown>) => buildConnectorToolGuidance(
+        listExternalServices(mcpServers),
+        { connectorPlatformConfigured: isConnectorPlatformConfigured() },
+    );
+    let currentDeveloperInstructions: string | undefined = buildConnectorGuidance({
         ...baseMcpServers,
         ...initialAplusMcpServers,
-    }));
+    });
     const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
@@ -1649,7 +1654,7 @@ export async function runCodex(opts: {
                     resumeThread: client.threadId
                         ? async ({ threadId, mcpServers }) => {
                             const nextDeveloperInstructions = buildCodexDeveloperInstructions({
-                                connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpServers)),
+                                connectorGuidance: buildConnectorGuidance(mcpServers),
                                 agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                                 mode: message.mode,
                             });
@@ -1666,7 +1671,7 @@ export async function runCodex(opts: {
                 });
 
                 const nextDeveloperInstructions = buildCodexDeveloperInstructions({
-                    connectorGuidance: buildConnectorToolGuidance(listExternalServices(mcpSync.mcpServers)),
+                    connectorGuidance: buildConnectorGuidance(mcpSync.mcpServers),
                     agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                     mode: message.mode,
                 });
