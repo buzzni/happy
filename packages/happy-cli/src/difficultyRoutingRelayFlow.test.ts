@@ -1,6 +1,19 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { resolveDifficultyRouting } from './difficultyRoutingRuntime'
+import {
+  isRoutingProtect,
+  resolveDifficultyRouting,
+  type DifficultyRoutingRuntimeDecision,
+  type DifficultyRoutingRuntimeOutcome,
+} from './difficultyRoutingRuntime'
+
+/** A protective decline must never be read as a decision by accident. */
+function asDecision(outcome: DifficultyRoutingRuntimeOutcome): DifficultyRoutingRuntimeDecision {
+  if (!outcome || isRoutingProtect(outcome)) {
+    throw new Error(`expected a routing decision, received ${JSON.stringify(outcome)}`)
+  }
+  return outcome
+}
 import { DifficultyRoutingClassifierHost, createDifficultyRoutingHostKey } from './daemon/difficultyRoutingClassifierHost'
 
 const intent = { version: 1, mode: 'auto', policy: 'org-shared-difficulty-routing.v1', clientRequestId: 'turn-flow', clientRouteSource: 'default-auto' }
@@ -59,7 +72,7 @@ describe('sealed shared classifier flow', () => {
     await vi.advanceTimersByTimeAsync(0)
     const pending = resolveDifficultyRouting(input)
     await vi.advanceTimersByTimeAsync(2200)
-    expect((await pending)?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+    expect(asDecision(await pending).event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
   })
   it('sends only original text to the native worker and returns its actual model decision', async () => {
     const f = setup()
@@ -67,21 +80,21 @@ describe('sealed shared classifier flow', () => {
     expect(f.requests).toHaveLength(2)
     expect(f.authorize).toHaveBeenCalledTimes(2)
     expect(f.received).toEqual([{ type: 'classify', requestId: 'turn-flow', text, maxInputTokens: 512 }])
-    expect(result?.route).toMatchObject({ model: 'gpt-6-sol', effort: 'high', difficulty: 'hard' })
-    expect(result?.event.ev).toMatchObject({ t: 'difficulty-routing', result: { model: 'gpt-6-sol', classifierSource: 'p2-org-shared', policyRevision: 4 } })
+    expect(asDecision(result).route).toMatchObject({ model: 'gpt-6-sol', effort: 'high', difficulty: 'hard' })
+    expect(asDecision(result).event.ev).toMatchObject({ t: 'difficulty-routing', result: { model: 'gpt-6-sol', classifierSource: 'p2-org-shared', policyRevision: 4 } })
   })
   it('does not decrypt after revocation and falls back to local P1', async () => {
     const f = setup({ revoke: true })
     const result = await resolveDifficultyRouting(input)
     expect(f.received).toEqual([])
-    expect(result?.route.difficulty).toBe('routine')
-    expect(result?.event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
+    expect(asDecision(result).route.difficulty).toBe('routine')
+    expect(asDecision(result).event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
   })
   it('discards a response bound to another turn', async () => {
     setup({ wrongResponse: true })
     const result = await resolveDifficultyRouting(input)
-    expect(result?.route.difficulty).toBe('routine')
-    expect(result?.event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
+    expect(asDecision(result).route.difficulty).toBe('routine')
+    expect(asDecision(result).event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
   })
   // The end-to-end point of timing v2: the three clocks are independent and the turn still
   // completes. Under v1 a server this far ahead was rejected outright at grant validation.
@@ -90,7 +103,7 @@ describe('sealed shared classifier flow', () => {
       const f = setup({ serverSkewMs })
       const result = await resolveDifficultyRouting(input)
       expect(f.received, `skew ${serverSkewMs}`).toEqual([{ type: 'classify', requestId: 'turn-flow', text, maxInputTokens: 512 }])
-      expect(result?.event.ev, `skew ${serverSkewMs}`).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+      expect(asDecision(result).event.ev, `skew ${serverSkewMs}`).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
       host?.terminate(); host = undefined
     }
   })

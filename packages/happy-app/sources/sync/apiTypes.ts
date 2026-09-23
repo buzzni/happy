@@ -203,6 +203,7 @@ export const ApiEphemeralUsageUpdateSchema = z.object({
     id: z.string(),
     key: z.string(),
     timestamp: z.number(),
+    sourceEventId: z.string().optional(),
     tokens: z.object({
         total: z.number(),
         input: z.number(),
@@ -214,7 +215,7 @@ export const ApiEphemeralUsageUpdateSchema = z.object({
         total: z.number(),
         input: z.number(),
         output: z.number(),
-    }),
+    }).nullable(),
 });
 
 export const ApiEphemeralMachineActivityUpdateSchema = z.object({

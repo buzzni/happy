@@ -57,6 +57,30 @@ export function usageHandler(userId: string, socket: Socket) {
                     });
                     return stored;
                 });
+                if (event.provider !== 'anthropic') {
+                    try {
+                        const ephemeral = buildUsageEphemeral(
+                            event.sessionId,
+                            'provider-session',
+                            {
+                                total: event.tokens.total,
+                                input: event.tokens.input,
+                                output: event.tokens.output,
+                                cache_read: event.tokens.cacheRead,
+                                cache_creation: event.tokens.cacheWrite,
+                            },
+                            null,
+                            event.sourceEventId,
+                        );
+                        eventRouter.emitEphemeral({
+                            userId,
+                            payload: ephemeral,
+                            recipientFilter: { type: 'user-scoped-only' },
+                        });
+                    } catch {
+                        log({ module: 'websocket', level: 'warn' }, 'Failed to relay provider usage observation');
+                    }
+                }
                 callback?.({ success: true, eventId: usageEvent.id });
             } catch (error) {
                 log({ module: 'websocket', level: 'error' }, `Failed to persist provider usage event: ${error}`);
@@ -69,6 +93,11 @@ export function usageHandler(userId: string, socket: Socket) {
         await receiveUsageLock.inLock(async () => {
             try {
                 const { key, sessionId, tokens, cost } = data;
+                const sourceEventId = typeof data.sourceEventId === 'string'
+                    && data.sourceEventId.trim().length > 0
+                    && data.sourceEventId.length <= 512
+                    ? data.sourceEventId.trim()
+                    : undefined;
 
                 // Validate required fields
                 if (!key || typeof key !== 'string') {
@@ -150,7 +179,13 @@ export function usageHandler(userId: string, socket: Socket) {
 
                     // Emit usage ephemeral update if sessionId is provided
                     if (sessionId) {
-                        const usageEvent = buildUsageEphemeral(sessionId, key, usageData.tokens, usageData.cost);
+                        const usageEvent = buildUsageEphemeral(
+                            sessionId,
+                            key,
+                            usageData.tokens,
+                            usageData.cost,
+                            sourceEventId,
+                        );
                         eventRouter.emitEphemeral({
                             userId,
                             payload: usageEvent,

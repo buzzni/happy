@@ -304,7 +304,12 @@ export const UserMessageSchema = z.object({
   meta: MessageMetaSchema.optional()
 })
 
-export type UserMessage = z.infer<typeof UserMessageSchema>
+// Runtime-only durable identity supplied by ApiSessionClient from the trusted
+// server message row. It is intentionally absent from UserMessageSchema so an
+// encrypted client payload cannot choose or spoof this value.
+export type UserMessage = z.infer<typeof UserMessageSchema> & {
+  serverMessageId?: string
+}
 
 /**
  * File event message — sent by the app as a session envelope before the text message.
@@ -424,11 +429,16 @@ export type Metadata = {
    * doesn't supply it (specs/session-created-by).
    */
   createdBy?: { accountId: string; displayName?: string }
-  difficultyRoutingState?: {
-    difficulty?: 'trivial' | 'routine' | 'hard' | 'escalated'
-    hardTurns?: number
-    updatedAt?: number
-  }
+  /**
+   * Auto-routing state. Deliberately `unknown`: the record may be the pre-v2
+   * shape (`{ difficulty, hardTurns, updatedAt }`), the versioned v2 shape, or
+   * one written by a newer CLI that this build cannot represent. Every reader
+   * goes through `normalizeRoutingSessionState`, which validates it and reports
+   * an unreadable record as an unknown floor rather than as an absent one — a
+   * typed field here would invite exactly the unchecked cast that loses that
+   * distinction.
+   */
+  difficultyRoutingState?: unknown
 };
 
 export type AgentGoalStatus = {

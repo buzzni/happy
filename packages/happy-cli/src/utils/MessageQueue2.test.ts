@@ -530,3 +530,84 @@ describe('MessageQueue2', () => {
         expect(batch3?.mode.type).toBe('B');
     });
 });
+
+
+/**
+ * A batch merges N user inputs into one execution. Auto-routing commits its
+ * floor and its counters at that execution, so it needs every merged input's
+ * request id — `collectBatch` previously kept only the first item's mode and
+ * silently dropped the rest, which would have attributed a batch to one input.
+ *
+ * The ids travel beside the mode, not inside it: putting them in the mode would
+ * change its hash and stop the batching this is meant to describe.
+ */
+describe('MessageQueue2 batch request identity', async () => {
+    it('shouldReturnEveryMergedRequestIdInBatchOrder', async () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'same', undefined, ['req-1']);
+        queue.push('two', 'same', undefined, ['req-2']);
+
+        const batch = (await queue.waitForMessagesAndGetAsString());
+
+        expect(batch?.message).toBe('one\ntwo');
+        expect(batch?.requestIds).toEqual(['req-1', 'req-2']);
+    });
+
+    it('shouldNotChangeTheModeHashWhenRequestIdsDiffer', async () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'same', undefined, ['req-1']);
+        queue.push('two', 'same', undefined, ['req-2']);
+
+        expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toHaveLength(2);
+    });
+
+    it('shouldOmitRequestIdsWhenNoMessageCarriedOne', async () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'same');
+
+        expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toBeUndefined();
+    });
+
+    it('shouldNotLeakRequestIdsFromABatchThatWasNotCollected', async () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'modeA', undefined, ['req-1']);
+        queue.push('two', 'modeB', undefined, ['req-2']);
+
+        expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-1']);
+        expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-2']);
+    });
+
+    it('shouldKeepOnlyTheIsolatedMessagesOwnRequestId', async () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'same', undefined, ['req-1']);
+        queue.pushIsolated('alone', 'same', undefined, ['req-2']);
+
+        expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-1']);
+        expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-2']);
+    });
+});
+
+describe('MessageQueue2 discarded request identity', () => {
+    it('shouldReportTheRequestIdsItFlushed', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'm', undefined, ['req-1']);
+        queue.push('two', 'm', undefined, ['req-2']);
+
+        expect(queue.pushIsolateAndClear('/clear', 'm')).toEqual(['req-1', 'req-2']);
+    });
+
+    it('shouldReportNothingWhenThereWasNothingToFlush', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        expect(queue.pushIsolateAndClear('/clear', 'm')).toEqual([]);
+    });
+
+    it('shouldNotReportTheIsolatedMessagesOwnQueueEntry', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('one', 'm', undefined, ['req-1']);
+
+        const discarded = queue.pushIsolateAndClear('/clear', 'm');
+
+        expect(discarded).toEqual(['req-1']);
+        expect(queue.size()).toBe(1);
+    });
+});

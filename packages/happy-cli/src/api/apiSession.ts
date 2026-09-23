@@ -637,7 +637,7 @@ export class ApiSessionClient extends EventEmitter {
                             ? (body as { content: { type: string } }).content.type
                             : 'unknown',
                     });
-                    this.routeIncomingMessage(body);
+                    this.routeIncomingMessage(body, data.body.message.id);
                     this.lastSeq = Math.max(this.lastSeq, messageSeq);
                 } else if (data.body.t === 'update-session') {
                     if (data.body.metadata && data.body.metadata.version > this.metadataVersion) {
@@ -904,18 +904,21 @@ export class ApiSessionClient extends EventEmitter {
         };
     }
 
-    private routeIncomingMessage(message: unknown) {
+    private routeIncomingMessage(message: unknown, serverMessageId?: string) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
+            const userMessage: UserMessage = serverMessageId
+                ? { ...userResult.data, serverMessageId }
+                : userResult.data;
             this.inputObservedForNextTurn = true;
-            if (userResult.data.meta?.sentFrom !== 'daemon') {
+            if (userMessage.meta?.sentFrom !== 'daemon') {
                 this.lastUserInteractionAt = Date.now();
             }
             this.reportDaemonRuntime(this.currentThinking, true);
             if (this.pendingMessageCallback) {
-                this.pendingMessageCallback(userResult.data);
+                this.pendingMessageCallback(userMessage);
             } else {
-                this.pendingMessages.push(userResult.data);
+                this.pendingMessages.push(userMessage);
             }
             return;
         }
@@ -996,7 +999,7 @@ export class ApiSessionClient extends EventEmitter {
 
                 try {
                     const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
-                    this.routeIncomingMessage(body);
+                    this.routeIncomingMessage(body, message.id);
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
                         sessionId: this.sessionId,
@@ -1284,6 +1287,7 @@ export class ApiSessionClient extends EventEmitter {
     private applyClaudeSessionMessageSideEffects(body: RawJSONLines) {
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
+            let sourceEventId: string | undefined;
             try {
                 const rawMessage = body.message as { id?: unknown; model?: unknown };
                 const rawTimestamp = (body as { timestamp?: unknown }).timestamp;
@@ -1293,14 +1297,16 @@ export class ApiSessionClient extends EventEmitter {
                 const occurredAt = typeof parsedTimestamp === 'number' && Number.isFinite(parsedTimestamp)
                     ? Math.floor(parsedTimestamp)
                     : Date.now();
-                this.sendProviderUsageEvent(createClaudeUsageEvent({
+                const providerUsageEvent = createClaudeUsageEvent({
                     sessionId: this.sessionId,
                     occurredAt,
                     messageId: typeof rawMessage.id === 'string' ? rawMessage.id : null,
                     transcriptUuid: body.uuid,
                     model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
                     usage: body.message.usage,
-                }));
+                });
+                sourceEventId = providerUsageEvent.sourceEventId;
+                this.sendProviderUsageEvent(providerUsageEvent);
                 this.claudeTurnUsage.noteAssistant({
                     usage: body.message.usage,
                     model: typeof rawMessage.model === 'string' ? rawMessage.model : null,
@@ -1310,7 +1316,7 @@ export class ApiSessionClient extends EventEmitter {
             }
 
             try {
-                this.sendUsageData(body.message.usage, body.message.model);
+                this.sendUsageData(body.message.usage, body.message.model, sourceEventId);
             } catch (error) {
                 logger.debug('[SOCKET] Failed to send usage data:', error);
             }
@@ -1666,26 +1672,29 @@ export class ApiSessionClient extends EventEmitter {
             : null;
         const fallback = this.claudeTurnUsage.resolveResult({ usage, modelUsage });
         if (!fallback || typeof result.uuid !== 'string' || !result.uuid.trim()) return;
+        let sourceEventId: string | undefined;
         try {
-            this.sendProviderUsageEvent(createClaudeTurnUsageEvent({
+            const providerUsageEvent = createClaudeTurnUsageEvent({
                 sessionId: this.sessionId,
                 occurredAt: Date.now(),
                 resultUuid: result.uuid,
                 model: fallback.model,
                 usage: fallback.usage,
-            }));
+            });
+            sourceEventId = providerUsageEvent.sourceEventId;
+            this.sendProviderUsageEvent(providerUsageEvent);
         } catch (error) {
             logger.warn('[SOCKET] Failed to normalize turn usage data:', error);
             return;
         }
         try {
-            this.sendUsageData(fallback.usage, fallback.model ?? undefined);
+            this.sendUsageData(fallback.usage, fallback.model ?? undefined, sourceEventId);
         } catch (error) {
             logger.debug('[SOCKET] Failed to send turn usage data:', error);
         }
     }
 
-    sendUsageData(usage: Usage, model?: string) {
+    sendUsageData(usage: Usage, model?: string, sourceEventId?: string) {
         // Calculate total tokens
         const totalTokens = usage.input_tokens + usage.output_tokens + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
 
@@ -1706,7 +1715,8 @@ export class ApiSessionClient extends EventEmitter {
                 total: costs.total,
                 input: costs.input,
                 output: costs.output
-            }
+            },
+            ...(sourceEventId ? { sourceEventId } : {}),
         }
         logger.debugLargeJson('[SOCKET] Sending usage data:', usageReport)
         this.socket.emit('usage-report', usageReport);

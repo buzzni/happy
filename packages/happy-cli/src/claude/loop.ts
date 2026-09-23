@@ -69,7 +69,16 @@ interface LoopOptions {
     checkpointComposition?: CheckpointSessionComposition
     onSessionReady?: (session: Session) => void
     onAbort?: () => void
+    /** Called after /clear actually resets the provider context. */
+    onSessionReset?: () => void
     onActiveUserInputAccepted?: (text: string) => void
+    /**
+     * Called when a collected batch's mode becomes the settings of an engine
+     * query — the engine-applied boundary. Carries every client request the
+     * batch merged, so a consumer can commit per-execution state exactly once.
+     */
+    onModeResolved?: (requestIds: string[] | undefined) => { model: string; effort: string | null } | null
+    onModeApplied?: (requestIds: string[] | undefined, executionId: string) => { model: string; effort: string | null } | null
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     hookSettingsPath: string
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
@@ -103,6 +112,9 @@ export async function loop(opts: LoopOptions): Promise<number> {
         onModeChange: opts.onModeChange,
         onAbort: opts.onAbort,
         onActiveUserInputAccepted: opts.onActiveUserInputAccepted,
+        onModeResolved: opts.onModeResolved,
+        onModeApplied: opts.onModeApplied,
+        onSessionReset: opts.onSessionReset,
         hookSettingsPath: opts.hookSettingsPath,
         jsRuntime: opts.jsRuntime,
         startingMode: opts.startingMode,

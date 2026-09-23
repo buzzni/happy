@@ -41,7 +41,8 @@ describe('enqueueCodexUserText', () => {
         });
 
         expect(result).toBe('queued');
-        expect(queue.push).toHaveBeenCalledWith('inspect this image', mode, attachments);
+        // Fourth argument is the routing request ids, absent for this call.
+        expect(queue.push).toHaveBeenCalledWith('inspect this image', mode, attachments, undefined);
         expect(queue.pushIsolateAndClear).not.toHaveBeenCalled();
     });
 
@@ -67,5 +68,21 @@ describe('enqueueCodexUserText', () => {
         expect(result).toBe('clear');
         expect(queue.pushIsolateAndClear).toHaveBeenCalledWith('/clear', mode, attachments);
         expect(queue.push).not.toHaveBeenCalled();
+    });
+});
+
+
+describe('enqueueCodexUserText routing request ids', () => {
+    it('shouldForwardRequestIdsForAQueuedTurn', () => {
+        const queue = { push: vi.fn(), pushIsolateAndClear: vi.fn() };
+
+        enqueueCodexUserText({
+            text: 'refactor this',
+            mode: 'mode',
+            queue,
+            requestIds: ['req-1'],
+        });
+
+        expect(queue.push).toHaveBeenCalledWith('refactor this', 'mode', undefined, ['req-1']);
     });
 });

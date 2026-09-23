@@ -118,6 +118,66 @@ export const difficultyRoutingResultSchema = z.object({
   classifierSource: z.enum(['p1-local', 'p2-org-shared', 'p2-local', 'fallback-p1', 'manual-legacy']),
   remoteStatus: z.enum(['ok', 'busy', 'not-ready', 'expired', 'revoked', 'unsupported', 'error']).optional(),
   classifierRevision: z.string().min(1).optional(),
+
+  // --- additive v2 fields ---------------------------------------------------
+  // Every one is optional, so a v1 producer still validates and a v1 reader
+  // still sees exactly the fields it knows. An absent field means "this
+  // producer did not report it", never a default: a missing `stage` in
+  // particular must not be read as `applied`.
+
+  /**
+   * Where in the lifecycle this event was emitted.
+   * - `selected` — a route was computed.
+   * - `queued` — the request was accepted for execution.
+   * - `applied` — the runner handed the setting to the execution engine. This is
+   *   NOT provider confirmation, completion, a cache hit, or a cost saving.
+   * - `failed` / `cancelled` — the request will not execute under this decision.
+   * - `unknown` — the producer could not determine the stage.
+   */
+  stage: z.enum(['selected', 'queued', 'applied', 'failed', 'cancelled', 'unknown']).optional(),
+  /** Monotonic within a session. A lower revision never overwrites a higher one. */
+  revision: z.number().int().min(0).optional(),
+  /** Strength of the evidence behind the base route, never upgraded by a reader. */
+  evidence: z.enum(['engine-applied', 'legacy-selection', 'unknown']).optional(),
+  /** Identifies one execution attempt; several client requests may share it. */
+  executionId: z.string().min(1).optional(),
+  /** Every client request merged into this execution — N inputs, one run. */
+  clientRequestIds: z.array(z.string().min(1)).max(256).optional(),
+  /** What the classifier said about the input alone, before the floor applied. */
+  candidateDifficulty: z.enum(['trivial', 'routine', 'hard', 'escalated']).optional(),
+  /** The durable floor, which is never the temporarily escalated tier. */
+  baseRoute: z.object({
+    difficulty: z.enum(['trivial', 'routine', 'hard', 'escalated']),
+    model: z.string().min(1),
+    effort: z.string().min(1).nullable(),
+  }).optional(),
+  /** True when `model` is a one-turn override that does not raise the floor. */
+  temporaryEscalation: z.boolean().optional(),
+  /** Non-content reasons for the transition. Never prompt or response text. */
+  decisionReasons: z.array(z.string().min(1).max(64)).max(16).optional(),
+  /**
+   * Only ever set when a provider actually confirmed the model it served. It is
+   * never a copy of `model` — that would manufacture confirmation the runtime
+   * does not have.
+   */
+  providerConfirmedModel: z.string().min(1).optional(),
+  /**
+   * The route the previous execution ACTUALLY ran on, whatever produced it —
+   * an automatic turn, a temporary escalation, a client-routed turn or a manual
+   * pin. This is what makes every transition observable (R8/AC5): during a
+   * temporary escalation `baseRoute` is deliberately NOT what ran, and a manual
+   * turn has no base at all, so neither can stand in for it.
+   *
+   * Absent means unknown — a producer that never recorded one, not "the same as
+   * the floor". Non-content and optional; `kind: 'manual'` never implies the
+   * manual turn fed the automatic floor.
+   */
+  previousApplied: z.object({
+    model: z.string().min(1),
+    effort: z.string().min(1).nullable(),
+    difficulty: z.enum(['trivial', 'routine', 'hard', 'escalated']),
+    kind: z.enum(['auto', 'local-auto-bootstrap', 'manual']),
+  }).optional(),
 });
 export type DifficultyRoutingResult = z.infer<typeof difficultyRoutingResultSchema>;
 

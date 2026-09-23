@@ -40,8 +40,85 @@ export const USER_REQUEST_MODELS: Record<RoutableAgent, Record<Difficulty, Route
   },
 }
 
+/**
+ * Every (agent, model, effort) pair this build recognises as a routing tier,
+ * across generations — not just the one generation `USER_REQUEST_MODELS` routes
+ * to today.
+ *
+ * Two different jobs must not be confused:
+ *
+ * - `USER_REQUEST_MODELS` decides what a NEW decision routes to. It is
+ *   unchanged here; nothing in this table remaps an existing pair.
+ * - this table decides what an EXISTING pair MEANS, whether it arrived from a
+ *   stored floor written by an older build or from a client running a newer
+ *   catalog than ours.
+ *
+ * Without it, a pair from the other generation reads as "unknown model", and an
+ * unknown model has no tier — so the floor is dropped and the conversation
+ * silently restarts cheap. That is the exact failure this feature exists to
+ * prevent, and it shows up precisely when the two repos are mid-rollout.
+ *
+ * Recognising a pair is never the same as rewriting it: a floor stored as
+ * `claude-opus-5/high` keeps running `claude-opus-5/high` (R3 exact retention).
+ * This only says that pair means `hard`.
+ *
+ * Sourced 2026-09-23 from the Desktop worktree
+ * `src/domain/operationModels.ts` (USER_REQUEST_MODELS), which is the
+ * definitive table for the generation this CLI does not yet route to.
+ */
+export const KNOWN_ROUTE_TIERS: ReadonlyArray<{
+  agent: RoutableAgent
+  model: string
+  effort: string
+  tier: Difficulty
+}> = [
+  // --- claude, generation shipped by this CLI ---
+  { agent: 'claude', model: 'claude-haiku-4-5', effort: 'low', tier: 'trivial' },
+  { agent: 'claude', model: 'claude-sonnet-5', effort: 'high', tier: 'routine' },
+  { agent: 'claude', model: 'claude-opus-5', effort: 'high', tier: 'hard' },
+  { agent: 'claude', model: 'claude-fable-5-1', effort: 'high', tier: 'escalated' },
+  // --- claude, generation shipped by Desktop ---
+  { agent: 'claude', model: 'claude-opus-5-5', effort: 'high', tier: 'hard' },
+  // --- codex, generation shipped by this CLI ---
+  { agent: 'codex', model: 'gpt-5.6-luna', effort: 'low', tier: 'trivial' },
+  { agent: 'codex', model: 'gpt-5.6-terra', effort: 'high', tier: 'routine' },
+  { agent: 'codex', model: 'gpt-5.6-sol', effort: 'high', tier: 'hard' },
+  { agent: 'codex', model: 'gpt-6-astra', effort: 'medium', tier: 'escalated' },
+  // --- codex, generation shipped by Desktop. `routine` stays on gpt-5.6-terra
+  //     in both: the GPT-6 generation has no terra-equivalent rung. ---
+  { agent: 'codex', model: 'gpt-6-luna', effort: 'low', tier: 'trivial' },
+  { agent: 'codex', model: 'gpt-6-sol', effort: 'high', tier: 'hard' },
+]
+
+/**
+ * The tier a known pair means, or null when this build has never heard of it.
+ *
+ * Null is deliberately not "assume the cheapest": an unrecognised pair carries
+ * no comparable tier, and guessing one would fabricate a floor.
+ */
+export function tierForKnownRoutePair(
+  agent: RoutableAgent,
+  model: string | undefined,
+  effort: string | null | undefined,
+): Difficulty | null {
+  if (!model || effort === null || effort === undefined) return null
+  return KNOWN_ROUTE_TIERS.find((entry) => (
+    entry.agent === agent && entry.model === model && entry.effort === effort
+  ))?.tier ?? null
+}
+
+/** Whether this build recognises the pair at all, in either generation. */
+export function isKnownRoutePair(
+  agent: RoutableAgent,
+  route: Pick<SendModelOptionsResult, 'model' | 'effort'>,
+): boolean {
+  return tierForKnownRoutePair(agent, route.model, route.effort) !== null
+}
+
 const DIFFICULTY_ORDER: readonly Difficulty[] = ['trivial', 'routine', 'hard', 'escalated']
-const HARD_TURNS_BEFORE_ESCALATION = 3
+/** Exported so the engine boundary can re-check the same threshold the
+ *  classifier used, against the counter as it stands at execution time. */
+export const HARD_TURNS_BEFORE_ESCALATION = 3
 const STICKY_IDLE_RESET_MS = 60 * 60 * 1000
 
 export function isRoutableAgent(agent: string | undefined): agent is RoutableAgent {

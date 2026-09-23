@@ -35,7 +35,7 @@ import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { initialMachineMetadata } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
-import { MessageQueue2, type PendingAttachment } from '@/utils/MessageQueue2';
+import { MessageQueue2, type CollectedBatch, type PendingAttachment } from '@/utils/MessageQueue2';
 import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
@@ -120,7 +120,15 @@ import {
     prepareCodexInitialPrompt,
     prepareCodexSessionStart,
 } from './initialPrompt';
-import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
+import {
+    buildLocalAutoBootstrapDecision,
+    buildManualAppliedDecision,
+    isRoutingProtect,
+    createDifficultyRoutingUnknownEvent,
+    reconcileDecisionWithAppliedSettings,
+    resolveDifficultyRouting,
+} from '@/difficultyRoutingRuntime';
+import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import {
@@ -392,7 +400,26 @@ export async function runCodex(opts: {
         }
     });
     session = initialSession;
-    let difficultyRoutingState = session.getMetadata()?.difficultyRoutingState as DifficultyRoutingState | undefined;
+    /**
+     * Owns the routing floor across accept → engine-apply. The floor is *not*
+     * written when a turn is accepted; it is written when this runner hands the
+     * batch's settings to the Codex engine below.
+     */
+    /**
+     * Identifies one execution attempt. A provider-level retry of the same batch
+     * reuses it, so a transport retry cannot inflate the router's stuck counter.
+     */
+    const difficultyRoutingCommitter = new DifficultyRoutingCommitter(
+        session.getMetadata()?.difficultyRoutingState,
+        {
+            agent: 'codex',
+            persist: (state) => session.updateMetadata((current) => ({
+                ...current,
+                difficultyRoutingState: state,
+            })),
+            emit: (envelope) => session.sendSessionProtocolMessage(envelope),
+        },
+    );
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {
@@ -579,7 +606,7 @@ export async function runCodex(opts: {
         });
         currentAppendSystemPrompt = messageAppendSystemPrompt;
 
-        const routed = !delegatedDifficultyRoutingMessage || isCodexClearText(message.content.text)
+        const outcome = !delegatedDifficultyRoutingMessage || isCodexClearText(message.content.text)
             ? null
             : await resolveDifficultyRouting({
                 agent: 'codex',
@@ -588,8 +615,55 @@ export async function runCodex(opts: {
                 contentText: message.content.text,
                 meta: message.meta,
                 current: { model: messageModel, effort: messageEffort },
-                state: difficultyRoutingState,
+                state: difficultyRoutingCommitter.current(),
             });
+
+        /*
+         * A protective decline is not "no opinion" — see runClaude for the full
+         * rationale. `messageModel` already holds the client's candidate, which
+         * on this path is the cheap one; keep the session's current setting
+         * rather than silently downgrading the conversation.
+         */
+        if (outcome && isRoutingProtect(outcome)) {
+            logger.debug(`[Codex] Auto-route declined protectively (${outcome.reason}); keeping current model`);
+            messageModel = currentModel;
+            messageEffort = currentEffort;
+            const protectIntent = message.meta?.difficultyRoutingIntent as { clientRequestId?: string } | undefined;
+            if (typeof protectIntent?.clientRequestId === 'string') {
+                session.sendSessionProtocolMessage(createDifficultyRoutingUnknownEvent({
+                    clientRequestId: protectIntent.clientRequestId,
+                    reason: outcome.reason,
+                    model: messageModel,
+                    effort: messageEffort ?? null,
+                }));
+            }
+        }
+        const routed = outcome && !isRoutingProtect(outcome) ? outcome : null;
+
+        // Not routed by us but still automatic, or an explicit manual pin. Both
+        // are committed at the engine boundary through the same pending channel.
+        const localRoutingRequestId = message.serverMessageId
+            ? `message:${message.serverMessageId}`
+            : message.localKey ? `local:${message.localKey}` : randomUUID();
+        const localDecision = routed || isCodexClearText(message.content.text)
+            ? null
+            : message.meta?.modelSource === 'auto'
+                ? buildLocalAutoBootstrapDecision({
+                    agent: 'codex',
+                    clientRequestId: localRoutingRequestId,
+                    model: messageModel,
+                    effort: messageEffort ?? null,
+                    now: Date.now(),
+                })
+                : message.meta?.modelSource === 'user' && messageModel
+                    ? buildManualAppliedDecision({
+                        clientRequestId: localRoutingRequestId,
+                        model: messageModel,
+                        effort: messageEffort ?? null,
+                        now: Date.now(),
+                    })
+                    : null;
+
         if (routed) {
             messageModel = routed.route.model ?? messageModel;
             if (isSupportedCodexReasoningEffort(routed.route.effort)) {
@@ -617,15 +691,42 @@ export async function runCodex(opts: {
                 mode: enhancedMode,
                 queue: messageQueue,
                 attachments: attachmentsForThisMessage,
+                // Travels beside the mode so the engine boundary below can commit
+                // this decision — and so a batch keeps every merged request's id.
+                requestIds: routed
+                    ? [routed.pending.clientRequestId]
+                    : localDecision ? [localDecision.clientRequestId] : undefined,
             });
             deferredTurn?.commit();
             if (routed && enqueueResult === 'queued') {
-                difficultyRoutingState = routed.state;
+                // Aligned to what the Codex client will actually be given — an
+                // unsupported effort is dropped above, so the decision and the
+                // engine would otherwise disagree. See runClaude for the full note.
+                const reconciled = reconcileDecisionWithAppliedSettings(
+                    routed.pending,
+                    { model: messageModel, effort: messageEffort ?? null },
+                    'codex',
+                );
+                if (reconciled) {
+                    difficultyRoutingCommitter.recordPending(routed.state);
+                    if (reconciled !== routed.pending) {
+                        difficultyRoutingCommitter.recordLocalPending(reconciled);
+                    }
+                } else {
+                    logger.debug('[Codex] Routed model was substituted into an unknown pair; no floor recorded');
+                }
                 session.sendSessionProtocolMessage(routed.event);
-                session.updateMetadata((current) => ({
-                    ...current,
-                    difficultyRoutingState: routed.state,
-                }));
+            } else if (localDecision && enqueueResult === 'queued') {
+                const reconciled = reconcileDecisionWithAppliedSettings(
+                    localDecision,
+                    { model: messageModel, effort: messageEffort ?? null },
+                    'codex',
+                );
+                if (reconciled) difficultyRoutingCommitter.recordLocalPending(reconciled);
+            }
+            if (enqueueResult === 'clear') {
+                // Phase one: accepted, not yet reset. See DifficultyRoutingCommitter.
+                difficultyRoutingCommitter.requestEpoch();
             }
         } catch (error) {
             deferredTurn?.rollback();
@@ -1579,7 +1680,7 @@ export async function runCodex(opts: {
             }
         }
 
-        let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
+        let pending: CollectedBatch<EnhancedMode> | null = null;
 
         /*
          * A managed Codex run can be asked to end its input without being
@@ -1627,7 +1728,7 @@ export async function runCodex(opts: {
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
-            let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = pending;
+            let message: CollectedBatch<EnhancedMode> | null = pending;
             pending = null;
             if (!message) {
                 /*
@@ -1680,6 +1781,12 @@ export async function runCodex(opts: {
             if (isCodexClearText(message.message) && authRecovery.status().state !== 'failed') {
                 authRecovery.endTurn();
                 logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
+                /*
+                 * The provider's context really is being reset here, so this is
+                 * where the routing epoch ends — not where /clear was accepted.
+                 * Turns accepted in between still run and keep their receipts.
+                 */
+                difficultyRoutingCommitter.startEpoch();
                 client.clearThreadState();
                 currentTurnId = null;
                 currentProviderTurnId = null;
@@ -1713,6 +1820,7 @@ export async function runCodex(opts: {
                 messageBuffer.addMessage(message.message, 'user');
             }
 
+            let routingApplied = false;
             try {
                 authRecovery.assertReady();
                 if (checkpointComposition.completeTurn) {
@@ -1899,12 +2007,27 @@ export async function runCodex(opts: {
                 });
 
                 lessonFrame.acceptingSteer = true;
+                /*
+                 * The engine-applied boundary: this batch's model and effort are
+                 * about to become the turn's settings. Everything before this
+                 * point — classification, acceptance, queueing — could still have
+                 * been cancelled without the conversation ever running on the
+                 * routed model, which is why the floor waits until here.
+                 *
+                 * Committed *before* the await, not after: the settings are
+                 * applied by the call itself, so a turn that then fails or is
+                 * cancelled mid-flight still ran on this model.
+                 */
+                const appliedRoute = difficultyRoutingCommitter.commitApplied(message.requestIds, codexTurnId!);
+                routingApplied = true;
                 const result = await client.sendTurnAndWait(turnPrompt, {
-                    model: message.mode.model,
+                    model: appliedRoute ? appliedRoute.model : message.mode.model,
                     approvalPolicy: executionPolicy.approvalPolicy,
                     sandbox: executionPolicy.sandbox,
                     writableRoots: additionalDirectories,
-                    effort: message.mode.effort,
+                    effort: appliedRoute
+                        ? (isSupportedCodexReasoningEffort(appliedRoute.effort) ? appliedRoute.effort : undefined)
+                        : message.mode.effort,
                     extraInputItems: imageInputs.inputItems,
                 });
                 lessonFrame.acceptingSteer = false;
@@ -1999,6 +2122,9 @@ export async function runCodex(opts: {
                     session.sendSessionProtocolMessage(envelope);
                 }
             } finally {
+                if (!routingApplied) {
+                    difficultyRoutingCommitter.discardPending(message.requestIds ?? [], owningForegroundSignal.aborted ? 'cancelled' : 'failed');
+                }
                 activeLessonTurn = null;
                 lessonProposalTurn.cancel();
                 // specs/linux-checkpoint-enforcement-backend R4 — the checkpoint turn is opened before

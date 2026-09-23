@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
@@ -401,7 +402,20 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             message: MessageParam['content'];
             mode: EnhancedMode;
             hash: string;
+            /**
+             * Kept on the held-back batch too. A message deferred because the mode
+             * changed still has to commit its routing decision when the next
+             * generation actually runs it — dropping the ids here would lose the
+             * decision for exactly the turns that were queued behind a mode change.
+             */
+            requestIds?: string[];
         } | null = null;
+
+        /**
+         * Distinguishes one applied execution from the next, so a replayed or
+         * duplicated boundary commits once. It counts *engine applications*, not
+         * transport retries — a provider-level retry never re-enters this path.
+         */
 
         /*
          * A managed run can be asked to end its input without being killed.
@@ -555,6 +569,24 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             modeHash = p.hash;
                             mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
+                            /*
+                             * The boundary may raise a decision that was queued
+                             * before the floor rose. Applying the revision to
+                             * the mode we are about to hand the SDK is the whole
+                             * point: recording it while the turn still ran on
+                             * the stale model would make the state a claim
+                             * rather than a record of what executed.
+                             */
+                            const revisedPending = session.onModeApplied?.(p.requestIds, randomUUID());
+                            if (revisedPending) {
+                                const revisedMode: EnhancedMode = {
+                                    ...p.mode,
+                                    model: revisedPending.model,
+                                    effort: (revisedPending.effort ?? undefined) as EnhancedMode['effort'],
+                                };
+                                mode = revisedMode;
+                                p = { ...p, mode: revisedMode };
+                            }
                             return p;
                         }
 
@@ -610,7 +642,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
                         // Check if mode has changed
                         if (msg) {
-                            if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
+                            // Preview without committing: a changed engine setting needs a
+                            // fresh SDK query before this request can be marked applied.
+                            const resolved = session.onModeResolved?.(msg.requestIds);
+                            if (resolved) {
+                                msg = { ...msg, mode: { ...msg.mode, model: resolved.model,
+                                    effort: (resolved.effort ?? undefined) as EnhancedMode['effort'] } };
+                            }
+                            const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort);
+                            if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
                                 logger.debug('[remote]: mode has changed, pending message');
                                 pending = msg;
                                 return null;
@@ -618,6 +658,32 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             modeHash = msg.hash;
                             mode = msg.mode;
                             permissionHandler.handleModeChange(mode.permissionMode);
+
+                            /*
+                             * The engine-applied boundary for Claude. This batch's
+                             * mode — model and effort included — is now the query's
+                             * settings, so auto-routing may commit its floor here
+                             * and nowhere earlier: everything before this point
+                             * could still have been cancelled with the routed model
+                             * never reaching the engine.
+                             *
+                             * This is not provider confirmation. It says the runner
+                             * applied the setting, not that Anthropic served it.
+                             *
+                             * A batch whose mode differs returns above, so a message
+                             * held back as `pending` is not committed here — it is
+                             * committed by the generation that actually runs it.
+                             */
+                            const revisedBatch = session.onModeApplied?.(msg.requestIds, randomUUID());
+                            if (revisedBatch) {
+                                const revisedMode: EnhancedMode = {
+                                    ...msg.mode,
+                                    model: revisedBatch.model,
+                                    effort: (revisedBatch.effort ?? undefined) as EnhancedMode['effort'],
+                                };
+                                mode = revisedMode;
+                                msg = { ...msg, mode: revisedMode };
+                            }
 
                             // Per-message attachments are already claimed by the message
                             // when it was pushed onto the queue, so there is no race window
@@ -728,6 +794,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onSessionReset: () => {
                         logger.debug('[remote]: Session reset');
                         session.clearSessionId();
+                        session.onSessionReset?.();
                     },
                     onReady: () => {
                         session.client.closeClaudeSessionTurn('completed');
