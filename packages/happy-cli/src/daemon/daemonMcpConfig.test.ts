@@ -11,6 +11,7 @@ vi.mock('@/persistence', () => ({
 }))
 
 import { resolveDaemonMcpConfigEnvironment } from './daemonMcpConfig'
+import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
 
 describe('resolveDaemonMcpConfigEnvironment', () => {
   beforeEach(() => {
@@ -80,6 +81,47 @@ describe('resolveDaemonMcpConfigEnvironment', () => {
     expect(mocks.updateSettings).not.toHaveBeenCalled()
   })
 
+  it('persists and forwards only the endpoint when restarted from a session environment', async () => {
+    const endpoint = 'https://studio.example/api/me/mcp-config'
+    const environment = injectMcpCallerGrant(
+      { EXISTING: 'value' },
+      'session-grant',
+      `${endpoint}?capability_token=session-token&unrelated=private#session-secret`,
+      'session-project',
+    )
+    const sessionUrl = environment.HAPPY_APLUS_MCP_CONFIG_URL
+
+    const resolved = await resolveDaemonMcpConfigEnvironment(environment, { persistExplicit: true })
+
+    expect(resolved.HAPPY_APLUS_MCP_CONFIG_URL).toBe(endpoint)
+    expect(environment.HAPPY_APLUS_MCP_CONFIG_URL).toBe(sessionUrl)
+    expect(resolved.EXISTING).toBe('value')
+    expect(mocks.updateSettings).toHaveBeenCalledTimes(1)
+    const updater = mocks.updateSettings.mock.calls[0][0]
+    expect(await updater({ schemaVersion: 2, onboardingCompleted: true, machineId: 'machine' }))
+      .toEqual({ schemaVersion: 2, onboardingCompleted: true, machineId: 'machine', aplusMcpConfigUrl: endpoint })
+  })
+
+  it('strips session scope from a previously persisted URL before restoring it', async () => {
+    mocks.readSettings.mockResolvedValue({
+      aplusMcpConfigUrl: 'https://studio.example/api/me/mcp-config?project_id=old&token=secret#private',
+    })
+
+    await expect(resolveDaemonMcpConfigEnvironment({})).resolves.toEqual({
+      HAPPY_APLUS_MCP_CONFIG_URL: 'https://studio.example/api/me/mcp-config',
+    })
+  })
+
+  it.each([null, 123, {}, ['https://studio.example/api/me/mcp-config']])(
+    'rejects a non-string persisted URL without URL coercion: %j', async value => {
+      mocks.readSettings.mockResolvedValue({ aplusMcpConfigUrl: value })
+
+      await expect(resolveDaemonMcpConfigEnvironment({}))
+        .rejects.toThrow('Invalid persisted Aplus MCP config URL')
+      expect(mocks.updateSettings).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([
     'not-a-url',
     'file:///tmp/mcp-config',
@@ -102,6 +144,13 @@ describe('resolveDaemonMcpConfigEnvironment', () => {
 
     await expect(resolveDaemonMcpConfigEnvironment({}))
       .rejects.toThrow('Invalid persisted Aplus MCP config URL')
+    expect(mocks.updateSettings).not.toHaveBeenCalled()
+  })
+
+  it('does not expose rejected URL credentials in its error', async () => {
+    await expect(resolveDaemonMcpConfigEnvironment({
+      HAPPY_APLUS_MCP_CONFIG_URL: 'https://user:session-secret@studio.example/api/me/mcp-config',
+    }, { persistExplicit: true })).rejects.toThrow(/^Invalid HAPPY_APLUS_MCP_CONFIG_URL$/)
     expect(mocks.updateSettings).not.toHaveBeenCalled()
   })
 })
