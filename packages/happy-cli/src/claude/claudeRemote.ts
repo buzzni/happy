@@ -29,7 +29,7 @@ import { McpConfigSynchronizer, type McpConfigSource } from './mcpConfigSynchron
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { buildWorkerAgents, readWorkerConfigFromEnv } from "@/orchestrator/workerAgents";
 import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from "@/orchestrator/skillGovernance";
-import { readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
+import { isConnectorPlatformConfigured, readExpectedConnectors, readExpectedMcpServices } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
@@ -262,7 +262,7 @@ export async function claudeRemote(opts: {
         expectedConnectors: readExpectedConnectors(),
         expectedMcpServices: readExpectedMcpServices(),
         configuredServerNames: Object.keys(mergedMcpServers),
-    }));
+    }), { connectorPlatformConfigured: isConnectorPlatformConfigured() });
     const promptOptions = buildClaudeSystemPromptOptions({
         customSystemPrompt: initial.mode.customSystemPrompt,
         appendSystemPrompt: initial.mode.appendSystemPrompt,
