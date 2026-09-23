@@ -38,8 +38,13 @@ interface PermissionsField {
     allowedTools?: string[];
 }
 
+import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
+
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
+
+    // Survives generation restarts within this session; see the call below.
+    const lessonObservations = createLessonTurnObservations();
 
     // Check if we have a TTY for UI rendering
     const hasTTY = process.stdout.isTTY && process.stdin.isTTY;
@@ -107,6 +112,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const startedGeneration = (): GenerationProof | null => generationProofs.current();
 
     async function abort() {
+        session.cancelLessonReview();
         if (abortController && !abortController.signal.aborted) {
             /*
              * Recorded before the abort, not after. A provider that handles
@@ -153,7 +159,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (!text.trim()) {
             return { success: false, error: 'Steer text is required' };
         }
-        if (!activeInputSender?.(text)) {
+        if (!await activeInputSender?.(text)) {
             return { success: false, error: 'No active Claude turn' };
         }
         session.onActiveUserInputAccepted?.(text);
@@ -163,11 +169,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    let mcpStatusReader: Pick<McpRuntimeRecovery, 'readStatuses'> | null = null;
     let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
     registerMcpReconnectHandler(
         session.client.rpcHandlerManager,
         session.client.sessionId,
         () => mcpController,
+        () => mcpStatusReader,
     );
 
     // Drop any permission requests left over in agent state from a
@@ -365,6 +373,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         let pending: {
             message: MessageParam['content'];
             mode: EnhancedMode;
+            hash: string;
         } | null = null;
 
         /*
@@ -437,6 +446,32 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
+                    lessonProposalTurn: session.lessonProposalTurn,
+                    lessonReviewLifecycle: session.lessonReviewLifecycle,
+                    /*
+                     * The host and completed-turn history belong to the session.
+                     * The shared observation buffer is drained at every turn and
+                     * generation boundary; interrupted work is never evidence
+                     * for a later successful turn.
+                     */
+                    ...(session.lessons
+                        ? {
+                            lessons: {
+                                turn: session.lessons.turn,
+                                review: session.lessons.review,
+                                sessionKind: session.lessons.sessionKind,
+                                observations: lessonObservations,
+                                /*
+                                 * The authoritative Happy session id, not the
+                                 * Claude provider one — that is null here on a
+                                 * fresh session, and a placeholder would
+                                 * attribute traces to an identity nobody can
+                                 * resolve.
+                                 */
+                                sessionId: session.client.sessionId ?? null,
+                            },
+                        }
+                        : {}),
                     path: session.path,
                     managedSettingsLockdown: session.managedSettingsLockdown,
                     managedRun: session.managedRun,
@@ -488,6 +523,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (pending) {
                             let p = pending;
                             pending = null;
+                            // This message starts the new provider. Seed its comparison
+                            // baseline too, or the next model/effort change is missed.
+                            modeHash = p.hash;
+                            mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
                             return p;
                         }
@@ -634,6 +673,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             await q.setPermissionMode(mode);
                         });
                     },
+                    onMcpStatusReaderReady: (reader) => { mcpStatusReader = reader; },
                     onMcpControllerReady: (controller) => {
                         mcpController = controller;
                     },
@@ -715,6 +755,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             } finally {
 
                 mcpController = null;
+                mcpStatusReader = null;
                 // The process is gone: whatever text is still buffered can
                 // never be completed, so ship it as-is rather than let it
                 // leak into the next launch's frames.
@@ -749,6 +790,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+        session.cancelLessonReview();
         /*
          * The verdict for this run, reported once, and only for a run that was
          * asked to stop.

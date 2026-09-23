@@ -1,3 +1,4 @@
+import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
@@ -82,6 +83,8 @@ import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManage
 import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
+import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
+import { readLessonOwner } from '@/memory/lessonOwnerMarker';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -660,8 +663,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onTranscriptEvent: updateClaudeGoalState,
     });
 
+    const lessonProposalTurn = createLessonProposalTurn();
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        ...(principal.kind === 'account' ? { proposeLesson: lessonProposalTurn.submit } : {}),
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
     });
@@ -1311,6 +1316,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
             return;
         }
+        currentSession?.cancelLessonReview();
         const attachmentsPromise = session.drainAttachmentsForUserMessage();
         return handleUserMessage({ message, attachmentsPromise });
     });
@@ -1507,8 +1513,41 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     };
 
     // Create claude loop
-    const exitCode = await loop({
+    /*
+     * The lesson host for this session, built once.
+     *
+     * Bounded on its own budget, so a slow studio delays nothing, and null for
+     * a managed run — which holds no account credential and must not be handed
+     * one. When it is null the loop behaves exactly as it did before.
+     */
+    const lessons = createLazyLessonSessionHost({
+        accountToken,
+        machineId: principal.kind === 'account' ? (machineId ?? null) : null,
+        sessionId: session.sessionId,
+        happyHomeDir: configuration.happyHomeDir,
+    });
+
+    /*
+     * Closed on every exit path — normal, thrown or signalled. Registered
+     * after `lessons` exists so the closure cannot capture it in its temporal
+     * dead zone, and tolerant of a double close.
+     */
+    let lessonsClosed = false;
+    const closeLessons = async () => {
+        if (lessonsClosed) return;
+        lessonsClosed = true;
+        await lessons.close().catch(() => undefined);
+    };
+    const closeLessonsOnSignal = () => { void closeLessons(); };
+    process.once('SIGTERM', closeLessonsOnSignal);
+    process.once('SIGINT', closeLessonsOnSignal);
+
+    let exitCode: number;
+    try {
+        exitCode = await loop({
         path: workingDirectory,
+        ...(lessons ? { lessons } : {}),
+        lessonProposalTurn,
         sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,
@@ -1543,7 +1582,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
                 const token = requireAccountToken(accountToken);
                 const account = requireAccountMachineId(machineId);
-                await refreshMcpCallerGrantIfExpiring(token, account);
+                await refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
                 return fetchAplusMcpServersResult(
                     token,
                     account,
@@ -1564,6 +1603,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
+    } finally {
+        process.removeListener('SIGTERM', closeLessonsOnSignal);
+        process.removeListener('SIGINT', closeLessonsOnSignal);
+        await closeLessons();
+    }
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak
     // Note: currentSession is set by onSessionReady callback during loop()

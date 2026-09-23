@@ -1,3 +1,4 @@
+import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
@@ -48,7 +49,7 @@ export interface ServerToClientEvents {
   update: (data: Update) => void
   // `callback` is optional because socket.io does not guarantee an ack on
   // every delivered packet — see createRpcRequestListener.
-  'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void
+  'rpc-request': (data: RpcRequest, callback?: RpcResponseCallback) => void
   'rpc-registered': (data: { method: string }) => void
   'rpc-unregistered': (data: { method: string }) => void
   'rpc-error': (data: { type: string, error: string }) => void
@@ -179,6 +180,8 @@ export const MachineMetadataSchema = z.object({
    * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
+  /** Current tracked-child presence via encrypted machine RPC (BYOS only). */
+  daemonSessionState: z.object({ version: z.literal(1) }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>

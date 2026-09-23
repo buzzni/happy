@@ -85,11 +85,22 @@ export function buildCodexTurnPrompt(opts: {
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled'>;
     includeAppendSystemPrompt: boolean;
     hasTitle: boolean;
+    /**
+     * Project lessons recalled for this turn, already bounded and labelled.
+     *
+     * Placed before the user's message and after the system prompt: it is
+     * reference material for the request that follows, not an instruction of
+     * its own, and the block says so in its own words.
+     */
+    lessonBlock?: string;
 }): string {
     const parts: string[] = [];
 
     if (opts.includeAppendSystemPrompt && opts.mode.appendSystemPrompt) {
         parts.push(opts.mode.appendSystemPrompt);
+    }
+    if (opts.lessonBlock) {
+        parts.push(opts.lessonBlock);
     }
     parts.push(opts.message);
 

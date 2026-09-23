@@ -1,3 +1,4 @@
+import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { ApiClient, ApiSessionClient } from "@/lib";
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { EnhancedMode } from "./loop";
@@ -9,6 +10,14 @@ import type { AplusMcpServersMap } from '@/aplus/fetchAplusMcpServers';
 import type { McpConfigSource } from './mcpConfigSynchronizer';
 import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 
+import type { LessonSessionHost } from '@/memory/lessonSessionHost';
+
+/** Survives SDK generations, but is reset with the actual conversation. */
+export interface ClaudeLessonReviewLifecycle {
+    controller: AbortController;
+    completedAssistantTurns: number;
+}
+
 export class Session {
     readonly path: string;
     readonly logPath: string;
@@ -19,6 +28,23 @@ export class Session {
     readonly managedSettingsLockdown?: boolean;
     /** A managed Cloud run: unbound instruction paths are closed. */
     readonly managedRun?: boolean;
+    /**
+     * Project lesson recall and background review for this session.
+     *
+     * Built once by the runner, from the daemon's trusted spawn context, and
+     * carried here so the remote launcher can hand it to each turn without
+     * rebuilding it per turn. Absent for a managed run and for any
+     * installation without a lesson host.
+     */
+    readonly lessons?: LessonSessionHost;
+    readonly lessonProposalTurn?: LessonProposalTurn;
+    readonly lessonReviewLifecycle: ClaudeLessonReviewLifecycle = {
+        controller: new AbortController(), completedAssistantTurns: 0,
+    };
+    cancelLessonReview = (): void => {
+        this.lessonReviewLifecycle.controller.abort();
+        this.lessonProposalTurn?.cancel();
+    };
     claudeArgs?: string[];  // Made mutable to allow filtering
     mcpServers: Record<string, any>;
     readonly mcpConfig?: McpConfigSource;
@@ -57,6 +83,8 @@ export class Session {
         claudeEnvVars?: Record<string, string>,
         managedSettingsLockdown?: boolean,
         managedRun?: boolean,
+        lessons?: LessonSessionHost,
+        lessonProposalTurn?: LessonProposalTurn,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
         mcpConfig?: McpConfigSource,
@@ -87,6 +115,8 @@ export class Session {
         this.claudeEnvVars = opts.claudeEnvVars;
         this.managedSettingsLockdown = opts.managedSettingsLockdown;
         this.managedRun = opts.managedRun;
+        this.lessons = opts.lessons;
+        this.lessonProposalTurn = opts.lessonProposalTurn;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
         this.mcpConfig = opts.mcpConfig;
@@ -120,6 +150,7 @@ export class Session {
      * Cleanup resources (call when session is no longer needed)
      */
     cleanup = (): void => {
+        this.cancelLessonReview();
         clearInterval(this.keepAliveInterval);
         this.sessionFoundCallbacks = [];
         logger.debug('[Session] Cleaned up resources');
@@ -188,6 +219,8 @@ export class Session {
      * Clear the current session ID (used by /clear command)
      */
     clearSessionId = (): void => {
+        this.cancelLessonReview();
+        this.lessonReviewLifecycle.completedAssistantTurns = 0;
         this.sessionId = null;
         logger.debug('[Session] Session ID cleared');
     }

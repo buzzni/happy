@@ -63,6 +63,7 @@ import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPol
 import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
+import { CodexAuthRecoveryError, type CodexAuthCheck, type CodexAuthSource } from './codexAuthRecovery';
 
 type PendingRequest = {
     resolve: (result: unknown) => void;
@@ -1521,6 +1522,65 @@ export class CodexAppServerClient {
             threadId: opts.threadId,
         };
         return await this.request('thread/goal/clear', params) as ThreadGoalClearResponse;
+    }
+
+    get authRecoverySource(): CodexAuthSource {
+        if (this.managedProviderArgs || this.sandboxPolicyMode === 'mandatory') return 'managed';
+        if (this.multiAuthProxy) return 'multi-auth';
+        if (process.env.CODEX_ACCESS_TOKEN || process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL) return 'unknown';
+        return process.env.CODEX_HOME ? 'custom-home' : 'cli-login';
+    }
+
+    get authRecoveryBusy(): boolean {
+        return !!this.pendingTurnCompletion || !!this.pendingInterrupt || this.outstandingServerRequests > 0 || this.pending.size > 0;
+    }
+
+    /** Explicit, idle-only recovery. Unlike legacy reconnect, failure never discards the thread. */
+    async reconnectForAuth(): Promise<CodexAuthCheck> {
+        const threadId = this._threadId;
+        const defaults = this.threadDefaults;
+        if (!threadId || this.authRecoveryBusy || this.authRecoverySource === 'managed') throw new CodexAuthRecoveryError('restart-failed');
+        let phase: 'restart-failed' | 'account-check-failed' | 'resume-failed' = 'restart-failed';
+        try {
+            await this.disconnectInternal({ preserveThreadState: true, awaitProcessExit: true });
+            await this.connect();
+            phase = 'account-check-failed';
+            // A rotation proxy owns authentication itself. account/read cannot verify its payer.
+            let account: CodexAuthCheck = 'unverified';
+            if (!this.multiAuthProxy) {
+                const result = await this.request('account/read', { refreshToken: false }, 8000) as {
+                    account?: { type?: string } | null; requiresOpenaiAuth?: boolean;
+                };
+                if (result?.requiresOpenaiAuth !== true) throw new CodexAuthRecoveryError('account-check-failed');
+                if (result?.account?.type === 'chatgpt') account = 'authenticated';
+                else if (result?.account?.type === 'apiKey') account = 'unverified';
+                else if (result?.requiresOpenaiAuth === true && !result.account) throw new CodexAuthRecoveryError('authentication-required');
+                else throw new CodexAuthRecoveryError('account-check-failed');
+                if (result.account?.type === 'chatgpt') {
+                    const limits = await this.request('account/rateLimits/read', undefined, 8000) as {
+                        rateLimits?: { primary?: { usedPercent?: number } | null; secondary?: { usedPercent?: number } | null;
+                            rateLimitReachedType?: string | null };
+                    };
+                    if (!limits?.rateLimits) throw new CodexAuthRecoveryError('account-check-failed');
+                    const { primary, secondary, rateLimitReachedType } = limits.rateLimits;
+                    if (![primary, secondary].some(window => typeof window?.usedPercent === 'number'
+                        && Number.isFinite(window.usedPercent) && window.usedPercent >= 0)) {
+                        throw new CodexAuthRecoveryError('account-check-failed');
+                    }
+                    if (rateLimitReachedType || [primary, secondary].some(window => typeof window?.usedPercent === 'number' && window.usedPercent >= 100)) {
+                        throw new CodexAuthRecoveryError('limit-reached');
+                    }
+                }
+            }
+            phase = 'resume-failed';
+            const resumed = await this.resumeThread({ threadId });
+            if (resumed.threadId !== threadId) throw new CodexAuthRecoveryError('resume-failed');
+            return account;
+        } catch (error) {
+            this._threadId = threadId;
+            this.threadDefaults = defaults;
+            throw error instanceof CodexAuthRecoveryError ? error : new CodexAuthRecoveryError(phase);
+        }
     }
 
     async reconnectAndResumeThread(opts?: { preservePendingTurnCompletion?: boolean }): Promise<boolean> {

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import {
     buildViewerBridgeModule,
@@ -71,25 +71,25 @@ describe('buildViewerBridgeModule', () => {
 
 describe('ensureViewerWebRoot', () => {
     let sourceRoot: string
-    let targetRoot: string
+    let baseDir: string
 
     beforeEach(() => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-'))
         sourceRoot = join(base, 'novnc')
-        targetRoot = join(base, 'mirror')
+        baseDir = join(base, 'mirror')
         mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
         writeFileSync(join(sourceRoot, 'app', 'ui.js'), 'export default {}')
     })
 
     it('serves a patched page while leaving noVNC\'s assets where they are', () => {
-        const root = ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        expect(root).toBe(targetRoot)
-        expect(readFileSync(join(targetRoot, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
-        expect(lstatSync(join(targetRoot, 'app')).isSymbolicLink()).toBe(true)
-        expect(readlinkSync(join(targetRoot, 'app'))).toBe(join(sourceRoot, 'app'))
-        expect(existsSync(join(targetRoot, VIEWER_BRIDGE_PATH))).toBe(true)
+        expect(root.startsWith(join(baseDir, 'remote-'))).toBe(true)
+        expect(readFileSync(join(root, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        expect(lstatSync(join(root, 'app')).isSymbolicLink()).toBe(true)
+        expect(readlinkSync(join(root, 'app'))).toBe(join(sourceRoot, 'app'))
+        expect(existsSync(join(root, VIEWER_BRIDGE_PATH))).toBe(true)
     })
 
     // Debian's package makes / an alias of vnc.html; a symlink there would
@@ -97,19 +97,19 @@ describe('ensureViewerWebRoot', () => {
     it('patches the directory index too', () => {
         symlinkSync(join(sourceRoot, 'vnc.html'), join(sourceRoot, 'index.html'))
 
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        expect(lstatSync(join(targetRoot, 'index.html')).isSymbolicLink()).toBe(false)
-        expect(readFileSync(join(targetRoot, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        expect(lstatSync(join(root, 'index.html')).isSymbolicLink()).toBe(false)
+        expect(readFileSync(join(root, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 
-    it('rebuilds cleanly when the mode changes', () => {
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'scale' })
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+    it('gives each mode its own root instead of overwriting the other', () => {
+        const scale = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'scale' })
+        const remote = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        const html = readFileSync(join(targetRoot, 'vnc.html'), 'utf8')
-        expect(html).toContain("'resize', 'remote'")
-        expect(html).not.toContain("'resize', 'scale'")
+        expect(remote).not.toBe(scale)
+        expect(readFileSync(join(remote, 'vnc.html'), 'utf8')).toContain("'resize', 'remote'")
+        expect(readFileSync(join(scale, 'vnc.html'), 'utf8')).toContain("'resize', 'scale'")
     })
 
     // A machine whose noVNC install does not look like we expect still has a
@@ -117,7 +117,7 @@ describe('ensureViewerWebRoot', () => {
     it('falls back to the stock root rather than serving nothing', () => {
         writeFileSync(join(sourceRoot, 'vnc.html'), '<html><body>no head</body></html>')
 
-        expect(ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })).toBe(sourceRoot)
+        expect(ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })).toBe(sourceRoot)
     })
 })
 
@@ -397,12 +397,12 @@ describe('installViewerClipboardBridge', () => {
 
 describe('ensureViewerWebRoot idempotence', () => {
     let sourceRoot: string
-    let targetRoot: string
+    let baseDir: string
 
     beforeEach(() => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-again-'))
         sourceRoot = join(base, 'novnc')
-        targetRoot = join(base, 'mirror')
+        baseDir = join(base, 'mirror')
         mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
         writeFileSync(join(sourceRoot, 'app', 'ui.js'), 'export default {}')
@@ -412,25 +412,69 @@ describe('ensureViewerWebRoot idempotence', () => {
     // mirror: tearing down a directory that is already correct would 404
     // whatever asset another user's page is loading right then.
     it('leaves an already-current mirror alone', () => {
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
-        const witness = join(targetRoot, 'rebuild-witness')
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const witness = join(root, 'rebuild-witness')
         writeFileSync(witness, 'x')
 
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
-
+        expect(ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })).toBe(root)
         expect(existsSync(witness)).toBe(true)
     })
 
-    it('rebuilds when noVNC itself gained files the mirror never saw', () => {
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
-        const witness = join(targetRoot, 'rebuild-witness')
-        writeFileSync(witness, 'x')
+    // The rename-collision branch: the name is right but what is under it is
+    // not, which no correct viewer can be serving, so it is rebuilt in place.
+    // "Not current" is not "not in use": a root with only index.html gone
+    // still serves /vnc.html to every session on it. Repair has to publish a
+    // fresh directory under the name and move the old one aside — a rename
+    // keeps its inode, so a websockify chdir'd into it keeps working — never
+    // delete it, which is the outage.
+    it('repairs a root that carries the right name with the wrong contents without deleting it', () => {
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        writeFileSync(join(root, 'index.html'), 'corrupted')
+
+        const again = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+
+        expect(again).toBe(root)
+        expect(readFileSync(join(root, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        const entries = readdirSync(baseDir)
+        expect(entries.some((entry) => entry.endsWith('.tmp'))).toBe(false)
+        const movedAside = entries.find((entry) => entry !== basename(root))
+        expect(movedAside).toBeDefined()
+        expect(readFileSync(join(baseDir, movedAside as string, 'index.html'), 'utf8')).toBe('corrupted')
+    })
+
+    // Every asset in the mirror is a symlink into the install it was built
+    // from, so reusing a root across installs would serve symlinks pointing
+    // at a path that may no longer exist.
+    it('does not reuse a root built against a different noVNC install', () => {
+        const other = join(baseDir, '..', 'novnc-moved')
+        mkdirSync(join(other, 'app'), { recursive: true })
+        writeFileSync(join(other, 'vnc.html'), STOCK_HTML)
+        writeFileSync(join(other, 'app', 'ui.js'), 'export default {}')
+
+        const fromFirst = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const fromOther = ensureViewerWebRoot({ sourceRoot: other, baseDir, resizeMode: 'remote' })
+
+        expect(fromOther).not.toBe(fromFirst)
+        expect(readlinkSync(join(fromOther, 'app'))).toBe(join(other, 'app'))
+    })
+
+    // 2026-09-21, walter-gpu: one mutable directory was shared by every live
+    // websockify, and a rebuild deleted it out from under them. websockify
+    // chdir()s into its web root at startup, so once that inode is gone the
+    // process is still bound to its port and closes every request unanswered
+    // — a screen that answers `read ECONNRESET` on every path.
+    it('builds a new root instead of deleting the one a live viewer is serving', () => {
+        const inUse = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const servedFile = join(inUse, 'vnc.html')
         mkdirSync(join(sourceRoot, 'vendor'))
 
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const rebuilt = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        expect(existsSync(witness)).toBe(false)
-        expect(existsSync(join(targetRoot, 'vendor'))).toBe(true)
+        expect(rebuilt).not.toBe(inUse)
+        expect(existsSync(join(rebuilt, 'vendor'))).toBe(true)
+        // The old viewer keeps a directory it can still read from.
+        expect(existsSync(inUse)).toBe(true)
+        expect(readFileSync(servedFile, 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 })
 
@@ -469,16 +513,38 @@ describe('ensureViewerWebRoot failure handling', () => {
     it('keeps a working mirror when the source becomes unreadable later', () => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-keep-'))
         const sourceRoot = join(base, 'novnc')
-        const targetRoot = join(base, 'mirror')
+        const baseDir = join(base, 'mirror')
         mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const inUse = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
         writeFileSync(join(sourceRoot, 'vnc.html'), '<html><body>no head</body></html>')
-        const root = ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
         expect(root).toBe(sourceRoot)
-        expect(existsSync(join(targetRoot, 'vnc.html'))).toBe(true)
+        expect(existsSync(join(inUse, 'vnc.html'))).toBe(true)
+    })
+
+    // A failure partway through assembly must fall back, remove its own
+    // staging, and leave every existing root alone. The failure is real: the
+    // bridge lives under `aplus/`, and a source entry of that name collides
+    // with the directory assembly made for it — after staging exists.
+    it('falls back and cleans only its own staging when assembly fails', () => {
+        const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-partial-'))
+        const sourceRoot = join(base, 'novnc')
+        const baseDir = join(base, 'mirror')
+        mkdirSync(join(sourceRoot, 'app'), { recursive: true })
+        writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
+        const healthy = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        mkdirSync(join(sourceRoot, dirname(VIEWER_BRIDGE_PATH)))
+        const reasons: string[] = []
+
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote', onFallback: (r) => reasons.push(r) })
+
+        expect(root).toBe(sourceRoot)
+        expect(reasons).toHaveLength(1)
+        expect(readdirSync(baseDir).some((entry) => entry.endsWith('.tmp'))).toBe(false)
+        expect(readFileSync(join(healthy, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 })
 

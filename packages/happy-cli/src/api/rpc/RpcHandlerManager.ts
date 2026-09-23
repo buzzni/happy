@@ -12,6 +12,7 @@ import {
     RpcHandlerConfig,
 } from './types';
 import { Socket } from 'socket.io-client';
+import { createRpcLatency, parseRpcLatencyRequest } from '@slopus/happy-wire';
 
 export class RpcHandlerManager {
     private handlers: RpcHandlerMap = new Map();
@@ -87,6 +88,19 @@ export class RpcHandlerManager {
     async handleRequest(
         request: RpcRequest,
     ): Promise<any> {
+        const requestTrace = request?.method === this.getPrefixedMethod('daemon-session-state')
+            ? parseRpcLatencyRequest(request.rpcLatency) : undefined;
+        if (!requestTrace) return this.executeRequest(request);
+        const trace = createRpcLatency(requestTrace);
+        const end = trace.begin('daemon-total');
+        try {
+            const result = await this.executeRequest(request, trace);
+            end('resolved');
+            return { result, rpcLatency: trace.snapshot() };
+        } catch (error) { end('rejected'); throw error; }
+    }
+
+    private async executeRequest(request: RpcRequest, trace?: ReturnType<typeof createRpcLatency>): Promise<any> {
         try {
             if (this.managedAllowlist) {
                 const prefix = `${this.scopePrefix}:`;
@@ -112,15 +126,17 @@ export class RpcHandlerManager {
             }
 
             // Decrypt the incoming params
-            const decryptedParams = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(request.params));
+            const decode = () => decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(request.params));
+            const decryptedParams = trace ? trace.measureSync('daemon-decrypt', decode) : decode();
 
             // Call the handler
             this.logger('[RPC] Calling handler', { method: request.method });
-            const result = await handler(decryptedParams);
+            const result = await (trace ? trace.measure('daemon-handler', () => Promise.resolve(handler(decryptedParams))) : handler(decryptedParams));
             this.logger('[RPC] Handler returned', { method: request.method, hasResult: result !== undefined });
 
             // Encrypt and return the response
-            const encryptedResponse = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, result));
+            const encode = () => encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, result));
+            const encryptedResponse = trace ? trace.measureSync('daemon-encrypt', encode) : encode();
             this.logger('[RPC] Sending encrypted response', { method: request.method, responseLength: encryptedResponse.length });
             return encryptedResponse;
         } catch (error) {

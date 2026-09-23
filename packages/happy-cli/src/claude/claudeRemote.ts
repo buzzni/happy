@@ -1,3 +1,5 @@
+import type { ClaudeLessonReviewLifecycle } from './session';
+import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { EnhancedMode } from "./loop";
 import { endManagedTurnInput } from '@/managed/managedGracefulStop';
 
@@ -34,9 +36,18 @@ import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPr
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
 import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
+import { randomUUID } from 'node:crypto';
+import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
 import { managedSettingSources } from '@/managed/managedStartup';
+import type { LessonReviewWorker } from '@/memory/lessonReviewWorker';
+import type { LessonTurnKind } from '@/memory/lessonTurnEvidence';
+import {
+    createLessonTurnObservations,
+    type LessonTurnObservations,
+} from '@/memory/lessonTurnObservations';
+import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
 
-export type ClaudeActiveInputSender = (text: string) => boolean;
+export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
 
 export async function claudeRemote(opts: {
 
@@ -75,6 +86,23 @@ export async function claudeRemote(opts: {
     onQueryReady?: (query: { setPermissionMode: (mode: string) => Promise<void> }) => void,
     /** Path to temporary settings file with SessionStart hook (required for session tracking) */
     hookSettingsPath: string,
+    /**
+     * Project lesson recall and foreground candidate review for this session.
+     *
+     * Built by the runner from the daemon's trusted spawn context. Absent for
+     * a managed run and for any installation without a lesson host, and when
+     * it is absent this function behaves exactly as it did before.
+     */
+    lessonProposalTurn?: LessonProposalTurn,
+    lessonReviewLifecycle?: ClaudeLessonReviewLifecycle,
+    lessons?: {
+        turn: LessonTurnHost | null,
+        review: LessonReviewWorker | null,
+        sessionKind: LessonTurnKind,
+        observations: LessonTurnObservations,
+        /** The authoritative Happy session id; absent disables lesson work. */
+        sessionId: string | null,
+    },
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime,
     /** Orchestrator mode: inject worker MCP tools and system prompt */
@@ -102,6 +130,7 @@ export async function claudeRemote(opts: {
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
     onMcpStatus?: (status: McpRuntimeServerStatus) => void,
+    onMcpStatusReaderReady?: (reader: Pick<McpRuntimeRecovery, 'readStatuses'> | null) => void,
     onMcpControllerReady?: (controller: Pick<McpRuntimeRecovery, 'reconnectServer'> | null) => void,
     onActiveInputReady?: (sender: ClaudeActiveInputSender | null) => void,
     onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void,
@@ -147,11 +176,25 @@ export async function claudeRemote(opts: {
         });
     }
 
+    // Retained by Session across checkpoint/mode generations; each accepted input replaces its controller.
+    const reviewLifecycle = opts.lessonReviewLifecycle ?? {
+        controller: new AbortController(), completedAssistantTurns: 0,
+    };
+    let reviewAbort = reviewLifecycle.controller;
+    const preemptReview = () => {
+        opts.lessonProposalTurn?.cancel();
+        reviewLifecycle.controller.abort();
+        reviewAbort = new AbortController();
+        reviewLifecycle.controller = reviewAbort;
+        if (opts.signal?.aborted) reviewAbort.abort();
+    };
+
     // Get initial message
     const initial = await opts.nextMessage();
     if (!initial) { // No initial message - exit
         return 'not-started' as const;
     }
+    preemptReview();
     opts.onPromptSuggestionChange?.(null);
 
     // Handle special commands (extract text for parsing when content is a block array)
@@ -162,6 +205,7 @@ export async function claudeRemote(opts: {
 
     // Handle /clear command
     if (specialCommand.type === 'clear') {
+        reviewLifecycle.completedAssistantTurns = 0;
         if (opts.onCompletionEvent) {
             opts.onCompletionEvent('Context was reset');
         }
@@ -298,6 +342,140 @@ export async function claudeRemote(opts: {
         }
     };
 
+    /*
+     * Lesson state for this session's turns.
+     *
+     * `pendingLessonTicket` is what makes "selected" and "delivered" two
+     * different things here: recall fills it before a message is pushed, and
+     * it is only acknowledged once the SDK reports the assistant actually
+     * beginning that turn. A push onto the queue is not acceptance.
+     *
+     * It is turn-local by construction — cleared on acknowledgement and
+     * overwritten by the next recall — so a late result cannot be attached to
+     * a turn it did not belong to.
+     */
+    const lessonTurn = opts.lessons?.sessionId ? (opts.lessons.turn ?? null) : null;
+    const lessonReview = opts.lessons?.sessionId ? (opts.lessons.review ?? null) : null;
+    // Unknown means automation: a session this host cannot classify must not
+    // be allowed to teach the project.
+    const cancelProposal = () => opts.lessonProposalTurn?.cancel();
+    opts.signal?.addEventListener('abort', cancelProposal, { once: true });
+    const lessonSessionKind: LessonTurnKind = opts.lessons?.sessionKind ?? 'automation';
+    const claudeTurnObservations = opts.lessons?.observations ?? createLessonTurnObservations();
+    /*
+     * The authoritative Happy session id, never a placeholder.
+     *
+     * A constructed one would attribute this session's traces and candidates
+     * to an identity nobody can resolve, so without it there is no lesson work
+     * at all.
+     */
+    const sessionIdForLessons = opts.lessons?.sessionId ?? null;
+    /*
+     * Stops recall and any running review the moment this run is torn down.
+     * `opts.signal` is the caller's own cancellation, so it drives this too.
+     */
+    let pendingLessonTicket: LessonDeliveryTicket | null = null;
+    const proposalToolCallIds = new Set<string>();
+    /** Text of the user message each turn carried, for the review evidence. */
+    let currentTurnMessages = [readTurnText(initial.message)];
+    /**
+     * One id per accepted user input, created once and shared by recall, the
+     * acknowledgement and the evidence.
+     *
+     * Not `sessionId:counter`: a counter restarts at zero on resume, so a
+     * resumed session reuses ids CML has already persisted — the same request
+     * id with a different query is a conflict, and with the same query it
+     * returns a stale cached answer.
+     */
+    let currentTurnId = `${sessionIdForLessons}:${randomUUID()}`;
+    /**
+     * Recalls lessons and returns the text to send.
+     *
+     * Bounded and never fatal: a slow or unreachable store yields the message
+     * unchanged and the turn proceeds.
+     */
+/** The plain-text parts of a user message, for a recall query or evidence. */
+function readTurnText(content: unknown): string {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+        .filter((block) => (block as { type?: unknown })?.type === 'text'
+            && typeof (block as { text?: unknown }).text === 'string')
+        .map((block) => (block as { text: string }).text)
+        .join('\n');
+}
+
+    /**
+     * Recalls lessons for a turn and returns the content to send.
+     *
+     * The original content is preserved exactly when nothing is added.
+     * Structured content carries attachments — images, documents — and an
+     * earlier version flattened it to `''` to get a query string, which sent
+     * an empty turn and dropped every attachment. The query is read from the
+     * text blocks; the blocks themselves are never rewritten.
+     *
+     * When a block is added it is prepended as one more text block, so an
+     * array stays an array and nothing already in it moves.
+     */
+    const recallWithLessons = async (
+        content: string | ContentBlockParam[],
+        turnId: string,
+        signal: AbortSignal,
+    ): Promise<{ content: string | ContentBlockParam[]; ticket: LessonDeliveryTicket | null }> => {
+        if (!lessonTurn) return { content, ticket: null };
+        const query = typeof content === 'string'
+            ? content
+            : content
+                .filter((block): block is ContentBlockParam & { type: 'text'; text: string } =>
+                    (block as { type?: unknown }).type === 'text'
+                    && typeof (block as { text?: unknown }).text === 'string')
+                .map((block) => block.text)
+                .join('\n');
+        if (!query.trim()) {
+            return { content, ticket: null };
+        }
+        const outcome = await lessonTurn.recall({
+            turnId,
+            query,
+            signal: opts.signal ? AbortSignal.any([signal, opts.signal]) : signal,
+        }).catch(() => null);
+        if (!outcome || outcome.outcome !== 'selected') {
+            return { content, ticket: null };
+        }
+        // Prepended, and clearly labelled as reference material — the same
+        // shape the Codex path uses.
+        return {
+            content: typeof content === 'string'
+                ? `${outcome.block}\n\n${content}`
+                : [{ type: 'text', text: outcome.block } as ContentBlockParam, ...content],
+            ticket: outcome.ticket,
+        };
+    };
+
+    const isCommandInput = (content: unknown) => /^\/\S/.test(readTurnText(content).trimStart());
+    let queryClosed = false;
+    const withLessons = async (content: string | ContentBlockParam[]) => {
+        // Native slash commands must remain the first provider input token.
+        if (isCommandInput(content)) {
+            pendingLessonTicket = null;
+            opts.lessonProposalTurn?.cancel();
+            return content;
+        }
+        const owningTurnId = currentTurnId;
+        const owningSignal = reviewAbort.signal;
+        const current = () => !queryClosed && currentTurnId === owningTurnId && !owningSignal.aborted && !opts.signal?.aborted;
+        const recalled = await recallWithLessons(content, owningTurnId, owningSignal);
+        if (!current()) return content;
+        pendingLessonTicket = recalled.ticket;
+        opts.lessonProposalTurn?.cancel();
+        const instruction = lessonSessionKind === 'foreground' && !opts.signal?.aborted && lessonReview?.prepareReviewTurn && opts.lessonProposalTurn
+            ? await opts.lessonProposalTurn.prepare(owningTurnId, () => lessonReview.prepareReviewTurn!()) : '';
+        if (!current()) return content;
+        if (!instruction) return recalled.content;
+        return typeof recalled.content === 'string' ? `${instruction}\n\n${recalled.content}`
+            : [{ type: 'text' as const, text: instruction }, ...recalled.content];
+    };
+
     // Push initial message
     let messages = new PushableAsyncIterable<SDKUserMessage>();
     messages.push({
@@ -305,7 +483,7 @@ export async function claudeRemote(opts: {
         parent_tool_use_id: null,
         message: {
             role: 'user',
-            content: initial.message,
+            content: await withLessons(initial.message),
         },
     });
 
@@ -329,6 +507,7 @@ export async function claudeRemote(opts: {
         options: sdkOptions,
     });
     const mcpRecovery = new McpRuntimeRecovery(response, { onStatus: opts.onMcpStatus });
+    opts.onMcpStatusReaderReady?.(mcpRecovery);
     const mcpConfigSynchronizer = opts.mcpConfig
         ? new McpConfigSynchronizer(response, { ...opts.mcpConfig, onStatus: opts.onMcpStatus })
         : null;
@@ -342,14 +521,43 @@ export async function claudeRemote(opts: {
 
     updateThinking(true);
     let acceptsActiveInput = true;
-    const sendActiveInput: ClaudeActiveInputSender = (text) => {
+    const sendActiveInput: ClaudeActiveInputSender = async (text) => {
         if (!acceptsActiveInput || messages.done || !text.trim()) {
             return false;
         }
+        // A steer joins the provider turn already in flight. Its recall trace
+        // is distinct, but its arrival cannot replace the turn whose result is
+        // still pending.
+        const owningTurnId = currentTurnId;
+        preemptReview();
+        const steerAbort = reviewAbort;
+        const commandInput = isCommandInput(text);
+        const recalled = commandInput ? { content: text, ticket: null } : await recallWithLessons(
+            text,
+            `${sessionIdForLessons}:${randomUUID()}`,
+            steerAbort.signal,
+        );
+        // A steer joins this same provider turn, but invalidates its previous
+        // draft. Re-authorize and send a fresh token for the corrected work.
+        const current = () => acceptsActiveInput && !messages.done && !opts.signal?.aborted
+            && !steerAbort.signal.aborted && currentTurnId === owningTurnId && reviewAbort === steerAbort;
+        if (!current()) return false;
+        const instruction = !commandInput && lessonSessionKind === 'foreground' && lessonReview?.prepareReviewTurn && opts.lessonProposalTurn
+            ? await opts.lessonProposalTurn.prepare(owningTurnId, async () => {
+                const prepared = await lessonReview.prepareReviewTurn!();
+                return current() ? prepared : null;
+            }) : '';
+        if (!current()) return false;
+        /*
+         * The SDK exposes no event that proves this in-band steer was acted
+         * upon. Keep its selected trace unacknowledged rather than treating an
+         * assistant event for the already-running input as proof of delivery.
+         */
+        currentTurnMessages.push(readTurnText(text));
         messages.push({
             type: 'user',
             parent_tool_use_id: null,
-            message: { role: 'user', content: text },
+            message: { role: 'user', content: instruction ? `${instruction}\n\n${recalled.content}` : recalled.content },
         });
         return true;
     };
@@ -360,6 +568,45 @@ export async function claudeRemote(opts: {
 
         for await (const message of response) {
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
+
+            /*
+             * The first provider event of this turn — the assistant starting
+             * to answer — is the earliest point at which the input is known to
+             * have been accepted. Acknowledging when the message was queued
+             * would record a delivery that a failure before this point could
+             * still have prevented.
+             *
+             * Its own catch: a memory failure must not enter the turn's error
+             * handling, which would close the turn and write a failure into
+             * the transcript.
+             */
+            /*
+             * Tool calls the assistant is starting. Paired with their results
+             * by `tool_use_id`, so parallel calls never cross — the same rule
+             * the Codex path follows with `call_id`.
+             */
+            if (message.type === 'assistant' && Array.isArray((message as { message?: { content?: unknown } }).message?.content)) {
+                for (const block of (message as { message: { content: unknown[] } }).message.content) {
+                    const call = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
+                    if (call.type !== 'tool_use' || typeof call.id !== 'string') continue;
+                    if (call.name === 'mcp__happy__propose_lesson') { proposalToolCallIds.add(call.id); continue; }
+                    const input = call.input as { command?: unknown; cwd?: unknown } | undefined;
+                    claudeTurnObservations.commandStarted({
+                        callId: call.id,
+                        // A tool's command when it has one, its name otherwise:
+                        // "the same check ran twice" has to mean something for
+                        // tools that are not shell commands too.
+                        command: input?.command ?? call.name,
+                        cwd: input?.cwd,
+                    });
+                }
+            }
+
+            if (pendingLessonTicket && lessonTurn && message.type === 'assistant') {
+                const ticket = pendingLessonTicket;
+                pendingLessonTicket = null;
+                await lessonTurn.acknowledge(ticket).catch(() => false);
+            }
 
             if (message.type === 'prompt_suggestion') {
                 if (acceptsPromptSuggestion) {
@@ -437,6 +684,40 @@ export async function claudeRemote(opts: {
                 opts.onActiveInputReady?.(null);
                 updateThinking(false);
                 logger.debug('[claudeRemote] Result received');
+
+                /*
+                 * A turn that reached a result ended normally. The worker
+                 * validates a proposal produced by this same provider turn
+                 * against its observed evidence, permissions and settings.
+                 * Not awaited: candidate persistence never blocks the chat.
+                 */
+                /*
+                 * Always taken, so nothing carries into the next turn — and
+                 * discarded when the turn errored, because a turn that failed
+                 * has no verified procedure in it.
+                 */
+                const observed = claudeTurnObservations.take();
+                const proposal = opts.lessonProposalTurn?.take(currentTurnId) ?? {};
+                const hadPriorAssistantTurn = reviewLifecycle.completedAssistantTurns > 0;
+                const finishLessonReview = () => {
+                    if (!(message as { is_error?: boolean }).is_error) reviewLifecycle.completedAssistantTurns += 1;
+                    if (lessonReview && !(message as { is_error?: boolean }).is_error) {
+                        void lessonReview.reviewFinishedTurn({
+                            ...proposal,
+                            record: {
+                                sessionId: sessionIdForLessons!,
+                                turnId: currentTurnId,
+                                kind: lessonSessionKind,
+                                endedNormally: true,
+                                hadPriorAssistantTurn,
+                                userMessages: currentTurnMessages,
+                                agentSummary: observed.summary,
+                                recoveredFailures: observed.recoveredFailures,
+                            },
+                            signal: opts.signal ? AbortSignal.any([reviewAbort.signal, opts.signal]) : reviewAbort.signal,
+                        }).catch(() => undefined);
+                    }
+                };
                 opts.onMcpControllerReady?.(mcpRecovery);
 
                 await mcpRecovery.recoverFailedServers();
@@ -511,12 +792,16 @@ export async function claudeRemote(opts: {
                     if (applyResult.status !== 'completed') {
                         throw new Error('checkpoint turn apply did not complete');
                     }
+                    finishLessonReview();
                     opts.onReady();
                     return opts.exitAfterFirstTurn
                         ? 'turn-complete' as const
                         : 'protected-turn-complete' as const;
                 }
 
+                // Without checkpoint protection, the provider result is the
+                // completion boundary. Protected turns must apply first.
+                finishLessonReview();
                 // Send ready event
                 opts.onReady();
 
@@ -547,9 +832,11 @@ export async function claudeRemote(opts: {
                 // Background task messages (task_started, task_progress, task_notification)
                 // continue flowing through while we wait for user input.
                 opts.nextMessage().then(async (next) => {
+                    if (queryClosed) return;
                     if (!next) {
                         messages.end();
                     } else {
+                        preemptReview();
                         await mcpConfigSynchronizer?.sync();
                         try {
                             const nextTurn = await opts.beforeTurn?.();
@@ -573,9 +860,25 @@ export async function claudeRemote(opts: {
                         // 새어든다.
                         await mcpRecovery.recoverFailedServers();
                         mode = next.mode;
+                        // Content can be structured blocks; only plain text is
+                        // usable as a recall query or as review evidence — but
+                        // the blocks themselves are what gets sent, so recall
+                        // runs on the whole message rather than on a flattened
+                        // copy that would drop every attachment.
+                        currentTurnMessages = [readTurnText(next.message)];
+                        currentTurnId = `${sessionIdForLessons}:${randomUUID()}`;
+                        /*
+                         * After the `acceptsPromptSuggestion` flip and the MCP
+                         * recovery, for the reason the comment above gives: a
+                         * result that arrives from the previous turn must not
+                         * be attached to this one.
+                         */
+                        const withBlock = await withLessons(next.message);
+                        if (queryClosed || messages.done || opts.signal?.aborted) return;
+                        messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: withBlock } });
+                        // Steering may only follow the primary input, never overtake its recall.
                         acceptsActiveInput = true;
                         opts.onActiveInputReady?.(sendActiveInput);
-                        messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: next.message } });
                     }
                 }).catch(() => {
                     messages.end();
@@ -587,6 +890,20 @@ export async function claudeRemote(opts: {
                 const msg = message as SDKUserMessage;
                 if (msg.message.role === 'user' && Array.isArray(msg.message.content)) {
                     for (let c of msg.message.content) {
+                        /*
+                         * The provider's own verdict on a tool call. `is_error`
+                         * is what Claude reports; reading the result text and
+                         * guessing would invent successes the agent never had.
+                         * An aborted call verifies nothing either way.
+                         */
+                        if (c.type === 'tool_result' && c.tool_use_id && !proposalToolCallIds.delete(c.tool_use_id)) {
+                            claudeTurnObservations.commandEnded({
+                                callId: c.tool_use_id,
+                                status: opts.isAborted(c.tool_use_id) ? 'cancelled' : 'completed',
+                                exitCode: c.is_error === true ? 1 : 0,
+                                output: typeof c.content === 'string' ? c.content : undefined,
+                            });
+                        }
                         if (c.type === 'tool_result' && c.tool_use_id && opts.isAborted(c.tool_use_id)) {
                             logger.debug('[claudeRemote] Tool aborted, exiting claudeRemote');
                             return;
@@ -603,10 +920,16 @@ export async function claudeRemote(opts: {
             throw e;
         }
     } finally {
+        opts.lessonProposalTurn?.cancel();
+        opts.signal?.removeEventListener('abort', cancelProposal);
+        queryClosed = true;
         acceptsActiveInput = false;
         opts.onActiveInputReady?.(null);
         opts.onMcpControllerReady?.(null);
+        opts.onMcpStatusReaderReady?.(null);
         updateThinking(false);
+        claudeTurnObservations.take();
+        proposalToolCallIds.clear();
     }
     return undefined;
 }
