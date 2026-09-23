@@ -1423,16 +1423,17 @@ export async function runCodex(opts: {
         { sessionId: session.sessionId },
     );
     const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
-    for (const status of initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : []) {
-        session.updateMetadata((currentMetadata) => ({
-            ...currentMetadata,
-            mcpServers: [
-                ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== status.name),
-                status,
-            ],
-        }));
-    }
+    let configStatuses = initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : [];
     const initialAplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
+    session.updateMetadata((current) => ({
+        ...current,
+        mcpServers: [
+            ...Object.keys(initialAplusMcpServers)
+                .filter((name) => !configStatuses.some((entry) => entry.name === name))
+                .map((name) => ({ name, status: 'reconnecting' as const, checkedAt: Date.now() })),
+            ...configStatuses,
+        ],
+    }));
     const baseMcpServers = {
         happy: {
             command: process.execPath,
@@ -1463,11 +1464,13 @@ export async function runCodex(opts: {
             // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
             const account = requireAccountMachineId(machineId);
             await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
-            return fetchAplusMcpServersResult(
+            const result = await fetchAplusMcpServersResult(
                 requireAccountToken(accountToken),
                 account,
                 { sessionId: session.sessionId, lifecycle: 'turn' },
             );
+            configStatuses = mcpConfigFailureStatuses(result);
+            return result;
         },
         bridgeAplusServers: (servers) => bridgeAplusMcpServers(servers, bridgeOptions),
         onStatus: (status) => {
@@ -1481,6 +1484,26 @@ export async function runCodex(opts: {
         },
     });
     const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
+    const reportMcpStatuses = async () => {
+        const threadId = client.threadId;
+        if (!threadId) return [];
+        const runtimeStatuses = await mcpRuntimeRecovery.readStatuses({
+            threadId,
+            mcpServers: mcpConfigSynchronizer.mcpServers,
+            expectedServerNames: listConfiguredExternalServices(mcpConfigSynchronizer.mcpServers),
+        });
+        const statuses = [
+            ...runtimeStatuses.filter((entry) => !configStatuses.some(({ name }) => name === entry.name)),
+            ...configStatuses,
+        ];
+        session.updateMetadata((current) => ({ ...current, mcpServers: statuses }));
+        return statuses;
+    };
+    session.rpcHandlerManager.registerHandler('mcp-status', async (params: { sessionId?: string }) => {
+        if (params.sessionId !== session.sessionId) throw new Error('Session mismatch');
+        return { statuses: await reportMcpStatuses() };
+    });
+
     let appendSystemPromptInjected = false;
     // Assigned inside the `try` once the loop's stop gate exists; called from
     // its `finally`. Until then there is no stop to report.
@@ -1501,6 +1524,7 @@ export async function runCodex(opts: {
                 mcpServers: mcpConfigSynchronizer.mcpServers,
                 developerInstructions: currentDeveloperInstructions,
             });
+            await reportMcpStatuses();
             appendSystemPromptInjected = true;
         }
 
@@ -1769,6 +1793,7 @@ export async function runCodex(opts: {
                     expectedServerNames: listConfiguredExternalServices(mcpSync.mcpServers),
                     developerInstructions: currentDeveloperInstructions,
                 });
+                await reportMcpStatuses();
                 if (runtimeRecovery.status !== 'ready') {
                     const metadataStatuses = buildCodexMcpRecoveryMetadataStatuses({
                         recovery: runtimeRecovery,

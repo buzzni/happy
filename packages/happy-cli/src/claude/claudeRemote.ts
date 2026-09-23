@@ -130,6 +130,7 @@ export async function claudeRemote(opts: {
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
     onMcpStatus?: (status: McpRuntimeServerStatus) => void,
+    onMcpStatusReaderReady?: (reader: Pick<McpRuntimeRecovery, 'readStatuses'> | null) => void,
     onMcpControllerReady?: (controller: Pick<McpRuntimeRecovery, 'reconnectServer'> | null) => void,
     onActiveInputReady?: (sender: ClaudeActiveInputSender | null) => void,
     onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void,
@@ -506,6 +507,7 @@ function readTurnText(content: unknown): string {
         options: sdkOptions,
     });
     const mcpRecovery = new McpRuntimeRecovery(response, { onStatus: opts.onMcpStatus });
+    opts.onMcpStatusReaderReady?.(mcpRecovery);
     const mcpConfigSynchronizer = opts.mcpConfig
         ? new McpConfigSynchronizer(response, { ...opts.mcpConfig, onStatus: opts.onMcpStatus })
         : null;
@@ -924,6 +926,7 @@ function readTurnText(content: unknown): string {
         acceptsActiveInput = false;
         opts.onActiveInputReady?.(null);
         opts.onMcpControllerReady?.(null);
+        opts.onMcpStatusReaderReady?.(null);
         updateThinking(false);
         claudeTurnObservations.take();
         proposalToolCallIds.clear();

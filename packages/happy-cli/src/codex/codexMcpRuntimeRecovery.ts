@@ -114,6 +114,35 @@ export class CodexMcpRuntimeRecovery {
         this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     }
 
+    /** Read-only: normal readiness must be visible even when no recovery ran. */
+    async readStatuses(input: RecoveryInput): Promise<McpRuntimeServerStatus[]> {
+        const startup = new Map(this.client.getMcpStartupStatuses()
+            .filter((entry) => !entry.threadId || entry.threadId === input.threadId)
+            .map((entry) => [entry.name, entry]));
+        let inventory: Map<string, CodexMcpServerInventory> | undefined;
+        try {
+            const result = await this.client.listMcpServerStatus({ threadId: input.threadId });
+            inventory = new Map(result.data.map((entry) => [entry.name, entry]));
+        } catch {
+            // No inventory is unknown, never proof of a healthy connection.
+        }
+        const checkedAt = this.now();
+        return [...new Set(input.expectedServerNames)].sort().map((name) => {
+            const started = startup.get(name);
+            const entry = inventory?.get(name);
+            let status: McpRuntimeServerStatus['status'] = 'reconnecting';
+            if (entry?.authStatus === 'notLoggedIn' || started?.failureReason === 'reauthenticationRequired') {
+                status = 'needs-auth';
+            } else if (started?.status === 'failed' || started?.status === 'cancelled') {
+                status = 'failed';
+            } else if (started?.status !== 'starting') {
+                if ((entry && Object.keys(entry.tools).length > 0) || started?.status === 'ready' || started?.status === 'connected') status = 'connected';
+                else if (inventory && !entry) status = 'failed';
+            }
+            return { name, status, checkedAt };
+        });
+    }
+
     recoverBeforeTurn(input: RecoveryInput): Promise<CodexMcpRecoveryResult> {
         const existing = this.inFlight.get(input.threadId);
         if (existing) return existing;

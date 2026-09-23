@@ -576,3 +576,54 @@ describe('CodexMcpRuntimeRecovery', () => {
         });
     });
 });
+
+
+describe('Codex MCP status reporting', () => {
+    const input = { threadId: 'thread-1', mcpServers: {}, expectedServerNames: ['argos', 'notion'] };
+    it('reports every healthy server without resuming a thread or waiting for another turn', async () => {
+        const client = {
+            getMcpStartupStatuses: () => [],
+            listMcpServerStatus: vi.fn(async () => ({ data: [
+                { name: 'argos', authStatus: 'unsupported', tools: { search: {} } },
+                { name: 'notion', authStatus: 'oAuth', tools: { fetch: {} } },
+            ] })),
+            resumeThread: vi.fn(),
+        };
+        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 123 });
+        expect(await recovery.readStatuses(input)).toEqual([
+            { name: 'argos', status: 'connected', checkedAt: 123 },
+            { name: 'notion', status: 'connected', checkedAt: 123 },
+        ]);
+        expect(client.resumeThread).not.toHaveBeenCalled();
+    });
+    it('does not turn missing evidence or starting/auth-failed services green', async () => {
+        const client = {
+            getMcpStartupStatuses: () => [{ name: 'argos', status: 'starting' }],
+            listMcpServerStatus: vi.fn(async () => ({ data: [
+                { name: 'argos', authStatus: 'unsupported', tools: {} },
+                { name: 'notion', authStatus: 'notLoggedIn', tools: {} },
+            ] })), resumeThread: vi.fn(),
+        };
+        const recovery = new CodexMcpRuntimeRecovery(client, { now: () => 123 });
+        expect(await recovery.readStatuses(input)).toEqual([
+            { name: 'argos', status: 'reconnecting', checkedAt: 123 },
+            { name: 'notion', status: 'needs-auth', checkedAt: 123 },
+        ]);
+        client.listMcpServerStatus.mockRejectedValue(new Error('private token'));
+        expect(await recovery.readStatuses(input)).toEqual([
+            { name: 'argos', status: 'reconnecting', checkedAt: 123 },
+            { name: 'notion', status: 'reconnecting', checkedAt: 123 },
+        ]);
+    });
+});
+
+
+it('does not mark an empty inventory entry with unknown auth as connected', async () => {
+    const recovery = new CodexMcpRuntimeRecovery({
+        getMcpStartupStatuses: () => [],
+        listMcpServerStatus: async () => ({ data: [{ name: 'argos', authStatus: 'unknown', tools: {} }] }),
+        resumeThread: vi.fn(),
+    });
+    expect(await recovery.readStatuses({ threadId: 't', mcpServers: {}, expectedServerNames: ['argos'] }))
+        .toEqual([{ name: 'argos', status: 'reconnecting', checkedAt: expect.any(Number) }]);
+});
