@@ -1,7 +1,24 @@
-import { describe, expect, it } from 'vitest';
+import { logger } from '@/ui/logger';
+import { describe, expect, it, vi } from 'vitest';
 import { createLessonProposalTurn } from './lessonProposalTurn';
 const tokenOf = (text: string) => text.match(/token="([^"]+)"/)![1];
 describe('lesson proposal turn', () => {
+    it('reports timeout without logging the turn or issuing a late token', async () => {
+        vi.useFakeTimers();
+        const log = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        try {
+            const state = createLessonProposalTurn();
+            let complete!: (value: { revision: number }) => void;
+            const preparing = state.prepare('private-turn', () => new Promise(resolve => { complete = resolve; }));
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(await preparing).toBe('');
+            expect(log).toHaveBeenCalledWith('[lesson-review-prepare] timeout');
+            complete({ revision: 1 });
+            await Promise.resolve();
+            expect(state.submit({ token: 'late', proposal: {} }).accepted).toBe(false);
+            expect(JSON.stringify(log.mock.calls)).not.toContain('private-turn');
+        } finally { log.mockRestore(); vi.useRealTimers(); }
+    });
     it('consumes a current proposal once with its settings revision', () => {
         const state = createLessonProposalTurn();
         const token = tokenOf(state.begin('turn', 7));

@@ -1,3 +1,4 @@
+import { logger } from '@/ui/logger';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -108,6 +109,34 @@ describe('foreground lesson proposals', () => {
         expect(call.identity).toMatchObject({ capabilities: ['lesson.review'], machineId: 'm1' });
         expect(h.host.calls.map(c => c.name)).toEqual(['appendNormalEndEvidence', 'enqueueCandidate', 'markReviewed']);
         await rm(h.dir, { recursive: true, force: true });
+    });
+    it('distinguishes authorization refusal while preparing a proposal', async () => {
+        const log = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        const h = await harness({ identity: () => null });
+        try {
+            expect(await h.worker.prepareReviewTurn!()).toBeNull();
+            expect(log).toHaveBeenCalledWith('[lesson-review-prepare] permission_denied');
+        } finally { log.mockRestore(); await rm(h.dir, { recursive: true, force: true }); }
+    });
+    it.each([
+        ['no-signal', false, 'observed task', []],
+        ['no-evidence', true, '', []],
+    ] as const)('reports bounded %s diagnostics without recording content', async (reason, prior, summary, failures) => {
+        const log = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+        const h = await harness();
+        try {
+            const result = await h.worker.reviewFinishedTurn({ ...input(), record: {
+                ...record, hadPriorAssistantTurn: prior, userMessages: ['아니 secret-value'],
+                agentSummary: summary, recoveredFailures: failures,
+            } });
+            expect(result).toBe('not-eligible');
+            expect(log).toHaveBeenCalledWith('[lesson-review-evidence]', {
+                reason, kind: 'foreground', hadPriorAssistantTurn: prior,
+                hasObservedActions: Boolean(summary), hasVerifiedRecovery: false, proposalSubmitted: true,
+            });
+            expect(JSON.stringify(log.mock.calls)).not.toContain('secret-value');
+            expect(h.host.calls).toHaveLength(0);
+        } finally { log.mockRestore(); await rm(h.dir, { recursive: true, force: true }); }
     });
     it('does not call a gateway or persist evidence when no proposal was supplied', async () => {
         const network = vi.fn(); vi.stubGlobal('fetch', network);

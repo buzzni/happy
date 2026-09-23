@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { logger } from '@/ui/logger';
 
 /** A proposal is untrusted, volatile data until its owning foreground turn ends normally. */
 export function createLessonProposalTurn() {
@@ -32,10 +33,16 @@ export function createLessonProposalTurn() {
             state.cancel();
             const plannedEpoch = epoch;
             let timer: ReturnType<typeof setTimeout> | undefined;
-            const timeout = new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1000); timer.unref?.(); });
+            const timeout = new Promise<null>(resolve => { timer = setTimeout(() => { logger.debug('[lesson-review-prepare] timeout'); resolve(null); }, 1000); timer.unref?.(); });
             const prepared = await Promise.race([load().catch(() => null), timeout]);
             clearTimeout(timer);
-            return prepared && epoch === plannedEpoch ? state.begin(turnId, prepared.revision) : '';
+            if (!prepared) return '';
+            if (epoch !== plannedEpoch) {
+                logger.debug('[lesson-review-prepare] cancelled');
+                return '';
+            }
+            logger.debug('[lesson-review-prepare] ready');
+            return state.begin(turnId, prepared.revision);
         },
     };
     return state;
