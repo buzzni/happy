@@ -57,7 +57,7 @@ const happyHome = () => process.env.ABP_HAPPY_HOME ?? join(homedir(), '.happy-cl
 const clientDir = () => process.env.ABP_SESSION_CLIENT_DIR ?? '/Users/justin/workspace/aplus-dev-studio-desktop/.aplus/worktrees/abp-desktop'
 
 /** Spawn a real agent session through the isolated daemon and bind an agent grant to it. */
-export async function spawnAgentSession(ctx: RunContext, label: string): Promise<{ sessionId: string; grantId: GrantId }> {
+export async function spawnAgentSession(ctx: RunContext, label: string, extraEnv: Record<string, string> = {}): Promise<{ sessionId: string; grantId: GrantId }> {
     const daemon = JSON.parse(readFileSync(join(happyHome(), 'daemon.state.json'), 'utf8'))
     const workspace = join(homedir(), 'abp-poc-agent-ws', `${ctx.run}-${label}`)
     mkdirSync(workspace, { recursive: true })
@@ -70,7 +70,7 @@ export async function spawnAgentSession(ctx: RunContext, label: string): Promise
         body: JSON.stringify({
             directory: workspace,
             agent: 'claude',
-            environmentVariables: { HAPPY_BROWSER_TASK_RUNTIME_URL: ctx.runtimeUrl, HAPPY_BROWSER_TASK_GRANT_FILE: grantFile },
+            environmentVariables: { ...extraEnv, HAPPY_BROWSER_TASK_RUNTIME_URL: ctx.runtimeUrl, HAPPY_BROWSER_TASK_GRANT_FILE: grantFile },
         }),
     })
     const spawned = await response.json() as { success: boolean; sessionId: string }
