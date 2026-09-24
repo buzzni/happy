@@ -14,6 +14,7 @@ import React from "react";
 import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
+import type { QueueLatencyTrace } from "@/utils/MessageQueue2";
 import { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "./sdk";
 import { formatClaudeMessageForInk } from "@/ui/messageFormatterInk";
 import { logger } from "@/ui/logger";
@@ -409,8 +410,26 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              * decision for exactly the turns that were queued behind a mode change.
              */
             requestIds?: string[];
-            latency?: ClaudeTurnLatencyInput;
+            inputCount: number;
+            latencyTraces: QueueLatencyTrace[];
         } | null = null;
+        /*
+         * Queue time ends when a generation takes the batch. A batch held back
+         * behind a provider restart is taken by the next generation, so it is
+         * measured there — its restart cost belongs to its record.
+         */
+        const toTurnLatency = (batch: { inputCount: number; latencyTraces: QueueLatencyTrace[] }): ClaudeTurnLatencyInput | undefined => (
+            batch.latencyTraces.length > 0
+                ? {
+                    attribution: batch.inputCount === 1 ? 'exclusive' : 'coalesced',
+                    inputCount: batch.inputCount,
+                    traces: batch.latencyTraces.map((trace) => ({
+                        ...trace,
+                        queueMs: Math.max(0, performance.now() - trace.receivedAt),
+                    })),
+                }
+                : undefined
+        );
 
         /**
          * Distinguishes one applied execution from the next, so a replayed or
@@ -588,7 +607,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 mode = revisedMode;
                                 p = { ...p, mode: revisedMode };
                             }
-                            return p;
+                            return { ...p, latency: toTurnLatency(p) };
                         }
 
                         /*
@@ -659,16 +678,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             modeHash = msg.hash;
                             mode = msg.mode;
                             permissionHandler.handleModeChange(mode.permissionMode);
-                            const latency: ClaudeTurnLatencyInput | undefined = msg.latencyTraces.length > 0
-                                ? {
-                                    attribution: msg.inputCount === 1 ? 'exclusive' : 'coalesced',
-                                    inputCount: msg.inputCount,
-                                    traces: msg.latencyTraces.map((trace) => ({
-                                        ...trace,
-                                        queueMs: Math.max(0, performance.now() - trace.receivedAt),
-                                    })),
-                                }
-                                : undefined;
+                            const latency = toTurnLatency(msg);
 
                             /*
                              * The engine-applied boundary for Claude. This batch's
