@@ -29,6 +29,19 @@ describe('TaskStore writer and journal guarantees', () => {
         await store.close()
     })
 
+    it('recovers from a transient append failure without disabling unrelated writes', async () => {
+        const dir = await tempDir(); let failOnce = true
+        const store = await TaskStore.open(dir, (operation) => {
+            if (operation === 'event-append' && failOnce) {
+                failOnce = false
+                throw new Error('ENOSPC')
+            }
+        })
+        await expect(store.createTask(sample(), event)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        await expect(store.createTask({ ...sample(), taskId: 't2' as TaskId }, event)).resolves.toMatchObject({ taskId: 't2' })
+        await store.close()
+    })
+
     it('quarantines a garbled final line during recovery', async () => {
         const dir = await tempDir(); const store = await TaskStore.open(dir)
         await store.createTask(sample(), event); await store.close()
@@ -40,14 +53,18 @@ describe('TaskStore writer and journal guarantees', () => {
         await recovered.close()
     })
 
-    it('fails closed on a checksummed middle record corruption', async () => {
+    it('fails closed for the corrupt task while leaving unrelated tasks writable', async () => {
         const dir = await tempDir(); const store = await TaskStore.open(dir)
         await store.createTask(sample(), event)
         await store.commit('t1' as TaskId, { status: 'running' }, { ...event, type: 'state-changed', atMs: 2 })
+        await store.createTask({ ...sample(), taskId: 't2' as TaskId }, event)
         await store.close()
         const file = join(dir, 'tasks', 't1', 'events.jsonl')
         const contents = await readFile(file, 'utf8')
         await writeFile(file, contents.replace('task-created', 'task-corrupt'))
-        await expect(TaskStore.open(dir)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        const recovered = await TaskStore.open(dir)
+        expect(() => recovered.getTask('t1' as TaskId)).toThrowError(expect.objectContaining({ code: 'JOURNAL_UNAVAILABLE' }))
+        await expect(recovered.commit('t2' as TaskId, { status: 'running' }, { ...event, type: 'state-changed', atMs: 3 })).resolves.toMatchObject({ status: 'running' })
+        await recovered.close()
     })
 })

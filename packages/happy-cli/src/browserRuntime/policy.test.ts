@@ -11,6 +11,12 @@ describe('fixture action policy', () => {
         expect(classifyAction(step, { ref: '@e1' as ElementRef, role: 'button', name: 'Continue', visible: true, frameOrigin: 'https://fixture.test' })).toBe('auto')
     })
 
+    it('uses the current page path when driver risk hints are absent', () => {
+        const element = { ref: '@e1' as ElementRef, role: 'button', name: 'Continue', visible: true, frameOrigin: 'https://fixture.test' }
+        expect(classifyAction(step, { ...element, name: 'Confirm payment' }, undefined, 'https://fixture.test/checkout')).toBe('approval-required')
+        expect(classifyAction(step, element, undefined, 'https://fixture.test/risky-submit')).toBe('approval-required')
+    })
+
     it('uses exact origins and strips URL secrets and canaries from nested values', () => {
         expect(assertAllowedOrigin('https://fixture.test/path?q=secret#fragment', { allowedOrigins: ['https://fixture.test'] })).toBe('https://fixture.test')
         expect(() => assertAllowedOrigin('https://fixture.test.evil/path', { allowedOrigins: ['https://fixture.test'] })).toThrowError(BrowserRuntimeError)

@@ -1,27 +1,102 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView } from './contracts'
-
+import {
+    BrowserRuntimeError,
+    POC_LIMITS,
+    SCHEMA_VERSION,
+    type ActionId,
+    type ActionState,
+    type ApprovalId,
+    type BatchId,
+    type BatchResult,
+    type BatchStep,
+    type BrowserInstanceId,
+    type ProfileId,
+    type TabId,
+    type TaskEvent,
+    type TaskId,
+    type TaskSpaceId,
+    type TaskView,
+} from './contracts'
+export interface ActionRecord {
+    state: ActionState
+    kind?: BatchStep['kind']
+    batchId?: BatchId
+    payloadHash?: string
+    leaseEpoch?: number
+    browserInstanceId?: BrowserInstanceId
+}
+export interface ApprovalRecord {
+    approvalId?: ApprovalId
+    actionId?: ActionId
+    origin?: string
+    description?: string
+    bindingHash?: string
+    expiresAtMs?: number
+    state: 'pending' | 'consumed' | 'rejected' | 'expired'
+    batchId?: BatchId
+    nextStep?: number
+    payloadHash?: string
+    documentGeneration?: number
+    leaseEpoch?: number
+    browserInstanceId?: BrowserInstanceId
+    result?: BatchResult
+}
+export interface BatchRecord {
+    steps: BatchStep[]
+    nextStep: number
+    result?: BatchResult
+}
 export interface StoredTask extends TaskView {
-    owner: { principalId: string; workspaceId: string; machineId: string }
-    actions: Record<string, Record<string, unknown>>
-    approvals: Record<string, Record<string, unknown>>
-    batches: Record<string, Record<string, unknown>>
-    dedupe: Record<string, { hash: string; result: unknown }>
+    owner: {
+        principalId: string
+        workspaceId: string
+        machineId: string
+    }
+    actions: Record<string, ActionRecord>
+    approvals: Record<string, ApprovalRecord>
+    batches: Record<string, BatchRecord>
+    dedupe: Record<string, {
+        hash: string
+        result: unknown
+    }>
     nextSafeStep?: number
     runtimeFingerprint?: string
     documentGenerations?: Record<string, number>
     [key: string]: unknown
 }
-export interface StoreEventInput extends Omit<TaskEvent, 'seq' | 'schemaVersion' | 'taskId' | 'stateVersion'> { stateVersion?: number }
+export interface StoreEventInput extends Omit<TaskEvent, 'seq' | 'schemaVersion' | 'taskId' | 'stateVersion'> {
+    stateVersion?: number
+}
 export type FaultInjector = (operation: 'lock' | 'event-append' | 'task-replace' | 'metadata') => void | Promise<void>
-interface SpaceRecord { taskSpaceId: TaskSpaceId; profileId: import('./contracts').ProfileId; createdAtMs: number; tabs: string[]; closed?: boolean; owner?: { principalId: string; workspaceId: string; machineId: string }; requestKey?: string; requestHash?: string; dedupe?: Record<string, { hash: string; result: unknown }> }
-
+interface SpaceRecord {
+    taskSpaceId: TaskSpaceId
+    profileId: ProfileId
+    createdAtMs: number
+    tabs: TabId[]
+    closed?: boolean
+    owner?: {
+        principalId: string
+        workspaceId: string
+        machineId: string
+    }
+    requestKey?: string
+    requestHash?: string
+    dedupe?: Record<string, {
+        hash: string
+        result: unknown
+    }>
+}
+export interface TaskMutation {
+    patch: Partial<StoredTask>
+    event: StoreEventInput
+    business?: boolean
+}
 const stable = (value: unknown): string => JSON.stringify(value)
 const checksum = (body: string): string => createHash('sha256').update(body).digest('hex')
-const journalError = (message = 'Task journal is unavailable'): BrowserRuntimeError => new BrowserRuntimeError('JOURNAL_UNAVAILABLE', message, true)
-
+const journalError = (message = 'Task journal is unavailable'): BrowserRuntimeError => new BrowserRuntimeError('JOURNAL_UNAVAILABLE',
+    message, true)
 /** Single-writer, fsync-backed JSONL journal plus atomically replaced task checkpoints. */
 export class TaskStore {
     private fencingToken = 0
@@ -29,10 +104,10 @@ export class TaskStore {
     private readonly tasks = new Map<TaskId, StoredTask>()
     private readonly spaces = new Map<TaskSpaceId, SpaceRecord>()
     private readonly revocations = new Set<string>()
+    private readonly taskTails = new Map<TaskId, Promise<void>>()
+    private readonly unreadableTasks = new Set<TaskId>()
     private closed = false
-    private failed = false
-    private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector) {}
-
+    private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector) { }
     static async open(stateDir: string, faultInjector?: FaultInjector): Promise<TaskStore> {
         const store = new TaskStore(stateDir, faultInjector)
         try {
@@ -41,182 +116,377 @@ export class TaskStore {
             await store.loadRevocations()
             await store.loadTasks()
             return store
-        } catch (error) { await store.close(); throw error }
+        }
+        catch (error) {
+            await store.close()
+            throw error
+        }
     }
-
     async close(): Promise<void> {
-        if (this.closed) return
+        if (this.closed)
+            return
         this.closed = true
         await this.lockHandle?.close().catch(() => undefined)
         try {
-            const lock = JSON.parse(await readFile(join(this.stateDir, 'writer.lock'), 'utf8')) as { fencingToken?: number }
-            if (lock.fencingToken === this.fencingToken) await rm(join(this.stateDir, 'writer.lock'), { force: true })
-        } catch { /* already removed */ }
+            const lock = JSON.parse(await readFile(join(this.stateDir, 'writer.lock'), 'utf8')) as {
+                fencingToken?: number
+            }
+            if (lock.fencingToken === this.fencingToken)
+                await rm(join(this.stateDir, 'writer.lock'), { force: true })
+        }
+        catch { /* already removed */ }
     }
-
     async createSpace(record: SpaceRecord): Promise<void> {
         await this.assertWriter()
         const perProfile = [...this.spaces.values()].filter((s) => s.profileId === record.profileId && !s.closed)
-        if (perProfile.length >= POC_LIMITS.maxSpacesPerProfile) throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
+        if (perProfile.length >= POC_LIMITS.maxSpacesPerProfile)
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
         this.spaces.set(record.taskSpaceId, structuredClone(record))
-        try { await this.writeMetadata() } catch (error) { this.spaces.delete(record.taskSpaceId); throw error }
+        try {
+            await this.writeMetadata()
+        }
+        catch (error) {
+            this.spaces.delete(record.taskSpaceId)
+            throw error
+        }
     }
-    getSpace(id: TaskSpaceId): SpaceRecord | undefined { const value = this.spaces.get(id); return value && structuredClone(value) }
-    listSpaces(profileId?: import('./contracts').ProfileId): SpaceRecord[] { return [...this.spaces.values()].filter((space) => !profileId || space.profileId === profileId).map((space) => structuredClone(space)) }
+    getSpace(id: TaskSpaceId): SpaceRecord | undefined { const value = this.spaces.get(id); return value && structuredClone(value); }
+    listSpaces(profileId?: ProfileId): SpaceRecord[] {
+        return [...this.spaces.values()]
+            .filter((space) => !profileId || space.profileId === profileId)
+            .map((space) => structuredClone(space))
+    }
     async updateSpace(id: TaskSpaceId, patch: Partial<SpaceRecord>): Promise<SpaceRecord> {
         const space = this.spaces.get(id)
-        if (!space) throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist')
+        if (!space)
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist')
         const previous = structuredClone(space)
         Object.assign(space, structuredClone(patch))
-        try { await this.writeMetadata() } catch (error) { this.spaces.set(id, previous); throw error }
+        try {
+            await this.writeMetadata()
+        }
+        catch (error) {
+            this.spaces.set(id, previous)
+            throw error
+        }
         return structuredClone(space)
     }
-    isRevoked(id: string): boolean { return this.revocations.has(id) }
-    async revoke(id: string): Promise<void> { this.revocations.add(id); try { await this.writeRevocations() } catch (error) { this.revocations.delete(id); throw error } }
-    getRevocations(): ReadonlySet<string> { return new Set(this.revocations) }
-
+    isRevoked(id: string): boolean { return this.revocations.has(id); }
+    async revoke(id: string): Promise<void> { this.revocations.add(id); try {
+        await this.writeRevocations()
+    }
+    catch (error) {
+        this.revocations.delete(id)
+        throw error
+    } }
+    getRevocations(): ReadonlySet<string> { return new Set(this.revocations); }
     async createTask(task: StoredTask, event: StoreEventInput): Promise<StoredTask> {
-        if (this.tasks.has(task.taskId)) throw new BrowserRuntimeError('CONFLICT', 'Task already exists')
+        if (this.tasks.has(task.taskId))
+            throw new BrowserRuntimeError('CONFLICT', 'Task already exists')
         await this.assertWriter()
         const initial = { ...structuredClone(task), lastSeq: 0 } as StoredTask
         this.tasks.set(task.taskId, initial)
-        try { return await this.commit(task.taskId, {}, event) } catch (error) { this.tasks.delete(task.taskId); throw error }
+        try {
+            return await this.commit(task.taskId, {}, event)
+        }
+        catch (error) {
+            this.tasks.delete(task.taskId)
+            throw error
+        }
     }
-    getTask(id: TaskId): StoredTask | undefined { const value = this.tasks.get(id); return value && structuredClone(value) }
-    listTasks(): StoredTask[] { return [...this.tasks.values()].map((task) => structuredClone(task)) }
-
+    getTask(id: TaskId): StoredTask | undefined {
+        if (this.unreadableTasks.has(id))
+            throw journalError('Task journal is unreadable')
+        const value = this.tasks.get(id)
+        return value && structuredClone(value)
+    }
+    listTasks(): StoredTask[] { return [...this.tasks.values()].map((task) => structuredClone(task)); }
     async commit(id: TaskId, patch: Partial<StoredTask>, event: StoreEventInput, business = false): Promise<StoredTask> {
+        return this.withTaskQueue(id, () => this.commitNow(id, patch, event, business))
+    }
+    async mutate(id: TaskId, callback: (current: StoredTask) => TaskMutation | null): Promise<StoredTask | null> {
+        return this.withTaskQueue(id, async () => {
+            await this.assertWriter()
+            const current = this.tasks.get(id)
+            if (!current)
+                throw new BrowserRuntimeError('SCOPE_DENIED', 'Task does not exist')
+            const mutation = callback(structuredClone(current))
+            if (!mutation)
+                return null
+            return this.commitNow(id, mutation.patch, mutation.event, mutation.business ?? false)
+        })
+    }
+    private async commitNow(id: TaskId, patch: Partial<StoredTask>, event: StoreEventInput, business = false): Promise<StoredTask> {
         await this.assertWriter()
         const current = this.tasks.get(id)
-        if (!current) throw new BrowserRuntimeError('SCOPE_DENIED', 'Task does not exist')
+        if (!current)
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Task does not exist')
         const taskDir = join(this.stateDir, 'tasks', id)
         const eventFile = join(taskDir, 'events.jsonl')
-        const body: TaskEvent = { schemaVersion: SCHEMA_VERSION, taskId: id, seq: Number(current.highWatermarkSeq) + 1, ...structuredClone(event), stateVersion: current.stateVersion + 1, data: event.data }
+        const body: TaskEvent = { schemaVersion: SCHEMA_VERSION, taskId: id, seq: Number(current.highWatermarkSeq) + 1,
+            ...structuredClone(event), stateVersion: current.stateVersion + 1, data: event.data }
         const envelope = { body, checksum: checksum(stable(body)) }
-        const next = { ...current, ...structuredClone(patch), stateVersion: patch.stateVersion ?? current.stateVersion + 1, updatedAtMs: event.atMs, highWatermarkSeq: body.seq, lastSeq: body.seq } as StoredTask
+        const next = { ...current, ...structuredClone(patch), stateVersion: patch.stateVersion ?? current.stateVersion + 1,
+            updatedAtMs: event.atMs, highWatermarkSeq: body.seq, lastSeq: body.seq } as StoredTask
         const bytes = Buffer.byteLength(stable(next))
         const eventCount = body.seq
-        if (business && (bytes > POC_LIMITS.journalMaxBytesPerTask || eventCount > POC_LIMITS.journalMaxEventsPerTask - POC_LIMITS.journalControlReserveEvents)) throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal business quota reached')
-        if (!business && eventCount > POC_LIMITS.journalMaxEventsPerTask) throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal control reserve is exhausted')
+        if (business && (bytes > POC_LIMITS.journalMaxBytesPerTask
+            || eventCount > POC_LIMITS.journalMaxEventsPerTask - POC_LIMITS.journalControlReserveEvents))
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal business quota reached')
+        if (!business && eventCount > POC_LIMITS.journalMaxEventsPerTask)
+            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal control reserve is exhausted')
         try {
             await mkdir(taskDir, { recursive: true })
             await this.faultInjector?.('event-append')
             const handle = await open(eventFile, 'a', 0o600)
-            try { await handle.writeFile(`${stable(envelope)}\n`); await handle.sync() } finally { await handle.close() }
+            try {
+                await handle.writeFile(`${stable(envelope)}\n`)
+                await handle.sync()
+            }
+            finally {
+                await handle.close()
+            }
             await this.atomicWrite(join(taskDir, 'task.json'), next, 'task-replace')
             next.__events = [...(current.__events as TaskEvent[] | undefined ?? []), body]
             this.tasks.set(id, next)
             return structuredClone(next)
-        } catch (error) {
-            this.failed = true
+        }
+        catch (error) {
             throw journalError(error instanceof Error ? `Task journal write failed: ${error.message}` : undefined)
         }
     }
-
+    private async withTaskQueue<T>(id: TaskId, operation: () => Promise<T>): Promise<T> {
+        const previous = this.taskTails.get(id) ?? Promise.resolve()
+        let release!: () => void
+        const current = new Promise<void>((resolve) => { release = resolve; })
+        const queued = previous.then(() => current)
+        this.taskTails.set(id, queued)
+        await previous
+        try {
+            return await operation()
+        }
+        finally {
+            release()
+            if (this.taskTails.get(id) === queued)
+                this.taskTails.delete(id)
+        }
+    }
     events(id: TaskId, afterSeq = 0, nowMs = Date.now()): TaskEvent[] {
         const task = this.tasks.get(id)
-        if (task && ['succeeded', 'failed', 'cancelled'].includes(task.status) && nowMs - task.updatedAtMs > POC_LIMITS.eventRetentionMs) return []
-        return (task?.__events as TaskEvent[] | undefined ?? []).filter((event) => event.seq > afterSeq).map((event) => structuredClone(event))
+        if (task && ['succeeded', 'failed', 'cancelled'].includes(task.status) && nowMs - task.updatedAtMs > POC_LIMITS.eventRetentionMs)
+            return []
+        return (task?.__events as TaskEvent[] | undefined ?? [])
+            .filter((event) => event.seq > afterSeq)
+            .map((event) => structuredClone(event))
     }
-
     private async acquire(): Promise<void> {
         await mkdir(this.stateDir, { recursive: true })
         await this.faultInjector?.('lock')
         const lockPath = join(this.stateDir, 'writer.lock')
         try {
             this.lockHandle = await open(lockPath, 'wx', 0o600)
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw journalError()
-            let lock: { pid: number } | undefined
-            try { lock = JSON.parse(await readFile(lockPath, 'utf8')) as { pid: number } } catch { lock = undefined }
+        }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST')
+                throw journalError()
+            let lock: {
+                pid: number
+            } | undefined
+            try {
+                lock = JSON.parse(await readFile(lockPath, 'utf8')) as {
+                    pid: number
+                }
+            }
+            catch {
+                lock = undefined
+            }
             let alive = false
-            if (lock?.pid) { try { process.kill(lock.pid, 0); alive = true } catch (killError) { alive = (killError as NodeJS.ErrnoException).code === 'EPERM' } }
-            if (alive) throw journalError('Task store already has a live writer')
+            if (lock?.pid) {
+                try {
+                    process.kill(lock.pid, 0)
+                    alive = true
+                }
+                catch (killError) {
+                    alive = (killError as NodeJS.ErrnoException).code === 'EPERM'
+                }
+            }
+            if (alive)
+                throw journalError('Task store already has a live writer')
             await rm(lockPath, { force: true })
             this.lockHandle = await open(lockPath, 'wx', 0o600)
         }
         const fencePath = join(this.stateDir, 'fencing')
         let previous = 0
-        try { previous = Number(await readFile(fencePath, 'utf8')) || 0 } catch { /* first writer */ }
+        try {
+            previous = Number(await readFile(fencePath, 'utf8')) || 0
+        }
+        catch { /* first writer */ }
         this.fencingToken = previous + 1
         const fence = await open(fencePath, 'w', 0o600)
-        try { await fence.writeFile(String(this.fencingToken)); await fence.sync() } finally { await fence.close() }
+        try {
+            await fence.writeFile(String(this.fencingToken))
+            await fence.sync()
+        }
+        finally {
+            await fence.close()
+        }
         await this.lockHandle.writeFile(stable({ pid: process.pid, fencingToken: this.fencingToken, started: Date.now() }))
         await this.lockHandle.sync()
         await this.syncDirectory(this.stateDir)
     }
-
     private async assertWriter(): Promise<void> {
-        if (this.closed || this.failed) throw journalError(this.closed ? 'Task store is closed' : 'Task store has failed closed')
-        let lock: { fencingToken?: number } | undefined
-        try { lock = JSON.parse(await readFile(join(this.stateDir, 'writer.lock'), 'utf8')) as { fencingToken?: number } } catch { throw journalError() }
+        if (this.closed)
+            throw journalError('Task store is closed')
+        let lock: {
+            fencingToken?: number
+        } | undefined
+        try {
+            lock = JSON.parse(await readFile(join(this.stateDir, 'writer.lock'), 'utf8')) as {
+                fencingToken?: number
+            }
+        }
+        catch {
+            throw journalError()
+        }
         let diskToken = 0
-        try { diskToken = Number(await readFile(join(this.stateDir, 'fencing'), 'utf8')) } catch { throw journalError() }
-        if (lock?.fencingToken !== this.fencingToken || diskToken !== this.fencingToken) throw journalError('Writer fencing token changed')
+        try {
+            diskToken = Number(await readFile(join(this.stateDir, 'fencing'), 'utf8'))
+        }
+        catch {
+            throw journalError()
+        }
+        if (lock?.fencingToken !== this.fencingToken || diskToken !== this.fencingToken)
+            throw journalError('Writer fencing token changed')
     }
-
     private async loadMetadata(): Promise<void> {
         try {
-            const metadata = JSON.parse(await readFile(join(this.stateDir, 'spaces.json'), 'utf8')) as { schemaVersion: number; spaces: SpaceRecord[] }
-            if (metadata.schemaVersion !== SCHEMA_VERSION) throw journalError('Unknown metadata schema')
-            for (const space of metadata.spaces) this.spaces.set(space.taskSpaceId, space)
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+            const metadata = JSON.parse(await readFile(join(this.stateDir, 'spaces.json'), 'utf8')) as {
+                schemaVersion: number
+                spaces: SpaceRecord[]
+            }
+            if (metadata.schemaVersion !== SCHEMA_VERSION)
+                throw journalError('Unknown metadata schema')
+            for (const space of metadata.spaces)
+                this.spaces.set(space.taskSpaceId, space)
+        }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+                throw error
+        }
     }
     private async loadRevocations(): Promise<void> {
         try {
-            const metadata = JSON.parse(await readFile(join(this.stateDir, 'revocations.json'), 'utf8')) as { schemaVersion: number; ids: string[] }
-            if (metadata.schemaVersion !== SCHEMA_VERSION) throw journalError('Unknown revocation schema')
-            for (const id of metadata.ids) this.revocations.add(id)
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+            const metadata = JSON.parse(await readFile(join(this.stateDir, 'revocations.json'), 'utf8')) as {
+                schemaVersion: number
+                ids: string[]
+            }
+            if (metadata.schemaVersion !== SCHEMA_VERSION)
+                throw journalError('Unknown revocation schema')
+            for (const id of metadata.ids)
+                this.revocations.add(id)
+        }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+                throw error
+        }
     }
     private async writeMetadata(): Promise<void> {
         await this.assertWriter()
-        try { await this.atomicWrite(join(this.stateDir, 'spaces.json'), { schemaVersion: SCHEMA_VERSION, spaces: [...this.spaces.values()] }, 'metadata') }
-        catch { this.failed = true; throw journalError() }
+        try {
+            await this.atomicWrite(join(this.stateDir, 'spaces.json'), { schemaVersion: SCHEMA_VERSION,
+                spaces: [...this.spaces.values()] }, 'metadata')
+        }
+        catch {
+            throw journalError()
+        }
     }
     private async writeRevocations(): Promise<void> {
         await this.assertWriter()
-        try { await this.atomicWrite(join(this.stateDir, 'revocations.json'), { schemaVersion: SCHEMA_VERSION, ids: [...this.revocations] }, 'metadata') }
-        catch { this.failed = true; throw journalError() }
+        try {
+            await this.atomicWrite(join(this.stateDir, 'revocations.json'), { schemaVersion: SCHEMA_VERSION,
+                ids: [...this.revocations] }, 'metadata')
+        }
+        catch {
+            throw journalError()
+        }
     }
-
     private async loadTasks(): Promise<void> {
         const taskRoot = join(this.stateDir, 'tasks')
         let dirs: string[]
-        try { dirs = await readdir(taskRoot) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
+        try {
+            dirs = await readdir(taskRoot)
+        }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+                return
+            throw error
+        }
         for (const id of dirs) {
             const taskDir = join(taskRoot, id)
-            let task: StoredTask
-            try { task = JSON.parse(await readFile(join(taskDir, 'task.json'), 'utf8')) as StoredTask } catch { throw journalError('Task checkpoint is unreadable') }
-            if (task.schemaVersion !== SCHEMA_VERSION) throw journalError('Unknown task schema')
-            const eventFile = join(taskDir, 'events.jsonl')
-            let raw = ''
-            try { raw = await readFile(eventFile, 'utf8') } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-            const lines = raw.split('\n')
-            const events: TaskEvent[] = []
-            const committedLines: string[] = []
-            let expectedSeq = 1
-            let orphan = ''
-            for (let index = 0; index < lines.length; index++) {
-                const line = lines[index]
-                if (!line) continue
-                let envelope: { body: TaskEvent; checksum: string }
-                try { envelope = JSON.parse(line) as typeof envelope } catch {
-                    if (index === lines.length - 1 || (index === lines.length - 2 && !lines.at(-1))) { orphan += `${line}\n`; continue }
-                    throw journalError('Task event journal has middle corruption')
+            try {
+                let task: StoredTask
+                try {
+                    task = JSON.parse(await readFile(join(taskDir, 'task.json'), 'utf8')) as StoredTask
                 }
-                if (envelope.checksum !== checksum(stable(envelope.body)) || envelope.body.seq !== expectedSeq) throw journalError('Task event journal checksum or sequence is invalid')
-                expectedSeq += 1
-                if (envelope.body.seq <= Number(task.lastSeq ?? 0)) { events.push(envelope.body); committedLines.push(line) }
-                else orphan += `${line}\n`
+                catch {
+                    throw journalError('Task checkpoint is unreadable')
+                }
+                if (task.schemaVersion !== SCHEMA_VERSION)
+                    throw journalError('Unknown task schema')
+                const eventFile = join(taskDir, 'events.jsonl')
+                let raw = ''
+                try {
+                    raw = await readFile(eventFile, 'utf8')
+                }
+                catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+                        throw error
+                }
+                const lines = raw.split('\n')
+                const events: TaskEvent[] = []
+                const committedLines: string[] = []
+                let expectedSeq = 1
+                let orphan = ''
+                for (let index = 0; index < lines.length; index++) {
+                    const line = lines[index]
+                    if (!line)
+                        continue
+                    let envelope: {
+                        body: TaskEvent
+                        checksum: string
+                    }
+                    try {
+                        envelope = JSON.parse(line) as typeof envelope
+                    }
+                    catch {
+                        if (index === lines.length - 1 || (index === lines.length - 2 && !lines.at(-1))) {
+                            orphan += `${line}\n`
+                            continue
+                        }
+                        throw journalError('Task event journal has middle corruption')
+                    }
+                    if (envelope.checksum !== checksum(stable(envelope.body)) || envelope.body.seq !== expectedSeq)
+                        throw journalError('Task event journal checksum or sequence is invalid')
+                    expectedSeq += 1
+                    if (envelope.body.seq <= Number(task.lastSeq ?? 0)) {
+                        events.push(envelope.body)
+                        committedLines.push(line)
+                    }
+                    else
+                        orphan += `${line}\n`
+                }
+                if (orphan)
+                    await writeFile(join(taskDir, 'events.orphan.jsonl'), orphan, { flag: 'a', mode: 0o600 })
+                if (committedLines.length !== lines.filter(Boolean).length)
+                    await this.atomicReplaceText(eventFile, committedLines.length ? `${committedLines.join('\n')}\n` : '')
+                task.__events = events
+                this.tasks.set(task.taskId, task)
             }
-            if (orphan) await writeFile(join(taskDir, 'events.orphan.jsonl'), orphan, { flag: 'a', mode: 0o600 })
-            if (committedLines.length !== lines.filter(Boolean).length) await this.atomicReplaceText(eventFile, committedLines.length ? `${committedLines.join('\n')}\n` : '')
-            task.__events = events
-            this.tasks.set(task.taskId, task)
+            catch {
+                this.unreadableTasks.add(id as TaskId)
+            }
         }
     }
-
     private async atomicWrite(file: string, value: unknown, fault: 'task-replace' | 'metadata'): Promise<void> {
         const dir = join(file, '..')
         await mkdir(dir, { recursive: true })
@@ -224,18 +494,39 @@ export class TaskStore {
         try {
             await this.faultInjector?.(fault)
             const handle = await open(temporary, 'wx', 0o600)
-            try { await handle.writeFile(stable(value)); await handle.sync() } finally { await handle.close() }
+            try {
+                await handle.writeFile(stable(value))
+                await handle.sync()
+            }
+            finally {
+                await handle.close()
+            }
             await rename(temporary, file)
             await this.syncDirectory(dir)
-        } catch (error) { await rm(temporary, { force: true }); throw error }
+        }
+        catch (error) {
+            await rm(temporary, { force: true })
+            throw error
+        }
     }
     private async atomicReplaceText(file: string, value: string): Promise<void> {
         const dir = join(file, '..')
         const temporary = join(dir, `.${randomUUID()}.tmp`)
         const handle = await open(temporary, 'wx', 0o600)
-        try { await handle.writeFile(value); await handle.sync() } finally { await handle.close() }
+        try {
+            await handle.writeFile(value)
+            await handle.sync()
+        }
+        finally {
+            await handle.close()
+        }
         await rename(temporary, file)
         await this.syncDirectory(dir)
     }
-    private async syncDirectory(dir: string): Promise<void> { const handle = await open(dir, 'r'); try { await handle.sync() } finally { await handle.close() } }
+    private async syncDirectory(dir: string): Promise<void> { const handle = await open(dir, 'r'); try {
+        await handle.sync()
+    }
+    finally {
+        await handle.close()
+    } }
 }
