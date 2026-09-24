@@ -125,6 +125,18 @@ http.createServer(async (req, res) => {
       if (mode === "hang") return;
       return send(res, 200, { ok: true });
     }
+    // ---- a01a03a07a10 routes ----
+    // A navigation that is a ledgered write with a held response: receipt is
+    // recorded immediately, the document arrives after `ms` (max 30 s). Lets a
+    // write be in flight (intent committed, not confirmed) across a Runtime crash.
+    if (p === "/a10/slow-write" && site === "a") {
+      record({ kind: "slow-write", run, key: u.searchParams.get("key") });
+      await sleep(u.searchParams.get("ms"));
+      return html(res, "SLOW WRITE DONE");
+    }
+    // Storage presence probe (reports present/none, never the stored values).
+    if (p === "/a10/storage-check" && site === "a") return html(res, `<div id="out">CHECKING</div><script>const out=(t)=>{document.querySelector('#out').textContent=t};const ls=localStorage.getItem('abp_ls')?'present':'none';const r=indexedDB.open('abp');r.onsuccess=()=>{const db=r.result;if(!db.objectStoreNames.contains('kv'))return out('LS='+ls+' IDB=none');const g=db.transaction('kv').objectStore('kv').get('canary');g.onsuccess=()=>out('LS='+ls+' IDB='+(g.result?'present':'none'));g.onerror=()=>out('LS='+ls+' IDB=none')};r.onerror=()=>out('LS='+ls+' IDB=none')<\/script>`);
+    // ---- end a01a03a07a10 routes ----
     if (site !== "a") return send(res, 404, { error: "not found" });
     if (p === "/login" && req.method === "POST") {
       const d = await body(req), sid = randomUUID();
