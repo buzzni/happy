@@ -76,7 +76,8 @@ describe('A02 running task without any client', () => {
         expect(done.map((e) => e.n), 'every step dispatched exactly once while no client was connected').toEqual(range(steps).map((k) => k + 1))
         expect(idleMs, 'the client-less window must exceed the test idle window').toBeGreaterThanOrEqual(IDLE_MS)
         const reconnect = clientFor(stack, t.token)
-        const task = await waitForTask(reconnect, t.taskId, (v) => v.status !== 'running')
+        // The batch result is stored in its own commit right after the pause commit: settle on both.
+        const task = await waitForTask(reconnect, t.taskId, (v) => v.status !== 'running' && v.lastBatch !== undefined)
         expect(task.status).toBe('paused')
         expect(task.pauseReason).toBe('awaiting-agent')
         expect(task.lastBatch?.outcome).toBe('succeeded')
@@ -146,7 +147,7 @@ describe('A02 client capability expiry does not stop a task within its valid gra
         const ledger = await stack.waitForLedger((entries) => ticks(entries, tag).filter((e) => Number(e.n) >= 1).length >= steps,
             { timeoutMs: 40_000 })
         expect(ticks(ledger, tag).filter((e) => Number(e.n) >= 1).length).toBe(steps)
-        const task = await waitForTask(t.client, t.taskId, (v) => v.status !== 'running')
+        const task = await waitForTask(t.client, t.taskId, (v) => v.status !== 'running' && v.lastBatch !== undefined)
         expect(task.pauseReason).toBe('awaiting-agent')
         expect(task.lastBatch?.outcome).toBe('succeeded')
         evidence({ card: 'A02', path: 'client-cap-expiry', iteration: i, viewerAfterExpiry: denied, steps })
@@ -186,7 +187,8 @@ describe('A02 pinnedProfiles retention is not extended by duplicate resume / vie
         const tag = tagOf('pin', i)
         const t = await openTask(tickUrl(tag, 0, 0))
         await submitTicks(t, tag, 1, 0)
-        const paused = await waitForTask(t.client, t.taskId, (v) => v.pauseReason === 'awaiting-agent')
+        // Baseline only after the trailing batch-result commit (resultStored), which legitimately moves updatedAtMs.
+        const paused = await waitForTask(t.client, t.taskId, (v) => v.pauseReason === 'awaiting-agent' && v.lastBatch !== undefined)
         expect(paused.pauseReason).toBe('awaiting-agent')
         const viewer = clientFor(stack, mintInteractive(stack))
         const results: Array<TaskView | string> = []
@@ -198,7 +200,10 @@ describe('A02 pinnedProfiles retention is not extended by duplicate resume / vie
         }
         const after = await t.client.getTask({ taskId: t.taskId })
         const debug = await admin<{ pinnedProfiles: string[] }>(stack, '/admin/debug')
-        expect(after.updatedAtMs, 'duplicate resume / viewer heartbeat must not extend the retention clock').toBe(paused.updatedAtMs)
+        const later = (await allEvents(viewer, t.taskId)).filter((e) => e.seq > paused.highWatermarkSeq)
+            .map((e) => ({ type: e.type, atMs: e.atMs, data: e.data }))
+        expect(after.updatedAtMs, `duplicate resume / viewer heartbeat must not extend the retention clock; events after baseline: ${
+            JSON.stringify(later)}; stateVersion ${paused.stateVersion}→${after.stateVersion}`).toBe(paused.updatedAtMs)
         expect(after.stateVersion).toBe(paused.stateVersion)
         expect(debug.pinnedProfiles).toContain(PROFILE_A)
         const finished = await t.client.finishTask({ taskId: t.taskId, expectedVersion: after.stateVersion, requestId: rid() })

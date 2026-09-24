@@ -1,8 +1,12 @@
 /**
  * A04 — persistent login on the execution machine + login/captcha handoff.
  *
- * Persistence (profile A): the human logs in through the viewer (xdotool on
- * the X display, not CDP), the agent sets storage canaries, then cookie /
+ * The agent never logs in itself: a navigate landing on /login* or /challenge*
+ * parks the task in awaiting-user(login|captcha); the human takes over, solves
+ * it on the X display (xdotool, the noVNC input path — never CDP), releases,
+ * and the agent resumes the same batch.
+ *
+ * Persistence (profile A): login via that handoff, the resumed batch sets storage canaries, then cookie /
  * localStorage / IndexedDB are re-checked from fresh grants after (1) dropping
  * every client, (2) killing Chromium, (3) restarting the browser container.
  * Profile B must stay unauthenticated.
@@ -16,7 +20,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { BrowserRuntimeError, type TabId, type TaskId, type TaskSpaceId, type TaskView } from '../contracts'
 import type { RuntimeClient } from '../runtimeClient'
 import { PROFILE_A, PROFILE_B, SITE_A, startPocStack, type LedgerEntry, type PocStack } from './pocStack'
-import { STRICT_PASSWORD, Viewer, cleanupTask, clientFor, waitHealthy, runtimePort, mintAgent, mintInteractive, allEvents, evidence, latestLeaseEpoch, range, repeat, rid, sleep, step, tagOf, waitForTask } from './a02a04Helpers'
+import { STRICT_PASSWORD, Viewer, cleanupTask, clientFor, waitHealthy, runtimePort, mintAgent, mintInteractive, allEvents, evidence, range, repeat, rid, sleep, step, tagOf, waitForTask } from './a02a04Helpers'
 
 const ITERATIONS = repeat(3)
 
@@ -65,9 +69,11 @@ async function probeStorage(profile: 'a' | 'b', tag: string) {
             const storage = await pageText(t.client, t.taskId, t.tabId, 'COOKIE=')
             const protectedTab = await t.client.openPage({ taskId: t.taskId, url: `${SITE_A}/protected-strict/${tag}?run=${stack.run}`,
                 requestId: rid() })
-            const prot = await pageText(t.client, t.taskId, protectedTab.tabId, 'STRICT AUTHENTICATED', 5_000)
-            return { storage: storage.text.trim(), authenticated: prot.text.includes('STRICT AUTHENTICATED'), protectedUrl: prot.url,
-                browserInstanceId: t.task.browserInstanceId }
+            // Unauthenticated: the redirect lands on /login-strict and the Runtime parks the task in awaiting-user(login).
+            const waitReason = protectedTab.task.status === 'awaiting-user' ? protectedTab.task.waitReason : undefined
+            const authenticated = waitReason ? false
+                : (await pageText(t.client, t.taskId, protectedTab.tabId, 'STRICT AUTHENTICATED', 5_000)).text.includes('STRICT AUTHENTICATED')
+            return { storage: storage.text.trim(), authenticated, waitReason, browserInstanceId: t.task.browserInstanceId }
             } finally {
                 await cleanupAll()
             }
@@ -86,16 +92,20 @@ describe('A04 persistent login (profile A) and isolation (profile B)', () => {
     it.each(range(ITERATIONS))('iteration %i: viewer login survives client drop, kill-chrome, browser container restart', async (i) => {
         // Fresh tag per iteration: the persistent login cookie and the LS/IDB canaries are distinct per store and iteration.
         const tag = tagOf('pa', i)
-        const t = await openTask('a', `${SITE_A}/protected-strict/${tag}?run=${stack.run}`)
         const viewerA = new Viewer(stack, 'a')
+        const t = await reachWait('login', tag, 'a', [
+            step(PLACEHOLDER_TAB, 'navigate', { url: `${SITE_A}/a02a04-storage-setup/${tag}?run=${stack.run}` }),
+            step(PLACEHOLDER_TAB, 'waitFor', { until: { kind: 'text', text: 'STORAGE SET' } }),
+        ])
+        const { human, epoch } = await takeOver(t.taskId, t.tabId, PROFILE_A)
         await viewerA.login(tag, STRICT_PASSWORD)
         const login = await stack.waitForLedger((entries) => count(entries, 'a02a04-login', tag).length > 0)
         expect(count(login, 'a02a04-login', tag).map((e) => e.ok)).toEqual([true])
-        const setup = await t.client.submitBatch({ taskId: t.taskId, expectedVersion: t.task.stateVersion, requestId: rid(), steps: [
-            step(t.tabId, 'navigate', { url: `${SITE_A}/a02a04-storage-setup/${tag}?run=${stack.run}` }),
-            step(t.tabId, 'waitFor', { until: { kind: 'text', text: 'STORAGE SET' } }),
-        ] }, { waitMs: 30_000 })
-        expect(setup.result?.outcome).toBe('succeeded')
+        await release(human, t.taskId, t.tabId, epoch)
+        const resumed = await resume(t.client, t.taskId)
+        expect(resumed, `resume after login failed: ${resumed instanceof Error ? resumed.message : ''}`).not.toBeInstanceOf(Error)
+        const setup = await waitForTask(t.client, t.taskId, (task) => task.status !== 'running')
+        expect(setup.lastBatch?.outcome, 'resumed batch must set the storage canaries').toBe('succeeded')
         await cleanupAll()
 
         // Fresh cookies live only in Chromium memory until its ~30 s commit; wait for the row before stopping the browser.
@@ -141,7 +151,7 @@ describe('A04 persistent login (profile A) and isolation (profile B)', () => {
         phases.profileB = { storage: b.storage.replace(tag, '<tag>'), authenticated: b.authenticated }
         expect(b.storage.includes('COOKIE=no LS=none IDB=none'), `profile B storage: ${b.storage.replaceAll(tag, '<tag>')}`).toBe(true)
         expect(b.authenticated).toBe(false)
-        expect(b.protectedUrl).toContain('/login-strict/')
+        expect(b.waitReason, 'profile B /protected must land on the login wait').toBe('login')
         evidence({ card: 'A04', path: 'persistence', iteration: i, phases, desktopCookieUpload: 'none (no API exists)' })
     }, 360_000)
 })
@@ -151,13 +161,19 @@ const flowUrls = (flow: Flow, tag: string) => flow === 'login'
     ? { start: `${SITE_A}/protected-strict/${tag}?run=${stack.run}`, prefix: `${SITE_A}/protected-strict/${tag}` }
     : { start: `${SITE_A}/captcha-protected/${tag}?run=${stack.run}`, prefix: `${SITE_A}/captcha-protected/${tag}` }
 
-/** Task reaches the protected page, gets redirected, and must persist awaiting-user(<flow>). */
-async function reachWait(flow: Flow, tag: string) {
+const PLACEHOLDER_TAB = '__tab__' as TabId
+/**
+ * Task starts on a neutral page, then one batch navigates to the protected page (redirected to /login-strict or
+ * /challenge-strict) followed by `rest` (default: the /a02a04-after continuation witness). The Runtime must stop
+ * the batch at awaiting-user(<flow>) and persist it with no client.
+ */
+async function reachWait(flow: Flow, tag: string, profile: 'a' | 'b' = 'b', rest?: unknown[]) {
     const urls = flowUrls(flow, tag)
-    const t = await openTask('b', urls.start)
+    const t = await openTask(profile, `${SITE_A}/a02a04-tick/${tag}?run=${stack.run}&n=0&ms=0`)
+    const tail = (rest ?? [step(PLACEHOLDER_TAB, 'navigate', { url: `${SITE_A}/a02a04-after/${tag}?run=${stack.run}` })])
+        .map((s) => ({ ...(s as object), tabId: t.tabId }) as never)
     const submitted = await t.client.submitBatch({ taskId: t.taskId, expectedVersion: t.task.stateVersion, requestId: rid(), steps: [
-        step(t.tabId, 'waitFor', { until: { kind: 'url', urlPrefix: urls.prefix } }),
-        step(t.tabId, 'navigate', { url: `${SITE_A}/a02a04-after/${tag}?run=${stack.run}` }),
+        step(t.tabId, 'navigate', { url: urls.start }), ...tail,
     ] }, { waitMs: 30_000 })
     expect(submitted.result?.outcome, `batch should stop at awaiting-user(${flow})`).toBe('awaiting-user')
     expect(submitted.result?.waitReason).toBe(flow)
@@ -170,19 +186,17 @@ async function reachWait(flow: Flow, tag: string) {
     return { ...t, client: fresh }
 }
 
-async function takeOver(taskId: TaskId, tabId: TabId, _client: RuntimeClient) {
-    const human = clientFor(stack, mintInteractive(stack, { profileId: PROFILE_B }))
-    // subscribe is a client (interactive) operation; the agent grant does not carry it.
-    const epoch = await latestLeaseEpoch(human, taskId)
-    let control
-    try {
-        control = await human.takeOver({ taskId, tabId, expectedEpoch: epoch, requestId: rid() })
-    } catch (error) {
-        throw new Error(`takeOver with the latest event leaseEpoch=${epoch} rejected (${(error as BrowserRuntimeError).code}): `
-            + 'a client can only learn the epoch from task events, so the persisted wait cannot be handed over')
-    }
+/** Interactive takeOver with the epoch from TaskView.tabLeases; waits until the owner is really the user (settling). */
+async function takeOver(taskId: TaskId, tabId: TabId, profileId: typeof PROFILE_A | typeof PROFILE_B = PROFILE_B) {
+    const human = clientFor(stack, mintInteractive(stack, { profileId }))
+    const lease = (await human.getTask({ taskId })).tabLeases?.find((l) => l.tabId === tabId)
+    expect(lease, 'TaskView.tabLeases must expose the task tab').toBeDefined()
+    const control = await human.takeOver({ taskId, tabId, expectedEpoch: lease!.leaseEpoch, requestId: rid() })
     expect(control.task.pauseReason).toBe('user-control')
-    return { human, control }
+    const owned = await waitForTask(human, taskId, (task) => task.tabLeases?.find((l) => l.tabId === tabId)?.owner.kind === 'user', 15_000)
+    const now = owned.tabLeases!.find((l) => l.tabId === tabId)!
+    expect(now.owner.kind, `owner must become user after takeOver (settling=${control.settling})`).toBe('user')
+    return { human, control, epoch: now.leaseEpoch }
 }
 
 async function release(human: RuntimeClient, taskId: TaskId, tabId: TabId, epoch: number) {
@@ -212,16 +226,18 @@ async function humanSolves(flow: Flow, tag: string, password = STRICT_PASSWORD) 
 
 /** Full happy handoff; returns the continued task. */
 async function completeHandoff(flow: Flow, tag: string, t: { client: RuntimeClient; taskId: TaskId; tabId: TabId }) {
-    const { human, control } = await takeOver(t.taskId, t.tabId, t.client)
+    const { human, epoch } = await takeOver(t.taskId, t.tabId)
     const attempts = await humanSolves(flow, tag)
     expect(attempts.at(-1)?.ok).toBe(true)
-    await release(human, t.taskId, t.tabId, control.leaseEpoch)
+    await release(human, t.taskId, t.tabId, epoch)
     const resumed = await resume(t.client, t.taskId)
     expect(resumed, `resume after ${flow} failed: ${resumed instanceof Error ? resumed.message : ''}`).not.toBeInstanceOf(Error)
     const done = await waitForTask(t.client, t.taskId, (task) => task.status !== 'running')
     const ledger = await stack.waitForLedger((entries) => count(entries, 'a02a04-after', tag).length > 0)
     const after = count(ledger, 'a02a04-after', tag)
-    expect(after.length, 'same task must continue exactly once after the handoff').toBe(1)
+    expect(after.length, `same task must continue exactly once after the handoff at the SUBMITTED url (…?run=<run>; a resumed step replayed from `
+        + `redacted persisted steps loses its query string); task after resume: ${JSON.stringify({ status: done.status,
+        pauseReason: done.pauseReason, waitReason: done.waitReason, batch: done.lastBatch })}`).toBe(1)
     expect(after[0][flow === 'login' ? 'loggedIn' : 'passed']).toBe(true)
     expect(done.taskId).toBe(t.taskId)
     expect(done.pauseReason).toBe('awaiting-agent')
@@ -260,8 +276,8 @@ describe.each(['login', 'captcha'] as const)('A04 handoff: waitReason=%s', (flow
     it.each(range(ITERATIONS))(`iteration %i: "done" without doing anything keeps waiting; a later real ${flow} still continues`, async (i) => {
         const tag = tagOf('nd', i)
         const t = await reachWait(flow, tag)
-        const { human, control } = await takeOver(t.taskId, t.tabId, t.client)
-        await release(human, t.taskId, t.tabId, control.leaseEpoch)
+        const { human, epoch } = await takeOver(t.taskId, t.tabId)
+        await release(human, t.taskId, t.tabId, epoch)
         const resumed = await resume(t.client, t.taskId)
         await expectStillWaiting(flow, tag, t)
         await completeHandoff(flow, tag, t)
@@ -274,10 +290,10 @@ describe('A04 handoff negative: wrong password', () => {
     it.each(range(ITERATIONS))('iteration %i: failed login does not continue the task', async (i) => {
         const tag = tagOf('wp', i)
         const t = await reachWait('login', tag)
-        const { human, control } = await takeOver(t.taskId, t.tabId, t.client)
+        const { human, epoch } = await takeOver(t.taskId, t.tabId)
         const attempts = await humanSolves('login', tag, 'wrong-password')
         expect(attempts.map((a) => a.ok)).toEqual([false])
-        await release(human, t.taskId, t.tabId, control.leaseEpoch)
+        await release(human, t.taskId, t.tabId, epoch)
         const resumed = await resume(t.client, t.taskId)
         await expectStillWaiting('login', tag, t)
         evidence({ card: 'A04', path: 'wrong-password', iteration: i, loginAttempts: attempts.length,
@@ -300,8 +316,9 @@ describe('A04 risky submit after login still needs its own approval', () => {
         expect(amount && confirm).toBeTruthy()
         const before = (await stack.ledger()).filter((e) => e.kind === 'risky').length
         let result = (await t.client.submitBatch({ taskId: t.taskId, expectedVersion: nav.task.stateVersion, requestId: rid(), steps: [
-            step(t.tabId, 'fill', { ref: amount!.ref, value: '42' }),
-            step(t.tabId, 'click', { ref: confirm!.ref }),
+            step(t.tabId, 'fill', { ref: amount!.ref, value: '42', snapshotId: observation.snapshotId }),
+            step(t.tabId, 'click', { ref: confirm!.ref, snapshotId: observation.snapshotId }),
+            step(t.tabId, 'waitFor', { until: { kind: 'text', text: 'PAYMENT RECORDED' } }),
         ] }, { waitMs: 30_000 })).result
         expect(result?.outcome).toBe('awaiting-user')
         expect(result?.waitReason).toBe('approval')
@@ -316,7 +333,7 @@ describe('A04 risky submit after login still needs its own approval', () => {
                 bindingHash: result.pendingApproval.bindingHash, requestId: rid(), decision: 'approve' })
             result = approved.batch
         }
-        expect(result?.outcome).toBe('succeeded')
+        expect(result?.outcome, 'approved write with an observed postcondition must be confirmed').toBe('succeeded')
         const after = await stack.waitForLedger((entries) => entries.filter((e) => e.kind === 'risky').length > before)
         expect(after.filter((e) => e.kind === 'risky').length - before).toBe(1)
         evidence({ card: 'A04', path: 'risky-after-login', iteration: i, writesBeforeApproval, approvals })
@@ -335,8 +352,9 @@ describe.each(['login', 'captcha'] as const)('A04 handoff across Runtime restart
         t.client = clientFor(stack, t.token)
         await expectStillWaiting(flow, tag, t)
         // The browser was not restarted, so the task's tab still exists and must stay addressable.
-        const seen = await t.client.observe({ taskId: t.taskId, tabId: t.tabId }).then(() => 'ok', (e: BrowserRuntimeError) => e.code)
-        expect(seen, 'task tab must stay observable after a Runtime-only restart (driver tab ownership lost?)').toBe('ok')
+        const viewer = clientFor(stack, mintInteractive(stack, { profileId: PROFILE_B }))
+        const lease = (await viewer.getTask({ taskId: t.taskId })).tabLeases?.find((l) => l.tabId === t.tabId)
+        expect(lease, 'task tab must be re-adopted after a Runtime-only restart').toBeDefined()
         await completeHandoff(flow, tag, t)
         evidence({ card: 'A04', path: `runtime-restart-${flow}`, iteration: i, taskId: t.taskId })
     }, 240_000)
