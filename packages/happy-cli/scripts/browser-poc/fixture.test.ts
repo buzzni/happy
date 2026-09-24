@@ -26,3 +26,13 @@ test('inline click handlers stay inside their HTML attribute', async () => {
         for (const handler of handlers) expect(handler).toContain('target:')
     }
 })
+test('every inline page script is valid JavaScript', async () => {
+    // A syntax error leaves the page blank, which a browser test would misread as missing state.
+    const pages = ['/storage-check', '/barrier?run=s&key=k', '/oopif?run=s', '/spa?run=s', '/risky-submit?run=s', '/secret-form?token=x', '/beforeunload', '/popup', '/challenge?next=/challenge-protected', '/login?next=/protected']
+    for (const path of pages) {
+        const body = await (await req(page + path)).text()
+        for (const match of body.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+            expect(() => new Function(match[1]), `${path} script`).not.toThrow()
+        }
+    }
+})
