@@ -146,7 +146,8 @@ describe('A05 scope, Space and input owner', () => {
                 ['b-screenshot-a-tab', c.screenshot({ taskId: tb.taskId, tabId: ta.tabId })],
             ] as const) denied.push(`${label}:${(await expectCode(p, ['SCOPE_DENIED', 'STALE_LEASE'], label)).code}`)
             await releaseBarrier(stack, L, 'gate', `n${i}`)
-            const done = await waitForTask(c, ta.taskId, (t) => t.status !== 'running')
+            // The batch result is committed right after the pause transition; wait for it explicitly.
+            const done = await waitForTask(c, ta.taskId, (t) => t.status !== 'running' && t.lastBatch?.batchId === accepted.batchId)
             const ledger = await settledLedger(stack, L, 1_000)
             const clicks = ledger.filter((e) => e.kind === 'click')
             evidence('A05', { path: 'same-session-race', i, denied, taskA: done.status, pause: done.pauseReason, clicks: clicks.map((e) => e.target) })
