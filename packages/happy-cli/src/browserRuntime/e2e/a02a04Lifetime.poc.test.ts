@@ -200,7 +200,10 @@ describe('A02 pinnedProfiles retention is not extended by duplicate resume / vie
         }
         const after = await t.client.getTask({ taskId: t.taskId })
         const debug = await admin<{ pinnedProfiles: string[] }>(stack, '/admin/debug')
-        expect(after.updatedAtMs, 'duplicate resume / viewer heartbeat must not extend the retention clock').toBe(paused.updatedAtMs)
+        const later = (await allEvents(viewer, t.taskId)).filter((e) => e.seq > paused.highWatermarkSeq)
+            .map((e) => ({ type: e.type, atMs: e.atMs, data: e.data }))
+        expect(after.updatedAtMs, `duplicate resume / viewer heartbeat must not extend the retention clock; events after baseline: ${
+            JSON.stringify(later)}; stateVersion ${paused.stateVersion}→${after.stateVersion}`).toBe(paused.updatedAtMs)
         expect(after.stateVersion).toBe(paused.stateVersion)
         expect(debug.pinnedProfiles).toContain(PROFILE_A)
         const finished = await t.client.finishTask({ taskId: t.taskId, expectedVersion: after.stateVersion, requestId: rid() })
