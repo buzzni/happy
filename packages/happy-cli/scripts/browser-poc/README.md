@@ -29,3 +29,17 @@ docker exec abp-smoke-1-browser-a curl -fsS http://a.poc-one.test:8080/marker?la
 docker run --rm --network abp-smoke-1 curlimages/curl:latest curl -fsS http://browser-a:9223/json/version
 docker run --rm --network abp-smoke-1 curlimages/curl:latest curl -fsS http://browser-a:9224/instance
 ```
+
+## A12 resources, soak, rollback
+
+Use a unique image tag for every run. The A12 cycle suite defaults to three repetitions of 100 task/page/action/finish/close cycles; `ABP_REPEAT` and `ABP_CYCLES` shorten local diagnosis only.
+
+```sh
+ABP_IMAGE_TAG=e2ed pnpm exec vitest run --project browser-poc src/browserRuntime/e2e/a12Resources.poc.test.ts
+ABP_IMAGE_TAG=e2ed pnpm exec vitest run --project browser-poc src/browserRuntime/e2e/a12Rollback.poc.test.ts
+ABP_IMAGE_TAG=e2ed pnpm exec vitest run --project browser-poc src/browserRuntime/e2e/a12Soak.poc.test.ts
+ABP_IMAGE_TAG=e2ed node scripts/browser-poc/soak.mjs --run <running-run> --minutes 30
+ABP_IMAGE_TAG=e2ed node scripts/browser-poc/rollback.mjs --run <running-run>
+```
+
+`soak.mjs` requires a running harness stack and reads its private `.abp/<run>/env.json` and `keys.json`. It warms up for five minutes, samples once a minute, writes `soak.jsonl` and `soak-summary.json`, and compares the first and last five measured minutes. `rollback.mjs` fences active tasks through the public cancel API, stops only that run's Runtime, restarts a run-owned browser to verify its profile volume canary and noVNC viewer, and removes only that run's containers and network. It preserves the synthetic profile volumes for inspection. To restore legacy agent tools, unset `HAPPY_BROWSER_TASK_RUNTIME_URL` before starting the agent; `src/claude/utils/startHappyServer.test.ts` verifies legacy `browser_*` tools appear without the flag. The PoC routing image is isolated to the labelled run, so removing that run restores the prior route. Synthetic volumes may later be purged with `node scripts/browser-poc/poc.mjs down --run <run> --purge` after inspection.
