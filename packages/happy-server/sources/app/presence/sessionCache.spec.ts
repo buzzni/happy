@@ -196,3 +196,66 @@ describe("sessionCache.flushPendingUpdates — Machine keepalive must not bump M
         expect(machineUpdateMock).not.toHaveBeenCalled();
     });
 });
+
+// 2026-09-24 prod: RDS 의 기본 TimeZone 이 Asia/Seoul 이고 lastActiveAt 은
+// `timestamp without time zone` 이다. Prisma 엔진은 raw 쿼리의 Date 파라미터를
+// timestamptz 로 보내므로, 서버가 세션 타임존으로 벽시계 변환을 하면서 keepalive
+// 가 KST 값(9시간 미래)을 썼다. ORM 쓰기(markMachineOnline/Offline, timeout.ts
+// 비교)는 UTC 값이라, 죽은 머신이 9시간 넘게 active 로 남았고 offline 쓰기의
+// `lastActiveAt <= at` 가드도 매번 빗나갔다.
+//
+// 아래 하네스는 운영과 같은 조건을 PGlite 로 만든다: DB TimeZone 을 KST 로 두고,
+// 코드가 만든 SQL 을 그대로 실행하되 Date 값은 Prisma 엔진처럼 timestamptz 로
+// 바인딩한다.
+describe("sessionCache.flushPendingUpdates — lastActiveAt 은 DB 세션 타임존과 무관하게 UTC 로 저장된다", () => {
+    async function runCapturedAgainstKstDatabase(table: "Session" | "Machine") {
+        const { PGlite } = await import("@electric-sql/pglite");
+        const pg = new PGlite();
+        try {
+            await pg.exec(`
+                SET TimeZone = 'Asia/Seoul';
+                CREATE TABLE "${table}" (
+                    "id" TEXT NOT NULL,
+                    "accountId" TEXT,
+                    "active" BOOLEAN NOT NULL DEFAULT false,
+                    "lastActiveAt" TIMESTAMP(3) NOT NULL
+                );
+                INSERT INTO "${table}" ("id", "accountId", "lastActiveAt")
+                VALUES ('row-1', 'user-1', '2000-01-01 00:00:00');
+            `);
+            const call = executeRawCalls[0];
+            const sql = call.strings.reduce((acc, part, i) => {
+                if (i === 0) return part;
+                const value = call.values[i - 1];
+                const cast = value instanceof Date ? "::timestamptz" : "";
+                return `${acc}$${i}${cast}${part}`;
+            });
+            const params = call.values.map((value) => value instanceof Date ? value.toISOString() : value);
+            await pg.query(sql, params);
+            const row = await pg.query<{ at: string }>(
+                `SELECT to_char("lastActiveAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at FROM "${table}" WHERE "id" = 'row-1'`,
+            );
+            return row.rows[0].at;
+        } finally {
+            await pg.close();
+        }
+    }
+
+    const at = Date.UTC(2026, 8, 23, 14, 57, 48, 397);
+
+    it("machine keepalive 가 KST 세션에서도 UTC 벽시계 값을 쓴다", async () => {
+        primeMachineCacheEntry("row-1", "user-1");
+        activityCache.queueMachineUpdate("row-1", at);
+        await flushNow();
+
+        expect(await runCapturedAgainstKstDatabase("Machine")).toBe("2026-09-23T14:57:48.397Z");
+    });
+
+    it("session keepalive 가 KST 세션에서도 UTC 벽시계 값을 쓴다", async () => {
+        primeCacheEntry("row-1", "user-1");
+        activityCache.queueSessionUpdate("row-1", at);
+        await flushNow();
+
+        expect(await runCapturedAgainstKstDatabase("Session")).toBe("2026-09-23T14:57:48.397Z");
+    });
+});
