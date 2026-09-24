@@ -965,6 +965,21 @@ export async function runAcp(opts: {
     }
   }
 
+  /*
+   * No channel ingress handlers here, deliberately (Saycode specs/desktop-messenger-channels).
+   *
+   * Registering them would make an ACP session *dispatchable*: the machine-level advertisement
+   * only gates `/new`, while an existing session is judged by this live capability answer. ACP
+   * can accept a prompt, but it cannot produce an answer the channel may relay — `AgentMessage`
+   * model output carries only `textDelta`/`fullText` with no phase or final marker, and
+   * `AcpBackend.sendPrompt` discards the `PromptResponse` whose `stopReason` is the one
+   * authoritative terminal it receives. R14 forbids guessing which text is the answer, so the
+   * absence of these handlers is the refusal: the probe gets "unknown method" and Desktop stops.
+   *
+   * What would change it: preserve `PromptResponse.stopReason` as the terminal, and obtain a
+   * per-segment final marker from the provider's own response or annotations.
+   */
+
   session.rpcHandlerManager.registerHandler('abort', handleAbort);
   const handleKillSession = async () => {
     shouldExit = true;

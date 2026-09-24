@@ -132,8 +132,21 @@ export async function claudeRemote(opts: {
     permissionsDeny?: string[],
 
     // Dynamic parameters
-    nextMessage: () => Promise<{ message: MessageParam['content'], mode: EnhancedMode, latency?: ClaudeTurnLatencyInput } | null>,
+    /**
+     * `channelRequestId` marks a batch that carries an external messenger request
+     * (Saycode specs/desktop-messenger-channels). Its presence is what stops the slash-command
+     * parsing below from treating relayed user text as session control. Auto-routing ids are a
+     * different thing that ordinary input carries too, so they are deliberately not read here.
+     */
+    nextMessage: () => Promise<{
+        message: MessageParam['content'],
+        mode: EnhancedMode,
+        channelRequestId?: string,
+        latency?: ClaudeTurnLatencyInput,
+    } | null>,
     beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
+    prepareChannelExecution?: (requestId: string) => Promise<boolean>,
+    beginChannelExecution?: (requestId: string) => boolean,
     completeTurn?: CheckpointSessionComposition['completeTurn'],
     onReady: () => void,
     isAborted: (toolCallId: string) => boolean,
@@ -260,7 +273,17 @@ export async function claudeRemote(opts: {
     const initialText = typeof initial.message === 'string'
         ? initial.message
         : (initial.message.find((b) => b.type === 'text') as { type: 'text'; text: string } | undefined)?.text ?? '';
-    const specialCommand = parseSpecialCommand(initialText);
+    /*
+     * Relayed channel text is never read as session control.
+     *
+     * This is a *second* parser, distinct from the one in `runClaude.onUserMessage`: a channel
+     * turn reaches the queue through the session's own RPC and so never passes through that
+     * handler, but it does arrive here — where `/clear` calls `onSessionReset` and returns before
+     * the provider ever sees the message. Gating only the first parser would leave an external
+     * sender able to wipe a session's context with seven characters.
+     */
+    const fromChannel = initial.channelRequestId !== undefined;
+    const specialCommand = fromChannel ? { type: null } as const : parseSpecialCommand(initialText);
 
     // Handle /clear command
     if (specialCommand.type === 'clear') {
@@ -561,6 +584,13 @@ function readTurnText(content: unknown): string {
         env: process.env,
     });
 
+    // A channel batch can already be outside MessageQueue2 while checkpoint preparation awaits.
+    // Only this last synchronous boundary may claim it started; absent authority fails closed.
+    if (initial.channelRequestId !== undefined
+        && (await opts.prepareChannelExecution?.(initial.channelRequestId) !== true
+        || opts.beginChannelExecution?.(initial.channelRequestId) !== true)) {
+        return 'not-started' as const;
+    }
     // Start the loop
     const response = query({
         prompt: messages,

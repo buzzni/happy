@@ -24,6 +24,7 @@ describe('Claude model changes across provider restarts', () => {
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         queue.pushIsolated('/clear', { permissionMode: 'default', model: 'claude-sonnet-5' });
@@ -62,6 +63,7 @@ describe('Claude model changes across provider restarts', () => {
                 if (metadata.claudeBackgroundTasks) snapshots.push(metadata.claudeBackgroundTasks);
             }), getMetadata: () => metadata,
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
@@ -126,6 +128,7 @@ describe('Claude model changes across provider restarts', () => {
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(), sendTurnLatency: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt, options }) => {

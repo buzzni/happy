@@ -11,7 +11,6 @@ import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2, type PendingAttachment, type QueueLatencyTrace } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
-import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { specialCommandResponse } from '@/claude/specialCommandResponse';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
@@ -33,6 +32,9 @@ import {
 } from '@/claude/claudeGoalStatus';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudeDisallowedTools, resolveInitialClaudePermissionMode, resolveRemoteClaudeDisallowedTools, resolveRemoteClaudePermissionMode } from './utils/permissionMode';
+import { ChannelPromptAcceptance, CHANNEL_ACK_DEADLINE_MS } from '@/channel/channelPromptAcceptance';
+import { enqueueChannelTurn } from '@/channel/channelTurnEnqueue';
+import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
 import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
@@ -889,6 +891,95 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         },
     }));
 
+    /*
+     * Channel ingress acceptance (Saycode specs/desktop-messenger-channels — R10/R12).
+     *
+     * Deliberately an RPC rather than an ordinary persisted user message, and that is the whole
+     * safety property. Probing a session's capability and then sending a normal message are two
+     * separate operations: the proven process can exit and be replaced by an older one in
+     * between, and that older one would consume the text while ignoring `meta.channelOrigin` —
+     * reading a `/clear` as destructive control again. Here the check *is* the acceptance. A
+     * runtime without this handler answers "unknown method", so the work is never admitted at
+     * all, and Desktop has no ordinary-message fallback to take instead.
+     *
+     * The user's text is recorded as a `role: 'session'` protocol envelope, not a `role: 'user'`
+     * message: `routeIncomingMessage` only queues things matching `UserMessageSchema`, so this
+     * record is display-only and cannot be re-executed by any runtime, which is what keeps the
+     * message visible in Desktop without enqueuing it twice.
+     */
+    /*
+     * Proof, from the process that is actually running, that this session honours channel
+     * deliveries (Saycode specs/desktop-messenger-channels).
+     *
+     * Registered here rather than in the remote launcher so it exists in **both** run modes. The
+     * launcher only runs while the session is in remote mode, and a session sitting in local mode
+     * would then fail the probe and be unreachable — even though the enqueue below wakes it
+     * correctly (the queue's `onMessage` handler is what asks local Claude to hand back control).
+     *
+     * The machine-level advertisement cannot answer this: upgrading the daemon does not restart
+     * sessions that are already running. Persisted metadata is no better — it outlives the process
+     * that wrote it. Only a live call reaches the loop that will actually receive the message, and
+     * a process without this handler answers with an RPC error, which the caller reads as "no".
+     */
+    session.rpcHandlerManager.registerHandler('channel-capability', async () => ({
+        protocolVersion: 1,
+        supportsChannelCancellation: true,
+        supportsChannelExecutionApproval: true,
+        engine: 'claude',
+        // A managed run answers exactly the prompt it was admitted for, so it declines the
+        // capability outright rather than advertising one it will then refuse to honour.
+        honoursChannelOrigin: !managedStartup,
+        // Named so the delivery that follows binds to *this* process; a restart in between is
+        // then refused rather than handled by a runtime whose capability was never checked.
+        runtimeId: session.runtimeId,
+    }));
+
+    const channelAcceptance = new ChannelPromptAcceptance({
+        runtimeId: session.runtimeId,
+        requestApproval: ({ requestId, runtimeId, nonce }) => session.sendSessionProtocolMessage(
+            createEnvelope('agent', { t: 'channel-ready', requestId, runtimeId, nonce })),
+        isManagedRun: () => Boolean(managedStartup),
+        recordDurably: async ({ text, localId }) => {
+            // Registered before the enqueue, because a flush can start immediately afterwards and
+            // a waiter added later would miss its own acknowledgement.
+            const ack = session.awaitMessageAck(localId, CHANNEL_ACK_DEADLINE_MS);
+            recordAppPrompt(text);
+            session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }), localId);
+            const outcome = await ack;
+            if (outcome.ok) return { ok: true as const };
+            /*
+             * Every negative outcome here is ambiguous, including `closed` and `sync-failed`.
+             * Neither proves the write did not go out: `onSyncFatal` settles *all* waiters at
+             * once regardless of what each one had already flushed, and a close can arrive after
+             * the server has committed the row. Claiming `provenNotWritten` on either would let a
+             * retry re-admit work that is already queued.
+             *
+             * `provenNotWritten` stays in the contract for a genuinely synchronous pre-enqueue
+             * refusal, which this path does not have.
+             */
+            return { ok: false as const, provenNotWritten: false };
+        },
+        // Mirrors the ordinary input path's continuation handling: on the first accepted turn
+        // of a resumed session the provider receives the prior transcript, and the visible
+        // user row stays the text the person actually wrote.
+        enqueue: (input) => enqueueChannelTurn(input, currentEnhancedMode, {
+            queue: messageQueue,
+            deferredContinuation,
+            onDeferredText: recordAppPrompt,
+        }),
+        now: () => Date.now(),
+    });
+    session.rpcHandlerManager.registerHandler('channel-prompt', async (params: unknown) =>
+        channelAcceptance.accept(params));
+    session.rpcHandlerManager.registerHandler('channel-authorize', async (params: unknown) => channelAcceptance.authorize(params));
+    session.rpcHandlerManager.registerHandler('channel-cancel', async (params: unknown) => {
+        const result = channelAcceptance.cancel(params);
+        if (result.ok && result.state === 'cancelled') {
+            messageQueue.removeByRequestId((params as { requestId: string }).requestId);
+        }
+        return result;
+    });
+
     session.rpcHandlerManager.registerHandler('goal-action', async (params: unknown) => {
         const actionParams = params && typeof params === 'object' && !Array.isArray(params)
             ? params as Record<string, unknown>
@@ -1716,6 +1807,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onSessionReady: (sessionInstance) => {
             // Store reference for hook server callback
             currentSession = sessionInstance;
+            sessionInstance.prepareChannelExecution = (requestId) => channelAcceptance.prepareExecution(requestId);
+            sessionInstance.beginChannelExecution = (requestId) => channelAcceptance.beginExecution(requestId);
         },
         onAbort: resetTurnScopedOptions,
         onSessionReset: () => difficultyRoutingCommitter.startEpoch(),

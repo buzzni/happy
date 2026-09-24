@@ -43,6 +43,9 @@ export interface PermissionResult {
  * Subclasses must implement:
  * - `getLogPrefix()` - returns the log prefix (e.g., '[Codex]')
  */
+/** Which path a pending request left by. */
+export type PendingSettlementReason = 'answered' | 'aborted' | 'reset';
+
 export abstract class BasePermissionHandler {
     protected pendingRequests = new Map<string, PendingRequest>();
     protected session: ApiSessionClient;
@@ -52,6 +55,39 @@ export abstract class BasePermissionHandler {
      * Returns the log prefix for this handler.
      */
     protected abstract getLogPrefix(): string;
+
+    /**
+     * A pending request left the map. Optional, and a no-op unless a subclass wants it.
+     *
+     * Exists so a subclass that publishes something about a waiting prompt can retract it on every
+     * path the prompt leaves by — answered, aborted, reset — without duplicating the settlement
+     * logic each of those paths already owns (Saycode specs/desktop-messenger-channels R8).
+     *
+     * Never called before the request has been removed and resolved, so an implementation cannot
+     * observe a half-settled request, and never in a way that can affect that settlement: see
+     * `notifySettled`. Subclasses that do not override it — Gemini, the ACP handler — are
+     * unaffected and gain no channel behaviour.
+     */
+    protected onPendingSettled?(permissionId: string, reason: PendingSettlementReason): void;
+
+    /**
+     * Calls the hook and swallows whatever it does.
+     *
+     * A publisher that throws must not turn an answered permission into an unanswered one, or stop
+     * an abort or a reset partway through — the prompt is already resolved by the time this runs,
+     * and the caller has nothing left it could roll back. The diagnostic is a fixed string: the
+     * failure came from a channel publisher whose error may carry provider text, and this log is
+     * not a place to put that.
+     */
+    private notifySettled(permissionId: string, reason: PendingSettlementReason): void {
+        if (!this.onPendingSettled) return;
+        try {
+            this.onPendingSettled(permissionId, reason);
+        } catch {
+            logger.debug(`${this.getLogPrefix()} settlement notification failed for ${permissionId}`);
+        }
+    }
+
 
     constructor(session: ApiSessionClient) {
         this.session = session;
@@ -91,6 +127,9 @@ export abstract class BasePermissionHandler {
                     : { decision: response.decision === 'denied' ? 'denied' : 'abort' };
 
                 pending.resolve(result);
+                // After the request is gone and resolved, so a throwing subscriber cannot turn an
+                // answered permission into an unanswered one.
+                this.notifySettled(response.id, 'answered');
 
                 // Move request to completed in agent state
                 this.session.updateAgentState((currentState) => {
@@ -156,6 +195,9 @@ export abstract class BasePermissionHandler {
             } catch (err) {
                 logger.debug(`${this.getLogPrefix()} Error resolving aborted request ${id}:`, err);
             }
+            // Per request and after its own resolve, so one throwing subscriber cannot stop the
+            // rest of the abort.
+            this.notifySettled(id, 'aborted');
         }
 
         // Move pending requests to completed as canceled in agent state
@@ -206,6 +248,9 @@ export abstract class BasePermissionHandler {
                 } catch (err) {
                     logger.debug(`${this.getLogPrefix()} Error rejecting pending request ${id}:`, err);
                 }
+                // Per request and after its own reject, so one throwing subscriber cannot leave the
+                // rest of the reset half-done.
+                this.notifySettled(id, 'reset');
             }
 
             // Clear requests in agent state
