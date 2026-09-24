@@ -75,9 +75,12 @@ async function unpackArchive(archivePath, destDir) {
             fs.mkdirSync(destDir, { recursive: true });
         }
         
-        // Create read stream and extract
+        // Create read stream and extract. pipe() does not forward errors, so every
+        // stage rejects on its own; otherwise a corrupt archive is an uncaught exception.
         fs.createReadStream(archivePath)
+            .on('error', reject)
             .pipe(zlib.createGunzip())
+            .on('error', reject)
             .pipe(tar.extract({
                 cwd: destDir,
                 preserveMode: true,
