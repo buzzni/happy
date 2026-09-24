@@ -4,6 +4,14 @@ import { canonicalJson } from './policy'
 
 export interface AuthKeys { agentKey: string | Buffer; interactiveKey: string | Buffer }
 const forbiddenAgentOperations = new Set<Operation>(INTERACTIVE_OPERATIONS)
+const interactiveCapabilityOperations = new Set<Operation>([
+    ...INTERACTIVE_OPERATIONS,
+    'cancel',
+    'resume',
+    'getTask',
+    'subscribe',
+])
+const issuedAtClockSkewMs = 30_000
 
 function sign(payload: Credential, key: string | Buffer): string {
     const body = Buffer.from(canonicalJson(payload)).toString('base64url')
@@ -13,13 +21,13 @@ function sign(payload: Credential, key: string | Buffer): string {
 
 function validateCredential(credential: Credential, nowMs: number): void {
     const { issuedAtMs, expiresAtMs } = credential
-    if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || issuedAtMs > nowMs || expiresAtMs <= nowMs || expiresAtMs <= issuedAtMs || expiresAtMs - issuedAtMs > POC_LIMITS.maxGrantLifetimeMs) {
+    if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs) || issuedAtMs > nowMs + issuedAtClockSkewMs || expiresAtMs <= nowMs || expiresAtMs <= issuedAtMs || expiresAtMs - issuedAtMs > POC_LIMITS.maxGrantLifetimeMs) {
         throw new BrowserRuntimeError('UNAUTHORIZED', 'Credential is expired or outside its lifetime')
     }
     if (credential.kind === 'agent-grant' && credential.operations.some((operation) => forbiddenAgentOperations.has(operation))) {
         throw new BrowserRuntimeError('UNAUTHORIZED', 'Agent grant contains an interactive operation')
     }
-    if (credential.kind === 'interactive' && credential.operations.some((operation) => !forbiddenAgentOperations.has(operation) && !['getTask', 'subscribe'].includes(operation))) {
+    if (credential.kind === 'interactive' && credential.operations.some((operation) => !interactiveCapabilityOperations.has(operation))) {
         throw new BrowserRuntimeError('UNAUTHORIZED', 'Interactive capability contains a non-interactive operation')
     }
 }
@@ -58,7 +66,7 @@ export function assertOperation(auth: AuthContext, operation: Operation, expecte
     if (credential.kind === 'agent-grant') {
         if (expected.agentSessionId !== undefined && credential.agentSessionId !== expected.agentSessionId) throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent session does not own task')
         if (expected.taskSpaceId && credential.taskSpaceIds.length > 0 && !credential.taskSpaceIds.includes(expected.taskSpaceId)) throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space is outside grant scope')
-    } else if (!INTERACTIVE_OPERATIONS.includes(operation) && !['getTask', 'subscribe'].includes(operation)) {
+    } else if (!interactiveCapabilityOperations.has(operation)) {
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Interactive capability cannot perform agent operation')
     }
 }

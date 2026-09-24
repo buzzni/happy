@@ -194,6 +194,8 @@ export interface BatchStep {
     url?: string
     /** click/fill target. May be `$name.<label>` to reference a named observe result in the same batch. */
     ref?: ElementRef | string
+    /** Snapshot from which ref was obtained; stale refs must fail at the driver. */
+    snapshotId?: SnapshotId
     /** fill value — synthetic, non-secret in the PoC */
     value?: string
     /** observe: name so later steps can refer to its refs */
@@ -252,6 +254,7 @@ export interface TaskView {
     highWatermarkSeq: number
     browserInstanceId?: BrowserInstanceId
     tabs: TabId[]
+    tabLeases?: Array<{ tabId: TabId; leaseEpoch: number; owner: InputOwner }>
     currentBatchId?: BatchId
     lastBatch?: BatchResult
     pendingApproval?: PendingApprovalSummary

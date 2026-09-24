@@ -14,6 +14,7 @@ export class FakeBrowserDriver implements BrowserDriver {
     private serial = 0
     private readonly pages = new Map<TabId, FakePage>()
     private readonly targetIds = new Map<TabId, string>()
+    private readonly snapshotGenerations = new Map<SnapshotId, number>()
     private currentActionId?: string
     readonly dispatchCounts = new Map<string, number>()
     readonly targetLedger: Array<{ targetId: string; tabId: TabId; operation: Operation; actionId?: string }> = []
@@ -49,6 +50,7 @@ export class FakeBrowserDriver implements BrowserDriver {
 
     async openTab(url: string, _origins: string[], opts: DriverOptions): Promise<DriverTabHandle> {
         await this.delay('openTab', opts)
+        this.throwNextFailure('openTab')
         const tabId = `tab-${++this.serial}` as TabId
         const targetId = `target-${this.serial}`
         this.pages.set(tabId, { url, title: 'Fixture', text: 'fixture ready', documentGeneration: 1, elements: [] })
@@ -67,22 +69,26 @@ export class FakeBrowserDriver implements BrowserDriver {
         return adopted
     }
     async navigate(tabId: TabId, url: string, _origins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
-        await this.delay('navigate', opts); const page = this.requirePage(tabId); page.url = url; page.documentGeneration = (page.documentGeneration ?? 0) + 1; this.record(tabId, `target-${tabId}`, 'navigate'); await this.afterDispatch('navigate'); return { url, documentGeneration: page.documentGeneration }
+        await this.delay('navigate', opts); this.throwNextFailure('navigate'); const page = this.requirePage(tabId); page.url = url; page.documentGeneration = (page.documentGeneration ?? 0) + 1; this.record(tabId, `target-${tabId}`, 'navigate'); await this.afterDispatch('navigate'); return { url, documentGeneration: page.documentGeneration }
     }
     async observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation> {
-        await this.delay('observe', opts); const page = this.requirePage(tabId); const origin = new URL(page.url).origin
+        await this.delay('observe', opts); this.throwNextFailure('observe'); const page = this.requirePage(tabId); const origin = new URL(page.url).origin
         const frames = (page.frameOrigins ?? []).map((frameOrigin, index) => ({ frameKey: `frame-${index}`, origin: frameOrigin, allowed: allowedOrigins.includes(frameOrigin), outOfProcess: false }))
         const elements = (page.elements ?? []).filter((element) => allowedOrigins.includes(element.frameOrigin)).slice(0, opts.maxElements ?? 100)
-        return { snapshotId: `snapshot-${randomUUID()}` as SnapshotId, tabId, url: page.url, title: page.title ?? '', documentGeneration: page.documentGeneration ?? 1, elements, frames, truncated: false, text: allowedOrigins.includes(origin) ? (page.text ?? '').slice(0, opts.maxTextChars ?? 20_000) : '' }
+        const snapshotId = `snapshot-${randomUUID()}` as SnapshotId
+        this.snapshotGenerations.set(snapshotId, page.documentGeneration ?? 1)
+        return { snapshotId, tabId, url: page.url, title: page.title ?? '', documentGeneration: page.documentGeneration ?? 1, elements, frames, truncated: false, text: allowedOrigins.includes(origin) ? (page.text ?? '').slice(0, opts.maxTextChars ?? 20_000) : '' }
     }
     async screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult> {
-        await this.delay('screenshot', opts); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !allowedOrigins.includes(origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')
+        await this.delay('screenshot', opts); this.throwNextFailure('screenshot'); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !allowedOrigins.includes(origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')
         return { tabId, mimeType: 'image/png', data: Buffer.from('synthetic').toString('base64'), documentGeneration: page.documentGeneration ?? 1, targetId: `target-${tabId}`, capturedAtMs: Date.now() }
     }
-    async click(tabId: TabId, _ref: ElementRef, _snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.requirePage(tabId); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
-    async fill(tabId: TabId, ref: ElementRef, _snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {
+    async click(tabId: TabId, _ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); this.assertSnapshot(snapshotId, page.documentGeneration ?? 1); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
+    async fill(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {
         await this.delay('fill', opts)
+        this.throwNextFailure('fill')
         const page = this.requirePage(tabId)
+        this.assertSnapshot(snapshotId, page.documentGeneration ?? 1)
         const field = page.elements?.find((element) => element.ref === ref)
         if (field)
             field.value = value
@@ -93,8 +99,8 @@ export class FakeBrowserDriver implements BrowserDriver {
         if (!this.pages.has(tabId)) throw new BrowserRuntimeError('TARGET_GONE', 'Tab does not exist')
         this.notifyWaitEntered()
         this.record(tabId, `target-${tabId}`, 'waitFor')
-        const failure = this.failures.get('waitFor')?.shift()
-        if (failure) throw failure
+        await this.afterDispatch('waitFor')
+        this.throwNextFailure('waitFor')
         await new Promise<void>((resolve, reject) => {
             const release = () => { opts.signal?.removeEventListener('abort', abort); resolve() }
             const abort = () => { opts.signal?.removeEventListener('abort', abort); reject(opts.signal?.reason ?? new Error('aborted')) }
@@ -112,6 +118,15 @@ export class FakeBrowserDriver implements BrowserDriver {
     seedTab(tabId: TabId, page: FakePage): void { this.pages.set(tabId, structuredClone(page)) }
 
     private requirePage(tabId: TabId): FakePage { const page = this.pages.get(tabId); if (!page) throw new BrowserRuntimeError('TARGET_GONE', 'Tab does not exist'); return page }
+    private throwNextFailure(operation: Operation): void {
+        const failure = this.failures.get(operation)?.shift()
+        if (failure)
+            throw failure
+    }
+    private assertSnapshot(snapshotId: SnapshotId, currentGeneration: number): void {
+        if (this.snapshotGenerations.get(snapshotId) !== currentGeneration)
+            throw new BrowserRuntimeError('STALE_REF', 'Reference snapshot is stale', false, false)
+    }
     private async delay(operation: Operation, opts: DriverOptions): Promise<void> {
         const delay = this.delays.get(operation) ?? 0
         if (!delay) return

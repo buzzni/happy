@@ -22,6 +22,17 @@ describe('TaskStore writer and journal guarantees', () => {
         await first.close()
     })
 
+    it('takes over a stale lock whose PID was reused by this process', async () => {
+        const dir = await tempDir()
+        const previous = await TaskStore.open(dir)
+        await previous.close()
+        await writeFile(join(dir, 'writer.lock'), JSON.stringify({ pid: process.pid, fencingToken: 1, started: 1 }))
+
+        const restarted = await TaskStore.open(dir)
+        await expect(restarted.createTask(sample(), event)).resolves.toMatchObject({ taskId: 't1' })
+        await restarted.close()
+    })
+
     it('does not ACK a failed journal append', async () => {
         const dir = await tempDir(); const store = await TaskStore.open(dir, (operation) => { if (operation === 'event-append') throw new Error('ENOSPC') })
         await expect(store.createTask(sample(), event)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
