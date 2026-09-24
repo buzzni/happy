@@ -134,8 +134,6 @@ http.createServer(async (req, res) => {
       await sleep(u.searchParams.get("ms"));
       return html(res, "SLOW WRITE DONE");
     }
-    // Storage presence probe (reports present/none, never the stored values).
-    if (p === "/a10/storage-check" && site === "a") return html(res, `<div id="out">CHECKING</div><script>const out=(t)=>{document.querySelector('#out').textContent=t};const ls=localStorage.getItem('abp_ls')?'present':'none';const r=indexedDB.open('abp');r.onsuccess=()=>{const db=r.result;if(!db.objectStoreNames.contains('kv'))return out('LS='+ls+' IDB=none');const g=db.transaction('kv').objectStore('kv').get('canary');g.onsuccess=()=>out('LS='+ls+' IDB='+(g.result?'present':'none'));g.onerror=()=>out('LS='+ls+' IDB=none')};r.onerror=()=>out('LS='+ls+' IDB=none')<\/script>`);
     // ---- end a01a03a07a10 routes ----
     if (site !== "a") return send(res, 404, { error: "not found" });
     // ---- a02a04 routes ----
