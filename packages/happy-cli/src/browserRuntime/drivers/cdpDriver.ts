@@ -472,9 +472,17 @@ export class CdpDriver implements BrowserDriver {
             const { binding, objectId } = await this.resolveRef(conn, tab, ref, snapshotId)
             const point = await this.prepareInput(conn, tab, binding, objectId, false)
             this.assertFresh(tab, binding, snapshotId)
+            // Hover first and re-verify: pages may swap the node on pointermove, and
+            // pressing without re-checking would click whatever took its place.
+            // A hover is not treated as a write.
+            await conn.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y }, binding.sessionId)
+            const settled = await this.prepareInput(conn, tab, binding, objectId, false)
+            this.assertFresh(tab, binding, snapshotId)
+            if (Math.abs(settled.x - point.x) > 1 || Math.abs(settled.y - point.y) > 1) {
+                throw new BrowserRuntimeError('INVALID_REQUEST', 'element moved while the pointer arrived; not interacting', true, false)
+            }
             op.markDispatch()
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
-            await conn.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y }, binding.sessionId)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
         }, true)

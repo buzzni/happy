@@ -68,6 +68,16 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 d.onclick = () => hit('decoy')
                 document.getElementById('slot').appendChild(d)
             }</script></body>`)
+        a.route('/spa-hover', `${HIT_SCRIPT}<body style="margin:0"><div id="slot"><button id="pay" style="position:absolute;left:20px;top:20px;width:120px;height:40px" onclick="hit('pay')">Pay</button></div>
+            <script>document.addEventListener('pointermove', () => {
+                const old = document.getElementById('pay'); if (!old) return
+                old.remove()
+                const d = document.createElement('button')
+                d.textContent = 'Pay'
+                d.style.cssText = 'position:absolute;left:20px;top:20px;width:120px;height:40px'
+                d.onclick = () => hit('decoy')
+                document.getElementById('slot').appendChild(d)
+            }, { once: true })</script></body>`)
         for (const [name, color] of [['red', '#ff0000'], ['green', '#00ff00'], ['blue', '#0000ff']]) {
             a.route(`/color/${name}`, `<body style="margin:0;background:${color};height:100vh"></body>`)
         }
@@ -235,6 +245,20 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const fresh = await driver.observe(tab.tabId, [a.origin], OPTS)
             await driver.click(tab.tabId, refOf(fresh, 'Pay'), fresh.snapshotId, OPTS)
             expect(await eventually(() => a.hits('decoy'), (n) => n === 1)).toBe(1)
+        })
+
+        it('re-verifies the target after the pointer arrives, so a hover-triggered swap is never clicked', async () => {
+            const tab = await open('/spa-hover', [a.origin])
+            for (let i = 0; i < 5; i++) {
+                await driver.navigate(tab.tabId, a.url('/spa-hover'), [a.origin], OPTS)
+                const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+                const error = await expectCode(driver.click(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS), 'STALE_REF')
+                // Only a hover was sent; no press reached the page.
+                expect(error.mayHaveSideEffects).toBe(false)
+            }
+            await delay(200)
+            expect(a.hits('decoy')).toBe(0)
+            expect(a.hits('pay')).toBe(0)
         })
 
         it('rejects refs after navigation and after a newer snapshot', async () => {
