@@ -55,6 +55,9 @@ const ISOLATED_WORLD = '__abp_driver__'
 const DEFAULT_MAX_ELEMENTS = 200
 const DEFAULT_MAX_TEXT_CHARS = 4_000
 const WAIT_POLL_MS = 100
+const MAX_POPUP_REPORTS = 100
+const MAX_CLOSED_TABS = 1_000
+const CLOSE_CONFIRM_MS = 2_000
 
 interface RefBinding {
     frameId: string
@@ -228,11 +231,26 @@ export class CdpDriver implements BrowserDriver {
                 await this.navigateInternal(conn, tab, url, allowedOrigins, op)
                 return { tabId: tab.tabId, targetId }
             } catch (error) {
-                if (tab) this.forgetTab(tab)
-                await conn.send('Target.closeTarget', { targetId }).catch(() => undefined)
+                await this.discardTarget(conn, targetId, tab)
                 throw error
             }
         })
+    }
+
+    /** Closes a target we created but will not hand out, and waits for it to be gone. */
+    private async discardTarget(conn: CdpConnection, targetId: string, tab: TabState | undefined): Promise<void> {
+        const gone = tab
+            ? new Promise<void>((resolve) => {
+                tab.goneListeners.add(resolve)
+                setTimeout(resolve, CLOSE_CONFIRM_MS)
+            })
+            : Promise.resolve()
+        await conn.send('Target.closeTarget', { targetId }).catch(() => undefined)
+        await gone
+        if (tab) {
+            this.closedTabs.delete(tab.tabId)
+            this.forgetTab(tab)
+        }
     }
 
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
@@ -619,6 +637,12 @@ export class CdpDriver implements BrowserDriver {
         tab.goneListeners.clear()
     }
 
+    /** Lets a retried closeTab of an already-closed owned tab return the same result. */
+    private rememberClosed(tabId: TabId): void {
+        this.closedTabs.add(tabId)
+        if (this.closedTabs.size > MAX_CLOSED_TABS) this.closedTabs.delete(this.closedTabs.values().next().value!)
+    }
+
     private dropAllTabs(): void {
         for (const tab of [...this.tabs.values()]) this.forgetTab(tab)
         this.sessions.clear()
@@ -659,7 +683,7 @@ export class CdpDriver implements BrowserDriver {
             const info = this.sessions.get(params.sessionId)
             if (!info) return
             if (info.isMain) {
-                this.closedTabs.add(info.tab.tabId)
+                this.rememberClosed(info.tab.tabId)
                 this.forgetTab(info.tab)
                 return
             }
@@ -671,10 +695,11 @@ export class CdpDriver implements BrowserDriver {
             if (!current()) return
             const tab = this.tabsByTarget.get(params.targetId)
             if (tab) {
-                this.closedTabs.add(tab.tabId)
+                this.rememberClosed(tab.tabId)
                 this.forgetTab(tab)
             }
-            this.popups.delete(params.targetId)
+            const popup = this.popups.get(params.targetId)
+            if (popup) popup.closed = true
         }
         conn.on('Target.targetDestroyed', onTargetEnded)
         conn.on('Target.targetCrashed', onTargetEnded)
@@ -709,6 +734,7 @@ export class CdpDriver implements BrowserDriver {
         const report = this.popups.get(info.targetId) ?? { openerTabId: opener.tabId, targetId: info.targetId, origin, closed: false }
         report.origin = origin || report.origin
         this.popups.set(info.targetId, report)
+        if (this.popups.size > MAX_POPUP_REPORTS) this.popups.delete(this.popups.keys().next().value!)
         const pending = !info.url || info.url === 'about:blank'
         if (!pending && !report.closed && !opener.allowedOrigins.includes(origin)) {
             report.closed = true

@@ -119,6 +119,7 @@ export interface Site {
     url(path: string): string
     /** Server-side click ledger: `/hit/<name>` increments `<name>`. */
     hits(name: string): number
+    resetHits(): void
     route(path: string, handler: Route | ((site: Site) => Route)): void
     close(): Promise<void>
 }
@@ -157,6 +158,7 @@ export async function startSite(host: string): Promise<Site> {
         origin: `http://${host}:${port}`,
         url: (path) => `http://${host}:${port}${path}`,
         hits: (name) => ledger.get(name) ?? 0,
+        resetHits: () => ledger.clear(),
         route: (path, handler) => { routes.set(path, handler) },
         close: () => new Promise((resolve) => {
             server.closeAllConnections()

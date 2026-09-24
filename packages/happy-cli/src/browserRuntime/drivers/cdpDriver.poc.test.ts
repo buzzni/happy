@@ -4,9 +4,9 @@
  * its own local port; ledgers are server-side so a click counts only if the
  * page really received a trusted input event.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserInstanceId, type ElementRef, type TabId } from '../contracts'
+import { BrowserRuntimeError, type BrowserInstanceId, type ElementRef, type Observation, type TabId } from '../contracts'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
 
@@ -44,6 +44,63 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         harness = await HarnessCdp.connect(chrome.browserWsUrl)
 
         a.route('/plain', `<title>Plain A</title><body>Alpha plain page</body>`)
+        c.route('/plain', `<title>Plain C</title><body>Charlie page</body>`)
+        b.route('/frame', `${HIT_SCRIPT}<body style="margin:0"><p>Bravo frame canary-b-7788</p><button onclick="hit('b-buy')">Buy</button></body>`)
+        a.route('/inner', `${HIT_SCRIPT}<body><button onclick="hit('inner')">Inner</button></body>`)
+        a.route('/oopif', () => `<title>OOPIF A</title>${HIT_SCRIPT}<body style="margin:0">
+            <p>Alpha visible text</p>
+            <button onclick="hit('a-buy')">Buy</button>
+            <div id="host"></div>
+            <script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '<button onclick="hit(\\'a-shadow\\')">Shadow Buy</button>'</script>
+            <button style="display:none" onclick="hit('a-hidden')">Hidden</button>
+            <button disabled onclick="hit('a-disabled')">Disabled</button>
+            <label>Password <input type="password" id="pw"></label>
+            <script>document.getElementById('pw').value = 'synthetic-pass-canary-123'</script>
+            <iframe id="fb" src="${b.url('/frame')}" style="width:400px;height:150px;border:0"></iframe>
+        </body>`)
+        a.route('/frames', () => `${HIT_SCRIPT}<body><iframe id="same" src="${a.url('/inner')}"></iframe><iframe id="cross" src="${b.url('/frame')}"></iframe></body>`)
+        a.route('/spa', `${HIT_SCRIPT}<body style="margin:0"><div id="slot"><button id="pay" style="position:absolute;left:20px;top:20px;width:120px;height:40px" onclick="hit('pay')">Pay</button></div>
+            <script>window.swap = () => {
+                document.getElementById('pay').remove()
+                const d = document.createElement('button')
+                d.textContent = 'Pay'
+                d.style.cssText = 'position:absolute;left:20px;top:20px;width:120px;height:40px'
+                d.onclick = () => hit('decoy')
+                document.getElementById('slot').appendChild(d)
+            }</script></body>`)
+        for (const [name, color] of [['red', '#ff0000'], ['green', '#00ff00'], ['blue', '#0000ff']]) {
+            a.route(`/color/${name}`, `<body style="margin:0;background:${color};height:100vh"></body>`)
+        }
+        a.route('/redirect-to-c', () => ({ status: 302, headers: { location: c.url('/plain') } }))
+        a.route('/popup', () => `<body><button onclick="window.open('${c.url('/plain')}', '_blank')">Open C</button><button onclick="window.open('${a.url('/plain')}', '_blank')">Open A</button></body>`)
+        a.route('/later', `<body><p>Waiting</p><script>setTimeout(() => { document.body.insertAdjacentHTML('beforeend', '<p>Arrived later</p>'); history.pushState({}, '', '/later/done') }, 400)</script></body>`)
+        a.route('/reveal', `${HIT_SCRIPT}<body><button id="r" style="visibility:hidden" onclick="hit('reveal')">Reveal</button><script>setTimeout(() => { document.getElementById('r').style.visibility = 'visible' }, 300)</script></body>`)
+        a.route('/form', `${HIT_SCRIPT}<body><input id="name" aria-label="Name" value="old"><button onclick="hit('v-' + encodeURIComponent(document.getElementById('name').value))">Send</button></body>`)
+        a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
+        a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
+            <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
+    })
+
+    const opened: TabId[] = []
+    async function open(path: string, origins: string[]) {
+        const tab = await driver.openTab(a.url(path), origins, OPTS)
+        opened.push(tab.tabId)
+        return tab
+    }
+    function refOf(obs: Observation, name: string, origin?: string): ElementRef {
+        const found = obs.elements.filter((e) => e.name === name && (!origin || e.frameOrigin === origin))
+        expect(found, `exactly one element named ${name}`).toHaveLength(1)
+        return found[0].ref
+    }
+
+    beforeEach(() => {
+        for (const site of [a, b, c]) site.resetHits()
+    })
+
+    afterEach(async () => {
+        for (const tabId of opened.splice(0)) {
+            if (driver.hasTab(tabId)) await driver.closeTab(tabId, OPTS).catch(() => undefined)
+        }
     })
 
     afterAll(async () => {
@@ -72,6 +129,330 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await expectCode(driver.observe('tab-unknown' as TabId, [a.origin], OPTS), 'TARGET_GONE')
             await expectCode(driver.click('tab-unknown' as TabId, '@e1' as ElementRef, 'snap' as never, OPTS), 'TARGET_GONE')
             expect(driver.hasTab('tab-unknown' as TabId)).toBe(false)
+        })
+    })
+
+    describe('OOPIF and snapshot', () => {
+        it('attaches the cross-site iframe as a separate child target and observes both frames', async () => {
+            const tab = await open('/oopif', [a.origin, b.origin])
+            const targets = await harness.targets()
+            const child = targets.find((t) => t.type === 'iframe' && t.url === b.url('/frame'))
+            expect(child, 'real OOPIF child target').toBeDefined()
+            console.info(`[browser-poc] OOPIF child target observed: ${!!child}`)
+
+            const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            const frameB = obs.frames.find((f) => f.origin === b.origin)
+            expect(frameB).toMatchObject({ allowed: true, outOfProcess: true })
+            expect(frameB?.text).toContain('Bravo frame')
+            expect(obs.frames[0]).toMatchObject({ origin: a.origin, allowed: true, outOfProcess: false })
+            const buyA = refOf(obs, 'Buy', a.origin)
+            const buyB = refOf(obs, 'Buy', b.origin)
+            expect(buyA).not.toBe(buyB)
+            expect(buyB).toMatch(/^@f\d+:e\d+$/)
+            expect(obs.elements.find((e) => e.name === 'Shadow Buy')).toBeDefined()
+            expect(obs.elements.find((e) => e.name === 'Hidden')).toMatchObject({ visible: false })
+            expect(obs.elements.find((e) => e.name === 'Disabled')).toMatchObject({ disabled: true })
+            const password = obs.elements.find((e) => e.name === 'Password')
+            expect(password).toBeDefined()
+            expect(password?.value).toBeUndefined()
+            expect(JSON.stringify(obs)).not.toContain('synthetic-pass-canary')
+        })
+
+        it('returns no text or refs from a frame whose origin is not allowed', async () => {
+            const tab = await open('/oopif', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const frameB = obs.frames.find((f) => f.origin === b.origin)
+            expect(frameB).toMatchObject({ allowed: false })
+            expect(frameB?.text).toBeUndefined()
+            expect(obs.elements.every((e) => e.frameOrigin === a.origin)).toBe(true)
+            const serialized = JSON.stringify(obs)
+            expect(serialized).not.toContain('canary-b-7788')
+            expect(serialized).not.toContain('Bravo')
+        })
+
+        it('truncates at the element budget and can observe a subtree via scopeRef', async () => {
+            const tab = await open('/many', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], { ...OPTS, maxElements: 8 })
+            expect(obs.truncated).toBe(true)
+            expect(obs.elements).toHaveLength(8)
+            const section = refOf(obs, 'Second list')
+            const scoped = await driver.observe(tab.tabId, [a.origin], { ...OPTS, scopeRef: section, maxElements: 100 })
+            expect(scoped.truncated).toBe(false)
+            expect(scoped.elements).toHaveLength(30)
+            expect(scoped.elements.every((e) => e.name.startsWith('Second '))).toBe(true)
+        })
+    })
+
+    describe('trusted input', () => {
+        it('clicks only the addressed frame when two frames have a same-label button', async () => {
+            const tab = await open('/oopif', [a.origin, b.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Buy', b.origin), obs.snapshotId, OPTS)
+            expect(await eventually(() => b.hits('b-buy'), (n) => n === 1)).toBe(1)
+            await driver.click(tab.tabId, refOf(obs, 'Buy', a.origin), obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('a-buy'), (n) => n === 1)).toBe(1)
+            await driver.click(tab.tabId, refOf(obs, 'Shadow Buy'), obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('a-shadow'), (n) => n === 1)).toBe(1)
+            await delay(200)
+            expect(b.hits('b-buy')).toBe(1)
+            expect(a.hits('a-buy')).toBe(1)
+        })
+
+        it('refuses hidden and disabled elements without dispatching', async () => {
+            const tab = await open('/oopif', [a.origin, b.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            await expectCode(driver.click(tab.tabId, refOf(obs, 'Hidden'), obs.snapshotId, OPTS), 'INVALID_REQUEST')
+            await expectCode(driver.click(tab.tabId, refOf(obs, 'Disabled'), obs.snapshotId, OPTS), 'INVALID_REQUEST')
+            await delay(200)
+            expect(a.hits('a-hidden')).toBe(0)
+            expect(a.hits('a-disabled')).toBe(0)
+        })
+
+        it('fills a text field with trusted input, replacing its value', async () => {
+            const tab = await open('/form', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.fill(tab.tabId, refOf(obs, 'Name'), obs.snapshotId, 'Neo', OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Send'), obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('v-Neo'), (n) => n === 1)).toBe(1)
+            expect(a.hits('v-old')).toBe(0)
+        })
+    })
+
+    describe('stale refs', () => {
+        it('rejects a ref whose node was replaced by a same-position decoy (10x, decoy clicks 0)', async () => {
+            const tab = await open('/spa', [a.origin])
+            for (let i = 0; i < 10; i++) {
+                await driver.navigate(tab.tabId, a.url('/spa'), [a.origin], OPTS)
+                const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+                const pay = refOf(obs, 'Pay')
+                await harness.evaluate(tab.targetId, 'swap()')
+                await expectCode(driver.click(tab.tabId, pay, obs.snapshotId, OPTS), 'STALE_REF')
+            }
+            await delay(200)
+            expect(a.hits('decoy')).toBe(0)
+            expect(a.hits('pay')).toBe(0)
+            // A fresh observe sees the new button; clicking it is legitimate.
+            const fresh = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(fresh, 'Pay'), fresh.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('decoy'), (n) => n === 1)).toBe(1)
+        })
+
+        it('rejects refs after navigation and after a newer snapshot', async () => {
+            const tab = await open('/spa', [a.origin])
+            const first = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const second = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await expectCode(driver.click(tab.tabId, refOf(first, 'Pay'), first.snapshotId, OPTS), 'STALE_REF')
+            await driver.navigate(tab.tabId, a.url('/spa'), [a.origin], OPTS)
+            await expectCode(driver.click(tab.tabId, refOf(second, 'Pay'), second.snapshotId, OPTS), 'STALE_REF')
+            await delay(200)
+            expect(a.hits('pay')).toBe(0)
+        })
+
+        it('rejects refs into an iframe that was detached and re-attached (same-process and OOPIF)', async () => {
+            const origins = [a.origin, b.origin]
+            const tab = await open('/frames', origins)
+            const obs = await driver.observe(tab.tabId, origins, OPTS)
+            expect(obs.frames.find((f) => f.origin === b.origin)?.outOfProcess).toBe(true)
+            const inner = refOf(obs, 'Inner')
+            const buyB = refOf(obs, 'Buy', b.origin)
+            const reattach = (id: string) => harness.evaluate(tab.targetId, `new Promise((resolve) => {
+                const old = document.getElementById('${id}'); const src = old.src; old.remove()
+                const f = document.createElement('iframe'); f.id = '${id}'; f.onload = () => resolve(1); f.src = src; document.body.appendChild(f)
+            })`)
+            await reattach('same')
+            await reattach('cross')
+            await expectCode(driver.click(tab.tabId, inner, obs.snapshotId, OPTS), 'STALE_REF')
+            await expectCode(driver.click(tab.tabId, buyB, obs.snapshotId, OPTS), 'STALE_REF')
+            await delay(200)
+            expect(a.hits('inner')).toBe(0)
+            expect(b.hits('b-buy')).toBe(0)
+        })
+    })
+
+    describe('target screenshot', () => {
+        it('captures the addressed background tab, not the tab in front (10x)', async () => {
+            const red = await open('/color/red', [a.origin])
+            const green = await open('/color/green', [a.origin])
+            const front = await harness.openFrontTab(a.url('/color/blue'))
+            try {
+                for (let i = 0; i < 10; i++) {
+                    for (const [tab, rgb] of [[red, [255, 0, 0]], [green, [0, 255, 0]]] as const) {
+                        const shot = await driver.screenshot(tab.tabId, [a.origin], OPTS)
+                        expect(shot.targetId).toBe(tab.targetId)
+                        expect(shot.mimeType).toBe('image/png')
+                        const png = decodePng(shot.data)
+                        const [r, g, bl] = png.pixel(10, 10)
+                        expect([r, g, bl]).toEqual(rgb)
+                    }
+                }
+            } finally {
+                await harness.closeTarget(front)
+            }
+        })
+
+        it('returns ORIGIN_DENIED when any frame origin is not allowed, and an image when all are', async () => {
+            const tab = await open('/oopif', [a.origin, b.origin])
+            await expectCode(driver.screenshot(tab.tabId, [a.origin], OPTS), 'ORIGIN_DENIED')
+            const shot = await driver.screenshot(tab.tabId, [a.origin, b.origin], OPTS)
+            expect(decodePng(shot.data).width).toBeGreaterThan(0)
+        })
+
+        it('discards the image when the frame tree changes during capture', async () => {
+            let targetId = ''
+            const hooked = new CdpDriver({
+                browserWsUrl: chrome.browserWsUrl,
+                browserInstanceIdProvider: async () => instanceId,
+                testHooks: {
+                    afterCapture: async () => {
+                        await harness.evaluate(targetId, `new Promise((resolve) => { const f = document.getElementById('fb'); f.onload = () => resolve(1); f.src = f.src.split('?')[0] + '?n=' + Date.now() })`)
+                    },
+                },
+            })
+            await hooked.connect()
+            try {
+                const tab = await hooked.openTab(a.url('/oopif'), [a.origin, b.origin], OPTS)
+                targetId = tab.targetId
+                const error = await expectCode(hooked.screenshot(tab.tabId, [a.origin, b.origin], OPTS), 'ORIGIN_DENIED')
+                expect(error.retryable).toBe(true)
+                await hooked.closeTab(tab.tabId, OPTS)
+            } finally {
+                await hooked.close()
+            }
+        })
+    })
+
+    describe('navigation origin checks and popups', () => {
+        it('refuses to open a disallowed origin or a redirect to one, leaving no owned tab', async () => {
+            const before = driver.debugCounts()
+            await expectCode(driver.openTab(c.url('/plain'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            await expectCode(driver.openTab(a.url('/redirect-to-c'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            expect(driver.debugCounts()).toEqual(before)
+            const pages = await harness.targets()
+            expect(pages.some((t) => t.url.startsWith(c.origin))).toBe(false)
+        })
+
+        it('stops a navigation that redirects to a disallowed origin', async () => {
+            const tab = await open('/plain', [a.origin])
+            const error = await expectCode(driver.navigate(tab.tabId, a.url('/redirect-to-c'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            expect(error.mayHaveSideEffects).toBe(true)
+            await expectCode(driver.observe(tab.tabId, [a.origin], OPTS), 'ORIGIN_DENIED')
+            await expectCode(driver.screenshot(tab.tabId, [a.origin], OPTS), 'ORIGIN_DENIED')
+        })
+
+        it('does not adopt popups and closes those on disallowed origins', async () => {
+            const tab = await open('/popup', [a.origin])
+            const before = driver.debugCounts()
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Open C'), obs.snapshotId, OPTS)
+            const reports = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === c.origin && p.closed))
+            expect(reports.find((p) => p.origin === c.origin)).toMatchObject({ openerTabId: tab.tabId, closed: true })
+            const gone = await eventually(() => harness.targets(), (t) => !t.some((x) => x.url.startsWith(c.origin)))
+            expect(gone.some((t) => t.url.startsWith(c.origin))).toBe(false)
+
+            await driver.click(tab.tabId, refOf(obs, 'Open A'), obs.snapshotId, OPTS)
+            const withA = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === a.origin))
+            const popupA = withA.find((p) => p.origin === a.origin)!
+            expect(popupA.closed).toBe(false)
+            expect(driver.debugCounts()).toEqual(before)
+            await harness.closeTarget(popupA.targetId)
+        })
+    })
+
+    describe('waitFor', () => {
+        it('resolves text and url predicates', async () => {
+            const tab = await open('/later', [a.origin])
+            await driver.waitFor(tab.tabId, { kind: 'text', text: 'Arrived later' }, [a.origin], OPTS)
+            await driver.waitFor(tab.tabId, { kind: 'url', urlPrefix: a.url('/later/done') }, [a.origin], OPTS)
+        })
+
+        it('resolves a ref predicate once the element becomes visible', async () => {
+            const tab = await open('/reveal', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const reveal = refOf(obs, 'Reveal')
+            await driver.waitFor(tab.tabId, { kind: 'ref', ref: reveal }, [a.origin], OPTS)
+            await driver.click(tab.tabId, reveal, obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('reveal'), (n) => n === 1)).toBe(1)
+        })
+
+        it('rejects within 50ms of abort and honours timeoutMs', async () => {
+            const tab = await open('/plain', [a.origin])
+            const controller = new AbortController()
+            const pending = driver.waitFor(tab.tabId, { kind: 'text', text: 'never-appears' }, [a.origin], { timeoutMs: 30_000, signal: controller.signal })
+            await delay(250)
+            const abortedAt = Date.now()
+            controller.abort()
+            await expectCode(pending, 'OUTCOME_UNKNOWN')
+            expect(Date.now() - abortedAt).toBeLessThan(50)
+
+            const started = Date.now()
+            const error = await expectCode(driver.waitFor(tab.tabId, { kind: 'text', text: 'never-appears' }, [a.origin], { timeoutMs: 300 }), 'OUTCOME_UNKNOWN')
+            expect(error.mayHaveSideEffects).toBe(false)
+            expect(Date.now() - started).toBeGreaterThanOrEqual(290)
+            expect(Date.now() - started).toBeLessThan(1_000)
+        })
+
+        it('does not match text inside a frame whose origin is not allowed', async () => {
+            const tab = await open('/oopif', [a.origin])
+            await expectCode(driver.waitFor(tab.tabId, { kind: 'text', text: 'canary-b-7788' }, [a.origin], { timeoutMs: 600 }), 'OUTCOME_UNKNOWN')
+        })
+    })
+
+    describe('closeTab', () => {
+        it('closes the target and releases tab and session registrations (5 cycles, OOPIF page)', async () => {
+            const baseline = driver.debugCounts()
+            for (let i = 0; i < 5; i++) {
+                const tab = await driver.openTab(a.url('/oopif'), [a.origin, b.origin], OPTS)
+                await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+                expect(driver.debugCounts().sessions).toBeGreaterThan(baseline.sessions + 1)
+                expect(await driver.closeTab(tab.tabId, OPTS)).toEqual({ closed: true })
+                expect(driver.hasTab(tab.tabId)).toBe(false)
+                expect(await driver.closeTab(tab.tabId, OPTS)).toEqual({ closed: true })
+                const targets = await harness.targets()
+                expect(targets.some((t) => t.targetId === tab.targetId)).toBe(false)
+            }
+            expect(driver.debugCounts()).toEqual(baseline)
+        })
+
+        it('does not accept a beforeunload prompt and reports it', async () => {
+            const tab = await open('/beforeunload', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Touch'), obs.snapshotId, OPTS)
+            await eventually(() => a.hits('bu'), (n) => n === 1)
+            expect(await driver.closeTab(tab.tabId, OPTS)).toEqual({ closed: false, beforeUnloadBlocked: true })
+            expect(driver.hasTab(tab.tabId)).toBe(true)
+            await harness.closeTarget(tab.targetId)
+            expect(await eventually(() => driver.hasTab(tab.tabId), (owned) => !owned)).toBe(false)
+        })
+    })
+
+    describe('connection loss', () => {
+        it('rejects pending calls with RUNTIME_UNAVAILABLE, drops tabs, and reconnects only explicitly', async () => {
+            const first = await launchChrome()
+            let second: LaunchedChrome | undefined
+            let n = 0
+            const lossy = new CdpDriver({ browserWsUrl: first.browserWsUrl, browserInstanceIdProvider: async () => `bi-loss-${++n}` as BrowserInstanceId })
+            try {
+                const firstId = await lossy.connect()
+                const tab = await lossy.openTab(a.url('/plain'), [a.origin], OPTS)
+                const pending = lossy.waitFor(tab.tabId, { kind: 'text', text: 'never-appears' }, [a.origin], { timeoutMs: 30_000 })
+                await delay(200)
+                await first.kill()
+                await expectCode(pending, 'RUNTIME_UNAVAILABLE')
+                expect(lossy.hasTab(tab.tabId)).toBe(false)
+                expect(lossy.debugCounts()).toEqual({ tabs: 0, sessions: 0 })
+                await expectCode(lossy.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+
+                second = await launchChrome()
+                const secondId = await lossy.reconnect(second.browserWsUrl)
+                expect(secondId).not.toBe(firstId)
+                expect(lossy.browserInstanceId()).toBe(secondId)
+                expect(lossy.hasTab(tab.tabId)).toBe(false)
+                await expectCode(lossy.observe(tab.tabId, [a.origin], OPTS), 'TARGET_GONE')
+            } finally {
+                await lossy.close()
+                await first.stop()
+                await second?.stop()
+            }
         })
     })
 })
