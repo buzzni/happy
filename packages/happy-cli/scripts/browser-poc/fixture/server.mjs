@@ -189,6 +189,7 @@ http.createServer(async (req, res) => {
     // Site A pages for the A05/A06/A08/A09/A11 suites. Clicks go to /api/click (ledger kind "click", target = label).
     if (p.startsWith("/x5/")) {
       const post = (target) => `fetch('/api/click',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run:${esc(script(run))},target:${esc(script(target))}})})`;
+      const postJs = (target) => `fetch('/api/click',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run:${script(run)},target:${script(target)}})})`;
       const onBarrier = (k, js) => k ? `<script>const t=setInterval(async()=>{const s=await(await fetch('/api/barrier-state?run='+encodeURIComponent(${script(run)})+'&key='+encodeURIComponent(${script(k)}))).json();if(s.released){clearInterval(t);${js}}},200)<\/script>` : "";
       const label = String(u.searchParams.get("label") || "panel");
       if (p === "/x5/panel") return html(res, `<style>body{margin:0;height:100vh;background:#${esc(String(u.searchParams.get("color") || "fff").replace(/[^0-9a-fA-F]/g, "").slice(0, 6))}}</style><h1>${esc(label)}</h1><div id="gate">GATE CLOSED</div><button onclick="${post(label)}">Press ${esc(label)}</button>${onBarrier(u.searchParams.get("key"), "document.querySelector('#gate').textContent='GATE OPEN'")}`);
@@ -197,11 +198,18 @@ http.createServer(async (req, res) => {
         const items = Array.from({ length: n }, (_, i) => `<button type="button" onclick="${post(`item-${i + 1}`)}">Item ${i + 1}</button>`).join("");
         return html(res, `<button disabled onclick="${post("disabled")}">Disabled action</button><button style="visibility:hidden" onclick="${post("hidden")}">Hidden action</button><form aria-label="Items" onsubmit="return false">${items}</form>`);
       }
-      if (p === "/x5/frame-reattach") return html(res, `<iframe id="fb" title="Site B" src="${esc(originB)}/frame-b?run=${encodeURIComponent(run)}"></iframe>${onBarrier(u.searchParams.get("key"), `const o=document.querySelector('#fb');const f=document.createElement('iframe');f.id='fb';f.title='Site B';f.src=o.src;o.remove();document.body.append(f);document.body.append(Object.assign(document.createElement('p'),{textContent:'REATTACHED'}))`)}`);
+      if (p === "/x5/frame-reattach") return html(res, `<iframe id="fb" title="Site B" src="${esc(originB)}/frame-b?run=${encodeURIComponent(run)}"></iframe>${onBarrier(u.searchParams.get("key"), `const o=document.querySelector('#fb');const f=document.createElement('iframe');f.id='fb';f.title='Site B';f.src=o.src;o.remove();document.body.append(f);document.body.append(Object.assign(document.createElement('p'),{textContent:'REATTACHED'}));f.onload=()=>${postJs("frame-reattached")}`)}`);
       if (p === "/x5/risky-mutating") {
         const mode = u.searchParams.get("mode") || "none";
         const change = mode === "reload" ? "location.reload()" : mode === "origin" ? `location.href=${script(`${originB}/frame-b?run=${encodeURIComponent(run)}`)}` : mode === "value" ? "document.querySelector('[name=amount]').value='999';document.body.append('VALUE CHANGED')" : mode === "node" ? "const o=document.querySelector('#pay');const b=o.cloneNode(true);o.replaceWith(b);document.body.append('NODE CHANGED')" : "";
-        return html(res, `<form id="f"><label>Amount <input name="amount" value="10"></label><button id="pay">Confirm payment</button></form><script>document.querySelector('#f').onsubmit=e=>{e.preventDefault();fetch('/api/risky',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run:${script(run)},amount:document.querySelector('[name=amount]').value})})}<\/script>${onBarrier(u.searchParams.get("key"), change)}`);
+        return html(res, `<form id="f"><label>Amount <input name="amount" value="10"></label><button id="pay">Confirm payment</button></form><script>document.querySelector('#f').onsubmit=e=>{e.preventDefault();fetch('/api/risky',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run:${script(run)},amount:document.querySelector('[name=amount]').value})}).then(r=>r.ok&&document.body.append(' PAYMENT SENT'))}<\/script>${onBarrier(u.searchParams.get("key"), change)}`);
+      }
+      if (p === "/x5/spa") {
+        // Deterministic SPA swap: mode=swap replaces the button when the barrier is released; mode=hover arms the
+        // swap on release and performs it on the next pointer move (i.e. during the click's hover).
+        const swap = `const d=document.createElement('button');d.textContent='Decoy';d.style.cssText='width:120px;height:40px';d.onclick=()=>${postJs("decoy")};document.querySelector('#target').replaceWith(d)`;
+        const onRelease = u.searchParams.get("mode") === "hover" ? `addEventListener('pointermove',()=>{${swap}},{once:true});document.body.append('ARMED');${postJs("spa-armed")}` : `${swap};document.body.append('SWAPPED');${postJs("spa-swapped")}`;
+        return html(res, `<button id="target" style="width:120px;height:40px" onclick="${post("target")}">Target</button>${onBarrier(u.searchParams.get("key"), onRelease)}`);
       }
       return send(res, 404, { error: "not found" });
     }
