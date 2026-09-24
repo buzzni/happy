@@ -9,6 +9,10 @@ python3 /usr/local/bin/cdp-proxy &
 python3 /usr/local/bin/instance-server &
 while :; do
   rm -f /home/browser/profile/Singleton*
+  # Drop the previous identity before the new Chromium can accept CDP
+  # connections, so a reconnecting Runtime can never pair the new browser
+  # with the old browserInstanceId.
+  rm -f /run/abp/instance.json
   browser_id=$(cat /proc/sys/kernel/random/uuid)
   chromium --user-data-dir=/home/browser/profile --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --site-per-process --no-first-run --no-default-browser-check --disable-dev-shm-usage --disable-crash-reporter --disable-breakpad --no-sandbox --display=:99 --host-resolver-rules="${ABP_HOST_RULES:-MAP *.poc-one.test 127.0.0.1,MAP *.poc-two.test 127.0.0.1,MAP *.poc-three.test 127.0.0.1}" about:blank >/tmp/chromium.log 2>&1 &
   chrome_pid=$!
