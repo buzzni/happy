@@ -36,3 +36,9 @@ test('every inline page script is valid JavaScript', async () => {
         }
     }
 })
+test('risky submit page shows a confirmation only after the server accepted the write', async () => {
+    const body = await (await req(page + '/risky-submit?run=confirm')).text()
+    // The text appears from the response handler, so a lost or held response never looks confirmed.
+    expect(body).toContain('.then(r=>r.json()).then(()=>{')
+    expect(body.indexOf('PAYMENT RECORDED')).toBeGreaterThan(body.indexOf("fetch('/api/risky'"))
+})
