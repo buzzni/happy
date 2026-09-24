@@ -289,7 +289,7 @@ export interface ObservedElement {
     disabled?: boolean
     visible: boolean
     frameOrigin: string
-    /** Fixture-only risk hints; they never grant access or alter allowed origin scope. */
+    /** Optional fixture risk hints; CDP may omit them, so policy also checks name and current page path. */
     targetUrl?: string
     formAction?: string
 }
@@ -423,6 +423,13 @@ export interface BrowserRuntimeApi {
     resume(auth: AuthContext, req: ResumeRequest): Promise<TaskView>
     cancel(auth: AuthContext, req: CancelRequest): Promise<CancelResult>
     closeSpace(auth: AuthContext, req: CloseSpaceRequest): Promise<{ closedTabs: TabId[] }>
+    /** Driver lifecycle notifications from the profile process wrapper. */
+    onDriverDisconnected(profileId: ProfileId): Promise<void>
+    onDriverReconnected(profileId: ProfileId): Promise<void>
+    /** Trusted process-wrapper/admin hooks; these do not accept client identity. */
+    revokeGrant(grantId: GrantId): Promise<void>
+    sweep(nowMs: number): Promise<void>
+    waitForEvents(taskId: TaskId, afterSeq: number, waitMs: number): Promise<SubscribeResult>
 }
 
 // ---------------------------------------------------------------------------

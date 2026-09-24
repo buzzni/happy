@@ -16,13 +16,13 @@ export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowe
     return origin
 }
 
-export function classifyAction(step: BatchStep, element?: ObservedElement, formAction?: string): 'auto' | 'approval-required' {
+export function classifyAction(step: BatchStep, element?: ObservedElement, formAction?: string, currentUrl?: string): 'auto' | 'approval-required' {
     if (!['click', 'fill'].includes(step.kind)) return 'auto'
     const riskyPath = (candidate?: string) => {
         if (!candidate) return false
         try { const path = new URL(candidate, 'https://fixture.invalid').pathname; return path === '/risky-submit' || path === '/api/risky' } catch { return false }
     }
-    if (riskyPath(formAction) || riskyPath(element?.formAction) || riskyPath(element?.targetUrl) || /^(pay|buy now|send|submit order|confirm payment)/i.test(element?.name ?? '')) return 'approval-required'
+    if (riskyPath(formAction) || riskyPath(element?.formAction) || riskyPath(element?.targetUrl) || riskyPath(currentUrl) || /^(pay|buy now|send|submit order|confirm payment)/i.test(element?.name ?? '')) return 'approval-required'
     return 'auto'
 }
 
