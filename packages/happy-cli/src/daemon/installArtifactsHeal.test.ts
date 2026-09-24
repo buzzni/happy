@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -69,6 +69,25 @@ describe('healInstallArtifacts', () => {
         expect(report.tools).toBe('failed');
         expect(log).toHaveBeenCalledWith(expect.stringContaining('--allow-scripts=@buzzni/happy-cli,node-pty'));
     });
+
+    // 데몬 프로세스 안에서 풀기 때문에 손상된 아카이브의 스트림 오류가 새어 나가면
+    // uncaughtException 으로 데몬이 종료된다.
+    it('reports a corrupt tools archive as failed instead of crashing', async () => {
+        const root = packageRoot();
+        withShippedTools(root);
+        rmSync(join(root, 'tools', 'archives'));
+        mkdirSync(join(root, 'tools', 'archives'));
+        for (const name of readdirSync(join(projectPath(), 'tools', 'archives'))) {
+            const shipped = readFileSync(join(projectPath(), 'tools', 'archives', name));
+            writeFileSync(join(root, 'tools', 'archives', name), shipped.subarray(0, 4096));
+        }
+        const log = vi.fn();
+
+        const report = await healInstallArtifacts({ packageRoot: root, platform: process.platform, log });
+
+        expect(report.tools).toBe('failed');
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('--allow-scripts=@buzzni/happy-cli,node-pty'));
+    }, 10_000);
 
     it('makes the macOS node-pty spawn-helper executable again', async () => {
         const root = packageRoot();
