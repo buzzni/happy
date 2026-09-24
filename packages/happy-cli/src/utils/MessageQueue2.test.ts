@@ -23,6 +23,23 @@ describe('MessageQueue2', () => {
         expect(queue.size()).toBe(0);
     });
 
+    it('keeps opt-in latency trace ids for every input coalesced into one batch', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        queue.push('message1', 'local', undefined, ['request-1'], { id: 'trace-1', receivedAt: 10 });
+        queue.push('message2', 'local', undefined, ['request-2'], { id: 'trace-2', receivedAt: 20 });
+
+        await expect(queue.waitForMessagesAndGetAsString()).resolves.toEqual(expect.objectContaining({
+            message: 'message1\nmessage2',
+            inputCount: 2,
+            requestIds: ['request-1', 'request-2'],
+            latencyTraces: [
+                { id: 'trace-1', receivedAt: 10 },
+                { id: 'trace-2', receivedAt: 20 },
+            ],
+        }));
+    });
+
     it('should put an isolated automation prompt before pending user messages', async () => {
         const queue = new MessageQueue2<string>(mode => mode);
         queue.push('pending user message', 'remote');

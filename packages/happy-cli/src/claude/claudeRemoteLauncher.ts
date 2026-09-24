@@ -11,7 +11,7 @@ import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import React from "react";
-import { claudeRemote, type ClaudeActiveInputSender } from "./claudeRemote";
+import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
 import { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "./sdk";
@@ -409,6 +409,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              * decision for exactly the turns that were queued behind a mode change.
              */
             requestIds?: string[];
+            latency?: ClaudeTurnLatencyInput;
         } | null = null;
 
         /**
@@ -658,6 +659,16 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             modeHash = msg.hash;
                             mode = msg.mode;
                             permissionHandler.handleModeChange(mode.permissionMode);
+                            const latency: ClaudeTurnLatencyInput | undefined = msg.latencyTraces.length > 0
+                                ? {
+                                    attribution: msg.inputCount === 1 ? 'exclusive' : 'coalesced',
+                                    inputCount: msg.inputCount,
+                                    traces: msg.latencyTraces.map((trace) => ({
+                                        ...trace,
+                                        queueMs: Math.max(0, performance.now() - trace.receivedAt),
+                                    })),
+                                }
+                                : undefined;
 
                             /*
                              * The engine-applied boundary for Claude. This batch's
@@ -718,12 +729,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 return {
                                     message: contentBlocks,
                                     mode: msg.mode,
+                                    latency,
                                 };
                             }
 
                             return {
                                 message: msg.message,
-                                mode: msg.mode
+                                mode: msg.mode,
+                                latency,
                             }
                         }
 
@@ -787,6 +800,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     claudeArgs: session.claudeArgs,
                     onMessage,
                     onStreamEvent: streamRelay.handleStreamEvent,
+                    onTurnLatency: (diagnostic) => session.client.sendTurnLatency(diagnostic),
                     onCompletionEvent: (message: string) => {
                         logger.debug(`[remote]: Completion event: ${message}`);
                         session.client.sendSessionEvent({ type: 'message', message });

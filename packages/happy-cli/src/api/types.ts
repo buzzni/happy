@@ -271,6 +271,13 @@ export const MessageMetaSchema = z.object({
   difficultyRoutingIntent: DifficultyRoutingIntentSchema.optional().catch(undefined),
   difficultyRoutingPrompt: z.string().optional(),
   difficultyRoutingAuthorization: z.string().optional(),
+  // Opt-in browser diagnostics only. The opaque id binds one daemon-local
+  // duration record to its originating browser attempt; it is never a user,
+  // session, message, or provider identifier.
+  latencyTrace: z.object({
+    version: z.literal(1),
+    id: z.string().uuid(),
+  }).optional().catch(undefined),
 })
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>

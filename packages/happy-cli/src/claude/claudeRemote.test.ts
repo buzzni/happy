@@ -322,7 +322,7 @@ describe('claudeRemote', () => {
         expect(nextMessage).toHaveBeenCalledOnce();
     });
 
-    it('routes stream_event partials to onStreamEvent and keeps them out of the persisted onMessage path', async () => {
+    it.each([false, true])('routes stream_event partials even when diagnostics throw: %s', async (diagnosticThrows) => {
         const streamEvent = {
             type: 'stream_event',
             uuid: 'evt-1',
@@ -340,6 +340,7 @@ describe('claudeRemote', () => {
         } as any);
         const onMessage = vi.fn();
         const onStreamEvent = vi.fn();
+        const onTurnLatency = vi.fn(() => { if (diagnosticThrows) throw new Error('diagnostic unavailable'); });
 
         await claudeRemote({
             sessionId: null,
@@ -347,7 +348,15 @@ describe('claudeRemote', () => {
             allowedTools: [],
             hookSettingsPath: '/tmp/happy-test-settings.json',
             exitAfterFirstTurn: true,
-            nextMessage: vi.fn(async () => ({ message: 'hi', mode })),
+            nextMessage: vi.fn(async () => ({
+                message: 'hi',
+                mode,
+                latency: {
+                    attribution: 'exclusive' as const,
+                    inputCount: 1,
+                    traces: [{ id: 'trace-1', receivedAt: 0, queueMs: 1 }],
+                },
+            })),
             onReady: vi.fn(),
             canCallTool: async () => ({ behavior: 'allow' }) as any,
             isAborted: () => false,
@@ -355,9 +364,14 @@ describe('claudeRemote', () => {
             onThinkingChange: vi.fn(),
             onMessage,
             onStreamEvent,
+            onTurnLatency,
         });
 
         expect(onStreamEvent).toHaveBeenCalledWith(streamEvent);
+        expect(onTurnLatency).toHaveBeenCalledWith(expect.objectContaining({
+            id: 'trace-1', attribution: 'exclusive', inputCount: 1, queueMs: 1,
+            sdkSubmitMs: expect.any(Number), firstSdkTextMs: expect.any(Number), outcome: 'text',
+        }));
         expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'stream_event' }));
         expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'result' }));
     });
