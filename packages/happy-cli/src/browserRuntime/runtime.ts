@@ -4,13 +4,13 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, type ActionId, type Ag
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
                 type TabId, type ApprovalId,
-                type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
+                type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
 import { createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
-import { approvalBinding, assertAllowedOrigin, classifyAction, classifyUserWait, observedFormValues, payloadHash, redact } from './policy'
+import { approvalBinding, assertAllowedOrigin, classifyAction, classifyUserWait, payloadHash, redact } from './policy'
 import { TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
@@ -30,6 +30,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly controllers = new Map<TaskId, AbortController>()
     private readonly workers = new Map<TaskId, Promise<BatchResult>>()
     private readonly inFlightDriverCalls = new Set<TaskId>()
+    private readonly latestAgentSnapshots = new Map<TabId, SnapshotId>()
+    private readonly latestAgentUrls = new Map<TabId, string>()
     private readonly commitTails = new Map<TaskId, Promise<unknown>>()
     private readonly eventWaiters = new Map<TaskId, Set<() => void>>()
     private readonly requestFlights = new Map<string, { hash: string; promise: Promise<unknown> }>()
@@ -325,6 +327,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             maxElements: req.maxElements, scopeRef: req.scopeRef })
         if (!this.agentGrant(auth).allowedOrigins.includes(new URL(result.url).origin))
             throw new BrowserRuntimeError('ORIGIN_DENIED', 'Observed page origin is not allowed')
+        this.latestAgentSnapshots.set(req.tabId, result.snapshotId)
+        this.latestAgentUrls.set(req.tabId, result.url)
         return sanitizeObservation(result, this.agentGrant(auth).allowedOrigins)
     }
     async screenshot(auth: AuthContext, req: {
@@ -659,25 +663,42 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             steps: BatchStep[]
             nextStep: number
         }
-        const approvedStep = batchRecord.steps[Number(approval.nextStep)]
+        const storedStep = batchRecord.steps[Number(approval.nextStep)]
+        const approvedStep = { ...storedStep, snapshotId: approval.snapshotId ?? storedStep.snapshotId }
         const driver = this.driver(task.profileId)
         const lease = this.leases.owner(approvedStep.tabId, task.profileId)
         if (lease.leaseEpoch !== Number(approval.leaseEpoch) || driver.browserInstanceId() !== approval.browserInstanceId
             || await driver.currentOrigin(approvedStep.tabId) !== approval.origin)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed')
-        const observation = await driver.observe(approvedStep.tabId, originalGrant.allowedOrigins, { timeoutMs: approvedStep.timeoutMs })
+        let description: ElementDescription | undefined
+        if (approvedStep.snapshotId && driver.describeRef) {
+            try {
+                description = await driver.describeRef(approvedStep.tabId, approvedStep.ref as ElementRef,
+                    approvedStep.snapshotId, { timeoutMs: approvedStep.timeoutMs })
+            }
+            catch (error) {
+                if (error instanceof BrowserRuntimeError && error.code === 'STALE_REF')
+                    throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval reference was replaced')
+                throw error
+            }
+        }
+        if (!description)
+            throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval reference can no longer be verified')
         if (this.clock.now() >= Number(approval.expiresAtMs) || originalGrant.expiresAtMs <= this.clock.now()
             || this.options.store.isRevoked(originalGrant.grantId))
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval or execution grant expired before dispatch')
-        const currentApprovalPayloadHash = payloadHash({ step: approvedStep, formValues: observedFormValues(observation.elements) })
-        if (observation.documentGeneration !== Number(approval.documentGeneration)
+        const currentApprovalPayloadHash = payloadHash({ step: approvedStep, formValues: description.formValues,
+            frameOrigin: description.frameOrigin, currentPageUrl: description.pageUrl })
+        if (description.documentGeneration !== Number(approval.documentGeneration)
+            || description.frameOrigin !== approval.frameOrigin
+            || new URL(description.pageUrl).origin !== approval.origin
             || currentApprovalPayloadHash !== approval.payloadHash)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval document or payload changed')
         const expectedBinding = approvalBinding({ principalId: originalGrant.principalId, workspaceId: originalGrant.workspaceId,
             taskId: task.taskId, actionId: approvedStep.actionId, origin: String(approval.origin),
                 payloadHash: String(approval.payloadHash), leaseEpoch: Number(approval.leaseEpoch),
                     browserInstanceId: String(approval.browserInstanceId), documentGeneration: Number(approval.documentGeneration),
-                        expiresAtMs: Number(approval.expiresAtMs) })
+                        expiresAtMs: Number(approval.expiresAtMs), frameOrigin: String(approval.frameOrigin) })
         if (expectedBinding !== req.bindingHash)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed')
         const consumed = await this.options.store.mutate(task.taskId, (current) => {
@@ -1223,6 +1244,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         try {
             for (let index = fromIndex; index < steps.length; index++) {
                 const step = steps[index]
+                const agentSnapshot = ['click', 'fill'].includes(step.kind)
+                    ? step.snapshotId ?? this.latestAgentSnapshots.get(step.tabId)
+                    : undefined
+                const effectiveStep: BatchStep = agentSnapshot ? { ...step, snapshotId: agentSnapshot } : step
                 let task = this.requireTask(task0.taskId)
                 if (task.cancelRequested) {
                     outcome = 'cancelled'
@@ -1274,16 +1299,23 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         browserInstanceId: driver.browserInstanceId() } }, batches: { ...task.batches, [batchId]: { steps: persistedBatchSteps(steps),
                             nextStep: index } } }, 'action-intent', { actionId: step.actionId, kind: step.kind,
                                 payloadHash: payloadHash(step) }, leaseEpoch)
-                let observed: Observation | undefined
+                let description: ElementDescription | undefined
                 try {
-                    observed = ['click', 'fill'].includes(step.kind)
-                        ? await driver.observe(step.tabId, grant.allowedOrigins, { timeoutMs: step.timeoutMs })
-                        : undefined
+                    if (['click', 'fill'].includes(step.kind)) {
+                        if (!agentSnapshot)
+                            throw new BrowserRuntimeError('STALE_REF', 'Action has no agent-visible snapshot', false, false)
+                        if (!driver.describeRef)
+                            throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Driver cannot safely classify referenced actions', false, false)
+                        description = await driver.describeRef(step.tabId, step.ref as ElementRef, agentSnapshot,
+                            { timeoutMs: step.timeoutMs })
+                        if (!grant.allowedOrigins.includes(description.frameOrigin)
+                            || !grant.allowedOrigins.includes(new URL(description.pageUrl).origin))
+                            throw new BrowserRuntimeError('ORIGIN_DENIED', 'Referenced element origin is not allowed', false, false)
+                    }
                 }
                 catch (error) {
-                    const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
-                    const safeRefusal = runtimeError && ['INVALID_REQUEST', 'STALE_REF'].includes(runtimeError.code)
-                        && !runtimeError.mayHaveSideEffects
+                    // Description is read-only preflight; input has not been sent.
+                    const safeRefusal = true
                     const write = ['click', 'fill', 'navigate'].includes(step.kind)
                     const uncertain = write && !safeRefusal
                     const state = uncertain ? 'uncertain' as const : 'failed' as const
@@ -1304,21 +1336,23 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     mayHaveSideEffects = uncertain
                     break
                 }
-                const element = observed?.elements.find((candidate) => candidate.ref === step.ref)
-                if (classifyAction(step, element, undefined, observed?.url) === 'approval-required' && step.actionId !== approvedActionId) {
+                if (classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required' && step.actionId !== approvedActionId) {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
                     const approval = createApproval({
                         grant,
                         taskId: task.taskId,
                         batchId,
-                        step,
+                        step: effectiveStep,
                         nextStep: index,
                         origin,
                         leaseEpoch,
                         browserInstanceId: driver.browserInstanceId(),
-                        documentGeneration: observed?.documentGeneration ?? 0,
-                        elementName: element?.name,
-                        formValues: observedFormValues(observed?.elements ?? []),
+                        documentGeneration: description?.documentGeneration ?? 0,
+                        snapshotId: agentSnapshot!,
+                        frameOrigin: description!.frameOrigin,
+                        currentPageUrl: description!.pageUrl,
+                        elementName: description?.name,
+                        formValues: description ? Object.entries(description.formValues).map(([name, value]) => ({ name, value })) : [],
                         expiresAtMs,
                     })
                     const approvalId = approval.summary.approvalId
@@ -1342,9 +1376,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             pendingApproval, waitReason: 'approval' })
                 }
                 if (step.kind === 'waitFor') {
-                    const pageUrl = await driver.currentOrigin(step.tabId)
-                    const observedPage = await driver.observe(step.tabId, grant.allowedOrigins, { timeoutMs: step.timeoutMs })
-                    const waitReason = classifyUserWait(observedPage.url)
+                    const pageUrl = this.latestAgentUrls.get(step.tabId)
+                    const waitReason = pageUrl ? classifyUserWait(pageUrl) : undefined
                     if (waitReason) {
                         task = await this.commit(task, { status: 'awaiting-user', waitReason,
                             waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs, waitCompletion: { batchId, nextStep: index,
@@ -1369,14 +1402,21 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 armed.armAction?.(step.actionId)
                 this.inFlightDriverCalls.add(task.taskId)
                 try {
-                    await this.dispatch(driver, step, observed, grant, controller.signal)
+                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal)
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!grant.allowedOrigins.includes(finalOrigin))
-                        throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, true)
-                    const finalObservation = step.kind === 'navigate'
-                        ? await driver.observe(step.tabId, grant.allowedOrigins, { timeoutMs: step.timeoutMs })
-                        : undefined
-                    const landedWaitReason = finalObservation ? classifyUserWait(finalObservation.url) : undefined
+                        throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
+                    const landedUrl = step.kind === 'navigate' && dispatchResult && 'url' in dispatchResult
+                        ? dispatchResult.url : undefined
+                    const landedWaitReason = landedUrl ? classifyUserWait(landedUrl) : undefined
+                    if (step.kind === 'observe' && dispatchResult && 'snapshotId' in dispatchResult) {
+                        if (!grant.allowedOrigins.includes(new URL(dispatchResult.url).origin))
+                            throw new BrowserRuntimeError('ORIGIN_DENIED', 'Observed page origin is not allowed', false, false)
+                        this.latestAgentSnapshots.set(step.tabId, dispatchResult.snapshotId)
+                        this.latestAgentUrls.set(step.tabId, dispatchResult.url)
+                    }
+                    if (landedUrl)
+                        this.latestAgentUrls.set(step.tabId, landedUrl)
                     task = this.requireTask(task.taskId)
                     if (task.cancelRequested || this.leases.owner(step.tabId,
                         task.profileId).leaseEpoch !== leaseEpoch || task.status !== 'running') {
@@ -1410,7 +1450,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         }
                     }
                     const requiresPostcondition = ['click', 'fill', 'navigate'].includes(step.kind)
-                        && classifyAction(step, element, undefined, observed?.url) === 'approval-required'
+                        && classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required'
                     const hasPostconditionStep = steps.slice(index + 1).some((candidate) => candidate.tabId === step.tabId
                         && candidate.kind === 'waitFor')
                     if (requiresPostcondition && !hasPostconditionStep) {
@@ -1434,7 +1474,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     task = await this.commit(task, { actions, batches: { ...task.batches, [batchId]: { steps: persistedBatchSteps(steps),
                         nextStep: index + 1 } } }, 'action-confirmed', { actionId: step.actionId }, leaseEpoch)
                     results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded',
-                        ...(observed ? { observation: sanitizeObservation(observed, grant.allowedOrigins) } : {}) })
+                        ...(step.kind === 'observe' && dispatchResult && 'snapshotId' in dispatchResult
+                            ? { observation: sanitizeObservation(dispatchResult, grant.allowedOrigins) } : {}) })
                     completedSteps.push(step.stepId)
                     if (landedWaitReason) {
                         const notPathPrefix = landedWaitReason === 'login' ? '/login' : '/challenge'
@@ -1571,9 +1612,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 this.controllers.delete(task0.taskId)
         }
     }
-    private async dispatch(driver: BrowserDriver, step: BatchStep, observed: Observation | undefined,
-        grant: AgentGrant, signal: AbortSignal): Promise<void> {
-        return dispatchStep(driver, step, observed, grant, signal)
+    private async dispatch(driver: BrowserDriver, step: BatchStep, grant: AgentGrant,
+        signal: AbortSignal): ReturnType<typeof dispatchStep> {
+        return dispatchStep(driver, step, grant, signal)
     }
     private async commit(task: StoredTask, patch: Partial<StoredTask>, type: TaskEvent['type'], data: Record<string, unknown>,
         leaseEpoch = 0, business = false): Promise<StoredTask> {

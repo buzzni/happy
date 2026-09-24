@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, PendingApprovalSummary, TaskId } from './contracts'
+import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, PendingApprovalSummary, SnapshotId, TaskId } from './contracts'
 import { approvalBinding, payloadHash, redact, type FormValue } from './policy'
 import type { ApprovalRecord } from './taskStore'
 
@@ -13,12 +13,17 @@ export function createApproval(input: {
     leaseEpoch: number
     browserInstanceId: BrowserInstanceId
     documentGeneration: number
+    snapshotId: SnapshotId
+    frameOrigin: string
+    currentPageUrl: string
     expiresAtMs: number
     elementName?: string
     formValues?: FormValue[]
 }): { summary: PendingApprovalSummary; record: ApprovalRecord } {
     const approvalId = `approval-${randomUUID()}` as ApprovalId
-    const stepHash = payloadHash({ step: input.step, formValues: input.formValues ?? [] })
+    const formValuesByName = Object.fromEntries((input.formValues ?? []).map(({ name, value }) => [name, value]))
+    const stepHash = payloadHash({ step: input.step, formValues: formValuesByName,
+        frameOrigin: input.frameOrigin, currentPageUrl: input.currentPageUrl })
     const formSummary = (input.formValues ?? [])
         .map(({ name, value }) => `${name}=${redact(value)}`)
         .join(', ')
@@ -34,6 +39,7 @@ export function createApproval(input: {
         browserInstanceId: input.browserInstanceId,
         documentGeneration: input.documentGeneration,
         expiresAtMs: input.expiresAtMs,
+        frameOrigin: input.frameOrigin,
     })
     const summary: PendingApprovalSummary = {
         approvalId,
@@ -54,6 +60,9 @@ export function createApproval(input: {
             documentGeneration: input.documentGeneration,
             leaseEpoch: input.leaseEpoch,
             browserInstanceId: input.browserInstanceId,
+            snapshotId: input.snapshotId,
+            frameOrigin: input.frameOrigin,
+            formValues: formValuesByName,
         },
     }
 }

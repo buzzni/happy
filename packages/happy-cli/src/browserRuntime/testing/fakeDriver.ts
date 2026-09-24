@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementRef, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
+import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
 
-export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[] }
-type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'screenshot' | 'click' | 'fill' | 'waitFor'
+export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[]; formAction?: string; formValues?: Record<string, string> }
+type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'describeRef' | 'screenshot' | 'click' | 'fill' | 'waitFor'
 interface HeldDispatch {
     operation: Operation
     entered(): void
@@ -15,10 +15,14 @@ export class FakeBrowserDriver implements BrowserDriver {
     private readonly pages = new Map<TabId, FakePage>()
     private readonly targetIds = new Map<TabId, string>()
     private readonly snapshotGenerations = new Map<SnapshotId, number>()
+    private readonly activeSnapshots = new Map<TabId, SnapshotId>()
+    private readonly snapshotElements = new Map<SnapshotId, Map<ElementRef, ObservedElement>>()
     private currentActionId?: string
     readonly dispatchCounts = new Map<string, number>()
     readonly targetLedger: Array<{ targetId: string; tabId: TabId; operation: Operation; actionId?: string }> = []
     readonly adoptedTabs: Array<{ tabId: TabId; targetId: string; adopted: boolean }> = []
+    readonly dispatchedSnapshots: Array<{ tabId: TabId; snapshotId: SnapshotId; operation: 'click' | 'fill' }> = []
+    observeCount = 0
     delays = new Map<Operation, number>()
     private readonly failures = new Map<Operation, Error[]>()
     private waitRelease?: () => void
@@ -76,22 +80,46 @@ export class FakeBrowserDriver implements BrowserDriver {
         const frames = (page.frameOrigins ?? []).map((frameOrigin, index) => ({ frameKey: `frame-${index}`, origin: frameOrigin, allowed: allowedOrigins.includes(frameOrigin), outOfProcess: false }))
         const elements = (page.elements ?? []).filter((element) => allowedOrigins.includes(element.frameOrigin)).slice(0, opts.maxElements ?? 100)
         const snapshotId = `snapshot-${randomUUID()}` as SnapshotId
+        this.observeCount++
+        this.activeSnapshots.set(tabId, snapshotId)
         this.snapshotGenerations.set(snapshotId, page.documentGeneration ?? 1)
+        this.snapshotElements.set(snapshotId, new Map(elements.map((element) => [element.ref, structuredClone(element)])))
         return { snapshotId, tabId, url: page.url, title: page.title ?? '', documentGeneration: page.documentGeneration ?? 1, elements, frames, truncated: false, text: allowedOrigins.includes(origin) ? (page.text ?? '').slice(0, opts.maxTextChars ?? 20_000) : '' }
+    }
+    async describeRef(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription> {
+        await this.delay('describeRef', opts)
+        this.throwNextFailure('describeRef')
+        const page = this.requirePage(tabId)
+        const described = this.snapshotElements.get(snapshotId)?.get(ref)
+        this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, described)
+        const currentElement = page.elements?.find((element) => element.ref === ref)
+        if (!described || !currentElement || !sameNode(described, currentElement))
+            throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false)
+        const values = page.formValues ?? Object.fromEntries((page.elements ?? []).flatMap((element) =>
+            element.value !== undefined && !/password/i.test(element.name) ? [[element.name, element.value]] : []))
+        const formValues = Object.fromEntries(Object.entries(values).filter(([name]) => !/password/i.test(name)))
+        return { ref, role: described.role, name: described.name, frameOrigin: described.frameOrigin,
+            pageUrl: page.url, formAction: page.formAction ?? described.formAction,
+            formValues: structuredClone(formValues), documentGeneration: page.documentGeneration ?? 1 }
     }
     async screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult> {
         await this.delay('screenshot', opts); this.throwNextFailure('screenshot'); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !allowedOrigins.includes(origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')
         return { tabId, mimeType: 'image/png', data: Buffer.from('synthetic').toString('base64'), documentGeneration: page.documentGeneration ?? 1, targetId: `target-${tabId}`, capturedAtMs: Date.now() }
     }
-    async click(tabId: TabId, _ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); this.assertSnapshot(snapshotId, page.documentGeneration ?? 1); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
+    async click(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); const element = this.snapshotElements.get(snapshotId)?.get(ref); this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, element); const current = page.elements?.find((candidate) => candidate.ref === ref); if (!current || !sameNode(element!, current)) throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false); this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'click' }); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
     async fill(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {
         await this.delay('fill', opts)
         this.throwNextFailure('fill')
         const page = this.requirePage(tabId)
-        this.assertSnapshot(snapshotId, page.documentGeneration ?? 1)
+        const element = this.snapshotElements.get(snapshotId)?.get(ref)
+        this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, element)
+        const current = page.elements?.find((candidate) => candidate.ref === ref)
+        if (!current || !sameNode(element!, current))
+            throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false)
         const field = page.elements?.find((element) => element.ref === ref)
         if (field)
             field.value = value
+        this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'fill' })
         this.record(tabId, `target-${tabId}`, 'fill')
         await this.afterDispatch('fill')
     }
@@ -123,8 +151,8 @@ export class FakeBrowserDriver implements BrowserDriver {
         if (failure)
             throw failure
     }
-    private assertSnapshot(snapshotId: SnapshotId, currentGeneration: number): void {
-        if (this.snapshotGenerations.get(snapshotId) !== currentGeneration)
+    private assertSnapshot(tabId: TabId, snapshotId: SnapshotId, currentGeneration: number, element?: ObservedElement): void {
+        if (this.activeSnapshots.get(tabId) !== snapshotId || this.snapshotGenerations.get(snapshotId) !== currentGeneration || !element)
             throw new BrowserRuntimeError('STALE_REF', 'Reference snapshot is stale', false, false)
     }
     private async delay(operation: Operation, opts: DriverOptions): Promise<void> {
@@ -152,4 +180,9 @@ export class FakeBrowserDriver implements BrowserDriver {
         held.entered()
         await held.gate
     }
+}
+
+function sameNode(left: ObservedElement, right: ObservedElement): boolean {
+    return left.ref === right.ref && left.role === right.role && left.name === right.name
+        && left.frameOrigin === right.frameOrigin
 }
