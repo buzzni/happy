@@ -236,7 +236,11 @@ export class CdpDriver implements BrowserDriver {
         return this.run(opts, async (op, conn) => {
             if (!allowedOrigins.includes(originOf(url))) throw originDenied('requested origin is not allowed')
             op.markDispatch()
-            const { targetId } = await conn.send('Target.createTarget', { url: 'about:blank', background: true, newWindow: false })
+            // Each owned tab gets its own background window: in a headful browser a
+            // background tab inside the user's window is hidden, so it neither paints
+            // (screenshots hang) nor reliably receives input, and activating it would
+            // steal the tab the user is looking at.
+            const { targetId } = await conn.send('Target.createTarget', { url: 'about:blank', background: true, newWindow: true })
             let tab: TabState | undefined
             try {
                 const { sessionId } = await conn.send('Target.attachToTarget', { targetId, flatten: true })
