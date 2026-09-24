@@ -1,3 +1,4 @@
+import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
@@ -81,9 +82,19 @@ import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessi
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { requireAccountToken, type ManagedStartup } from '@/managed/managedStartup';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
-import { resolveDifficultyRouting, type DifficultyRoutingState } from '@/difficultyRoutingRuntime';
+import {
+    buildLocalAutoBootstrapDecision,
+    buildManualAppliedDecision,
+    isRoutingProtect,
+    createDifficultyRoutingUnknownEvent,
+    reconcileDecisionWithAppliedSettings,
+    resolveDifficultyRouting,
+} from '@/difficultyRoutingRuntime';
+import { DifficultyRoutingCommitter } from '@/difficultyRoutingCommit';
 import { createSerialAsyncHandler } from '@/codex/utils/serialAsyncHandler';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
+import { createLazyLessonSessionHost } from '@/memory/lessonSessionHost';
+import { readLessonOwner } from '@/memory/lessonOwnerMarker';
 
 /**
  * How long a confirmed initial prompt waits for its acknowledgement before the
@@ -471,7 +482,22 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Create realtime session
     const session = api.sessionSyncClient(response);
     stage('session-client');
-    let difficultyRoutingState = session.getMetadata()?.difficultyRoutingState as DifficultyRoutingState | undefined;
+    /**
+     * Owns the routing floor across accept → engine-apply. Accepting a turn only
+     * records a pending decision; the floor and the failure counters move when
+     * the remote launcher hands the batch's mode to the SDK.
+     */
+    const difficultyRoutingCommitter = new DifficultyRoutingCommitter(
+        session.getMetadata()?.difficultyRoutingState,
+        {
+            agent: 'claude',
+            persist: (state) => session.updateMetadata((current) => ({
+                ...current,
+                difficultyRoutingState: state,
+            })),
+            emit: (envelope) => session.sendSessionProtocolMessage(envelope),
+        },
+    );
 
     // On reconnect, un-archive the session and skip replaying old messages.
     if (reconnectSessionId) {
@@ -551,7 +577,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         for (let i = 0; i < recentAppPrompts.length; i++) {
             const entry = recentAppPrompts[i];
             if (entry.addedAt < cutoff) continue;
-            if (entry.text === text) {
+            // claudeRemote may prepend recalled lessons or the lesson-proposal
+            // instruction to the prompt it hands the SDK, so the JSONL copy
+            // can end with the recorded text rather than equal it.
+            if (entry.text === text || text.endsWith(`\n\n${entry.text}`)) {
                 recentAppPrompts.splice(i, 1);
                 return true;
             }
@@ -662,8 +691,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onTranscriptEvent: updateClaudeGoalState,
     });
 
+    const lessonProposalTurn = createLessonProposalTurn();
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        ...(principal.kind === 'account' ? { proposeLesson: lessonProposalTurn.submit } : {}),
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
     });
@@ -1223,15 +1254,30 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
         if (specialCommand.type === 'compact') {
             logger.debug('[start] Detected /compact command');
-            messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage);
+            // Whatever this flushed will never run, so its routing decisions are
+            // dead. The floor never moved for them — they were only ever pending.
+            difficultyRoutingCommitter.discardPending(
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage),
+                'superseded',
+            );
             logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
             return;
         }
 
         if (specialCommand.type === 'clear') {
             logger.debug('[start] Detected /clear command');
+            /*
+             * Phase one only. The provider has not reset yet — this just queues
+             * the command — and further user turns are accepted before it does.
+             * Clearing here would be early; clearing later without this marker
+             * would take those later turns' receipts with it.
+             */
+            difficultyRoutingCommitter.requestEpoch();
             deferredContinuation.prepare(message.content.text);
-            messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage);
+            difficultyRoutingCommitter.discardPending(
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage),
+                'superseded',
+            );
             logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
             return;
         }
@@ -1297,7 +1343,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug(`[ax] orchestration failed, falling through: ${(err as Error).message}`);
         }
 
-        const routed = delegatedDifficultyRoutingMessage
+        const outcome = delegatedDifficultyRoutingMessage
             ? await resolveDifficultyRouting({
                 agent: 'claude',
                 sourceMachineId: machineId ?? '',
@@ -1305,9 +1351,66 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 contentText: message.content.text,
                 meta: message.meta,
                 current: { model: messageModel, effort: messageEffort },
-                state: difficultyRoutingState,
+                state: difficultyRoutingCommitter.current(),
             })
             : null;
+
+        /*
+         * A protective decline is not "no opinion". `messageModel` was already
+         * staged from the client's meta above, and on this path that candidate
+         * is the cheap one the client picked while a real floor exists that we
+         * cannot read or cannot run. Falling through would be exactly the silent
+         * downgrade the floor exists to prevent, so the turn keeps the session's
+         * current setting instead of the client's candidate.
+         */
+        if (outcome && isRoutingProtect(outcome)) {
+            logger.debug(`[loop] Auto-route declined protectively (${outcome.reason}); keeping current model`);
+            messageModel = currentModel;
+            messageEffort = currentEffort;
+            // Visible to the client, not just to a debug log: the turn runs, but
+            // the user should be able to see that routing had no say in it and
+            // can pick a model manually.
+            const protectIntent = message.meta?.difficultyRoutingIntent as { clientRequestId?: string } | undefined;
+            if (typeof protectIntent?.clientRequestId === 'string') {
+                session.sendSessionProtocolMessage(createDifficultyRoutingUnknownEvent({
+                    clientRequestId: protectIntent.clientRequestId,
+                    reason: outcome.reason,
+                    model: messageModel,
+                    effort: messageEffort ?? null,
+                }));
+            }
+        }
+        const routed = outcome && !isRoutingProtect(outcome) ? outcome : null;
+
+        /*
+         * Not routed by us, but still an automatic selection: the client's own
+         * router chose it. Recorded at the engine boundary as weak evidence so a
+         * later switch to shared routing does not restart from an empty floor
+         * (R2/AC3). `modelSource: 'user'` is the manual pin — recorded separately
+         * and never allowed to feed the floor (R5).
+         */
+        const localRoutingRequestId = message.serverMessageId
+            ? `message:${message.serverMessageId}`
+            : message.localKey ? `local:${message.localKey}` : randomUUID();
+        const localDecision = routed
+            ? null
+            : message.meta?.modelSource === 'auto'
+                ? buildLocalAutoBootstrapDecision({
+                    agent: 'claude',
+                    clientRequestId: localRoutingRequestId,
+                    model: messageModel,
+                    effort: messageEffort ?? null,
+                    now: Date.now(),
+                })
+                : message.meta?.modelSource === 'user' && messageModel
+                    ? buildManualAppliedDecision({
+                        clientRequestId: localRoutingRequestId,
+                        model: messageModel,
+                        effort: messageEffort ?? null,
+                        now: Date.now(),
+                    })
+                    : null;
+
         if (routed) {
             if (routed.route.model) {
                 messageModel = defaultClaudeModelForRuntime(
@@ -1366,15 +1469,46 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         const queuedText = deferredTurn?.text ?? pushText;
         try {
             if (deferredTurn) recordAppPrompt(queuedText);
-            messageQueue.push(queuedText, enhancedModeForThisMessage, attachmentsForThisMessage);
+            messageQueue.push(
+                queuedText,
+                enhancedModeForThisMessage,
+                attachmentsForThisMessage,
+                // Beside the mode, not inside it: the mode is hashed to decide
+                // batching, so a per-message id there would break batching.
+                routed
+                    ? [routed.pending.clientRequestId]
+                    : localDecision ? [localDecision.clientRequestId] : undefined,
+            );
             deferredTurn?.commit();
             if (routed) {
-                difficultyRoutingState = routed.state;
+                /*
+                 * `messageModel`/`messageEffort` are what the SDK will actually
+                 * receive, after this runtime's own rewrites. The decision is
+                 * aligned to them before it is recorded, so the floor can never
+                 * describe a model the provider never saw. An unclassifiable
+                 * substitution records no floor rather than a fabricated one.
+                 */
+                const reconciled = reconcileDecisionWithAppliedSettings(
+                    routed.pending,
+                    { model: messageModel, effort: messageEffort ?? null },
+                    'claude',
+                );
+                if (reconciled) {
+                    difficultyRoutingCommitter.recordPending(routed.state);
+                    if (reconciled !== routed.pending) {
+                        difficultyRoutingCommitter.recordLocalPending(reconciled);
+                    }
+                } else {
+                    logger.debug('[loop] Routed model was substituted into an unknown pair; no floor recorded');
+                }
                 session.sendSessionProtocolMessage(routed.event);
-                session.updateMetadata((current) => ({
-                    ...current,
-                    difficultyRoutingState: routed.state,
-                }));
+            } else if (localDecision) {
+                const reconciled = reconcileDecisionWithAppliedSettings(
+                    localDecision,
+                    { model: messageModel, effort: messageEffort ?? null },
+                    'claude',
+                );
+                if (reconciled) difficultyRoutingCommitter.recordLocalPending(reconciled);
             }
         } catch (error) {
             deferredTurn?.rollback();
@@ -1402,6 +1536,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
             return;
         }
+        currentSession?.cancelLessonReview();
         const attachmentsPromise = session.drainAttachmentsForUserMessage();
         return handleUserMessage({ message, attachmentsPromise });
     });
@@ -1598,8 +1733,58 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     };
 
     // Create claude loop
-    const exitCode = await loop({
+    /*
+     * The lesson host for this session, built once.
+     *
+     * Bounded on its own budget, so a slow studio delays nothing, and null for
+     * a managed run — which holds no account credential and must not be handed
+     * one. When it is null the loop behaves exactly as it did before.
+     */
+    const lessons = createLazyLessonSessionHost({
+        accountToken,
+        machineId: principal.kind === 'account' ? (machineId ?? null) : null,
+        sessionId: session.sessionId,
+        happyHomeDir: configuration.happyHomeDir,
+        announceCandidate: (envelope) => session.sendSessionProtocolMessage(envelope),
+    });
+
+    /*
+     * Closed on every exit path — normal, thrown or signalled. Registered
+     * after `lessons` exists so the closure cannot capture it in its temporal
+     * dead zone, and tolerant of a double close.
+     */
+    let lessonsClosed = false;
+    const closeLessons = async () => {
+        if (lessonsClosed) return;
+        lessonsClosed = true;
+        await lessons.close().catch(() => undefined);
+    };
+    const closeLessonsOnSignal = () => { void closeLessons(); };
+    process.once('SIGTERM', closeLessonsOnSignal);
+    process.once('SIGINT', closeLessonsOnSignal);
+
+    const normalizeBoundaryRoute = (revised: { model: string; effort: string | null } | null) => {
+        if (!revised) return null;
+        // Run the revision through the same runtime normalization an
+        // accepted turn gets, or a Z.AI-style substitution would be skipped
+        // for exactly the turns the boundary repaired.
+        const model = defaultClaudeModelForRuntime(
+            process.env,
+            normalizeClaudeModelForRuntime(revised.model, process.env),
+        );
+        if (!model) return null;
+        const effort = revised.effort && VALID_CLAUDE_EFFORTS.has(revised.effort)
+            ? revised.effort
+            : null;
+        return { model, effort };
+    };
+
+    let exitCode: number;
+    try {
+        exitCode = await loop({
         path: workingDirectory,
+        ...(lessons ? { lessons } : {}),
+        lessonProposalTurn,
         sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,
@@ -1622,6 +1807,14 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             sessionInstance.beginChannelExecution = (requestId) => channelAcceptance.beginExecution(requestId);
         },
         onAbort: resetTurnScopedOptions,
+        onSessionReset: () => difficultyRoutingCommitter.startEpoch(),
+        /**
+         * The engine-applied boundary. The launcher calls this when a batch's
+         * mode becomes the settings of an SDK query — the first moment the
+         * conversation genuinely runs on the routed model.
+         */
+        onModeResolved: (requestIds) => normalizeBoundaryRoute(difficultyRoutingCommitter.previewAppliedRoute(requestIds)),
+        onModeApplied: (requestIds, executionId) => difficultyRoutingCommitter.commitApplied(requestIds, executionId, normalizeBoundaryRoute),
         onActiveUserInputAccepted: (text) => {
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
@@ -1636,7 +1829,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
                 const token = requireAccountToken(accountToken);
                 const account = requireAccountMachineId(machineId);
-                await refreshMcpCallerGrantIfExpiring(token, account);
+                await refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
                 return fetchAplusMcpServersResult(
                     token,
                     account,
@@ -1657,6 +1850,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
+    } finally {
+        process.removeListener('SIGTERM', closeLessonsOnSignal);
+        process.removeListener('SIGINT', closeLessonsOnSignal);
+        await closeLessons();
+    }
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak
     // Note: currentSession is set by onSessionReady callback during loop()

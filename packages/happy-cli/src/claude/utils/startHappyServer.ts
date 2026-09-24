@@ -33,6 +33,7 @@ export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 export interface HappyServerHandlers {
     changeTitle: (title: string, branchSlug?: string) => Promise<{ success: boolean; error?: string }>;
     client: ApiSessionClient;
+    proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
 }
@@ -86,6 +87,14 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         name: "Happy MCP",
         version: "1.0.0",
     });
+
+    if (handlers.proposeLesson) {
+        mcp.registerTool('propose_lesson', {
+            title: 'Propose Project Lesson',
+            description: 'Stage one verified lesson proposal for the current foreground turn. Requires its current token. This does not save or approve a lesson; normal turn completion and human approval are required.',
+            inputSchema: { token: z.string().uuid(), proposal: z.record(z.string(), z.unknown()) },
+        }, async (input) => ({ content: [{ type: 'text' as const, text: JSON.stringify(handlers.proposeLesson!(input)) }] }));
+    }
 
     mcp.registerTool('script_automations', {
         title: 'Manage Project Script Automations',
@@ -381,6 +390,7 @@ function registerBrowserTools(mcp: McpServer): void {
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
+        proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
     } = {},
@@ -393,6 +403,7 @@ export async function startHappyServer(
         const mcp = createMcpServer({
             changeTitle,
             client,
+            proposeLesson: options.proposeLesson,
             protectedBashCwd: options.protectedBashCwd,
             trackProtectedBashProcess: options.trackProtectedBashProcess,
         });
@@ -426,7 +437,7 @@ export async function startHappyServer(
 
     return {
         url: baseUrl.toString(),
-        toolNames: ['change_title', 'bash_stream', 'script_automations', ...BROWSER_TOOL_NAMES],
+        toolNames: [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...BROWSER_TOOL_NAMES],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             server.close();

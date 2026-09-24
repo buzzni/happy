@@ -1,8 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { resolveAplusApiOrigin, resolveDifficultyRouting } from './difficultyRoutingRuntime'
+import {
+  buildLocalAutoBootstrapDecision,
+  buildManualAppliedDecision,
+  isRoutingProtect,
+  reconcileDecisionWithAppliedSettings,
+  resolveAplusApiOrigin,
+  resolveDifficultyRouting,
+  type DifficultyRoutingRuntimeDecision,
+  type DifficultyRoutingRuntimeOutcome,
+} from './difficultyRoutingRuntime'
+
+/** Narrows an outcome to a real decision so a protective decline cannot pass
+ *  a test silently by looking like "no opinion". */
+function asDecision(outcome: DifficultyRoutingRuntimeOutcome): DifficultyRoutingRuntimeDecision {
+  if (!outcome || isRoutingProtect(outcome)) {
+    throw new Error(`expected a routing decision, received ${JSON.stringify(outcome)}`)
+  }
+  return outcome
+}
 import { logger } from './ui/logger'
 import { configuration } from './configuration'
 import { encodeBase64 } from './api/encryption'
+import { baseFloorDifficulty, pendingDecision } from './difficultyRoutingSessionState'
 
 const intent = {
   version: 1,
@@ -38,13 +57,13 @@ function grantResponse(overrides: Record<string, unknown> = {}) {
       hostProcessPublicKey: encodeBase64(new Uint8Array(32).fill(1)),
       maxInputChars: 8000,
       modelMaxInputTokens: 512,
-      relayDeadlineAt: Date.now() + 1000,
+      relayDeadlineAt: Date.now() + 3000,
       // The client negotiates timing v2, so a compliant server always answers on it.
       timingVersion: 2,
       requestId: 'client-1',
       issuedAt: Date.now(),
       ttlMs: 60_000,
-      relayTtlMs: 1_000,
+      relayTtlMs: 3_000,
       ...overrides,
     },
     aiModelPolicy: {
@@ -97,13 +116,13 @@ describe('difficulty routing runtime', () => {
     const decision = await resolveDifficultyRouting(baseInput)
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(decision?.route).toMatchObject({
+    expect(asDecision(decision).route).toMatchObject({
       model: 'claude-haiku-4-5',
       effort: 'low',
       source: 'p1',
       difficulty: 'trivial',
     })
-    expect(decision?.event.ev).toMatchObject({
+    expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
       result: {
         clientRequestId: 'client-1',
@@ -188,12 +207,12 @@ describe('difficulty routing runtime', () => {
       current: { model: 'claude-sonnet-5', effort: 'high' },
     })
 
-    expect(decision?.route).toMatchObject({
+    expect(asDecision(decision).route).toMatchObject({
       model: 'claude-sonnet-5',
       effort: 'high',
       source: 'p1',
     })
-    expect(decision?.event.ev).toMatchObject({
+    expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
       result: {
         model: 'claude-sonnet-5',
@@ -218,16 +237,16 @@ describe('difficulty routing runtime', () => {
       current: { model: 'claude-opus-5', effort: 'high' },
     })
 
-    expect(decision?.route.model).toBe('claude-sonnet-5')
-    expect(decision?.event.ev).toMatchObject({
+    expect(asDecision(decision).route.model).toBe('claude-sonnet-5')
+    expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
       result: { model: 'claude-sonnet-5' },
     })
   })
 
-  // R11 은 원격 분류가 더하는 대기의 상한을 정한다. 실행측 몫은 750ms 인데, 이것은
-  // **grant 와 relay 가 나눠 쓰는 하나의 예산**이지 각각의 예산이 아니다. 각자 750ms 를
-  // 가지면 총 추가 대기가 1.5초가 되어 상한이 조용히 두 배가 된다 — 오류가 아니라
+  // R11 은 원격 분류가 더하는 대기의 상한을 정한다. 실행측 몫은 3000ms 인데, 이것은
+  // **grant 와 relay 가 나눠 쓰는 하나의 예산**이지 각각의 예산이 아니다. 각자 3000ms 를
+  // 가지면 총 추가 대기가 6초가 되어 상한이 조용히 두 배가 된다 — 오류가 아니라
   // "앱이 느려졌다"로만 나타난다. relay 에 독립 예산을 주는 변이가 기존 60건을 모두
   // 통과했으므로 여기서 직접 고정한다.
   //
@@ -242,7 +261,7 @@ describe('difficulty routing runtime', () => {
     }) as typeof AbortSignal.timeout)
     const fetchMock = vi.fn(async (url: string) => {
       if (String(url).includes('/grant')) {
-        vi.advanceTimersByTime(700)
+        vi.advanceTimersByTime(2950)
         return Response.json(grantResponse())
       }
       return Response.json({
@@ -257,8 +276,8 @@ describe('difficulty routing runtime', () => {
     // 1개뿐이면 relay 까지 가지 않은 것이므로 조용히 통과시키지 않고 여기서 실패한다.
     expect(timeouts.length).toBeGreaterThanOrEqual(2)
     const [grantBudget, relayBudget] = timeouts
-    expect(grantBudget).toBe(750)
-    // grant 가 700ms 를 썼으므로 relay 에 남은 것은 50ms 뿐이다.
+    expect(grantBudget).toBe(3000)
+    // grant 가 2950ms 를 썼으므로 relay 에 남은 것은 50ms 뿐이다.
     expect(relayBudget).toBeLessThanOrEqual(50)
     // 0 이하로 접히면 relay 가 즉시 중단되어 P2 가 사실상 꺼진다.
     expect(relayBudget).toBeGreaterThan(0)
@@ -267,19 +286,25 @@ describe('difficulty routing runtime', () => {
   it('accepts a server relay deadline computed after grant response latency', async () => {
     const fetchMock = vi.fn(async () => {
       vi.advanceTimersByTime(50)
-      return Response.json(grantResponse({ relayDeadlineAt: Date.now() + 1000 }))
+      return Response.json(grantResponse({ relayDeadlineAt: Date.now() + 3000 }))
     })
     vi.stubGlobal('fetch', fetchMock)
 
     const decision = await resolveDifficultyRouting(baseInput)
 
-    expect(decision?.event.ev).toMatchObject({
+    expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
       result: { classifierSource: 'p1-local' },
     })
   })
 
-  it('does not carry an expired sticky floor into a new local decision', async () => {
+  /**
+   * Was: "does not carry an expired sticky floor into a new local decision",
+   * which pinned the very defect this spec removes — an hour of silence dropped
+   * a hard conversation to Haiku on its next easy message. The floor now
+   * survives the gap; only the repeated-failure counters age out.
+   */
+  it('keeps the base floor after an idle gap and expires only the failure counters', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
 
     const decision = await resolveDifficultyRouting({
@@ -291,12 +316,248 @@ describe('difficulty routing runtime', () => {
       },
     })
 
-    expect(decision?.route).toMatchObject({
-      difficulty: 'trivial',
-      model: 'claude-haiku-4-5',
-      effort: 'low',
+    expect(asDecision(decision).route).toMatchObject({
+      difficulty: 'hard',
+      model: 'claude-opus-5-5',
+      effort: 'high',
     })
-    expect(decision?.state.hardTurns).toBe(0)
+    expect(asDecision(decision).pending.hardTurns).toBe(0)
+    expect(asDecision(decision).pending.decisionReasons).toContain('sticky-floor-maintained')
+  })
+
+  it('retains the exact supported base pair even when its catalog tier changes', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      state: { stateVersion: 2, revision: 3, base: {
+        difficulty: 'hard', model: 'claude-fable-5-1', effort: 'high',
+        provenance: 'engine-applied', policyVersion: 'prior-policy', policyRevision: 1, appliedAt: 1,
+      } },
+    })
+    expect(asDecision(decision).route.model).toBe('claude-fable-5-1')
+    expect(asDecision(decision).pending.base.model).toBe('claude-fable-5-1')
+    expect(asDecision(decision).pending.temporaryEscalation).toBe(false)
+  })
+
+  it('does not silently replace an unsupported stored base with a cheaper catalog model', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      state: { stateVersion: 2, revision: 3, base: {
+        difficulty: 'hard', model: 'retired-premium', effort: 'high',
+        provenance: 'engine-applied', policyVersion: 'prior-policy', policyRevision: 1, appliedAt: 1,
+      } },
+    })
+    // Contract tightened: a decline for THIS reason now tells the caller to
+    // keep its current model. Plain `null` would let the cheap candidate the
+    // caller already staged run, which is the downgrade being prevented.
+    expect(isRoutingProtect(decision)).toBe(true)
+  })
+
+  it('records policy substitution as the actual route without claiming temporary escalation', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ...grantResponse(), aiModelPolicy: {
+      source: 'organization', allowedSelectionKeys: ['claude:claude-sonnet-5'],
+      defaultSelectionKey: 'claude:claude-sonnet-5',
+    } })))
+    const decision = await resolveDifficultyRouting({ ...baseInput,
+      contentText: 'still broken, the same error again',
+      state: { difficulty: 'hard', hardTurns: 3, updatedAt: Date.now() - 1000 },
+    })
+    expect(asDecision(decision).pending).toMatchObject({ selectedDifficulty: 'routine', temporaryEscalation: false,
+      selected: { model: 'claude-sonnet-5', effort: 'high' },
+      base: { difficulty: 'routine', model: 'claude-sonnet-5', effort: 'high' },
+    })
+  })
+
+  it('does not commit the base floor at accept time — only a pending decision', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+    })
+
+    expect(asDecision(decision).pending).toMatchObject({
+      clientRequestId: 'client-1',
+      selectedDifficulty: 'hard',
+      temporaryEscalation: false,
+    })
+    // The floor is the engine's to confirm; accepting a request must not raise it.
+    expect(baseFloorDifficulty(asDecision(decision).state)).toBeUndefined()
+    expect(pendingDecision(asDecision(decision).state, 'client-1')).toBeDefined()
+    expect(asDecision(decision).event.ev).toMatchObject({
+      t: 'difficulty-routing',
+      result: { stage: 'queued' },
+    })
+  })
+
+  it('does not raise the floor from a candidate the policy refused to run', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['claude:claude-sonnet-5'],
+        defaultSelectionKey: 'claude:claude-sonnet-5',
+      },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      current: { model: 'claude-sonnet-5', effort: 'high' },
+    })
+
+    expect(asDecision(decision).route.model).toBe('claude-sonnet-5')
+    // Classified hard, ran routine: the floor records what ran, not what was wanted.
+    expect(asDecision(decision).pending.candidateDifficulty).toBe('hard')
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'routine', model: 'claude-sonnet-5' })
+    expect(asDecision(decision).pending.decisionReasons).toContain('policy-fallback')
+  })
+
+  it('repairs the effort when a policy substitution would leave an invalid pairing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['claude:claude-haiku-4-5'],
+        defaultSelectionKey: 'claude:claude-haiku-4-5',
+      },
+    })))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      // 'high' belongs to the tiers this model is not; carrying it over would
+      // produce a pairing the catalog never offers.
+      current: { model: 'claude-opus-5', effort: 'high' },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'claude-haiku-4-5', effort: 'low' })
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'trivial', model: 'claude-haiku-4-5' })
+  })
+
+  it('fails the decision rather than run a model the policy forbids', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['claude:some-model-not-in-catalog'],
+        defaultSelectionKey: null,
+      },
+    })))
+
+    await expect(resolveDifficultyRouting({
+      ...baseInput,
+      current: { model: 'claude-opus-5', effort: 'high' },
+    })).resolves.toBeNull()
+  })
+
+  it('keeps a temporary escalation out of the floor it would commit', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'still broken, the same error again',
+      state: { difficulty: 'hard', hardTurns: 3, updatedAt: Date.now() - 1000 },
+    })
+
+    expect(asDecision(decision).route.model).toBe('claude-fable-5-1')
+    expect(asDecision(decision).pending.temporaryEscalation).toBe(true)
+    expect(asDecision(decision).pending.base).toMatchObject({ difficulty: 'hard', model: 'claude-opus-5-5' })
+    expect(asDecision(decision).pending.decisionReasons).toContain('temporary-escalation')
+  })
+
+  it('names the return to the base path instead of presenting it as continuity', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'rename this variable',
+      state: {
+        stateVersion: 2,
+        revision: 4,
+        base: {
+          difficulty: 'hard',
+          model: 'claude-opus-5',
+          effort: 'high',
+          provenance: 'engine-applied',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: 7,
+          appliedAt: Date.now() - 1000,
+        },
+        lastEscalatedExecutionId: 'exec-prior',
+      },
+    })
+
+    expect(asDecision(decision).route.model).toBe('claude-opus-5')
+    expect(asDecision(decision).pending.decisionReasons).toContain('temporary-escalation-return')
+    expect(asDecision(decision).pending.decisionReasons).not.toContain('temporary-escalation')
+  })
+
+  it('carries the legacy provenance instead of claiming applied evidence', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      state: { difficulty: 'hard', hardTurns: 1, updatedAt: Date.now() - 1000 },
+    })
+
+    expect(asDecision(decision).event.ev).toMatchObject({
+      t: 'difficulty-routing',
+      result: { evidence: 'legacy-selection' },
+    })
+    expect(asDecision(decision).pending.decisionReasons).toContain('legacy-bootstrap')
+  })
+
+  it('does not reclassify downward when the stored floor cannot be read', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'rename this variable',
+      current: { model: 'claude-opus-5', effort: 'high' },
+      state: { stateVersion: 99, revision: 12 },
+    })
+
+    // A floor probably exists and this build cannot see it. Keeping the engine's
+    // current setting is the only move that neither claims continuity nor
+    // silently drops the conversation to the cheapest tier.
+    // Contract tightened: a decline for THIS reason now tells the caller to
+    // keep its current model. Plain `null` would let the cheap candidate the
+    // caller already staged run, which is the downgrade being prevented.
+    expect(isRoutingProtect(decision)).toBe(true)
+  })
+
+  it('never writes a v2 record over one a newer version wrote', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      state: { stateVersion: 99, revision: 12 },
+    })
+
+    // Contract tightened: a decline for THIS reason now tells the caller to
+    // keep its current model. Plain `null` would let the cheap candidate the
+    // caller already staged run, which is the downgrade being prevented.
+    expect(isRoutingProtect(decision)).toBe(true)
+  })
+
+  it('reuses the pending decision when the same client request is re-sent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const first = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+    })
+    const second = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      state: asDecision(first).state,
+    })
+
+    expect(Object.keys(asDecision(second).state.pending ?? {})).toEqual(['client-1'])
+    expect(baseFloorDifficulty(asDecision(second).state)).toBeUndefined()
   })
 
   it('uses the prior difficulty for short continuation without making a P2 relay request', async () => {
@@ -314,13 +575,13 @@ describe('difficulty routing runtime', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(decision?.route).toMatchObject({
+    expect(asDecision(decision).route).toMatchObject({
       difficulty: 'hard',
       rawDifficulty: 'hard',
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       effort: 'high',
     })
-    expect(decision?.event.ev).toMatchObject({
+    expect(asDecision(decision).event.ev).toMatchObject({
       t: 'difficulty-routing',
       result: { classifierSource: 'p1-local' },
     })
@@ -356,13 +617,13 @@ describe('difficulty routing diagnostics', () => {
     expect(JSON.stringify(skipped)).toContain('missing-authorization')
   })
 
-  it('records the applied decision with its classifier source, model and effort', async () => {
+  it('records the queued decision with its classifier source, model and effort', async () => {
     const lines = captureDebug()
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
 
     const decision = await resolveDifficultyRouting(baseInput)
 
-    expect(decision?.route.model).toBe('claude-haiku-4-5')
+    expect(asDecision(decision).route.model).toBe('claude-haiku-4-5')
     const applied = lines.filter((line) => line.message.includes('[difficultyRouting]'))
     expect(applied.length, '결정이 로그에 남아야 한다').toBeGreaterThan(0)
     const dump = JSON.stringify(applied)
@@ -466,7 +727,7 @@ describe('grant rejection detail', () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({
       issuedAt: serverNow,
       expiresAt: serverNow + 60_000,
-      relayDeadlineAt: serverNow + 1_000,
+      relayDeadlineAt: serverNow + 3_000,
     }))))
 
     expect(await resolveDifficultyRouting(baseInput)).not.toBeNull()
@@ -486,7 +747,7 @@ describe('grant rejection detail', () => {
     // Rejected because the server's own values disagree, not because of any local clock.
     vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse({ expiresAt: Date.now() - 1 }))))
     // Refused as a grant — the relay is never dispatched — so the turn falls back to P1.
-    expect((await resolveDifficultyRouting(baseInput))?.event.ev)
+    expect(asDecision(await resolveDifficultyRouting(baseInput)).event.ev)
       .toMatchObject({ result: { classifierSource: 'fallback-p1' } })
     expect(dump(lines)).toContain('ttlMs-mismatch')
 
@@ -552,12 +813,12 @@ describe('timing v2 grant negotiation', () => {
         hostProcessPublicKey: encodeBase64(new Uint8Array(32).fill(1)),
         maxInputChars: 8000,
         modelMaxInputTokens: 512,
-        relayDeadlineAt: serverNow + 1_000,
+        relayDeadlineAt: serverNow + 3_000,
         timingVersion: 2,
         requestId: 'client-1',
         issuedAt: serverNow,
         ttlMs: 60_000,
-        relayTtlMs: 1_000,
+        relayTtlMs: 3_000,
         ...over,
       },
       aiModelPolicy: { source: 'unrestricted', allowedSelectionKeys: null, defaultSelectionKey: null },
@@ -574,6 +835,7 @@ describe('timing v2 grant negotiation', () => {
     vi.stubGlobal('fetch', fetchMock)
     await resolve(baseInput)
     expect(bodyOf(fetchMock).timingVersion).toBe(2)
+    expect(bodyOf(fetchMock).maxRelayTtlMs).toBe(3000)
   })
 
   // The exact production numbers: 60002 / 1002 against ceilings of 60000 / 1000.
@@ -582,7 +844,7 @@ describe('timing v2 grant negotiation', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const decision = await resolve(baseInput)
-    expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p1-local' } })
+    expect(asDecision(decision).event.ev).toMatchObject({ result: { classifierSource: 'p1-local' } })
   })
 
   it('decides the same way however far the two clocks sit apart', async () => {
@@ -590,7 +852,7 @@ describe('timing v2 grant negotiation', () => {
       const fetchMock = vi.fn(async () => Response.json(v2Grant(Date.now() + skewMs)))
       vi.stubGlobal('fetch', fetchMock)
       const decision = await resolve(baseInput)
-      expect(decision?.event.ev, `skew ${skewMs}`).toMatchObject({ result: { classifierSource: 'p1-local' } })
+      expect(asDecision(decision).event.ev, `skew ${skewMs}`).toMatchObject({ result: { classifierSource: 'p1-local' } })
     }
   })
 
@@ -604,7 +866,7 @@ describe('timing v2 grant negotiation', () => {
       { issuedAt: 1 },
       { ttlMs: 60_001, expiresAt: 1 },
       { relayTtlMs: 0 },
-      { relayTtlMs: 1_001 },
+      { relayTtlMs: 3_001 },
       { ttlMs: '60000' },
       { issuedAt: -1 },
     ]) {
@@ -612,7 +874,7 @@ describe('timing v2 grant negotiation', () => {
       vi.stubGlobal('fetch', fetchMock)
       const decision = await resolve(baseInput)
       expect(fetchMock, JSON.stringify(over)).toHaveBeenCalledTimes(1)
-      expect(decision?.event.ev, JSON.stringify(over)).toMatchObject({
+      expect(asDecision(decision).event.ev, JSON.stringify(over)).toMatchObject({
         result: { classifierSource: 'fallback-p1', policyRevision: null },
       })
     }
@@ -629,7 +891,7 @@ describe('timing v2 grant negotiation', () => {
       vi.stubGlobal('fetch', fetchMock)
       const decision = await resolve(baseInput)
       expect(fetchMock, String(timingVersion)).toHaveBeenCalledTimes(1)
-      expect(decision?.event.ev, String(timingVersion)).toMatchObject({
+      expect(asDecision(decision).event.ev, String(timingVersion)).toMatchObject({
         result: { classifierSource: 'fallback-p1' },
       })
     }
@@ -645,7 +907,7 @@ describe('timing v2 grant negotiation', () => {
     const decision = await resolve(baseInput)
     // No relay: the grant was not accepted.
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
+    expect(asDecision(decision).event.ev).toMatchObject({ result: { classifierSource: 'fallback-p1' } })
   })
 
   // The CLI is published to npm and upgraded independently of the aplus API, so a client can
@@ -660,7 +922,7 @@ describe('timing v2 grant negotiation', () => {
 
     const decision = await resolve(baseInput)
     expect(decision).not.toBeNull()
-    expect(decision?.route.source).toBe('p1')
+    expect(asDecision(decision).route.source).toBe('p1')
   })
 
   // A grant that is malformed outside the timing contract is a broken server, not an older
@@ -740,19 +1002,19 @@ describe('timing v2 execution budget', () => {
     expect(relayBodies).toHaveLength(1)
     expect(relayBodies[0]).not.toHaveProperty('deadlineAt')
     expect(relayBodies[0].timingVersion).toBe(2)
-    // 750 total, 200 already spent on the grant, and sealing costs a little more.
+    // 3000 total, 200 already spent on the grant, and sealing costs a little more.
     expect(relayBodies[0].remainingMs).toBeGreaterThan(0)
-    expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(550)
+    expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(2800)
   })
 
   // Receiving the grant must not restart the TTL: the server issued it before we saw it.
   it('does not restart the budget when the grant arrives', async () => {
-    const { relayBodies } = wire({ grantMs: 700 })
+    const { relayBodies } = wire({ grantMs: 2950 })
     await resolve({ ...baseInput, contentText: RELAY_PROMPT })
     expect(relayBodies[0]?.remainingMs).toBeLessThanOrEqual(50)
   })
 
-  // With the default 1000ms relay budget the 750ms turn deadline always wins, so the
+  // With the default 3000ms relay budget the 3000ms turn deadline always wins, so the
   // round-trip deduction is invisible. A server that issues a tighter budget exposes it.
   it('charges the grant round trip against the budget the server issued', async () => {
     const relayBodies: Record<string, unknown>[] = []
@@ -776,7 +1038,7 @@ describe('timing v2 execution budget', () => {
   })
 
   it('never dispatches a relay once the budget is spent', async () => {
-    for (const grantMs of [750, 900]) {
+    for (const grantMs of [3000, 3200]) {
       const { fetchMock, relayBodies } = wire({ grantMs })
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `grant took ${grantMs}ms`).toHaveLength(0)
@@ -795,7 +1057,7 @@ describe('timing v2 execution budget', () => {
     vi.spyOn(freshLogger, 'debug').mockImplementation((message: string, ...args: unknown[]) => {
       lines.push({ message, args })
     })
-    wire({ grantMs: 800 })
+    wire({ grantMs: 3100 })
     expect(await resolve({ ...baseInput, contentText: RELAY_PROMPT })).toBeNull()
     expect(JSON.stringify(lines)).toContain('budget-spent')
     expect(JSON.stringify(lines)).not.toContain('budget-spent-before-relay')
@@ -805,11 +1067,11 @@ describe('timing v2 execution budget', () => {
   // returned, so it cannot tell "the late answer was dropped" from "the turn lost its routing".
   // Name the outcome instead: the remote answer is discarded, the local decision still applies.
   it('discards a relay answer that lands after the deadline', async () => {
-    for (const relayMs of [750, 900]) {
+    for (const relayMs of [3000, 3200]) {
       const { relayBodies } = wire({ relayMs })
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `relay took ${relayMs}ms`).toHaveLength(1)
-      expect(decision?.event.ev, `relay took ${relayMs}ms`).toMatchObject({
+      expect(asDecision(decision).event.ev, `relay took ${relayMs}ms`).toMatchObject({
         result: { classifierSource: 'fallback-p1' },
       })
     }
@@ -819,18 +1081,18 @@ describe('timing v2 execution budget', () => {
   // already degrades an unusable answer to the free local decision. Returning null instead
   // means one slow server turn silently removes routing from the turn entirely.
   it('keeps routing the turn when the relay answers past the deadline', async () => {
-    const { relayBodies } = wire({ relayMs: 750 })
+    const { relayBodies } = wire({ relayMs: 3000 })
     const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
     expect(relayBodies).toHaveLength(1)
     expect(decision).not.toBeNull()
-    expect(decision?.route.source).toBe('p1')
+    expect(asDecision(decision).route.source).toBe('p1')
   })
 
   it('still applies a relay answer that lands just inside the deadline', async () => {
-    const { relayBodies } = wire({ relayMs: 700 })
+    const { relayBodies } = wire({ relayMs: 2900 })
     const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
     expect(relayBodies).toHaveLength(1)
-    expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+    expect(asDecision(decision).event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
   })
 
   // The breaker counts real elapsed time, so a wall-clock jump can neither arm nor release it.
@@ -877,10 +1139,427 @@ describe('timing v2 execution budget', () => {
 
       const decision = await resolve({ ...baseInput, contentText: RELAY_PROMPT })
       expect(relayBodies, `jump ${jumpMs}`).toHaveLength(1)
-      expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(550)
-      expect(relayBodies[0].remainingMs).toBeGreaterThan(400)
-      expect(decision?.event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
+      expect(relayBodies[0].remainingMs).toBeLessThanOrEqual(2800)
+      expect(relayBodies[0].remainingMs).toBeGreaterThan(2600)
+      expect(asDecision(decision).event.ev).toMatchObject({ result: { classifierSource: 'p2-org-shared' } })
       vi.setSystemTime(1_700_000_000_000)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review follow-up: protective decline must not leave the engine on the
+// client's cheap candidate; reasons that were declared but never produced.
+// ---------------------------------------------------------------------------
+
+describe('protective decline (R2, R6)', () => {
+  const trivialMeta = {
+    difficultyRoutingIntent: intent,
+    difficultyRoutingAuthorization: 'routing-authorization',
+  }
+
+  it('shouldTellTheCallerToKeepItsCurrentModelWhenTheFloorCannotBeRead', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const outcome = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'rename this variable',
+      meta: trivialMeta,
+      // What the client already picked for this turn — the cheap candidate.
+      current: { model: 'claude-haiku-4-5', effort: 'low' },
+      state: { stateVersion: 99, revision: 12 },
+    })
+
+    // Plain `null` would let the caller run the cheap candidate it already
+    // staged, which is the silent downgrade this guard exists to prevent.
+    expect(isRoutingProtect(outcome)).toBe(true)
+  })
+
+  it('shouldTellTheCallerToKeepItsCurrentModelWhenTheStoredPairIsUnsupported', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const outcome = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'rename this variable',
+      meta: trivialMeta,
+      current: { model: 'claude-haiku-4-5', effort: 'low' },
+      state: {
+        stateVersion: 2,
+        revision: 3,
+        base: {
+          difficulty: 'hard',
+          model: 'claude-opus-5',
+          effort: 'not-a-real-effort',
+          provenance: 'engine-applied',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: 7,
+          appliedAt: Date.now(),
+        },
+      },
+    })
+
+    expect(isRoutingProtect(outcome)).toBe(true)
+  })
+
+  it('shouldStillDeclineWithoutProtectionWhenRoutingSimplyDoesNotApply', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down') }))
+
+    const outcome = await resolveDifficultyRouting({ ...baseInput, meta: trivialMeta })
+
+    // Nothing is known about a floor here, so there is nothing to protect and
+    // the existing "leave the turn alone" contract must be preserved.
+    expect(outcome).toBeNull()
+  })
+})
+
+describe('decision reasons that were previously unreachable (R5, AC5)', () => {
+  it('shouldCarryThePolicySnapshotSoTheEngineBoundaryCanRevalidate', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      ...grantResponse(),
+      aiModelPolicy: {
+        source: 'organization',
+        allowedSelectionKeys: ['claude:claude-haiku-4-5', 'claude:claude-opus-5'],
+        defaultSelectionKey: 'claude:claude-haiku-4-5',
+      },
+    })))
+
+    const decision = await resolveDifficultyRouting(baseInput)
+
+    expect(asDecision(decision).pending.policySnapshot).toEqual({
+      allowedSelectionKeys: ['claude:claude-haiku-4-5', 'claude:claude-opus-5'],
+      defaultSelectionKey: 'claude:claude-haiku-4-5',
+    })
+  })
+
+  it('shouldNameTheReturnToAutoAndCarryThePreviousActualSelection', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      state: {
+        stateVersion: 2,
+        revision: 5,
+        lastManual: { model: 'claude-sonnet-5', effort: 'high', at: Date.now() - 1000 },
+        lastAppliedRoute: {
+          model: 'claude-sonnet-5',
+          effort: 'high',
+          difficulty: 'routine',
+          kind: 'manual',
+          at: Date.now() - 1000,
+        },
+      },
+    })
+
+    // The transition is named as a reason, and the model it returned FROM
+    // travels in the general previous-actual field rather than a manual-only one.
+    expect(asDecision(decision).pending.decisionReasons).toContain('manual-return-to-auto')
+    expect(asDecision(decision).event.ev).toMatchObject({
+      t: 'difficulty-routing',
+      result: {
+        decisionReasons: expect.arrayContaining(['manual-return-to-auto']),
+        previousApplied: { model: 'claude-sonnet-5', effort: 'high', kind: 'manual' },
+      },
+    })
+  })
+
+  it('shouldNameAnExplicitContextResetOnTheFirstTurnOfANewEpoch', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      state: { stateVersion: 2, revision: 5, epochStartedAt: Date.now() - 10 },
+    })
+
+    expect(asDecision(decision).pending.decisionReasons).toContain('context-reset')
+  })
+
+  it('shouldNameAContinuationThatReusedThePriorDifficulty', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'continue',
+      state: { difficulty: 'hard', hardTurns: 1, updatedAt: Date.now() },
+    })
+
+    expect(asDecision(decision).pending.decisionReasons).toContain('continuation-reuse')
+  })
+})
+
+describe('local auto bootstrap (R2, AC3)', () => {
+  it('shouldRecordAClientChosenAutoModelAsAnObservedApply', () => {
+    // Previously recorded as `legacy-selection`, which made consumers discard a
+    // floor this CLI really applied. Where the classifier ran is `kind`'s job;
+    // it does not weaken the evidence for an execution we observed.
+    const boot = buildLocalAutoBootstrapDecision({
+      agent: 'claude',
+      clientRequestId: 'local-1',
+      model: 'claude-opus-5',
+      effort: 'high',
+      now: Date.now(),
+    })
+
+    expect(boot).toMatchObject({
+      kind: 'local-auto-bootstrap',
+      baseProvenance: 'engine-applied',
+      base: { difficulty: 'hard', model: 'claude-opus-5', effort: 'high' },
+    })
+    expect(boot?.decisionReasons).toContain('legacy-bootstrap')
+  })
+
+  it('shouldRefuseToBootstrapFromAModelOutsideTheRoutingCatalog', () => {
+    // An unknown model has no tier, so inventing one would fabricate a floor.
+    expect(buildLocalAutoBootstrapDecision({
+      agent: 'claude',
+      clientRequestId: 'local-1',
+      model: 'some-model-we-do-not-know',
+      effort: 'high',
+      now: Date.now(),
+    })).toBeNull()
+  })
+
+  it('shouldRefuseToBootstrapFromAPairTheCatalogDoesNotOffer', () => {
+    expect(buildLocalAutoBootstrapDecision({
+      agent: 'claude',
+      clientRequestId: 'local-1',
+      model: 'claude-opus-5',
+      effort: 'low',
+      now: Date.now(),
+    })).toBeNull()
+  })
+
+  it('shouldRecordAManualTurnWithoutGivingItAFloor', () => {
+    const manual = buildManualAppliedDecision({
+      clientRequestId: 'manual-1',
+      model: 'claude-sonnet-5',
+      effort: 'high',
+      now: Date.now(),
+    })
+
+    expect(manual.kind).toBe('manual')
+    expect(manual.selected).toEqual({ model: 'claude-sonnet-5', effort: 'high' })
+  })
+})
+
+describe('cross-generation floor preservation (R2, R3)', () => {
+  // Desktop routes a newer catalog generation than this CLI. A pair from that
+  // generation must be recognised (so the floor survives the local→shared move)
+  // and retained exactly (so recognising it never rewrites it).
+  const cases = [
+    { agent: 'claude' as const, model: 'claude-opus-5-5', effort: 'high', tier: 'hard' },
+    { agent: 'codex' as const, model: 'gpt-6-sol', effort: 'high', tier: 'hard' },
+    { agent: 'codex' as const, model: 'gpt-6-luna', effort: 'low', tier: 'trivial' },
+  ]
+
+  for (const { agent, model, effort, tier } of cases) {
+    it(`shouldBootstrapANewGenerationPairWithoutRewritingIt (${agent}/${model})`, () => {
+      const boot = buildLocalAutoBootstrapDecision({
+        agent,
+        clientRequestId: 'local-1',
+        model,
+        effort,
+        now: Date.now(),
+      })
+
+      expect(boot?.base).toEqual({ difficulty: tier, model, effort })
+      expect(boot?.selected).toEqual({ model, effort })
+    })
+  }
+
+  it('shouldKeepANewGenerationFloorOnTheSharedPathInsteadOfDroppingIt', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      // An easy follow-up: without cross-generation recognition the unknown
+      // stored pair made this decline, and the conversation restarted cheap.
+      contentText: 'rename this variable',
+      state: {
+        stateVersion: 2,
+        revision: 3,
+        base: {
+          difficulty: 'hard',
+          model: 'claude-opus-5-5',
+          effort: 'high',
+          provenance: 'engine-applied',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: 7,
+          appliedAt: Date.now(),
+        },
+      },
+    })
+
+    // Retained exactly — recognising the tier must not remap it to this build's
+    // own `claude-opus-5`.
+    expect(asDecision(decision).route).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' })
+  })
+
+  it('shouldStillRetainThisBuildsOwnGenerationExactly', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'rename this variable',
+      state: {
+        stateVersion: 2,
+        revision: 3,
+        base: {
+          difficulty: 'hard',
+          model: 'claude-opus-5',
+          effort: 'high',
+          provenance: 'engine-applied',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: 7,
+          appliedAt: Date.now(),
+        },
+      },
+    })
+
+    expect(asDecision(decision).route).toMatchObject({ model: 'claude-opus-5', effort: 'high' })
+  })
+
+  it('shouldStillRefuseAPairNoGenerationOffers', () => {
+    expect(buildLocalAutoBootstrapDecision({
+      agent: 'claude',
+      clientRequestId: 'local-1',
+      model: 'claude-opus-5-5',
+      effort: 'low',
+      now: Date.now(),
+    })).toBeNull()
+  })
+})
+
+describe('reconciling a decision with the settings actually applied (R8)', () => {
+  const base = buildLocalAutoBootstrapDecision({
+    agent: 'claude',
+    clientRequestId: 'r1',
+    model: 'claude-opus-5',
+    effort: 'high',
+    now: 1,
+  })!
+
+  it('shouldKeepTheDecisionUnchangedWhenTheRuntimeDidNotSubstitute', () => {
+    expect(reconcileDecisionWithAppliedSettings(base, { model: 'claude-opus-5', effort: 'high' }, 'claude'))
+      .toBe(base)
+  })
+
+  it('shouldRecordTheSubstitutedPairWhenTheRuntimeChangedIt', () => {
+    // The floor must describe what the SDK actually received, not what routing
+    // picked before the runtime rewrote it.
+    const reconciled = reconcileDecisionWithAppliedSettings(
+      base,
+      { model: 'claude-sonnet-5', effort: 'high' },
+      'claude',
+    )
+
+    expect(reconciled?.selected).toEqual({ model: 'claude-sonnet-5', effort: 'high' })
+    expect(reconciled?.base).toEqual({ difficulty: 'routine', model: 'claude-sonnet-5', effort: 'high' })
+  })
+
+  it('shouldRefuseToRecordAFloorForASubstitutionItCannotClassify', () => {
+    // A Z.AI-style rewrite can land on a model this catalog has never heard of.
+    // There is no honest tier for it, so no floor is claimed — and nothing is
+    // fabricated to fill the gap.
+    expect(reconcileDecisionWithAppliedSettings(
+      base,
+      { model: 'glm-4.7-some-backend-model', effort: 'high' },
+      'claude',
+    )).toBeNull()
+  })
+
+  it('shouldRefuseWhenOnlyTheEffortDriftedIntoAnUnknownPair', () => {
+    expect(reconcileDecisionWithAppliedSettings(
+      base,
+      { model: 'claude-opus-5', effort: 'low' },
+      'claude',
+    )).toBeNull()
+  })
+
+  it('shouldNeverInventAProviderConfirmation', () => {
+    const reconciled = reconcileDecisionWithAppliedSettings(
+      base,
+      { model: 'claude-sonnet-5', effort: 'high' },
+      'claude',
+    )
+    expect(reconciled).not.toHaveProperty('providerConfirmedModel')
+  })
+})
+
+describe('previous actual applied route on the wire (R8)', () => {
+  const grantOk = () => vi.stubGlobal('fetch', vi.fn(async () => Response.json(grantResponse())))
+
+  function stateWith(lastAppliedRoute: unknown) {
+    return {
+      stateVersion: 2,
+      revision: 5,
+      base: {
+        difficulty: 'hard',
+        model: 'claude-opus-5',
+        effort: 'high',
+        provenance: 'engine-applied',
+        policyVersion: 'org-shared-difficulty-routing.v1',
+        policyRevision: 7,
+        appliedAt: Date.now() - 1000,
+      },
+      lastAppliedRoute,
+    }
+  }
+
+  it('shouldReportTheEscalatedModelTheConversationActuallyReturnedFrom', async () => {
+    grantOk()
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      state: stateWith({
+        model: 'claude-fable-5-1',
+        effort: 'high',
+        difficulty: 'escalated',
+        kind: 'auto',
+        at: Date.now() - 500,
+      }),
+    })
+
+    // The base underneath the escalation was opus; what actually ran was fable.
+    expect(asDecision(decision).event.ev).toMatchObject({
+      t: 'difficulty-routing',
+      result: { previousApplied: { model: 'claude-fable-5-1', effort: 'high', difficulty: 'escalated' } },
+    })
+  })
+
+  it('shouldReportAPreviousManualSelectionThroughTheSameField', async () => {
+    grantOk()
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      state: stateWith({
+        model: 'claude-sonnet-5',
+        effort: 'high',
+        difficulty: 'routine',
+        kind: 'manual',
+        at: Date.now() - 500,
+      }),
+    })
+
+    expect(asDecision(decision).event.ev).toMatchObject({
+      t: 'difficulty-routing',
+      result: { previousApplied: { model: 'claude-sonnet-5', kind: 'manual' } },
+    })
+  })
+
+  it('shouldOmitTheFieldEntirelyWhenNoPreviousRouteIsKnown', async () => {
+    grantOk()
+
+    const decision = await resolveDifficultyRouting({
+      ...baseInput,
+      contentText: 'refactor the auth module',
+      // Old state: never recorded one. Unknown must stay unknown rather than
+      // being reconstructed from the floor.
+      state: stateWith(undefined),
+    })
+
+    const result = (asDecision(decision).event.ev as { result: Record<string, unknown> }).result
+    expect(result.previousApplied).toBeUndefined()
   })
 })

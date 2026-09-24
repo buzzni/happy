@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     fetchAplusMcpServers,
     fetchAplusMcpServersResult,
+    isConnectorPlatformConfigured,
     mcpConfigFailureStatuses,
     resolveMcpFloorServerNames,
 } from './fetchAplusMcpServers';
@@ -376,5 +377,24 @@ describe('fetchAplusMcpServersResult', () => {
         it('returns nothing when the session started with connectors only', () => {
             expect(resolveMcpFloorServerNames({ notion: {} as any }, ['notion'])).toEqual([]);
         });
+    });
+});
+
+describe('isConnectorPlatformConfigured', () => {
+    const previousConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+
+    afterEach(() => {
+        if (previousConfigUrl === undefined) delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+        else process.env.HAPPY_APLUS_MCP_CONFIG_URL = previousConfigUrl;
+    });
+
+    it('is false for a plain local run with no daemon-injected config URL', () => {
+        delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+        expect(isConnectorPlatformConfigured()).toBe(false);
+    });
+
+    it('is true once the daemon injected the trusted config URL', () => {
+        process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'http://aplus.test/api/me/mcp-config';
+        expect(isConnectorPlatformConfigured()).toBe(true);
     });
 });

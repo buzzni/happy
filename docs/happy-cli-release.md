@@ -52,6 +52,41 @@ hotfix that filters only the unsupported path for old/unknown daemon versions.
 Do not disable all bootstrap files, relax the daemon to arbitrary paths, or
 wait for fleet-wide CLI upgrades before restoring session creation.
 
+## Usage Wire Compatibility — Server Deploys Before the CLI (CRITICAL)
+
+`@slopus/happy-wire`'s `ProviderUsageEventV1Schema` is `.strict()`, and it is
+bundled into **both** the CLI and happy-server. When the CLI starts sending a
+field the deployed server's copy does not know, `usageHandler.ts` rejects the
+event with `safeParse` and logs one line:
+
+```
+log({ module: 'websocket', level: 'warn' }, 'Rejected invalid provider usage event');
+```
+
+The whole event is dropped — not just the new field, but that event's entire
+token usage — and the log does not name the offending field. Publishing the CLI
+first therefore loses usage silently across every session until the server
+catches up.
+
+This is the mirror of the spawn-bootstrap contract above: there the CLI ships
+first, here the **server** ships first.
+
+Before tagging a release that adds or changes any field in
+`packages/happy-wire/src/usage.ts`:
+
+1. Land the happy-wire change on happy `main`.
+2. Bump `vendor/happy` in A+ Dev Studio and promote `main` -> `product`. The
+   pointer bump is what rebuilds the happy-server image (its changed paths are
+   matched by `HAPPY_SERVER_IMAGE_PREFIXES` in `tools/ci/select-deploy-services.mjs`),
+   and the image is built from the checked-out `vendor/happy`. Bumping the
+   pointer does **not** publish the CLI, so this step puts nothing new in the
+   field.
+3. Confirm the deployed server accepts the new shape.
+4. Only then tag `happy-cli-v<version>`.
+
+The reverse direction is safe on its own: a new server with an old CLI parses
+fine as long as the new fields are `.nullish()`. Keep them `.nullish()`.
+
 ## Single Publisher Policy (CRITICAL)
 
 GitHub Actions owns the entire registry publication path. Local work ends after the

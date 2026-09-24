@@ -14,8 +14,20 @@ describe('buildConnectorToolGuidance', () => {
         expect(guidance).not.toContain('account');
     });
 
-    it('omits guidance when no personal connector is expected', () => {
+    it('keeps platform diagnosis guidance when the expected inventory is unknown', () => {
+        const guidance = buildConnectorToolGuidance([], { connectorPlatformConfigured: true });
+        expect(guidance).toContain('deferred MCP tool discovery');
+        expect(guidance).toContain('installed: false');
+        expect(guidance).not.toContain('expects these connected');
+        expect(guidance).toContain('does not establish that no services are connected');
+    });
+
+    // A session with no connector platform behind it is not a session whose
+    // inventory is unknown: there is nothing to diagnose, so the connector
+    // repair policy must stay out of its prompt.
+    it('omits guidance when no connector platform is configured', () => {
         expect(buildConnectorToolGuidance([])).toBe('');
+        expect(buildConnectorToolGuidance([], { connectorPlatformConfigured: false })).toBe('');
     });
 
     it('combines personal connectors and runtime MCP services while excluding internal servers', () => {

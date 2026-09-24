@@ -33,12 +33,12 @@ describe('enqueueChannelTurn', () => {
         // The Desktop turn is still first and still alone: nothing was discarded, nothing merged.
         const first = await q.waitForMessagesAndGetAsString();
         expect(first?.message).toBe('desktop typed this');
-        expect(first?.requestIds ?? []).toEqual([]);
+        expect(first?.channelRequestId).toBeUndefined();
 
         const second = await q.waitForMessagesAndGetAsString();
         expect(second?.message).toBe('from telegram');
         expect(second?.isolate).toBe(true);
-        expect(second?.requestIds).toEqual(['req-1']);
+        expect(second?.channelRequestId).toBe('req-1');
     });
 
     it('keeps two channel turns apart instead of batching them into one ask', async () => {
@@ -46,8 +46,8 @@ describe('enqueueChannelTurn', () => {
         enqueueChannelTurn({ text: 'first', requestId: 'req-1' }, () => MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
         enqueueChannelTurn({ text: 'second', requestId: 'req-2' }, () => MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
 
-        expect((await q.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-1']);
-        expect((await q.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-2']);
+        expect((await q.waitForMessagesAndGetAsString())?.channelRequestId).toBe('req-1');
+        expect((await q.waitForMessagesAndGetAsString())?.channelRequestId).toBe('req-2');
     });
 
     /**
@@ -58,7 +58,7 @@ describe('enqueueChannelTurn', () => {
     it('carries the request id to the consumer', async () => {
         const q = queue();
         enqueueChannelTurn({ text: 'work', requestId: 'req-9' }, () => MODE, { queue: q, deferredContinuation: NO_CONTINUATION });
-        expect((await q.waitForMessagesAndGetAsString())?.requestIds).toEqual(['req-9']);
+        expect((await q.waitForMessagesAndGetAsString())?.channelRequestId).toBe('req-9');
     });
 
     it('queues the continuation text and reports it, then commits', async () => {

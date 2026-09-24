@@ -310,13 +310,13 @@ describe('channel cancellation at the provider consumption boundary', () => {
 it('removes only the cancelled request and preserves Desktop order and a different channel', async () => {
     const queue = new MessageQueue2<string>(mode => mode);
     queue.push('desktop-before', 'default');
-    queue.pushIsolated('cancel-me', 'default', [], 'r1');
-    queue.pushIsolated('keep-me', 'default', [], 'r2');
+    queue.pushIsolated('cancel-me', 'default', [], undefined, 'r1');
+    queue.pushIsolated('keep-me', 'default', [], undefined, 'r2');
     queue.push('desktop-after', 'default');
     expect(queue.removeByRequestId('r1')).toBe(1);
     expect(queue.removeByRequestId('missing')).toBe(0);
     expect((await queue.waitForMessagesAndGetAsString())?.message).toBe('desktop-before');
-    expect((await queue.waitForMessagesAndGetAsString())?.requestIds).toEqual(['r2']);
+    expect((await queue.waitForMessagesAndGetAsString())?.channelRequestId).toBe('r2');
     expect((await queue.waitForMessagesAndGetAsString())?.message).toBe('desktop-after');
 });
 

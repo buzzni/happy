@@ -48,6 +48,11 @@ export class McpRuntimeRecovery {
         this.connectorNames = new Set(options.connectorNames ?? readExpectedConnectors());
     }
 
+    async readStatuses(): Promise<McpRuntimeServerStatus[]> {
+        const statuses = await this.query.mcpServerStatus();
+        return statuses.map((status) => this.emit(status));
+    }
+
     async recoverFailedServers(): Promise<void> {
         let statuses: McpServerStatus[];
         try {
@@ -125,6 +130,10 @@ export class McpRuntimeRecovery {
                 const current = (await this.query.mcpServerStatus()).find((status) => status.name === serverName);
                 if (current) {
                     this.emit(current);
+                    // Disabled is an intentional state, not a failed recovery to retry.
+                    if (current.status === 'disabled') {
+                        return { serverName, status: 'not_available' };
+                    }
                     if (current.status === 'connected' || current.status === 'needs-auth') {
                         this.cooldownUntil.delete(serverName);
                         return current.status === 'connected'
@@ -143,21 +152,21 @@ export class McpRuntimeRecovery {
         return { serverName, status: 'failed', error: lastError };
     }
 
-    private emit(status: Pick<McpServerStatus, 'name' | 'status' | 'error'>): void {
+    private emit(status: Pick<McpServerStatus, 'name' | 'status' | 'error'>): McpRuntimeServerStatus {
         let mappedStatus: McpRuntimeServerStatus['status'] = status.status === 'pending'
             ? 'reconnecting'
-            : status.status === 'disabled'
-                ? 'failed'
-                : status.status;
+            : status.status;
         if (this.connectorNames.has(status.name)) {
             if (mappedStatus === 'failed') mappedStatus = 'connector-runtime-failed';
             if (mappedStatus === 'needs-auth') mappedStatus = 'connector-needs-auth';
         }
-        this.onStatus?.({
+        const reported: McpRuntimeServerStatus = {
             name: status.name,
             status: mappedStatus,
             error: status.error ? sanitizeMcpError(status.error) : undefined,
             checkedAt: this.now(),
-        });
+        };
+        this.onStatus?.(reported);
+        return reported;
     }
 }

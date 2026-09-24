@@ -80,3 +80,7 @@ happy-workspaces/
 # claude-memory-layer markdown mirror (conversation logs)
 memory/
 memory.bak-*/
+
+# Lesson host source is code, not runtime memory storage.
+!packages/happy-cli/src/memory/
+!packages/happy-cli/src/memory/**

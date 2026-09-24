@@ -5,7 +5,13 @@ type PreparedTurn = { text: string; commit: () => void; rollback: () => void };
 
 export interface ChannelTurnEnqueueDeps<T> {
     queue: {
-        pushIsolated(message: string, mode: T, attachments?: PendingAttachment[], requestId?: string): void;
+        pushIsolated(
+            message: string,
+            mode: T,
+            attachments?: PendingAttachment[],
+            requestIds?: string[],
+            channelRequestId?: string,
+        ): void;
     };
     deferredContinuation: {
         prepare(text: string, options?: { fromChannel?: boolean }): PreparedTurn | null;
@@ -47,7 +53,7 @@ export function enqueueChannelTurn<T>(
     const queuedText = deferredTurn?.text ?? input.text;
     try {
         if (deferredTurn) deps.onDeferredText?.(queuedText);
-        deps.queue.pushIsolated(queuedText, mode(), [], input.requestId);
+        deps.queue.pushIsolated(queuedText, mode(), [], undefined, input.requestId);
         deferredTurn?.commit();
     } catch (error) {
         // The continuation must not be consumed by a turn that never reached the queue.

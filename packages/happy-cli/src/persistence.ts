@@ -55,6 +55,8 @@ interface Settings {
   sandboxConfig?: SandboxConfig
   serverUrl?: string
   webappUrl?: string
+  /** Non-secret endpoint restored when a later CLI invocation restarts the daemon. */
+  aplusMcpConfigUrl?: string
   /**
    * aplus §6-1 Phase 3b — aplus claim setup 커맨드가 남기는 계정 box 공개키
    * (base64). 존재하면 legacy 자격증명에 머신 키를 1회 provisioning 한다.

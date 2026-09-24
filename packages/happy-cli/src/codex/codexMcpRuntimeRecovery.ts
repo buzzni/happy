@@ -1,4 +1,5 @@
 import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { readExpectedConnectors } from '@/aplus/fetchAplusMcpServers';
 
 export type CodexMcpStartupStatus = {
     threadId?: string | null;
@@ -73,6 +74,7 @@ type RecoveryOptions = {
     cooldownMs?: number;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
+    connectorNames?: readonly string[];
 };
 
 type RecoveryInput = {
@@ -99,6 +101,7 @@ export class CodexMcpRuntimeRecovery {
     private readonly cooldownMs: number;
     private readonly now: () => number;
     private readonly sleep: (ms: number) => Promise<void>;
+    private readonly connectorNames: Set<string>;
     private readonly inFlight = new Map<string, Promise<CodexMcpRecoveryResult>>();
     private readonly cooldowns = new Map<string, { failureSignature: string; until: number }>();
     private readonly unhealthyServers = new Map<string, string[]>();
@@ -112,6 +115,72 @@ export class CodexMcpRuntimeRecovery {
         this.cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
         this.now = options.now ?? Date.now;
         this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+        this.connectorNames = new Set(options.connectorNames ?? readExpectedConnectors());
+    }
+
+    /** Read-only: normal readiness must be visible even when no recovery ran. */
+    async readStatuses(input: RecoveryInput): Promise<McpRuntimeServerStatus[]> {
+        // Status is informational: every input it reads is untrusted evidence,
+        // and no shape of it may throw out of here. A rejection would reach the
+        // turn loop, which treats it as a process crash and drops the prompt.
+        let startupEntries: CodexMcpStartupStatus[] = [];
+        try {
+            startupEntries = this.client.getMcpStartupStatuses();
+        } catch {
+            // Missing startup notifications are unknown, not failure.
+        }
+        const startup = new Map(startupEntries
+            .filter((entry) => !entry.threadId || entry.threadId === input.threadId)
+            .map((entry) => [entry.name, entry]));
+        let inventory: Map<string, CodexMcpServerInventory> | undefined;
+        try {
+            const result = await this.client.listMcpServerStatus({ threadId: input.threadId });
+            inventory = new Map(result.data.map((entry) => [entry.name, entry]));
+        } catch {
+            // No inventory is unknown, never proof of a healthy connection.
+        }
+        const checkedAt = this.now();
+        return [...new Set(input.expectedServerNames)].sort().map((name) => {
+            const started = startup.get(name);
+            const entry = inventory?.get(name);
+            let status: McpRuntimeServerStatus['status'] = 'reconnecting';
+            if (entry?.authStatus === 'notLoggedIn' || started?.failureReason === 'reauthenticationRequired') {
+                status = 'needs-auth';
+            } else if (started?.status === 'failed' || started?.status === 'cancelled') {
+                status = 'failed';
+            } else if (started?.status !== 'starting') {
+                // An inventory entry whose auth question is already settled is
+                // connected even when it publishes no tools -- a resource- or
+                // prompt-only server, or one whose tools are not enumerated yet.
+                // `inspect()` reads that same state as ready, so anything
+                // stricter here leaves a healthy server stuck on 'reconnecting'
+                // with no later path to correct it. Only `unknown` auth still
+                // needs tools as corroborating evidence.
+                const settledEntry = entry !== undefined && entry.authStatus !== 'unknown';
+                if (settledEntry
+                    || (entry && Object.keys(entry.tools ?? {}).length > 0)
+                    || started?.status === 'ready'
+                    || started?.status === 'connected') status = 'connected';
+                else if (inventory && !entry) status = 'failed';
+            }
+            return { name, status: this.qualifyConnector(name, status), checkedAt };
+        });
+    }
+
+    /**
+     * Saycode connectors carry their own wire statuses. Without this the same
+     * server flips between `needs-auth` and `connector-needs-auth` depending on
+     * which publisher wrote last, and a client cannot tell the two apart.
+     * Mirrors `buildCodexMcpRecoveryMetadataStatuses` and Claude's `emit`.
+     */
+    private qualifyConnector(
+        name: string,
+        status: McpRuntimeServerStatus['status'],
+    ): McpRuntimeServerStatus['status'] {
+        if (!this.connectorNames.has(name)) return status;
+        if (status === 'failed') return 'connector-runtime-failed';
+        if (status === 'needs-auth') return 'connector-needs-auth';
+        return status;
     }
 
     recoverBeforeTurn(input: RecoveryInput): Promise<CodexMcpRecoveryResult> {

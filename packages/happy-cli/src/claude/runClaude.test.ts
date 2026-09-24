@@ -260,7 +260,7 @@ async function startRemoteRunClaudeHarness(opts: {
         await stopRun();
         throw new Error('runClaude harness did not start');
     }
-    const runtimeSession = { thinking: false, cleanup: vi.fn() };
+    const runtimeSession = { thinking: false, cleanup: vi.fn(), cancelLessonReview: vi.fn() };
     loopOptions.onSessionReady(runtimeSession);
     const goalActionHandler = registerHandler.mock.calls.find(([method]) => method === 'goal-action')?.[1];
 
@@ -410,6 +410,23 @@ describe('runClaude remote JSONL scanner', () => {
             message: { content: 'apply this now' },
         });
         expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+
+        await harness.finish();
+    });
+
+    it('does not forward an app prompt that claudeRemote prefixed with lesson text', async () => {
+        const harness = await startRemoteRunClaudeHarness();
+
+        harness.loopOptions.onActiveUserInputAccepted('apply this now');
+        harness.scannerOptions.onMessage({
+            type: 'user',
+            message: { content: 'If this turn corrects an earlier mistake, use token="t".\n\napply this now' },
+        });
+        expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+
+        const terminalPrompt = { type: 'user', message: { content: 'typed in the terminal' } };
+        harness.scannerOptions.onMessage(terminalPrompt);
+        expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(terminalPrompt);
 
         await harness.finish();
     });
@@ -1385,6 +1402,20 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it.each(['auto', 'user'])('preserves durable message identity for %s routing receipts', async (modelSource) => {
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => expect(harness.sessionClient.onUserMessage).toHaveBeenCalled());
+        const receive = harness.sessionClient.onUserMessage.mock.calls[0][0];
+        for (const serverMessageId of ['durable-1', 'durable-1', 'durable-2']) {
+            await receive({ serverMessageId, content: { text: 'same content' },
+                meta: { modelSource, model: 'claude-opus-5', effort: 'high' } });
+        }
+        expect(harness.loopOptions.messageQueue.queue.map((entry: any) => entry.requestIds))
+            .toEqual([['message:durable-1'], ['message:durable-1'], ['message:durable-2']]);
+        await harness.finish();
+    });
+
     it('keeps legacy no-intent modelSource auto messages persistent', async () => {
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(true);
@@ -1488,6 +1519,8 @@ describe('runClaude remote JSONL scanner', () => {
             meta: {},
         });
 
+        expect(harness.runtimeSession.cancelLessonReview).toHaveBeenCalledTimes(2);
+        expect(harness.runtimeSession.cancelLessonReview.mock.invocationCallOrder[1]).toBeLessThan(harness.sessionClient.drainAttachmentsForUserMessage.mock.invocationCallOrder[1]);
         expect(harness.sessionClient.drainAttachmentsForUserMessage).toHaveBeenCalledTimes(2);
         grantDeferred.resolve(Response.json({
             ok: false,
@@ -1571,14 +1604,141 @@ describe('runClaude remote JSONL scanner', () => {
             meta: routedMeta('request-2'),
         });
 
-        const metadataUpdaters = harness.sessionClient.updateMetadata.mock.calls
+        const readState = () => {
+            const updaters = harness.sessionClient.updateMetadata.mock.calls
+                .map(([updater]) => updater)
+                .filter((updater) => typeof updater === 'function');
+            return updaters.at(-1)?.({})?.difficultyRoutingState as {
+                base?: { difficulty?: string; provenance?: string };
+                escalation?: { hardTurns?: number };
+                pending?: Record<string, unknown>;
+            } | undefined;
+        };
+
+        /*
+         * Accepting two turns records two pending decisions and nothing else.
+         * The previous version of this test asserted `hardTurns: 2` here, which
+         * pinned the defect: the counters advanced once per accepted message,
+         * before either turn had reached the engine, so a cancelled or merged
+         * turn still escalated the conversation.
+         */
+        const accepted = readState();
+        expect(Object.keys(accepted?.pending ?? {})).toEqual(['request-1', 'request-2']);
+        expect(accepted?.base).toBeUndefined();
+        expect(accepted?.escalation).toBeUndefined();
+
+        // The engine applies both as one batch: the floor and the counters move once.
+        harness.loopOptions.onModeApplied(['request-1', 'request-2'], 'exec-1');
+
+        const applied = readState();
+        expect(applied?.base).toMatchObject({ difficulty: 'hard', provenance: 'engine-applied' });
+        expect(applied?.escalation?.hardTurns).toBe(1);
+        expect(applied?.pending).toBeUndefined();
+
+        await userMessageHandler({ content: { text: '/clear' }, meta: {} });
+        expect(readState()?.base).toEqual(applied?.base);
+        await userMessageHandler({
+            content: { text: 'debug another deadlock after the reset' },
+            meta: routedMeta('request-after-clear'),
+        });
+        expect(Object.keys(readState()?.pending ?? {})).toEqual(['request-after-clear']);
+        harness.loopOptions.onSessionReset();
+        expect(readState()?.base).toBeUndefined();
+        expect(readState()?.escalation).toBeUndefined();
+        expect(Object.keys(readState()?.pending ?? {})).toEqual(['request-after-clear']);
+        harness.loopOptions.onModeApplied(['request-after-clear'], 'exec-after-clear');
+        expect(readState()?.base).toMatchObject({ difficulty: 'hard', provenance: 'engine-applied' });
+        expect(readState()?.escalation?.hardTurns).toBe(1);
+        await harness.finish();
+    });
+
+    it('tells the user when auto-routing declined instead of silently accepting the turn', async () => {
+        vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => Response.json({
+            ok: true,
+            grant: {
+                version: 1,
+                grantId: 'grant-1',
+                policyRevision: 7,
+                timingVersion: 2,
+                requestId: JSON.parse(init.body).clientRequestId,
+                issuedAt: Date.now(),
+                ttlMs: 10_000,
+                relayTtlMs: 1000,
+                expiresAt: Date.now() + 10_000,
+                sourceMachineId: 'machine-1',
+                hostMachineId: 'host-1',
+                hostProcessKeyId: 'key-1',
+                hostProcessPublicKey: Buffer.from(new Uint8Array(32).fill(1)).toString('base64'),
+                maxInputChars: 8000,
+                modelMaxInputTokens: 512,
+                relayDeadlineAt: Date.now() + 1000,
+            },
+            signedGrant: 'signed-grant',
+            aiModelPolicy: { source: 'unrestricted', allowedSelectionKeys: null, defaultSelectionKey: null },
+        })));
+        // A record written by a newer CLI: a floor exists and cannot be read.
+        // Seeded through the harness because the committer reads the metadata
+        // once, when the runner starts.
+        const harness = await startRemoteRunClaudeHarness({
+            metadata: { path: '/tmp', difficultyRoutingState: { stateVersion: 99, revision: 3 } } as never,
+        });
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({
+            content: { text: 'rename this variable' },
+            meta: {
+                modelSource: 'auto',
+                model: 'claude-haiku-4-5',
+                effort: 'low',
+                difficultyRoutingAuthorization: 'authorization',
+                difficultyRoutingIntent: {
+                    version: 1,
+                    mode: 'auto',
+                    policy: 'org-shared-difficulty-routing.v1',
+                    clientRequestId: 'request-protect',
+                    clientRouteSource: 'default-auto',
+                },
+            },
+        });
+
+        // The turn is accepted and will run — but the decline is reported, not
+        // buried in a debug log where nobody sees it.
+        const routingEvents = harness.sessionClient.sendSessionProtocolMessage.mock.calls
+            .map((call) => (call[0] as { ev: { t: string; result?: Record<string, unknown> } }).ev)
+            .filter((ev) => ev.t === 'difficulty-routing');
+        expect(routingEvents).toHaveLength(1);
+        expect(routingEvents[0].result).toMatchObject({
+            stage: 'unknown',
+            evidence: 'unknown',
+            clientRequestId: 'request-protect',
+        });
+        expect(harness.loopOptions.messageQueue.queue).toHaveLength(1);
+        await harness.finish();
+    });
+
+    it('does not move the routing floor for a turn that never reached the engine', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new Error('network down');
+        }));
+        const harness = await startRemoteRunClaudeHarness();
+        harness.sessionClient.hasTitle.mockReturnValue(true);
+        harness.sessionClient.updateMetadata.mockImplementation(vi.fn());
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+
+        // An execution that names a request nothing ever queued must not invent a floor.
+        harness.loopOptions.onModeApplied(['never-queued'], 'exec-1');
+
+        const updaters = harness.sessionClient.updateMetadata.mock.calls
             .map(([updater]) => updater)
             .filter((updater) => typeof updater === 'function');
-        const lastMetadata = metadataUpdaters.at(-1)?.({});
-        expect(lastMetadata?.difficultyRoutingState).toMatchObject({
-            difficulty: 'hard',
-            hardTurns: 2,
-        });
+        const state = updaters.at(-1)?.({})?.difficultyRoutingState as { base?: unknown } | undefined;
+        expect(state?.base).toBeUndefined();
         await harness.finish();
     });
 

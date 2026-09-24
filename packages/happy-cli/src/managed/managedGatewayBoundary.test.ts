@@ -326,8 +326,100 @@ describe('a registered api key', () => {
             ANTHROPIC_API_KEY: 'substituted',
             ANTHROPIC_AUTH_TOKEN: 'substituted',
             OPENAI_API_KEY: 'substituted',
+            openai_api_key: 'substituted',
+            claude_config_dir: '/another-user',
             CLAUDE_CONFIG_DIR: '/workspace/.auth/another-connection/claude',
             CODEX_HOME: '/workspace/.auth/another-connection/codex',
+            HAPPY_SOMETHING_ELSE: 'kept',
+        })).toEqual({ HAPPY_SOMETHING_ELSE: 'kept' });
+    });
+});
+
+/**
+ * What the usage ledger is told this run spent.
+ *
+ * The envelope's `aiAuth.kind` is the only layer that knows: every gateway
+ * base URL differs per envelope, and a personal key and an organisation bundle
+ * are the same variable. Without it every managed run lands in the `unknown`
+ * bucket — a run the platform paid for, reported as nobody's.
+ */
+describe('the auth source a managed run reports', () => {
+    const CONNECTION = 'conn-0123456789ab';
+    const KEY = 'sk-the-registered-key';
+
+    const reader = (provider: string) => (path: string): string => {
+        if (path === `/workspace/.auth/${CONNECTION}/connection.json`) {
+            return JSON.stringify({
+                v: 1, provider, connectionVersion: 2,
+                credentialKind: provider === 'claude' ? 'oauth' : 'api-key',
+            });
+        }
+        if (path === `/workspace/.auth/${CONNECTION}/${provider}/api-key.json`) {
+            return JSON.stringify({ v: 1, provider, apiKey: KEY });
+        }
+        throw new Error(`ENOENT: ${path}`);
+    };
+
+    const subscription = (): ManagedSpawnEnvelope => ({
+        ...envelope('claude'),
+        aiAuth: {
+            kind: 'personal-subscription', provider: 'claude',
+            connectionId: CONNECTION, connectionVersion: 2,
+        },
+        gateway: null,
+    });
+
+    const apiKey = (): ManagedSpawnEnvelope => ({
+        ...envelope('codex'),
+        aiAuth: {
+            kind: 'personal-api-key', provider: 'codex',
+            connectionId: CONNECTION, connectionVersion: 2,
+        },
+        gateway: null,
+    });
+
+    it.each([
+        ['platform-gateway', () => envelope('claude'), undefined],
+        ['platform-glm', () => ({ ...envelope('claude'), aiAuth: { kind: 'platform-glm' as const } }), undefined],
+        ['personal-subscription', subscription, reader('claude')],
+        ['personal-api-key', apiKey, reader('codex')],
+    ])('reports %s from the envelope the parent signed', (source, build, read) => {
+        const env: NodeJS.ProcessEnv = {};
+        applyManagedGatewayEnvironment(env, build() as ManagedSpawnEnvelope, read as ((path: string) => string) | undefined);
+        expect(env.HAPPY_AI_AUTH_SOURCE).toBe(source);
+    });
+
+    it('overwrites an inherited source rather than trusting it', () => {
+        // A reused runtime carries the previous launch's value, and the
+        // previous launch may have been somebody else's connection.
+        const env: NodeJS.ProcessEnv = {
+            HAPPY_AI_AUTH_SOURCE: 'personal-subscription',
+            HAPPY_AI_AUTH_CONNECTION_VERSION: '99',
+        };
+        applyManagedGatewayEnvironment(env, envelope('claude'));
+        expect(env.HAPPY_AI_AUTH_SOURCE).toBe('platform-gateway');
+        expect(env.HAPPY_AI_AUTH_CONNECTION_VERSION).toBeUndefined();
+    });
+
+    it('carries the connection version only when the envelope has one', () => {
+        const personalEnv: NodeJS.ProcessEnv = {};
+        applyManagedGatewayEnvironment(personalEnv, subscription(), reader('claude'));
+        expect(personalEnv.HAPPY_AI_AUTH_CONNECTION_VERSION).toBe('2');
+
+        // A platform kind has no connection at all. Inventing a version here
+        // would report a connection this run was never admitted on.
+        const platformEnv: NodeJS.ProcessEnv = {};
+        applyManagedGatewayEnvironment(platformEnv, envelope('codex'));
+        expect(platformEnv.HAPPY_AI_AUTH_CONNECTION_VERSION).toBeUndefined();
+    });
+
+    it('drops a caller override that would forge the reported source', () => {
+        // `--claude-env` is applied after startup, so an override here wins
+        // over the envelope — and meters this run against somebody else's
+        // subscription.
+        expect(stripProviderCredentialOverrides({
+            HAPPY_AI_AUTH_SOURCE: 'personal-subscription',
+            HAPPY_AI_AUTH_CONNECTION_VERSION: '7',
             HAPPY_SOMETHING_ELSE: 'kept',
         })).toEqual({ HAPPY_SOMETHING_ELSE: 'kept' });
     });

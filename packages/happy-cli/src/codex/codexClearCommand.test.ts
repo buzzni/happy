@@ -1,6 +1,91 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { shouldHandleCodexClear } from './codexClearCommand';
+import { enqueueCodexUserText, shouldHandleCodexClear } from './codexClearCommand';
+
+describe('enqueueCodexUserText', () => {
+    it('queues /clear in isolation instead of batching it into a model prompt', () => {
+        const mode = { permissionMode: 'default' as const };
+        const queue = {
+            push: vi.fn(),
+            pushIsolateAndClear: vi.fn(),
+        };
+
+        const result = enqueueCodexUserText({
+            text: '  /clear  ',
+            mode,
+            queue,
+        });
+
+        expect(result).toBe('clear');
+        expect(queue.pushIsolateAndClear).toHaveBeenCalledWith('  /clear  ', mode, undefined);
+        expect(queue.push).not.toHaveBeenCalled();
+    });
+
+    it('passes attachments to normal queued messages', () => {
+        const mode = { permissionMode: 'default' as const };
+        const attachments = [{
+            data: new Uint8Array([1, 2, 3]),
+            mimeType: 'image/png',
+            name: 'screen.png',
+        }];
+        const queue = {
+            push: vi.fn(),
+            pushIsolateAndClear: vi.fn(),
+        };
+
+        const result = enqueueCodexUserText({
+            text: 'inspect this image',
+            mode,
+            queue,
+            attachments,
+        });
+
+        expect(result).toBe('queued');
+        // Fourth argument is the routing request ids, absent for this call.
+        expect(queue.push).toHaveBeenCalledWith('inspect this image', mode, attachments, undefined);
+        expect(queue.pushIsolateAndClear).not.toHaveBeenCalled();
+    });
+
+    it('passes attachments to isolated clear messages', () => {
+        const mode = { permissionMode: 'default' as const };
+        const attachments = [{
+            data: new Uint8Array([4, 5, 6]),
+            mimeType: 'image/jpeg',
+            name: 'photo.jpg',
+        }];
+        const queue = {
+            push: vi.fn(),
+            pushIsolateAndClear: vi.fn(),
+        };
+
+        const result = enqueueCodexUserText({
+            text: '/clear',
+            mode,
+            queue,
+            attachments,
+        });
+
+        expect(result).toBe('clear');
+        expect(queue.pushIsolateAndClear).toHaveBeenCalledWith('/clear', mode, attachments);
+        expect(queue.push).not.toHaveBeenCalled();
+    });
+});
+
+
+describe('enqueueCodexUserText routing request ids', () => {
+    it('shouldForwardRequestIdsForAQueuedTurn', () => {
+        const queue = { push: vi.fn(), pushIsolateAndClear: vi.fn() };
+
+        enqueueCodexUserText({
+            text: 'refactor this',
+            mode: 'mode',
+            queue,
+            requestIds: ['req-1'],
+        });
+
+        expect(queue.push).toHaveBeenCalledWith('refactor this', 'mode', undefined, ['req-1']);
+    });
+});
 
 /**
  * The consumer-side gate (Saycode specs/desktop-messenger-channels — R1/R5).
@@ -16,20 +101,20 @@ describe('shouldHandleCodexClear', () => {
     });
 
     it('refuses a channel /clear — the reset an external sender must not reach', () => {
-        expect(shouldHandleCodexClear({ message: '/clear', requestIds: ['req-1'] })).toBe(false);
+        expect(shouldHandleCodexClear({ message: '/clear', channelRequestId: 'req-1' })).toBe(false);
     });
 
     it('leaves ordinary channel text alone either way', () => {
-        expect(shouldHandleCodexClear({ message: 'what changed today?', requestIds: ['req-1'] })).toBe(false);
+        expect(shouldHandleCodexClear({ message: 'what changed today?', channelRequestId: 'req-1' })).toBe(false);
         expect(shouldHandleCodexClear({ message: 'what changed today?' })).toBe(false);
     });
 
-    /**
-     * An empty array is not "no channel". It arrives from the same field and means the message
-     * carries no ids *yet*; reading it as local input would restore the hole for anything that
-     * populates `requestIds` after the queue hands the message over.
-     */
-    it('treats an empty id list as local, matching the queue contract', () => {
-        expect(shouldHandleCodexClear({ message: '/clear', requestIds: [] })).toBe(true);
+    it('still handles a local /clear that carries auto-routing ids', () => {
+        // Routing ids ride on ordinary Desktop input. Reading them as channel origin would take
+        // `/clear` away from the person sitting at the app.
+        const message: { message: string; requestIds?: string[]; channelRequestId?: string } = {
+            message: '/clear', requestIds: ['route-1'],
+        };
+        expect(shouldHandleCodexClear(message)).toBe(true);
     });
 });

@@ -17,6 +17,11 @@ import {
 } from './legacyProtocol';
 
 describe('shared wire message schemas', () => {
+  it('preserves a disabled MCP server without reporting a connection failure', () => {
+    const status = { name: 'plugin:example:gmail', status: 'disabled', checkedAt: 123 };
+    expect(McpRuntimeServerStatusSchema.parse(status)).toEqual(status);
+  });
+
   it('parses MCP runtime status and rejects unsupported states', () => {
     expect(McpRuntimeServerStatusSchema.safeParse({
       name: 'aplus-common',

@@ -1,0 +1,23 @@
+name: Workspace boundary native tests
+on:
+  pull_request:
+    paths:
+      - 'packages/happy-cli/src/modules/common/workspaceFileBoundary*'
+      - 'packages/happy-cli/src/modules/common/registerCommonHandlers.ts'
+      - '.github/workflows/workspace-boundary.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  filesystem:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.3'
+      - run: node --experimental-strip-types --test packages/happy-cli/src/modules/common/workspaceFileBoundary.test.mjs

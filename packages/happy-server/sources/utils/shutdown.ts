@@ -34,17 +34,24 @@ export function isShutdown() {
     return shutdownSignal.aborted;
 }
 
-export async function awaitShutdown() {
-    await new Promise<void>((resolve) => {
-        process.on('SIGINT', async () => {
-            log('Received SIGINT signal. Exiting...');
-            resolve();
-        });
-        process.on('SIGTERM', async () => {
-            log('Received SIGTERM signal. Exiting...');
-            resolve();
-        });
-    });
+export async function awaitShutdown(control?: { requested: Promise<void>; finalize?: () => Promise<void> }) {
+    let requested!: () => void;
+    const signal = new Promise<void>((resolve) => { requested = resolve; });
+    // Keep handling repeated signals until drain finishes; otherwise the OS can
+    // terminate the process before its database work has settled.
+    process.on('SIGINT', requested);
+    process.on('SIGTERM', requested);
+    try {
+        await (control ? Promise.race([signal, control.requested]) : signal);
+        await drainShutdownHandlers(control !== undefined);
+        await control?.finalize?.();
+    } finally {
+        process.off('SIGINT', requested);
+        process.off('SIGTERM', requested);
+    }
+}
+
+async function drainShutdownHandlers(controlled: boolean) {
     shutdownController.abort();
     
     // Copy handlers to avoid race conditions
@@ -53,18 +60,23 @@ export async function awaitShutdown() {
         handlersSnapshot.set(name, [...handlers]);
     }
     
-    // Execute all shutdown handlers concurrently
+    // Controlled standalone must drain users of the database before disconnecting it.
+    const databaseHandlers = controlled ? handlersSnapshot.get("db") ?? [] : [];
+    if (controlled) handlersSnapshot.delete("db");
+
+    // Execute independent shutdown handlers concurrently
     const allHandlers: Promise<void>[] = [];
     let totalHandlers = 0;
+    const failures: unknown[] = [];
     
     for (const [name, handlers] of handlersSnapshot) {
         totalHandlers += handlers.length;
         log(`Starting ${handlers.length} shutdown handlers for: ${name}`);
         
         handlers.forEach((handler, index) => {
-            const handlerPromise = handler().then(
+            const handlerPromise = Promise.resolve().then(handler).then(
                 () => {},
-                (error) => log(`Error in shutdown handler ${name}[${index}]:`, error)
+                (error) => { failures.push(error); log(`Error in shutdown handler ${name}[${index}]:`, error); }
             );
             allHandlers.push(handlerPromise);
         });
@@ -75,8 +87,13 @@ export async function awaitShutdown() {
         const startTime = Date.now();
         await Promise.all(allHandlers);
         const duration = Date.now() - startTime;
+
         log(`All ${totalHandlers} shutdown handlers completed in ${duration}ms`);
     }
+    await Promise.all(databaseHandlers.map(async (handler) => {
+        try { await handler(); } catch (error) { failures.push(error); log("Error disconnecting database:", error); }
+    }));
+    if (controlled && failures.length) throw new AggregateError(failures, "Standalone shutdown failed");
 }
 
 export async function keepAlive<T>(name: string, callback: () => Promise<T>): Promise<T> {

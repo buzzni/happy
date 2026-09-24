@@ -58,26 +58,33 @@ function resolveRefreshUrl(configUrl: string): string | null {
 export async function refreshMcpCallerGrantIfExpiring(
     token: string,
     machineId: string,
-    context: { projectId?: string; now?: number } = {},
+    context: { projectId?: string; sessionId?: string; now?: number } = {},
 ): Promise<boolean> {
     const grant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT
     const configUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
     if (!grant || !configUrl || !machineId) return false
     if (!grantExpiresWithin(grant, REFRESH_THRESHOLD_MS, context.now ?? Date.now())) return false
 
-    const refreshUrl = resolveRefreshUrl(configUrl)
-    if (!refreshUrl) return false
-
     // grant 는 발급 시점 scope 에 묶여 있다. 호출부가 추측하지 않고 실제 설정
     // URL 의 scope 를 그대로 쓴다.
     const projectId = context.projectId ?? readConfigProjectId(configUrl)
+    const sessionAuthority = projectId && context.sessionId
+        ? { machineId, sessionId: context.sessionId, callerGrant: grant } : null
+    let refreshUrl = resolveRefreshUrl(configUrl)
+    if (!refreshUrl) return false
+    if (sessionAuthority) {
+        refreshUrl = new URL(`/api/projects/${encodeURIComponent(projectId!)}/lesson-host/refresh`, refreshUrl).toString()
+    }
 
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
     try {
         const res = await fetch(refreshUrl, {
             method: 'POST',
+            redirect: 'error',
+            ...(sessionAuthority ? { body: JSON.stringify(sessionAuthority) } : {}),
             headers: {
+                ...(sessionAuthority ? { 'Content-Type': 'application/json' } : {}),
                 'Authorization': `Bearer ${token}`,
                 'X-Aplus-Machine-Id': machineId,
                 'X-Aplus-Caller-Grant': grant,

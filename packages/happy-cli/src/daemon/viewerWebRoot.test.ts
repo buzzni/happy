@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import {
     buildViewerBridgeModule,
@@ -71,25 +71,25 @@ describe('buildViewerBridgeModule', () => {
 
 describe('ensureViewerWebRoot', () => {
     let sourceRoot: string
-    let targetRoot: string
+    let baseDir: string
 
     beforeEach(() => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-'))
         sourceRoot = join(base, 'novnc')
-        targetRoot = join(base, 'mirror')
+        baseDir = join(base, 'mirror')
         mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
         writeFileSync(join(sourceRoot, 'app', 'ui.js'), 'export default {}')
     })
 
     it('serves a patched page while leaving noVNC\'s assets where they are', () => {
-        const root = ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        expect(root).toBe(targetRoot)
-        expect(readFileSync(join(targetRoot, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
-        expect(lstatSync(join(targetRoot, 'app')).isSymbolicLink()).toBe(true)
-        expect(readlinkSync(join(targetRoot, 'app'))).toBe(join(sourceRoot, 'app'))
-        expect(existsSync(join(targetRoot, VIEWER_BRIDGE_PATH))).toBe(true)
+        expect(root.startsWith(join(baseDir, 'remote-'))).toBe(true)
+        expect(readFileSync(join(root, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        expect(lstatSync(join(root, 'app')).isSymbolicLink()).toBe(true)
+        expect(readlinkSync(join(root, 'app'))).toBe(join(sourceRoot, 'app'))
+        expect(existsSync(join(root, VIEWER_BRIDGE_PATH))).toBe(true)
     })
 
     // Debian's package makes / an alias of vnc.html; a symlink there would
@@ -97,19 +97,19 @@ describe('ensureViewerWebRoot', () => {
     it('patches the directory index too', () => {
         symlinkSync(join(sourceRoot, 'vnc.html'), join(sourceRoot, 'index.html'))
 
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        expect(lstatSync(join(targetRoot, 'index.html')).isSymbolicLink()).toBe(false)
-        expect(readFileSync(join(targetRoot, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        expect(lstatSync(join(root, 'index.html')).isSymbolicLink()).toBe(false)
+        expect(readFileSync(join(root, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 
-    it('rebuilds cleanly when the mode changes', () => {
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'scale' })
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+    it('gives each mode its own root instead of overwriting the other', () => {
+        const scale = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'scale' })
+        const remote = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        const html = readFileSync(join(targetRoot, 'vnc.html'), 'utf8')
-        expect(html).toContain("'resize', 'remote'")
-        expect(html).not.toContain("'resize', 'scale'")
+        expect(remote).not.toBe(scale)
+        expect(readFileSync(join(remote, 'vnc.html'), 'utf8')).toContain("'resize', 'remote'")
+        expect(readFileSync(join(scale, 'vnc.html'), 'utf8')).toContain("'resize', 'scale'")
     })
 
     // A machine whose noVNC install does not look like we expect still has a
@@ -117,7 +117,7 @@ describe('ensureViewerWebRoot', () => {
     it('falls back to the stock root rather than serving nothing', () => {
         writeFileSync(join(sourceRoot, 'vnc.html'), '<html><body>no head</body></html>')
 
-        expect(ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })).toBe(sourceRoot)
+        expect(ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })).toBe(sourceRoot)
     })
 })
 
@@ -210,7 +210,9 @@ function fakeRfb() {
 }
 
 const CONTROL_L = 0xffe3
+const ALT_L = 0xffe9
 const LOWERCASE_V = 0x76
+const LOWERCASE_C = 0x63
 
 describe('installViewerClipboardBridge', () => {
     it('intercepts the paste shortcut before noVNC swallows the keystroke', () => {
@@ -284,8 +286,12 @@ describe('installViewerClipboardBridge', () => {
         let stopped = 0
         const stopImmediatePropagation = () => { stopped += 1 }
         dom.fireKeydown({ key: 'v', stopImmediatePropagation })
-        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'a', metaKey: true, stopImmediatePropagation })
         dom.fireKeydown({ key: 'v', ctrlKey: true, altKey: true, stopImmediatePropagation })
+        // Cmd+C and Ctrl+C are copy — the bridge owns those too (see the
+        // dedicated describe block below) precisely so this one stays
+        // untouched.
+        dom.fireKeydown({ key: 'c', ctrlKey: true, altKey: true, stopImmediatePropagation })
 
         expect(stopped).toBe(0)
         expect(dom.textarea.focused).toBe(false)
@@ -316,8 +322,11 @@ describe('installViewerClipboardBridge', () => {
         expect(rfb.pasted).toEqual(['aws-secret'])
         // Copying the text into the remote clipboard is only half of it: the
         // focused remote app still has to be told to paste, and ⌘V never
-        // reaches it (noVNC maps Meta to Alt for the remote end).
+        // reaches it (noVNC maps Meta to Alt for the remote end). That same
+        // remap also leaves Alt down, so it is released first — the dedicated
+        // test below pins why.
         expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
             [CONTROL_L, 'ControlLeft', true],
             [LOWERCASE_V, 'KeyV', true],
             [LOWERCASE_V, 'KeyV', false],
@@ -388,12 +397,12 @@ describe('installViewerClipboardBridge', () => {
 
 describe('ensureViewerWebRoot idempotence', () => {
     let sourceRoot: string
-    let targetRoot: string
+    let baseDir: string
 
     beforeEach(() => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-again-'))
         sourceRoot = join(base, 'novnc')
-        targetRoot = join(base, 'mirror')
+        baseDir = join(base, 'mirror')
         mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
         writeFileSync(join(sourceRoot, 'app', 'ui.js'), 'export default {}')
@@ -403,25 +412,69 @@ describe('ensureViewerWebRoot idempotence', () => {
     // mirror: tearing down a directory that is already correct would 404
     // whatever asset another user's page is loading right then.
     it('leaves an already-current mirror alone', () => {
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
-        const witness = join(targetRoot, 'rebuild-witness')
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const witness = join(root, 'rebuild-witness')
         writeFileSync(witness, 'x')
 
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
-
+        expect(ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })).toBe(root)
         expect(existsSync(witness)).toBe(true)
     })
 
-    it('rebuilds when noVNC itself gained files the mirror never saw', () => {
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
-        const witness = join(targetRoot, 'rebuild-witness')
-        writeFileSync(witness, 'x')
+    // The rename-collision branch: the name is right but what is under it is
+    // not, which no correct viewer can be serving, so it is rebuilt in place.
+    // "Not current" is not "not in use": a root with only index.html gone
+    // still serves /vnc.html to every session on it. Repair has to publish a
+    // fresh directory under the name and move the old one aside — a rename
+    // keeps its inode, so a websockify chdir'd into it keeps working — never
+    // delete it, which is the outage.
+    it('repairs a root that carries the right name with the wrong contents without deleting it', () => {
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        writeFileSync(join(root, 'index.html'), 'corrupted')
+
+        const again = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+
+        expect(again).toBe(root)
+        expect(readFileSync(join(root, 'index.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
+        const entries = readdirSync(baseDir)
+        expect(entries.some((entry) => entry.endsWith('.tmp'))).toBe(false)
+        const movedAside = entries.find((entry) => entry !== basename(root))
+        expect(movedAside).toBeDefined()
+        expect(readFileSync(join(baseDir, movedAside as string, 'index.html'), 'utf8')).toBe('corrupted')
+    })
+
+    // Every asset in the mirror is a symlink into the install it was built
+    // from, so reusing a root across installs would serve symlinks pointing
+    // at a path that may no longer exist.
+    it('does not reuse a root built against a different noVNC install', () => {
+        const other = join(baseDir, '..', 'novnc-moved')
+        mkdirSync(join(other, 'app'), { recursive: true })
+        writeFileSync(join(other, 'vnc.html'), STOCK_HTML)
+        writeFileSync(join(other, 'app', 'ui.js'), 'export default {}')
+
+        const fromFirst = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const fromOther = ensureViewerWebRoot({ sourceRoot: other, baseDir, resizeMode: 'remote' })
+
+        expect(fromOther).not.toBe(fromFirst)
+        expect(readlinkSync(join(fromOther, 'app'))).toBe(join(other, 'app'))
+    })
+
+    // 2026-09-21, walter-gpu: one mutable directory was shared by every live
+    // websockify, and a rebuild deleted it out from under them. websockify
+    // chdir()s into its web root at startup, so once that inode is gone the
+    // process is still bound to its port and closes every request unanswered
+    // — a screen that answers `read ECONNRESET` on every path.
+    it('builds a new root instead of deleting the one a live viewer is serving', () => {
+        const inUse = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        const servedFile = join(inUse, 'vnc.html')
         mkdirSync(join(sourceRoot, 'vendor'))
 
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const rebuilt = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
-        expect(existsSync(witness)).toBe(false)
-        expect(existsSync(join(targetRoot, 'vendor'))).toBe(true)
+        expect(rebuilt).not.toBe(inUse)
+        expect(existsSync(join(rebuilt, 'vendor'))).toBe(true)
+        // The old viewer keeps a directory it can still read from.
+        expect(existsSync(inUse)).toBe(true)
+        expect(readFileSync(servedFile, 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 })
 
@@ -460,16 +513,38 @@ describe('ensureViewerWebRoot failure handling', () => {
     it('keeps a working mirror when the source becomes unreadable later', () => {
         const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-keep-'))
         const sourceRoot = join(base, 'novnc')
-        const targetRoot = join(base, 'mirror')
+        const baseDir = join(base, 'mirror')
         mkdirSync(join(sourceRoot, 'app'), { recursive: true })
         writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
-        ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const inUse = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
         writeFileSync(join(sourceRoot, 'vnc.html'), '<html><body>no head</body></html>')
-        const root = ensureViewerWebRoot({ sourceRoot, targetRoot, resizeMode: 'remote' })
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
 
         expect(root).toBe(sourceRoot)
-        expect(existsSync(join(targetRoot, 'vnc.html'))).toBe(true)
+        expect(existsSync(join(inUse, 'vnc.html'))).toBe(true)
+    })
+
+    // A failure partway through assembly must fall back, remove its own
+    // staging, and leave every existing root alone. The failure is real: the
+    // bridge lives under `aplus/`, and a source entry of that name collides
+    // with the directory assembly made for it — after staging exists.
+    it('falls back and cleans only its own staging when assembly fails', () => {
+        const base = mkdtempSync(join(tmpdir(), 'viewer-web-root-partial-'))
+        const sourceRoot = join(base, 'novnc')
+        const baseDir = join(base, 'mirror')
+        mkdirSync(join(sourceRoot, 'app'), { recursive: true })
+        writeFileSync(join(sourceRoot, 'vnc.html'), STOCK_HTML)
+        const healthy = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote' })
+        mkdirSync(join(sourceRoot, dirname(VIEWER_BRIDGE_PATH)))
+        const reasons: string[] = []
+
+        const root = ensureViewerWebRoot({ sourceRoot, baseDir, resizeMode: 'remote', onFallback: (r) => reasons.push(r) })
+
+        expect(root).toBe(sourceRoot)
+        expect(reasons).toHaveLength(1)
+        expect(readdirSync(baseDir).some((entry) => entry.endsWith('.tmp'))).toBe(false)
+        expect(readFileSync(join(healthy, 'vnc.html'), 'utf8')).toContain(VIEWER_BRIDGE_PATH)
     })
 })
 
@@ -617,5 +692,178 @@ describe('installViewerClipboardBridge never swallows the shortcut', () => {
             [LOWERCASE_V, 'KeyV', false],
             [CONTROL_L, 'ControlLeft', false],
         ])
+    })
+})
+
+describe('installViewerClipboardBridge clears the Meta-Alt before pasting too', () => {
+    /**
+     * 붙여넣기도 같은 구조다 — Cmd+V 면 noVNC 가 이미 Alt_L 을 내려놨고, 60ms
+     * 뒤 주입되는 Ctrl+V 는 그 위에 얹힌다. 복사보다 늦게 터질 뿐(그 사이
+     * 사용자가 Cmd 를 떼면 우연히 통과) 같은 결함이다.
+     */
+    it('releases the Alt noVNC sent for Cmd before pressing Ctrl+V', async () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = async () => 'hello'
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'v', metaKey: true, stopImmediatePropagation: () => { } })
+        await Promise.resolve()
+        await Promise.resolve()
+        dom.runTimeouts()
+
+        expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_V, 'KeyV', true],
+            [LOWERCASE_V, 'KeyV', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+})
+
+describe('installViewerClipboardBridge sends Ctrl+C for copy, never noVNC\'s own remap', () => {
+    // noVNC remaps macOS's own Cmd (Super) key to Alt for the remote end
+    // (core/input/keyboard.js: "Alt behaves more like AltGraph on macOS").
+    // Left alone, a Mac user's Cmd+C arrives on the (Linux) remote as Alt+C,
+    // which copies nothing. The bridge must own the shortcut itself and
+    // always send Control_L, the same way it already does for paste.
+    it('sends Control_L + KeyC to the remote on Cmd+C', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation: () => { stopped += 1 } })
+
+        expect(dom.keydownIsCapturing()).toBe(true)
+        expect(stopped).toBe(1)
+        // 앞머리의 Alt 해제는 아래 전용 테스트가 이유까지 고정한다 — 여기서는
+        // 브리지가 가로채 **자기가** Control_L 을 보낸다는 것이 요지다.
+        expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_C, 'KeyC', true],
+            [LOWERCASE_C, 'KeyC', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    /**
+     * 실측(2026-09-20, 실제 Chromium on macOS + noVNC 1.7.0): Cmd 를 누르는
+     * 순간 noVNC 가 원격에 `Alt_L` **keydown** 을 보내고, Cmd 를 뗄 때까지
+     * 눌린 채로 둔다 — `keyboard.js` 의 `case XK_Super_L: keysym = XK_Alt_L`
+     * 이고, 바로 아래 macOS 특례는 `code !== 'MetaLeft'` 로 Meta 키 자신을
+     * 제외하기 때문이다.
+     *
+     * 그래서 브리지가 C 만 가로채 Ctrl+C 를 주입하면 원격이 실제로 받는 것은
+     * `Alt_L+Control_L+c` 다. 리눅스 원격에서 이 조합은 복사가 아니다.
+     * 주입 전에 그 Alt 를 풀어야 한다.
+     *
+     * 이 시점의 Alt 는 언제나 noVNC 의 Meta 변환분이다 — 사용자가 진짜 Option
+     * 을 누르고 있으면 위의 `event.altKey` 가드가 먼저 돌려보낸다.
+     */
+    it('releases the Alt noVNC sent for Cmd before pressing Ctrl+C', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys).toEqual([
+            [ALT_L, 'AltLeft', false],
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_C, 'KeyC', true],
+            [LOWERCASE_C, 'KeyC', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    /** Ctrl+C 에는 Alt 가 끼어들지 않는다 — 그 경로는 한 줄도 바뀌면 안 된다. */
+    it('does not touch Alt when the shortcut came from Ctrl, not Cmd', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', ctrlKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys.some(([keysym]: any[]) => keysym === ALT_L)).toBe(false)
+    })
+
+    it('sends the same Control_L + KeyC on Ctrl+C (Windows/Linux)', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', ctrlKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys).toEqual([
+            [CONTROL_L, 'ControlLeft', true],
+            [LOWERCASE_C, 'KeyC', true],
+            [LOWERCASE_C, 'KeyC', false],
+            [CONTROL_L, 'ControlLeft', false],
+        ])
+    })
+
+    // Same non-Latin-layout fallback as paste: a Korean layout can report a
+    // composed letter for the physical C key.
+    it('accepts the physical C key when the reported letter is not Latin', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'ㅊ', code: 'KeyC', metaKey: true, stopImmediatePropagation: () => { } })
+
+        expect(rfb.keys.length).toBeGreaterThan(0)
+    })
+
+    it('leaves every other Cmd/Ctrl shortcut alone', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        const stopImmediatePropagation = () => { stopped += 1 }
+        dom.fireKeydown({ key: 'a', metaKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'c', altKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'c', stopImmediatePropagation })
+
+        expect(stopped).toBe(0)
+        expect(rfb.keys).toEqual([])
+    })
+
+    // Ctrl/Cmd+Shift+C is the browser's own element inspector, both locally
+    // and on the remote screen (which runs exactly one application, a
+    // browser). Capturing it would silently turn the inspector into a copy,
+    // and the remote's answering selection would then overwrite the local
+    // clipboard through the copy-out listener. Shift falls through the same
+    // way Alt already does.
+    it('leaves the Shift variant to the browser', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        let stopped = 0
+        const stopImmediatePropagation = () => { stopped += 1 }
+        dom.fireKeydown({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true, stopImmediatePropagation })
+        dom.fireKeydown({ key: 'C', code: 'KeyC', metaKey: true, shiftKey: true, stopImmediatePropagation })
+
+        expect(stopped).toBe(0)
+        expect(rfb.keys).toEqual([])
+    })
+
+    // Copying does not touch the clipboard-read machinery at all — it only
+    // forwards the keystroke. The existing RFB `clipboard` listener already
+    // pulls whatever the remote puts on its selection back to the local
+    // clipboard once the remote actually receives a working Ctrl+C.
+    it('does not read or write the local clipboard on its own', () => {
+        const dom = fakeDom()
+        const rfb = fakeRfb()
+        dom.win.navigator.clipboard.readText = () => Promise.reject(new Error('should not be called'))
+        installViewerClipboardBridge({ rfb }, dom.win, dom.doc)
+
+        dom.fireKeydown({ key: 'c', metaKey: true, stopImmediatePropagation: () => { } })
+
+        expect(dom.written).toEqual([])
     })
 })

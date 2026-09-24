@@ -260,3 +260,20 @@ describe('startHappyServer tool registration', () => {
         }
     });
 });
+
+
+describe('foreground lesson proposal tool', () => {
+    it('only exposes the tool when the provider supplies a turn-bound handler', async () => {
+        const without = await startHappyServer(makeFakeClient(false));
+        try { expect(without.toolNames).not.toContain('propose_lesson'); } finally { without.stop(); }
+        const handler = vi.fn(() => ({ accepted: false }));
+        const server = await startHappyServer(makeFakeClient(false), { proposeLesson: handler });
+        try {
+            expect(server.toolNames).toContain('propose_lesson');
+            const token = 'b96f00e6-112e-4a8d-8117-23f28d3f9e34';
+            const response = await callTool(server.url, 1, 'propose_lesson', { token, proposal: { name: 'Verified' } });
+            expect(handler).toHaveBeenCalledWith({ token, proposal: { name: 'Verified' } });
+            expect(JSON.parse(response.result.content[0].text)).toEqual({ accepted: false });
+        } finally { server.stop(); }
+    });
+});

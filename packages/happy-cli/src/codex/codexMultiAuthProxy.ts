@@ -8,7 +8,7 @@ import { promisify } from 'node:util'
 
 const QUOTA_REMAINING_THRESHOLD = 5
 const PROVIDER_ID = 'codex-multi-auth-runtime-proxy'
-const CODEX_MULTI_AUTH_VERSION = '2.8.5'
+const CODEX_MULTI_AUTH_VERSION = '2.16.0'
 const execFile = promisify(execFileCallback)
 
 type ProxyServer = { baseUrl: string; close(): Promise<void> }

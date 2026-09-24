@@ -128,6 +128,22 @@ Local-storage mode (no `S3_HOST`) writes blobs under
 lifecycle equivalent — clean up old session directories on a cron if
 you want a TTL story.
 
+## Embedded standalone shutdown
+
+An embedding parent can opt into `HAPPY_STANDALONE_CONTROL=stdin-v1` when
+starting `standalone serve` with a private stdin pipe. Send the LF-terminated
+JSON line `{"v":1,"command":"shutdown"}` to request shutdown. EOF, pipe close
+or pipe error also requests shutdown, including events received during startup.
+The parent must retain ownership of the write handle and wait for actual exit;
+Windows process termination signals are not evidence of a graceful shutdown.
+
+Malformed, unsupported and oversized lines (more than 256 bytes) are ignored.
+Repeated requests are harmless. Other shutdown handlers finish before database
+disconnect, followed by PGlite close; drain/close errors produce a nonzero exit.
+No network control endpoint is added. Without the opt-in, stdin has no control
+role and the existing signal-based entry point remains available. This contract
+does not assert that Desktop packaging or native Windows ARM64 is supported.
+
 ## License
 
 MIT - Use it, modify it, deploy it anywhere.

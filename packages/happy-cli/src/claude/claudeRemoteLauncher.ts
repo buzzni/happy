@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
 import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver'
@@ -46,8 +48,13 @@ interface PermissionsField {
     allowedTools?: string[];
 }
 
+import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
+
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
+
+    // Survives generation restarts within this session; see the call below.
+    const lessonObservations = createLessonTurnObservations();
 
     // Check if we have a TTY for UI rendering
     const hasTTY = process.stdout.isTTY && process.stdin.isTTY;
@@ -115,6 +122,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const startedGeneration = (): GenerationProof | null => generationProofs.current();
 
     async function abort() {
+        session.cancelLessonReview();
         if (abortController && !abortController.signal.aborted) {
             /*
              * Recorded before the abort, not after. A provider that handles
@@ -161,7 +169,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (!text.trim()) {
             return { success: false, error: 'Steer text is required' };
         }
-        if (!activeInputSender?.(text)) {
+        if (!await activeInputSender?.(text)) {
             return { success: false, error: 'No active Claude turn' };
         }
         session.onActiveUserInputAccepted?.(text);
@@ -171,11 +179,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    let mcpStatusReader: Pick<McpRuntimeRecovery, 'readStatuses'> | null = null;
     let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
     registerMcpReconnectHandler(
         session.client.rpcHandlerManager,
         session.client.sessionId,
         () => mcpController,
+        () => mcpStatusReader,
     );
 
     // Drop any permission requests left over in agent state from a
@@ -256,7 +266,33 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
+    let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
+    function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
+        backgroundTasks = next;
+        session.client.updateMetadata(current => ({ ...current, claudeBackgroundTasks: next }));
+    }
+
     function onMessage(message: SDKMessage) {
+        if (message.type === 'system' && message.subtype === 'init') {
+            // The level signal is per provider process. Until its first full
+            // snapshot, older CLIs still use this generation's transcript.
+            publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });
+        }
+        if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
+            publishBackgroundTasks({
+                startedAt: backgroundTasks?.startedAt ?? Date.now(),
+                available: true,
+                // REPLACE, including empty: edge bookends can arrive out of
+                // order and must never resurrect a task removed by this list.
+                tasks: message.tasks.filter(task => !task.ambient).map(task => ({
+                    taskId: task.task_id,
+                    label: task.description,
+                    kind: task.task_type.includes('bash') ? 'shell' : 'agent',
+                })),
+            });
+            return;
+        }
+
 
         // Write to message log
         formatClaudeMessageForInk(message, messageBuffer);
@@ -430,9 +466,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         let pending: {
             message: MessageParam['content'];
             mode: EnhancedMode;
-            /** Carried through the deferral so an isolated channel turn keeps its handle. */
+            hash: string;
+            /**
+             * Kept on the held-back batch too. A message deferred because the mode
+             * changed still has to commit its routing decision when the next
+             * generation actually runs it — dropping the ids here would lose the
+             * decision for exactly the turns that were queued behind a mode change.
+             */
             requestIds?: string[];
+            /** Carried through the deferral so an isolated channel turn keeps its handle. */
+            channelRequestId?: string;
         } | null = null;
+
+        /**
+         * Distinguishes one applied execution from the next, so a replayed or
+         * duplicated boundary commits once. It counts *engine applications*, not
+         * transport retries — a provider-level retry never re-enters this path.
+         */
 
         /*
          * A managed run can be asked to end its input without being killed.
@@ -504,6 +554,32 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
+                    lessonProposalTurn: session.lessonProposalTurn,
+                    lessonReviewLifecycle: session.lessonReviewLifecycle,
+                    /*
+                     * The host and completed-turn history belong to the session.
+                     * The shared observation buffer is drained at every turn and
+                     * generation boundary; interrupted work is never evidence
+                     * for a later successful turn.
+                     */
+                    ...(session.lessons
+                        ? {
+                            lessons: {
+                                turn: session.lessons.turn,
+                                review: session.lessons.review,
+                                sessionKind: session.lessons.sessionKind,
+                                observations: lessonObservations,
+                                /*
+                                 * The authoritative Happy session id, not the
+                                 * Claude provider one — that is null here on a
+                                 * fresh session, and a placeholder would
+                                 * attribute traces to an identity nobody can
+                                 * resolve.
+                                 */
+                                sessionId: session.client.sessionId ?? null,
+                            },
+                        }
+                        : {}),
                     path: session.path,
                     managedSettingsLockdown: session.managedSettingsLockdown,
                     managedRun: session.managedRun,
@@ -560,8 +636,30 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // This is the path an isolated channel turn actually takes: it was
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
-                            messageQueue.enqueue(pendingRequestItem(p.requestIds?.[0] ?? null));
+                            messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
+                            // This message starts the new provider. Seed its comparison
+                            // baseline too, or the next model/effort change is missed.
+                            modeHash = p.hash;
+                            mode = p.mode;
                             permissionHandler.handleModeChange(p.mode.permissionMode);
+                            /*
+                             * The boundary may raise a decision that was queued
+                             * before the floor rose. Applying the revision to
+                             * the mode we are about to hand the SDK is the whole
+                             * point: recording it while the turn still ran on
+                             * the stale model would make the state a claim
+                             * rather than a record of what executed.
+                             */
+                            const revisedPending = session.onModeApplied?.(p.requestIds, randomUUID());
+                            if (revisedPending) {
+                                const revisedMode: EnhancedMode = {
+                                    ...p.mode,
+                                    model: revisedPending.model,
+                                    effort: (revisedPending.effort ?? undefined) as EnhancedMode['effort'],
+                                };
+                                mode = revisedMode;
+                                p = { ...p, mode: revisedMode };
+                            }
                             return p;
                         }
 
@@ -617,7 +715,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
                         // Check if mode has changed
                         if (msg) {
-                            if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
+                            // Preview without committing: a changed engine setting needs a
+                            // fresh SDK query before this request can be marked applied.
+                            const resolved = session.onModeResolved?.(msg.requestIds);
+                            if (resolved) {
+                                msg = { ...msg, mode: { ...msg.mode, model: resolved.model,
+                                    effort: (resolved.effort ?? undefined) as EnhancedMode['effort'] } };
+                            }
+                            const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort);
+                            if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
                                 logger.debug('[remote]: mode has changed, pending message');
                                 pending = msg;
                                 return null;
@@ -629,8 +735,34 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // two points the queue may have reordered, isolated or dropped it.
                             // A batch with no channel message clears it, so an in-app turn never
                             // inherits an id.
-                            messageQueue.enqueue(pendingRequestItem(msg.requestIds?.[0] ?? null));
+                            messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
                             permissionHandler.handleModeChange(mode.permissionMode);
+
+                            /*
+                             * The engine-applied boundary for Claude. This batch's
+                             * mode — model and effort included — is now the query's
+                             * settings, so auto-routing may commit its floor here
+                             * and nowhere earlier: everything before this point
+                             * could still have been cancelled with the routed model
+                             * never reaching the engine.
+                             *
+                             * This is not provider confirmation. It says the runner
+                             * applied the setting, not that Anthropic served it.
+                             *
+                             * A batch whose mode differs returns above, so a message
+                             * held back as `pending` is not committed here — it is
+                             * committed by the generation that actually runs it.
+                             */
+                            const revisedBatch = session.onModeApplied?.(msg.requestIds, randomUUID());
+                            if (revisedBatch) {
+                                const revisedMode: EnhancedMode = {
+                                    ...msg.mode,
+                                    model: revisedBatch.model,
+                                    effort: (revisedBatch.effort ?? undefined) as EnhancedMode['effort'],
+                                };
+                                mode = revisedMode;
+                                msg = { ...msg, mode: revisedMode };
+                            }
 
                             // Per-message attachments are already claimed by the message
                             // when it was pushed onto the queue, so there is no race window
@@ -665,18 +797,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 return {
                                     message: contentBlocks,
                                     mode: msg.mode,
-                                    ...(msg.requestIds ? { requestIds: msg.requestIds } : {}),
+                                    ...(msg.channelRequestId !== undefined ? { channelRequestId: msg.channelRequestId } : {}),
                                 };
                             }
 
                             // Carried through so the slash-command parser in `claudeRemote` knows
                             // this text was relayed rather than typed into the app. A channel
                             // batch normally reaches that parser via the `pending` branch above,
-                            // but the ids travel on every path so no future route drops them.
+                            // but the handle travels on every path so no future route drops it.
                             return {
                                 message: msg.message,
                                 mode: msg.mode,
-                                ...(msg.requestIds ? { requestIds: msg.requestIds } : {}),
+                                ...(msg.channelRequestId !== undefined ? { channelRequestId: msg.channelRequestId } : {}),
                             }
                         }
 
@@ -719,6 +851,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             await q.setPermissionMode(mode);
                         });
                     },
+                    onMcpStatusReaderReady: (reader) => { mcpStatusReader = reader; },
                     onMcpControllerReady: (controller) => {
                         mcpController = controller;
                     },
@@ -746,6 +879,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onSessionReset: () => {
                         logger.debug('[remote]: Session reset');
                         session.clearSessionId();
+                        session.onSessionReset?.();
                     },
                     onReady: () => {
                         // Queued, not called: a terminal emitted ahead of the transcript closes a
@@ -801,8 +935,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     continue;
                 }
             } finally {
+                if (backgroundTasks) {
+                    publishBackgroundTasks({ ...backgroundTasks, available: false });
+                    backgroundTasks = undefined;
+                }
 
                 mcpController = null;
+                mcpStatusReader = null;
                 // The process is gone: whatever text is still buffered can
                 // never be completed, so ship it as-is rather than let it
                 // leak into the next launch's frames.
@@ -837,6 +976,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+        session.cancelLessonReview();
         /*
          * The verdict for this run, reported once, and only for a run that was
          * asked to stop.

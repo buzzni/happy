@@ -97,7 +97,7 @@ export function readRelayBudget(request: DifficultyRoutingRelayRequest, wallNow:
     if (request.timingVersion !== 2) return { ok: false, status: 'unsupported' }
     if (request.deadlineAt !== undefined) return { ok: false, status: 'error' }
     const remainingMs = request.remainingMs
-    return typeof remainingMs === 'number' && Number.isSafeInteger(remainingMs) && remainingMs >= 1 && remainingMs <= 1000
+    return typeof remainingMs === 'number' && Number.isSafeInteger(remainingMs) && remainingMs >= 1 && remainingMs <= 3000
       ? { ok: true, remainingMs }
       : { ok: false, status: 'error' }
   }
@@ -302,7 +302,7 @@ export class DifficultyRoutingClassifierHost {
   }
   private armIdle(): void {
     clearTimeout(this.idleTimer)
-    if (!this.active && !this.queue.length) this.idleTimer = setTimeout(() => this.stopWorker('not-ready'), this.deps.idleMs ?? 15 * 60000)
+    if (!this.active && !this.queue.length) this.idleTimer = setTimeout(() => this.stopWorker('not-ready'), this.deps.idleMs ?? 60 * 60000)
     this.idleTimer?.unref?.()
   }
   private openSealedText(request: DifficultyRoutingRelayRequest): string | null {

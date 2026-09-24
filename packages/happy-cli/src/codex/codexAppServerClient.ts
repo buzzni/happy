@@ -17,6 +17,7 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
+import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroundTasks';
 import type {
     InitializeParams,
     NewConversationParams,
@@ -63,6 +64,7 @@ import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPol
 import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
+import { CodexAuthRecoveryError, type CodexAuthCheck, type CodexAuthSource } from './codexAuthRecovery';
 
 type PendingRequest = {
     resolve: (result: unknown) => void;
@@ -305,9 +307,55 @@ export class CodexAppServerClient {
     private completedTurnIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
     // Codex can report turn/completed before its commandExecution item has
-    // completed. Keep the terminal event behind that item's end so consumers
-    // receive one well-formed turn: tool start → tool end → turn end.
+    // completed. Give trailing item completion a chance to arrive; on an
+    // authoritative turn end, reconcile remaining commands as background work
+    // instead of holding the conversation open for a long-lived server.
     private openCommandExecutionTurns = new Map<string, string | null>();
+    private openCommandLabels = new Map<string, string>();
+    private backgroundTimer: ReturnType<typeof setTimeout> | null = null;
+    private backgroundTasks = new CodexBackgroundTasks(
+        (method, params) => this.request(method, params, 3000),
+        (tasks) => this.eventHandler?.({ type: 'background_tasks', tasks }),
+    );
+
+    restoreBackgroundTasks(tasks: CodexBackgroundTask[]): void {
+        this.backgroundTasks.restore(tasks);
+    }
+
+    private scheduleBackgroundRefresh(delay = 5000): void {
+        if (delay === 1000 && this.backgroundTimer) {
+            clearTimeout(this.backgroundTimer);
+            this.backgroundTimer = null;
+        }
+        if (this.backgroundTimer || !this._threadId || !this.connected) return;
+        this.backgroundTimer = setTimeout(() => {
+            this.backgroundTimer = null;
+            const threadId = this._threadId;
+            const epoch = this.processEpoch;
+            if (!threadId) return;
+            // Only an authoritative terminal transfers open commands out of
+            // the foreground. Neither text nor an idle/final-answer fallback does.
+            const terminal = this.deferredRawTurnCompletion?.source === 'turn/completed'
+                ? this.deferredRawTurnCompletion : null;
+            const candidates = terminal ? [...this.openCommandExecutionTurns]
+                .filter(([, turn]) => !terminal.turnId || !turn || turn === terminal.turnId)
+                .map(([callId]) => ({ callId, command: this.openCommandLabels.get(callId) ?? '' })) : [];
+            void this.backgroundTasks.refresh(threadId, candidates).then(() => {
+                if (!this.connected || this._threadId !== threadId || this.processEpoch !== epoch) return;
+                if (terminal && this.deferredRawTurnCompletion === terminal) {
+                    for (const { callId } of candidates) {
+                        this.openCommandExecutionTurns.delete(callId);
+                        this.openCommandLabels.delete(callId);
+                    }
+                    this.flushDeferredRawTurnCompletion();
+                }
+                if (this.backgroundTasks.hasTasks || this.deferredRawTurnCompletion?.source === 'turn/completed') {
+                    this.scheduleBackgroundRefresh();
+                }
+            });
+        }, delay);
+        this.backgroundTimer.unref?.();
+    }
     private deferredRawTurnCompletion: DeferredRawTurnCompletion | null = null;
     private rawTurnCompletionFallbackTimer: ReturnType<typeof setTimeout> | null = null;
     private pendingAgentMessageDeltas = new Map<string, string>();
@@ -555,11 +603,13 @@ export class CodexAppServerClient {
             // command is still draining.
             if (source === 'turn/completed') {
                 this.deferredRawTurnCompletion = { turnId, status, error, source };
+                this.scheduleBackgroundRefresh(1000);
             }
             return;
         }
         if (this.hasOpenCommandsForTurn(turnId)) {
             this.deferredRawTurnCompletion = { turnId, status, error, source };
+            if (source === 'turn/completed') this.scheduleBackgroundRefresh(1000);
             return;
         }
         this.emitRawTurnCompletion(turnId, status, error, source);
@@ -789,6 +839,7 @@ export class CodexAppServerClient {
             const callId = typeof item.id === 'string' ? item.id : '';
             if (callId) {
                 this.openCommandExecutionTurns.set(callId, this.extractTurnId(params));
+                this.openCommandLabels.set(callId, item.command ?? '');
             }
             this.eventHandler?.({
                 type: 'exec_command_begin',
@@ -816,6 +867,8 @@ export class CodexAppServerClient {
             });
             if (callId) {
                 this.openCommandExecutionTurns.delete(callId);
+                this.openCommandLabels.delete(callId);
+                this.backgroundTasks.complete(callId);
             }
             this.flushDeferredRawTurnCompletion();
             return true;
@@ -1022,6 +1075,9 @@ export class CodexAppServerClient {
                 return;
             }
             this.connected = false;
+            if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
+            this.backgroundTimer = null;
+            this.backgroundTasks.invalidate();
             this.clearAgentMessageDeltas();
             void this.cleanupMultiAuthProxy();
             // Reject all pending requests
@@ -1132,6 +1188,9 @@ export class CodexAppServerClient {
          */
         awaitProcessExit?: boolean;
     }): Promise<void> {
+        if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
+        this.backgroundTimer = null;
+        this.backgroundTasks.invalidate();
         this.clearAgentMessageDeltas();
         if (!this.connected
             && !this.process
@@ -1339,6 +1398,7 @@ export class CodexAppServerClient {
 
         const result = await this.request('thread/start', params) as NewConversationResponse;
         this._threadId = result.thread.id;
+        this.scheduleBackgroundRefresh();
         this._turnId = null;
         this.rememberThreadDefaults(opts);
         logger.debug('[CodexAppServer] Thread started:', this._threadId);
@@ -1382,6 +1442,7 @@ export class CodexAppServerClient {
 
         const result = await this.request('thread/resume', params) as ResumeConversationResponse;
         this._threadId = result.thread.id;
+        this.scheduleBackgroundRefresh();
         this._turnId = null;
         this.rememberThreadDefaults({
             model: opts?.model ?? defaults.model,
@@ -1431,6 +1492,7 @@ export class CodexAppServerClient {
 
         const result = await this.request('thread/fork', params) as ForkConversationResponse;
         this._threadId = result.thread.id;
+        this.scheduleBackgroundRefresh();
         this._turnId = null;
         this.rememberThreadDefaults({
             model: opts.model ?? defaults.model,
@@ -1540,6 +1602,65 @@ export class CodexAppServerClient {
         return await this.request('thread/goal/clear', params) as ThreadGoalClearResponse;
     }
 
+    get authRecoverySource(): CodexAuthSource {
+        if (this.managedProviderArgs || this.sandboxPolicyMode === 'mandatory') return 'managed';
+        if (this.multiAuthProxy) return 'multi-auth';
+        if (process.env.CODEX_ACCESS_TOKEN || process.env.OPENAI_API_KEY || process.env.OPENAI_BASE_URL) return 'unknown';
+        return process.env.CODEX_HOME ? 'custom-home' : 'cli-login';
+    }
+
+    get authRecoveryBusy(): boolean {
+        return !!this.pendingTurnCompletion || !!this.pendingInterrupt || this.outstandingServerRequests > 0 || this.pending.size > 0;
+    }
+
+    /** Explicit, idle-only recovery. Unlike legacy reconnect, failure never discards the thread. */
+    async reconnectForAuth(): Promise<CodexAuthCheck> {
+        const threadId = this._threadId;
+        const defaults = this.threadDefaults;
+        if (!threadId || this.authRecoveryBusy || this.authRecoverySource === 'managed') throw new CodexAuthRecoveryError('restart-failed');
+        let phase: 'restart-failed' | 'account-check-failed' | 'resume-failed' = 'restart-failed';
+        try {
+            await this.disconnectInternal({ preserveThreadState: true, awaitProcessExit: true });
+            await this.connect();
+            phase = 'account-check-failed';
+            // A rotation proxy owns authentication itself. account/read cannot verify its payer.
+            let account: CodexAuthCheck = 'unverified';
+            if (!this.multiAuthProxy) {
+                const result = await this.request('account/read', { refreshToken: false }, 8000) as {
+                    account?: { type?: string } | null; requiresOpenaiAuth?: boolean;
+                };
+                if (result?.requiresOpenaiAuth !== true) throw new CodexAuthRecoveryError('account-check-failed');
+                if (result?.account?.type === 'chatgpt') account = 'authenticated';
+                else if (result?.account?.type === 'apiKey') account = 'unverified';
+                else if (result?.requiresOpenaiAuth === true && !result.account) throw new CodexAuthRecoveryError('authentication-required');
+                else throw new CodexAuthRecoveryError('account-check-failed');
+                if (result.account?.type === 'chatgpt') {
+                    const limits = await this.request('account/rateLimits/read', undefined, 8000) as {
+                        rateLimits?: { primary?: { usedPercent?: number } | null; secondary?: { usedPercent?: number } | null;
+                            rateLimitReachedType?: string | null };
+                    };
+                    if (!limits?.rateLimits) throw new CodexAuthRecoveryError('account-check-failed');
+                    const { primary, secondary, rateLimitReachedType } = limits.rateLimits;
+                    if (![primary, secondary].some(window => typeof window?.usedPercent === 'number'
+                        && Number.isFinite(window.usedPercent) && window.usedPercent >= 0)) {
+                        throw new CodexAuthRecoveryError('account-check-failed');
+                    }
+                    if (rateLimitReachedType || [primary, secondary].some(window => typeof window?.usedPercent === 'number' && window.usedPercent >= 100)) {
+                        throw new CodexAuthRecoveryError('limit-reached');
+                    }
+                }
+            }
+            phase = 'resume-failed';
+            const resumed = await this.resumeThread({ threadId });
+            if (resumed.threadId !== threadId) throw new CodexAuthRecoveryError('resume-failed');
+            return account;
+        } catch (error) {
+            this._threadId = threadId;
+            this.threadDefaults = defaults;
+            throw error instanceof CodexAuthRecoveryError ? error : new CodexAuthRecoveryError(phase);
+        }
+    }
+
     async reconnectAndResumeThread(opts?: { preservePendingTurnCompletion?: boolean }): Promise<boolean> {
         const threadId = this._threadId;
         await this.disconnectInternal({
@@ -1583,6 +1704,7 @@ export class CodexAppServerClient {
         this.pendingTurnCompletion.resolve(aborted);
         this.pendingTurnCompletion = null;
         this.openCommandExecutionTurns.clear();
+        this.openCommandLabels.clear();
         this.deferredRawTurnCompletion = null;
     }
 
