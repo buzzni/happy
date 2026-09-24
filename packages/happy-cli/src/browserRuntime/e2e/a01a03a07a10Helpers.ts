@@ -118,7 +118,7 @@ export interface SuiteStack {
      * the host by a few ms (observed: pocStack.mintAgent tokens rejected as
      * "outside its lifetime" on the first call).
      */
-    mintAgent(options?: { agentSessionId?: string; ttlMs?: number; allowedOrigins?: string[]; operations?: Operation[] }): { token: string; grantId: GrantId; agentSessionId: AgentSessionId }
+    mintAgent(options?: { profileId?: ProfileId; agentSessionId?: string; ttlMs?: number; allowedOrigins?: string[]; operations?: Operation[] }): { token: string; grantId: GrantId; agentSessionId: AgentSessionId }
     mintInteractive(options?: { ttlMs?: number; principalId?: PrincipalId; profileId?: ProfileId }): string
     down(): void
 }
@@ -192,6 +192,10 @@ export async function startSuiteStack(prefix: string): Promise<SuiteStack> {
                 } finally {
                     transport.destroy()
                 }
+                // A Runtime that exited (e.g. refused the writer lock) will not come back by itself.
+                if (Date.now() > deadline - timeoutMs + 5_000 && containerState(run).startsWith('exited')) {
+                    throw new Error(`runtime container exited instead of becoming healthy (${containerState(run)})`)
+                }
                 await new Promise((resolve) => setTimeout(resolve, 250))
             }
             throw new Error(`runtime did not become healthy within ${timeoutMs} ms (${lastError}); container state: ${containerState(run)}`)
@@ -202,7 +206,7 @@ export async function startSuiteStack(prefix: string): Promise<SuiteStack> {
             const agentSessionId = (options.agentSessionId ?? `agent-${randomUUID()}`) as AgentSessionId
             const token = mintAgentGrant({
                 kind: 'agent-grant', grantId, principalId: PRINCIPAL_A, workspaceId: WORKSPACE, machineId: MACHINE, agentSessionId,
-                profileId: PROFILE_A, allowedOrigins: options.allowedOrigins ?? [SITE_A, SITE_B],
+                profileId: options.profileId ?? PROFILE_A, allowedOrigins: options.allowedOrigins ?? [SITE_A, SITE_B],
                 operations: options.operations ?? [...AGENT_OPERATIONS], taskSpaceIds: [],
                 issuedAtMs, expiresAtMs: issuedAtMs + CLOCK_SKEW_MS + (options.ttlMs ?? 30 * 60_000),
             }, stack.keys, issuedAtMs)
