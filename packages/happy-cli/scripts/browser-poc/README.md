@@ -29,3 +29,5 @@ docker exec abp-smoke-1-browser-a curl -fsS http://a.poc-one.test:8080/marker?la
 docker run --rm --network abp-smoke-1 curlimages/curl:latest curl -fsS http://browser-a:9223/json/version
 docker run --rm --network abp-smoke-1 curlimages/curl:latest curl -fsS http://browser-a:9224/instance
 ```
+
+Suite-specific fixture routes (`// ---- a05a06a08a09a11 routes ----` block, site A only): `/x5/panel?label=&color=&key=` (coloured panel with a `Press <label>` button and an optional barrier-driven `GATE OPEN` text), `/x5/controls?n=` (disabled + hidden buttons and `n` items inside a form, for truncation/subtree observation), `/x5/frame-reattach?key=` (site B iframe replaced by a fresh one when the barrier is released), `/x5/risky-mutating?key=&mode=reload|origin|value|node` (risky payment form whose document/origin/field value/button node changes when the barrier is released). All clicks are recorded as ledger `click` entries with the target label.
