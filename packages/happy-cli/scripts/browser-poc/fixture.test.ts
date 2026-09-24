@@ -17,3 +17,12 @@ afterAll(() => { child?.kill(); rmSync(dir, { recursive: true, force: true }) })
 test('control requires token and page cannot access control', async () => { expect((await req(control + '/control/ledger?run=x')).status).toBe(401); expect((await req(page + '/control/barrier/release', 'POST', { run: 'x', key: 'k', nonce: 'n' })).status).toBe(404); expect((await req(page + '/control/ledger?run=x')).status).toBe(404) })
 test('barrier release and answer correctness are ledgered', async () => { const run = 'answer'; expect((await req(page + '/api/barrier-state?run=answer&key=k')).status).toBe(200); expect((await req(control + '/control/barrier/release', 'POST', { run, key: 'k', nonce: 'n' }, true)).status).toBe(200); await req(page + '/api/answer', 'POST', { run, key: 'k', answer: 'n' }); await req(page + '/api/answer', 'POST', { run, key: 'k', answer: 'bad' }); const { entries } = await (await req(control + '/control/ledger?run=answer', 'GET', undefined, true)).json(); expect(entries.map((x: any) => [x.kind, x.correct])).toEqual([['barrier-release', undefined], ['answer', true], ['answer', false]]) })
 test('duplicate risky submissions all count; drop records without response', async () => { const run = 'risky'; await req(page + '/api/risky', 'POST', { run, amount: '2', requestId: 'same' }); await req(page + '/api/risky', 'POST', { run, amount: '2', requestId: 'same' }); await req(control + '/control/fault', 'POST', { kind: 'risky', mode: 'drop-after-record', run }, true); await expect(req(page + '/api/risky', 'POST', { run, amount: '2', requestId: 'same' })).rejects.toThrow(); const { entries } = await (await req(control + '/control/ledger?run=risky', 'GET', undefined, true)).json(); expect(entries.filter((x: any) => x.kind === 'risky')).toHaveLength(3) })
+test('inline click handlers stay inside their HTML attribute', async () => {
+    // A raw JSON string in onclick="..." ends the attribute early, so the real button never records a click.
+    for (const path of ['/oopif?run=attr', '/spa?run=attr']) {
+        const body = await (await req(page + path)).text()
+        const handlers = [...body.matchAll(/onclick="([^"]*)"/g)].map((match) => match[1])
+        expect(handlers.length).toBeGreaterThan(0)
+        for (const handler of handlers) expect(handler).toContain('target:')
+    }
+})
