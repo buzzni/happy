@@ -201,6 +201,29 @@ describe('lazy bootstrap', () => {
         await host.close();
     });
 
+    it('spends at most one default readiness budget per session while the studio hangs', async () => {
+        // Production passes no budgetMs, and each turn runs recall and then
+        // review preparation against the same pending bootstrap.
+        (globalThis as { fetch: typeof fetch }).fetch =
+            (() => new Promise<Response>(() => {})) as unknown as typeof fetch;
+        const host = createLazyLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(),
+        });
+        const turn = async (turnId: string) => {
+            const started = Date.now();
+            expect(await host.turn!.recall({ turnId, query: 'anything' })).toEqual({ outcome: 'timeout' });
+            expect(await host.review!.prepareReviewTurn!()).toBeNull();
+            return Date.now() - started;
+        };
+        try {
+            expect(await turn('first')).toBeLessThan(1_500);
+            expect(await turn('second')).toBeLessThan(100);
+        } finally {
+            await host.close();
+        }
+    }, 10_000);
+
     it('closes a host that finishes starting after it was disposed', async () => {
         (globalThis as { fetch: typeof fetch }).fetch =
             (async () => new Response('{}', { status: 404 })) as unknown as typeof fetch;
@@ -242,7 +265,7 @@ describe('lazy bootstrap boundaries', () => {
         await host.close();
     });
 
-    it('does not prepare a review when shutdown wins the ready-host continuation', async () => {
+    it('drops a review preparation that shutdown overtakes and prepares none after it', async () => {
         const built = stub();
         const prepare = vi.fn(async () => ({ revision: 1 }));
         built.review!.prepareReviewTurn = prepare;
@@ -255,7 +278,8 @@ describe('lazy bootstrap boundaries', () => {
         const pending = host.review!.prepareReviewTurn!();
         await host.close();
         expect(await pending).toBeNull();
-        expect(prepare).not.toHaveBeenCalled();
+        expect(await host.review!.prepareReviewTurn!()).toBeNull();
+        expect(prepare).toHaveBeenCalledTimes(1);
     });
 
     it.each(['abort', 'close'] as const)('does not deliver a late first-turn recall after %s', async action => {
