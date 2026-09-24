@@ -49,6 +49,24 @@ import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHo
 
 export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
 
+export type ClaudeTurnLatencyInput = {
+    attribution: 'exclusive' | 'coalesced';
+    inputCount: number;
+    traces: Array<{ id: string; receivedAt: number; queueMs: number }>;
+};
+
+export type ClaudeTurnLatencyDiagnostic = {
+    version: 1;
+    type: 'turn-latency';
+    id: string;
+    attribution: ClaudeTurnLatencyInput['attribution'];
+    inputCount: number;
+    queueMs: number;
+    sdkSubmitMs: number;
+    firstSdkTextMs: number | null;
+    outcome: 'text' | 'no-text';
+};
+
 export async function claudeRemote(opts: {
 
     // Fixed parameters
@@ -124,6 +142,7 @@ export async function claudeRemote(opts: {
         message: MessageParam['content'],
         mode: EnhancedMode,
         channelRequestId?: string,
+        latency?: ClaudeTurnLatencyInput,
     } | null>,
     beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
     prepareChannelExecution?: (requestId: string) => Promise<boolean>,
@@ -138,6 +157,7 @@ export async function claudeRemote(opts: {
     onMessage: (message: SDKMessage) => void,
     /** Token-level partials. Never persisted — see streamDeltaRelay. */
     onStreamEvent?: (message: Extract<SDKMessage, { type: 'stream_event' }>) => void,
+    onTurnLatency?: (diagnostic: ClaudeTurnLatencyDiagnostic) => void,
     onPromptSuggestionChange?: (suggestion: string | null) => void,
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
@@ -199,6 +219,46 @@ export async function claudeRemote(opts: {
         reviewAbort = new AbortController();
         reviewLifecycle.controller = reviewAbort;
         if (opts.signal?.aborted) reviewAbort.abort();
+    };
+
+    let activeTurnLatency: { input: ClaudeTurnLatencyInput; sdkSubmitMs: number } | null = null;
+    const activateTurnLatency = (input: ClaudeTurnLatencyInput | undefined) => {
+        if (!input || input.traces.length === 0) {
+            activeTurnLatency = null;
+            return;
+        }
+        activeTurnLatency = { input, sdkSubmitMs: performance.now() };
+    };
+    const finishTurnLatency = (outcome: ClaudeTurnLatencyDiagnostic['outcome']) => {
+        const active = activeTurnLatency;
+        activeTurnLatency = null;
+        if (!active) return;
+        const now = performance.now();
+        for (const trace of active.input.traces) {
+            try {
+                opts.onTurnLatency?.({
+                    version: 1,
+                    type: 'turn-latency',
+                    id: trace.id,
+                    attribution: active.input.attribution,
+                    inputCount: active.input.inputCount,
+                    queueMs: trace.queueMs,
+                    sdkSubmitMs: Math.max(0, active.sdkSubmitMs - trace.receivedAt),
+                    firstSdkTextMs: outcome === 'text' ? Math.max(0, now - trace.receivedAt) : null,
+                    outcome,
+                });
+            } catch {
+                logger.debug('[claudeRemote] Turn latency diagnostic delivery failed');
+            }
+        }
+    };
+    const isTopLevelTextDelta = (message: Extract<SDKMessage, { type: 'stream_event' }>) => {
+        if (message.parent_tool_use_id !== null) return false;
+        const event = message.event as { type?: unknown; delta?: { type?: unknown; text?: unknown } };
+        return event.type === 'content_block_delta'
+            && event.delta?.type === 'text_delta'
+            && typeof event.delta.text === 'string'
+            && event.delta.text.length > 0;
     };
 
     // Get initial message
@@ -500,6 +560,7 @@ function readTurnText(content: unknown): string {
 
     // Push initial message
     let messages = new PushableAsyncIterable<SDKUserMessage>();
+    activateTurnLatency(initial.latency);
     messages.push({
         type: 'user',
         parent_tool_use_id: null,
@@ -651,6 +712,7 @@ function readTurnText(content: unknown): string {
             // Partial assistant output is a preview, not transcript: keep it
             // out of the persisted onMessage path.
             if (message.type === 'stream_event') {
+                if (isTopLevelTextDelta(message)) finishTurnLatency('text');
                 opts.onStreamEvent?.(message);
                 continue;
             }
@@ -708,6 +770,7 @@ function readTurnText(content: unknown): string {
 
             // Handle result messages
             if (message.type === 'result') {
+                finishTurnLatency('no-text');
                 acceptsPromptSuggestion = true;
                 acceptsActiveInput = false;
                 opts.onActiveInputReady?.(null);
@@ -904,6 +967,7 @@ function readTurnText(content: unknown): string {
                          */
                         const withBlock = await withLessons(next.message);
                         if (queryClosed || messages.done || opts.signal?.aborted) return;
+                        activateTurnLatency(next.latency);
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: withBlock } });
                         // Steering may only follow the primary input, never overtake its recall.
                         acceptsActiveInput = true;
