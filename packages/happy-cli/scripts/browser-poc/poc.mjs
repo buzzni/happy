@@ -62,6 +62,10 @@ function up(run, argv) {
   const names = resourceNames(run), rebuild = argv.includes("--rebuild"), runtimeBundle = opt(argv, "--runtime-bundle"), envFile = opt(argv, "--runtime-env"), keysFile = opt(argv, "--runtime-keys");
   const labels = dockerLabels(run), network = names.network;
   docker("network", "create", ...labels, network);
+  // Each browser gets its own network: the Runtime and the fixture join both, but a
+  // browser (or a page in it) can never reach the other profile's CDP endpoint.
+  const browserNetworks = { a: `${network}-a`, b: `${network}-b` };
+  for (const net of Object.values(browserNetworks)) docker("network", "create", ...labels, net);
   for (const volume of [names.profileA, names.profileB, names.state, names.fixtureData]) docker("volume", "create", ...labels, volume);
   image(IMAGES.fixture, "fixture.Dockerfile", rebuild);
   image(IMAGES.browser, "browser.Dockerfile", rebuild);
@@ -70,10 +74,11 @@ function up(run, argv) {
   // RFB passwords are at most 8 characters.
   const vncPassword = randomBytes(6).toString("base64url").slice(0, 8);
   const fixture = runContainer(names.fixture, run, ["--network", network, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", "127.0.0.1::9099", "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, IMAGES.fixture]);
-  const fixtureIp = docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`, fixture);
-  const hostRules = `MAP a.poc-one.test ${fixtureIp},MAP b.poc-two.test ${fixtureIp},MAP c.poc-three.test ${fixtureIp}`;
+  for (const net of Object.values(browserNetworks)) docker("network", "connect", "--alias", "a.poc-one.test", "--alias", "b.poc-two.test", "--alias", "c.poc-three.test", net, fixture);
+  const fixtureIpOn = (net) => docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${net}").IPAddress}}`, fixture);
+  const hostRulesFor = (net) => { const ip = fixtureIpOn(net); return `MAP a.poc-one.test ${ip},MAP b.poc-two.test ${ip},MAP c.poc-three.test ${ip}`; };
   const browsers = {};
-  for (const profile of ["a", "b"]) browsers[profile] = runContainer(names[profile === "a" ? "browserA" : "browserB"], run, ["--network", network, "--network-alias", `browser-${profile}`, "-e", `ABP_VNC_PASSWORD=${vncPassword}`, "--read-only", "--tmpfs", "/tmp:rw,size=128m", "--tmpfs", "/run/abp:rw,uid=1000,gid=1000,size=1m", "--tmpfs", "/home/browser/.cache:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.config:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.local:rw,uid=1000,gid=1000,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2", "--shm-size", "256m", "-v", `${profile === "a" ? names.profileA : names.profileB}:/home/browser/profile`, "-e", `ABP_HOST_RULES=${hostRules}`, "-p", "127.0.0.1::6080", IMAGES.browser]);
+  for (const profile of ["a", "b"]) browsers[profile] = runContainer(names[profile === "a" ? "browserA" : "browserB"], run, ["--network", browserNetworks[profile], "--network-alias", `browser-${profile}`, "-e", `ABP_VNC_PASSWORD=${vncPassword}`, "-e", `ABP_CDP_HOST=browser-${profile}:9223`, "--read-only", "--tmpfs", "/tmp:rw,size=128m", "--tmpfs", "/run/abp:rw,uid=1000,gid=1000,size=1m", "--tmpfs", "/home/browser/.cache:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.config:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.local:rw,uid=1000,gid=1000,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2", "--shm-size", "256m", "-v", `${profile === "a" ? names.profileA : names.profileB}:/home/browser/profile`, "-e", `ABP_HOST_RULES=${hostRulesFor(browserNetworks[profile])}`, "-p", "127.0.0.1::6080", IMAGES.browser]);
   let runtime;
   if (runtimeBundle) {
     const env = envFile ? JSON.parse(readFileSync(resolve(envFile), "utf8")) : {};
@@ -81,6 +86,7 @@ function up(run, argv) {
     if (keysFile) args.push("-v", `${resolve(keysFile)}:/app/keys.json:ro`);
     for (const [k, v] of Object.entries(env)) args.push("-e", `${k}=${v}`);
     runtime = runContainer(names.runtime, run, [...args, IMAGES.runtime]);
+    for (const net of Object.values(browserNetworks)) docker("network", "connect", net, runtime);
   }
   const s = { run, names, containers: { fixture, browserA: browsers.a, browserB: browsers.b, ...runtime ? { runtime } : {} }, ports: { control: port(fixture, 9099), novncA: port(browsers.a, 6080), novncB: port(browsers.b, 6080), ...runtime ? { runtime: port(runtime, 8787), admin: port(runtime, 8788) } : {} }, harnessToken, vncPassword, runtimeBundle: runtimeBundle ? resolve(runtimeBundle) : void 0, runtimeEnv: envFile ? resolve(envFile) : void 0 };
   const path = statePath(run);

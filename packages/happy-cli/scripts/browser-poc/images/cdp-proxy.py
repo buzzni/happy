@@ -2,7 +2,10 @@
 """Local CDP Host-header adapter for Chromium's DNS-rebinding check."""
 import socket
 import socketserver
+import os
 import threading
+
+EXPECTED_HOST = os.environ.get("ABP_CDP_HOST", "").encode()
 
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -18,6 +21,12 @@ class Handler(socketserver.BaseRequestHandler):
             return
         head, rest = header.split(b'\r\n\r\n', 1)
         lines = head.split(b'\r\n')
+        # Only the Runtime addresses this browser as ABP_CDP_HOST; anything else
+        # (another container name, an IP, a rebinding hostname) is refused.
+        hosts = [line.split(b':', 1)[1].strip() for line in lines if line.lower().startswith(b'host:')]
+        if EXPECTED_HOST and hosts != [EXPECTED_HOST]:
+            client.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            return
         original_host = b'browser-a:9223'
         for i, line in enumerate(lines):
             if line.lower().startswith(b'host:'):
