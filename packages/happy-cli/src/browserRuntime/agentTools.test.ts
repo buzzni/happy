@@ -59,6 +59,17 @@ describe('browser task agent tools', () => {
         expect(out.result.stepIds[0].actionId).toBe(req.steps[0].actionId)
     })
 
+    it('submit_batch derives omitted step ids from the requestId, so a retry with the same requestId is an exact duplicate', async () => {
+        const submitBatch = vi.fn(async () => ({ batchId: 'b', accepted: true, task: {} }))
+        const client = await connect({ submitBatch })
+        const args = { taskId: 't', expectedVersion: 3, requestId: 'req-9', steps: [{ kind: 'fill', tabId: 'tb', ref: '@e1', value: 'x' }, { kind: 'click', tabId: 'tb', ref: '@e2' }] }
+        await client.callTool({ name: 'browser_task_submit_batch', arguments: args })
+        await client.callTool({ name: 'browser_task_submit_batch', arguments: args })
+        const [first, second] = submitBatch.mock.calls.map((call) => (call as unknown as [{ steps: Array<{ actionId: string; stepId: string }> }])[0].steps)
+        expect(second).toEqual(first)
+        expect(new Set(first.map((step) => step.actionId)).size).toBe(2)
+    })
+
     it('wraps page text as untrusted data', async () => {
         const observe = vi.fn(async () => ({
             snapshotId: 'sn', tabId: 'tb', url: 'http://a', title: 'T', documentGeneration: 1, truncated: false,

@@ -138,10 +138,12 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
         },
     }, async (a) => {
         const r = id(a.requestId)
-        const steps: BatchStep[] = a.steps.map((s) => ({
+        // Omitted ids derive from the requestId, so retrying with the same requestId
+        // is an exact duplicate instead of a conflicting new batch.
+        const steps: BatchStep[] = a.steps.map((s, index) => ({
             ...s,
-            stepId: id(s.stepId) as never,
-            actionId: id(s.actionId) as never,
+            stepId: (s.stepId ?? `${r}:s${index + 1}`) as never,
+            actionId: (s.actionId ?? `${r}:a${index + 1}`) as never,
             tabId: s.tabId as never,
             timeoutMs: s.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS,
         })) as BatchStep[]
