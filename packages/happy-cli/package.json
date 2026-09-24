@@ -89,6 +89,7 @@
     "cli": "tsx src/index.ts",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
+    "test:browser-poc": "vitest run --project browser-poc",
     "bundle:server": "node scripts/bundle-server.cjs",
     "bundle:server:all": "node scripts/bundle-server.cjs --all-platforms",
     "bundle:webapp": "node scripts/bundle-webapp.cjs",
