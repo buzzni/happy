@@ -381,8 +381,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 throw new BrowserRuntimeError('CONFLICT', 'actionId repeats in batch')
             ids.add(step.actionId)
             const prior = task.actions[step.actionId]
-            if (prior && prior.payloadHash !== payloadHash(step))
-                throw new BrowserRuntimeError('CONFLICT', 'actionId was reused with different input')
+            if (prior)
+                throw new BrowserRuntimeError('CONFLICT', prior.payloadHash !== payloadHash(step)
+                    ? 'actionId was reused with different input'
+                    : 'actionId was already used in a prior batch')
             if (!task.tabs.includes(step.tabId))
                 throw new BrowserRuntimeError('SCOPE_DENIED', 'Step tab does not belong to task')
             if (step.timeoutMs <= 0 || step.timeoutMs > (step.kind === 'waitFor'
@@ -667,7 +669,18 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const approvedStep = { ...storedStep, snapshotId: approval.snapshotId ?? storedStep.snapshotId }
         const driver = this.driver(task.profileId)
         const lease = this.leases.owner(approvedStep.tabId, task.profileId)
-        if (lease.leaseEpoch !== Number(approval.leaseEpoch) || driver.browserInstanceId() !== approval.browserInstanceId
+        const sameLiveApprovalLease = lease.leaseEpoch === Number(approval.leaseEpoch)
+            && lease.owner.kind === 'agent' && lease.owner.taskId === task.taskId
+            && lease.owner.segmentId === approval.batchId
+        // Recovery bumps epochs to fence stale clients. A pending approval may
+        // survive that bump only when recovery restored an otherwise idle tab,
+        // no user owns this profile, and the same approval still blocks the task.
+        const recoveredApprovalLease = lease.owner.kind === 'none'
+            && task.status === 'awaiting-user' && task.waitReason === 'approval'
+            && !this.leases.isUserFenced(task.profileId)
+            && lease.leaseEpoch > Number(approval.leaseEpoch)
+            && task.tabLeaseEpochs?.[approvedStep.tabId] === lease.leaseEpoch
+        if ((!sameLiveApprovalLease && !recoveredApprovalLease) || driver.browserInstanceId() !== approval.browserInstanceId
             || await driver.currentOrigin(approvedStep.tabId) !== approval.origin)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed')
         let description: ElementDescription | undefined
@@ -1240,14 +1253,37 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.controllers.set(task0.taskId, controller)
         const batchLeases = new Map<TabId, number>()
         const pendingPostconditions: Array<{ actionId: ActionId; stepId: BatchStep['stepId']; tabId: TabId }> = []
+        const namedObservations = new Map<string, Observation>()
         let preserveLeases = false
         try {
             for (let index = fromIndex; index < steps.length; index++) {
                 const step = steps[index]
-                const agentSnapshot = ['click', 'fill'].includes(step.kind)
+                let resolvedRef = step.ref
+                let namedSnapshot: SnapshotId | undefined
+                let refResolutionError: BrowserRuntimeError | undefined
+                if (['click', 'fill'].includes(step.kind) && typeof step.ref === 'string' && step.ref.startsWith('$')) {
+                    const separator = step.ref.indexOf('.', 1)
+                    const resultName = separator > 1 ? step.ref.slice(1, separator) : ''
+                    const accessibleName = separator > 1 ? step.ref.slice(separator + 1) : ''
+                    const namedObservation = resultName ? namedObservations.get(resultName) : undefined
+                    const matches = namedObservation?.elements.filter((element) => element.name === accessibleName) ?? []
+                    if (!namedObservation || !accessibleName || matches.length !== 1) {
+                        refResolutionError = new BrowserRuntimeError('INVALID_REQUEST',
+                            'Named ref must identify exactly one element in this batch')
+                    }
+                    else {
+                        resolvedRef = matches[0].ref
+                        namedSnapshot = namedObservation.snapshotId
+                    }
+                }
+                const agentSnapshot = namedSnapshot ?? (['click', 'fill'].includes(step.kind)
                     ? step.snapshotId ?? this.latestAgentSnapshots.get(step.tabId)
-                    : undefined
-                const effectiveStep: BatchStep = agentSnapshot ? { ...step, snapshotId: agentSnapshot } : step
+                    : undefined)
+                const effectiveStep: BatchStep = {
+                    ...step,
+                    ...(resolvedRef ? { ref: resolvedRef } : {}),
+                    ...(agentSnapshot ? { snapshotId: agentSnapshot } : {}),
+                }
                 let task = this.requireTask(task0.taskId)
                 if (task.cancelRequested) {
                     outcome = 'cancelled'
@@ -1287,11 +1323,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (action) {
                     if (action.payloadHash !== payloadHash(step))
                         throw new BrowserRuntimeError('CONFLICT', 'actionId has been used with different input')
-                    if (action.state === 'confirmed') {
-                        completedSteps.push(step.stepId)
-                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded' })
-                        continue
-                    }
+                    if (action.state === 'confirmed')
+                        throw new BrowserRuntimeError('CONFLICT', 'actionId was already confirmed in a prior batch')
                     throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'actionId has an unresolved prior result', false, true)
                 }
                 task = await this.commit(task, { actions: { ...task.actions, [step.actionId]: { state: 'intent-committed',
@@ -1302,11 +1335,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 let description: ElementDescription | undefined
                 try {
                     if (['click', 'fill'].includes(step.kind)) {
+                        if (refResolutionError)
+                            throw refResolutionError
                         if (!agentSnapshot)
                             throw new BrowserRuntimeError('STALE_REF', 'Action has no agent-visible snapshot', false, false)
                         if (!driver.describeRef)
                             throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Driver cannot safely classify referenced actions', false, false)
-                        description = await driver.describeRef(step.tabId, step.ref as ElementRef, agentSnapshot,
+                        description = await driver.describeRef(step.tabId, effectiveStep.ref as ElementRef, agentSnapshot,
                             { timeoutMs: step.timeoutMs })
                         if (!grant.allowedOrigins.includes(description.frameOrigin)
                             || !grant.allowedOrigins.includes(new URL(description.pageUrl).origin))
@@ -1358,13 +1393,19 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     const approvalId = approval.summary.approvalId
                     const pendingApproval = approval.summary
                     const approvals = { ...task.approvals, [approvalId]: approval.record }
+                    const approvalBatch = task.batches[batchId]
+                    const approvalSteps = [...approvalBatch.steps]
+                    approvalSteps[index] = effectiveStep
                     task = await this.commit(task, {
                         status: 'awaiting-user',
                         waitReason: 'approval',
                         waitExpiresAtMs: expiresAtMs,
                         pendingApproval,
                         actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: 'planned' } },
-                            approvals }, 'approval-requested', {
+                        approvals,
+                        batches: { ...task.batches, [batchId]: { ...approvalBatch, steps: persistedBatchSteps(approvalSteps),
+                            nextStep: index } },
+                    }, 'approval-requested', {
                                 approvalId,
                                 actionId: step.actionId,
                                 origin,
@@ -1414,6 +1455,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             throw new BrowserRuntimeError('ORIGIN_DENIED', 'Observed page origin is not allowed', false, false)
                         this.latestAgentSnapshots.set(step.tabId, dispatchResult.snapshotId)
                         this.latestAgentUrls.set(step.tabId, dispatchResult.url)
+                        if (step.name)
+                            namedObservations.set(step.name, sanitizeObservation(dispatchResult, grant.allowedOrigins))
                     }
                     if (landedUrl)
                         this.latestAgentUrls.set(step.tabId, landedUrl)
@@ -1709,6 +1752,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist'); return space; }
     private assertTaskTab(task: StoredTask, tab: TabId): void { if (!task.tabs.includes(tab))
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Tab is not owned by task'); }
+    /**
+     * Design: submitBatch can start from queued or paused(awaiting-agent).
+     * Running/recovering, terminal, cancellation-fenced, and uncertain tasks
+     * block. awaiting-user blocks for approval, login, and captcha. Paused
+     * reasons user-control, user-input-complete, user-wait-expired,
+     * approval-expired, grant-expired, quota, task-time-limit, outcome-unknown,
+     * browser-replaced, and cancelled-with-unknown-effect all require their
+     * dedicated resolution flow before another batch is accepted.
+     */
     private assertCanStart(task: StoredTask): void {
         if (task.cancelRequested || ['succeeded', 'failed', 'cancelled'].includes(task.status))
             throw new BrowserRuntimeError('CONFLICT', 'Task cannot accept new work')
@@ -1716,7 +1768,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('CONFLICT', 'Task already owns an execution segment')
         if (task.status === 'paused' && task.pauseReason !== 'awaiting-agent' || task.status === 'awaiting-user'
             || task.uncertainActions.length)
-            throw new BrowserRuntimeError('CONFLICT', 'Task is paused for a blocking reason')
+            throw new BrowserRuntimeError('CONFLICT', `Task is paused for a blocking reason (${task.pauseReason ?? task.waitReason ?? task.status})`)
     }
     private allocateTabId(): TabId { return `lease-reservation-${randomUUID()}` as TabId; }
     private view(task: StoredTask): TaskView { const { owner: _owner, agentGrant: _grant, actions: _actions, approvals: _approvals,
