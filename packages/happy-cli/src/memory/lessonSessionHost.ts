@@ -140,8 +140,9 @@ function studioOrigin(env: NodeJS.ProcessEnv): string | null {
     }
 }
 
-/** Starts in the background; a cold turn may wait at most one readiness budget.
- * Late startup remains reusable by later turns, and shutdown never awaits it.
+/** Starts in the background; only the first cold recall may wait, for at most
+ * one readiness budget per session. Late startup remains reusable by later
+ * turns, and shutdown never awaits it.
  */
 export function createLazyLessonSessionHost(
     input: Parameters<typeof createLessonSessionHost>[0] & {
@@ -157,6 +158,8 @@ export function createLazyLessonSessionHost(
     let starting = false;
     let retryAt = 0;
     let pending: Promise<void> | undefined;
+    // A hung studio must not cost every turn a budget; later turns see only a ready host.
+    let readinessBudgetSpent = false;
     const shutdown = new AbortController();
     const start = () => {
         if (disposed || ready || starting || Date.now() < retryAt) return;
@@ -188,7 +191,8 @@ export function createLazyLessonSessionHost(
     const awaitReady = async (signal?: AbortSignal) => {
         if (signal?.aborted || disposed) return null;
         const current = settled();
-        if (current || !starting || !pending) return current;
+        if (current || !starting || !pending || readinessBudgetSpent) return current;
+        readinessBudgetSpent = true;
         const cancelled = AbortSignal.any([shutdown.signal, ...(signal ? [signal] : [])]);
         let timer: ReturnType<typeof setTimeout> | undefined;
         let onAbort: () => void = () => undefined;
@@ -225,8 +229,9 @@ export function createLazyLessonSessionHost(
         },
         review: {
             async prepareReviewTurn() {
-                const host = await awaitReady();
-                if (disposed || !host) return null;
+                // Recall already waited for readiness this turn; never wait twice.
+                const host = settled();
+                if (!host) return null;
                 const prepared = await host.review?.prepareReviewTurn?.();
                 return disposed ? null : prepared ?? null;
             },
