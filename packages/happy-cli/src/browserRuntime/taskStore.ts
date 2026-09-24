@@ -102,6 +102,7 @@ export interface TaskMutation {
 }
 const stable = (value: unknown): string => JSON.stringify(value)
 const checksum = (body: string): string => createHash('sha256').update(body).digest('hex')
+const processInstanceId = randomUUID()
 const journalError = (message = 'Task journal is unavailable'): BrowserRuntimeError => new BrowserRuntimeError('JOURNAL_UNAVAILABLE',
     message, true)
 /** Single-writer, fsync-backed JSONL journal plus atomically replaced task checkpoints. */
@@ -325,17 +326,19 @@ export class TaskStore {
                 throw journalError()
             let lock: {
                 pid: number
+                processInstanceId?: string
             } | undefined
             try {
                 lock = JSON.parse(await readFile(lockPath, 'utf8')) as {
                     pid: number
+                    processInstanceId?: string
                 }
             }
             catch {
                 lock = undefined
             }
             let alive = false
-            if (lock?.pid) {
+            if (lock?.pid && lock.pid !== process.pid) {
                 try {
                     process.kill(lock.pid, 0)
                     alive = true
@@ -343,6 +346,9 @@ export class TaskStore {
                 catch (killError) {
                     alive = (killError as NodeJS.ErrnoException).code === 'EPERM'
                 }
+            }
+            else if (lock?.pid === process.pid && lock.processInstanceId === processInstanceId) {
+                alive = true
             }
             if (alive)
                 throw journalError('Task store already has a live writer')
@@ -364,7 +370,8 @@ export class TaskStore {
         finally {
             await fence.close()
         }
-        await this.lockHandle.writeFile(stable({ pid: process.pid, fencingToken: this.fencingToken, started: Date.now() }))
+        await this.lockHandle.writeFile(stable({ pid: process.pid, processInstanceId,
+            fencingToken: this.fencingToken, started: Date.now() }))
         await this.lockHandle.sync()
         await this.syncDirectory(this.stateDir)
     }

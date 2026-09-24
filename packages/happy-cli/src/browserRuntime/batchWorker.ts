@@ -30,12 +30,12 @@ export async function dispatchStep(
             if (!step.ref || typeof step.ref === 'string' && step.ref.startsWith('$')) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'click needs a resolved ref')
             }
-            return driver.click(step.tabId, step.ref as ElementRef, observed?.snapshotId as SnapshotId, options)
+            return driver.click(step.tabId, step.ref as ElementRef, step.snapshotId ?? observed?.snapshotId as SnapshotId, options)
         case 'fill':
             if (!step.ref || step.value === undefined) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'fill needs ref and value')
             }
-            return driver.fill(step.tabId, step.ref as ElementRef, observed?.snapshotId as SnapshotId, step.value, options)
+            return driver.fill(step.tabId, step.ref as ElementRef, step.snapshotId ?? observed?.snapshotId as SnapshotId, step.value, options)
         case 'observe':
             await driver.observe(step.tabId, grant.allowedOrigins, options)
             return

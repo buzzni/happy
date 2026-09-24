@@ -127,7 +127,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         task: TaskView
     }> {
         await this.recovery
-        const task = this.requireTask(req.taskId)
+        let task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'openPage', task)
         const duplicate = this.taskRequest(task, auth, req.requestId, { operation: 'openPage', ...req })
         if (duplicate)
@@ -153,11 +153,35 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const reservation = this.allocateTabId()
         const epoch = this.leases.acquire(reservation, task.profileId, { kind: 'agent', agentSessionId: task.agentSessionId,
             taskId: task.taskId, segmentId: actionId })
-        const running = transitionTask({ status: task.status, pauseReason: task.pauseReason }, { type: 'start' })
-        await this.commit(task, { ...running, currentBatchId: undefined, actions: { ...task.actions,
-            [actionId]: { state: 'intent-committed', payloadHash: payloadHash({ url: req.url }), leaseEpoch: epoch,
-                browserInstanceId: driver.browserInstanceId() } } }, 'action-intent', { actionId, kind: 'navigate',
-                    url: redact(req.url), phase: 'intent-committed' }, epoch)
+        try {
+            const started = await this.options.store.mutate(task.taskId, (current) => {
+                this.assertCanStart(current)
+                if (current.stateVersion !== task.stateVersion)
+                    throw new BrowserRuntimeError('CONFLICT', 'Task version changed before page open')
+                const next = transitionTask({ status: current.status, pauseReason: current.pauseReason }, { type: 'start' })
+                return {
+                    patch: {
+                        ...next,
+                        currentBatchId: undefined,
+                        actions: { ...current.actions, [actionId]: {
+                            state: 'intent-committed',
+                            payloadHash: payloadHash({ url: req.url }),
+                            leaseEpoch: epoch,
+                            browserInstanceId: driver.browserInstanceId(),
+                        } },
+                    },
+                    event: this.event('action-intent', { actionId, kind: 'navigate',
+                        url: redact(req.url), phase: 'intent-committed' }, current.stateVersion + 1, epoch),
+                }
+            })
+            if (!started)
+                throw new BrowserRuntimeError('CONFLICT', 'Task changed before page open')
+            task = started
+        }
+        catch (error) {
+            this.leases.release(reservation, task.profileId)
+            throw error
+        }
         const controller = new AbortController()
         this.controllers.set(task.taskId, controller)
         ;(driver as DriverWithAction).armAction?.(actionId)
@@ -169,6 +193,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         catch (error) {
             this.leases.release(reservation, task.profileId)
             const current = this.requireTask(task.taskId)
+            if (error instanceof BrowserRuntimeError && error.code === 'ORIGIN_DENIED'
+                && !error.mayHaveSideEffects) {
+                await this.commit(current, {
+                    status: 'failed',
+                    actions: { ...current.actions, [actionId]: { ...current.actions[actionId], state: 'failed' } },
+                }, 'action-failed', { actionId, error: safeError(error) }, epoch)
+                throw error
+            }
             if (!current.cancelRequested)
                 await this.commit(current, { status: 'paused', pauseReason: 'outcome-unknown', actions: { ...current.actions,
                     [actionId]: { ...current.actions[actionId], state: 'uncertain' } }, uncertainActions: [...current.uncertainActions,
@@ -375,7 +407,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 const dedupe = { ...current.dedupe, [key]: { hash, result: { batchId, accepted: true, task: predictedTask } } }
                 return {
                     patch: { ...next, currentBatchId: batchId, pauseReason: undefined, waitReason: undefined, dedupe,
-                        batches: { ...current.batches, [batchId]: { steps: redact(req.steps), nextStep: 0 } } },
+                        batches: { ...current.batches, [batchId]: { steps: persistedBatchSteps(req.steps), nextStep: 0 } } },
                     event: this.event('batch-accepted', { batchId, stepCount: req.steps.length }, current.stateVersion + 1),
                     business: true,
                 }
@@ -466,6 +498,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.authorizeTask(auth, 'subscribe', task)
         if (req.afterSeq < 0)
             throw new BrowserRuntimeError('INVALID_REQUEST', 'Invalid event cursor')
+        if (req.afterSeq > task.highWatermarkSeq)
+            return { kind: 'snapshot-required', snapshot: this.view(task), highWatermarkSeq: task.highWatermarkSeq }
         const events = this.options.store.events(req.taskId, req.afterSeq, this.clock.now())
         if (!events.length && req.afterSeq < task.highWatermarkSeq && ['succeeded', 'failed',
             'cancelled'].includes(task.status) && this.clock.now() - task.updatedAtMs > POC_LIMITS.eventRetentionMs)
@@ -478,6 +512,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.recovery
         const read = () => {
             const task = this.requireTask(taskId)
+            if (afterSeq > task.highWatermarkSeq)
+                return { kind: 'snapshot-required' as const, snapshot: this.view(task), highWatermarkSeq: task.highWatermarkSeq }
             const events = this.options.store.events(taskId, afterSeq, this.clock.now())
             if (events.length && afterSeq < events[0].seq - 1)
                 return { kind: 'snapshot-required' as const, snapshot: this.view(task), highWatermarkSeq: task.highWatermarkSeq }
@@ -611,6 +647,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (req.decision === 'reject') {
             const cancelled = await this.commit(task, { status: 'cancelled', approvals: { ...task.approvals,
                 [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId })
+            for (const lease of this.leases.revokeTask(task.taskId))
+                await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
             return { outcome: 'rejected', task: this.view(cancelled) }
         }
         const originalGrant = task.agentGrant as AgentGrant | undefined
@@ -1180,6 +1218,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const controller = this.controllers.get(task0.taskId) ?? new AbortController()
         this.controllers.set(task0.taskId, controller)
         const batchLeases = new Map<TabId, number>()
+        const pendingPostconditions: Array<{ actionId: ActionId; stepId: BatchStep['stepId']; tabId: TabId }> = []
         let preserveLeases = false
         try {
             for (let index = fromIndex; index < steps.length; index++) {
@@ -1232,11 +1271,39 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 }
                 task = await this.commit(task, { actions: { ...task.actions, [step.actionId]: { state: 'intent-committed',
                     kind: step.kind, batchId, payloadHash: payloadHash(step), leaseEpoch,
-                        browserInstanceId: driver.browserInstanceId() } }, batches: { ...task.batches, [batchId]: { steps,
+                        browserInstanceId: driver.browserInstanceId() } }, batches: { ...task.batches, [batchId]: { steps: persistedBatchSteps(steps),
                             nextStep: index } } }, 'action-intent', { actionId: step.actionId, kind: step.kind,
                                 payloadHash: payloadHash(step) }, leaseEpoch)
-                const observed = ['click', 'fill'].includes(step.kind) ? await driver.observe(step.tabId, grant.allowedOrigins,
-                    { timeoutMs: step.timeoutMs }) : undefined
+                let observed: Observation | undefined
+                try {
+                    observed = ['click', 'fill'].includes(step.kind)
+                        ? await driver.observe(step.tabId, grant.allowedOrigins, { timeoutMs: step.timeoutMs })
+                        : undefined
+                }
+                catch (error) {
+                    const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
+                    const safeRefusal = runtimeError && ['INVALID_REQUEST', 'STALE_REF'].includes(runtimeError.code)
+                        && !runtimeError.mayHaveSideEffects
+                    const write = ['click', 'fill', 'navigate'].includes(step.kind)
+                    const uncertain = write && !safeRefusal
+                    const state = uncertain ? 'uncertain' as const : 'failed' as const
+                    task = await this.commit(task, {
+                        actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state } },
+                        status: 'paused',
+                        ...(uncertain ? { pauseReason: 'outcome-unknown',
+                            uncertainActions: [...new Set([...task.uncertainActions, step.actionId])] }
+                            : { pauseReason: 'awaiting-agent' }),
+                    }, uncertain ? 'action-uncertain' : 'action-failed', {
+                        actionId: step.actionId,
+                        error: safeError(error),
+                    }, leaseEpoch)
+                    results.push({ stepId: step.stepId, actionId: step.actionId,
+                        outcome: uncertain ? 'uncertain' : 'failed', error: safeError(error) })
+                    failedStep = step.stepId
+                    outcome = uncertain ? 'uncertain' : 'failed'
+                    mayHaveSideEffects = uncertain
+                    break
+                }
                 const element = observed?.elements.find((candidate) => candidate.ref === step.ref)
                 if (classifyAction(step, element, undefined, observed?.url) === 'approval-required' && step.actionId !== approvedActionId) {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
@@ -1324,8 +1391,47 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     }
                     task = await this.commit(task, { actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId],
                         state: 'dispatched' } } }, 'action-dispatched', { actionId: step.actionId }, leaseEpoch)
+                    if (step.kind === 'waitFor') {
+                        const observedPostconditions = pendingPostconditions.filter((pending) => pending.tabId === step.tabId)
+                        if (observedPostconditions.length) {
+                            const actions = { ...task.actions }
+                            for (const pending of observedPostconditions)
+                                actions[pending.actionId] = { ...actions[pending.actionId], state: 'confirmed' }
+                            task = await this.commit(task, { actions }, 'action-confirmed', {
+                                reason: 'postcondition-observed',
+                                actionIds: observedPostconditions.map((pending) => pending.actionId),
+                                postconditionActionId: step.actionId,
+                            }, leaseEpoch)
+                            for (const pending of observedPostconditions) {
+                                completedSteps.push(pending.stepId)
+                                results.push({ stepId: pending.stepId, actionId: pending.actionId, outcome: 'succeeded' })
+                                pendingPostconditions.splice(pendingPostconditions.indexOf(pending), 1)
+                            }
+                        }
+                    }
+                    const requiresPostcondition = ['click', 'fill', 'navigate'].includes(step.kind)
+                        && classifyAction(step, element, undefined, observed?.url) === 'approval-required'
+                    const hasPostconditionStep = steps.slice(index + 1).some((candidate) => candidate.tabId === step.tabId
+                        && candidate.kind === 'waitFor')
+                    if (requiresPostcondition && !hasPostconditionStep) {
+                        task = await this.commit(task, {
+                            actions: { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: 'uncertain' } },
+                            status: 'paused',
+                            pauseReason: 'outcome-unknown',
+                            uncertainActions: [...new Set([...task.uncertainActions, step.actionId])],
+                        }, 'action-uncertain', { actionId: step.actionId, reason: 'postcondition-required' }, leaseEpoch)
+                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'uncertain' })
+                        failedStep = step.stepId
+                        outcome = 'uncertain'
+                        mayHaveSideEffects = true
+                        break
+                    }
+                    if (requiresPostcondition && hasPostconditionStep) {
+                        pendingPostconditions.push({ actionId: step.actionId, stepId: step.stepId, tabId: step.tabId })
+                        continue
+                    }
                     const actions = { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: 'confirmed' as const } }
-                    task = await this.commit(task, { actions, batches: { ...task.batches, [batchId]: { steps,
+                    task = await this.commit(task, { actions, batches: { ...task.batches, [batchId]: { steps: persistedBatchSteps(steps),
                         nextStep: index + 1 } } }, 'action-confirmed', { actionId: step.actionId }, leaseEpoch)
                     results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded',
                         ...(observed ? { observation: sanitizeObservation(observed, grant.allowedOrigins) } : {}) })
@@ -1357,6 +1463,31 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 }
                 catch (error) {
                     task = this.requireTask(task.taskId)
+                    const pending = pendingPostconditions.filter((candidate) => candidate.tabId === step.tabId)
+                    if (pending.length && task.status === 'running' && !task.cancelRequested) {
+                        const actions = { ...task.actions }
+                        for (const candidate of pending)
+                            actions[candidate.actionId] = { ...actions[candidate.actionId], state: 'uncertain' }
+                        actions[step.actionId] = { ...actions[step.actionId], state: 'failed' }
+                        const uncertainIds = [...new Set([...task.uncertainActions,
+                            ...pending.map((candidate) => candidate.actionId)])]
+                        task = await this.commit(task, { actions, status: 'paused', pauseReason: 'outcome-unknown',
+                            uncertainActions: uncertainIds }, 'action-uncertain', {
+                            actionIds: pending.map((candidate) => candidate.actionId),
+                            postconditionActionId: step.actionId,
+                            error: safeError(error),
+                        }, leaseEpoch)
+                        for (const candidate of pending) {
+                            results.push({ stepId: candidate.stepId, actionId: candidate.actionId, outcome: 'uncertain' })
+                            pendingPostconditions.splice(pendingPostconditions.indexOf(candidate), 1)
+                        }
+                        results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'failed',
+                            error: safeError(error) })
+                        failedStep = pending[0].stepId
+                        outcome = 'uncertain'
+                        mayHaveSideEffects = true
+                        break
+                    }
                     if (task.pauseReason === 'user-control' || this.leases.owner(step.tabId, task.profileId).leaseEpoch !== leaseEpoch) {
                         const uncertain = ['click', 'fill', 'navigate'].includes(step.kind)
                         const state = uncertain ? 'uncertain' as const : 'skipped' as const
@@ -1540,6 +1671,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private assertCanStart(task: StoredTask): void {
         if (task.cancelRequested || ['succeeded', 'failed', 'cancelled'].includes(task.status))
             throw new BrowserRuntimeError('CONFLICT', 'Task cannot accept new work')
+        if (task.status === 'running')
+            throw new BrowserRuntimeError('CONFLICT', 'Task already owns an execution segment')
         if (task.status === 'paused' && task.pauseReason !== 'awaiting-agent' || task.status === 'awaiting-user'
             || task.uncertainActions.length)
             throw new BrowserRuntimeError('CONFLICT', 'Task is paused for a blocking reason')
@@ -1547,7 +1680,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private allocateTabId(): TabId { return `lease-reservation-${randomUUID()}` as TabId; }
     private view(task: StoredTask): TaskView { const { owner: _owner, agentGrant: _grant, actions: _actions, approvals: _approvals,
         batches: _batches, dedupe: _dedupe, tabTargets: _tabTargets, tabLeaseEpochs: _tabLeaseEpochs,
-        __events: _events, lastSeq: _lastSeq, ...view } = task; return structuredClone(view); }
+        __events: _events, lastSeq: _lastSeq, ...view } = task; return structuredClone({ ...view,
+        tabLeases: task.tabs.map((tabId) => ({ tabId, ...this.leases.owner(tabId, task.profileId) })) }); }
     private taskRequest(task: StoredTask, auth: AuthContext, requestId: string,
         payload: unknown): unknown | undefined { const key = requestKey(auth, requestId); const old = task.dedupe[key]; if (!old)
         return; if (old.hash !== payloadHash(payload))
@@ -1635,6 +1769,10 @@ function safeError(error: unknown): RuntimeErrorBody {
         mayHaveSideEffects: false,
     }
     return redact(body)
+}
+
+function persistedBatchSteps(steps: BatchStep[]): BatchStep[] {
+    return redact(steps.map((step) => step.kind === 'fill' ? { ...step, value: undefined } : step))
 }
 function matchesWait(predicate: NonNullable<BatchStep['until']>, observation: Observation): boolean {
     if (predicate.kind === 'text')

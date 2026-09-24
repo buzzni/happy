@@ -16,7 +16,7 @@ async function createHarness(prefix: string, expiresAtMs = 3_600_000) {
     const store = await TaskStore.open(dir); const clock = new FakeClock(100)
     const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
     const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
-    const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs }
+    const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'subscribe', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs }
     const auth = { credential, verifiedAtMs: clock.now() }
     const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
     const task = await runtime.createTask(auth, { taskSpaceId: space.taskSpaceId, requestId: 'task-req' as RequestId })
@@ -57,6 +57,16 @@ describe('BrowserRuntime durable request contract', () => {
         const result = await waiting
         expect(result.kind).toBe('events')
         if (result.kind === 'events') expect(result.events.some((event) => event.type === 'cancel-accepted')).toBe(true)
+        await h.store.close()
+    })
+
+    it('requires a snapshot when subscribe receives a cursor beyond the task high watermark', async () => {
+        const h = await createHarness('abp-runtime-future-cursor-')
+        const result = await h.runtime.subscribe(h.auth, {
+            taskId: h.task.taskId,
+            afterSeq: h.opened.task.highWatermarkSeq + 10,
+        })
+        expect(result.kind).toBe('snapshot-required')
         await h.store.close()
     })
 
@@ -488,6 +498,40 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('preserves user-control when a fenced waitFor fails after takeover', async () => {
+        const h = await createHarness('abp-runtime-takeover-wait-failure-')
+        h.driver.setIgnoreWaitAbort(true)
+        const held = h.driver.holdAfterNextDispatch('waitFor')
+        h.driver.failNext('waitFor', new BrowserRuntimeError('OUTCOME_UNKNOWN', 'synthetic wait failure', false, false))
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const running = h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'takeover-wait-failure-batch' as RequestId,
+            steps: [{ stepId: 'wait' as never, actionId: 'wait' as never, tabId: h.opened.tabId,
+                kind: 'waitFor', until: { kind: 'text', text: 'release' }, timeoutMs: 120_000 }],
+        }, { waitMs: 5000 })
+        await h.driver.waitForEntered
+        const live = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const uiCredential: InteractiveCapability = {
+            kind: 'interactive', capabilityId: 'wait-failure-ui' as never, principalId: 'p' as never,
+            workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'wait-failure-viewer',
+            profileId: h.profileId, operations: ['takeOver'], issuedAtMs: 0, expiresAtMs: 3_600_000,
+        }
+        const takeover = await h.runtime.takeOver({ credential: uiCredential, verifiedAtMs: h.clock.now() }, {
+            taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: live.tabLeases?.[0].leaseEpoch ?? 0, requestId: 'takeover-wait-failure' as RequestId,
+        })
+        expect(takeover.task.pauseReason).toBe('user-control')
+        held.release()
+        await running
+
+        const after = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(after.pauseReason).toBe('user-control')
+        expect(after.status).toBe('paused')
+        await h.store.close()
+    })
+
     it('pauses after a timed-out read-only step so the same task can accept a follow-up batch', async () => {
         const h = await createHarness('abp-runtime-read-timeout-')
         h.driver.failNext('waitFor', new BrowserRuntimeError('OUTCOME_UNKNOWN', 'read-only wait timed out', true, false))
@@ -526,13 +570,39 @@ describe('BrowserRuntime durable request contract', () => {
         const task = await runtime.createTask(auth, { taskSpaceId: space.taskSpaceId, requestId: 'task-req' as RequestId })
         const opened = await runtime.openPage(auth, { taskId: task.taskId, url: 'https://fixture.test/start', requestId: 'open-req' as RequestId })
         const request = { taskId: task.taskId, expectedVersion: (await runtime.getTask(auth, { taskId: task.taskId })).stateVersion, requestId: 'batch-req' as RequestId, steps: [{ stepId: 'step-1' as never, actionId: 'action-1' as never, tabId: opened.tabId, kind: 'click' as const, ref: '@e1' as never, timeoutMs: 1000 }] }
-        const first = await runtime.submitBatch(auth, request, { waitMs: 100 })
-        const duplicate = await runtime.submitBatch(auth, request, { waitMs: 100 })
+        const first = await runtime.submitBatch(auth, request, { waitMs: 1_000 })
+        const duplicate = await runtime.submitBatch(auth, request, { waitMs: 1_000 })
         expect(first.batchId).toBe(duplicate.batchId)
         expect(driver.dispatchCounts.get('action-1')).toBe(1)
         await expect(runtime.submitBatch(auth, { ...request, steps: [{ ...request.steps[0], ref: '@e2' as never }] }))
             .rejects.toMatchObject({ code: 'CONFLICT' })
         await store.close()
+    })
+
+    it('rejects a confirmed actionId reused in a new batch', async () => {
+        const h = await createHarness('abp-runtime-action-id-reuse-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@continue' as never, role: 'button', name: 'Continue', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
+        const first = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: first.stateVersion,
+            requestId: 'action-reuse-first' as RequestId,
+            steps: [{ stepId: 'first-step' as never, actionId: 'reused-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@continue' as never, timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+        const ready = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        await expect(h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: ready.stateVersion,
+            requestId: 'action-reuse-second' as RequestId,
+            steps: [{ stepId: 'second-step' as never, actionId: 'reused-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@continue' as never, timeoutMs: 1000 }],
+        })).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect(h.driver.dispatchCounts.get('reused-action')).toBe(1)
+        await h.store.close()
     })
 
     it('fences a hanging waitFor without waiting for it and prevents later dispatch', async () => {
@@ -646,7 +716,7 @@ describe('BrowserRuntime durable request contract', () => {
         expect(first.outcome).toBe('approved')
         expect(duplicate.outcome).toBe('approved')
         expect(driver.dispatchCounts.get('pay-action')).toBe(1)
-        expect((await runtime.getTask(auth, { taskId: task.taskId })).pauseReason).toBe('awaiting-agent')
+        expect((await runtime.getTask(auth, { taskId: task.taskId })).pauseReason).toBe('outcome-unknown')
         await store.close()
     })
 
@@ -758,6 +828,257 @@ describe('BrowserRuntime durable request contract', () => {
             requestId: 'approve-changed-amount' as RequestId, decision: 'approve',
         })).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
         expect(h.driver.dispatchCounts.get('submit-order') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('keeps an approved submit click uncertain until a trusted postcondition is observed', async () => {
+        const h = await createHarness('abp-runtime-submit-uncertain-')
+        h.driver.seedTab(h.opened.tabId, {
+            url: 'https://fixture.test/start',
+            elements: [{ ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true,
+                frameOrigin: 'https://fixture.test' }],
+        })
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const submitted = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'submit-uncertain-batch' as RequestId,
+            steps: [{ stepId: 'pay-step' as never, actionId: 'pay-action' as never, tabId: h.opened.tabId,
+                kind: 'click', ref: '@pay' as never, timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+        const approval = submitted.result?.pendingApproval
+        if (!approval) throw new Error('test requires a pending approval')
+        const uiCredential: InteractiveCapability = {
+            kind: 'interactive', capabilityId: 'submit-ui' as never, principalId: 'p' as never,
+            workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer',
+            profileId: h.profileId, operations: ['approve'], issuedAtMs: 0, expiresAtMs: 3_600_000,
+        }
+        const result = await h.runtime.approve({ credential: uiCredential, verifiedAtMs: h.clock.now() }, {
+            taskId: h.task.taskId, approvalId: approval.approvalId, bindingHash: approval.bindingHash,
+            requestId: 'submit-uncertain-approve' as RequestId, decision: 'approve',
+        })
+
+        expect(result.batch?.outcome).toBe('uncertain')
+        expect(result.batch?.mayHaveSideEffects).toBe(true)
+        expect(result.task.pauseReason).toBe('outcome-unknown')
+        await expect(h.runtime.finishTask(h.auth, {
+            taskId: h.task.taskId, expectedVersion: result.task.stateVersion, requestId: 'submit-uncertain-finish' as RequestId,
+        })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await h.store.close()
+    })
+
+    it('records a pre-dispatch STALE_REF refusal as a failed step without side effects', async () => {
+        const h = await createHarness('abp-runtime-pre-dispatch-refusal-')
+        h.driver.seedTab(h.opened.tabId, {
+            url: 'https://fixture.test/start',
+            elements: [{ ref: '@continue' as never, role: 'button', name: 'Continue', visible: true,
+                frameOrigin: 'https://fixture.test' }],
+        })
+        h.driver.failNext('observe', new BrowserRuntimeError('STALE_REF', 'stale synthetic ref', false, false))
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const result = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'pre-dispatch-refusal' as RequestId,
+            steps: [{ stepId: 'continue-step' as never, actionId: 'continue-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@continue' as never, timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+
+        expect(result.result?.outcome).toBe('failed')
+        expect(result.result?.mayHaveSideEffects).toBe(false)
+        expect(result.result?.steps[0]?.error?.code).toBe('STALE_REF')
+        expect(result.task.pauseReason).toBe('awaiting-agent')
+        expect(h.driver.dispatchCounts.get('continue-action') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('accepts a submit action only when a following batch waitFor postcondition completes', async () => {
+        const h = await createHarness('abp-runtime-submit-postcondition-')
+        h.driver.seedTab(h.opened.tabId, {
+            url: 'https://fixture.test/start',
+            elements: [{ ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true,
+                frameOrigin: 'https://fixture.test' }],
+        })
+        h.driver.setDelay('waitFor', 1)
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const submitted = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'submit-postcondition-batch' as RequestId,
+            steps: [
+                { stepId: 'pay-step' as never, actionId: 'pay-action' as never, tabId: h.opened.tabId,
+                    kind: 'click', ref: '@pay' as never, timeoutMs: 1000 },
+                { stepId: 'success-check' as never, actionId: 'success-check-action' as never, tabId: h.opened.tabId,
+                    kind: 'waitFor', until: { kind: 'text', text: 'Payment complete' }, timeoutMs: 1000 },
+            ],
+        }, { waitMs: 2000 })
+        const approval = submitted.result?.pendingApproval
+        if (!approval) throw new Error('test requires a pending approval')
+        const uiCredential: InteractiveCapability = {
+            kind: 'interactive', capabilityId: 'postcondition-ui' as never, principalId: 'p' as never,
+            workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer',
+            profileId: h.profileId, operations: ['approve'], issuedAtMs: 0, expiresAtMs: 3_600_000,
+        }
+        const approved = await h.runtime.approve({ credential: uiCredential, verifiedAtMs: h.clock.now() }, {
+            taskId: h.task.taskId, approvalId: approval.approvalId, bindingHash: approval.bindingHash,
+            requestId: 'submit-postcondition-approve' as RequestId, decision: 'approve',
+        })
+        expect(approved.batch?.outcome).toBe('succeeded')
+        expect(approved.task.pauseReason).toBe('awaiting-agent')
+        await h.store.close()
+    })
+
+    it('does not rebind an agent ref to a newer snapshot of the same URL', async () => {
+        const h = await createHarness('abp-runtime-original-snapshot-')
+        h.driver.seedTab(h.opened.tabId, {
+            url: 'https://fixture.test/start',
+            documentGeneration: 1,
+            elements: [{ ref: '@continue' as never, role: 'button', name: 'Continue', visible: true,
+                frameOrigin: 'https://fixture.test' }],
+        })
+        const original = await h.driver.observe(h.opened.tabId, ['https://fixture.test'], { timeoutMs: 1000 })
+        h.driver.seedTab(h.opened.tabId, {
+            url: 'https://fixture.test/start',
+            documentGeneration: 2,
+            elements: [{ ref: '@continue' as never, role: 'button', name: 'Decoy', visible: true,
+                frameOrigin: 'https://fixture.test' }],
+        })
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const response = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'old-snapshot-click' as RequestId,
+            steps: [{ stepId: 'click' as never, actionId: 'old-snapshot-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@continue' as never, timeoutMs: 1000,
+                snapshotId: original.snapshotId } as never],
+        }, { waitMs: 1000 })
+        expect(response.result?.outcome).toBe('failed')
+        expect(response.result?.steps[0]?.error?.code).toBe('STALE_REF')
+        expect(h.driver.dispatchCounts.get('old-snapshot-action') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('releases an approval batch lease when the interactive user rejects it', async () => {
+        const h = await createHarness('abp-runtime-reject-release-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const batch = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'reject-lease-batch' as RequestId,
+            steps: [{ stepId: 'pay-step' as never, actionId: 'pay-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@pay' as never, timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+        const approval = batch.result?.pendingApproval
+        if (!approval) throw new Error('test requires a pending approval')
+        const uiCredential: InteractiveCapability = {
+            kind: 'interactive', capabilityId: 'reject-ui' as never, principalId: 'p' as never,
+            workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer',
+            profileId: h.profileId, operations: ['approve'], issuedAtMs: 0, expiresAtMs: 3_600_000,
+        }
+        await h.runtime.approve({ credential: uiCredential, verifiedAtMs: h.clock.now() }, {
+            taskId: h.task.taskId, approvalId: approval.approvalId, bindingHash: approval.bindingHash,
+            requestId: 'reject-lease-approval' as RequestId, decision: 'reject',
+        })
+
+        await expect(h.runtime.closeSpace(h.auth, {
+            taskSpaceId: h.space.taskSpaceId, requestId: 'reject-lease-close-space' as RequestId,
+        })).resolves.toMatchObject({ closedTabs: [h.opened.tabId] })
+        await h.store.close()
+    })
+
+    it('does not accept a batch while openPage owns the task execution segment', async () => {
+        const h = await createHarness('abp-runtime-open-batch-race-')
+        h.driver.setDelay('openTab', 200)
+        const opening = h.runtime.openPage(h.auth, {
+            taskId: h.task.taskId,
+            url: 'https://fixture.test/second',
+            requestId: 'open-race-second-page' as RequestId,
+        })
+        let current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        for (let attempt = 0; current.status !== 'running' && attempt < 100; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 1))
+            current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        }
+        expect(current.status).toBe('running')
+        await expect(h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'batch-race-during-open' as RequestId,
+            steps: [{ stepId: 'observe' as never, actionId: 'observe-race' as never,
+                tabId: h.opened.tabId, kind: 'observe', timeoutMs: 1000 }],
+        })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await opening
+        await h.store.close()
+    })
+
+    it('serializes a simultaneous openPage and submitBatch start on the latest task state', async () => {
+        const h = await createHarness('abp-runtime-open-submit-simultaneous-')
+        h.driver.setDelay('openTab', 100)
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const [opened, submitted] = await Promise.allSettled([
+            h.runtime.openPage(h.auth, {
+                taskId: h.task.taskId,
+                url: 'https://fixture.test/second',
+                requestId: 'simultaneous-open' as RequestId,
+            }),
+            h.runtime.submitBatch(h.auth, {
+                taskId: h.task.taskId,
+                expectedVersion: current.stateVersion,
+                requestId: 'simultaneous-submit' as RequestId,
+                steps: [{ stepId: 'observe' as never, actionId: 'simultaneous-observe' as never,
+                    tabId: h.opened.tabId, kind: 'observe', timeoutMs: 1000 }],
+            }, { waitMs: 1000 }),
+        ])
+        expect([opened.status, submitted.status].filter((status) => status === 'fulfilled')).toHaveLength(1)
+        await h.store.close()
+    })
+
+    it('keeps a pre-side-effect openPage origin refusal as a confirmed failure', async () => {
+        const h = await createHarness('abp-runtime-open-origin-refusal-')
+        h.driver.failNext('openTab', new BrowserRuntimeError('ORIGIN_DENIED', 'redirect origin denied', false, false))
+        await expect(h.runtime.openPage(h.auth, {
+            taskId: h.task.taskId,
+            url: 'https://fixture.test/redirect',
+            requestId: 'open-denied-redirect' as RequestId,
+        })).rejects.toMatchObject({ code: 'ORIGIN_DENIED', mayHaveSideEffects: false })
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(task.status).toBe('failed')
+        expect(task.uncertainActions).toEqual([])
+        await h.store.close()
+    })
+
+    it('exposes persisted lease epochs and the current input owner on each task tab', async () => {
+        const h = await createHarness('abp-runtime-task-view-leases-')
+        const view = await h.runtime.getTask(h.auth, { taskId: h.task.taskId }) as typeof h.task & {
+            tabLeases?: Array<{ tabId: string; leaseEpoch: number; owner: { kind: string } }>
+        }
+        expect(view.tabLeases).toEqual([{ tabId: h.opened.tabId, leaseEpoch: expect.any(Number), owner: { kind: 'none' } }])
+        await h.store.close()
+    })
+
+    it('redacts fill values from durable batch checkpoints', async () => {
+        const h = await createHarness('abp-runtime-redact-fill-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@password' as never, role: 'textbox', name: 'Password', value: '', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'fill-secret' as RequestId,
+            steps: [{ stepId: 'fill' as never, actionId: 'fill-secret-action' as never,
+                tabId: h.opened.tabId, kind: 'fill', ref: '@password' as never,
+                value: 'synthetic-password-value', timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+
+        const journal = await readTree(h.dir)
+        expect(journal).not.toContain('synthetic-password-value')
+        expect(journal).not.toContain('ABP-CANARY-')
         await h.store.close()
     })
 })
