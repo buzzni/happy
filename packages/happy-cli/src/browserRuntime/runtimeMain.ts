@@ -78,6 +78,24 @@ async function connectWithRetry(driver: CdpDriver, profile: ProfileConfig, log: 
     }
 }
 
+const MIN_SECRET_LENGTH = 32
+
+/** Every key must be present and long; an empty admin token would otherwise match an empty bearer. */
+function loadKeys(path: string): KeysFile {
+    let parsed: Partial<KeysFile>
+    try {
+        parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<KeysFile>
+    } catch {
+        // Never echo the parse error: it can quote bytes of the key file.
+        throw new Error('ABP_KEYS_FILE is unreadable or not JSON')
+    }
+    for (const name of ['agentKey', 'interactiveKey', 'adminToken'] as const) {
+        const value = parsed[name]
+        if (typeof value !== 'string' || value.length < MIN_SECRET_LENGTH) throw new Error(`ABP_KEYS_FILE ${name} is missing or shorter than ${MIN_SECRET_LENGTH} characters`)
+    }
+    return parsed as KeysFile
+}
+
 function adminAuthorized(req: IncomingMessage, adminToken: string): boolean {
     const header = req.headers.authorization ?? ''
     const supplied = Buffer.from(header.startsWith('Bearer ') ? header.slice(7) : '')
@@ -141,7 +159,7 @@ function startAdminServer(input: { runtime: BrowserRuntime; drivers: Map<Profile
 async function main(): Promise<void> {
     const log = (line: string) => process.stderr.write(`[abp-runtime] ${new Date().toISOString()} ${line}\n`)
     const stateDir = requiredEnv('ABP_STATE_DIR')
-    const keys = JSON.parse(readFileSync(requiredEnv('ABP_KEYS_FILE'), 'utf8')) as KeysFile
+    const keys = loadKeys(requiredEnv('ABP_KEYS_FILE'))
     const profiles = JSON.parse(requiredEnv('ABP_PROFILES')) as ProfileConfig[]
     const host = process.env.ABP_RUNTIME_HOST ?? '0.0.0.0'
     const port = Number(process.env.ABP_RUNTIME_PORT ?? '8787')
@@ -161,19 +179,34 @@ async function main(): Promise<void> {
 
     for (const profile of profiles) {
         const driver = drivers.get(profile.profileId)!
-        driver.onDisconnect(() => {
+        // One recovery chain per profile: a close during reconnect must not start a
+        // second chain that races the first over the same tasks.
+        let recovering: Promise<void> | undefined
+        const recover = (): Promise<void> => (async () => {
             log(`profile=${profile.profileId} browser disconnected`)
-            void runtime.onDriverDisconnected(profile.profileId)
+            await runtime.onDriverDisconnected(profile.profileId)
                 .catch((error) => log(`disconnect handling failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
-                .then(() => connectWithRetry(driver, profile, log))
-                .then(() => runtime.onDriverReconnected(profile.profileId))
-                .then(() => log(`profile=${profile.profileId} browser reconnected`))
-                .catch((error) => log(`reconnect handling failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+            do {
+                await connectWithRetry(driver, profile, log)
+            } while (!driver.isConnected())
+            await runtime.onDriverReconnected(profile.profileId)
+            log(`profile=${profile.profileId} browser reconnected`)
+        })()
+            .catch((error) => { log(`reconnect handling failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`) })
+            .finally(() => { recovering = undefined })
+        driver.onDisconnect(() => {
+            recovering ??= recover()
         })
     }
 
+    let sweeping = false
     const sweep = setInterval(() => {
-        void runtime.sweep(Date.now()).catch((error) => log(`sweep failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+        // A slow sweep (journal fsync) must not overlap the next tick.
+        if (sweeping) return
+        sweeping = true
+        void runtime.sweep(Date.now())
+            .catch((error) => log(`sweep failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+            .finally(() => { sweeping = false })
     }, SWEEP_INTERVAL_MS)
     sweep.unref()
 
@@ -205,6 +238,10 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error) => {
-    process.stderr.write(`[abp-runtime] fatal ${error instanceof BrowserRuntimeError ? error.code : ''} ${error instanceof Error ? error.message : String(error)}\n`)
+    // Messages here are ours (config/lock errors); unexpected errors are reduced to their name.
+    const detail = error instanceof BrowserRuntimeError ? `${error.code} ${error.message}`
+        : error instanceof Error && error.message.startsWith('ABP_') ? error.message
+            : error instanceof Error ? error.name : 'unknown'
+    process.stderr.write(`[abp-runtime] fatal ${detail}\n`)
     process.exit(1)
 })
