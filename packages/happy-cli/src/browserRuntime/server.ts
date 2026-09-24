@@ -5,7 +5,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { z } from 'zod'
-import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody } from './contracts'
+import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody, type TaskId } from './contracts'
 import { renderConsolePage } from './consolePage'
 
 const MAX_BODY_BYTES = 1024 * 1024
@@ -59,7 +59,8 @@ export function httpStatusFor(code: ErrorCode): number {
 }
 
 export interface RuntimeServerOptions {
-    api: BrowserRuntimeApi & { waitForEvents?(taskId: string, afterSeq: number, waitMs: number): Promise<void> }
+    /** waitForEvents is only used as a wake-up signal after an authorized subscribe; its result is ignored. */
+    api: Omit<BrowserRuntimeApi, 'waitForEvents'> & { waitForEvents?(taskId: TaskId, afterSeq: number, waitMs: number): Promise<unknown> }
     verifyToken: (bearer: string) => AuthContext
     host?: string
     port: number
@@ -139,7 +140,7 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
         if (op === 'subscribe') {
             const first = (await call.call(api, auth, dto)) as { kind: string; events?: unknown[] }
             if (!waitMs || !api.waitForEvents || first.kind !== 'events' || (first.events?.length ?? 0) > 0) return first
-            await api.waitForEvents(dto.taskId as string, dto.afterSeq as number, waitMs)
+            await api.waitForEvents(dto.taskId as TaskId, dto.afterSeq as number, waitMs)
             return call.call(api, auth, dto)
         }
         return call.call(api, auth, dto)

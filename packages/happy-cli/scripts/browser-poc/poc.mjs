@@ -55,7 +55,7 @@ async function control(s, method, path, payload) {
   return res.json();
 }
 function up(run, argv) {
-  const names = resourceNames(run), rebuild = argv.includes("--rebuild"), runtimeBundle = opt(argv, "--runtime-bundle"), envFile = opt(argv, "--runtime-env");
+  const names = resourceNames(run), rebuild = argv.includes("--rebuild"), runtimeBundle = opt(argv, "--runtime-bundle"), envFile = opt(argv, "--runtime-env"), keysFile = opt(argv, "--runtime-keys");
   const labels = dockerLabels(run), network = names.network;
   docker("network", "create", ...labels, network);
   for (const volume of [names.profileA, names.profileB, names.state, names.fixtureData]) docker("volume", "create", ...labels, volume);
@@ -71,11 +71,12 @@ function up(run, argv) {
   let runtime;
   if (runtimeBundle) {
     const env = envFile ? JSON.parse(readFileSync(resolve(envFile), "utf8")) : {};
-    const args = ["--network", network, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", "127.0.0.1::8787"];
+    const args = ["--network", network, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", "127.0.0.1::8787", "-p", "127.0.0.1::8788"];
+    if (keysFile) args.push("-v", `${resolve(keysFile)}:/app/keys.json:ro`);
     for (const [k, v] of Object.entries(env)) args.push("-e", `${k}=${v}`);
     runtime = runContainer(names.runtime, run, [...args, "abp-runtime:poc"]);
   }
-  const s = { run, names, containers: { fixture, browserA: browsers.a, browserB: browsers.b, ...runtime ? { runtime } : {} }, ports: { control: port(fixture, 9099), novncA: port(browsers.a, 6080), novncB: port(browsers.b, 6080), ...runtime ? { runtime: port(runtime, 8787) } : {} }, harnessToken, runtimeBundle: runtimeBundle ? resolve(runtimeBundle) : void 0, runtimeEnv: envFile ? resolve(envFile) : void 0 };
+  const s = { run, names, containers: { fixture, browserA: browsers.a, browserB: browsers.b, ...runtime ? { runtime } : {} }, ports: { control: port(fixture, 9099), novncA: port(browsers.a, 6080), novncB: port(browsers.b, 6080), ...runtime ? { runtime: port(runtime, 8787), admin: port(runtime, 8788) } : {} }, harnessToken, runtimeBundle: runtimeBundle ? resolve(runtimeBundle) : void 0, runtimeEnv: envFile ? resolve(envFile) : void 0 };
   const path = statePath(run);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(s, null, 2), { mode: 384 });
@@ -97,6 +98,7 @@ function fault(run, argv) {
   else if (kind === "restart-browser-container") docker("restart", browser);
   else if (kind === "restart-runtime") docker("restart", s.containers.runtime);
   else if (kind === "kill-runtime") docker("kill", s.containers.runtime);
+  else if (kind === "start-runtime") docker("start", s.containers.runtime);
   else if (kind === "pause-runtime") docker("pause", s.containers.runtime);
   else if (kind === "unpause-runtime") docker("unpause", s.containers.runtime);
   else throw new Error(`unknown fault ${kind}`);
