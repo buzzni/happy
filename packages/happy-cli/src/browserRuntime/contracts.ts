@@ -1,0 +1,448 @@
+/**
+ * Agent Browser PoC — shared contract v1.
+ *
+ * Source of truth for the plan: Saydo `specs/agent-browser-poc/contracts.md`.
+ * Everything a module boundary exchanges lives here so the Runtime core, the
+ * CDP driver, the transport and the agent tools can be built in parallel.
+ *
+ * Nothing in this file performs I/O.
+ */
+
+export const SCHEMA_VERSION = 1 as const
+
+// ---------------------------------------------------------------------------
+// Identifiers. Branded so a tabId can never be passed where a taskId is meant.
+// ---------------------------------------------------------------------------
+
+type Brand<T, B extends string> = T & { readonly __brand: B }
+
+export type PrincipalId = Brand<string, 'PrincipalId'>
+export type WorkspaceId = Brand<string, 'WorkspaceId'>
+export type MachineId = Brand<string, 'MachineId'>
+export type AgentSessionId = Brand<string, 'AgentSessionId'>
+export type ProfileId = Brand<string, 'ProfileId'>
+export type TaskSpaceId = Brand<string, 'TaskSpaceId'>
+export type TaskId = Brand<string, 'TaskId'>
+export type BatchId = Brand<string, 'BatchId'>
+export type ActionId = Brand<string, 'ActionId'>
+export type StepId = Brand<string, 'StepId'>
+export type TabId = Brand<string, 'TabId'>
+export type RequestId = Brand<string, 'RequestId'>
+export type ApprovalId = Brand<string, 'ApprovalId'>
+export type GrantId = Brand<string, 'GrantId'>
+export type BrowserInstanceId = Brand<string, 'BrowserInstanceId'>
+export type SnapshotId = Brand<string, 'SnapshotId'>
+/** Frame-qualified element ref, e.g. `@e3` (main frame) or `@f2:e7`. Opaque to callers. */
+export type ElementRef = Brand<string, 'ElementRef'>
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export const ERROR_CODES = [
+    'UNAUTHORIZED',
+    'SCOPE_DENIED',
+    'STALE_LEASE',
+    'STALE_REF',
+    'ORIGIN_DENIED',
+    'APPROVAL_REQUIRED',
+    'APPROVAL_EXPIRED',
+    'CONFLICT',
+    'QUOTA_EXCEEDED',
+    'TARGET_GONE',
+    'RUNTIME_UNAVAILABLE',
+    'OUTCOME_UNKNOWN',
+    'UNSUPPORTED_OPERATION',
+    'JOURNAL_UNAVAILABLE',
+    // Not in the original list but needed to report malformed input without
+    // overloading CONFLICT. Kept separate so callers can tell "fix the request"
+    // from "someone else changed the task".
+    'INVALID_REQUEST',
+] as const
+export type ErrorCode = (typeof ERROR_CODES)[number]
+
+export interface RuntimeErrorBody {
+    code: ErrorCode
+    message: string
+    retryable: boolean
+    mayHaveSideEffects: boolean
+}
+
+export class BrowserRuntimeError extends Error {
+    constructor(
+        readonly code: ErrorCode,
+        message: string,
+        readonly retryable = false,
+        readonly mayHaveSideEffects = false,
+    ) {
+        super(message)
+        this.name = 'BrowserRuntimeError'
+    }
+
+    toBody(): RuntimeErrorBody {
+        return { code: this.code, message: this.message, retryable: this.retryable, mayHaveSideEffects: this.mayHaveSideEffects }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Authentication context. Produced by the transport from a verified token,
+// never from request JSON.
+// ---------------------------------------------------------------------------
+
+export type Operation =
+    | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
+    | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
+    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace'
+
+/** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
+export const AGENT_OPERATIONS: readonly Operation[] = [
+    'createSpace', 'createTask', 'openPage', 'closePage', 'observe', 'screenshot',
+    'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace',
+]
+/** Operations that require an interactive (human UI) capability. */
+export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl']
+
+export interface AgentGrant {
+    kind: 'agent-grant'
+    grantId: GrantId
+    principalId: PrincipalId
+    workspaceId: WorkspaceId
+    machineId: MachineId
+    agentSessionId: AgentSessionId
+    profileId: ProfileId
+    /** Exact origins, e.g. `http://a.poc-one.test`. No wildcards in the PoC. */
+    allowedOrigins: string[]
+    operations: Operation[]
+    /** Optional narrowing to specific task spaces; empty = any space of the profile. */
+    taskSpaceIds: TaskSpaceId[]
+    issuedAtMs: number
+    expiresAtMs: number
+}
+
+export interface InteractiveCapability {
+    kind: 'interactive'
+    capabilityId: string
+    principalId: PrincipalId
+    workspaceId: WorkspaceId
+    machineId: MachineId
+    viewerSessionId: string
+    profileId: ProfileId
+    operations: Operation[]
+    issuedAtMs: number
+    expiresAtMs: number
+}
+
+/** Client (UI) read access: getTask/subscribe for the principal's tasks. */
+export type Credential = AgentGrant | InteractiveCapability
+
+export interface AuthContext {
+    credential: Credential
+    /** Set by the transport after verifying signature, expiry and revocation. */
+    verifiedAtMs: number
+}
+
+// ---------------------------------------------------------------------------
+// Task / action state
+// ---------------------------------------------------------------------------
+
+export type TaskStatus =
+    | 'queued'
+    | 'running'
+    | 'paused'
+    | 'awaiting-user'
+    | 'recovering'
+    | 'succeeded'
+    | 'failed'
+    | 'cancelled'
+
+export const TERMINAL_STATUSES: readonly TaskStatus[] = ['succeeded', 'failed', 'cancelled']
+
+export const PAUSE_REASONS = [
+    'awaiting-agent',
+    'user-control',
+    'user-input-complete',
+    'user-wait-expired',
+    'approval-expired',
+    'grant-expired',
+    'quota',
+    'task-time-limit',
+    'outcome-unknown',
+    'browser-replaced',
+    'cancelled-with-unknown-effect',
+] as const
+export type PauseReason = (typeof PAUSE_REASONS)[number]
+
+export type WaitReason = 'approval' | 'login' | 'captcha'
+
+export type ActionState = 'planned' | 'intent-committed' | 'dispatched' | 'confirmed' | 'uncertain' | 'failed' | 'skipped'
+
+export type StepKind = 'navigate' | 'observe' | 'screenshot' | 'fill' | 'click' | 'waitFor'
+
+/** Condition predicates allowed in waitFor. No functions. */
+export type WaitPredicate =
+    | { kind: 'text'; text: string }
+    | { kind: 'ref'; ref: ElementRef }
+    | { kind: 'url'; urlPrefix: string }
+
+export interface BatchStep {
+    stepId: StepId
+    actionId: ActionId
+    tabId: TabId
+    kind: StepKind
+    timeoutMs: number
+    /** navigate */
+    url?: string
+    /** click/fill target. May be `$name.<label>` to reference a named observe result in the same batch. */
+    ref?: ElementRef | string
+    /** fill value — synthetic, non-secret in the PoC */
+    value?: string
+    /** observe: name so later steps can refer to its refs */
+    name?: string
+    /** waitFor */
+    until?: WaitPredicate
+}
+
+export type StepOutcome = 'succeeded' | 'failed' | 'awaiting-user' | 'uncertain' | 'skipped'
+
+export interface StepResult {
+    stepId: StepId
+    actionId: ActionId
+    outcome: StepOutcome
+    error?: RuntimeErrorBody
+    /** observe/screenshot payload summary; never raw secrets */
+    observation?: Observation
+    screenshot?: ScreenshotResult
+}
+
+export interface BatchResult {
+    batchId: BatchId
+    taskId: TaskId
+    outcome: 'succeeded' | 'failed' | 'awaiting-user' | 'uncertain' | 'cancelled'
+    completedSteps: StepId[]
+    failedStep?: StepId
+    mayHaveSideEffects: boolean
+    lastCheckpointSeq: number
+    steps: StepResult[]
+    /** When outcome = awaiting-user */
+    pendingApproval?: PendingApprovalSummary
+    waitReason?: WaitReason
+}
+
+export interface PendingApprovalSummary {
+    approvalId: ApprovalId
+    actionId: ActionId
+    origin: string
+    /** Human-readable, redacted description of what will be sent */
+    description: string
+    bindingHash: string
+    expiresAtMs: number
+}
+
+export interface TaskView {
+    schemaVersion: typeof SCHEMA_VERSION
+    taskId: TaskId
+    taskSpaceId: TaskSpaceId
+    profileId: ProfileId
+    agentSessionId: AgentSessionId
+    status: TaskStatus
+    pauseReason?: PauseReason
+    waitReason?: WaitReason
+    cancelRequested: boolean
+    stateVersion: number
+    highWatermarkSeq: number
+    browserInstanceId?: BrowserInstanceId
+    tabs: TabId[]
+    currentBatchId?: BatchId
+    lastBatch?: BatchResult
+    pendingApproval?: PendingApprovalSummary
+    uncertainActions: ActionId[]
+    createdAtMs: number
+    updatedAtMs: number
+}
+
+export interface TaskEvent {
+    schemaVersion: typeof SCHEMA_VERSION
+    taskId: TaskId
+    seq: number
+    type:
+        | 'task-created' | 'state-changed' | 'batch-accepted' | 'action-intent' | 'action-dispatched'
+        | 'action-confirmed' | 'action-uncertain' | 'action-failed' | 'approval-requested'
+        | 'approval-consumed' | 'approval-rejected' | 'input-owner-changed' | 'agent-attention-required'
+        | 'cancel-accepted' | 'page-opened' | 'page-closed' | 'recovered' | 'late-result'
+    atMs: number
+    stateVersion: number
+    leaseEpoch: number
+    /** Sanitized payload. Never contains cookies, passwords, tokens or raw DOM. */
+    data: Record<string, unknown>
+}
+
+// ---------------------------------------------------------------------------
+// Observation (driver output)
+// ---------------------------------------------------------------------------
+
+export interface ObservedElement {
+    ref: ElementRef
+    role: string
+    name: string
+    /** text/value summary, redacted for password fields */
+    value?: string
+    disabled?: boolean
+    visible: boolean
+    frameOrigin: string
+}
+
+export interface ObservedFrame {
+    frameKey: string
+    origin: string
+    allowed: boolean
+    /** OOPIF = separate CDP target/session */
+    outOfProcess: boolean
+    /** only when allowed */
+    text?: string
+}
+
+export interface Observation {
+    snapshotId: SnapshotId
+    tabId: TabId
+    url: string
+    title: string
+    documentGeneration: number
+    elements: ObservedElement[]
+    frames: ObservedFrame[]
+    truncated: boolean
+    /** Body text context of allowed frames, truncated */
+    text: string
+}
+
+export interface ScreenshotResult {
+    tabId: TabId
+    mimeType: 'image/png'
+    /** base64; only returned to the caller, never persisted by the Runtime */
+    data: string
+    documentGeneration: number
+    targetId: string
+    capturedAtMs: number
+}
+
+// ---------------------------------------------------------------------------
+// Driver port — implemented by drivers/cdpDriver.ts, faked in unit tests.
+// ---------------------------------------------------------------------------
+
+export interface DriverTabHandle {
+    tabId: TabId
+    /** CDP target id; opaque */
+    targetId: string
+}
+
+export interface DriverOptions {
+    signal?: AbortSignal
+    timeoutMs: number
+}
+
+export interface BrowserDriver {
+    /** Identity of the browser process this driver is connected to. */
+    browserInstanceId(): BrowserInstanceId
+    openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle>
+    closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }>
+    hasTab(tabId: TabId): boolean
+    navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }>
+    observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation>
+    screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult>
+    /** Resolve ref against the *current* document; throws STALE_REF if generation/node changed. */
+    click(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void>
+    fill(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void>
+    waitFor(tabId: TabId, predicate: WaitPredicate, allowedOrigins: string[], opts: DriverOptions): Promise<void>
+    /** Current top-level origin of the tab, for policy checks. */
+    currentOrigin(tabId: TabId): Promise<string>
+    close(): Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Operation requests (model/client DTOs). Auth is NOT part of these.
+// ---------------------------------------------------------------------------
+
+export interface CreateSpaceRequest { profileId: ProfileId; requestId: RequestId }
+export interface CreateTaskRequest { taskSpaceId: TaskSpaceId; requestId: RequestId }
+export interface OpenPageRequest { taskId: TaskId; url: string; requestId: RequestId }
+export interface ClosePageRequest { taskSpaceId: TaskSpaceId; tabId: TabId; requestId: RequestId }
+export interface ObserveRequest { taskId: TaskId; tabId: TabId; maxElements?: number; scopeRef?: ElementRef }
+export interface ScreenshotRequest { taskId: TaskId; tabId: TabId }
+export interface SubmitBatchRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId; steps: BatchStep[] }
+export interface FinishTaskRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
+export interface GetTaskRequest { taskId: TaskId }
+export interface SubscribeRequest { taskId: TaskId; afterSeq: number }
+export interface ApproveRequest { taskId: TaskId; approvalId: ApprovalId; bindingHash: string; requestId: RequestId; decision: 'approve' | 'reject' }
+export interface TakeOverRequest { taskId: TaskId; tabId: TabId; expectedEpoch: number; requestId: RequestId }
+export interface ReleaseControlRequest { taskId: TaskId; tabId: TabId; expectedEpoch: number; requestId: RequestId }
+export interface ResumeRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
+export interface CancelRequest { taskId: TaskId; requestId: RequestId }
+export interface CloseSpaceRequest { taskSpaceId: TaskSpaceId; requestId: RequestId }
+
+export type SubscribeResult =
+    | { kind: 'events'; events: TaskEvent[]; highWatermarkSeq: number }
+    | { kind: 'snapshot-required'; snapshot: TaskView; highWatermarkSeq: number }
+
+// ---------------------------------------------------------------------------
+// Runtime API — implemented by runtime.ts, served by server.ts, called by the
+// agent tools (agentTools.ts) and the client console. Every method validates
+// `auth` itself; transports only verify tokens.
+// ---------------------------------------------------------------------------
+
+export interface OpenPageResult { tabId: TabId; actionId: ActionId; url: string; task: TaskView }
+export interface CancelResult { status: 'cancel-accepted'; task: TaskView; fenceAckMs: number }
+export interface ControlResult { leaseEpoch: number; owner: InputOwner; task: TaskView }
+export interface ApproveResult { outcome: 'approved' | 'rejected'; task: TaskView; batch?: BatchResult }
+
+export type InputOwner =
+    | { kind: 'agent'; agentSessionId: AgentSessionId; taskId: TaskId; segmentId: BatchId | ActionId }
+    | { kind: 'user'; principalId: PrincipalId; viewerSessionId: string }
+    | { kind: 'none' }
+
+export interface BrowserRuntimeApi {
+    createSpace(auth: AuthContext, req: CreateSpaceRequest): Promise<{ taskSpaceId: TaskSpaceId }>
+    createTask(auth: AuthContext, req: CreateTaskRequest): Promise<TaskView>
+    openPage(auth: AuthContext, req: OpenPageRequest): Promise<OpenPageResult>
+    closePage(auth: AuthContext, req: ClosePageRequest): Promise<{ closed: boolean; handoff?: 'beforeunload' }>
+    observe(auth: AuthContext, req: ObserveRequest): Promise<Observation>
+    screenshot(auth: AuthContext, req: ScreenshotRequest): Promise<ScreenshotResult>
+    /**
+     * Returns once the batch is durably accepted AND has reached a stopping
+     * point (paused/awaiting-user/terminal) or `waitMs` elapsed, whichever is
+     * first. The batch keeps running server-side regardless of the caller.
+     */
+    submitBatch(auth: AuthContext, req: SubmitBatchRequest, opts?: { waitMs?: number }): Promise<{ batchId: BatchId; accepted: true; task: TaskView; result?: BatchResult }>
+    finishTask(auth: AuthContext, req: FinishTaskRequest): Promise<TaskView>
+    getTask(auth: AuthContext, req: GetTaskRequest): Promise<TaskView>
+    subscribe(auth: AuthContext, req: SubscribeRequest): Promise<SubscribeResult>
+    approve(auth: AuthContext, req: ApproveRequest): Promise<ApproveResult>
+    takeOver(auth: AuthContext, req: TakeOverRequest): Promise<ControlResult>
+    releaseControl(auth: AuthContext, req: ReleaseControlRequest): Promise<ControlResult>
+    resume(auth: AuthContext, req: ResumeRequest): Promise<TaskView>
+    cancel(auth: AuthContext, req: CancelRequest): Promise<CancelResult>
+    closeSpace(auth: AuthContext, req: CloseSpaceRequest): Promise<{ closedTabs: TabId[] }>
+}
+
+// ---------------------------------------------------------------------------
+// PoC defaults (contracts.md "자원·권한 기본값")
+// ---------------------------------------------------------------------------
+
+export const POC_LIMITS = {
+    maxSpacesPerProfile: 2,
+    maxActiveTabs: 6,
+    maxBatchSteps: 50,
+    maxStepTimeoutMs: 30_000,
+    maxWaitForTimeoutMs: 120_000,
+    taskTimeLimitMs: 60 * 60_000,
+    maxGrantLifetimeMs: 60 * 60_000,
+    workerHeartbeatMs: 10_000,
+    workerStaleMs: 60_000,
+    userWaitMs: 10 * 60_000,
+    pausedBrowserRetentionMs: 10 * 60_000,
+    fenceAckTargetMs: 2_000,
+    journalMaxBytesPerTask: 10 * 1024 * 1024,
+    journalMaxEventsPerTask: 10_000,
+    /** Records reserved for pause/cancel/audit after the business cap is hit. */
+    journalControlReserveEvents: 100,
+    terminalBrowserIdleMs: 5 * 60_000,
+    eventRetentionMs: 7 * 24 * 60 * 60_000,
+} as const
