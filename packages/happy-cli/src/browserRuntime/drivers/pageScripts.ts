@@ -217,19 +217,23 @@ export const HIT_TEST = String.raw`function hitTest() {
 }`
 
 /** `this` = the target element; selects its current content so insertText replaces it. */
+/** Focuses and selects the element; returns whether it (still) holds focus, so text never goes elsewhere. */
 export const SELECT_CONTENT = String.raw`function selectContent() {
     const element = this
     element.focus()
+    const root = element.getRootNode()
+    const focused = () => (root.activeElement ?? element.ownerDocument.activeElement) === element
     if (typeof element.select === 'function') {
         element.select()
-        return
+        return focused()
     }
     const selection = element.ownerDocument.getSelection()
-    if (!selection) return
+    if (!selection) return focused()
     const range = element.ownerDocument.createRange()
     range.selectNodeContents(element)
     selection.removeAllRanges()
     selection.addRange(range)
+    return focused()
 }`
 
 export const FRAME_HAS_TEXT = String.raw`function frameHasText(needle) {

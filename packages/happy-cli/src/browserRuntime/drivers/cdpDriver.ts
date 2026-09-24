@@ -65,6 +65,21 @@ const WAIT_POLL_MS = 100
 const MAX_POPUP_REPORTS = 100
 const MAX_CLOSED_TABS = 1_000
 const CLOSE_CONFIRM_MS = 2_000
+const CONNECT_TIMEOUT_MS = 10_000
+
+async function withDeadline<T>(ms: number, message: string, body: () => Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+        return await Promise.race([
+            body(),
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => reject(new BrowserRuntimeError('RUNTIME_UNAVAILABLE', message, true, false)), ms)
+            }),
+        ])
+    } finally {
+        clearTimeout(timer)
+    }
+}
 
 interface RefBinding {
     frameId: string
@@ -115,6 +130,18 @@ interface LiveFrame {
 class OpContext {
     dispatched = false
     aborted = false
+    private rejectAborted!: (error: Error) => void
+    /** Rejects once the operation was abandoned (timeout/abort/connection loss), so waits inside the body stop too. */
+    readonly whenAborted: Promise<never> = new Promise<never>((_resolve, reject) => { this.rejectAborted = reject })
+
+    constructor() {
+        this.whenAborted.catch(() => undefined)
+    }
+
+    abort(error: Error): void {
+        this.aborted = true
+        this.rejectAborted(error)
+    }
 
     /** Call immediately before sending anything with a page-visible effect. */
     markDispatch(): void {
@@ -184,9 +211,18 @@ export class CdpDriver implements BrowserDriver {
             this.instanceId = undefined
             for (const listener of [...this.disconnectListeners]) listener()
         })
-        await conn.send('Target.setDiscoverTargets', { discover: true })
-        this.instanceId = await this.options.browserInstanceIdProvider()
-        return this.instanceId
+        const instanceId = await withDeadline(CONNECT_TIMEOUT_MS, 'browser did not answer during connect', async () => {
+            await conn.send('Target.setDiscoverTargets', { discover: true })
+            return this.options.browserInstanceIdProvider()
+        }).catch((error) => {
+            conn.close()
+            throw error
+        })
+        // The identity only belongs to this connection if it is still the live one:
+        // a close while the provider was answering means it may describe the old browser.
+        if (this.conn !== conn || conn.closed) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'browser connection closed during connect', true, false)
+        this.instanceId = instanceId
+        return instanceId
     }
 
     /**
@@ -210,7 +246,7 @@ export class CdpDriver implements BrowserDriver {
     }
 
     isConnected(): boolean {
-        return this.conn !== undefined && this.instanceId !== undefined
+        return this.conn !== undefined && !this.conn.closed && this.instanceId !== undefined
     }
 
     browserInstanceId(): BrowserInstanceId {
@@ -537,9 +573,13 @@ export class CdpDriver implements BrowserDriver {
             const { binding, objectId } = await this.resolveRef(conn, tab, ref, snapshotId, true)
             await this.prepareInput(conn, tab, binding, objectId, true)
             this.assertFresh(tab, binding, snapshotId)
-            op.markDispatch()
+            // Focus/select are not writes; verify the target really holds focus (a page may
+            // move it on focus) before any text is typed.
             await conn.send('DOM.focus', { backendNodeId: binding.backendNodeId }, binding.sessionId)
-            await conn.send('Runtime.callFunctionOn', { functionDeclaration: SELECT_CONTENT, objectId }, binding.sessionId)
+            const { result: focus } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: SELECT_CONTENT, objectId, returnByValue: true }, binding.sessionId)
+            if (focus.value !== true) throw new BrowserRuntimeError('INVALID_REQUEST', 'focus moved away from the element; not typing', true, false)
+            this.assertFresh(tab, binding, snapshotId)
+            op.markDispatch()
             if (value) {
                 await conn.send('Input.insertText', { text: value }, binding.sessionId)
             } else {
@@ -621,7 +661,7 @@ export class CdpDriver implements BrowserDriver {
                 fn()
             }
             const fail = (error: BrowserRuntimeError) => {
-                op.aborted = true
+                op.abort(error)
                 settle(() => reject(error))
             }
             if (opts.signal?.aborted) {
@@ -893,7 +933,9 @@ export class CdpDriver implements BrowserDriver {
             if (result.errorText) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', `navigation failed: ${result.errorText}`, true, true)
             }
-            if (result.loaderId) await loaded
+            // A slow page must not keep the body alive after the caller gave up:
+            // openTab then discards the half-opened target instead of leaking it.
+            if (result.loaderId) await Promise.race([loaded, op.whenAborted])
         } finally {
             for (const off of offs) off()
         }

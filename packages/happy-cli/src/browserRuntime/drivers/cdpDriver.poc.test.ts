@@ -80,6 +80,8 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             }, { once: true })</script></body>`)
         a.route('/pay-form', `${HIT_SCRIPT}<body><form action="/submit-order" onsubmit="event.preventDefault(); hit('submit')"><label>Amount <input name="amount" value="10"></label><label>Secret <input type="password" name="pw" value="synthetic-pw"></label><button id="go">Confirm payment</button></form></body>`)
         a.route('/dialogs', `${HIT_SCRIPT}<body><button onclick="alert('hello'); hit('after-alert')">Alert</button><button onclick="hit(confirm('sure?') ? 'confirmed' : 'declined')">Confirm</button></body>`)
+        a.route('/focus-thief', `<body><label>Code <input id="code" onfocus="document.getElementById('other').focus()"></label><label>Other <input id="other"></label></body>`)
+        a.route('/slow-load', `<body>slow<script>const until = Date.now() + 4000; while (Date.now() < until) {}</script></body>`)
         for (const [name, color] of [['red', '#ff0000'], ['green', '#00ff00'], ['blue', '#0000ff']]) {
             a.route(`/color/${name}`, `<body style="margin:0;background:${color};height:100vh"></body>`)
         }
@@ -227,6 +229,26 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await driver.click(tab.tabId, refOf(obs, 'Send'), obs.snapshotId, OPTS)
             expect(await eventually(() => a.hits('v-Neo'), (n) => n === 1)).toBe(1)
             expect(a.hits('v-old')).toBe(0)
+        })
+    })
+
+    describe('openTab timeout', () => {
+        it('discards the half-opened target when the caller already gave up (no leaked owned tab)', async () => {
+            const before = driver.debugCounts()
+            await expectCode(driver.openTab(a.url('/slow-load'), [a.origin], { timeoutMs: 1_000 }), 'OUTCOME_UNKNOWN')
+            // Even after the page finally loads, nothing is left registered.
+            await delay(5_000)
+            expect(driver.debugCounts()).toEqual(before)
+        })
+    })
+
+    describe('fill focus', () => {
+        it('refuses to type when the page moves focus away from the target', async () => {
+            const tab = await open('/focus-thief', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const error = await expectCode(driver.fill(tab.tabId, refOf(obs, 'Code'), obs.snapshotId, 'secret-otp', OPTS), 'INVALID_REQUEST')
+            expect(error.mayHaveSideEffects).toBe(false)
+            expect(await harness.evaluate(tab.targetId, "document.getElementById('other').value")).toBe('')
         })
     })
 
