@@ -251,6 +251,21 @@ export class CdpDriver implements BrowserDriver {
         })
     }
 
+    adoptTab(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean> {
+        return this.run(opts, async (_op, conn) => {
+            const existing = this.tabs.get(tabId)
+            if (existing) return existing.targetId === targetId
+            const { targetInfos } = await conn.send('Target.getTargets', {}) as { targetInfos: Array<{ targetId: string; type: string; url: string }> }
+            const target = targetInfos.find((info) => info.targetId === targetId && info.type === 'page')
+            if (!target) return false
+            const { sessionId } = await conn.send('Target.attachToTarget', { targetId, flatten: true })
+            const tab = this.registerTab(targetId, sessionId, allowedOrigins, tabId)
+            tab.mainUrl = target.url
+            await this.setupSession(conn, sessionId, true)
+            return true
+        })
+    }
+
     /** Closes a target we created but will not hand out, and waits for it to be gone. */
     private async discardTarget(conn: CdpConnection, targetId: string, tab: TabState | undefined): Promise<void> {
         const gone = tab
@@ -616,9 +631,9 @@ export class CdpDriver implements BrowserDriver {
     // Internals: registry and events
     // -----------------------------------------------------------------------
 
-    private registerTab(targetId: string, sessionId: string, allowedOrigins: string[]): TabState {
+    private registerTab(targetId: string, sessionId: string, allowedOrigins: string[], tabId = newId('tab') as TabId): TabState {
         const tab: TabState = {
-            tabId: newId('tab') as TabId,
+            tabId,
             targetId,
             sessionId,
             sessions: new Set([sessionId]),

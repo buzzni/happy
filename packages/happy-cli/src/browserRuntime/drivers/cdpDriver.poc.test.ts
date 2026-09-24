@@ -425,6 +425,27 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         })
     })
 
+    describe('runtime restart', () => {
+        it('lets a new driver re-take an owned tab by targetId and never adopts unknown targets', async () => {
+            const tab = await driver.openTab(a.url('/plain'), [a.origin], OPTS)
+            // A second driver on the same browser plays the restarted Runtime.
+            const restarted = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId })
+            try {
+                await restarted.connect()
+                expect(restarted.hasTab(tab.tabId)).toBe(false)
+                expect(await restarted.adoptTab(tab.tabId, tab.targetId, [a.origin], OPTS)).toBe(true)
+                expect(restarted.hasTab(tab.tabId)).toBe(true)
+                const observation = await restarted.observe(tab.tabId, [a.origin], OPTS)
+                expect(observation.text).toContain('Alpha plain page')
+                expect(await restarted.adoptTab('tab-other' as TabId, 'no-such-target', [a.origin], OPTS)).toBe(false)
+                expect(restarted.hasTab('tab-other' as TabId)).toBe(false)
+            } finally {
+                await restarted.close()
+                await driver.closeTab(tab.tabId, OPTS)
+            }
+        })
+    })
+
     describe('connection loss', () => {
         it('rejects pending calls with RUNTIME_UNAVAILABLE, drops tabs, and reconnects only explicitly', async () => {
             const first = await launchChrome()

@@ -348,6 +348,13 @@ export interface BrowserDriver {
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle>
     closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }>
     hasTab(tabId: TabId): boolean
+    /**
+     * Re-take ownership of a tab this Runtime created before it restarted, by the
+     * targetId it persisted. Only valid while the browser instance is unchanged
+     * (the caller checks browserInstanceId first). Returns false when the target
+     * no longer exists. Refs from before the restart stay invalid.
+     */
+    adoptTab?(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean>
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }>
     observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation>
     screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult>
