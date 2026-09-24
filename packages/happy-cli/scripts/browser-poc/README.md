@@ -29,3 +29,4 @@ docker exec abp-smoke-1-browser-a curl -fsS http://a.poc-one.test:8080/marker?la
 docker run --rm --network abp-smoke-1 curlimages/curl:latest curl -fsS http://browser-a:9223/json/version
 docker run --rm --network abp-smoke-1 curlimages/curl:latest curl -fsS http://browser-a:9224/instance
 ```
+- `a02a04` suites (A02/A04 E2E) add per-tag routes under `/login-strict|protected-strict|challenge-strict|captcha-protected|a02a04-after|a02a04-tick/<tag>` (strict password `correct-horse`, ledger kinds `a02a04-*`).
