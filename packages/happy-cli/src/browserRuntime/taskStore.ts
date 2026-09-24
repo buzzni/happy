@@ -70,7 +70,7 @@ export interface StoreEventInput extends Omit<TaskEvent, 'seq' | 'schemaVersion'
     stateVersion?: number
 }
 export type FaultInjector = (operation: 'lock' | 'event-append' | 'task-replace' | 'metadata') => void | Promise<void>
-interface SpaceRecord {
+export interface SpaceRecord {
     taskSpaceId: TaskSpaceId
     profileId: ProfileId
     createdAtMs: number
@@ -105,6 +105,7 @@ export class TaskStore {
     private readonly spaces = new Map<TaskSpaceId, SpaceRecord>()
     private readonly revocations = new Set<string>()
     private readonly taskTails = new Map<TaskId, Promise<void>>()
+    private metadataTail: Promise<void> = Promise.resolve()
     private readonly unreadableTasks = new Set<TaskId>()
     private closed = false
     private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector) { }
@@ -137,18 +138,19 @@ export class TaskStore {
         catch { /* already removed */ }
     }
     async createSpace(record: SpaceRecord): Promise<void> {
-        await this.assertWriter()
-        const perProfile = [...this.spaces.values()].filter((s) => s.profileId === record.profileId && !s.closed)
-        if (perProfile.length >= POC_LIMITS.maxSpacesPerProfile)
-            throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
-        this.spaces.set(record.taskSpaceId, structuredClone(record))
-        try {
-            await this.writeMetadata()
-        }
-        catch (error) {
-            this.spaces.delete(record.taskSpaceId)
-            throw error
-        }
+        await this.withMetadataQueue(async () => {
+            await this.assertWriter()
+            const perProfile = [...this.spaces.values()].filter((space) => space.profileId === record.profileId && !space.closed)
+            if (perProfile.length >= POC_LIMITS.maxSpacesPerProfile)
+                throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
+            this.spaces.set(record.taskSpaceId, structuredClone(record))
+            try {
+                await this.writeMetadata()
+            } catch (error) {
+                this.spaces.delete(record.taskSpaceId)
+                throw error
+            }
+        })
     }
     getSpace(id: TaskSpaceId): SpaceRecord | undefined { const value = this.spaces.get(id); return value && structuredClone(value); }
     listSpaces(profileId?: ProfileId): SpaceRecord[] {
@@ -157,19 +159,41 @@ export class TaskStore {
             .map((space) => structuredClone(space))
     }
     async updateSpace(id: TaskSpaceId, patch: Partial<SpaceRecord>): Promise<SpaceRecord> {
-        const space = this.spaces.get(id)
-        if (!space)
-            throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist')
-        const previous = structuredClone(space)
-        Object.assign(space, structuredClone(patch))
+        const updated = await this.mutateSpace(id, () => patch)
+        if (!updated) throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist')
+        return updated
+    }
+    async mutateSpace(id: TaskSpaceId, callback: (current: SpaceRecord) => Partial<SpaceRecord> | null): Promise<SpaceRecord | null> {
+        return this.withMetadataQueue(async () => {
+            await this.assertWriter()
+            const space = this.spaces.get(id)
+            if (!space) throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist')
+            const patch = callback(structuredClone(space))
+            if (!patch) return null
+            const previous = structuredClone(space)
+            const nextPatch = structuredClone(patch)
+            if (nextPatch.dedupe)
+                nextPatch.dedupe = { ...space.dedupe, ...nextPatch.dedupe }
+            Object.assign(space, nextPatch)
+            try {
+                await this.writeMetadata()
+                return structuredClone(space)
+            } catch (error) {
+                this.spaces.set(id, previous)
+                throw error
+            }
+        })
+    }
+    private async withMetadataQueue<T>(operation: () => Promise<T>): Promise<T> {
+        const previous = this.metadataTail
+        let release!: () => void
+        this.metadataTail = new Promise<void>((resolve) => { release = resolve })
+        await previous
         try {
-            await this.writeMetadata()
+            return await operation()
+        } finally {
+            release()
         }
-        catch (error) {
-            this.spaces.set(id, previous)
-            throw error
-        }
-        return structuredClone(space)
     }
     isRevoked(id: string): boolean { return this.revocations.has(id); }
     async revoke(id: string): Promise<void> { this.revocations.add(id); try {

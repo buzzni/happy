@@ -11,6 +11,7 @@ export class FakeBrowserDriver implements BrowserDriver {
     readonly dispatchCounts = new Map<string, number>()
     readonly targetLedger: Array<{ targetId: string; tabId: TabId; operation: Operation; actionId?: string }> = []
     delays = new Map<Operation, number>()
+    private readonly failures = new Map<Operation, Error[]>()
     private waitRelease?: () => void
     private notifyWaitEntered!: () => void
     readonly waitForEntered = new Promise<void>((resolve) => { this.notifyWaitEntered = resolve })
@@ -19,6 +20,9 @@ export class FakeBrowserDriver implements BrowserDriver {
     swapInstance(): BrowserInstanceId { return this.instance = `browser-${randomUUID()}` as BrowserInstanceId }
     armAction(actionId: string): void { this.currentActionId = actionId }
     setDelay(operation: Operation, ms: number): void { this.delays.set(operation, ms) }
+    failNext(operation: Operation, error: Error): void {
+        this.failures.set(operation, [...(this.failures.get(operation) ?? []), error])
+    }
     releaseWait(): void { this.waitRelease?.(); this.waitRelease = undefined }
     waitUntilReleased(): Promise<void> { return new Promise((resolve) => { this.waitRelease = resolve }) }
 
@@ -54,6 +58,8 @@ export class FakeBrowserDriver implements BrowserDriver {
         if (!this.pages.has(tabId)) throw new BrowserRuntimeError('TARGET_GONE', 'Tab does not exist')
         this.notifyWaitEntered()
         this.record(tabId, `target-${tabId}`, 'waitFor')
+        const failure = this.failures.get('waitFor')?.shift()
+        if (failure) throw failure
         await new Promise<void>((resolve, reject) => {
             const release = () => { opts.signal?.removeEventListener('abort', abort); resolve() }
             const abort = () => { opts.signal?.removeEventListener('abort', abort); reject(opts.signal?.reason ?? new Error('aborted')) }
