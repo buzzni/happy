@@ -297,6 +297,20 @@ export interface ObservedElement {
     formAction?: string
 }
 
+export interface ElementDescription {
+    ref: ElementRef
+    role: string
+    name: string
+    frameOrigin: string
+    /** URL of the element's frame document */
+    pageUrl: string
+    /** Absolute action URL of the enclosing form, if any */
+    formAction?: string
+    /** Current values of the enclosing form's fields; password fields are omitted */
+    formValues: Record<string, string>
+    documentGeneration: number
+}
+
 export interface ObservedFrame {
     frameKey: string
     origin: string
@@ -358,6 +372,13 @@ export interface BrowserDriver {
      * no longer exists. Refs from before the restart stay invalid.
      */
     adoptTab?(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean>
+    /**
+     * Describe the element a ref of `snapshotId` points to in the CURRENT document,
+     * without taking a new snapshot (so the agent's refs stay valid). Throws
+     * STALE_REF exactly like click/fill would. Used for policy classification and
+     * approval binding right before dispatch.
+     */
+    describeRef?(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription>
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }>
     observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation>
     screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult>

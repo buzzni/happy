@@ -69,7 +69,8 @@ const stepSchema = z.object({
     actionId: z.string().min(1).optional().describe('Stable id for this action; reuse when resubmitting the same action.'),
     timeoutMs: z.number().int().positive().optional().describe(`Default ${DEFAULT_STEP_TIMEOUT_MS}`),
     url: z.string().optional(),
-    ref: z.string().optional().describe('Element ref from observe (e.g. "@e3") or "$name.<label>" from a named observe step'),
+    ref: z.string().optional().describe('Element ref from observe (e.g. "@e3")'),
+    snapshotId: z.string().optional().describe('snapshotId of the observe result the ref came from (defaults to the latest observe of that tab)'),
     value: z.string().optional(),
     name: z.string().optional(),
     until: z.union([

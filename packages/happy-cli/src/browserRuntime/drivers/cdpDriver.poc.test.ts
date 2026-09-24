@@ -78,6 +78,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 d.onclick = () => hit('decoy')
                 document.getElementById('slot').appendChild(d)
             }, { once: true })</script></body>`)
+        a.route('/pay-form', `${HIT_SCRIPT}<body><form action="/submit-order" onsubmit="event.preventDefault(); hit('submit')"><label>Amount <input name="amount" value="10"></label><label>Secret <input type="password" name="pw" value="synthetic-pw"></label><button id="go">Confirm payment</button></form></body>`)
         for (const [name, color] of [['red', '#ff0000'], ['green', '#00ff00'], ['blue', '#0000ff']]) {
             a.route(`/color/${name}`, `<body style="margin:0;background:${color};height:100vh"></body>`)
         }
@@ -225,6 +226,29 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await driver.click(tab.tabId, refOf(obs, 'Send'), obs.snapshotId, OPTS)
             expect(await eventually(() => a.hits('v-Neo'), (n) => n === 1)).toBe(1)
             expect(a.hits('v-old')).toBe(0)
+        })
+    })
+
+    describe('describeRef', () => {
+        it('describes the element of the agent snapshot with live form values, without superseding that snapshot', async () => {
+            const tab = await open('/pay-form', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const confirm = refOf(obs, 'Confirm payment')
+            await harness.evaluate(tab.targetId, "document.querySelector('[name=amount]').value = '999'")
+            const described = await driver.describeRef(tab.tabId, confirm, obs.snapshotId, OPTS)
+            expect(described).toMatchObject({ name: 'Confirm payment', frameOrigin: a.origin, formValues: { amount: '999' } })
+            expect(described.formAction).toBe(a.url('/submit-order'))
+            expect(described.formValues).not.toHaveProperty('pw')
+            // The agent's snapshot is still the current one: its ref can be clicked.
+            await driver.click(tab.tabId, confirm, obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('submit'), (n) => n === 1)).toBe(1)
+        })
+
+        it('fails with STALE_REF when the node behind the ref was replaced', async () => {
+            const tab = await open('/spa', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await harness.evaluate(tab.targetId, 'swap()')
+            await expectCode(driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS), 'STALE_REF')
         })
     })
 

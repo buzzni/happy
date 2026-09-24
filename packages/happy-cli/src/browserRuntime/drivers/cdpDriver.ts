@@ -21,6 +21,7 @@ import {
     type BrowserInstanceId,
     type DriverOptions,
     type DriverTabHandle,
+    type ElementDescription,
     type ElementRef,
     type Observation,
     type ObservedElement,
@@ -31,7 +32,7 @@ import {
     type WaitPredicate,
 } from '../contracts'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
-import { CHECK_ELEMENT, COLLECT_FRAME, FRAME_HAS_TEXT, HIT_TEST, SELECT_CONTENT, type CollectedFrame, type ElementState } from './pageScripts'
+import { CHECK_ELEMENT, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, SELECT_CONTENT, type CollectedFrame, type ElementState } from './pageScripts'
 
 export interface CdpDriverOptions {
     /** Browser-level endpoint from `/json/version` (webSocketDebuggerUrl). */
@@ -65,6 +66,9 @@ interface RefBinding {
     stamp: number
     loaderId: string
     backendNodeId: number
+    role: string
+    name: string
+    frameOrigin: string
 }
 
 interface TabState {
@@ -401,6 +405,9 @@ export class CdpDriver implements BrowserDriver {
                         stamp,
                         loaderId: frame.loaderId,
                         backendNodeId: backendNodeIds[index],
+                        role: element.role,
+                        name: element.name,
+                        frameOrigin: frame.origin,
                     })
                     const observedElement: ObservedElement = {
                         ref: ref as ElementRef,
@@ -490,6 +497,26 @@ export class CdpDriver implements BrowserDriver {
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
         }, true)
+    }
+
+    describeRef(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription> {
+        return this.run(opts, async (_op, conn) => {
+            const tab = this.requireTab(tabId)
+            const { binding, objectId } = await this.resolveRef(conn, tab, ref, snapshotId)
+            const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: DESCRIBE_ELEMENT, objectId, returnByValue: true }, binding.sessionId)
+            this.assertFresh(tab, binding, snapshotId)
+            const context = result.value as { pageUrl: string; formAction?: string; formValues: Record<string, string> }
+            return {
+                ref,
+                role: binding.role,
+                name: binding.name,
+                frameOrigin: binding.frameOrigin,
+                pageUrl: context.pageUrl,
+                ...(context.formAction ? { formAction: context.formAction } : {}),
+                formValues: context.formValues,
+                documentGeneration: tab.generation,
+            }
+        })
     }
 
     fill(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {

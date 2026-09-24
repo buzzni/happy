@@ -117,6 +117,14 @@ describe('runtime HTTP server', () => {
         expect(calls[0].opts).toEqual({ waitMs: 5000 })
     })
 
+    it('passes a click step\'s snapshotId through so the Runtime can check the ref against the snapshot it came from', async () => {
+        const { base, calls } = await start()
+        const steps = [{ stepId: 's', actionId: 'a', tabId: 'tb', kind: 'click', timeoutMs: 1000, ref: '@e2', snapshotId: 'snap-1' }]
+        const res = await post(base, 'submitBatch', { taskId: 't', expectedVersion: 1, requestId: 'r', steps })
+        expect(res.status).toBe(200)
+        expect((calls[0].req as { steps: unknown[] }).steps).toEqual(steps)
+    })
+
     it('maps runtime errors to HTTP statuses and never echoes the token', async () => {
         const { base } = await start()
         const stale = await post(base, 'getTask', { taskId: 'conflict' })

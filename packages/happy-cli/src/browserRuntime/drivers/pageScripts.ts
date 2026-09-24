@@ -236,3 +236,18 @@ export const FRAME_HAS_TEXT = String.raw`function frameHasText(needle) {
     const body = document.body ?? document.documentElement
     return !!body && ((body).innerText || '').includes(needle)
 }`
+
+/** Runs on a resolved element; reads its form context without touching page state. */
+export const DESCRIBE_ELEMENT = String.raw`function describeElement() {
+    const element = this
+    const form = element.form || (element.closest && element.closest('form'))
+    const formValues = {}
+    if (form) {
+        for (const field of Array.from(form.elements)) {
+            if (!field.name || field.type === 'password' || field.type === 'file') continue
+            if ((field.type === 'checkbox' || field.type === 'radio') && !field.checked) continue
+            formValues[field.name] = String(field.value ?? '').slice(0, 200)
+        }
+    }
+    return { pageUrl: String(location.href), formAction: form ? String(form.action || location.href) : undefined, formValues }
+}`

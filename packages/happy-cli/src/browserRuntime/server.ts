@@ -22,7 +22,7 @@ const batchStep = z.object({
     stepId: id, actionId: id, tabId: id,
     kind: z.enum(['navigate', 'observe', 'screenshot', 'fill', 'click', 'waitFor']),
     timeoutMs: z.number().int().positive(),
-    url: z.string().optional(), ref: z.string().optional(), value: z.string().optional(),
+    url: z.string().optional(), ref: z.string().optional(), snapshotId: id.optional(), value: z.string().optional(),
     name: z.string().optional(), until: waitPredicate.optional(),
 }).strict()
 const version = z.number().int().nonnegative()
