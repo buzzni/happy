@@ -21,15 +21,15 @@ import { runBashStream } from "./bashStream";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
+import { readFile } from 'node:fs/promises';
+import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
+import { RuntimeClient } from '@/browserRuntime/runtimeClient';
+import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 
 // chat-tool-output-streaming Phase 3 — bash_stream emits its agent-side
 // tool name via this constant so per-runner mappers (sessionProtocolMapper
 // for Claude, AcpSessionManager for ACP, …) consistently key the call
 // registry against the same name.
-import { readFile } from 'node:fs/promises';
-import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
-import { RuntimeClient } from '@/browserRuntime/runtimeClient';
-import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
