@@ -3,9 +3,9 @@
  *
  * Human input in the viewer is simulated through the X display of the browser
  * container with xdotool — the same path noVNC input takes — never CDP.
- * There is no window manager in the container, so the Chromium window gets
- * X input focus via `windowfocus` and the task tab is brought to the front
- * with Ctrl+Tab until the window title (= page <title>) matches.
+ * There is no window manager in the container and every agent tab is its own
+ * background window, so the human's target is found by window title (= page
+ * <title>) and given X input focus with windowraise + windowfocus.
  */
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -65,28 +65,34 @@ export class Viewer {
     xdo(args: string): string {
         return execFileSync('docker', ['exec', this.container, 'sh', '-c', `DISPLAY=:99 xdotool ${args}`], { encoding: 'utf8' }).trim()
     }
-    window(): string {
-        const ids = this.xdo('search --onlyvisible --class chromium').split('\n').filter(Boolean)
-        if (!ids.length) throw new Error('no visible Chromium window on the viewer display')
-        return ids[ids.length - 1]
+    /** Every agent tab is its own top-level window (per-tab background windows); find it by page <title>. */
+    windowsNamed(needle: string): string[] {
+        try {
+            return this.xdo(`search --name ${JSON.stringify(needle).replaceAll('$', '')}`).split('\n').filter(Boolean)
+        } catch {
+            return [] // xdotool exits 1 when nothing matches
+        }
     }
     title(): string {
-        return this.xdo(`getwindowname ${this.window()}`)
+        try {
+            return this.xdo('getwindowfocus getwindowname')
+        } catch {
+            return ''
+        }
     }
-    /** Focus the Chromium window and cycle tabs until the page <title> contains `needle`. */
+    /** Raise and focus the window whose title contains `needle` (no WM in the container: windowraise + windowfocus). */
     async bringToFront(needle: string, timeoutMs = 20_000): Promise<void> {
         const deadline = Date.now() + timeoutMs
         while (Date.now() < deadline) {
-            const window = this.window()
-            this.xdo(`windowfocus --sync ${window}`)
-            for (let i = 0; i < 12; i++) {
-                if (this.xdo(`getwindowname ${window}`).includes(needle)) return
-                this.xdo('key ctrl+Tab')
-                await sleep(250)
+            for (const id of this.windowsNamed(needle)) {
+                try {
+                    this.xdo(`windowraise ${id} windowfocus --sync ${id}`)
+                } catch { /* window went away */ }
+                if (this.title().includes(needle)) return
             }
-            await sleep(500)
+            await sleep(300)
         }
-        throw new Error(`viewer: no tab titled "${needle}" (current "${this.title()}")`)
+        throw new Error(`viewer: no window titled "${needle}" (focused "${this.title()}")`)
     }
     async waitForTitle(needle: string, timeoutMs = 10_000): Promise<boolean> {
         const deadline = Date.now() + timeoutMs
