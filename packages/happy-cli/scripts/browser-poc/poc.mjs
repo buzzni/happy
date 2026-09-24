@@ -40,6 +40,10 @@ function port(id, internal) {
   if (!match) throw new Error(`missing localhost port for ${id}:${internal}`);
   return Number(match[1]);
 }
+// Parallel harness sessions may build their own images (ABP_IMAGE_TAG=<suffix>)
+// so a rebuild in one session never swaps the image under another session's run.
+const IMAGE_TAG = process.env.ABP_IMAGE_TAG || "poc";
+const IMAGES = { fixture: `abp-fixture:${IMAGE_TAG}`, browser: `abp-browser:${IMAGE_TAG}`, runtime: `abp-runtime:${IMAGE_TAG}` };
 function image(tag, file, rebuild) {
   if (rebuild || !docker("image", "ls", "-q", tag)) docker("build", "-f", join(root, "images", file), "-t", tag, buildContext);
 }
@@ -59,22 +63,22 @@ function up(run, argv) {
   const labels = dockerLabels(run), network = names.network;
   docker("network", "create", ...labels, network);
   for (const volume of [names.profileA, names.profileB, names.state, names.fixtureData]) docker("volume", "create", ...labels, volume);
-  image("abp-fixture:poc", "fixture.Dockerfile", rebuild);
-  image("abp-browser:poc", "browser.Dockerfile", rebuild);
-  image("abp-runtime:poc", "runtime.Dockerfile", rebuild);
+  image(IMAGES.fixture, "fixture.Dockerfile", rebuild);
+  image(IMAGES.browser, "browser.Dockerfile", rebuild);
+  image(IMAGES.runtime, "runtime.Dockerfile", rebuild);
   const harnessToken = randomBytes(32).toString("hex");
-  const fixture = runContainer(names.fixture, run, ["--network", network, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", "127.0.0.1::9099", "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, "abp-fixture:poc"]);
+  const fixture = runContainer(names.fixture, run, ["--network", network, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", "127.0.0.1::9099", "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, IMAGES.fixture]);
   const fixtureIp = docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`, fixture);
   const hostRules = `MAP a.poc-one.test ${fixtureIp},MAP b.poc-two.test ${fixtureIp},MAP c.poc-three.test ${fixtureIp}`;
   const browsers = {};
-  for (const profile of ["a", "b"]) browsers[profile] = runContainer(names[profile === "a" ? "browserA" : "browserB"], run, ["--network", network, "--network-alias", `browser-${profile}`, "--read-only", "--tmpfs", "/tmp:rw,size=128m", "--tmpfs", "/run/abp:rw,uid=1000,gid=1000,size=1m", "--tmpfs", "/home/browser/.cache:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.config:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.local:rw,uid=1000,gid=1000,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2", "--shm-size", "256m", "-v", `${profile === "a" ? names.profileA : names.profileB}:/home/browser/profile`, "-e", `ABP_HOST_RULES=${hostRules}`, "-p", "127.0.0.1::6080", "abp-browser:poc"]);
+  for (const profile of ["a", "b"]) browsers[profile] = runContainer(names[profile === "a" ? "browserA" : "browserB"], run, ["--network", network, "--network-alias", `browser-${profile}`, "--read-only", "--tmpfs", "/tmp:rw,size=128m", "--tmpfs", "/run/abp:rw,uid=1000,gid=1000,size=1m", "--tmpfs", "/home/browser/.cache:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.config:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.local:rw,uid=1000,gid=1000,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2", "--shm-size", "256m", "-v", `${profile === "a" ? names.profileA : names.profileB}:/home/browser/profile`, "-e", `ABP_HOST_RULES=${hostRules}`, "-p", "127.0.0.1::6080", IMAGES.browser]);
   let runtime;
   if (runtimeBundle) {
     const env = envFile ? JSON.parse(readFileSync(resolve(envFile), "utf8")) : {};
     const args = ["--network", network, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", "127.0.0.1::8787", "-p", "127.0.0.1::8788"];
     if (keysFile) args.push("-v", `${resolve(keysFile)}:/app/keys.json:ro`);
     for (const [k, v] of Object.entries(env)) args.push("-e", `${k}=${v}`);
-    runtime = runContainer(names.runtime, run, [...args, "abp-runtime:poc"]);
+    runtime = runContainer(names.runtime, run, [...args, IMAGES.runtime]);
   }
   const s = { run, names, containers: { fixture, browserA: browsers.a, browserB: browsers.b, ...runtime ? { runtime } : {} }, ports: { control: port(fixture, 9099), novncA: port(browsers.a, 6080), novncB: port(browsers.b, 6080), ...runtime ? { runtime: port(runtime, 8787), admin: port(runtime, 8788) } : {} }, harnessToken, runtimeBundle: runtimeBundle ? resolve(runtimeBundle) : void 0, runtimeEnv: envFile ? resolve(envFile) : void 0 };
   const path = statePath(run);
