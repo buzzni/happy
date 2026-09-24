@@ -19,6 +19,8 @@ export interface ClaudeLessonReviewLifecycle {
 }
 
 export class Session {
+    prepareChannelExecution?: (requestId: string) => Promise<boolean>;
+    beginChannelExecution?: (requestId: string) => boolean;
     readonly path: string;
     readonly logPath: string;
     readonly api: ApiClient;

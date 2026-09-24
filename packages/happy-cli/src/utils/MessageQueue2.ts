@@ -16,6 +16,14 @@ interface QueueItem<T> {
      * message a unique hash and destroy the batching itself.
      */
     requestIds?: string[];
+    /**
+     * Core-minted handle for a turn that answers an external messenger request
+     * (Saycode specs/desktop-messenger-channels). Kept apart from `requestIds`: those are
+     * auto-routing ids that ordinary Desktop input carries too, and anything that reads "has an
+     * id" as "came from a channel" would then put every routed Desktop message behind channel
+     * execution approval and switch off its slash commands.
+     */
+    channelRequestId?: string;
 }
 
 export type CollectedBatch<T> = {
@@ -30,6 +38,11 @@ export type CollectedBatch<T> = {
      * first input alone loses the rest.
      */
     requestIds?: string[];
+    /**
+     * The channel request this batch answers. Channel turns are always pushed isolated, so a
+     * batch carries at most one — and a batch with one carries nothing else.
+     */
+    channelRequestId?: string;
 }
 
 /**
@@ -57,6 +70,13 @@ export class MessageQueue2<T> {
      */
     setOnMessage(handler: ((message: string, mode: T) => void) | null): void {
         this.onMessageHandler = handler;
+    }
+
+    /** Remove only a tagged channel request; ordinary Desktop input is never selected. */
+    removeByRequestId(requestId: string): number {
+        const before = this.queue.length;
+        this.queue = this.queue.filter(item => item.channelRequestId !== requestId);
+        return before - this.queue.length;
     }
 
     /**
@@ -183,7 +203,13 @@ export class MessageQueue2<T> {
      * Push a message that must be processed alone without discarding
      * already-queued user prompts.
      */
-    pushIsolated(message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[]): void {
+    pushIsolated(
+        message: string,
+        mode: T,
+        attachments?: PendingAttachment[],
+        requestIds?: string[],
+        channelRequestId?: string,
+    ): void {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -198,6 +224,7 @@ export class MessageQueue2<T> {
             isolate: true,
             attachments,
             requestIds,
+            channelRequestId,
         });
 
         // Trigger message handler if set
@@ -350,6 +377,7 @@ export class MessageQueue2<T> {
         const sameModeMessages: string[] = [];
         const collectedAttachments: PendingAttachment[] = [];
         const collectedRequestIds: string[] = [];
+        let channelRequestId: string | undefined;
         let mode = firstItem.mode;
         let isolate = firstItem.isolate ?? false;
         const targetModeHash = firstItem.modeHash;
@@ -360,6 +388,7 @@ export class MessageQueue2<T> {
             sameModeMessages.push(item.message);
             if (item.attachments) collectedAttachments.push(...item.attachments);
             if (item.requestIds) collectedRequestIds.push(...item.requestIds);
+            channelRequestId = item.channelRequestId;
             logger.debug(`[MessageQueue2] Collected isolated message with mode hash: ${targetModeHash}`);
         } else {
             // Collect all messages with the same mode until we hit an isolated message
@@ -384,6 +413,7 @@ export class MessageQueue2<T> {
             isolate,
             attachments: collectedAttachments.length > 0 ? collectedAttachments : undefined,
             requestIds: collectedRequestIds.length > 0 ? collectedRequestIds : undefined,
+            ...(channelRequestId !== undefined ? { channelRequestId } : {}),
         };
     }
 

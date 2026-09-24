@@ -11,8 +11,16 @@ import type { AgentState } from "@/api/types";
 import {
     BasePermissionHandler,
     PermissionResult,
-    PendingRequest
+    PendingRequest,
+    type PendingSettlementReason
 } from '@/utils/BasePermissionHandler';
+import {
+    buildChannelApprovalObservation,
+    channelApprovalEvent,
+    channelApprovalWithdrawnEvent,
+} from '@/channel/channelApprovalEvent';
+import type { ChannelPermissionBinding } from '@/channel/channelPermissionBinding';
+import { createEnvelope } from '@slopus/happy-wire';
 
 // Re-export types for backwards compatibility
 export type { PermissionResult, PendingRequest };
@@ -43,6 +51,77 @@ export class CodexPermissionHandler extends BasePermissionHandler {
 
     protected getLogPrefix(): string {
         return '[Codex]';
+    }
+
+    /**
+     * Prompts whose wait has been published to a messenger, by permission id
+     * (Saycode specs/desktop-messenger-channels — R8/R9).
+     *
+     * Every entry is `answerable: false`. Codex registers no dedicated `channel-permission` RPC at
+     * all, so an external answer has no route here in the first place; the flag is what makes that
+     * explicit rather than incidental, and it is why every Codex observation is `desktop-only`
+     * rather than `generic`. Approving a Codex prompt from a messenger is not supported, and this
+     * is only the guidance that says the turn is waiting and to go to Desktop.
+     */
+    private readonly channelBindings = new Map<string, ChannelPermissionBinding>();
+
+    /**
+     * Publishes the wait for a prompt whose turn Core could name.
+     *
+     * Called from inside `handleToolCall`, immediately after the pending request is registered.
+     * That placement is the point: called from the approval boundary *before* `handleToolCall`,
+     * there is no pending request yet and every publish is dropped — which is exactly the defect
+     * this replaced. There is no ordering left for a call site to get wrong.
+     *
+     * The turn arrives resolved, from the approval request's own provider turn id — never from
+     * "whatever turn is current". A prompt whose turn could not be resolved publishes nothing:
+     * the messenger is then no better informed than before, which is the fail-closed direction,
+     * and no wait is ever attributed to another request.
+     */
+    private observeChannelWait(input: {
+        permissionId: string;
+        turnId: string;
+        channelRequestId: string | null;
+        runtimeId: string;
+    }): void {
+        const binding: ChannelPermissionBinding = {
+            permissionId: input.permissionId,
+            turnId: input.turnId,
+            channelRequestId: input.channelRequestId,
+            runtimeId: input.runtimeId,
+            answerable: false,
+        };
+        const observation = buildChannelApprovalObservation(binding);
+        // An in-app prompt resolves to null here: it belongs to the Desktop user, and pointing a
+        // messenger at it would hand it to someone who is not looking at it.
+        if (!observation) return;
+        this.channelBindings.set(input.permissionId, binding);
+        this.session.sendSessionProtocolMessage(
+            createEnvelope('agent', channelApprovalEvent(observation, Date.now())),
+        );
+    }
+
+    /** What an external surface may know about a prompt. No arguments, no tool output. */
+    channelBindingFor(permissionId: string): ChannelPermissionBinding | undefined {
+        return this.channelBindings.get(permissionId);
+    }
+
+    /**
+     * Retracts a published wait, on every path the prompt leaves by.
+     *
+     * The base calls this only after the request has been removed and resolved, and swallows
+     * anything thrown here, so a failed publish cannot turn an answered permission into an
+     * unanswered one.
+     */
+    protected override onPendingSettled(permissionId: string, reason: PendingSettlementReason): void {
+        const binding = this.channelBindings.get(permissionId);
+        if (!binding) return;
+        this.channelBindings.delete(permissionId);
+        const observation = buildChannelApprovalObservation(binding);
+        if (!observation) return;
+        this.session.sendSessionProtocolMessage(
+            createEnvelope('agent', channelApprovalWithdrawnEvent(observation, reason, Date.now())),
+        );
     }
 
     private shouldAutoApprove(
@@ -78,7 +157,14 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         toolCallId: string,
         toolName: string,
         input: unknown,
-        context?: { serverName?: string },
+        context?: {
+            serverName?: string;
+            /**
+             * The turn this approval belongs to, already resolved from the request's own provider
+             * turn id. Absent means it could not be resolved, and nothing is published.
+             */
+            channelTurn?: { turnId: string; channelRequestId: string | null; runtimeId: string };
+        },
     ): Promise<PermissionResult> {
         if (this.shouldAutoApprove(toolName, toolCallId, context)) {
             logger.debug(`${this.getLogPrefix()} Auto-approving tool ${toolName} (${toolCallId})`);
@@ -112,6 +198,21 @@ export class CodexPermissionHandler extends BasePermissionHandler {
 
             // Update agent state with pending request
             this.addPendingRequestToState(toolCallId, toolName, input);
+
+            // After the pending request exists, and swallowing anything thrown: a channel
+            // publisher that fails must not stop the Desktop user from being asked at all.
+            if (context?.channelTurn) {
+                try {
+                    this.observeChannelWait({
+                        permissionId: toolCallId,
+                        turnId: context.channelTurn.turnId,
+                        channelRequestId: context.channelTurn.channelRequestId,
+                        runtimeId: context.channelTurn.runtimeId,
+                    });
+                } catch {
+                    logger.debug(`${this.getLogPrefix()} channel wait could not be published for ${toolCallId}`);
+                }
+            }
 
             logger.debug(`${this.getLogPrefix()} Permission request sent for tool: ${toolName} (${toolCallId})`);
         });

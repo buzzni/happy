@@ -647,3 +647,118 @@ describe('closeClaudeTurnWithStatus', () => {
         expect(result.envelopes[0].ev).toEqual({ t: 'turn-end', status: 'cancelled' });
     });
 });
+
+describe('channel request correlation on turn boundaries', () => {
+    // Saycode specs/desktop-messenger-channels. The handle rides the turn boundary because that
+    // is what identifies *which* work a reply belongs to; "the last assistant message" and
+    // "afterSeq" are both wrong as soon as another turn is in flight.
+    const assistantText = {
+        type: 'assistant',
+        uuid: 'a-1',
+        message: { role: 'assistant', model: 'claude', content: [{ type: 'text', text: 'working' }] },
+        timestamp: '2025-01-01T00:00:00.000Z',
+    } as any;
+
+    it('stamps the pending request id on the turn it opens', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-1' };
+        const result = mapClaudeLogMessageToSessionEnvelopes(assistantText, state);
+
+        const start = result.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
+        expect(start?.ev).toMatchObject({ t: 'turn-start', requestId: 'core-req-1' });
+        // Consumed, so it cannot be inherited by whatever opens next.
+        expect(state.pendingRequestId).toBeNull();
+    });
+
+    it('repeats the same id on the matching turn-end', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-1' };
+        mapClaudeLogMessageToSessionEnvelopes(assistantText, state);
+        const closed = closeClaudeTurnWithStatus(state, 'completed');
+
+        expect(closed.envelopes[0].ev).toMatchObject({
+            t: 'turn-end', status: 'completed', requestId: 'core-req-1',
+        });
+    });
+
+    it('carries the terminal status, so a cancelled turn is not read as an answer', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-2' };
+        mapClaudeLogMessageToSessionEnvelopes(assistantText, state);
+        const closed = closeClaudeTurnWithStatus(state, 'cancelled');
+
+        expect(closed.envelopes[0].ev).toMatchObject({
+            t: 'turn-end', status: 'cancelled', requestId: 'core-req-2',
+        });
+    });
+
+    it('leaves an ordinary in-app turn with no request id at all', () => {
+        const state = { currentTurnId: null };
+        const result = mapClaudeLogMessageToSessionEnvelopes(assistantText, state);
+        const start = result.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
+
+        expect(start?.ev).toEqual({ t: 'turn-start' });
+        expect(closeClaudeTurnWithStatus(state, 'completed').envelopes[0].ev)
+            .toEqual({ t: 'turn-end', status: 'completed' });
+    });
+
+    it('does not let a later turn inherit a consumed id', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-3' };
+        mapClaudeLogMessageToSessionEnvelopes(assistantText, state);
+        closeClaudeTurnWithStatus(state, 'completed');
+
+        // A second, unrelated turn opens with nothing pending.
+        const second = mapClaudeLogMessageToSessionEnvelopes({ ...assistantText, uuid: 'a-2' }, state);
+        const start = second.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
+        expect(start?.ev).toEqual({ t: 'turn-start' });
+    });
+})
+
+describe('channel correlation on runs that produce no text', () => {
+    const assistantText = {
+        type: 'assistant',
+        uuid: 'a-1',
+        message: { role: 'assistant', model: 'claude', content: [{ type: 'text', text: 'working' }] },
+        timestamp: '2025-01-01T00:00:00.000Z',
+    } as any;
+
+    it('answers a request whose run failed before producing any text', () => {
+        // A turn only opens on mapped activity. Without this the pending id is stranded: the
+        // caller waits forever, and the next unrelated turn inherits the id.
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-1' };
+        const closed = closeClaudeTurnWithStatus(state, 'failed');
+
+        expect(closed.envelopes.map((envelope) => (envelope.ev as { t: string }).t))
+            .toEqual(['turn-start', 'turn-end']);
+        expect(closed.envelopes[0].ev).toMatchObject({ requestId: 'core-req-1' });
+        expect(closed.envelopes[1].ev).toMatchObject({ status: 'failed', requestId: 'core-req-1' });
+        expect(state.pendingRequestId).toBeNull();
+    });
+
+    it('stays silent for an in-app run that produced nothing', () => {
+        const state = { currentTurnId: null };
+        expect(closeClaudeTurnWithStatus(state, 'completed').envelopes).toHaveLength(0);
+    });
+
+    it('never bleeds a channel id into the next ordinary turn', () => {
+        // Channel request A, then an ordinary Desktop turn B, across each path that can end a
+        // turn: a clean close, an empty terminal result, and a cancel.
+        for (const status of ['completed', 'failed', 'cancelled'] as const) {
+            const state = { currentTurnId: null, pendingRequestId: 'core-req-A' };
+            mapClaudeLogMessageToSessionEnvelopes(assistantText, state);
+            closeClaudeTurnWithStatus(state, status);
+
+            const ordinary = mapClaudeLogMessageToSessionEnvelopes({ ...assistantText, uuid: 'b-1' }, state);
+            const start = ordinary.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
+            expect(start?.ev).toEqual({ t: 'turn-start' });
+            expect(closeClaudeTurnWithStatus(state, 'completed').envelopes[0].ev)
+                .toEqual({ t: 'turn-end', status: 'completed' });
+        }
+    });
+
+    it('does not bleed after a textless terminal result either', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-A' };
+        closeClaudeTurnWithStatus(state, 'failed');
+
+        const ordinary = mapClaudeLogMessageToSessionEnvelopes({ ...assistantText, uuid: 'b-2' }, state);
+        const start = ordinary.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
+        expect(start?.ev).toEqual({ t: 'turn-start' });
+    });
+});

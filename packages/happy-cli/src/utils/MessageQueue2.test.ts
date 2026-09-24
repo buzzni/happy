@@ -531,6 +531,68 @@ describe('MessageQueue2', () => {
     });
 });
 
+describe('channel request correlation', () => {
+    // Saycode specs/desktop-messenger-channels — the handle has to survive the queue, because the
+    // turn that eventually runs is what the reply must be matched against.
+    it('carries an isolated message’s request id through to the batch', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.pushIsolated('from telegram', 'm', undefined, undefined, 'core-req-1');
+        expect(queue.queue.length).toBe(1);
+        const batch = (queue as unknown as { collectBatch(): { channelRequestId?: string } }).collectBatch();
+        expect(batch.channelRequestId).toBe('core-req-1');
+    });
+
+    it('does not read an auto-routing id as a channel request', () => {
+        // Both kinds of id travel through this queue. Ordinary Desktop input carries routing ids,
+        // and a consumer that took "has an id" to mean "came from a channel" would put that input
+        // behind channel execution approval — which never arrives for it — and disable its slash
+        // commands.
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('typed in the app', 'm', undefined, ['route-1']);
+        const batch = (queue as unknown as { collectBatch(): { channelRequestId?: string; requestIds?: string[] } }).collectBatch();
+        expect(batch.requestIds).toEqual(['route-1']);
+        expect(batch.channelRequestId).toBeUndefined();
+    });
+
+    it('removes only the tagged channel request, never routed Desktop input', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('typed in the app', 'm', undefined, ['core-req-4']);
+        queue.pushIsolated('from telegram', 'm', undefined, undefined, 'core-req-4');
+        expect(queue.removeByRequestId('core-req-4')).toBe(1);
+        expect(queue.queue.map(item => item.message)).toEqual(['typed in the app']);
+    });
+
+    it('reports no request ids for ordinary in-app messages', () => {
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('typed in the app', 'm');
+        const batch = (queue as unknown as { collectBatch(): { channelRequestId?: string } }).collectBatch();
+        expect(batch.channelRequestId).toBeUndefined();
+    });
+
+    it('does not let a channel turn batch with in-app messages', () => {
+        // Same mode, so `push` would have merged them into one turn with two askers and no way to
+        // say which reply answers which request.
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('typed in the app', 'm');
+        queue.pushIsolated('from telegram', 'm', undefined, undefined, 'core-req-2');
+
+        const first = (queue as unknown as { collectBatch(): { message: string; channelRequestId?: string } }).collectBatch();
+        expect(first.message).toBe('typed in the app');
+        expect(first.channelRequestId).toBeUndefined();
+
+        const second = (queue as unknown as { collectBatch(): { message: string; channelRequestId?: string } }).collectBatch();
+        expect(second.message).toBe('from telegram');
+        expect(second.channelRequestId).toBe('core-req-2');
+    });
+
+    it('keeps already-queued work when a channel message arrives', () => {
+        // `pushIsolateAndClear` would have discarded it; `pushIsolated` must not.
+        const queue = new MessageQueue2<string>((mode) => mode);
+        queue.push('work someone is waiting on', 'm');
+        queue.pushIsolated('from telegram', 'm', undefined, undefined, 'core-req-3');
+        expect(queue.queue.length).toBe(2);
+    });
+});
 
 /**
  * A batch merges N user inputs into one execution. Auto-routing commits its

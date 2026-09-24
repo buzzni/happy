@@ -88,6 +88,17 @@ const CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS = 2_048;
 export type ApprovalHandler = (params: {
     type: 'exec' | 'patch' | 'mcp';
     callId: string;
+    /**
+     * The provider's own turn and thread for this approval, when its request carried them
+     * (Saycode specs/desktop-messenger-channels — R8/R9).
+     *
+     * Read off the raw request with the same extractors the turn lifecycle uses, and passed
+     * through **only when present**. A consumer that needs to name the waiting turn must use this;
+     * falling back to whatever turn is currently open would attribute the wait to whichever
+     * request happens to be running, which is a different request's business.
+     */
+    turnId?: string | null;
+    threadId?: string | null;
     command?: string[];
     cwd?: string;
     fileChanges?: Record<string, unknown>;
@@ -432,6 +443,12 @@ export class CodexAppServerClient {
     private extractTurnId(params: any): string | null {
         const turnId = params?.turn?.id ?? params?.turnId ?? params?.turn_id ?? null;
         return typeof turnId === 'string' && turnId.length > 0 ? turnId : null;
+    }
+
+    /** Same shape as `extractTurnId`, for the thread. Absent stays absent — nothing is inferred. */
+    private extractThreadId(params: any): string | null {
+        const threadId = params?.thread?.id ?? params?.threadId ?? params?.thread_id ?? null;
+        return typeof threadId === 'string' && threadId.length > 0 ? threadId : null;
     }
 
     private extractTurnStatus(params: any): string | null {
@@ -2296,6 +2313,8 @@ export class CodexAppServerClient {
             const decision = await this.handleApproval({
                 type: 'mcp',
                 callId: `${params?.serverName ?? 'mcp'}:${id}`,
+                turnId: this.extractTurnId(params),
+                threadId: this.extractThreadId(params),
                 toolName,
                 input: params?._meta?.tool_params ?? {},
                 serverName: params?.serverName,
@@ -2312,6 +2331,8 @@ export class CodexAppServerClient {
             const decision = await this.handleApproval({
                 type: 'exec',
                 callId,
+                turnId: this.extractTurnId(params),
+                threadId: this.extractThreadId(params),
                 command: params.command != null ? [params.command] : [],
                 cwd: params.cwd,
                 reason: params.reason,
@@ -2327,6 +2348,8 @@ export class CodexAppServerClient {
             const decision = await this.handleApproval({
                 type: 'patch',
                 callId,
+                turnId: this.extractTurnId(params),
+                threadId: this.extractThreadId(params),
                 fileChanges: params.fileChanges ?? (typeof callId === 'string'
                     ? this.rawFileChangesByItemId.get(callId)
                     : undefined),
