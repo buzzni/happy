@@ -223,10 +223,13 @@ export class TaskStore {
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Task does not exist')
         const taskDir = join(this.stateDir, 'tasks', id)
         const eventFile = join(taskDir, 'events.jsonl')
+        // A patch may pin stateVersion (bookkeeping such as request dedupe records):
+        // the task did not change for the agent, so its expectedVersion must stay valid.
+        const stateVersion = patch.stateVersion ?? current.stateVersion + 1
         const body: TaskEvent = { schemaVersion: SCHEMA_VERSION, taskId: id, seq: Number(current.highWatermarkSeq) + 1,
-            ...structuredClone(event), stateVersion: current.stateVersion + 1, data: event.data }
+            ...structuredClone(event), stateVersion, data: event.data }
         const envelope = { body, checksum: checksum(stable(body)) }
-        const next = { ...current, ...structuredClone(patch), stateVersion: patch.stateVersion ?? current.stateVersion + 1,
+        const next = { ...current, ...structuredClone(patch), stateVersion,
             updatedAtMs: event.atMs, highWatermarkSeq: body.seq, lastSeq: body.seq } as StoredTask
         const bytes = Buffer.byteLength(stable(next))
         const eventCount = body.seq

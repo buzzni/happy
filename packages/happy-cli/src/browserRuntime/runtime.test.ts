@@ -25,6 +25,21 @@ async function createHarness(prefix: string, expiresAtMs = 3_600_000) {
 }
 
 describe('BrowserRuntime durable request contract', () => {
+    it('returns a task version from openPage and submitBatch that the next call can use as expectedVersion', async () => {
+        const h = await createHarness('abp-runtime-version-')
+        expect(h.opened.task.stateVersion).toBe((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).stateVersion)
+        const submitted = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: h.opened.task.stateVersion,
+            requestId: 'batch-version' as RequestId,
+            steps: [{ stepId: 's1' as never, actionId: 'act-v1' as never, tabId: h.opened.tabId, kind: 'observe', timeoutMs: 1_000 }],
+        }, { waitMs: 2_000 })
+        expect(submitted.result?.outcome).toBe('succeeded')
+        const finished = await h.runtime.finishTask(h.auth, { taskId: h.task.taskId, expectedVersion: submitted.task.stateVersion, requestId: 'finish-version' as RequestId })
+        expect(finished.status).toBe('succeeded')
+        await h.store.close()
+    })
+
     it('notifies waitForEvents after a committed event', async () => {
         const h = await createHarness('abp-runtime-events-')
         const afterSeq = (await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).highWatermarkSeq

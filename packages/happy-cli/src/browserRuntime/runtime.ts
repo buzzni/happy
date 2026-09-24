@@ -1207,7 +1207,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             [requestKey(auth, requestId)]: { hash: payloadHash(payload), result: redact(result) } }; }
     private async saveTaskRequest(task: StoredTask, auth: AuthContext, requestId: string, payload: unknown,
         result: unknown): Promise<StoredTask> { const dedupe = { ...task.dedupe, [requestKey(auth,
-            requestId)]: { hash: payloadHash(payload), result: redact(result) } }; return this.commit(task, { dedupe },
+            requestId)]: { hash: payloadHash(payload), result: redact(result) } }; return this.commit(task, { dedupe, stateVersion: task.stateVersion },
                 'state-changed', { requestStored: true }); }
     private async saveRequest(task: StoredTask, auth: AuthContext, requestId: string, payload: unknown,
         result: unknown): Promise<StoredTask> { return this.saveTaskRequest(task, auth, requestId, payload, result); }
