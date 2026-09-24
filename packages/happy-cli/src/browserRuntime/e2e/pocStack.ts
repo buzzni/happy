@@ -29,6 +29,7 @@ import {
 import { RuntimeClient } from '../runtimeClient'
 
 const here = dirname(fileURLToPath(import.meta.url))
+const ISSUE_BACKDATE_MS = 5_000
 const packageDir = resolve(here, '../../..')
 const pocDir = join(packageDir, 'scripts/browser-poc')
 
@@ -121,7 +122,6 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
     const env = JSON.parse(readFileSync(join(runDir, 'env.json'), 'utf8')) as PocEnvJson
     const runtimeUrl = `http://127.0.0.1:${env.ports.runtime}`
     const controlUrl = `http://127.0.0.1:${env.ports.control}`
-    const adminUrl = `http://127.0.0.1:${env.ports.admin}`
 
     const control = async (method: string, path: string, body?: unknown) => {
         const response = await fetch(`${controlUrl}${path}`, {
@@ -133,13 +133,24 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
         return response.json() as Promise<Record<string, unknown>>
     }
 
+    const refreshRuntimePorts = () => {
+        for (const [name, containerPort] of [['runtime', 8787], ['admin', 8788]] as const) {
+            try {
+                const mapping = execFileSync('docker', ['port', env.containers.runtime, String(containerPort)], { encoding: 'utf8' }).trim().split('\n')[0]
+                env.ports[name] = Number(mapping.split(':').at(-1))
+            } catch { /* not running (e.g. after kill-runtime) */ }
+        }
+        stack.runtimeUrl = `http://127.0.0.1:${env.ports.runtime}`
+    }
+
     const stack: PocStack = {
         run,
         runtimeUrl,
         env,
         keys,
         mintAgent(grant = {}) {
-            const now = Date.now()
+            // Containers can run a few ms behind the host; never mint a token from the future.
+            const now = Date.now() - ISSUE_BACKDATE_MS
             const grantId = (grant.grantId ?? `grant-${randomUUID()}`) as GrantId
             const token = mintAgentGrant({
                 kind: 'agent-grant',
@@ -158,7 +169,8 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
             return { token, grantId }
         },
         mintInteractive(capability = {}) {
-            const now = Date.now()
+            // Containers can run a few ms behind the host; never mint a token from the future.
+            const now = Date.now() - ISSUE_BACKDATE_MS
             return mintInteractiveCapability({
                 kind: 'interactive',
                 capabilityId: `cap-${randomUUID()}`,
@@ -173,10 +185,10 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
             }, keys, now)
         },
         client(token) {
-            return new RuntimeClient({ baseUrl: runtimeUrl, token })
+            return new RuntimeClient({ baseUrl: stack.runtimeUrl, token })
         },
         async admin(path, body = {}) {
-            const response = await fetch(`${adminUrl}${path}`, {
+            const response = await fetch(`http://127.0.0.1:${env.ports.admin}${path}`, {
                 method: path === '/admin/debug' ? 'GET' : 'POST',
                 headers: { authorization: `Bearer ${keys.adminToken}`, 'content-type': 'application/json' },
                 ...(path === '/admin/debug' ? {} : { body: JSON.stringify(body) }),
@@ -209,12 +221,14 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
         },
         fault(kind, profile = 'a') {
             poc(['fault', kind, '--run', run, '--profile', profile])
+            // A restarted Runtime container may publish on new host ports; clients created afterwards use them.
+            if (kind.includes('runtime')) refreshRuntimePorts()
         },
         async waitForRuntime(timeoutMs = 60_000) {
             const deadline = Date.now() + timeoutMs
             while (Date.now() < deadline) {
                 try {
-                    const response = await fetch(`${runtimeUrl}/v1/health`)
+                    const response = await fetch(`${stack.runtimeUrl}/v1/health`)
                     if (response.ok) {
                         const health = await response.json() as { profiles?: Array<{ connected: boolean }> }
                         if (health.profiles?.every((profile) => profile.connected)) return
