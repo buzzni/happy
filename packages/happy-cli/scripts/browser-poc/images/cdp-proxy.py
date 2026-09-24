@@ -35,6 +35,10 @@ class Handler(socketserver.BaseRequestHandler):
                 return
             rh, rb = response.split(b'\r\n\r\n', 1)
             if b'101 Switching Protocols' in rh:
+                # The handshake timeout must not apply to the long-lived CDP
+                # websocket: an idle driver connection would otherwise drop.
+                client.settimeout(None)
+                upstream.settimeout(None)
                 client.sendall(response)
                 def pipe(src, dst):
                     try:
