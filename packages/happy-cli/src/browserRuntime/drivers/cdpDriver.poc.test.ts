@@ -79,6 +79,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 document.getElementById('slot').appendChild(d)
             }, { once: true })</script></body>`)
         a.route('/pay-form', `${HIT_SCRIPT}<body><form action="/submit-order" onsubmit="event.preventDefault(); hit('submit')"><label>Amount <input name="amount" value="10"></label><label>Secret <input type="password" name="pw" value="synthetic-pw"></label><button id="go">Confirm payment</button></form></body>`)
+        a.route('/dialogs', `${HIT_SCRIPT}<body><button onclick="alert('hello'); hit('after-alert')">Alert</button><button onclick="hit(confirm('sure?') ? 'confirmed' : 'declined')">Confirm</button></body>`)
         for (const [name, color] of [['red', '#ff0000'], ['green', '#00ff00'], ['blue', '#0000ff']]) {
             a.route(`/color/${name}`, `<body style="margin:0;background:${color};height:100vh"></body>`)
         }
@@ -226,6 +227,20 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await driver.click(tab.tabId, refOf(obs, 'Send'), obs.snapshotId, OPTS)
             expect(await eventually(() => a.hits('v-Neo'), (n) => n === 1)).toBe(1)
             expect(a.hits('v-old')).toBe(0)
+        })
+    })
+
+    describe('javascript dialogs', () => {
+        it('dismisses alert/confirm opened by an agent click instead of freezing the tab, and never accepts on the user\'s behalf', async () => {
+            const tab = await open('/dialogs', [a.origin])
+            let obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Alert'), obs.snapshotId, { timeoutMs: 5_000 })
+            expect(await eventually(() => a.hits('after-alert'), (n) => n === 1)).toBe(1)
+            obs = await driver.observe(tab.tabId, [a.origin], { timeoutMs: 5_000 })
+            await driver.click(tab.tabId, refOf(obs, 'Confirm'), obs.snapshotId, { timeoutMs: 5_000 })
+            expect(await eventually(() => a.hits('declined'), (n) => n === 1)).toBe(1)
+            expect(a.hits('confirmed')).toBe(0)
+            expect(driver.dialogReports().filter((report) => report.tabId === tab.tabId).map((report) => report.type)).toEqual(['alert', 'confirm'])
         })
     })
 

@@ -45,6 +45,12 @@ export interface CdpDriverOptions {
     }
 }
 
+export interface DialogReport {
+    tabId: TabId
+    type: string
+    atMs: number
+}
+
 export interface PopupReport {
     openerTabId: TabId
     targetId: string
@@ -158,6 +164,7 @@ export class CdpDriver implements BrowserDriver {
     private readonly closedTabs = new Set<TabId>()
     private readonly popups = new Map<string, PopupReport>()
     private readonly disconnectListeners = new Set<() => void>()
+    private readonly dialogs: DialogReport[] = []
 
     constructor(private readonly options: CdpDriverOptions) {
         this.browserWsUrl = options.browserWsUrl
@@ -225,6 +232,11 @@ export class CdpDriver implements BrowserDriver {
     /** For leak checks (A12): owned tabs and attached sessions. */
     debugCounts(): { tabs: number; sessions: number } {
         return { tabs: this.tabs.size, sessions: this.sessions.size }
+    }
+
+    /** JavaScript dialogs the driver dismissed on owned tabs (most recent last, bounded). */
+    dialogReports(): DialogReport[] {
+        return this.dialogs.map((report) => ({ ...report }))
     }
 
     /** Pages opened by owned tabs. They are never adopted as owned tabs. */
@@ -771,6 +783,17 @@ export class CdpDriver implements BrowserDriver {
         }
         conn.on('Target.targetDestroyed', onTargetEnded)
         conn.on('Target.targetCrashed', onTargetEnded)
+        // A page dialog blocks the renderer: without an answer every later command on
+        // the tab hangs. Dismiss it (never accept on the user's behalf — confirm() is
+        // false, beforeunload stays on the page) and keep a report.
+        conn.on('Page.javascriptDialogOpening', (params, sessionId) => {
+            if (!current() || !sessionId) return
+            const info = this.sessions.get(sessionId)
+            if (!info) return
+            this.dialogs.push({ tabId: info.tab.tabId, type: String(params.type), atMs: Date.now() })
+            if (this.dialogs.length > MAX_POPUP_REPORTS) this.dialogs.shift()
+            conn.send('Page.handleJavaScriptDialog', { accept: false }, sessionId).catch(() => undefined)
+        })
         conn.on('Target.targetCreated', (params) => current() && this.onTargetInfo(conn, params.targetInfo))
         conn.on('Target.targetInfoChanged', (params) => current() && this.onTargetInfo(conn, params.targetInfo))
 
