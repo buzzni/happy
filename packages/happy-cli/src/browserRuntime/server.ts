@@ -1,0 +1,177 @@
+/**
+ * HTTP transport for the Browser Runtime. Verifies bearer tokens, validates
+ * request DTOs and forwards to BrowserRuntimeApi. No business rules here.
+ */
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { z } from 'zod'
+import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody } from './contracts'
+import { renderConsolePage } from './consolePage'
+
+const MAX_BODY_BYTES = 1024 * 1024
+export const MAX_BATCH_WAIT_MS = 120_000
+export const MAX_SUBSCRIBE_WAIT_MS = 30_000
+
+const id = z.string().min(1).max(256)
+const waitPredicate = z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('text'), text: z.string() }).strict(),
+    z.object({ kind: z.literal('ref'), ref: id }).strict(),
+    z.object({ kind: z.literal('url'), urlPrefix: z.string() }).strict(),
+])
+const batchStep = z.object({
+    stepId: id, actionId: id, tabId: id,
+    kind: z.enum(['navigate', 'observe', 'screenshot', 'fill', 'click', 'waitFor']),
+    timeoutMs: z.number().int().positive(),
+    url: z.string().optional(), ref: z.string().optional(), value: z.string().optional(),
+    name: z.string().optional(), until: waitPredicate.optional(),
+}).strict()
+const version = z.number().int().nonnegative()
+
+export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
+    createSpace: z.object({ profileId: id, requestId: id }).strict(),
+    createTask: z.object({ taskSpaceId: id, requestId: id }).strict(),
+    openPage: z.object({ taskId: id, url: z.string().min(1), requestId: id }).strict(),
+    closePage: z.object({ taskSpaceId: id, tabId: id, requestId: id }).strict(),
+    observe: z.object({ taskId: id, tabId: id, maxElements: z.number().int().positive().optional(), scopeRef: id.optional() }).strict(),
+    screenshot: z.object({ taskId: id, tabId: id }).strict(),
+    submitBatch: z.object({
+        taskId: id, expectedVersion: version, requestId: id, steps: z.array(batchStep),
+        waitMs: z.number().int().nonnegative().max(MAX_BATCH_WAIT_MS).optional(),
+    }).strict(),
+    finishTask: z.object({ taskId: id, expectedVersion: version, requestId: id }).strict(),
+    getTask: z.object({ taskId: id }).strict(),
+    subscribe: z.object({ taskId: id, afterSeq: version, waitMs: z.number().int().nonnegative().max(MAX_SUBSCRIBE_WAIT_MS).optional() }).strict(),
+    approve: z.object({ taskId: id, approvalId: id, bindingHash: z.string().min(1), requestId: id, decision: z.enum(['approve', 'reject']) }).strict(),
+    takeOver: z.object({ taskId: id, tabId: id, expectedEpoch: version, requestId: id }).strict(),
+    releaseControl: z.object({ taskId: id, tabId: id, expectedEpoch: version, requestId: id }).strict(),
+    resume: z.object({ taskId: id, expectedVersion: version, requestId: id }).strict(),
+    cancel: z.object({ taskId: id, requestId: id }).strict(),
+    closeSpace: z.object({ taskSpaceId: id, requestId: id }).strict(),
+}
+
+const STATUS: Partial<Record<ErrorCode, number>> = {
+    UNAUTHORIZED: 401, SCOPE_DENIED: 403, ORIGIN_DENIED: 403,
+    CONFLICT: 409, STALE_LEASE: 409, STALE_REF: 409, QUOTA_EXCEEDED: 429,
+    RUNTIME_UNAVAILABLE: 503, JOURNAL_UNAVAILABLE: 503, INVALID_REQUEST: 400,
+}
+export function httpStatusFor(code: ErrorCode): number {
+    return STATUS[code] ?? 500
+}
+
+export interface RuntimeServerOptions {
+    api: BrowserRuntimeApi & { waitForEvents?(taskId: string, afterSeq: number, waitMs: number): Promise<void> }
+    verifyToken: (bearer: string) => AuthContext
+    host?: string
+    port: number
+    health: () => object
+    log?: (line: string) => void
+}
+
+export interface RuntimeServer { url: string; port: number; close(): Promise<void> }
+
+class HttpError extends Error {
+    constructor(readonly status: number, readonly body: RuntimeErrorBody) { super(body.message) }
+}
+
+function send(res: ServerResponse, status: number, body: unknown) {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(body))
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+    return new Promise((resolve, reject) => {
+        let size = 0
+        const chunks: Buffer[] = []
+        req.on('data', (c: Buffer) => {
+            size += c.length
+            if (size > MAX_BODY_BYTES) {
+                reject(new BrowserRuntimeError('INVALID_REQUEST', 'request body too large'))
+                req.destroy()
+                return
+            }
+            chunks.push(c)
+        })
+        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+        req.on('error', reject)
+    })
+}
+
+function errorBody(err: unknown): { status: number; body: RuntimeErrorBody } {
+    if (err instanceof HttpError) return { status: err.status, body: err.body }
+    if (err instanceof BrowserRuntimeError) return { status: httpStatusFor(err.code), body: err.toBody() }
+    // Unknown errors may carry anything (including secrets); never echo them.
+    return { status: 500, body: { code: 'RUNTIME_UNAVAILABLE', message: 'internal error', retryable: true, mayHaveSideEffects: true } }
+}
+
+export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<RuntimeServer> {
+    const { api, verifyToken } = opts
+    const log = opts.log ?? (() => {})
+
+    const handleOp = async (req: IncomingMessage, op: string): Promise<unknown> => {
+        if (!Object.prototype.hasOwnProperty.call(REQUEST_SCHEMAS, op)) {
+            throw new HttpError(404, { code: 'UNSUPPORTED_OPERATION', message: 'unknown operation', retryable: false, mayHaveSideEffects: false })
+        }
+        const header = req.headers.authorization ?? ''
+        const match = /^Bearer (\S+)$/.exec(header)
+        if (!match) throw new BrowserRuntimeError('UNAUTHORIZED', 'missing bearer token')
+        let auth: AuthContext
+        try {
+            auth = verifyToken(match[1])
+        } catch (e) {
+            if (e instanceof BrowserRuntimeError) throw e
+            throw new BrowserRuntimeError('UNAUTHORIZED', 'invalid token')
+        }
+        const raw = await readBody(req)
+        let json: unknown
+        try {
+            json = raw.length === 0 ? {} : JSON.parse(raw)
+        } catch {
+            throw new BrowserRuntimeError('INVALID_REQUEST', 'body is not valid JSON')
+        }
+        const parsed = REQUEST_SCHEMAS[op as Operation].safeParse(json)
+        if (!parsed.success) {
+            const detail = parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).slice(0, 5).join('; ')
+            throw new BrowserRuntimeError('INVALID_REQUEST', `invalid ${op} request: ${detail}`)
+        }
+        const { waitMs, ...dto } = parsed.data as { waitMs?: number } & Record<string, unknown>
+        const call = api[op as Operation] as (a: AuthContext, r: unknown, o?: unknown) => Promise<unknown>
+        if (op === 'submitBatch') return call.call(api, auth, dto, waitMs !== undefined ? { waitMs } : undefined)
+        if (op === 'subscribe') {
+            const first = (await call.call(api, auth, dto)) as { kind: string; events?: unknown[] }
+            if (!waitMs || !api.waitForEvents || first.kind !== 'events' || (first.events?.length ?? 0) > 0) return first
+            await api.waitForEvents(dto.taskId as string, dto.afterSeq as number, waitMs)
+            return call.call(api, auth, dto)
+        }
+        return call.call(api, auth, dto)
+    }
+
+    const server = createServer(async (req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        try {
+            if (req.method === 'GET' && url.pathname === '/v1/health') return send(res, 200, { ok: true, ...opts.health() })
+            if (req.method === 'GET' && url.pathname === '/console') {
+                res.writeHead(200, {
+                    'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+                    'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:",
+                })
+                return res.end(renderConsolePage())
+            }
+            const m = /^\/v1\/ops\/([A-Za-z]+)$/.exec(url.pathname)
+            if (req.method === 'POST' && m) return send(res, 200, { ok: true, result: await handleOp(req, m[1]) })
+            send(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION', message: 'not found', retryable: false, mayHaveSideEffects: false } })
+        } catch (err) {
+            const { status, body } = errorBody(err)
+            // Path only: query strings and headers may carry credentials.
+            log(`[browserRuntime] ${req.method} ${url.pathname} -> ${status} ${body.code}`)
+            if (!res.headersSent) send(res, status, { ok: false, error: body })
+        }
+    })
+
+    await new Promise<void>((resolve) => server.listen(opts.port, opts.host ?? '127.0.0.1', resolve))
+    const port = (server.address() as AddressInfo).port
+    return {
+        url: `http://${opts.host ?? '127.0.0.1'}:${port}`,
+        port,
+        close: () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()) }),
+    }
+}

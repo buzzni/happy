@@ -26,6 +26,10 @@ import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browse
 // tool name via this constant so per-runner mappers (sessionProtocolMapper
 // for Claude, AcpSessionManager for ACP, …) consistently key the call
 // registry against the same name.
+import { readFile } from 'node:fs/promises';
+import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
+import { RuntimeClient } from '@/browserRuntime/runtimeClient';
+import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
@@ -36,6 +40,7 @@ export interface HappyServerHandlers {
     proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
+    browserTaskRuntime?: RuntimeClient;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -228,7 +233,13 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         }
     });
 
-    registerBrowserTools(mcp);
+    // Agent Browser PoC: the task runtime replaces the extension-bridge tools,
+    // which fall back to the active tab and would bypass the task lease.
+    if (handlers.browserTaskRuntime) {
+        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId });
+    } else {
+        registerBrowserTools(mcp);
+    }
 
     return mcp;
 }
@@ -387,6 +398,19 @@ function registerBrowserTools(mcp: McpServer): void {
     }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } }));
 }
 
+function createBrowserTaskRuntimeClient(): RuntimeClient | undefined {
+    const baseUrl = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
+    if (!baseUrl) return undefined;
+    const grantFile = process.env.HAPPY_BROWSER_TASK_GRANT_FILE;
+    // Read at call time so a rotated grant is picked up without a restart.
+    const token = async () => {
+        const grant = grantFile ? await readFile(grantFile, 'utf8').catch(() => '') : '';
+        if (!grant.trim()) throw new BrowserRuntimeError('UNAUTHORIZED', 'browser task grant is unavailable');
+        return grant.trim();
+    };
+    return new RuntimeClient({ baseUrl, token });
+}
+
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
@@ -397,6 +421,11 @@ export async function startHappyServer(
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
+    const browserTaskRuntime = createBrowserTaskRuntimeClient();
+    if (browserTaskRuntime) {
+        logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
+    }
+
     const changeTitle = createChangeTitleHandler(client);
 
     const server = createServer(async (req, res) => {
@@ -406,6 +435,7 @@ export async function startHappyServer(
             proposeLesson: options.proposeLesson,
             protectedBashCwd: options.protectedBashCwd,
             trackProtectedBashProcess: options.trackProtectedBashProcess,
+            browserTaskRuntime,
         });
         try {
             const transport = new StreamableHTTPServerTransport({
@@ -437,7 +467,7 @@ export async function startHappyServer(
 
     return {
         url: baseUrl.toString(),
-        toolNames: [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...BROWSER_TOOL_NAMES],
+        toolNames: [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             server.close();
