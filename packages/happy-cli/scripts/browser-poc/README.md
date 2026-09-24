@@ -22,7 +22,7 @@ node scripts/browser-poc/poc.mjs down --run smoke-1 --purge
 
 Fixture sites share container port 8080: `http://a.poc-one.test:8080`, `http://b.poc-two.test:8080`, `http://c.poc-three.test:8080`. Browser profiles use network DNS mapping to the fixture. The control API listens on 9099 inside the fixture and requires `x-harness-token` on every request. Browser CDP at browser-a/browser-b port 9223 and instance service at 9224 are internal only: each browser sits on its own network (`abp-<run>-a` / `-b`) shared only with the Runtime and the fixture, and the CDP proxy accepts only `Host: browser-<profile>:9223`. The noVNC viewer requires the per-run password stored in `.abp/<run>/env.json` (`vncPassword`). noVNC is exposed on dynamic loopback ports listed in env.json.
 
-Suite-specific fixture routes: `GET /a10/slow-write?run=&key=&ms=` (site A, A10 suite) ledgers `{kind: "slow-write", key}` on receipt and responds after `ms` (max 30 s), so a navigation write can be in flight across a Runtime crash. `GET /a10/storage-check` (site A) renders `LS=present|none IDB=present|none` for the storage written by `/storage-setup`.
+Suite-specific fixture routes: `GET /a10/slow-write?run=&key=&ms=` (site A, A10 suite) ledgers `{kind: "slow-write", key}` on receipt and responds after `ms` (max 30 s), so a navigation write can be in flight across a Runtime crash.
 
 Smoke checks (replace names and ports from env.json):
 
