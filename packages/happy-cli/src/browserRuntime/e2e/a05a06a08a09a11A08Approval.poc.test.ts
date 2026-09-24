@@ -56,11 +56,15 @@ async function reachApproval(label: string, options: { path?: string; params?: R
     const grant = mintAgent(stack, { profileId: options.profileId ?? PROFILE_A })
     const agent = client(stack, grant.token)
     const ui = client(stack, mintInteractive(stack, { profileId: options.profileId ?? PROFILE_A }).token)
-    const t = await newTaskWithPage(agent, pageUrl(stack, SITE_A, options.path ?? '/risky-submit', options.params ?? {}, L), { profileId: options.profileId })
+    const t = await newTaskWithPage(agent, pageUrl(stack, SITE_A, options.path ?? '/x5/risky-mutating', options.params ?? {}, L), { profileId: options.profileId })
     const o = await agent.observe({ taskId: t.taskId, tabId: t.tabId })
     const confirm = o.elements.find((e) => e.name === 'Confirm payment')!
     const started = Date.now()
-    const submitted = await agent.submitBatch({ taskId: t.taskId, expectedVersion: t.version, requestId: rid(), steps: [step(t.tabId, 'click', { ref: confirm.ref })] }, { waitMs: 60_000 })
+    // A submit is only confirmed by an explicit postcondition step (the page shows PAYMENT SENT once the write is acknowledged).
+    const submitted = await agent.submitBatch({ taskId: t.taskId, expectedVersion: t.version, requestId: rid(), steps: [
+        step(t.tabId, 'click', { ref: confirm.ref, snapshotId: o.snapshotId }),
+        step(t.tabId, 'waitFor', { until: { kind: 'text', text: 'PAYMENT SENT' }, timeoutMs: 15_000 }),
+    ] }, { waitMs: 60_000 })
     const toolReturnMs = Date.now() - started
     expect(submitted.result?.outcome, 'the tool call must return awaiting-user instead of blocking').toBe('awaiting-user')
     expect(submitted.result?.waitReason).toBe('approval')

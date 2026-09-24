@@ -17,6 +17,7 @@ import {
     BrowserRuntimeError,
     type AgentSessionId,
     type GrantId,
+    type InputOwner,
     type ActionId,
     type BatchStep,
     type ErrorCode,
@@ -410,4 +411,18 @@ export async function observeUntil(c: RuntimeClient, taskId: TaskId, tabId: TabI
 export function containerLogs(stack: PocStack, name: string): string {
     return execFileSync('docker', ['logs', `abp-${stack.run}-${name}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) +
         execFileSync('sh', ['-c', 'docker logs "$0" 2>&1 >/dev/null', `abp-${stack.run}-${name}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+}
+
+/** The tab's current lease as exposed by TaskView.tabLeases. */
+export async function tabLease(c: RuntimeClient, taskId: TaskId, tabId: TabId): Promise<{ leaseEpoch: number; owner: InputOwner }> {
+    const lease = (await c.getTask({ taskId })).tabLeases?.find((l) => l.tabId === tabId)
+    if (!lease) throw new Error('TaskView.tabLeases has no entry for the tab')
+    return lease
+}
+
+/** After a settling takeOver ACK: wait until the user actually owns the tab (in-flight driver call settled). */
+export async function waitUserOwner(c: RuntimeClient, taskId: TaskId, tabId: TabId, timeoutMs = 35_000): Promise<{ leaseEpoch: number; waitedMs: number }> {
+    const started = Date.now()
+    await waitForTask(c, taskId, (t) => t.tabLeases?.find((l) => l.tabId === tabId)?.owner.kind === 'user', timeoutMs)
+    return { leaseEpoch: (await tabLease(c, taskId, tabId)).leaseEpoch, waitedMs: Date.now() - started }
 }

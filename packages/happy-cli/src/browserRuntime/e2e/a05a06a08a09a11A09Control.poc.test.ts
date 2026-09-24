@@ -8,15 +8,15 @@
  * (cancel), grant revocation (admin, standing in for the auth server) and
  * user takeover. Every combination runs ABP_REPEAT (default 10) times.
  *
- * Stop is issued with the agent grant: the Runtime does not accept `cancel`
- * from an interactive capability (auth.ts), see the report.
+ * In the control matrix Stop is the user's (interactive capability carrying
+ * `cancel`); the late-confirmation paths stop through the agent grant.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { ActionId, TaskEvent } from '../contracts'
 import type { RuntimeClient } from '../runtimeClient'
 import {
-    admin, allEvents, cleanupSpace, client, count, evidence, expectCode, latestEpoch, ledgerRun, mintAgent, mintInteractive,
-    newTaskWithPage, observeUntil, pageUrl, range, releaseBarrier, repeat, rid, settledLedger, step, waitForTask, waitHealthy,
+    admin, allEvents, cleanupSpace, client, count, evidence, expectCode, ledgerRun, mintAgent, mintInteractive,
+    newTaskWithPage, observeUntil, pageUrl, range, releaseBarrier, repeat, rid, settledLedger, step, tabLease, waitForTask, waitHealthy, waitUserOwner,
     waitLedger,
 } from './a05a06a08a09a11Helpers'
 import { SITE_A, startPocStack, type PocStack } from './pocStack'
@@ -62,25 +62,27 @@ describe('A09 takeover / Stop / late effect', () => {
                 const L = ledgerRun(stack, `a09-${op}-${hang}-${i}`)
                 const grant = mintAgent(stack)
                 const agent = client(stack, grant.token)
-                const ui = client(stack, mintInteractive(stack).token)
+                const ui = client(stack, mintInteractive(stack, { operations: ['approve', 'takeOver', 'releaseControl', 'getTask', 'subscribe', 'cancel', 'resume'] }).token)
                 const t = await newTaskWithPage(agent, pageUrl(stack, SITE_A, '/x5/panel', { label: 'P', key: 'gate' }, L))
                 // Other Space of the same profile: VNC input is profile-global, so takeover must fence it too.
                 const other = op === 'takeover' ? await newTaskWithPage(agent, pageUrl(stack, SITE_A, '/x5/panel', { label: 'Q' }, L)) : undefined
                 let userEpoch: number | undefined
                 try {
-                    const press = (await agent.observe({ taskId: t.taskId, tabId: t.tabId })).elements.find((e) => e.name === 'Press P')!.ref
+                    const seen = await agent.observe({ taskId: t.taskId, tabId: t.tabId })
+                    const press = seen.elements.find((e) => e.name === 'Press P')!.ref
                     const hangStep = hang === 'waitFor'
                         ? step(t.tabId, 'waitFor', { until: { kind: 'text', text: 'GATE OPEN' }, timeoutMs: 120_000 })
                         : step(t.tabId, 'navigate', { url: pageUrl(stack, SITE_A, '/slow', { ms: String(SLOW_MS) }, L), timeoutMs: 30_000 })
-                    const follow = step(t.tabId, 'click', { ref: press })
+                    const follow = step(t.tabId, 'click', { ref: press, snapshotId: seen.snapshotId })
                     await agent.submitBatch({ taskId: t.taskId, expectedVersion: t.version, requestId: rid(), steps: [hangStep, follow] })
                     await waitInFlight(ui, t.taskId, hangStep.actionId)
 
                     const started = Date.now()
                     let fenceMs: number
                     let reported: number | undefined
+                    let settling = false
                     if (op === 'cancel') {
-                        const res = await agent.cancel({ taskId: t.taskId, requestId: rid() })
+                        const res = await ui.cancel({ taskId: t.taskId, requestId: rid() })
                         fenceMs = Date.now() - started
                         reported = res.fenceAckMs
                         expect(res.status).toBe('cancel-accepted')
@@ -88,10 +90,11 @@ describe('A09 takeover / Stop / late effect', () => {
                         await admin(stack, '/admin/revoke-grant', { grantId: grant.grantId })
                         fenceMs = Date.now() - started
                     } else {
-                        const res = await ui.takeOver({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: await latestEpoch(ui, t.taskId), requestId: rid() })
+                        const res = await ui.takeOver({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: (await tabLease(ui, t.taskId, t.tabId)).leaseEpoch, requestId: rid() })
                         fenceMs = Date.now() - started
-                        userEpoch = res.leaseEpoch
-                        expect(res.owner.kind).toBe('user')
+                        settling = res.settling === true
+                        // ACK first; the user owns input only once the in-flight driver call has settled.
+                        if (!settling) expect(res.owner.kind).toBe('user')
                     }
                     const fenced = await ui.getTask({ taskId: t.taskId })
 
@@ -107,6 +110,12 @@ describe('A09 takeover / Stop / late effect', () => {
                         }
                     }
 
+                    let settleMs: number | undefined
+                    if (op === 'takeover') {
+                        const owned = await waitUserOwner(ui, t.taskId, t.tabId)
+                        userEpoch = owned.leaseEpoch
+                        settleMs = owned.waitedMs
+                    }
                     // Let the original wait / driver call finish late.
                     if (hang === 'waitFor') await releaseBarrier(stack, L, 'gate', `n${i}`)
                     const reader = op === 'revoke' ? client(stack, mintAgent(stack, { agentSessionId: fenced.agentSessionId }).token) : agent
@@ -114,7 +123,7 @@ describe('A09 takeover / Stop / late effect', () => {
                     const ledger = await settledLedger(stack, L, 1_500)
                     const events = await allEvents(ui, t.taskId)
                     const after = await ui.getTask({ taskId: t.taskId })
-                    evidence('A09', { path: `${op}-${hang}`, i, fenceMs, reportedFenceAckMs: reported, statusAtAck: `${fenced.status}/${fenced.pauseReason ?? ''}`, final: `${after.status}/${after.pauseReason ?? ''}`, followIntents: eventsFor(events, follow.actionId).length, pressesP: count(ledger, 'click', { target: 'P' }), otherOutcome, pressesQ: count(ledger, 'click', { target: 'Q' }), uncertain: after.uncertainActions.length, transitions: events.filter((e) => ['state-changed', 'input-owner-changed', 'late-result', 'action-failed', 'action-uncertain', 'cancel-accepted'].includes(e.type)).map((e) => `${e.seq}:${e.type}:${String(e.data.pauseReason ?? e.data.status ?? e.data.owner ?? e.data.batchOutcome ?? '')}`) })
+                    evidence('A09', { path: `${op}-${hang}`, i, fenceMs, reportedFenceAckMs: reported, settling, settleMs, statusAtAck: `${fenced.status}/${fenced.pauseReason ?? ''}`, final: `${after.status}/${after.pauseReason ?? ''}`, followIntents: eventsFor(events, follow.actionId).length, pressesP: count(ledger, 'click', { target: 'P' }), otherOutcome, pressesQ: count(ledger, 'click', { target: 'Q' }), uncertain: after.uncertainActions.length, transitions: events.filter((e) => ['state-changed', 'input-owner-changed', 'late-result', 'action-failed', 'action-uncertain', 'cancel-accepted'].includes(e.type)).map((e) => `${e.seq}:${e.type}:${String(e.data.pauseReason ?? e.data.status ?? e.data.owner ?? e.data.batchOutcome ?? '')}`) })
                     expect(fenceMs, 'fence ACK must not wait for the hung wait/driver call').toBeLessThan(FENCE_ACK_MS)
                     expect(eventsFor(events, follow.actionId), 'no follow-up step may start after the fence').toHaveLength(0)
                     expect(count(ledger, 'click', { target: 'P' })).toBe(0)
@@ -144,9 +153,8 @@ describe('A09 takeover / Stop / late effect', () => {
         const ui = client(stack, mintInteractive(stack).token)
         const t = await newTaskWithPage(agent, pageUrl(stack, SITE_A, '/x5/panel', { label: 'R' }, L))
         try {
-            // Workaround for the idle-epoch gap asserted in the test below: the last event carries the
-            // pre-release epoch, the live lease is one higher.
-            const taken = await ui.takeOver({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: (await latestEpoch(ui, t.taskId)) + 1, requestId: rid() })
+            const taken = await ui.takeOver({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: (await tabLease(ui, t.taskId, t.tabId)).leaseEpoch, requestId: rid() })
+            expect(taken.settling ?? false, 'idle tab: nothing in flight, owner changes immediately').toBe(false)
             await expectCode(agent.submitBatch({ taskId: t.taskId, expectedVersion: taken.task.stateVersion, requestId: rid(), steps: [step(t.tabId, 'observe')] }), 'CONFLICT', 'agent batch during user control')
             await expectCode(agent.resume({ taskId: t.taskId, expectedVersion: taken.task.stateVersion, requestId: rid() }), 'CONFLICT', 'agent resume during user control')
             const released = await ui.releaseControl({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: taken.leaseEpoch, requestId: rid() })
@@ -175,7 +183,7 @@ describe('A09 takeover / Stop / late effect', () => {
         const t = await newTaskWithPage(agent, pageUrl(stack, SITE_A, '/x5/panel', { label: 'E' }, ledgerRun(stack, `a09-epoch-${i}`)))
         let userEpoch: number | undefined
         try {
-            const observed = await latestEpoch(ui, t.taskId)
+            const observed = (await tabLease(ui, t.taskId, t.tabId)).leaseEpoch
             let outcome: string
             try {
                 userEpoch = (await ui.takeOver({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: observed, requestId: rid() })).leaseEpoch
@@ -184,7 +192,7 @@ describe('A09 takeover / Stop / late effect', () => {
                 outcome = `rejected:${(error as { code?: string }).code}`
             }
             evidence('A09', { path: 'idle-epoch-visibility', i, observedEpoch: observed, outcome })
-            expect(outcome, 'CONTRACT: TaskView/events expose no current leaseEpoch for an idle tab, so takeOver(expectedEpoch) cannot be issued correctly').toBe('taken')
+            expect(outcome, 'CONTRACT: takeOver with the epoch exposed by TaskView.tabLeases must succeed for an idle tab').toBe('taken')
         } finally {
             if (userEpoch !== undefined) await ui.releaseControl({ taskId: t.taskId, tabId: t.tabId, expectedEpoch: userEpoch, requestId: rid() }).catch(() => undefined)
             expect(await cleanupSpace(stack, agent, t.taskSpaceId, [t.taskId])).toBeUndefined()
