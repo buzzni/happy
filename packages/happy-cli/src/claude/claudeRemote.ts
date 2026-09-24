@@ -563,6 +563,14 @@ function readTurnText(content: unknown): string {
     };
     opts.onActiveInputReady?.(sendActiveInput);
     let acceptsPromptSuggestion = false;
+    /*
+     * Background work an automation's one turn must outlive. Ending the input
+     * at the first result used to kill these with the provider, and the run
+     * reported success while the agents it launched were cut off mid-task.
+     * Background shells are excluded: they are often servers that never end,
+     * and tearing them down with the run is what they have always relied on.
+     */
+    let awaitedBackgroundTasks = 0;
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
@@ -635,6 +643,12 @@ function readTurnText(content: unknown): string {
                 : message;
             opts.onMessage(outboundMessage);
 
+            if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
+                awaitedBackgroundTasks = message.tasks
+                    .filter((task) => !task.ambient && task.task_type !== 'local_bash')
+                    .length;
+            }
+
             // Handle special system messages
             if (message.type === 'system' && message.subtype === 'init') {
                 // Start thinking when session initializes
@@ -679,6 +693,12 @@ function readTurnText(content: unknown): string {
 
             // Handle result messages
             if (message.type === 'result') {
+                if (opts.exitAfterFirstTurn && awaitedBackgroundTasks > 0) {
+                    // The provider starts the next turn itself when that work
+                    // reports back; the run ends at the result after it.
+                    logger.debug(`[claudeRemote] Run-once result deferred: ${awaitedBackgroundTasks} background task(s) still running`);
+                    continue;
+                }
                 acceptsPromptSuggestion = true;
                 acceptsActiveInput = false;
                 opts.onActiveInputReady?.(null);
