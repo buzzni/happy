@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { type AgentGrant, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
 import { FakeClock } from './clock'
 import { FakeBrowserDriver } from './testing/fakeDriver'
 import { TaskStore } from './taskStore'
@@ -159,6 +159,82 @@ describe('BrowserRuntime durable request contract', () => {
         expect(duplicate.batchId).toBe(first.batchId)
         await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
         expect(h.driver.dispatchCounts.get('same-action')).toBe(1)
+        await h.store.close()
+    })
+
+    it('deduplicates concurrent openPage calls with one external tab creation', async () => {
+        const h = await createHarness('abp-runtime-open-duplicate-')
+        const initialOpens = h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length
+        h.driver.setDelay('openTab', 25)
+        const request = { taskId: h.task.taskId, url: 'https://fixture.test/duplicate', requestId: 'open-same' as RequestId }
+        const [first, second] = await Promise.all([
+            h.runtime.openPage(h.auth, request),
+            h.runtime.openPage(h.auth, request),
+        ])
+        expect(first.tabId).toBe(second.tabId)
+        expect(h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length - initialOpens).toBe(1)
+        await h.store.close()
+    })
+
+    it('replays a mutation request result from the journal after reopening the runtime', async () => {
+        const h = await createHarness('abp-runtime-dedupe-restart-')
+        const request = { taskId: h.task.taskId, requestId: 'cancel-durable' as RequestId }
+        const first = await h.runtime.cancel(h.auth, request)
+        await h.store.close()
+
+        const store = await TaskStore.open(h.dir)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const dispatchCount = h.driver.dispatchCounts.size
+        const replay = await runtime.cancel(h.auth, request)
+
+        expect(replay).toEqual(first)
+        expect(h.driver.dispatchCounts.size).toBe(dispatchCount)
+        await store.close()
+    })
+
+    it('keeps a legitimately in-flight 120 second waitFor live during stale-worker sweep', async () => {
+        const h = await createHarness('abp-runtime-wait-heartbeat-')
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const pending = h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: task.stateVersion,
+            requestId: 'long-wait' as RequestId,
+            steps: [{ stepId: 'wait-step' as never, actionId: 'wait-action' as never, tabId: h.opened.tabId,
+                kind: 'waitFor', until: { kind: 'text', text: 'release me' }, timeoutMs: 120_000 }],
+        }, { waitMs: 120_000 })
+        await h.driver.waitForEntered
+        h.clock.set(61_000)
+        await h.runtime.sweep(h.clock.now())
+        expect((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).status).toBe('running')
+        h.driver.releaseWait()
+        const result = await pending
+        expect(result.result?.outcome).toBe('succeeded')
+        await h.store.close()
+    })
+
+    it('pauses after a timed-out read-only step so the same task can accept a follow-up batch', async () => {
+        const h = await createHarness('abp-runtime-read-timeout-')
+        h.driver.failNext('waitFor', new BrowserRuntimeError('OUTCOME_UNKNOWN', 'read-only wait timed out', true, false))
+        const initial = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const failed = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: initial.stateVersion,
+            requestId: 'read-timeout' as RequestId,
+            steps: [{ stepId: 'timeout-step' as never, actionId: 'timeout-action' as never, tabId: h.opened.tabId,
+                kind: 'waitFor', until: { kind: 'text', text: 'missing' }, timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+        expect(failed.result).toMatchObject({ outcome: 'failed', failedStep: 'timeout-step', mayHaveSideEffects: false })
+        expect(failed.task.status).toBe('paused')
+        expect(failed.task.pauseReason).toBe('awaiting-agent')
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const followup = await h.runtime.submitBatch(h.auth, {
+            taskId: h.task.taskId,
+            expectedVersion: current.stateVersion,
+            requestId: 'read-timeout-followup' as RequestId,
+            steps: [{ stepId: 'observe-step' as never, actionId: 'observe-action' as never, tabId: h.opened.tabId,
+                kind: 'observe', timeoutMs: 1000 }],
+        }, { waitMs: 1000 })
+        expect(followup.result?.outcome).toBe('succeeded')
         await h.store.close()
     })
 

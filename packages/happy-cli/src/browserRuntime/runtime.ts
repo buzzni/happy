@@ -11,7 +11,7 @@ import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
 import { approvalBinding, assertAllowedOrigin, classifyAction, payloadHash, redact } from './policy'
-import { TaskStore, type StoredTask, type StoreEventInput } from './taskStore'
+import { TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
 export interface BrowserRuntimeOptions {
@@ -29,8 +29,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly clock: RuntimeClock
     private readonly controllers = new Map<TaskId, AbortController>()
     private readonly workers = new Map<TaskId, Promise<BatchResult>>()
+    private readonly inFlightDriverCalls = new Set<TaskId>()
     private readonly commitTails = new Map<TaskId, Promise<unknown>>()
     private readonly eventWaiters = new Map<TaskId, Set<() => void>>()
+    private readonly requestFlights = new Map<string, { hash: string; promise: Promise<unknown> }>()
     private readonly recovery: Promise<void>
     constructor(private readonly options: BrowserRuntimeOptions) {
         this.drivers = options.drivers instanceof Map ? options.drivers : new Map(Object.entries(options.drivers) as [
@@ -40,7 +42,32 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.clock = options.clock ?? systemClock
         this.recovery = this.recoverExistingTasks()
     }
-    async createSpace(auth: AuthContext, req: {
+    createSpace: BrowserRuntimeApi['createSpace'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'createSpace', ...req }, () => this.createSpaceImpl(auth, req))
+    createTask: BrowserRuntimeApi['createTask'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'createTask', ...req }, () => this.createTaskImpl(auth, req))
+    openPage: BrowserRuntimeApi['openPage'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'openPage', ...req }, () => this.openPageImpl(auth, req))
+    closePage: BrowserRuntimeApi['closePage'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'closePage', ...req }, () => this.closePageImpl(auth, req))
+    submitBatch: BrowserRuntimeApi['submitBatch'] = (auth, req, opts) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'submitBatch', ...req }, () => this.submitBatchImpl(auth, req, opts))
+    finishTask: BrowserRuntimeApi['finishTask'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'finishTask', ...req }, () => this.finishTaskImpl(auth, req))
+    approve: BrowserRuntimeApi['approve'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'approve', ...req }, () => this.approveImpl(auth, req))
+    takeOver: BrowserRuntimeApi['takeOver'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'takeOver', ...req }, () => this.takeOverImpl(auth, req))
+    releaseControl: BrowserRuntimeApi['releaseControl'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'releaseControl', ...req }, () => this.releaseControlImpl(auth, req))
+    resume: BrowserRuntimeApi['resume'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'resume', ...req }, () => this.resumeImpl(auth, req))
+    cancel: BrowserRuntimeApi['cancel'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'cancel', ...req }, () => this.cancelImpl(auth, req))
+    closeSpace: BrowserRuntimeApi['closeSpace'] = (auth, req) =>
+        this.withRequestFlight(auth, req.requestId, { operation: 'closeSpace', ...req }, () => this.closeSpaceImpl(auth, req))
+
+    private async createSpaceImpl(auth: AuthContext, req: {
         profileId: ProfileId
         requestId: RequestId
     }): Promise<{
@@ -61,7 +88,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 dedupe: {} })
         return { taskSpaceId }
     }
-    async createTask(auth: AuthContext, req: {
+    private async createTaskImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
         requestId: RequestId
     }): Promise<TaskView> {
@@ -87,7 +114,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const stored = await this.saveRequest(saved, auth, req.requestId, { operation: 'createTask', ...req }, this.view(saved))
         return this.view(stored)
     }
-    async openPage(auth: AuthContext, req: {
+    private async openPageImpl(auth: AuthContext, req: {
         taskId: TaskId
         url: string
         requestId: RequestId
@@ -189,7 +216,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.leases.release(handle.tabId, task.profileId)
         return result
     }
-    async closePage(auth: AuthContext, req: {
+    private async closePageImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
         tabId: TabId
         requestId: RequestId
@@ -248,7 +275,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.assertTaskTab(task, req.tabId)
         return this.driver(task.profileId).screenshot(req.tabId, this.agentGrant(auth).allowedOrigins, { timeoutMs: 30000 })
     }
-    async submitBatch(auth: AuthContext, req: {
+    private async submitBatchImpl(auth: AuthContext, req: {
         taskId: TaskId
         expectedVersion: number
         requestId: RequestId
@@ -382,7 +409,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             waitMs))])
         return { batchId, accepted: true, task: await this.getTask(auth, { taskId: task.taskId }), ...(result ? { result } : {}) }
     }
-    async finishTask(auth: AuthContext, req: {
+    private async finishTaskImpl(auth: AuthContext, req: {
         taskId: TaskId
         expectedVersion: number
         requestId: RequestId
@@ -511,7 +538,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 reason = task.waitReason === 'approval' ? 'approval-expired' : 'user-wait-expired'
             else if (nowMs - task.createdAtMs >= POC_LIMITS.taskTimeLimitMs)
                 reason = 'task-time-limit'
-            else if (task.status === 'running' && nowMs - task.updatedAtMs >= POC_LIMITS.workerStaleMs)
+            else if (task.status === 'running' && !this.inFlightDriverCalls.has(task.taskId)
+                && nowMs - task.updatedAtMs >= POC_LIMITS.workerStaleMs)
                 reason = undefined
             if (reason) {
                 if (task.status === 'paused' && task.pauseReason === reason)
@@ -521,12 +549,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 await this.commit(task, { status: 'paused', pauseReason: reason,
                     ...(reason === 'approval-expired' ? { pendingApproval: undefined } : {}) }, 'state-changed', { pauseReason: reason })
             }
-            else if (task.status === 'running' && nowMs - task.updatedAtMs >= POC_LIMITS.workerStaleMs) {
+            else if (task.status === 'running' && !this.inFlightDriverCalls.has(task.taskId)
+                && nowMs - task.updatedAtMs >= POC_LIMITS.workerStaleMs) {
                 await this.commit(task, { status: 'recovering' }, 'recovered', { reason: 'worker-heartbeat-stale' })
             }
         }
     }
-    async approve(auth: AuthContext, req: {
+    private async approveImpl(auth: AuthContext, req: {
         taskId: TaskId
         approvalId: ApprovalId
         bindingHash: string
@@ -602,7 +631,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             result } } }, 'agent-attention-required', { approvalId: req.approvalId, outcome: result.outcome })
         return { outcome: 'approved', task: this.view(this.requireTask(req.taskId)), batch: result }
     }
-    async takeOver(auth: AuthContext, req: {
+    private async takeOverImpl(auth: AuthContext, req: {
         taskId: TaskId
         tabId: TabId
         expectedEpoch: number
@@ -634,7 +663,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.controllers.get(task.taskId)?.abort(new Error('user takeover'))
         return { leaseEpoch: epoch, owner, task: this.view(paused) }
     }
-    async releaseControl(auth: AuthContext, req: {
+    private async releaseControlImpl(auth: AuthContext, req: {
         taskId: TaskId
         tabId: TabId
         expectedEpoch: number
@@ -656,7 +685,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             { tabId: req.tabId, owner: 'none' }, epoch)
         return { leaseEpoch: epoch, owner: { kind: 'none' }, task: this.view(next) }
     }
-    async resume(auth: AuthContext, req: {
+    private async resumeImpl(auth: AuthContext, req: {
         taskId: TaskId
         expectedVersion: number
         requestId: RequestId
@@ -731,7 +760,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', agentGrant: auth.credential },
             'state-changed', { status: 'paused', pauseReason: 'awaiting-agent' }))
     }
-    async cancel(auth: AuthContext, req: {
+    private async cancelImpl(auth: AuthContext, req: {
         taskId: TaskId
         requestId: RequestId
     }): Promise<{
@@ -756,7 +785,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     { cancelRequested: true, uncertainActions: uncertain })
         return { status: 'cancel-accepted', task: this.view(next), fenceAckMs: Math.max(0, this.clock.now() - started) }
     }
-    async closeSpace(auth: AuthContext, req: {
+    private async closeSpaceImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
         requestId: RequestId
     }): Promise<{
@@ -801,6 +830,111 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 && !task.cancelRequested ? { pauseReason: 'awaiting-agent' } : {}) },
                     confirmed ? 'action-confirmed' : 'action-uncertain', { actionId, reconciled: confirmed })
         return this.view(updated)
+    }
+    private async withRequestFlight<T>(
+        auth: AuthContext,
+        requestId: RequestId,
+        payload: unknown,
+        run: () => Promise<T>,
+    ): Promise<T> {
+        await this.recovery
+        this.assertMutationScope(auth, payload)
+        const key = requestKey(auth, requestId)
+        const hash = payloadHash(payload)
+        const stored = this.findDurableRequest(key)
+        if (stored) {
+            if (stored.hash !== hash)
+                throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
+            return structuredClone(stored.result) as T
+        }
+        const active = this.requestFlights.get(key)
+        if (active) {
+            if (active.hash !== hash)
+                throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
+            return structuredClone(await active.promise) as T
+        }
+        const promise = (async () => {
+            const result = await run()
+            await this.persistRequestResult(key, hash, payload, result)
+            return result
+        })()
+        this.requestFlights.set(key, { hash, promise })
+        try {
+            return await promise
+        } finally {
+            if (this.requestFlights.get(key)?.promise === promise)
+                this.requestFlights.delete(key)
+        }
+    }
+    private assertMutationScope(auth: AuthContext, payload: unknown): void {
+        if (!isRecord(payload) || typeof payload.operation !== 'string')
+            throw new BrowserRuntimeError('INVALID_REQUEST', 'Mutation operation is missing')
+        const operation = payload.operation as Operation
+        if (typeof payload.taskId === 'string') {
+            const task = this.requireTask(payload.taskId as TaskId)
+            this.authorizeTask(auth, operation, task)
+            return
+        }
+        if (typeof payload.taskSpaceId === 'string') {
+            const space = this.requireSpace(payload.taskSpaceId as TaskSpaceId)
+            this.checkCredential(auth, operation, space.profileId, space.taskSpaceId)
+            this.authorizeSpace(auth, space)
+            return
+        }
+        if (typeof payload.profileId === 'string') {
+            this.checkCredential(auth, operation, payload.profileId as ProfileId)
+            return
+        }
+        throw new BrowserRuntimeError('INVALID_REQUEST', 'Mutation resource is missing')
+    }
+    private findDurableRequest(key: string): { hash: string; result: unknown } | undefined {
+        for (const task of this.options.store.listTasks()) {
+            const value = task.dedupe[key]
+            if (value) return value
+        }
+        for (const space of this.options.store.listSpaces()) {
+            const value = space.dedupe?.[key]
+            if (value) return value
+            if (space.requestKey === key && space.requestHash)
+                return { hash: space.requestHash, result: { taskSpaceId: space.taskSpaceId } }
+        }
+        return undefined
+    }
+    private async persistRequestResult(key: string, hash: string, payload: unknown, result: unknown): Promise<void> {
+        if (this.findDurableRequest(key)) return
+        const payloadRecord = isRecord(payload) ? payload : {}
+        const resultRecord = isRecord(result) ? result : {}
+        const nestedTask = isRecord(resultRecord.task) ? resultRecord.task : undefined
+        const taskIdValue = payloadRecord.taskId ?? resultRecord.taskId ?? nestedTask?.taskId
+        if (typeof taskIdValue === 'string') {
+            const taskId = taskIdValue as TaskId
+            await this.options.store.mutate(taskId, (current) => {
+                const existing = current.dedupe[key]
+                if (existing) {
+                    if (existing.hash !== hash)
+                        throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
+                    return null
+                }
+                return {
+                    patch: { dedupe: { ...current.dedupe, [key]: { hash, result: redact(result) } }, stateVersion: current.stateVersion },
+                    event: this.event('state-changed', { requestStored: true }, current.stateVersion),
+                }
+            })
+            return
+        }
+        const spaceIdValue = payloadRecord.taskSpaceId ?? resultRecord.taskSpaceId
+        if (typeof spaceIdValue === 'string') {
+            const spaceId = spaceIdValue as TaskSpaceId
+            await this.options.store.mutateSpace(spaceId, (current) => {
+                const existing = current.dedupe?.[key]
+                if (existing) {
+                    if (existing.hash !== hash)
+                        throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
+                    return null
+                }
+                return { dedupe: { ...current.dedupe, [key]: { hash, result: redact(result) } } }
+            })
+        }
     }
     private async recoverExistingTasks(): Promise<void> {
         for (const task of this.options.store.listTasks()) {
@@ -1014,6 +1148,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 this.leases.assert(step.tabId, task.profileId, task.taskId, batchId, leaseEpoch)
                 const armed = driver as DriverWithAction
                 armed.armAction?.(step.actionId)
+                this.inFlightDriverCalls.add(task.taskId)
                 try {
                     await this.dispatch(driver, step, observed, grant, controller.signal)
                     const finalOrigin = await driver.currentOrigin(step.tabId)
@@ -1063,12 +1198,21 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         outcome = 'cancelled'
                         break
                     }
-                    const uncertain = ['click', 'fill', 'navigate'].includes(step.kind)
+                    const write = ['click', 'fill', 'navigate'].includes(step.kind)
+                    const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
+                    const deniedOrigin = runtimeError?.code === 'ORIGIN_DENIED'
+                    const uncertain = write && runtimeError?.mayHaveSideEffects !== false && !deniedOrigin
                     const actionState = uncertain ? 'uncertain' as const : 'failed' as const
                     const actions = { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: actionState } }
-                    task = await this.commit(task, { actions, status: uncertain ? 'paused' : 'failed',
-                        ...(uncertain ? { pauseReason: 'outcome-unknown', uncertainActions: [...task.uncertainActions,
-                            step.actionId] } : {}) }, uncertain ? 'action-uncertain' : 'action-failed', { actionId: step.actionId,
+                    const safeFailure = !uncertain && !deniedOrigin
+                    task = await this.commit(task, {
+                        actions,
+                        status: uncertain || safeFailure ? 'paused' : 'failed',
+                        ...(uncertain
+                            ? { pauseReason: 'outcome-unknown', uncertainActions: [...task.uncertainActions, step.actionId] }
+                            : safeFailure ? { pauseReason: 'awaiting-agent' } : {}),
+                        ...(safeFailure ? { currentBatchId: undefined } : {}),
+                    }, uncertain ? 'action-uncertain' : 'action-failed', { actionId: step.actionId,
                                 error: safeError(error) }, leaseEpoch)
                     results.push({ stepId: step.stepId, actionId: step.actionId, outcome: uncertain ? 'uncertain' : 'failed',
                         error: safeError(error) })
@@ -1076,6 +1220,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     outcome = uncertain ? 'uncertain' : 'failed'
                     mayHaveSideEffects = uncertain
                     break
+                }
+                finally {
+                    this.inFlightDriverCalls.delete(task.taskId)
                 }
             }
             let finalTask = this.requireTask(task0.taskId)
@@ -1145,9 +1292,24 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async saveBatchResult(task: StoredTask, batchId: BatchId, result: BatchResult): Promise<BatchResult> {
-        const batches = { ...task.batches, [batchId]: { ...task.batches[batchId], result } }
-        const committed = await this.commit(task, { lastBatch: result, batches }, 'state-changed', { batchId,
-            batchOutcome: result.outcome, resultStored: true })
+        const committed = await this.options.store.mutate(task.taskId, (current) => {
+            const batch = current.batches[batchId]
+            if (!batch)
+                throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Batch record is missing')
+            return {
+                patch: {
+                    lastBatch: result,
+                    batches: { ...current.batches, [batchId]: { ...batch, result } },
+                },
+                event: this.event('state-changed', {
+                    batchId,
+                    batchOutcome: result.outcome,
+                    resultStored: true,
+                }, current.stateVersion),
+            }
+        })
+        if (!committed)
+            throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Batch result was not committed')
         return { ...result, lastCheckpointSeq: committed.highWatermarkSeq }
     }
     private event(type: TaskEvent['type'], data: Record<string, unknown>, stateVersion: number,
@@ -1206,9 +1368,27 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         result: unknown): NonNullable<NonNullable<ReturnType<TaskStore['getSpace']>>['dedupe']> { return { ...space.dedupe,
             [requestKey(auth, requestId)]: { hash: payloadHash(payload), result: redact(result) } }; }
     private async saveTaskRequest(task: StoredTask, auth: AuthContext, requestId: string, payload: unknown,
-        result: unknown): Promise<StoredTask> { const dedupe = { ...task.dedupe, [requestKey(auth,
-            requestId)]: { hash: payloadHash(payload), result: redact(result) } }; return this.commit(task, { dedupe, stateVersion: task.stateVersion },
-                'state-changed', { requestStored: true }); }
+        result: unknown): Promise<StoredTask> {
+        const key = requestKey(auth, requestId)
+        const hash = payloadHash(payload)
+        const redactedResult = redact(result)
+        const committed = await this.options.store.mutate(task.taskId, (current) => {
+            const existing = current.dedupe[key]
+            if (existing) {
+                if (existing.hash !== hash)
+                    throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
+                return null
+            }
+            return {
+                patch: {
+                    dedupe: { ...current.dedupe, [key]: { hash, result: redactedResult } },
+                    stateVersion: current.stateVersion,
+                },
+                event: this.event('state-changed', { requestStored: true }, current.stateVersion),
+            }
+        })
+        return committed ?? this.requireTask(task.taskId)
+    }
     private async saveRequest(task: StoredTask, auth: AuthContext, requestId: string, payload: unknown,
         result: unknown): Promise<StoredTask> { return this.saveTaskRequest(task, auth, requestId, payload, result); }
     private findRequest(requestId: string, auth: AuthContext): {
@@ -1248,6 +1428,9 @@ function rebaseTaskPatch(base: StoredTask, current: StoredTask, patch: Partial<S
         Object.assign(result, { [field]: merged })
     }
     return result
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 function requestKey(auth: AuthContext, requestId: string): string {
     return `${auth.credential.principalId}/${auth.credential.workspaceId}/${auth.credential.machineId}/${requestId}`
