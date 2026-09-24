@@ -206,18 +206,25 @@ describe('A07 batch, duplicate and partial failure', () => {
                     }
                     // Separate "who resent": Runtime dispatches vs requests the fixture received.
                     const journal = await eventsUntil(viewer.client, task.taskId, 0, () => true)
-                    const ofClick = (type: string) => journal.filter((event) => event.type === type && event.data.actionId === clickAction).length
-                    const runtimeIntents = ofClick('action-intent')
-                    const runtimeDispatches = ofClick('action-dispatched')
+                    // The pre-approval intent is rolled back to 'planned' at approval-requested (never dispatched)
+                    // and re-committed after approval: count intents/dispatches relative to approval-consumed.
+                    const ofClick = (type: string) => journal.filter((event) => event.type === type && event.data.actionId === clickAction)
+                    const consumedSeq = journal.find((event) => event.type === 'approval-consumed')?.seq ?? Number.POSITIVE_INFINITY
+                    const runtimeIntents = ofClick('action-intent').filter((event) => event.seq > consumedSeq).length
+                    const runtimeDispatches = ofClick('action-dispatched').length
+                    const dispatchesBeforeApproval = ofClick('action-dispatched').filter((event) => event.seq < consumedSeq).length
                     const receivedAt = risky(ledger, amount).map((entry) => entry.atMs - risky(ledger, amount)[0].atMs)
                     evidence('A07', {
                         path: `risky-${mode}`, iteration, taskId: task.taskId, approvals, received, receivedAtDeltaMs: receivedAt,
-                        runtimeIntents, runtimeDispatches, browserLevelRetry: runtimeDispatches === 1 && received > 1,
+                        intentsAfterApproval: runtimeIntents, intentsTotal: ofClick('action-intent').length, dispatchesBeforeApproval,
+                        runtimeDispatches, browserLevelRetry: runtimeDispatches === 1 && received > 1,
                         batchOutcome: result?.outcome, mayHaveSideEffects: result?.mayHaveSideEffects, taskStatus: after.status,
                         pauseReason: after.pauseReason, uncertainActions: after.uncertainActions.length, finish: finishCode,
                     })
                     expect(approvals).toBe(1)
-                    expect(runtimeIntents, 'the Runtime must record exactly one intent for the click').toBe(1)
+                    expect(consumedSeq, 'approval-consumed event missing from the journal').toBeLessThan(Number.POSITIVE_INFINITY)
+                    expect(dispatchesBeforeApproval, 'nothing may be dispatched before approval').toBe(0)
+                    expect(runtimeIntents, 'the Runtime must record exactly one intent for the click after approval').toBe(1)
                     expect(runtimeDispatches, 'the Runtime must dispatch the click exactly once (no auto resend)').toBe(1)
                     if (mode === 'normal') {
                         expect(received).toBe(1)
