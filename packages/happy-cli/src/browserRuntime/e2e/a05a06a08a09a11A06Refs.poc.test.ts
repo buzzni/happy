@@ -47,7 +47,7 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
             expect(bRef.startsWith('@f')).toBe(true)
 
             let v = t.version
-            const r1 = await batch(c, t.taskId, v, [[t.tabId, 'click', { ref: bRef }]])
+            const r1 = await batch(c, t.taskId, v, [[t.tabId, 'click', { ref: bRef, snapshotId: o.snapshotId }]])
             v = r1.version
             expect(r1.result.outcome).toBe('succeeded')
             let ledger = await waitLedger(stack, L, (e) => count(e, 'click') >= 1)
@@ -55,7 +55,7 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
 
             const targets: unknown[] = []
             for (const ref of aRefs) {
-                const r = await batch(c, t.taskId, v, [[t.tabId, 'click', { ref }]])
+                const r = await batch(c, t.taskId, v, [[t.tabId, 'click', { ref, snapshotId: o.snapshotId }]])
                 v = r.version
                 expect(r.result.outcome).toBe('succeeded')
                 ledger = await waitLedger(stack, L, (e) => count(e, 'click') >= 2 + targets.length)
@@ -73,14 +73,15 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
 
     it.each(range(N))('SPA swap after snapshot: stale ref fails with STALE_REF and the decoy is never clicked #%i', async (i) => {
         const L = ledgerRun(stack, `a06-spa-${i}`)
-        const t = await newTaskWithPage(c, pageUrl(stack, SITE_A, '/spa', { swapAfterMs: '1500' }, L))
+        const t = await newTaskWithPage(c, pageUrl(stack, SITE_A, '/x5/spa', { key: 'swap', mode: 'swap' }, L))
         try {
             const before = await c.observe({ taskId: t.taskId, tabId: t.tabId })
             const target = before.elements.find((e) => e.name === 'Target')
             expect(target, 'snapshot must be taken before the swap').toBeDefined()
-            // Condition sync: the SPA has replaced the node (same position, different button).
-            await observeUntil(c, t.taskId, t.tabId, (o) => o.elements.some((e) => e.name === 'Decoy'))
-            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: target!.ref }]])
+            await releaseBarrier(stack, L, 'swap', `n${i}`)
+            // Sync on the fixture ledger, not on a new observe (that would become the latest agent-visible snapshot).
+            await waitLedger(stack, L, (e) => count(e, 'click', { target: 'spa-swapped' }) >= 1, { settleMs: 0 })
+            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: target!.ref, snapshotId: before.snapshotId }]])
             const ledger = await settledLedger(stack, L, 1_000)
             evidence('A06', { path: 'spa-swap', i, outcome: r.result.outcome, code: failedCode(r.result), decoyClicks: count(ledger, 'click', { target: 'decoy' }), targetClicks: count(ledger, 'click', { target: 'target' }) })
             expect(count(ledger, 'click', { target: 'decoy' }), 'CONTRACT: a ref from the pre-swap snapshot must never click the replacement (decoy) button').toBe(0)
@@ -93,11 +94,14 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
 
     it.each(range(N))('SPA swap triggered by the click pointer move: decoy never clicked #%i', async (i) => {
         const L = ledgerRun(stack, `a06-spamove-${i}`)
-        const t = await newTaskWithPage(c, pageUrl(stack, SITE_A, '/spa', {}, L))
+        const t = await newTaskWithPage(c, pageUrl(stack, SITE_A, '/x5/spa', { key: 'arm', mode: 'hover' }, L))
         try {
             const before = await c.observe({ taskId: t.taskId, tabId: t.tabId })
-            const target = before.elements.find((e) => e.name === 'Target')!
-            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: target.ref }]])
+            const target = before.elements.find((e) => e.name === 'Target')
+            expect(target, 'snapshot must be taken before arming the hover swap').toBeDefined()
+            await releaseBarrier(stack, L, 'arm', `n${i}`)
+            await waitLedger(stack, L, (e) => count(e, 'click', { target: 'spa-armed' }) >= 1, { settleMs: 0 })
+            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: target!.ref, snapshotId: before.snapshotId }]])
             const ledger = await settledLedger(stack, L, 1_000)
             evidence('A06', { path: 'spa-pointermove-swap', i, outcome: r.result.outcome, code: failedCode(r.result), decoyClicks: count(ledger, 'click', { target: 'decoy' }), targetClicks: count(ledger, 'click', { target: 'target' }) })
             expect(count(ledger, 'click', { target: 'decoy' }), 'CONTRACT: node swapped during input must not receive the click').toBe(0)
@@ -116,7 +120,7 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
             const before = await c.observe({ taskId: t.taskId, tabId: t.tabId })
             const oldRef = before.elements.find((e) => e.frameOrigin === SITE_A && e.name === 'Buy')!.ref
             // Same URL again: the new document has an element at the same ref position.
-            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'navigate', { url }], [t.tabId, 'click', { ref: oldRef }]])
+            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'navigate', { url }], [t.tabId, 'click', { ref: oldRef, snapshotId: before.snapshotId }]])
             const ledger = await settledLedger(stack, L, 1_000)
             evidence('A06', { path: 'navigation-stale-ref', i, outcome: r.result.outcome, code: failedCode(r.result), clicks: count(ledger, 'click') })
             expect(count(ledger, 'click'), 'CONTRACT: a ref observed before navigation must not click in the new document').toBe(0)
@@ -133,9 +137,11 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
             const before = await c.observe({ taskId: t.taskId, tabId: t.tabId })
             const oldRef = before.elements.find((e) => e.frameOrigin === SITE_B)!.ref
             await releaseBarrier(stack, L, 'swap', 'go')
-            const after = await observeUntil(c, t.taskId, t.tabId, (o) => o.text.includes('REATTACHED') && o.elements.some((e) => e.frameOrigin === SITE_B))
-            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: oldRef }]])
-            const ledger = await settledLedger(stack, L, 1_000)
+            await waitLedger(stack, L, (e) => count(e, 'click', { target: 'frame-reattached' }) >= 1, { settleMs: 0 })
+            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: oldRef, snapshotId: before.snapshotId }]])
+            const ledger = (await settledLedger(stack, L, 1_000)).filter((e) => e.target !== 'frame-reattached')
+            // Observing the re-attached frame afterwards must work too (the agent's next step).
+            const after = await observeUntil(c, t.taskId, t.tabId, (o) => o.elements.some((e) => e.frameOrigin === SITE_B))
             evidence('A06', { path: 'frame-reattach', i, oldRef, newRef: after.elements.find((e) => e.frameOrigin === SITE_B)?.ref, code: failedCode(r.result), clicks: count(ledger, 'click') })
             expect(count(ledger, 'click'), 'old frame ref must not click the re-attached frame').toBe(0)
             expect(failedCode(r.result)).toBe('STALE_REF')
@@ -180,7 +186,7 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
             const sub = await c.observe({ taskId: t.taskId, tabId: t.tabId, scopeRef: form!.ref })
             const item30 = sub.elements.find((e) => e.name === 'Item 30')
             expect(item30, 'subtree observation must reach elements cut by truncation').toBeDefined()
-            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: item30!.ref }]])
+            const r = await batch(c, t.taskId, t.version, [[t.tabId, 'click', { ref: item30!.ref, snapshotId: sub.snapshotId }]])
             let ledger = await waitLedger(stack, L, (e) => count(e, 'click') >= 1, { settleMs: 1_000 })
             const clicked = ledger.filter((e) => e.kind === 'click').map((e) => e.target)
             evidence('A06', { path: 'truncation-subtree', i, truncated: small.truncated, smallCount: small.elements.length, subCount: sub.elements.length, subRef: item30!.ref, outcome: r.result.outcome, clicked })
@@ -189,10 +195,10 @@ describe('A06 snapshot/ref/iframe/screenshot via Runtime', () => {
             const d = await c.observe({ taskId: tDisabled.taskId, tabId: tDisabled.tabId })
             const disabled = d.elements.find((e) => e.name === 'Disabled action')!
             expect(disabled.disabled).toBe(true)
-            const rd = await batch(c, tDisabled.taskId, tDisabled.version, [[tDisabled.tabId, 'click', { ref: disabled.ref as ElementRef }]])
+            const rd = await batch(c, tDisabled.taskId, tDisabled.version, [[tDisabled.tabId, 'click', { ref: disabled.ref as ElementRef, snapshotId: d.snapshotId }]])
             const h = await c.observe({ taskId: tHidden.taskId, tabId: tHidden.tabId })
             const hidden = h.elements.find((e) => e.name === 'Hidden action')
-            const rh = hidden ? await batch(c, tHidden.taskId, tHidden.version, [[tHidden.tabId, 'click', { ref: hidden.ref }]]) : undefined
+            const rh = hidden ? await batch(c, tHidden.taskId, tHidden.version, [[tHidden.tabId, 'click', { ref: hidden.ref, snapshotId: h.snapshotId }]]) : undefined
             ledger = await settledLedger(stack, L, 1_000)
             evidence('A06', { path: 'disabled-hidden', i, disabledOutcome: rd.result.outcome, disabledCode: failedCode(rd.result), hiddenInSnapshot: !!hidden, hiddenVisible: hidden?.visible, hiddenOutcome: rh?.result.outcome, hiddenCode: rh && failedCode(rh.result) })
             expect(rd.result.outcome).not.toBe('succeeded')
