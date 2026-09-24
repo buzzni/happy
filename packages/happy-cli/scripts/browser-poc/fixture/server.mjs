@@ -138,6 +138,53 @@ http.createServer(async (req, res) => {
     if (p === "/a10/storage-check" && site === "a") return html(res, `<div id="out">CHECKING</div><script>const out=(t)=>{document.querySelector('#out').textContent=t};const ls=localStorage.getItem('abp_ls')?'present':'none';const r=indexedDB.open('abp');r.onsuccess=()=>{const db=r.result;if(!db.objectStoreNames.contains('kv'))return out('LS='+ls+' IDB=none');const g=db.transaction('kv').objectStore('kv').get('canary');g.onsuccess=()=>out('LS='+ls+' IDB='+(g.result?'present':'none'));g.onerror=()=>out('LS='+ls+' IDB=none')};r.onerror=()=>out('LS='+ls+' IDB=none')<\/script>`);
     // ---- end a01a03a07a10 routes ----
     if (site !== "a") return send(res, 404, { error: "not found" });
+    // ---- a02a04 routes ----
+    // Per-tag (per-iteration) login/challenge so earlier iterations' cookies never satisfy later ones.
+    // /login-strict rejects any password other than "correct-horse"; ledger entries prove dispatch and continuation.
+    {
+      const m = /^\/(protected-strict|login-strict|captcha-protected|challenge-strict|a02a04-after|a02a04-tick|a02a04-storage-setup|a02a04-storage-check)\/([a-z0-9-]{1,40})$/.exec(p);
+      if (m) {
+        const [, route, tag] = m, jar = cookie(req), q = `run=${encodeURIComponent(run)}`;
+        const loggedIn = jar[`abp_s_${tag}`] !== undefined && sessions.get(jar[`abp_s_${tag}`]) === `strict:${tag}`;
+        const passed = jar[`abp_c_${tag}`] === "ok";
+        if (route === "protected-strict") return loggedIn ? html(res, `<title>ABP strict protected ${esc(tag)}</title>STRICT AUTHENTICATED ${esc(tag)}`) : redirect(res, `/login-strict/${tag}?${q}`);
+        if (route === "login-strict" && req.method === "POST") {
+          const d = await body(req), ok = d.password === "correct-horse";
+          record({ kind: "a02a04-login", run: d.run || run, tag, ok });
+          if (!ok) return redirect(res, `/login-strict/${tag}?${q}&error=1`);
+          const sid = randomUUID();
+          sessions.set(sid, `strict:${tag}`);
+          res.setHeader("set-cookie", `abp_s_${tag}=${sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=86400`);
+          return redirect(res, `/protected-strict/${tag}?${q}`);
+        }
+        if (route === "login-strict") return html(res, `<title>ABP strict login ${esc(tag)}</title>${u.searchParams.get("error") ? "<p>WRONG PASSWORD</p>" : ""}<form method="post" action="/login-strict/${esc(tag)}?${esc(q)}"><input type="hidden" name="run" value="${esc(run)}"><label>User <input name="user" autofocus></label><label>Password <input type="password" name="password"></label><button>Log in</button></form>`);
+        if (route === "captcha-protected") return passed ? html(res, `<title>ABP captcha passed ${esc(tag)}</title>CAPTCHA PASSED ${esc(tag)}`) : redirect(res, `/challenge-strict/${tag}?${q}`);
+        if (route === "challenge-strict" && req.method === "POST") {
+          const d = await body(req);
+          record({ kind: "a02a04-challenge", run: d.run || run, tag, ok: d.robot === "no" });
+          if (d.robot !== "no") return redirect(res, `/challenge-strict/${tag}?${q}`);
+          res.setHeader("set-cookie", `abp_c_${tag}=ok; HttpOnly; Path=/; SameSite=Lax`);
+          return redirect(res, `/captcha-protected/${tag}?${q}`);
+        }
+        if (route === "challenge-strict") return html(res, `<title>ABP challenge ${esc(tag)}</title><form method="post" action="/challenge-strict/${esc(tag)}?${esc(q)}"><input type="hidden" name="run" value="${esc(run)}"><label><input type="checkbox" name="robot" value="no" autofocus>I am not a robot</label><button>Continue</button></form>`);
+        // Persistent (Max-Age) strict cookie + per-tag localStorage/IndexedDB canaries. The shared /login cookie is a
+        // session cookie (dropped on every Chromium restart) and /storage-check has a script syntax error.
+        if (route === "a02a04-storage-setup") {
+          if (!loggedIn) return redirect(res, `/login-strict/${tag}?${q}`);
+          return html(res, `<title>ABP storage setup ${esc(tag)}</title><script>(async()=>{localStorage.setItem('abp_ls_${tag}','ls-${tag}');const r=indexedDB.open('abp_${tag}',1);r.onupgradeneeded=()=>r.result.createObjectStore('kv');r.onsuccess=()=>{const t=r.result.transaction('kv','readwrite');t.objectStore('kv').put('idb-${tag}','canary');t.oncomplete=()=>document.body.textContent='STORAGE SET'}})()<\/script>`);
+        }
+        if (route === "a02a04-storage-check") return html(res, `<title>ABP storage check ${esc(tag)}</title><script>const c=${loggedIn}?'yes':'no';const ls=localStorage.getItem('abp_ls_${tag}')||'none';const out=(v)=>document.body.textContent='COOKIE='+c+' LS='+ls+' IDB='+v;const r=indexedDB.open('abp_${tag}');r.onsuccess=()=>{if(!r.result.objectStoreNames.contains('kv'))return out('none');const g=r.result.transaction('kv').objectStore('kv').get('canary');g.onsuccess=()=>out(g.result||'none');g.onerror=()=>out('none')};r.onerror=()=>out('none')<\/script>`);
+        if (route === "a02a04-after") {
+          record({ kind: "a02a04-after", run, tag, loggedIn, passed });
+          return html(res, `<title>ABP after ${esc(tag)}</title>AFTER ${esc(tag)} login=${loggedIn} captcha=${passed}`);
+        }
+        // Recorded on arrival (= dispatch), then held for ?ms so a batch spans real time.
+        record({ kind: "a02a04-tick", run, tag, n: Number(u.searchParams.get("n") || 0) });
+        await sleep(u.searchParams.get("ms"));
+        return html(res, `<title>ABP tick ${esc(tag)}</title>TICK ${esc(tag)} ${esc(u.searchParams.get("n"))}`);
+      }
+    }
+    // ---- end a02a04 routes ----
     if (p === "/login" && req.method === "POST") {
       const d = await body(req), sid = randomUUID();
       sessions.set(sid, String(d.user || "user"));
