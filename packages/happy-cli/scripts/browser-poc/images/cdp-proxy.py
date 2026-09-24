@@ -34,7 +34,8 @@ class Handler(socketserver.BaseRequestHandler):
             if b'\r\n\r\n' not in response:
                 return
             rh, rb = response.split(b'\r\n\r\n', 1)
-            if b'101 Switching Protocols' in rh:
+            # Chromium answers "101 WebSocket Protocol Handshake", so match the status code, not the reason phrase.
+            if rh.split(b'\r\n', 1)[0].split(b' ')[1:2] == [b'101']:
                 # The handshake timeout must not apply to the long-lived CDP
                 # websocket: an idle driver connection would otherwise drop.
                 client.settimeout(None)
