@@ -10,7 +10,7 @@ import { createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
-import { approvalBinding, assertAllowedOrigin, classifyAction, payloadHash, redact } from './policy'
+import { approvalBinding, assertAllowedOrigin, classifyAction, classifyUserWait, observedFormValues, payloadHash, redact } from './policy'
 import { TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
@@ -84,6 +84,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         const taskSpaceId = `space-${randomUUID()}` as TaskSpaceId
         await this.options.store.createSpace({ taskSpaceId, profileId: req.profileId, createdAtMs: this.clock.now(), tabs: [],
+            tabTargets: {}, tabLeaseEpochs: {},
             owner: identity(auth), requestKey: requestKeyValue, requestHash: payloadHash({ operation: 'createSpace', ...req }),
                 dedupe: {} })
         return { taskSpaceId }
@@ -107,7 +108,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const credential = auth.credential as AgentGrant
         const task: StoredTask = { schemaVersion: SCHEMA_VERSION, taskId, taskSpaceId: req.taskSpaceId, profileId: space.profileId,
             agentSessionId: credential.agentSessionId, status: 'queued', cancelRequested: false, stateVersion: 0, highWatermarkSeq: 0,
-                tabs: [], uncertainActions: [], createdAtMs: now, updatedAtMs: now, owner: identity(auth), agentGrant: credential,
+                tabs: [], tabTargets: {}, tabLeaseEpochs: {}, uncertainActions: [], createdAtMs: now, updatedAtMs: now,
+                    owner: identity(auth), agentGrant: credential,
                     actions: {}, approvals: {}, batches: {}, dedupe: {},
                     browserInstanceId: this.driver(space.profileId).browserInstanceId() }
         const saved = await this.options.store.createTask(task, this.event('task-created', { taskSpaceId: req.taskSpaceId }, 0))
@@ -197,6 +199,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 state: 'failed' } } }, 'action-failed', { actionId, code: 'ORIGIN_DENIED' }, epoch)
             throw new BrowserRuntimeError('ORIGIN_DENIED', 'Navigation ended at a disallowed origin')
         }
+        const finalObservation = await driver.observe(handle.tabId, grant.allowedOrigins, { timeoutMs: 10000 })
+        const waitReason = classifyUserWait(finalObservation.url)
         this.leases.release(reservation, task.profileId)
         const dispatched = this.requireTask(task.taskId)
         await this.commit(dispatched, { actions: { ...dispatched.actions, [actionId]: { ...dispatched.actions[actionId],
@@ -204,16 +208,28 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const tabEpoch = this.leases.acquire(handle.tabId, task.profileId, { kind: 'agent', agentSessionId: task.agentSessionId,
             taskId: task.taskId, segmentId: actionId })
         const next = this.requireTask(task.taskId)
-        const after = await this.commit(next, { tabs: [...next.tabs, handle.tabId], status: 'paused', pauseReason: 'awaiting-agent',
+        const after = await this.commit(next, {
+            tabs: [...next.tabs, handle.tabId],
+            tabTargets: { ...next.tabTargets, [handle.tabId]: handle.targetId },
+            tabLeaseEpochs: { ...next.tabLeaseEpochs, [handle.tabId]: tabEpoch },
+            status: waitReason ? 'awaiting-user' : 'paused',
+            pauseReason: waitReason ? undefined : 'awaiting-agent',
+            ...(waitReason ? { waitReason, waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
+                waitCompletion: { tabId: handle.tabId, notPathPrefix: waitReason === 'login' ? '/login' : '/challenge' } } : {}),
             browserInstanceId: driver.browserInstanceId(), actions: { ...next.actions, [actionId]: { ...next.actions[actionId],
                 state: 'confirmed' } } }, 'page-opened', { tabId: handle.tabId, actionId, origin: finalOrigin }, tabEpoch)
         if (this.controllers.get(task.taskId) === controller)
             this.controllers.delete(task.taskId)
         const space = this.requireSpace(task.taskSpaceId)
-        await this.options.store.updateSpace(task.taskSpaceId, { tabs: [...space.tabs, handle.tabId] })
+        await this.options.store.updateSpace(task.taskSpaceId, {
+            tabs: [...space.tabs, handle.tabId],
+            tabTargets: { ...space.tabTargets, [handle.tabId]: handle.targetId },
+            tabLeaseEpochs: { ...space.tabLeaseEpochs, [handle.tabId]: tabEpoch },
+        })
         const result = { tabId: handle.tabId, actionId, url: redact(req.url), task: this.view(after) }
         await this.saveTaskRequest(after, auth, req.requestId, { operation: 'openPage', ...req }, result)
-        this.leases.release(handle.tabId, task.profileId)
+        const releasedEpoch = this.leases.release(handle.tabId, task.profileId)
+        await this.persistTabLease(task.taskId, task.taskSpaceId, handle.tabId, releasedEpoch)
         return result
     }
     private async closePageImpl(auth: AuthContext, req: {
@@ -234,6 +250,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 closed: boolean
                 handoff?: 'beforeunload'
             }
+        if (!space.tabs.includes(req.tabId) && space.goneTabs?.includes(req.tabId)) {
+            const response = { closed: false }
+            await this.options.store.updateSpace(req.taskSpaceId, {
+                dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closePage', ...req }, response),
+            })
+            return response
+        }
+        if (!space.tabs.includes(req.tabId))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Tab is not registered to this task space')
         const refs = this.options.store.listTasks().filter((task) => task.tabs.includes(req.tabId) && (!['succeeded', 'failed',
             'cancelled'].includes(task.status) || this.workers.has(task.taskId)))
         if (refs.length)
@@ -245,7 +270,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (result.beforeUnloadBlocked)
             return { closed: false, handoff: 'beforeunload' }
         const response = { closed: result.closed }
-        await this.options.store.updateSpace(req.taskSpaceId, { tabs: space.tabs.filter((tab) => tab !== req.tabId),
+        const { [req.tabId]: _target, ...tabTargets } = space.tabTargets ?? {}
+        const { [req.tabId]: _epoch, ...tabLeaseEpochs } = space.tabLeaseEpochs ?? {}
+        await this.options.store.updateSpace(req.taskSpaceId, {
+            tabs: space.tabs.filter((tab) => tab !== req.tabId),
+            goneTabs: [...new Set([...(space.goneTabs ?? []), req.tabId])],
+            tabTargets, tabLeaseEpochs,
             dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closePage', ...req }, response) })
         return response
     }
@@ -488,6 +518,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     async onDriverReconnected(profileId: ProfileId): Promise<void> {
         await this.recovery
+        await this.restorePersistedTabs(profileId)
         const driver = this.drivers.get(profileId)
         let currentInstance: BrowserInstanceId | undefined
         try {
@@ -600,7 +631,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (this.clock.now() >= Number(approval.expiresAtMs) || originalGrant.expiresAtMs <= this.clock.now()
             || this.options.store.isRevoked(originalGrant.grantId))
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval or execution grant expired before dispatch')
-        if (observation.documentGeneration !== Number(approval.documentGeneration) || payloadHash(approvedStep) !== approval.payloadHash)
+        const currentApprovalPayloadHash = payloadHash({ step: approvedStep, formValues: observedFormValues(observation.elements) })
+        if (observation.documentGeneration !== Number(approval.documentGeneration)
+            || currentApprovalPayloadHash !== approval.payloadHash)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval document or payload changed')
         const expectedBinding = approvalBinding({ principalId: originalGrant.principalId, workspaceId: originalGrant.workspaceId,
             taskId: task.taskId, actionId: approvedStep.actionId, origin: String(approval.origin),
@@ -650,7 +683,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             kind: 'interactive'
         }>
         const owner: InputOwner = { kind: 'user', principalId: interactive.principalId, viewerSessionId: interactive.viewerSessionId }
-        const epoch = this.leases.takeOver(req.tabId, task.profileId, owner)
+        const settling = this.inFlightDriverCalls.has(task.taskId)
+        const epoch = this.leases.fenceForTakeover(req.tabId, task.profileId, task.taskId, owner)
+        await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, { tabId: req.tabId, owner })
+        await this.persistProfileUserOwner(task.profileId, { tabId: req.tabId, owner })
+        if (!settling)
+            this.leases.completePendingTakeovers(task.taskId)
         const pending = Object.entries(task.actions).filter(([, action]) => ['click', 'fill',
             'navigate'].includes(String(action.kind)) && ['intent-committed', 'dispatched'].includes(String(action.state)))
         const actions = { ...task.actions }
@@ -659,9 +697,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const paused = await this.commit(task, { status: 'paused', pauseReason: 'user-control', actions,
             ...(pending.length ? { uncertainActions: [...new Set([...task.uncertainActions,
                 ...pending.map(([id]) => id as ActionId)])] } : {}) }, 'input-owner-changed', { tabId: req.tabId, owner: 'user',
-                    unsettledActions: pending.map(([id]) => id) }, epoch)
+                    unsettledActions: pending.map(([id]) => id), settling }, epoch)
         this.controllers.get(task.taskId)?.abort(new Error('user takeover'))
-        return { leaseEpoch: epoch, owner, task: this.view(paused) }
+        const currentOwner = this.leases.owner(req.tabId, task.profileId).owner
+        return { leaseEpoch: epoch, owner: currentOwner, task: this.view(paused), settling }
     }
     private async releaseControlImpl(auth: AuthContext, req: {
         taskId: TaskId
@@ -681,6 +720,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             || current.owner.principalId !== interactive.principalId || current.owner.viewerSessionId !== interactive.viewerSessionId)
             throw new BrowserRuntimeError('STALE_LEASE', 'User lease changed')
         const epoch = this.leases.release(req.tabId, task.profileId)
+        await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, null)
+        await this.persistProfileUserOwner(task.profileId, null)
         const next = await this.commit(task, { status: 'paused', pauseReason: 'user-input-complete' }, 'input-owner-changed',
             { tabId: req.tabId, owner: 'none' }, epoch)
         return { leaseEpoch: epoch, owner: { kind: 'none' }, task: this.view(next) }
@@ -708,21 +749,35 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
                     { pauseReason: 'user-wait-expired', waitReason: task.waitReason }))
             const wait = task.waitCompletion as {
-                batchId: string
-                nextStep: number
+                batchId?: string
+                nextStep?: number
                 tabId: TabId
                 predicate: BatchStep['until']
+                notPathPrefix?: string
             } | undefined
-            if (!wait?.predicate)
+            if (!wait?.predicate && !wait?.notPathPrefix)
                 throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Wait completion condition is missing')
             const observation = await this.driver(task.profileId).observe(wait.tabId, auth.credential.allowedOrigins, { timeoutMs: 10000 })
-            if (!matchesWait(wait.predicate, observation))
+            const waitCompleted = wait.notPathPrefix
+                ? !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
+                : matchesWait(wait.predicate!, observation)
+            if (!waitCompleted)
                 return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
                     waitReason: task.waitReason }))
+            if (!wait.batchId) {
+                return this.view(await this.commit(task, {
+                    status: 'paused',
+                    pauseReason: 'awaiting-agent',
+                    waitReason: undefined,
+                    waitCompletion: undefined,
+                    waitExpiresAtMs: undefined,
+                    agentGrant: auth.credential,
+                }, 'state-changed', { status: 'paused', pauseReason: 'awaiting-agent', waitCompleted: true }))
+            }
             const record = task.batches[wait.batchId] as {
                 steps: BatchStep[]
             }
-            const resumeAt = wait.nextStep + 1
+            const resumeAt = Number(wait.nextStep ?? 0)
             const running = await this.commit(task, { status: 'running', pauseReason: undefined, waitReason: undefined,
                 waitCompletion: undefined, browserInstanceId: this.driver(task.profileId).browserInstanceId(),
                     batches: { ...task.batches, [wait.batchId]: { ...record, nextStep: resumeAt } } }, 'state-changed',
@@ -774,7 +829,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.authorizeTask(auth, 'cancel', task)
         if (['succeeded', 'failed', 'cancelled'].includes(task.status))
             return { status: 'cancel-accepted', task: this.view(task), fenceAckMs: Math.max(0, this.clock.now() - started) }
-        this.leases.revokeTask(task.taskId)
+        const revokedLeases = this.leases.revokeTask(task.taskId)
+        for (const lease of revokedLeases)
+            await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
         this.controllers.get(task.taskId)?.abort(new Error('cancelled'))
         const uncertain = [...new Set([...task.uncertainActions, ...Object.entries(task.actions).filter(([, action]) => ['navigate',
             'click', 'fill'].includes(String(action.kind)) && (action.state === 'intent-committed'
@@ -811,8 +868,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             closedTabs.push(tab as TabId)
         }
         const response = { closedTabs }
-        await this.options.store.updateSpace(req.taskSpaceId, { tabs: [], closed: true, dedupe: this.spaceDedupe(space, auth,
-            req.requestId, { operation: 'closeSpace', ...req }, response) })
+        await this.options.store.updateSpace(req.taskSpaceId, {
+            tabs: [], tabTargets: {}, tabLeaseEpochs: {}, profileUserOwner: null, closed: true,
+            dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closeSpace', ...req }, response),
+        })
         return response
     }
     async reconcileAction(taskId: TaskId, actionId: ActionId, confirmed: boolean): Promise<TaskView> {
@@ -936,7 +995,99 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             })
         }
     }
+    private async persistTabLease(taskId: TaskId, taskSpaceId: TaskSpaceId, tabId: TabId, epoch: number,
+        profileUserOwner?: SpaceRecord['profileUserOwner']): Promise<void> {
+        await this.options.store.mutate(taskId, (current) => ({
+            patch: {
+                tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
+                stateVersion: current.stateVersion,
+            },
+            event: this.event('state-changed', { tabId, leaseEpochStored: true }, current.stateVersion),
+        }))
+        await this.options.store.mutateSpace(taskSpaceId, (current) => ({
+            tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
+            ...(profileUserOwner === undefined ? {} : { profileUserOwner }),
+        }))
+    }
+    private async persistProfileUserOwner(profileId: ProfileId,
+        profileUserOwner: SpaceRecord['profileUserOwner']): Promise<void> {
+        for (const space of this.options.store.listSpaces(profileId))
+            await this.options.store.updateSpace(space.taskSpaceId, { profileUserOwner })
+    }
+    private async restorePersistedTabs(profileId?: ProfileId): Promise<void> {
+        for (const space of this.options.store.listSpaces(profileId)) {
+            const driver = this.drivers.get(space.profileId)
+            if (!driver)
+                continue
+            let currentInstance: BrowserInstanceId | undefined
+            try {
+                currentInstance = driver.browserInstanceId()
+            }
+            catch {
+                currentInstance = undefined
+            }
+            const profileOwner = this.options.store.listSpaces(space.profileId)
+                .map((item) => item.profileUserOwner)
+                .find((owner) => owner != null) ?? undefined
+            for (const tabId of [...space.tabs]) {
+                const references = this.options.store.listTasks().filter((task) => task.tabs.includes(tabId))
+                const targetId = space.tabTargets?.[tabId]
+                    ?? references.map((task) => task.tabTargets?.[tabId]).find((target): target is string => Boolean(target))
+                const browserMatches = Boolean(currentInstance) && references.every((task) =>
+                    !task.browserInstanceId || task.browserInstanceId === currentInstance)
+                const allowedOrigins = references.flatMap((task) => (task.agentGrant as AgentGrant | undefined)?.allowedOrigins ?? [])
+                let adopted = false
+                if (browserMatches && targetId && driver.adoptTab) {
+                    adopted = await driver.adoptTab(tabId, targetId, [...new Set(allowedOrigins)], { timeoutMs: 10000 })
+                }
+                else if (browserMatches) {
+                    adopted = driver.hasTab(tabId)
+                }
+                if (!adopted) {
+                    await this.dropOwnedTab(space, tabId, references)
+                    continue
+                }
+                const previousEpoch = Math.max(space.tabLeaseEpochs?.[tabId] ?? 0,
+                    ...references.map((task) => task.tabLeaseEpochs?.[tabId] ?? 0))
+                const persistedOwner = profileOwner?.tabId === tabId ? profileOwner.owner : { kind: 'none' as const }
+                const epoch = this.leases.restore(tabId, space.profileId, previousEpoch, persistedOwner)
+                await this.options.store.mutateSpace(space.taskSpaceId, (current) => ({
+                    tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
+                }))
+                for (const task of references) {
+                    await this.options.store.mutate(task.taskId, (current) => ({
+                        patch: {
+                            ...(targetId ? { tabTargets: { ...current.tabTargets, [tabId]: targetId } } : {}),
+                            tabLeaseEpochs: { ...current.tabLeaseEpochs, [tabId]: epoch },
+                            stateVersion: current.stateVersion,
+                        },
+                        event: this.event('state-changed', { tabId, leaseEpochRestored: true }, current.stateVersion),
+                    }))
+                }
+            }
+        }
+    }
+    private async dropOwnedTab(space: SpaceRecord, tabId: TabId, references: StoredTask[]): Promise<void> {
+        await this.options.store.mutateSpace(space.taskSpaceId, (current) => {
+            const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            return {
+                tabs: current.tabs.filter((tab) => tab !== tabId),
+                goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
+                tabTargets,
+                tabLeaseEpochs,
+            }
+        })
+        for (const task of references) {
+            await this.commit(task, {
+                tabs: task.tabs.filter((tab) => tab !== tabId),
+                tabTargets: Object.fromEntries(Object.entries(task.tabTargets ?? {}).filter(([tab]) => tab !== tabId)),
+                tabLeaseEpochs: Object.fromEntries(Object.entries(task.tabLeaseEpochs ?? {}).filter(([tab]) => tab !== tabId)),
+            }, 'page-closed', { tabId, reason: 'gone' })
+        }
+    }
     private async recoverExistingTasks(): Promise<void> {
+        await this.restorePersistedTabs()
         for (const task of this.options.store.listTasks()) {
             if (['succeeded', 'failed', 'cancelled'].includes(task.status))
                 continue
@@ -1066,6 +1217,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     leaseEpoch = this.leases.acquire(step.tabId, task.profileId, { kind: 'agent', agentSessionId: task.agentSessionId,
                         taskId: task.taskId, segmentId: batchId })
                     batchLeases.set(step.tabId, leaseEpoch)
+                    await this.persistTabLease(task.taskId, task.taskSpaceId, step.tabId, leaseEpoch)
                 }
                 const action = task.actions[step.actionId]
                 if (action) {
@@ -1098,6 +1250,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         leaseEpoch,
                         browserInstanceId: driver.browserInstanceId(),
                         documentGeneration: observed?.documentGeneration ?? 0,
+                        elementName: element?.name,
+                        formValues: observedFormValues(observed?.elements ?? []),
                         expiresAtMs,
                     })
                     const approvalId = approval.summary.approvalId
@@ -1123,14 +1277,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (step.kind === 'waitFor') {
                     const pageUrl = await driver.currentOrigin(step.tabId)
                     const observedPage = await driver.observe(step.tabId, grant.allowedOrigins, { timeoutMs: step.timeoutMs })
-                    const path = new URL(observedPage.url).pathname
-                    const expectedProtectedPage = step.until?.kind === 'url' && !/\/(login|challenge)(\/|$)/.test(step.until.urlPrefix)
-                    const waitReason = expectedProtectedPage && path.startsWith('/login') ? 'login' : expectedProtectedPage
-                        && path.startsWith('/challenge') ? 'captcha' : undefined
+                    const waitReason = classifyUserWait(observedPage.url)
                     if (waitReason) {
                         task = await this.commit(task, { status: 'awaiting-user', waitReason,
                             waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs, waitCompletion: { batchId, nextStep: index,
-                                tabId: step.tabId, predicate: step.until, protectedOrigin: pageUrl } }, 'state-changed',
+                                tabId: step.tabId, notPathPrefix: waitReason === 'login' ? '/login' : '/challenge',
+                                protectedOrigin: pageUrl } }, 'state-changed',
                                     { status: 'awaiting-user', waitReason, actionId: step.actionId }, leaseEpoch)
                         preserveLeases = true
                         return this.saveBatchResult(task, batchId, { batchId, taskId: task.taskId, outcome: 'awaiting-user',
@@ -1154,6 +1306,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!grant.allowedOrigins.includes(finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, true)
+                    const finalObservation = step.kind === 'navigate'
+                        ? await driver.observe(step.tabId, grant.allowedOrigins, { timeoutMs: step.timeoutMs })
+                        : undefined
+                    const landedWaitReason = finalObservation ? classifyUserWait(finalObservation.url) : undefined
                     task = this.requireTask(task.taskId)
                     if (task.cancelRequested || this.leases.owner(step.tabId,
                         task.profileId).leaseEpoch !== leaseEpoch || task.status !== 'running') {
@@ -1174,6 +1330,30 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded',
                         ...(observed ? { observation: sanitizeObservation(observed, grant.allowedOrigins) } : {}) })
                     completedSteps.push(step.stepId)
+                    if (landedWaitReason) {
+                        const notPathPrefix = landedWaitReason === 'login' ? '/login' : '/challenge'
+                        task = await this.commit(task, {
+                            status: 'awaiting-user',
+                            waitReason: landedWaitReason,
+                            waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
+                            waitCompletion: { batchId, nextStep: index + 1, tabId: step.tabId, notPathPrefix },
+                        }, 'state-changed', {
+                            status: 'awaiting-user',
+                            waitReason: landedWaitReason,
+                            tabId: step.tabId,
+                        }, leaseEpoch)
+                        preserveLeases = true
+                        return this.saveBatchResult(task, batchId, {
+                            batchId,
+                            taskId: task.taskId,
+                            outcome: 'awaiting-user',
+                            completedSteps,
+                            mayHaveSideEffects: false,
+                            lastCheckpointSeq: task.highWatermarkSeq + 1,
+                            steps: results,
+                            waitReason: landedWaitReason,
+                        })
+                    }
                 }
                 catch (error) {
                     task = this.requireTask(task.taskId)
@@ -1223,6 +1403,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 }
                 finally {
                     this.inFlightDriverCalls.delete(task.taskId)
+                    const completedTakeovers = this.leases.completePendingTakeovers(task.taskId)
+                    if (completedTakeovers.length) {
+                        const current = this.requireTask(task.taskId)
+                        await this.commit(current, {}, 'input-owner-changed', {
+                            owner: 'user',
+                            settling: false,
+                            tabs: completedTakeovers.map((takeover) => takeover.tabId),
+                        }, completedTakeovers[0].leaseEpoch)
+                    }
                 }
             }
             let finalTask = this.requireTask(task0.taskId)
@@ -1242,8 +1431,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 for (const [tabId, epoch] of batchLeases) {
                     const current = this.leases.owner(tabId, task0.profileId)
                     if (current.owner.kind === 'agent' && current.owner.taskId === task0.taskId && current.owner.segmentId === batchId
-                        && current.leaseEpoch === epoch)
-                        this.leases.release(tabId, task0.profileId)
+                        && current.leaseEpoch === epoch) {
+                        const releasedEpoch = this.leases.release(tabId, task0.profileId)
+                        await this.persistTabLease(task0.taskId, task0.taskSpaceId, tabId, releasedEpoch)
+                    }
                 }
             if (this.controllers.get(task0.taskId) === controller)
                 this.controllers.delete(task0.taskId)
@@ -1355,7 +1546,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     private allocateTabId(): TabId { return `lease-reservation-${randomUUID()}` as TabId; }
     private view(task: StoredTask): TaskView { const { owner: _owner, agentGrant: _grant, actions: _actions, approvals: _approvals,
-        batches: _batches, dedupe: _dedupe, __events: _events, lastSeq: _lastSeq, ...view } = task; return structuredClone(view); }
+        batches: _batches, dedupe: _dedupe, tabTargets: _tabTargets, tabLeaseEpochs: _tabLeaseEpochs,
+        __events: _events, lastSeq: _lastSeq, ...view } = task; return structuredClone(view); }
     private taskRequest(task: StoredTask, auth: AuthContext, requestId: string,
         payload: unknown): unknown | undefined { const key = requestKey(auth, requestId); const old = task.dedupe[key]; if (!old)
         return; if (old.hash !== payloadHash(payload))

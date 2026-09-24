@@ -3,16 +3,27 @@ import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type D
 
 export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[] }
 type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'screenshot' | 'click' | 'fill' | 'waitFor'
+interface HeldDispatch {
+    operation: Operation
+    entered(): void
+    release(): void
+    gate: Promise<void>
+}
 export class FakeBrowserDriver implements BrowserDriver {
     private instance = `browser-${randomUUID()}` as BrowserInstanceId
     private serial = 0
     private readonly pages = new Map<TabId, FakePage>()
+    private readonly targetIds = new Map<TabId, string>()
     private currentActionId?: string
     readonly dispatchCounts = new Map<string, number>()
     readonly targetLedger: Array<{ targetId: string; tabId: TabId; operation: Operation; actionId?: string }> = []
+    readonly adoptedTabs: Array<{ tabId: TabId; targetId: string; adopted: boolean }> = []
     delays = new Map<Operation, number>()
     private readonly failures = new Map<Operation, Error[]>()
     private waitRelease?: () => void
+    private ignoreWaitAbort = false
+    private heldDispatch?: HeldDispatch
+    private dispatchObserver?: (actionId: string) => void
     private notifyWaitEntered!: () => void
     readonly waitForEntered = new Promise<void>((resolve) => { this.notifyWaitEntered = resolve })
 
@@ -20,6 +31,16 @@ export class FakeBrowserDriver implements BrowserDriver {
     swapInstance(): BrowserInstanceId { return this.instance = `browser-${randomUUID()}` as BrowserInstanceId }
     armAction(actionId: string): void { this.currentActionId = actionId }
     setDelay(operation: Operation, ms: number): void { this.delays.set(operation, ms) }
+    setIgnoreWaitAbort(ignore: boolean): void { this.ignoreWaitAbort = ignore }
+    holdAfterNextDispatch(operation: Operation): { entered: Promise<void>; release(): void } {
+        let notifyEntered!: () => void
+        let release!: () => void
+        const entered = new Promise<void>((resolve) => { notifyEntered = resolve })
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        this.heldDispatch = { operation, entered: notifyEntered, release, gate }
+        return { entered, release }
+    }
+    observeDispatches(observer?: (actionId: string) => void): void { this.dispatchObserver = observer }
     failNext(operation: Operation, error: Error): void {
         this.failures.set(operation, [...(this.failures.get(operation) ?? []), error])
     }
@@ -31,6 +52,7 @@ export class FakeBrowserDriver implements BrowserDriver {
         const tabId = `tab-${++this.serial}` as TabId
         const targetId = `target-${this.serial}`
         this.pages.set(tabId, { url, title: 'Fixture', text: 'fixture ready', documentGeneration: 1, elements: [] })
+        this.targetIds.set(tabId, targetId)
         this.record(tabId, targetId, 'openTab')
         return { tabId, targetId }
     }
@@ -39,8 +61,13 @@ export class FakeBrowserDriver implements BrowserDriver {
         this.pages.delete(tabId); this.record(tabId, `target-${tabId}`, 'closeTab'); return { closed: true }
     }
     hasTab(tabId: TabId): boolean { return this.pages.has(tabId) }
+    async adoptTab(tabId: TabId, targetId: string, _allowedOrigins: string[], _opts: DriverOptions): Promise<boolean> {
+        const adopted = this.pages.has(tabId) && this.targetIds.get(tabId) === targetId
+        this.adoptedTabs.push({ tabId, targetId, adopted })
+        return adopted
+    }
     async navigate(tabId: TabId, url: string, _origins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
-        await this.delay('navigate', opts); const page = this.requirePage(tabId); page.url = url; page.documentGeneration = (page.documentGeneration ?? 0) + 1; this.record(tabId, `target-${tabId}`, 'navigate'); return { url, documentGeneration: page.documentGeneration }
+        await this.delay('navigate', opts); const page = this.requirePage(tabId); page.url = url; page.documentGeneration = (page.documentGeneration ?? 0) + 1; this.record(tabId, `target-${tabId}`, 'navigate'); await this.afterDispatch('navigate'); return { url, documentGeneration: page.documentGeneration }
     }
     async observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation> {
         await this.delay('observe', opts); const page = this.requirePage(tabId); const origin = new URL(page.url).origin
@@ -52,8 +79,16 @@ export class FakeBrowserDriver implements BrowserDriver {
         await this.delay('screenshot', opts); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !allowedOrigins.includes(origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')
         return { tabId, mimeType: 'image/png', data: Buffer.from('synthetic').toString('base64'), documentGeneration: page.documentGeneration ?? 1, targetId: `target-${tabId}`, capturedAtMs: Date.now() }
     }
-    async click(tabId: TabId, _ref: ElementRef, _snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.requirePage(tabId); this.record(tabId, `target-${tabId}`, 'click') }
-    async fill(tabId: TabId, _ref: ElementRef, _snapshotId: SnapshotId, _value: string, opts: DriverOptions): Promise<void> { await this.delay('fill', opts); this.requirePage(tabId); this.record(tabId, `target-${tabId}`, 'fill') }
+    async click(tabId: TabId, _ref: ElementRef, _snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.requirePage(tabId); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
+    async fill(tabId: TabId, ref: ElementRef, _snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {
+        await this.delay('fill', opts)
+        const page = this.requirePage(tabId)
+        const field = page.elements?.find((element) => element.ref === ref)
+        if (field)
+            field.value = value
+        this.record(tabId, `target-${tabId}`, 'fill')
+        await this.afterDispatch('fill')
+    }
     async waitFor(tabId: TabId, _predicate: WaitPredicate, _origins: string[], opts: DriverOptions): Promise<void> {
         if (!this.pages.has(tabId)) throw new BrowserRuntimeError('TARGET_GONE', 'Tab does not exist')
         this.notifyWaitEntered()
@@ -64,8 +99,10 @@ export class FakeBrowserDriver implements BrowserDriver {
             const release = () => { opts.signal?.removeEventListener('abort', abort); resolve() }
             const abort = () => { opts.signal?.removeEventListener('abort', abort); reject(opts.signal?.reason ?? new Error('aborted')) }
             this.waitRelease = release
-            opts.signal?.addEventListener('abort', abort, { once: true })
-            if (opts.signal?.aborted) abort()
+            if (!this.ignoreWaitAbort) {
+                opts.signal?.addEventListener('abort', abort, { once: true })
+                if (opts.signal?.aborted) abort()
+            }
             const timeout = this.delays.get('waitFor')
             if (timeout !== undefined) setTimeout(release, timeout)
         })
@@ -85,8 +122,19 @@ export class FakeBrowserDriver implements BrowserDriver {
     }
     private record(tabId: TabId, targetId: string, operation: Operation): void {
         const actionId = this.currentActionId
-        if (actionId && ['openTab', 'navigate', 'click', 'fill'].includes(operation)) this.dispatchCounts.set(actionId, (this.dispatchCounts.get(actionId) ?? 0) + 1)
+        if (actionId && ['openTab', 'navigate', 'click', 'fill'].includes(operation)) {
+            this.dispatchCounts.set(actionId, (this.dispatchCounts.get(actionId) ?? 0) + 1)
+            this.dispatchObserver?.(actionId)
+        }
         this.targetLedger.push({ targetId, tabId, operation, actionId })
         this.currentActionId = undefined
+    }
+    private async afterDispatch(operation: Operation): Promise<void> {
+        const held = this.heldDispatch
+        if (!held || held.operation !== operation)
+            return
+        this.heldDispatch = undefined
+        held.entered()
+        await held.gate
     }
 }

@@ -17,13 +17,42 @@ export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowe
 }
 
 export function classifyAction(step: BatchStep, element?: ObservedElement, formAction?: string, currentUrl?: string): 'auto' | 'approval-required' {
-    if (!['click', 'fill'].includes(step.kind)) return 'auto'
+    if (step.kind !== 'click') return 'auto'
     const riskyPath = (candidate?: string) => {
         if (!candidate) return false
         try { const path = new URL(candidate, 'https://fixture.invalid').pathname; return path === '/risky-submit' || path === '/api/risky' } catch { return false }
     }
-    if (riskyPath(formAction) || riskyPath(element?.formAction) || riskyPath(element?.targetUrl) || riskyPath(currentUrl) || /^(pay|buy now|send|submit order|confirm payment)/i.test(element?.name ?? '')) return 'approval-required'
+    if (/^(pay|buy now|send|submit order|confirm payment)/i.test(element?.name ?? '')) return 'approval-required'
+    const submitControl = ['button', 'submit'].includes(element?.role.toLowerCase() ?? '')
+    if (submitControl && (riskyPath(formAction) || riskyPath(element?.formAction)
+        || riskyPath(element?.targetUrl) || riskyPath(currentUrl))) return 'approval-required'
     return 'auto'
+}
+
+export interface FormValue {
+    name: string
+    value: string
+}
+
+export function observedFormValues(elements: ObservedElement[]): FormValue[] {
+    return elements.flatMap((element) => {
+        if (element.value === undefined || /password/i.test(element.name))
+            return []
+        return [{ name: element.name, value: element.value }]
+    })
+}
+
+export function classifyUserWait(url: string): 'login' | 'captcha' | undefined {
+    try {
+        const path = new URL(url).pathname
+        if (path.startsWith('/login'))
+            return 'login'
+        if (path.startsWith('/challenge'))
+            return 'captcha'
+    } catch {
+        return undefined
+    }
+    return undefined
 }
 
 export function approvalBinding(input: { principalId: string; workspaceId: string; taskId: string; actionId: string; origin: string; payloadHash: string; leaseEpoch: number; browserInstanceId: string; documentGeneration: number; expiresAtMs: number }): string {

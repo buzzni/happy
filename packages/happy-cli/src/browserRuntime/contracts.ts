@@ -400,7 +400,7 @@ export type SubscribeResult =
 
 export interface OpenPageResult { tabId: TabId; actionId: ActionId; url: string; task: TaskView }
 export interface CancelResult { status: 'cancel-accepted'; task: TaskView; fenceAckMs: number }
-export interface ControlResult { leaseEpoch: number; owner: InputOwner; task: TaskView }
+export interface ControlResult { leaseEpoch: number; owner: InputOwner; task: TaskView; settling?: boolean }
 export interface ApproveResult { outcome: 'approved' | 'rejected'; task: TaskView; batch?: BatchResult }
 
 export type InputOwner =
