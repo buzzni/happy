@@ -15,15 +15,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { ActionId, TabId, TaskId, TaskSpaceId } from '../contracts'
 import {
-    aid, answerEntries, barrierUrl, cleanupTask, containerFingerprint, eventsUntil, evidence, observeBarrierRefs, repeat, rid,
-    runtimeConnections, sid, startSuiteStack, waitForNoRuntimeConnections, type BarrierRefs, type SuiteStack,
+    aid, answerEntries, barrierUrl, cleanupTask, containerFingerprint, eventsUntil, evidence, repeat, rid,
+    runtimeConnections, sid, startSuiteStack, waitForNoRuntimeConnections, type SuiteStack,
 } from './a01a03a07a10Helpers'
 import { PROFILE_A, SITE_A } from './pocStack'
 
 describe('A01 deterministic continuation without clients', () => {
     let suite: SuiteStack
     let taskSpaceId: TaskSpaceId
-    let refs: BarrierRefs
 
     beforeAll(async () => {
         suite = await startSuiteStack('a01')
@@ -31,17 +30,6 @@ describe('A01 deterministic continuation without clients', () => {
         const { client, close } = suite.client(token)
         try {
             taskSpaceId = (await client.createSpace({ profileId: PROFILE_A, requestId: rid() })).taskSpaceId
-            // Calibration: learn the answer form refs from a real observation of
-            // an already-released barrier page (same fixture markup, other key).
-            const task = await client.createTask({ taskSpaceId, requestId: rid() })
-            const key = 'a01-calibration'
-            await suite.stack.releaseBarrier(key, 'calibration')
-            const opened = await client.openPage({ taskId: task.taskId, url: barrierUrl(SITE_A, suite.run, key), requestId: rid() })
-            refs = await observeBarrierRefs(client, task.taskId, opened.tabId)
-            const finished = await client.finishTask({ taskId: task.taskId, expectedVersion: opened.task.stateVersion, requestId: rid() })
-            expect(finished.status).toBe('succeeded')
-            await client.closePage({ taskSpaceId, tabId: opened.tabId, requestId: rid() })
-            evidence('A01', { calibration: { input: refs.input, submit: refs.submit } })
         } finally {
             close()
         }
@@ -63,6 +51,7 @@ describe('A01 deterministic continuation without clients', () => {
             const opened = await first.client.openPage({ taskId, url: barrierUrl(SITE_A, suite.run, key), requestId: rid() })
             tabId = opened.tabId
             const waitAction = aid('wait') as ActionId
+            const observeAction = aid('observe') as ActionId
             const fillAction = aid('fill') as ActionId
             const clickAction = aid('click') as ActionId
             const submitted = await first.client.submitBatch({
@@ -71,11 +60,17 @@ describe('A01 deterministic continuation without clients', () => {
                 requestId: rid(),
                 steps: [
                     { stepId: sid('wait'), actionId: waitAction, tabId, kind: 'waitFor', until: { kind: 'text', text: 'NONCE:' }, timeoutMs: 120_000 },
-                    { stepId: sid('fill'), actionId: fillAction, tabId, kind: 'fill', ref: refs.input, value: nonce, timeoutMs: 10_000 },
-                    { stepId: sid('click'), actionId: clickAction, tabId, kind: 'click', ref: refs.submit, timeoutMs: 10_000 },
+                    { stepId: sid('page'), actionId: observeAction, tabId, kind: 'observe', name: 'page', timeoutMs: 10_000 },
+                    { stepId: sid('fill'), actionId: fillAction, tabId, kind: 'fill', ref: '$page.Answer', value: nonce, timeoutMs: 10_000 },
+                    { stepId: sid('click'), actionId: clickAction, tabId, kind: 'click', ref: '$page.Submit answer', timeoutMs: 10_000 },
                 ],
             })
             const batchId = submitted.batchId
+            // The answer form does not exist before the release, so the batch
+            // observes the released page itself and targets named in-batch refs
+            // (the agent never saw those elements; no ref from another snapshot).
+            // The answer click is not approval-required, so it confirms without a
+            // postcondition step; the fixture ledger is the postcondition here.
             // The waitFor intent is durable = the batch is parked at the barrier.
             // subscribe is a client (viewer) operation; agent grants cannot carry it.
             const viewer = suite.client(suite.mintInteractive())
@@ -107,6 +102,14 @@ describe('A01 deterministic continuation without clients', () => {
             const ledger = await suite.stack.waitForLedger((entries) => answerEntries(entries, key).length >= 1, { timeoutMs: 60_000, settleMs: 2_000 })
             const connectionsWhileProgressing = runtimeConnections(suite.run)
             const answers = answerEntries(ledger, key)
+            if (answers.length === 0) {
+                const probe = suite.client(token)
+                const stuck = await probe.client.getTask({ taskId })
+                probe.close()
+                evidence('A01', { iteration, noAnswer: { status: stuck.status, pauseReason: stuck.pauseReason, lastBatch: stuck.lastBatch && {
+                    outcome: stuck.lastBatch.outcome, completedSteps: stuck.lastBatch.completedSteps, failedStep: stuck.lastBatch.failedStep,
+                    errors: stuck.lastBatch.steps.filter((step) => step.error).map((step) => [step.stepId, step.error?.code, step.error?.message]) } } })
+            }
             const release = ledger.find((entry) => entry.kind === 'barrier-release' && entry.key === key)
             expect(connectionsWhileProgressing, 'a client reconnected before the ledger result was checked').toBe(0)
             expect(release, 'barrier release not ledgered').toBeDefined()
@@ -125,7 +128,7 @@ describe('A01 deterministic continuation without clients', () => {
             expect(after.pauseReason).toBe('awaiting-agent')
             expect(after.lastBatch?.batchId).toBe(batchId)
             expect(after.lastBatch?.outcome).toBe('succeeded')
-            expect(after.lastBatch?.completedSteps).toEqual(['wait', 'fill', 'click'])
+            expect(after.lastBatch?.completedSteps).toEqual(['wait', 'page', 'fill', 'click'])
             const accepted = events.filter((event) => event.type === 'batch-accepted')
             expect(accepted, 'no batch may be submitted after the client closed').toHaveLength(1)
             const dispatched = events.filter((event) => event.type === 'action-dispatched')
@@ -135,7 +138,8 @@ describe('A01 deterministic continuation without clients', () => {
             expect(fillEvent!.atMs).toBeGreaterThanOrEqual(release!.atMs)
             expect(clickEvent!.atMs).toBeGreaterThanOrEqual(fillEvent!.atMs)
             const intents = events.filter((event) => event.type === 'action-intent').map((event) => event.data.actionId)
-            expect(intents.filter((id) => [waitAction, fillAction, clickAction].includes(id as ActionId))).toEqual([waitAction, fillAction, clickAction])
+            const batchActions = [waitAction, observeAction, fillAction, clickAction]
+            expect(intents.filter((id) => batchActions.includes(id as ActionId))).toEqual(batchActions)
             second.close()
             secondViewer.close()
 

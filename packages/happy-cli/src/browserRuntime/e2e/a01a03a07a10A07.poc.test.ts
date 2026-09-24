@@ -153,9 +153,26 @@ describe('A07 batch, duplicate and partial failure', () => {
         })
     }, 120_000)
 
-    for (const mode of ['drop-after-record', 'hang'] as const) {
-        it.each(repeat(10))(`iteration %i: risky write with fixture ${mode} → uncertain, mayHaveSideEffects, received once, finish rejected`, async (iteration) => {
-            const amount = `${mode === 'hang' ? 7 : 3}${String(iteration).padStart(3, '0')}.${Date.now() % 1000}`
+    /**
+     * Risky write (approval + postcondition) under three fixture behaviours:
+     *  - normal: response arrives, page shows PAYMENT RECORDED → the waitFor
+     *    postcondition confirms the click (control path).
+     *  - hang: the fixture records the request and HOLDS the response (no socket
+     *    reset). The postcondition never appears → uncertain. Both the Runtime's
+     *    dispatch count and the fixture receipts must be exactly 1.
+     *  - drop-after-record: the fixture resets the socket after recording. Chromium's
+     *    network stack may transparently re-send the POST on a reset connection; that
+     *    is a browser-level retry, not a Runtime duplicate. Asserted here: Runtime
+     *    dispatched once, uncertain; receipts > 1 are recorded as browserLevelRetry.
+     */
+    const RISKY_MODES = [
+        { mode: 'normal', digit: 1 },
+        { mode: 'hang', digit: 7 },
+        { mode: 'drop-after-record', digit: 3 },
+    ] as const
+    for (const { mode, digit } of RISKY_MODES) {
+        it.each(repeat(10))(`iteration %i: risky write with fixture ${mode}`, async (iteration) => {
+            const amount = `${digit}${String(iteration).padStart(3, '0')}.${Date.now() % 1000}`
             await suite.stack.fixtureFault('risky', mode)
             try {
                 await scenario(async (agent, track) => {
@@ -170,8 +187,9 @@ describe('A07 batch, duplicate and partial failure', () => {
                     const submitted = await agent.submitBatch({
                         taskId: task.taskId, expectedVersion: opened.task.stateVersion, requestId: rid(),
                         steps: [
-                            { stepId: sid('fill'), actionId: aid('amount'), tabId: opened.tabId, kind: 'fill', ref: input.ref, value: amount, timeoutMs: 10_000 },
-                            clickStep(opened.tabId, confirm.ref, clickAction),
+                            { stepId: sid('fill'), actionId: aid('amount'), tabId: opened.tabId, kind: 'fill', ref: input.ref, snapshotId: observation.snapshotId, value: amount, timeoutMs: 10_000 },
+                            { ...clickStep(opened.tabId, confirm.ref, clickAction), snapshotId: observation.snapshotId },
+                            { stepId: sid('recorded'), actionId: aid('recorded'), tabId: opened.tabId, kind: 'waitFor', until: { kind: 'text', text: 'PAYMENT RECORDED' }, timeoutMs: 6_000 },
                         ],
                     }, { waitMs: 30_000 })
                     expect(submitted.result?.outcome, 'risky fixture action must wait for approval').toBe('awaiting-user')
@@ -188,17 +206,29 @@ describe('A07 batch, duplicate and partial failure', () => {
                     }
                     // Separate "who resent": Runtime dispatches vs requests the fixture received.
                     const journal = await eventsUntil(viewer.client, task.taskId, 0, () => true)
-                    const runtimeDispatches = journal.filter((event) => event.data.actionId === clickAction && ['action-intent', 'action-dispatched'].includes(event.type))
-                        .map((event) => event.type)
+                    const ofClick = (type: string) => journal.filter((event) => event.type === type && event.data.actionId === clickAction).length
+                    const runtimeIntents = ofClick('action-intent')
+                    const runtimeDispatches = ofClick('action-dispatched')
                     const receivedAt = risky(ledger, amount).map((entry) => entry.atMs - risky(ledger, amount)[0].atMs)
                     evidence('A07', {
                         path: `risky-${mode}`, iteration, taskId: task.taskId, approvals, received, receivedAtDeltaMs: receivedAt,
-                        runtimeClickRecords: runtimeDispatches, batchOutcome: result?.outcome,
-                        mayHaveSideEffects: result?.mayHaveSideEffects, taskStatus: after.status, pauseReason: after.pauseReason,
-                        uncertainActions: after.uncertainActions.length, finishAfterLostResponse: finishCode,
+                        runtimeIntents, runtimeDispatches, browserLevelRetry: runtimeDispatches === 1 && received > 1,
+                        batchOutcome: result?.outcome, mayHaveSideEffects: result?.mayHaveSideEffects, taskStatus: after.status,
+                        pauseReason: after.pauseReason, uncertainActions: after.uncertainActions.length, finish: finishCode,
                     })
-                    expect(received, 'fixture must receive the write exactly once (no auto resend)').toBe(1)
-                    expect(result?.outcome, `fixture ${mode}: the write's response never arrived, so the batch must be uncertain, not ${result?.outcome}`).toBe('uncertain')
+                    expect(approvals).toBe(1)
+                    expect(runtimeIntents, 'the Runtime must record exactly one intent for the click').toBe(1)
+                    expect(runtimeDispatches, 'the Runtime must dispatch the click exactly once (no auto resend)').toBe(1)
+                    if (mode === 'normal') {
+                        expect(received).toBe(1)
+                        expect(result?.outcome, 'postcondition observed → confirmed').toBe('succeeded')
+                        expect(after.uncertainActions).toEqual([])
+                        expect(finishCode).toBe('accepted')
+                        return
+                    }
+                    if (mode === 'hang') expect(received, 'held response: the fixture must receive the write exactly once').toBe(1)
+                    else expect(received, 'reset: at least the Runtime\'s one dispatch reaches the fixture').toBeGreaterThanOrEqual(1)
+                    expect(result?.outcome, `fixture ${mode}: the postcondition never appeared, so the batch must be uncertain, not ${result?.outcome}`).toBe('uncertain')
                     expect(result?.mayHaveSideEffects).toBe(true)
                     expect(after.uncertainActions).toContain(clickAction)
                     expect(finishCode, 'finishTask must be rejected while an action is uncertain').toBe('CONFLICT')
