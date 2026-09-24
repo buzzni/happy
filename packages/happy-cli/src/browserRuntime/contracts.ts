@@ -289,6 +289,9 @@ export interface ObservedElement {
     disabled?: boolean
     visible: boolean
     frameOrigin: string
+    /** Fixture-only risk hints; they never grant access or alter allowed origin scope. */
+    targetUrl?: string
+    formAction?: string
 }
 
 export interface ObservedFrame {
