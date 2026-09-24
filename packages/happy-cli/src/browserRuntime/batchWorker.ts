@@ -5,7 +5,6 @@ import {
     type BrowserDriver,
     type ElementRef,
     type Observation,
-    type SnapshotId,
 } from './contracts'
 import { assertAllowedOrigin } from './policy'
 
@@ -13,10 +12,9 @@ import { assertAllowedOrigin } from './policy'
 export async function dispatchStep(
     driver: BrowserDriver,
     step: BatchStep,
-    observed: Observation | undefined,
     grant: AgentGrant,
     signal: AbortSignal,
-): Promise<void> {
+): Promise<Observation | { url: string; documentGeneration: number } | void> {
     const options = { signal, timeoutMs: step.timeoutMs }
     switch (step.kind) {
         case 'navigate': {
@@ -24,21 +22,22 @@ export async function dispatchStep(
             assertAllowedOrigin(step.url, grant)
             const result = await driver.navigate(step.tabId, step.url, grant.allowedOrigins, options)
             assertAllowedOrigin(result.url, grant)
-            return
+            return result
         }
         case 'click':
             if (!step.ref || typeof step.ref === 'string' && step.ref.startsWith('$')) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'click needs a resolved ref')
             }
-            return driver.click(step.tabId, step.ref as ElementRef, step.snapshotId ?? observed?.snapshotId as SnapshotId, options)
+            if (!step.snapshotId) throw new BrowserRuntimeError('STALE_REF', 'click has no agent-visible snapshot', false, false)
+            return driver.click(step.tabId, step.ref as ElementRef, step.snapshotId, options)
         case 'fill':
             if (!step.ref || step.value === undefined) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'fill needs ref and value')
             }
-            return driver.fill(step.tabId, step.ref as ElementRef, step.snapshotId ?? observed?.snapshotId as SnapshotId, step.value, options)
+            if (!step.snapshotId) throw new BrowserRuntimeError('STALE_REF', 'fill has no agent-visible snapshot', false, false)
+            return driver.fill(step.tabId, step.ref as ElementRef, step.snapshotId, step.value, options)
         case 'observe':
-            await driver.observe(step.tabId, grant.allowedOrigins, options)
-            return
+            return driver.observe(step.tabId, grant.allowedOrigins, options)
         case 'screenshot':
             await driver.screenshot(step.tabId, grant.allowedOrigins, options)
             return

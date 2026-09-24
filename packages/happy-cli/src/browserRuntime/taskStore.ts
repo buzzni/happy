@@ -19,6 +19,7 @@ import {
     type TaskSpaceId,
     type TaskView,
     type InputOwner,
+    type SnapshotId,
 } from './contracts'
 export interface ActionRecord {
     state: ActionState
@@ -42,6 +43,9 @@ export interface ApprovalRecord {
     documentGeneration?: number
     leaseEpoch?: number
     browserInstanceId?: BrowserInstanceId
+    snapshotId?: SnapshotId
+    frameOrigin?: string
+    formValues?: Record<string, string>
     result?: BatchResult
 }
 export interface BatchRecord {

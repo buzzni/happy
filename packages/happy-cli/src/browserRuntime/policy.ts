@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ObservedElement } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type ObservedElement } from './contracts'
 
 export function canonicalJson(value: unknown): string {
     if (value === null || typeof value !== 'object') return JSON.stringify(value)
@@ -16,16 +16,21 @@ export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowe
     return origin
 }
 
-export function classifyAction(step: BatchStep, element?: ObservedElement, formAction?: string, currentUrl?: string): 'auto' | 'approval-required' {
+export function classifyAction(step: BatchStep, element?: ObservedElement | ElementDescription, formAction?: string, currentUrl?: string): 'auto' | 'approval-required' {
     if (step.kind !== 'click') return 'auto'
     const riskyPath = (candidate?: string) => {
         if (!candidate) return false
         try { const path = new URL(candidate, 'https://fixture.invalid').pathname; return path === '/risky-submit' || path === '/api/risky' } catch { return false }
     }
     if (/^(pay|buy now|send|submit order|confirm payment)/i.test(element?.name ?? '')) return 'approval-required'
+    if ('pageUrl' in (element ?? {})) currentUrl = (element as ElementDescription).pageUrl
+    if ('formAction' in (element ?? {})) formAction = (element as ElementDescription).formAction
+    if ('frameOrigin' in (element ?? {}) && !('pageUrl' in (element ?? {})))
+        formAction = formAction ?? (element as ObservedElement).formAction
     const submitControl = ['button', 'submit'].includes(element?.role.toLowerCase() ?? '')
+    const targetUrl = element && 'targetUrl' in element ? element.targetUrl : undefined
     if (submitControl && (riskyPath(formAction) || riskyPath(element?.formAction)
-        || riskyPath(element?.targetUrl) || riskyPath(currentUrl))) return 'approval-required'
+        || riskyPath(targetUrl) || riskyPath(currentUrl))) return 'approval-required'
     return 'auto'
 }
 
@@ -55,7 +60,7 @@ export function classifyUserWait(url: string): 'login' | 'captcha' | undefined {
     return undefined
 }
 
-export function approvalBinding(input: { principalId: string; workspaceId: string; taskId: string; actionId: string; origin: string; payloadHash: string; leaseEpoch: number; browserInstanceId: string; documentGeneration: number; expiresAtMs: number }): string {
+export function approvalBinding(input: { principalId: string; workspaceId: string; taskId: string; actionId: string; origin: string; payloadHash: string; leaseEpoch: number; browserInstanceId: string; documentGeneration: number; expiresAtMs: number; frameOrigin?: string }): string {
     return payloadHashHex(input)
 }
 function payloadHashHex(value: unknown): string { return createHash('sha256').update(canonicalJson(value)).digest('hex') }

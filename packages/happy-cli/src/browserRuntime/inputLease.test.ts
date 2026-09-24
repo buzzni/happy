@@ -47,7 +47,10 @@ describe('input lease fencing', () => {
         const segment1 = 'batch-1' as never
         const owner1 = { kind: 'agent' as const, agentSessionId: 'same-agent' as never, taskId: task1, segmentId: segment1 }
         const epoch = leases.acquire(tab, profile, owner1)
-        driver.seedTab(tab, { url: 'https://fixture.test/start', text: 'ready', elements: [] })
+        driver.seedTab(tab, { url: 'https://fixture.test/start', text: 'ready', elements: [
+            { ref: '@continue' as never, role: 'button', name: 'Continue', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
         driver.setDelay('waitFor', 1)
 
         const observed = await driver.observe(tab, ['https://fixture.test'], { timeoutMs: 1000 })
@@ -66,8 +69,9 @@ describe('input lease fencing', () => {
         leases.acquire(tab, profile, {
             kind: 'agent', agentSessionId: 'same-agent' as never, taskId: task2, segmentId: 'batch-2' as never,
         })
+        const task2Observation = await driver.observe(tab, ['https://fixture.test'], { timeoutMs: 1000 })
         driver.armAction('task2-input')
-        await driver.click(tab, '@continue' as never, observed.snapshotId, { timeoutMs: 1000 })
+        await driver.click(tab, '@continue' as never, task2Observation.snapshotId, { timeoutMs: 1000 })
 
         expect(driver.targetLedger.filter((entry) => entry.actionId).map((entry) => entry.actionId)).toEqual([
             'task1-input', 'task1-postcondition', 'task2-input',
