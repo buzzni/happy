@@ -433,18 +433,27 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const lossy = new CdpDriver({ browserWsUrl: first.browserWsUrl, browserInstanceIdProvider: async () => `bi-loss-${++n}` as BrowserInstanceId })
             try {
                 const firstId = await lossy.connect()
+                let disconnects = 0
+                lossy.onDisconnect(() => { disconnects++ })
                 const tab = await lossy.openTab(a.url('/plain'), [a.origin], OPTS)
                 const pending = lossy.waitFor(tab.tabId, { kind: 'text', text: 'never-appears' }, [a.origin], { timeoutMs: 30_000 })
+                // Observe the rejection before killing Chrome, so it is never momentarily unhandled.
+                const pendingRejected = expectCode(pending, 'RUNTIME_UNAVAILABLE')
                 await delay(200)
                 await first.kill()
-                await expectCode(pending, 'RUNTIME_UNAVAILABLE')
+                await pendingRejected
                 expect(lossy.hasTab(tab.tabId)).toBe(false)
                 expect(lossy.debugCounts()).toEqual({ tabs: 0, sessions: 0 })
+                expect(disconnects).toBe(1)
+                expect(lossy.isConnected()).toBe(false)
+                expect(() => lossy.browserInstanceId()).toThrow()
                 await expectCode(lossy.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
 
                 second = await launchChrome()
                 const secondId = await lossy.reconnect(second.browserWsUrl)
                 expect(secondId).not.toBe(firstId)
+                expect(lossy.isConnected()).toBe(true)
+                expect(disconnects).toBe(1)
                 expect(lossy.browserInstanceId()).toBe(secondId)
                 expect(lossy.hasTab(tab.tabId)).toBe(false)
                 await expectCode(lossy.observe(tab.tabId, [a.origin], OPTS), 'TARGET_GONE')

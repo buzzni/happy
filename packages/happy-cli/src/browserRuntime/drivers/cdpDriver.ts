@@ -153,6 +153,7 @@ export class CdpDriver implements BrowserDriver {
     private readonly sessions = new Map<string, SessionInfo>()
     private readonly closedTabs = new Set<TabId>()
     private readonly popups = new Map<string, PopupReport>()
+    private readonly disconnectListeners = new Set<() => void>()
 
     constructor(private readonly options: CdpDriverOptions) {
         this.browserWsUrl = options.browserWsUrl
@@ -167,7 +168,10 @@ export class CdpDriver implements BrowserDriver {
         this.conn = conn
         this.wire(conn)
         conn.onClose(() => {
-            if (this.conn === conn) this.dropAllTabs()
+            if (this.conn !== conn) return
+            this.dropAllTabs()
+            this.instanceId = undefined
+            for (const listener of [...this.disconnectListeners]) listener()
         })
         await conn.send('Target.setDiscoverTargets', { discover: true })
         this.instanceId = await this.options.browserInstanceIdProvider()
@@ -186,6 +190,16 @@ export class CdpDriver implements BrowserDriver {
         old?.close()
         this.instanceId = undefined
         return this.connect()
+    }
+
+    /** Called once per lost browser connection (not for an explicit close/reconnect). */
+    onDisconnect(listener: () => void): () => void {
+        this.disconnectListeners.add(listener)
+        return () => this.disconnectListeners.delete(listener)
+    }
+
+    isConnected(): boolean {
+        return this.conn !== undefined && this.instanceId !== undefined
     }
 
     browserInstanceId(): BrowserInstanceId {
