@@ -140,18 +140,8 @@ function studioOrigin(env: NodeJS.ProcessEnv): string | null {
     }
 }
 
-/**
- * Starts the bootstrap in the background and returns a host immediately.
- *
- * The bootstrap makes three authenticated calls. Awaiting them before the
- * first turn meant a cold or slow studio could add its whole budget to that
- * turn on top of the recall budget — and worse, a single slow call lost
- * lessons for the *entire session* rather than for one turn.
- *
- * So the session starts at once with a host whose turn and review surfaces
- * answer `unsupported` until the real one is ready, and every later turn uses
- * it. Nothing blocks, and a slow start costs one turn's recall rather than the
- * session's memory.
+/** Starts in the background; a cold turn may wait at most one readiness budget.
+ * Late startup remains reusable by later turns, and shutdown never awaits it.
  */
 export function createLazyLessonSessionHost(
     input: Parameters<typeof createLessonSessionHost>[0] & {
@@ -164,23 +154,15 @@ export function createLazyLessonSessionHost(
 ): LessonSessionHost {
     let ready: LessonSessionHost | null = null;
     let disposed = false;
-    /*
-     * The raw bootstrap, not the budgeted one.
-     *
-     * `createLessonSessionHost` exists for a caller that must have an answer
-     * before it can continue, so it gives up at its deadline and closes a host
-     * that arrives late. Wrapping it here would mean a studio that took four
-     * seconds once left the whole session without lessons for good. Nothing is
-     * waiting on this, so it runs to whatever conclusion it reaches and the
-     * turn after it lands is the first one that recalls.
-     */
     let starting = false;
     let retryAt = 0;
+    let pending: Promise<void> | undefined;
+    const shutdown = new AbortController();
     const start = () => {
         if (disposed || ready || starting || Date.now() < retryAt) return;
         starting = true;
         // Failure is retried only by later turns, never a background timer.
-        void (async () => {
+        pending = (async () => {
             try {
                 const built = await (input.bootstrap ?? (() => bootstrapLessonSessionHost(input)))();
                 if (built && disposed) {
@@ -198,9 +180,31 @@ export function createLazyLessonSessionHost(
     };
     start();
 
-    /** Starts a bounded retry without putting its network work on the turn path. */
     const settled = () => {
+        if (disposed) return null;
         start();
+        return ready;
+    };
+    const awaitReady = async (signal?: AbortSignal) => {
+        if (signal?.aborted || disposed) return null;
+        const current = settled();
+        if (current || !starting || !pending) return current;
+        const cancelled = AbortSignal.any([shutdown.signal, ...(signal ? [signal] : [])]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let onAbort: () => void = () => undefined;
+        try {
+            await Promise.race([pending, new Promise<void>(resolve => {
+                onAbort = resolve;
+                cancelled.addEventListener('abort', onAbort, { once: true });
+                timer = setTimeout(resolve, input.budgetMs ?? 1_000);
+                if (cancelled.aborted) resolve();
+            })]);
+        } finally {
+            clearTimeout(timer);
+            cancelled.removeEventListener('abort', onAbort);
+        }
+        if (cancelled.aborted) return null;
+        if (!ready && starting) logger.debug('[lesson-host] readiness timeout; later turns can retry');
         return ready;
     };
 
@@ -210,8 +214,9 @@ export function createLazyLessonSessionHost(
         sessionKind: readLessonSessionKind(input.env ?? process.env),
         turn: {
             async recall(args) {
-                const host = settled()?.turn;
-                return host ? host.recall(args) : { outcome: 'unsupported' as const };
+                const host = (await awaitReady(args.signal))?.turn;
+                if (disposed || args.signal?.aborted) return { outcome: 'unsupported' as const };
+                return host ? host.recall(args) : { outcome: starting && !disposed ? 'timeout' as const : 'unsupported' as const };
             },
             async acknowledge(ticket) {
                 const host = ready?.turn;
@@ -220,7 +225,10 @@ export function createLazyLessonSessionHost(
         },
         review: {
             async prepareReviewTurn() {
-                return await settled()?.review?.prepareReviewTurn?.() ?? null;
+                const host = await awaitReady();
+                if (disposed || !host) return null;
+                const prepared = await host.review?.prepareReviewTurn?.();
+                return disposed ? null : prepared ?? null;
             },
             async reviewFinishedTurn(args) {
                 const host = settled()?.review;
@@ -239,6 +247,7 @@ export function createLazyLessonSessionHost(
              * sees it and closes itself in the bootstrap above.
              */
             disposed = true;
+            shutdown.abort();
             const built = ready;
             ready = null;
             await built?.close().catch(() => undefined);

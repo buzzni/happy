@@ -175,7 +175,7 @@ describe('readLessonSessionKind', () => {
 });
 
 describe('lazy bootstrap', () => {
-    it('returns at once and answers unsupported until it is ready', async () => {
+    it('starts at once and bounds a cold first recall', async () => {
         // A studio that never answers: the session must still start now.
         (globalThis as { fetch: typeof fetch }).fetch =
             (() => new Promise<Response>(() => {})) as unknown as typeof fetch;
@@ -188,7 +188,8 @@ describe('lazy bootstrap', () => {
         expect(host.sessionKind).toBe('foreground');
         // Not "no lessons apply" — this host cannot answer yet, and says so.
         expect(await host.turn!.recall({ turnId: 't', query: 'anything' }))
-            .toEqual({ outcome: 'unsupported' });
+            .toEqual({ outcome: 'timeout' });
+        expect(Date.now() - started).toBeLessThan(500);
         expect(await host.review!.reviewFinishedTurn({
             record: {
                 sessionId: 's1', turnId: 't', kind: 'foreground', endedNormally: true,
@@ -227,6 +228,54 @@ describe('lazy bootstrap boundaries', () => {
         return host as LessonSessionHost & { closed: number };
     }
 
+    it('uses a host that becomes ready during the first recall instead of dropping the turn', async () => {
+        const built = stub();
+        let land!: (host: LessonSessionHost) => void;
+        const host = createLazyLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), budgetMs: 100,
+            bootstrap: () => new Promise(resolve => { land = resolve; }),
+        });
+        const first = host.turn!.recall({ turnId: 'first', query: 'runtime version' });
+        land(built);
+        expect(await first).toEqual({ outcome: 'ready' });
+        await host.close();
+    });
+
+    it('does not prepare a review when shutdown wins the ready-host continuation', async () => {
+        const built = stub();
+        const prepare = vi.fn(async () => ({ revision: 1 }));
+        built.review!.prepareReviewTurn = prepare;
+        const host = createLazyLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(),
+            bootstrap: async () => built,
+        });
+        await host.turn!.recall({ turnId: 'ready', query: 'runtime version' });
+        const pending = host.review!.prepareReviewTurn!();
+        await host.close();
+        expect(await pending).toBeNull();
+        expect(prepare).not.toHaveBeenCalled();
+    });
+
+    it.each(['abort', 'close'] as const)('does not deliver a late first-turn recall after %s', async action => {
+        const built = stub();
+        const recall = vi.spyOn(built.turn!, 'recall');
+        let land!: (host: LessonSessionHost) => void;
+        const host = createLazyLessonSessionHost({
+            accountToken: 'token', machineId: 'm1', sessionId: 's1',
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), budgetMs: 100,
+            bootstrap: () => new Promise(resolve => { land = resolve; }),
+        });
+        const controller = new AbortController();
+        const first = host.turn!.recall({ turnId: 'first', query: 'version', signal: controller.signal });
+        if (action === 'abort') controller.abort(); else await host.close();
+        land(built);
+        expect((await first).outcome).not.toBe('selected');
+        expect(recall).not.toHaveBeenCalled();
+        await host.close();
+    });
+
     it.each(['recall', 'review'] as const)('retries a failed bootstrap on later %s with backoff and singleflight', async (surface) => {
         const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000);
         const built = stub();
@@ -236,7 +285,7 @@ describe('lazy bootstrap boundaries', () => {
             .mockImplementation(() => new Promise((resolve) => { land = resolve; }));
         const host = createLazyLessonSessionHost({
             accountToken: 'token', machineId: 'm1', sessionId: 's1',
-            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), bootstrap,
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), bootstrap, budgetMs: 5,
         });
         const call = () => surface === 'recall'
             ? host.turn!.recall({ turnId: 't', query: 'x' })
@@ -273,7 +322,7 @@ describe('lazy bootstrap boundaries', () => {
             .mockImplementation(() => new Promise((resolve) => { land = resolve; }));
         const host = createLazyLessonSessionHost({
             accountToken: 'token', machineId: 'm1', sessionId: 's1',
-            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), bootstrap,
+            happyHomeDir: '/tmp/happy-lesson-bootstrap', env: env(), bootstrap, budgetMs: 5,
         });
         try {
             await new Promise((resolve) => setTimeout(resolve, 0));
@@ -310,7 +359,7 @@ describe('lazy bootstrap boundaries', () => {
             bootstrap: () => new Promise((resolve) => { land = () => resolve(built); }),
         });
         await new Promise((resolve) => setTimeout(resolve, 20));
-        expect(await host.turn!.recall({ turnId: 't', query: 'x' })).toEqual({ outcome: 'unsupported' });
+        expect(await host.turn!.recall({ turnId: 't', query: 'x' })).toEqual({ outcome: 'timeout' });
 
         land();
         await new Promise((resolve) => setTimeout(resolve, 0));

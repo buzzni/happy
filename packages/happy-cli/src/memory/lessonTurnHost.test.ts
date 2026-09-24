@@ -131,11 +131,26 @@ describe('lesson input delivery boundaries', () => {
         expect(deps.onOutcome).not.toHaveBeenCalledWith('delivered');
     });
 
+    it('delivers references for every selected lesson when full bodies exceed the budget', async () => {
+        const { deps, host } = fixture();
+        deps.host.service.recall.mockResolvedValue({ outcome: 'selected', traceId: 'large',
+            lessonIds: ['l', 'large'], lessons: [lesson, { ...lesson, lessonId: 'large', steps: ['x'.repeat(1600)] }] });
+        const result = await host.recall({ turnId: 'large', query: 'port already bound' });
+        expect(result.outcome).toBe('selected');
+        if (result.outcome !== 'selected') throw new Error('missing reference block');
+        expect(result.block).toContain('mem-lesson-get l revision 1');
+        expect(result.block).toContain('mem-lesson-get large revision 1');
+        expect(result.block).toContain('Read the full lesson before applying');
+        expect(Buffer.byteLength(result.block)).toBeLessThanOrEqual(1500);
+        expect(result.ticket.lessonIds).toEqual(['l', 'large']);
+        expect(await host.acknowledge(result.ticket)).toBe(true);
+    });
+
     it('keeps validation in the block and rejects a selected set that cannot fit', async () => {
         const { deps, host } = fixture();
         const first = await host.recall({ turnId: 't', query: 'port already bound' });
         expect(first.outcome === 'selected' && first.block).toContain('Probe the port');
-        deps.host.service.recall.mockResolvedValue({ outcome: 'selected', traceId: 'large', lessonIds: ['l', 'large'], lessons: [lesson, { ...lesson, lessonId: 'large', steps: ['x'.repeat(1600)] }] });
+        deps.host.service.recall.mockResolvedValue({ outcome: 'selected', traceId: 'large', lessonIds: ['l', 'large'], lessons: [lesson, { ...lesson, lessonId: 'large', name: 'x'.repeat(1600), steps: [] }] });
         expect(await host.recall({ turnId: 't2', query: 'port already bound' })).toEqual({ outcome: 'budget_exceeded' });
         expect(deps.host.service.ackDelivery).not.toHaveBeenCalled();
     });
