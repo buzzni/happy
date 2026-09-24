@@ -378,3 +378,21 @@ export async function cleanupTask(suite: SuiteStack, agent: RuntimeClient, taskI
 }
 
 export { PROFILE_A }
+
+/** A task with one tab on an already released /barrier page, answer form visible. */
+export async function openReleasedBarrier(suite: SuiteStack, agent: RuntimeClient, taskSpaceId: TaskSpaceId, key: string, nonce: string) {
+    await suite.stack.releaseBarrier(key, nonce)
+    const task = await agent.createTask({ taskSpaceId, requestId: rid() })
+    const opened = await agent.openPage({ taskId: task.taskId, url: barrierUrl(SITE_A, suite.run, key), requestId: rid() })
+    const refs = await observeBarrierRefs(agent, task.taskId, opened.tabId)
+    return { task, opened, tabId: opened.tabId, refs }
+}
+
+/** waitFor nonce → fill answer → click submit; one ledgered answer per run of this batch. */
+export function answerSteps(tabId: TabId, refs: BarrierRefs, nonce: string, tag = randomBytes(3).toString('hex')) {
+    return [
+        { stepId: sid('wait'), actionId: `wait-${tag}` as ActionId, tabId, kind: 'waitFor' as const, until: { kind: 'text' as const, text: 'NONCE:' }, timeoutMs: 20_000 },
+        { stepId: sid('fill'), actionId: `fill-${tag}` as ActionId, tabId, kind: 'fill' as const, ref: refs.input, value: nonce, timeoutMs: 10_000 },
+        { stepId: sid('click'), actionId: `click-${tag}` as ActionId, tabId, kind: 'click' as const, ref: refs.submit, timeoutMs: 10_000 },
+    ]
+}
