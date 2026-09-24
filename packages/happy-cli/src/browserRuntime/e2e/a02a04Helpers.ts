@@ -165,16 +165,25 @@ export function mintInteractive(stack: PocStack, capability: { profileId?: Grant
 }
 
 /** Cancel (if needed) and close the task's space so the per-profile space limit (2) is not exhausted. */
-export async function cleanupTask(client: RuntimeClient, taskId: TaskId, taskSpaceId: TaskSpaceId): Promise<void> {
+export async function cleanupTask(client: RuntimeClient, taskId: TaskId, taskSpaceId: TaskSpaceId,
+    reconcile?: (taskId: TaskId, actionId: ActionId) => Promise<unknown>): Promise<void> {
+    let task: TaskView | undefined
     try {
-        const task = await client.getTask({ taskId })
+        task = await client.getTask({ taskId })
         if (!['succeeded', 'failed', 'cancelled'].includes(task.status)) {
             await client.cancel({ taskId, requestId: rid() })
-            await waitForTask(client, taskId, (t) => ['succeeded', 'failed', 'cancelled'].includes(t.status), 15_000)
+            task = await waitForTask(client, taskId, (t) => ['succeeded', 'failed', 'cancelled'].includes(t.status)
+                || t.uncertainActions.length > 0, 15_000)
+            // An aborted in-flight action stays uncertain; the trusted harness resolves it from the fixture ledger.
+            if (reconcile && task.uncertainActions.length) {
+                for (const actionId of task.uncertainActions) await reconcile(taskId, actionId)
+                task = await waitForTask(client, taskId, (t) => ['succeeded', 'failed', 'cancelled'].includes(t.status), 15_000)
+            }
         }
         await client.closeSpace({ taskSpaceId, requestId: rid() })
     } catch (error) {
-        console.log(JSON.stringify({ cleanupFailed: taskId, code: (error as { code?: string }).code }))
+        console.log(JSON.stringify({ cleanupFailed: taskId, code: (error as { code?: string }).code, status: task?.status,
+            pauseReason: task?.pauseReason, uncertain: task?.uncertainActions.length }))
     }
 }
 
