@@ -348,6 +348,8 @@ export interface BrowserDriver {
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle>
     closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }>
     hasTab(tabId: TabId): boolean
+    /** Reattach a persisted tab after a Runtime-only restart; callers verify browserInstanceId first. */
+    adoptTab?(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean>
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }>
     observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation>
     screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult>
@@ -393,7 +395,7 @@ export type SubscribeResult =
 
 export interface OpenPageResult { tabId: TabId; actionId: ActionId; url: string; task: TaskView }
 export interface CancelResult { status: 'cancel-accepted'; task: TaskView; fenceAckMs: number }
-export interface ControlResult { leaseEpoch: number; owner: InputOwner; task: TaskView }
+export interface ControlResult { leaseEpoch: number; owner: InputOwner; task: TaskView; settling?: boolean }
 export interface ApproveResult { outcome: 'approved' | 'rejected'; task: TaskView; batch?: BatchResult }
 
 export type InputOwner =

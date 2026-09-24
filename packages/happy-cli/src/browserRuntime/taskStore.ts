@@ -18,6 +18,7 @@ import {
     type TaskId,
     type TaskSpaceId,
     type TaskView,
+    type InputOwner,
 } from './contracts'
 export interface ActionRecord {
     state: ActionState
@@ -64,6 +65,8 @@ export interface StoredTask extends TaskView {
     nextSafeStep?: number
     runtimeFingerprint?: string
     documentGenerations?: Record<string, number>
+    tabTargets?: Record<string, string>
+    tabLeaseEpochs?: Record<string, number>
     [key: string]: unknown
 }
 export interface StoreEventInput extends Omit<TaskEvent, 'seq' | 'schemaVersion' | 'taskId' | 'stateVersion'> {
@@ -75,6 +78,10 @@ export interface SpaceRecord {
     profileId: ProfileId
     createdAtMs: number
     tabs: TabId[]
+    goneTabs?: TabId[]
+    tabTargets?: Record<string, string>
+    tabLeaseEpochs?: Record<string, number>
+    profileUserOwner?: { tabId: TabId; owner: Extract<InputOwner, { kind: 'user' }> } | null
     closed?: boolean
     owner?: {
         principalId: string

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, PendingApprovalSummary, TaskId } from './contracts'
-import { approvalBinding, payloadHash } from './policy'
+import { approvalBinding, payloadHash, redact, type FormValue } from './policy'
 import type { ApprovalRecord } from './taskStore'
 
 export function createApproval(input: {
@@ -14,9 +14,15 @@ export function createApproval(input: {
     browserInstanceId: BrowserInstanceId
     documentGeneration: number
     expiresAtMs: number
+    elementName?: string
+    formValues?: FormValue[]
 }): { summary: PendingApprovalSummary; record: ApprovalRecord } {
     const approvalId = `approval-${randomUUID()}` as ApprovalId
-    const stepHash = payloadHash(input.step)
+    const stepHash = payloadHash({ step: input.step, formValues: input.formValues ?? [] })
+    const formSummary = (input.formValues ?? [])
+        .map(({ name, value }) => `${name}=${redact(value)}`)
+        .join(', ')
+    const targetName = input.elementName ? ` "${redact(input.elementName)}"` : ` ${input.step.kind}`
     const bindingHash = approvalBinding({
         principalId: input.grant.principalId,
         workspaceId: input.grant.workspaceId,
@@ -33,7 +39,7 @@ export function createApproval(input: {
         approvalId,
         actionId: input.step.actionId,
         origin: input.origin,
-        description: `Confirm ${input.step.kind}`,
+        description: `Confirm${targetName}${formSummary ? ` (${formSummary})` : ''}`,
         bindingHash,
         expiresAtMs: input.expiresAtMs,
     }
