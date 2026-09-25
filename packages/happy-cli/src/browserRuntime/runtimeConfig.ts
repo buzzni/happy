@@ -24,6 +24,8 @@ const profileSchema = z.object({
     /** Browser container endpoints; may instead come from ABP_PROFILES. */
     cdpHttpUrl: z.string().url().optional(),
     instanceUrl: z.string().url().optional(),
+    /** x11vnc of the browser container on the profile network (`host:port`), for the Runtime viewer. */
+    vncAddress: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}:\d{1,5}$/, 'must be host:port').optional(),
 }).strict()
 
 const schema = z.object({
@@ -43,6 +45,8 @@ const schema = z.object({
     brokerSocketGid: z.number().int().nonnegative().optional(),
     /** SHA-256 (hex) of the daemon token installed at /var/lib/abp/daemon-token. */
     daemonTokenSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+    /** Machine tunnel origins the viewer WebSocket accepts besides the Runtime's own loopback origin. */
+    viewerOrigins: z.array(origin).default([]),
     maxAgentWindows: z.number().int().min(1).max(16).default(4),
     retentionDays: z.number().int().min(1).max(365).default(7),
 }).strict().superRefine((config, ctx) => {

@@ -11,6 +11,35 @@ export class InputLeaseManager {
     private readonly tabs = new Map<TabId, TabLease>()
     private readonly taskTabs = new Map<TaskId, Set<TabId>>()
     private readonly pendingTakeovers = new Map<TabId, PendingTakeover>()
+    private readonly listeners = new Set<() => void>()
+    private readonly externalFences = new Map<symbol, ProfileId>()
+
+    /**
+     * Keeps agent input off the profile until the returned function is called
+     * (idempotent). The viewer holds this while x11vnc may still be consuming
+     * human input written before control was lost (D2).
+     */
+    fenceProfile(profileId: ProfileId): () => void {
+        const token = Symbol('fence')
+        this.externalFences.set(token, profileId)
+        return () => { this.externalFences.delete(token) }
+    }
+
+    /** Called after every lease change; viewer connections re-check their control here (D2). */
+    subscribe(listener: () => void): () => void {
+        this.listeners.add(listener)
+        return () => { this.listeners.delete(listener) }
+    }
+
+    /** The profile's user-owned tabs, and whether a takeover still waits for an in-flight driver call. */
+    userControl(profileId: ProfileId): { tabs: Array<{ tabId: TabId; leaseEpoch: number; owner: Extract<InputOwner, { kind: 'user' }> }>; settling: boolean } {
+        const tabs: Array<{ tabId: TabId; leaseEpoch: number; owner: Extract<InputOwner, { kind: 'user' }> }> = []
+        for (const [tabId, lease] of this.tabs) {
+            if (lease.profileId === profileId && lease.owner.kind === 'user') tabs.push({ tabId, leaseEpoch: lease.epoch, owner: structuredClone(lease.owner) })
+        }
+        const settling = [...this.pendingTakeovers.keys()].some((tabId) => this.tabs.get(tabId)?.profileId === profileId)
+        return { tabs, settling }
+    }
 
     acquire(tabId: TabId, profileId: ProfileId, owner: Extract<InputOwner, { kind: 'agent' }>): number {
         if (this.isUserFenced(profileId)) throw new BrowserRuntimeError('STALE_LEASE', 'User input fences the whole profile')
@@ -20,6 +49,7 @@ export class InputLeaseManager {
         }
         lease.owner = owner
         this.taskTabs.set(owner.taskId, (this.taskTabs.get(owner.taskId) ?? new Set()).add(tabId))
+        this.changed()
         return lease.epoch
     }
 
@@ -27,6 +57,7 @@ export class InputLeaseManager {
         const lease = this.get(tabId, profileId)
         lease.epoch = Math.max(lease.epoch, previousEpoch) + 1
         lease.owner = structuredClone(owner)
+        this.changed()
         return lease.epoch
     }
 
@@ -36,6 +67,7 @@ export class InputLeaseManager {
         const lease = this.get(tabId, profileId)
         lease.epoch += 1
         lease.owner = owner
+        this.changed()
         return lease.epoch
     }
 
@@ -49,6 +81,7 @@ export class InputLeaseManager {
         lease.epoch += 1
         lease.owner = { kind: 'none' }
         this.pendingTakeovers.set(tabId, { taskId, owner })
+        this.changed()
         return lease.epoch
     }
 
@@ -64,6 +97,7 @@ export class InputLeaseManager {
             this.pendingTakeovers.delete(tabId)
             completed.push({ tabId, owner: structuredClone(lease.owner), leaseEpoch: lease.epoch })
         }
+        if (completed.length) this.changed()
         return completed
     }
 
@@ -72,6 +106,7 @@ export class InputLeaseManager {
         this.pendingTakeovers.delete(tabId)
         lease.epoch += 1
         lease.owner = { kind: 'none' }
+        this.changed()
         return lease.epoch
     }
 
@@ -92,11 +127,15 @@ export class InputLeaseManager {
                 revoked.push({ tabId, leaseEpoch: this.release(tabId, lease.profileId) })
             }
         }
+        let settledPending = false
         for (const [tabId, pending] of this.pendingTakeovers) {
-            if (pending.taskId === taskId)
+            if (pending.taskId === taskId) {
                 this.pendingTakeovers.delete(tabId)
+                settledPending = true
+            }
         }
         this.taskTabs.delete(taskId)
+        if (settledPending) this.changed()
         return revoked
     }
 
@@ -106,8 +145,16 @@ export class InputLeaseManager {
     }
 
     isUserFenced(profileId: ProfileId): boolean {
-        return [...this.tabs.values()].some((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
+        return [...this.externalFences.values()].includes(profileId)
+            || [...this.tabs.values()].some((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
             || [...this.pendingTakeovers.keys()].some((tabId) => this.tabs.get(tabId)?.profileId === profileId)
+    }
+
+    private changed(): void {
+        for (const listener of [...this.listeners]) {
+            // A listener fault must never interrupt a lease transition.
+            try { listener() } catch { /* ignored */ }
+        }
     }
 
     private get(tabId: TabId, profileId: ProfileId): TabLease {

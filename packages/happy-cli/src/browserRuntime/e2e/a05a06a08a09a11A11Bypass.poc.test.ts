@@ -246,7 +246,7 @@ describe('A11 bypass, origin and secrets', () => {
         const cdpExposed = Object.entries(ports).filter(([, v]) => /(^|\D)(9222|9223|9224)\/tcp/.test(v))
         const evaluateOp = await rawOp(stack, 'evaluate', { expression: '1' }, { authorization: `Bearer ${mintAgent(stack).token}` })
         const agentOps = await rawOp(stack, 'submitBatch', { taskId: 'task-x', expectedVersion: 0, requestId: rid(), steps: [{ stepId: 's', actionId: 'a', tabId: 't', kind: 'evaluate', timeoutMs: 1000 }] }, { authorization: `Bearer ${mintAgent(stack).token}` })
-        const security = await vncSecurityTypes(stack.env.ports.novncA).catch((e: Error) => [`error:${e.message}`] as unknown as number[])
+        const security = await vncSecurityTypes(stack.env.ports.novncA!).catch((e: Error) => [`error:${e.message}`] as unknown as number[])
         evidence('A11', { path: 'raw-surfaces', i, ports, cdpExposed: cdpExposed.length, evaluateOp: `${evaluateOp.status}:${evaluateOp.json.error?.code}`, evaluateStep: `${agentOps.status}:${agentOps.json.error?.code}`, vncSecurityTypes: security })
         expect(cdpExposed, 'no CDP / instance port may be published to the host').toEqual([])
         expect(evaluateOp.status).toBe(404)
