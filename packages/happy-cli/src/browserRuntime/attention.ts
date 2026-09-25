@@ -9,8 +9,14 @@
  * Durability: the task journal is the source of truth. A crash between a task
  * commit and the outbox write is repaired by `reconcile()` at start-up, which
  * appends any tagged task event newer than the outbox's per-task cursor.
- * The daemon reads the feed over the broker socket and deduplicates delivery
- * by `abp-<taskId>-<eventSeq>`.
+ * Readers only ever see sequences that are already on disk, so a sequence a
+ * daemon acknowledged is never reassigned by that repair; a failed write is
+ * retried. The daemon reads the feed over the broker socket and deduplicates
+ * delivery by `abp-<taskId>-<eventSeq>`.
+ *
+ * `unresolved` keeps each task's latest attention entry until an agent batch
+ * follows it, independent of the bounded event retention, so the
+ * expired-cursor snapshot never loses a task that still needs its agent.
  */
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
@@ -21,6 +27,7 @@ import type { StoredTask, TaskStore } from './taskStore'
 const FILE = 'attention.json'
 const SCHEMA_VERSION = 1
 const DEFAULT_MAX_EVENTS = 1_000
+const DEFAULT_RETRY_MS = 1_000
 
 interface OutboxFile {
     schemaVersion: number
@@ -28,6 +35,8 @@ interface OutboxFile {
     events: AttentionEvent[]
     /** Highest task event seq already recorded, per task. */
     taskCursors: Record<string, number>
+    /** Latest attention entry per task that no agent batch has followed yet. */
+    unresolved?: Record<string, AttentionEvent>
 }
 
 function attentionReason(event: TaskEvent): AttentionReason | undefined {
@@ -39,10 +48,18 @@ export class AttentionOutbox {
     private store?: TaskStore
     private writeTail: Promise<void> = Promise.resolve()
     private readonly waiters = new Set<() => void>()
+    /** Highest sequence on disk; nothing above it is visible to readers. */
+    private durableSeq: number
+    private dirty = false
+    private closed = false
+    private retryTimer?: NodeJS.Timeout
+    private detach?: () => void
 
-    private constructor(private readonly stateDir: string, private readonly maxEvents: number, private state: OutboxFile) { }
+    private constructor(private readonly stateDir: string, private readonly maxEvents: number, private readonly retryMs: number, private state: OutboxFile) {
+        this.durableSeq = state.lastSeq
+    }
 
-    static async open(stateDir: string, options: { maxEvents?: number } = {}): Promise<AttentionOutbox> {
+    static async open(stateDir: string, options: { maxEvents?: number; retryMs?: number } = {}): Promise<AttentionOutbox> {
         let state: OutboxFile = { schemaVersion: SCHEMA_VERSION, lastSeq: 0, events: [], taskCursors: {} }
         try {
             const parsed = JSON.parse(await readFile(join(stateDir, FILE), 'utf8')) as OutboxFile
@@ -51,13 +68,15 @@ export class AttentionOutbox {
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error instanceof BrowserRuntimeError ? error : new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Attention outbox is unreadable')
         }
-        return new AttentionOutbox(stateDir, options.maxEvents ?? DEFAULT_MAX_EVENTS, state)
+        // Files written before `unresolved` existed: the retained events are all that is known.
+        state.unresolved ??= Object.fromEntries(state.events.map((event) => [event.taskId, event]))
+        return new AttentionOutbox(stateDir, options.maxEvents ?? DEFAULT_MAX_EVENTS, options.retryMs ?? DEFAULT_RETRY_MS, state)
     }
 
     /** Start recording tagged commits of `store`. */
     attach(store: TaskStore): void {
         this.store = store
-        store.onCommitted((task, event) => this.record(task, event))
+        this.detach = store.onCommitted((task, event) => this.record(task, event))
     }
 
     /** Append tagged task events that the outbox missed (crash between commit and outbox write). */
@@ -69,15 +88,18 @@ export class AttentionOutbox {
     }
 
     read(afterSeq: number): AttentionFeed {
-        const oldestSeq = this.state.events[0]?.seq ?? this.state.lastSeq + 1
-        if (afterSeq + 1 < oldestSeq || afterSeq > this.state.lastSeq) {
-            return { code: 'CURSOR_EXPIRED', events: [], snapshot: this.snapshot(), nextSeq: this.state.lastSeq, oldestSeq }
+        const visible = this.state.events.filter((event) => event.seq <= this.durableSeq)
+        const oldestSeq = visible[0]?.seq ?? this.durableSeq + 1
+        // Expired only when events between the cursor and the oldest retained one were
+        // dropped: afterSeq = oldestSeq - 1 (e.g. 0 with oldestSeq 1) has no gap.
+        if (afterSeq + 1 < oldestSeq || afterSeq > this.durableSeq) {
+            return { code: 'CURSOR_EXPIRED', events: [], snapshot: this.snapshot(), nextSeq: this.durableSeq, oldestSeq }
         }
-        const events = this.state.events.filter((event) => event.seq > afterSeq)
+        const events = visible.filter((event) => event.seq > afterSeq)
         return { events: structuredClone(events), nextSeq: events.at(-1)?.seq ?? afterSeq, oldestSeq }
     }
 
-    /** Long poll: resolves as soon as an event after `afterSeq` exists, or after waitMs. */
+    /** Long poll: resolves as soon as a durable event after `afterSeq` exists, or after waitMs. */
     async wait(afterSeq: number, waitMs: number): Promise<AttentionFeed> {
         const first = this.read(afterSeq)
         if ('code' in first || first.events.length > 0 || waitMs <= 0) return first
@@ -89,34 +111,73 @@ export class AttentionOutbox {
         return this.read(afterSeq)
     }
 
-    /** Resolves once every recorded event is durable. */
-    flush(): Promise<void> { return this.writeTail }
+    /** Resolves once every recorded event is durable; rejects if the write fails (it is retried). */
+    flush(): Promise<void> { return this.write() }
 
-    private record(task: StoredTask, event: TaskEvent): void {
-        const reason = attentionReason(event)
-        if (event.seq <= (this.state.taskCursors[task.taskId] ?? 0)) return
-        this.state.taskCursors[task.taskId] = event.seq
-        if (!reason) return
-        const seq = this.state.lastSeq + 1
-        this.state.lastSeq = seq
-        this.state.events = [...this.state.events, { seq, taskId: task.taskId as TaskId, agentSessionId: task.agentSessionId,
-            status: task.status, eventSeq: event.seq, reason }].slice(-this.maxEvents)
-        const snapshot = structuredClone(this.state)
-        // A failed write is retried by the next record; reconcile() repairs a crash.
-        this.writeTail = this.writeTail.then(() => this.persist(snapshot)).catch(() => undefined)
+    /** Stop recording and writing (shutdown, or a simulated crash in tests). */
+    close(): void {
+        this.closed = true
+        this.detach?.()
+        clearTimeout(this.retryTimer)
         for (const wake of [...this.waiters]) wake()
     }
 
-    /** Latest attention entry per task that no agent batch has followed since. */
+    private record(task: StoredTask, event: TaskEvent): void {
+        if (this.closed) return
+        const reason = attentionReason(event)
+        if (event.seq <= (this.state.taskCursors[task.taskId] ?? 0)) return
+        this.state.taskCursors[task.taskId] = event.seq
+        const unresolved = this.state.unresolved ??= {}
+        if (event.type === 'batch-accepted' && unresolved[task.taskId]) {
+            delete unresolved[task.taskId]
+            this.dirty = true
+        }
+        if (reason) {
+            const seq = this.state.lastSeq + 1
+            const entry: AttentionEvent = { seq, taskId: task.taskId as TaskId, agentSessionId: task.agentSessionId, status: task.status, eventSeq: event.seq, reason }
+            this.state.lastSeq = seq
+            this.state.events = [...this.state.events, entry].slice(-this.maxEvents)
+            unresolved[task.taskId] = entry
+            this.dirty = true
+        }
+        if (this.dirty) void this.write().catch(() => undefined)
+    }
+
+    /** Persist the current state if it changed; readers are woken only once it is on disk. */
+    private write(): Promise<void> {
+        const run = this.writeTail.catch(() => undefined).then(async () => {
+            if (!this.dirty || this.closed) return
+            const snapshot = structuredClone(this.state)
+            this.dirty = false
+            try {
+                await this.persist(snapshot)
+            } catch (error) {
+                this.dirty = true
+                this.scheduleRetry()
+                throw error
+            }
+            this.durableSeq = Math.max(this.durableSeq, snapshot.lastSeq)
+            for (const wake of [...this.waiters]) wake()
+        })
+        this.writeTail = run
+        return run
+    }
+
+    private scheduleRetry(): void {
+        if (this.retryTimer || this.closed) return
+        this.retryTimer = setTimeout(() => { this.retryTimer = undefined; void this.write().catch(() => undefined) }, this.retryMs)
+        this.retryTimer.unref()
+    }
+
+    /** Durable unresolved entries whose task still needs its agent. */
     private snapshot(): AttentionEvent[] {
-        const latest = new Map<string, AttentionEvent>()
-        for (const event of this.state.events) latest.set(event.taskId, event)
-        return [...latest.values()].filter((entry) => {
+        return Object.values(this.state.unresolved ?? {}).filter((entry) => {
+            if (entry.seq > this.durableSeq) return false
             const task = this.store?.getTask(entry.taskId)
             if (!task) return false
             const handled = (this.store?.events(entry.taskId, entry.eventSeq) ?? []).some((event) => event.type === 'batch-accepted')
             return !handled && (!(TERMINAL_STATUSES as readonly string[]).includes(task.status) || entry.reason === 'approval-rejected')
-        }).map((entry) => structuredClone(entry))
+        }).sort((left, right) => left.seq - right.seq).map((entry) => structuredClone(entry))
     }
 
     private async persist(state: OutboxFile): Promise<void> {

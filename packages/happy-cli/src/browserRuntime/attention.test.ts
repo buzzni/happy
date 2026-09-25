@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -73,6 +73,95 @@ describe('AttentionOutbox', () => {
         expect(expired).toMatchObject({ code: 'CURSOR_EXPIRED', events: [], nextSeq: 3, oldestSeq: 2 })
         expect('snapshot' in expired && expired.snapshot.map((entry) => `${entry.taskId}:${entry.reason}`)).toEqual(['t1:approval-approved'])
         expect(outbox.read(9)).toMatchObject({ code: 'CURSOR_EXPIRED' })
+        await store.close()
+    })
+
+    it('treats afterSeq = oldestSeq - 1 as no gap: a cursor expires only when afterSeq + 1 < oldestSeq', async () => {
+        const dir = await tempDir()
+        const store = await TaskStore.open(dir)
+        const outbox = await AttentionOutbox.open(dir, { maxEvents: 2 })
+        outbox.attach(store)
+        // Fresh outbox: nothing was ever evicted, so the daemon's initial cursor 0 is valid with oldestSeq 1.
+        expect(outbox.read(0)).toEqual({ events: [], nextSeq: 0, oldestSeq: 1 })
+        await store.createTask(storedTask('t1'), { type: 'task-created', atMs: 1, leaseEpoch: 0, data: {} })
+        for (const reason of ['takeover-released', 'user-resumed', 'approval-approved']) await store.commit('t1' as TaskId, {}, attentionEvent(reason))
+        await outbox.flush()
+        // seq 1 was evicted (oldestSeq 2): a daemon that already read seq 1 missed nothing...
+        expect(outbox.read(1)).not.toHaveProperty('code')
+        // ...one that stopped at 0 did.
+        expect(outbox.read(0)).toHaveProperty('code', 'CURSOR_EXPIRED')
+        await store.close()
+    })
+
+    it('exposes an event only once it is durable, and retries a failed outbox write', async () => {
+        const dir = await tempDir()
+        const store = await TaskStore.open(dir)
+        const outbox = await AttentionOutbox.open(dir, { retryMs: 3_600_000 })
+        outbox.attach(store)
+        await store.createTask(storedTask('t1'), { type: 'task-created', atMs: 1, leaseEpoch: 0, data: {} })
+        await chmod(dir, 0o500)
+        try {
+            await store.commit('t1' as TaskId, {}, attentionEvent('user-resumed'))
+            await expect(outbox.flush()).rejects.toThrow()
+            expect(outbox.read(0)).toEqual({ events: [], nextSeq: 0, oldestSeq: 1 })
+            expect((await outbox.wait(0, 20)).events).toEqual([])
+        } finally {
+            await chmod(dir, 0o700)
+        }
+        await outbox.flush()
+        expect(outbox.read(0).events.map((event) => `${event.seq}:${event.reason}`)).toEqual(['1:user-resumed'])
+        outbox.close()
+        await store.close()
+    })
+
+    it('never reassigns a sequence the daemon already acknowledged when a crash loses an undurable event', async () => {
+        const dir = await tempDir()
+        const store = await TaskStore.open(dir)
+        const outbox = await AttentionOutbox.open(dir, { retryMs: 3_600_000 })
+        outbox.attach(store)
+        for (const taskId of ['t-a', 't-b']) await store.createTask(storedTask(taskId), { type: 'task-created', atMs: 1, leaseEpoch: 0, data: {} })
+        await store.commit('t-b' as TaskId, {}, attentionEvent('takeover-released'))
+        await outbox.flush()
+        const acknowledged = outbox.read(0)
+        expect('code' in acknowledged ? [] : acknowledged.events.map((event) => `${event.seq}:${event.taskId}`)).toEqual(['1:t-b'])
+        const cursor = acknowledged.nextSeq
+
+        await chmod(dir, 0o500)
+        try {
+            await store.commit('t-a' as TaskId, {}, attentionEvent('approval-approved'))
+            await outbox.flush().catch(() => undefined)
+            expect(outbox.read(cursor)).toEqual({ events: [], nextSeq: cursor, oldestSeq: 1 })
+        } finally {
+            // Crash: the outbox dies with t-a's event only in the task journal.
+            outbox.close()
+            await chmod(dir, 0o700)
+        }
+        const recovered = await AttentionOutbox.open(dir)
+        recovered.attach(store)
+        await recovered.reconcile()
+        expect(recovered.read(cursor)).toMatchObject({ events: [{ seq: 2, taskId: 't-a', reason: 'approval-approved' }], nextSeq: 2 })
+        await store.close()
+    })
+
+    it('keeps an unresolved task in the expired-cursor snapshot after its event left retention, until an agent batch follows it', async () => {
+        const dir = await tempDir()
+        const store = await TaskStore.open(dir)
+        const outbox = await AttentionOutbox.open(dir, { maxEvents: 2 })
+        outbox.attach(store)
+        for (const taskId of ['t1', 't2']) await store.createTask(storedTask(taskId), { type: 'task-created', atMs: 1, leaseEpoch: 0, data: {} })
+        await store.commit('t1' as TaskId, {}, attentionEvent('approval-approved'))
+        for (const reason of ['takeover-released', 'user-resumed']) await store.commit('t2' as TaskId, {}, attentionEvent(reason))
+        await outbox.flush()
+        const snapshot = (feed: ReturnType<AttentionOutbox['read']>) => 'snapshot' in feed ? feed.snapshot.map((entry) => `${entry.taskId}:${entry.reason}`).sort() : []
+        expect(outbox.read(1)).toMatchObject({ events: [{ seq: 2 }, { seq: 3 }] })
+        expect(snapshot(outbox.read(0))).toEqual(['t1:approval-approved', 't2:user-resumed'])
+
+        await store.commit('t2' as TaskId, {}, { type: 'batch-accepted', atMs: 3, leaseEpoch: 0, data: {} })
+        await outbox.flush()
+        expect(snapshot(outbox.read(0))).toEqual(['t1:approval-approved'])
+        const reopened = await AttentionOutbox.open(dir, { maxEvents: 2 })
+        reopened.attach(store)
+        expect(snapshot(reopened.read(0))).toEqual(['t1:approval-approved'])
         await store.close()
     })
 
