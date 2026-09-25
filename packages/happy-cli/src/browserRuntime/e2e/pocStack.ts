@@ -27,6 +27,7 @@ import {
     type WorkspaceId,
 } from '../contracts'
 import { RuntimeClient } from '../runtimeClient'
+import { fixtureSitePolicies } from '../testing/fixtureSitePolicy'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const ISSUE_BACKDATE_MS = 5_000
@@ -116,6 +117,8 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
             { profileId: PROFILE_A, cdpHttpUrl: 'http://browser-a:9223', instanceUrl: 'http://browser-a:9224/instance' },
             { profileId: PROFILE_B, cdpHttpUrl: 'http://browser-b:9223', instanceUrl: 'http://browser-b:9224/instance' },
         ]),
+        // Harness mode: the synthetic fixture's explicit site policy (PoC classifier parity).
+        ABP_SITE_POLICY: JSON.stringify(fixtureSitePolicies([SITE_A, SITE_B, SITE_C])),
     }), { mode: 0o600 })
     const bundle = options.bundle ?? buildRuntimeBundle()
     poc(['up', '--run', run, '--runtime-bundle', bundle, '--runtime-env', runtimeEnvFile, '--runtime-keys', keysFile])

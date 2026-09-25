@@ -13,6 +13,7 @@
  *   ABP_RUNTIME_HOST/PORT    task API bind (default 0.0.0.0:8787 in the container)
  *   ABP_ADMIN_PORT           admin API port (default 8788)
  *   ABP_MAX_AGENT_WINDOWS    optional, agent windows per profile (default 4, at most the tab quota)
+ *   ABP_SITE_POLICY          JSON sites[] (policy.parseSitePolicies): allowed origins and their action policy
  */
 import { readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
@@ -20,6 +21,7 @@ import { timingSafeEqual } from 'node:crypto'
 import { verifyToken, type AuthKeys } from './auth'
 import { BrowserRuntimeError, POC_LIMITS, type ActionId, type BrowserInstanceId, type GrantId, type ProfileId, type TaskId } from './contracts'
 import { CdpDriver, DEFAULT_MAX_AGENT_WINDOWS } from './drivers/cdpDriver'
+import { parseSitePolicies, type SitePolicy } from './policy'
 import { BrowserRuntime } from './runtime'
 import { startRuntimeServer } from './server'
 import { TaskStore } from './taskStore'
@@ -109,6 +111,16 @@ function maxAgentWindows(): number {
     return value
 }
 
+/** Required: without a site policy nothing may be opened, so refuse to start instead. */
+function loadSites(): SitePolicy[] {
+    try {
+        return parseSitePolicies(JSON.parse(requiredEnv('ABP_SITE_POLICY')))
+    } catch {
+        // Never echo the parser error: it can quote the configuration.
+        throw new Error('ABP_SITE_POLICY is missing or not a valid sites[] policy')
+    }
+}
+
 /** Every key must be present and long; an empty admin token would otherwise match an empty bearer. */
 function loadKeys(path: string): KeysFile {
     let parsed: Partial<KeysFile>
@@ -194,6 +206,7 @@ async function main(): Promise<void> {
     const port = Number(process.env.ABP_RUNTIME_PORT ?? '8787')
     const adminPort = Number(process.env.ABP_ADMIN_PORT ?? '8788')
     const windows = maxAgentWindows()
+    const sites = loadSites()
 
     // A second live Runtime on the same state dir is refused (writer lock). After a
     // crash the old lock's heartbeat is still fresh for up to its lease, so wait that
@@ -207,7 +220,7 @@ async function main(): Promise<void> {
     // Connect before recovery so it can compare browser instance ids.
     await Promise.all(profiles.map((profile) => connectWithRetry(drivers.get(profile.profileId)!, profile, log)))
 
-    const runtime = new BrowserRuntime({ store, drivers })
+    const runtime = new BrowserRuntime({ store, drivers, sites })
 
     for (const profile of profiles) {
         const driver = drivers.get(profile.profileId)!

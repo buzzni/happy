@@ -10,7 +10,7 @@ import { approvalPayloadHash, createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
-import { approvalBinding, assertAllowedOrigin, classifyAction, classifyUserWait, payloadHash, redact } from './policy'
+import { approvalBinding, assertAllowedOrigin, assertSiteAllowed, classifySiteAction, classifyUserWait, loginCompleted, payloadHash, redact, type SitePolicy } from './policy'
 import { TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
@@ -18,6 +18,8 @@ export interface BrowserRuntimeOptions {
     store: TaskStore
     drivers: Map<ProfileId, BrowserDriver> | Record<string, BrowserDriver>
     clock?: RuntimeClock
+    /** Site allowlist and action policy (D7). Origins outside it cannot be opened, whatever a grant allows. */
+    sites: SitePolicy[]
 }
 type DriverWithAction = BrowserDriver & {
     armAction?: (actionId: string) => void
@@ -146,6 +148,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 { pauseReason: 'task-time-limit' })
             throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached')
         }
+        assertSiteAllowed(this.options.sites, req.url)
         const grant = this.agentGrant(auth)
         const origin = assertAllowedOrigin(req.url, grant)
         const driver = this.driver(task.profileId)
@@ -1018,7 +1021,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Wait completion condition is missing')
             const observation = await this.driver(task.profileId).observe(wait.tabId, auth.credential.allowedOrigins, { timeoutMs: 10000 })
             const waitCompleted = wait.notPathPrefix
-                ? !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
+                ? task.waitReason === 'login'
+                    ? loginCompleted(this.options.sites, observation, wait.notPathPrefix, (wait as { protectedOrigin?: string }).protectedOrigin)
+                    : !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
                 : matchesWait(wait.predicate!, observation)
             if (!waitCompleted)
                 return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
@@ -1675,7 +1680,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         if (!grant.allowedOrigins.includes(description.frameOrigin)
                             || !grant.allowedOrigins.includes(new URL(description.pageUrl).origin))
                             throw new BrowserRuntimeError('ORIGIN_DENIED', 'Referenced element origin is not allowed', false, false)
+                        // The agent chose this element by its snapshot label; a relabel in place means it chose something else.
+                        if (description.currentName !== undefined && (description.role || description.name)
+                            && (description.currentName !== description.name || description.currentRole !== description.role))
+                            throw new BrowserRuntimeError('STALE_REF', 'Element label changed since the snapshot; observe again', false, false)
                     }
+                    // A navigation or fill the site policy holds has no element approval to bind: hand it to the user.
+                    if (['navigate', 'fill'].includes(step.kind) && step.actionId !== approvedActionId
+                        && classifySiteAction(this.options.sites, effectiveStep, description) === 'requires-approval')
+                        throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Site policy requires the user for this action', false, false)
                 }
                 catch (error) {
                     // Description is read-only preflight; input has not been sent.
@@ -1729,7 +1742,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         || recomputedApprovalBinding !== boundApproval.bindingHash)
                         throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed before dispatch')
                 }
-                if (classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required' && step.actionId !== approvedActionId) {
+                if (step.kind === 'click' && classifySiteAction(this.options.sites, effectiveStep, description) === 'requires-approval'
+                    && step.actionId !== approvedActionId) {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
                     const approval = createApproval({
                         grant,
@@ -1847,7 +1861,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         }
                     }
                     const requiresPostcondition = ['click', 'fill', 'navigate'].includes(step.kind)
-                        && classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required'
+                        && classifySiteAction(this.options.sites, effectiveStep, description) === 'requires-approval'
                     const hasPostconditionStep = steps.slice(index + 1).some((candidate) => candidate.tabId === step.tabId
                         && candidate.kind === 'waitFor')
                     if (requiresPostcondition && !hasPostconditionStep) {
@@ -2096,8 +2110,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return credential.expiresAtMs > this.clock.now()
             && !this.options.store.isRevoked(credential.kind === 'agent-grant' ? credential.grantId : credential.capabilityId)
     }
+    /** The agent's grant, narrowed to origins that have a site policy: every navigation, redirect and observation is checked against this. */
     private agentGrant(auth: AuthContext): AgentGrant { if (auth.credential.kind !== 'agent-grant')
-        throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent grant required'); return auth.credential; }
+        throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent grant required')
+    const sited = new Set(this.options.sites.map((site) => site.origin))
+    return { ...auth.credential, allowedOrigins: auth.credential.allowedOrigins.filter((origin) => sited.has(origin)) } }
     private driver(profileId: ProfileId): BrowserDriver { const driver = this.drivers.get(profileId); if (!driver)
         throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'No browser driver is configured for profile'); return driver; }
     private requireTask(id: TaskId): StoredTask { const task = this.options.store.getTask(id); if (!task)

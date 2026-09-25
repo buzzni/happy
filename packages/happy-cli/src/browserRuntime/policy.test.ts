@@ -1,36 +1,35 @@
 import { describe, expect, it } from 'vitest'
-import { BrowserRuntimeError, type BatchStep, type ElementRef, type FormSubmission } from './contracts'
-import { assertAllowedOrigin, approvalBinding, classifyAction, classifyUserWait, formDigest, formSummary, redact } from './policy'
+import { BrowserRuntimeError, type BatchStep, type ElementDescription, type ElementRef, type FormSubmission } from './contracts'
+import { assertAllowedOrigin, approvalBinding, classifySiteAction, classifyUserWait, formDigest, formSummary, loginCompleted, parseSitePolicies, redact, type SitePolicy } from './policy'
+import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
 
 const step: BatchStep = { stepId: 's' as never, actionId: 'a' as never, tabId: 't' as never, kind: 'click', ref: '@e1' as ElementRef, timeoutMs: 1000 }
 
-describe('fixture action policy', () => {
-    it('requires approval for risky targets and accessible names but ignores page text', () => {
-        expect(classifyAction(step, { ref: '@e1' as ElementRef, role: 'button', name: 'Continue', visible: true, frameOrigin: 'https://fixture.test', targetUrl: '/risky-submit' })).toBe('approval-required')
-        expect(classifyAction(step, { ref: '@e1' as ElementRef, role: 'button', name: 'Pay now', visible: true, frameOrigin: 'https://fixture.test' })).toBe('approval-required')
-        expect(classifyAction(step, { ref: '@e1' as ElementRef, role: 'button', name: 'Continue', visible: true, frameOrigin: 'https://fixture.test' })).toBe('auto')
+describe('fixture site policy (parity with the PoC classifier)', () => {
+    const sites = fixtureSitePolicies(['https://fixture.test'])
+    const described = (over: Partial<ElementDescription> = {}): ElementDescription => ({ ref: '@e1' as ElementRef, role: 'button', name: 'Continue',
+        frameOrigin: 'https://fixture.test', pageUrl: 'https://fixture.test/start', formValues: {}, documentGeneration: 1, identity: 'id', ...over })
+
+    it('requires approval for risky accessible names and risky form paths but ignores page text', () => {
+        expect(classifySiteAction(sites, step, described({ name: 'Pay now' }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, described({ formAction: 'https://fixture.test/risky-submit' }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, described())).toBe('auto')
     })
 
-    it('uses the current page path when driver risk hints are absent', () => {
-        const element = { ref: '@e1' as ElementRef, role: 'button', name: 'Continue', visible: true, frameOrigin: 'https://fixture.test' }
-        expect(classifyAction(step, { ...element, name: 'Confirm payment' }, undefined, 'https://fixture.test/checkout')).toBe('approval-required')
-        expect(classifyAction(step, element, undefined, 'https://fixture.test/risky-submit')).toBe('approval-required')
+    it('uses the current page path when the element has no form', () => {
+        expect(classifySiteAction(sites, step, described({ name: 'Confirm payment', pageUrl: 'https://fixture.test/checkout' }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, described({ pageUrl: 'https://fixture.test/risky-submit' }))).toBe('requires-approval')
     })
 
     it('classifies only the submitting click on a risky form path, never fill or read-only steps', () => {
-        const submit = { ref: '@e1' as ElementRef, role: 'button', name: 'Continue', visible: true, frameOrigin: 'https://fixture.test' }
-        const input = { ...submit, role: 'textbox' }
-        const fill: BatchStep = { ...step, kind: 'fill', value: '5' }
-        const observe: BatchStep = { ...step, kind: 'observe' }
-        const waitFor: BatchStep = { ...step, kind: 'waitFor', until: { kind: 'text', text: 'ready' } }
-        const screenshot: BatchStep = { ...step, kind: 'screenshot' }
-
-        expect(classifyAction(fill, input, undefined, 'https://fixture.test/risky-submit')).toBe('auto')
-        expect(classifyAction(observe, undefined, undefined, 'https://fixture.test/risky-submit')).toBe('auto')
-        expect(classifyAction(waitFor, undefined, undefined, 'https://fixture.test/risky-submit')).toBe('auto')
-        expect(classifyAction(screenshot, undefined, undefined, 'https://fixture.test/risky-submit')).toBe('auto')
-        expect(classifyAction(step, input, undefined, 'https://fixture.test/risky-submit')).toBe('auto')
-        expect(classifyAction(step, submit, undefined, 'https://fixture.test/risky-submit')).toBe('approval-required')
+        const risky = described({ pageUrl: 'https://fixture.test/risky-submit' })
+        const input = { ...risky, role: 'textbox' }
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '5' }, input)).toBe('auto')
+        expect(classifySiteAction(sites, { ...step, kind: 'observe' })).toBe('auto')
+        expect(classifySiteAction(sites, { ...step, kind: 'waitFor', until: { kind: 'text', text: 'ready' } })).toBe('auto')
+        expect(classifySiteAction(sites, { ...step, kind: 'screenshot' })).toBe('auto')
+        expect(classifySiteAction(sites, step, input)).toBe('auto')
+        expect(classifySiteAction(sites, step, risky)).toBe('requires-approval')
     })
 
     it('classifies fixture login and captcha paths for user waits', () => {
@@ -94,5 +93,81 @@ describe('form digest', () => {
         expect(formSummary(base)).toBe('POST https://fixture.test/order: item=a, item=b, amount=10, pin=••••')
         const many = { ...base, fields: Array.from({ length: 20 }, (_, i) => [`f${i}`, String(i)]) as FormSubmission['fields'] }
         expect(formSummary(many)).toMatch(/f11=11, \+8 more$/)
+    })
+})
+
+describe('site action policy (D7)', () => {
+    const origin = 'https://shop.test'
+    const element = (over: Partial<ElementDescription> = {}): ElementDescription => ({ ref: '@e1' as ElementRef, role: 'button', name: 'Continue',
+        frameOrigin: origin, pageUrl: `${origin}/cart`, formValues: {}, documentGeneration: 1, identity: 'id', currentRole: 'button', currentName: 'Continue', ...over })
+    const form = (action: string, over: Partial<FormSubmission> = {}): FormSubmission & { digest: string } => {
+        const submission: FormSubmission = { action, method: 'post', enctype: 'application/x-www-form-urlencoded', target: '', fields: [], submitter: null, opaque: false, ...over }
+        return { ...submission, digest: formDigest(submission) }
+    }
+    const click: BatchStep = { ...step, kind: 'click' }
+    const strict: SitePolicy[] = [{ origin, actions: [] }]
+
+    it('holds every unmatched write-capable action for approval and lets reads, links and plain fills run', () => {
+        expect(classifySiteAction(strict, click, element())).toBe('requires-approval')
+        expect(classifySiteAction(strict, click, element({ form: form(`${origin}/cart/update`) }))).toBe('requires-approval')
+        expect(classifySiteAction(strict, click, element({ form: form(`${origin}/checkout`), submitsForm: true }))).toBe('requires-approval')
+        expect(classifySiteAction(strict, click, element({ role: 'link', currentRole: 'link', tag: 'a', linkUrl: `${origin}/help` }))).toBe('auto')
+        expect(classifySiteAction(strict, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('auto')
+        expect(classifySiteAction(strict, { ...step, kind: 'navigate', url: `${origin}/cart` })).toBe('auto')
+        expect(classifySiteAction(strict, { ...step, kind: 'observe' })).toBe('auto')
+    })
+
+    it('applies the first matching rule; a rule matches only when all of its conditions do', () => {
+        const sites: SitePolicy[] = [{ origin, actions: [
+            { match: { kinds: ['submit'], targetPaths: ['/checkout*'] }, risk: 'requires-approval' },
+            { match: { kinds: ['submit', 'click'], namePrefixes: ['add to'] }, risk: 'auto' },
+            { match: { kinds: ['navigate', 'link'], targetPaths: ['/api/delete'] }, risk: 'requires-approval' },
+            { match: { kinds: ['fill'], roles: ['textbox'], pagePaths: ['/transfer'] }, risk: 'requires-approval' },
+        ] }]
+        expect(classifySiteAction(sites, click, element({ name: 'Add to cart', currentName: 'Add to cart' }))).toBe('auto')
+        expect(classifySiteAction(sites, click, element({ name: 'Add to cart', currentName: 'Add to cart', submitsForm: true, form: form(`${origin}/checkout/now`) }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, click, element({ name: 'Remove', currentName: 'Remove' }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, { ...step, kind: 'navigate', url: `${origin}/api/delete?id=1` })).toBe('requires-approval')
+        expect(classifySiteAction(sites, click, element({ role: 'link', currentRole: 'link', tag: 'a', linkUrl: `${origin}/api/delete?id=1` }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox', pageUrl: `${origin}/transfer` }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('auto')
+    })
+
+    it('holds an action for approval when its effect cannot be bound or its destination is outside the site list', () => {
+        const permissive: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }] }]
+        expect(classifySiteAction(permissive, click, element())).toBe('auto')
+        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form('https://elsewhere.test/collect') }))).toBe('requires-approval')
+        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form(`${origin}/x`, { opaque: true }) }))).toBe('requires-approval')
+        // A restored ref carries no snapshot label: a relabel cannot be ruled out.
+        expect(classifySiteAction(permissive, click, element({ role: '', name: '' }))).toBe('requires-approval')
+        // An element of a frame whose site has no policy.
+        expect(classifySiteAction(permissive, click, element({ frameOrigin: 'https://embed.test' }))).toBe('requires-approval')
+    })
+
+    it('validates the configuration strictly', () => {
+        const valid = [{ origin, actions: [{ match: { kinds: ['submit'], targetPaths: ['/pay*'], namePrefixes: ['Pay'] }, risk: 'requires-approval' }],
+            loginCompleteWhen: { urlPrefix: `${origin}/account`, text: 'Signed in' } }]
+        expect(parseSitePolicies(valid)).toEqual(valid)
+        for (const bad of [
+            [{ origin: `${origin}/path`, actions: [] }],
+            [{ origin: 'ftp://shop.test', actions: [] }],
+            [{ origin, actions: [{ match: {}, risk: 'maybe' }] }],
+            [{ origin, actions: [{ match: { kinds: ['teleport'] }, risk: 'auto' }] }],
+            [{ origin, actions: [{ match: { targetPaths: ['relative'] }, risk: 'auto' }] }],
+            [{ origin, actions: [], extra: true }],
+            [{ origin, actions: [] }, { origin, actions: [] }],
+            [{ origin, actions: [], loginCompleteWhen: { urlPrefix: 'https://other.test/' } }],
+            {},
+        ]) expect(() => parseSitePolicies(bad), JSON.stringify(bad)).toThrow()
+    })
+
+    it('decides login completion from the site condition, not from leaving the login path', () => {
+        const sites: SitePolicy[] = [{ origin, actions: [], loginCompleteWhen: { urlPrefix: `${origin}/account`, text: 'Signed in' } }]
+        expect(loginCompleted(sites, { url: `${origin}/account`, text: 'Welcome. Signed in as synthetic', elements: [] }, '/login')).toBe(true)
+        expect(loginCompleted(sites, { url: `${origin}/account`, text: 'Welcome', elements: [] }, '/login')).toBe(false)
+        expect(loginCompleted(sites, { url: `${origin}/error`, text: 'Signed in', elements: [] }, '/login')).toBe(false)
+        // Without a site condition the PoC rule applies: the page left the login path.
+        expect(loginCompleted([{ origin, actions: [] }], { url: `${origin}/error`, text: '', elements: [] }, '/login')).toBe(true)
+        expect(loginCompleted([{ origin, actions: [] }], { url: `${origin}/login/2fa`, text: '', elements: [] }, '/login')).toBe(false)
     })
 })
