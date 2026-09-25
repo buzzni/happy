@@ -163,3 +163,16 @@ describe('runtime HTTP server', () => {
         expect(html).not.toContain('localStorage')
     })
 })
+
+describe('runtime readiness', () => {
+    it('reports 200 when every check passes and 503 with the failing checks otherwise', async () => {
+        let checks = { browsers: true, writerLock: true, disk: true }
+        const fake = makeFake()
+        server = await startRuntimeServer({ api: fake.api, verifyToken, port: 0, health: () => ({}), ready: async () => checks })
+        const ready = await fetch(`${server.url}/v1/ready`)
+        expect([ready.status, await ready.json()]).toEqual([200, { ok: true, ready: true, checks }])
+        checks = { browsers: true, writerLock: false, disk: true }
+        const notReady = await fetch(`${server.url}/v1/ready`)
+        expect([notReady.status, await notReady.json()]).toEqual([503, { ok: false, ready: false, checks }])
+    })
+})

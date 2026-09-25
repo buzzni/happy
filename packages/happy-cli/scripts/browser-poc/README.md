@@ -18,7 +18,7 @@ node scripts/browser-poc/poc.mjs down --run smoke-1
 node scripts/browser-poc/poc.mjs down --run smoke-1 --purge
 ```
 
-`up` can omit `--runtime-bundle` when testing fixture and browsers alone. `--runtime-env` is a JSON object of environment variables. The Runtime bundle must be readable by uid 1000 inside the container (for example, mode 0644). `--rebuild` forces image rebuild. `down` keeps profile and state volumes by default; `--purge` deletes volumes labelled with this run. `fill-disk` is not implemented.
+`up` can omit `--runtime-bundle` when testing fixture and browsers alone. `--runtime-env` is a JSON object of environment variables. The Runtime bundle must be readable by the Runtime container user (uid 10870) (for example, mode 0644). `--rebuild` forces image rebuild. `down` keeps profile and state volumes by default; `--purge` deletes volumes labelled with this run. `fill-disk` is not implemented.
 
 Fixture sites share container port 8080: `http://a.poc-one.test:8080`, `http://b.poc-two.test:8080`, `http://c.poc-three.test:8080`. Browser profiles use network DNS mapping to the fixture. The control API listens on 9099 inside the fixture and requires `x-harness-token` on every request. Browser CDP at browser-a/browser-b port 9223 and instance service at 9224 are internal only: each browser sits on its own network (`abp-<run>-a` / `-b`) shared only with the Runtime and the fixture, and the CDP proxy accepts only `Host: browser-<profile>:9223`. The noVNC viewer requires the per-run password stored in `.abp/<run>/env.json` (`vncPassword`). noVNC is exposed on dynamic loopback ports listed in env.json.
 

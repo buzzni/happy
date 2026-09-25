@@ -1,26 +1,44 @@
 /**
- * Browser Runtime process entry (Agent Browser PoC).
+ * Browser Runtime process entry (Agent Browser).
  *
  * Runs on the execution machine, independent of any Desktop/viewer/CLI
  * request: it owns the TaskStore writer lock, one CDP driver per profile, the
- * authenticated task API, and a separate admin API used by the harness acting
- * as the auth server (grant revocation, trusted reconciliation).
+ * authenticated task API, the admin API, and (with a config file) the broker
+ * socket that issues agent grants and serves the attention feed.
  *
- * Environment (all required unless noted):
- *   ABP_STATE_DIR            durable store directory (volume)
- *   ABP_KEYS_FILE            JSON {agentKey, interactiveKey, adminToken}
- *   ABP_PROFILES             JSON [{profileId, cdpHttpUrl, instanceUrl}]
- *   ABP_RUNTIME_HOST/PORT    task API bind (default 0.0.0.0:8787 in the container)
- *   ABP_ADMIN_PORT           admin API port (default 8788)
+ * Two modes:
+ *  - harness (no ABP_CONFIG_FILE): the PoC E2E setup. Keys come from
+ *    ABP_KEYS_FILE, the admin API is a TCP port with a bearer token.
+ *  - config file (ABP_CONFIG_FILE, /etc/abp/runtime.json): identity, profile
+ *    owners and trusted issuers come from the file. In authMode "production"
+ *    interactive capabilities must be server-signed (abp2), the agent key is
+ *    generated inside the state volume, admin is a unix socket only, and the
+ *    writer flock taken by the container entrypoint must be held.
+ *
+ * Environment:
+ *   ABP_STATE_DIR            durable store directory (volume), required
+ *   ABP_CONFIG_FILE          runtime config file (config mode)
+ *   ABP_KEYS_FILE            JSON {agentKey, interactiveKey, adminToken} (harness; optional in config mode)
+ *   ABP_PROFILES             JSON [{profileId, cdpHttpUrl, instanceUrl}] (config mode: fills missing endpoints)
+ *   ABP_RUNTIME_HOST/PORT    task API bind in harness mode (default 0.0.0.0:8787 in the container)
+ *   ABP_ADMIN_PORT           harness admin API port (default 8788)
+ *   ABP_WRITER_FLOCK         lock file the entrypoint holds with flock -F (set by the entrypoint)
  */
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { startAdminServer } from './admin'
-import { verifyToken, type AuthKeys } from './auth'
-import { BrowserRuntimeError, type BrowserInstanceId, type ProfileId } from './contracts'
+import { open, readFile, statfs } from 'node:fs/promises'
+import { join } from 'node:path'
+import { collectRuntimeMetrics, startAdminServer, type AdminServer } from './admin'
+import { AttentionOutbox } from './attention'
+import { verifyToken, type AuthKeys, type VerifyPolicy } from './auth'
+import { startBroker, type Broker } from './broker'
+import { BrowserRuntimeError, type BrowserInstanceId, type BrowserRuntimeApi, type ProfileId } from './contracts'
 import { CdpDriver } from './drivers/cdpDriver'
 import { BrowserRuntime } from './runtime'
+import { loadRuntimeConfig, type RuntimeConfig } from './runtimeConfig'
 import { startRuntimeServer } from './server'
 import { TaskStore } from './taskStore'
+import { holdsWriterFlock } from './writerFlock'
 
 interface ProfileConfig {
     profileId: ProfileId
@@ -98,7 +116,7 @@ async function openStoreWaitingForStaleLease(stateDir: string, log: (line: strin
 }
 
 /** Every key must be present and long; an empty admin token would otherwise match an empty bearer. */
-function loadKeys(path: string): KeysFile {
+function loadKeys(path: string, required: ReadonlyArray<keyof KeysFile> = ['agentKey', 'interactiveKey', 'adminToken']): KeysFile {
     let parsed: Partial<KeysFile>
     try {
         parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<KeysFile>
@@ -108,24 +126,80 @@ function loadKeys(path: string): KeysFile {
     }
     for (const name of ['agentKey', 'interactiveKey', 'adminToken'] as const) {
         const value = parsed[name]
+        if (value === undefined && !required.includes(name)) continue
         if (typeof value !== 'string' || value.length < MIN_SECRET_LENGTH) throw new Error(`ABP_KEYS_FILE ${name} is missing or shorter than ${MIN_SECRET_LENGTH} characters`)
     }
     return parsed as KeysFile
 }
 
+/** The agent HMAC key is created inside the state volume on first start and never leaves it. */
+async function loadOrCreateAgentKey(stateDir: string): Promise<string> {
+    const path = join(stateDir, 'agent.key')
+    try {
+        const handle = await open(path, 'wx', 0o600)
+        try {
+            await handle.writeFile(randomBytes(32).toString('hex'))
+            await handle.sync()
+        } finally {
+            await handle.close()
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error('ABP agent key could not be created')
+    }
+    const key = (await readFile(path, 'utf8')).trim()
+    if (key.length < MIN_SECRET_LENGTH) throw new Error('ABP agent key in the state volume is invalid')
+    return key
+}
+
+/** Config profiles may leave endpoints to ABP_PROFILES (container names chosen by the launcher). */
+function configProfiles(config: RuntimeConfig): ProfileConfig[] {
+    const fromEnv = process.env.ABP_PROFILES ? JSON.parse(process.env.ABP_PROFILES) as ProfileConfig[] : []
+    return config.profiles.map((profile) => {
+        const endpoints = fromEnv.find((candidate) => candidate.profileId === profile.profileId)
+        const cdpHttpUrl = profile.cdpHttpUrl ?? endpoints?.cdpHttpUrl
+        const instanceUrl = profile.instanceUrl ?? endpoints?.instanceUrl
+        if (!cdpHttpUrl || !instanceUrl) throw new Error(`ABP profile ${profile.profileId} has no browser endpoints`)
+        return { profileId: profile.profileId as ProfileId, cdpHttpUrl, instanceUrl }
+    })
+}
+
+const MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
+const FENCE_ACK_SAMPLES = 100
+
 async function main(): Promise<void> {
     const log = (line: string) => process.stderr.write(`[abp-runtime] ${new Date().toISOString()} ${line}\n`)
     const stateDir = requiredEnv('ABP_STATE_DIR')
-    const keys = loadKeys(requiredEnv('ABP_KEYS_FILE'))
-    const profiles = JSON.parse(requiredEnv('ABP_PROFILES')) as ProfileConfig[]
-    const host = process.env.ABP_RUNTIME_HOST ?? '0.0.0.0'
-    const port = Number(process.env.ABP_RUNTIME_PORT ?? '8787')
+    const config = process.env.ABP_CONFIG_FILE ? loadRuntimeConfig(process.env.ABP_CONFIG_FILE) : undefined
+    const production = config?.authMode === 'production'
+    const harnessKeys = process.env.ABP_KEYS_FILE ? loadKeys(process.env.ABP_KEYS_FILE, config ? ['agentKey'] : undefined) : undefined
+    if (!config && !harnessKeys) throw new Error('ABP_KEYS_FILE is required without ABP_CONFIG_FILE')
+    // Production never accepts a harness interactive key or admin token.
+    const keys: AuthKeys = production || !harnessKeys
+        ? { agentKey: await loadOrCreateAgentKey(stateDir) }
+        : harnessKeys
+    const profiles = config ? configProfiles(config) : JSON.parse(requiredEnv('ABP_PROFILES')) as ProfileConfig[]
+    const host = config?.runtimeHost ?? process.env.ABP_RUNTIME_HOST ?? '0.0.0.0'
+    const port = config?.runtimePort ?? Number(process.env.ABP_RUNTIME_PORT ?? '8787')
     const adminPort = Number(process.env.ABP_ADMIN_PORT ?? '8788')
+    const policy: VerifyPolicy = config
+        ? { authMode: config.authMode, machineId: config.machineId, workspaceId: config.workspaceId, trustedIssuers: config.trustedIssuers, profilePrincipals: config.profilePrincipals }
+        : { authMode: 'harness' }
+
+    // D9: the entrypoint holds an exclusive kernel flock (flock -n -F) before node
+    // starts. Production refuses to open the store or CDP without it.
+    const flockPath = process.env.ABP_WRITER_FLOCK
+    const flockHeld = flockPath ? await holdsWriterFlock(flockPath) : false
+    if (production && !flockHeld) throw new Error('ABP writer flock is not held by this process (start through the image entrypoint)')
+    if (!flockHeld) log('writer flock not verified; relying on the heartbeat lease only')
 
     // A second live Runtime on the same state dir is refused (writer lock). After a
     // crash the old lock's heartbeat is still fresh for up to its lease, so wait that
     // long before giving up instead of exiting while the previous writer is merely dead.
     const store = await openStoreWaitingForStaleLease(stateDir, log)
+    // Attached and reconciled before the Runtime's own recovery commits anything.
+    const attention = await AttentionOutbox.open(stateDir)
+    attention.attach(store)
+    await attention.reconcile()
 
     const drivers = new Map<ProfileId, CdpDriver>()
     for (const profile of profiles) {
@@ -160,8 +234,11 @@ async function main(): Promise<void> {
 
     // Keeps the writer lock's heartbeat fresh; another Runtime may only take the
     // store over once this stops (the lease expires after 20 s without it).
+    let heartbeatOkAtMs = Date.now()
     const heartbeat = setInterval(() => {
-        void store.heartbeat().catch((error) => log(`lock heartbeat failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+        void store.heartbeat()
+            .then(() => { heartbeatOkAtMs = Date.now() })
+            .catch((error) => log(`lock heartbeat failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
     }, LOCK_HEARTBEAT_MS)
     heartbeat.unref()
 
@@ -176,10 +253,27 @@ async function main(): Promise<void> {
     }, SWEEP_INTERVAL_MS)
     sweep.unref()
 
+    const fenceAcksMs: number[] = []
+    // Records cancel fence ACK latency for metrics; every other operation goes straight to the Runtime.
+    const api = new Proxy(runtime, {
+        get(target, property) {
+            if (property === 'cancel') {
+                return async (...args: Parameters<BrowserRuntimeApi['cancel']>) => {
+                    const result = await target.cancel(...args)
+                    fenceAcksMs.push(result.fenceAckMs)
+                    fenceAcksMs.splice(0, Math.max(0, fenceAcksMs.length - FENCE_ACK_SAMPLES))
+                    return result
+                }
+            }
+            const value = Reflect.get(target, property, target) as unknown
+            return typeof value === 'function' ? value.bind(target) : value
+        },
+    })
+
     const startedAtMs = Date.now()
     const server = await startRuntimeServer({
-        api: runtime,
-        verifyToken: (bearer) => verifyToken(bearer, keys, Date.now(), store.getRevocations()),
+        api,
+        verifyToken: (bearer) => verifyToken(bearer, keys, Date.now(), store.getRevocations(), policy),
         host,
         port,
         health: () => ({
@@ -187,15 +281,47 @@ async function main(): Promise<void> {
             startedAtMs,
             profiles: profiles.map((profile) => ({ profileId: profile.profileId, connected: drivers.get(profile.profileId)!.isConnected() })),
         }),
+        ready: async () => {
+            const disk = await statfs(stateDir).catch(() => undefined)
+            return {
+                browsers: profiles.every((profile) => drivers.get(profile.profileId)!.isConnected()),
+                writerLock: Date.now() - heartbeatOkAtMs <= 3 * LOCK_HEARTBEAT_MS && (flockHeld || !production),
+                disk: Boolean(disk && disk.bavail * disk.bsize >= MIN_FREE_DISK_BYTES),
+            }
+        },
         log: (line: string) => log(line),
     })
-    await startAdminServer({ runtime, drivers, adminToken: keys.adminToken, host, port: adminPort })
-    log(`listening api=${server.url} adminPort=${adminPort} profiles=${profiles.length}`)
+    const admin: AdminServer = await startAdminServer({
+        runtime, drivers,
+        listen: production || !harnessKeys?.adminToken
+            ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
+            : { host, port: adminPort, adminToken: harnessKeys.adminToken },
+        metrics: () => collectRuntimeMetrics({ store, drivers, stateDir, fenceAcksMs }),
+        revokeCapability: (capabilityId) => store.revoke(capabilityId),
+    })
+    let broker: Broker | undefined
+    if (config?.daemonTokenSha256) {
+        broker = await startBroker({
+            socketPath: config.brokerSocketPath, socketGid: config.brokerSocketGid, stateDir,
+            daemonTokenSha256: config.daemonTokenSha256,
+            identity: { machineId: config.machineId, workspaceId: config.workspaceId },
+            profiles: config.profilePrincipals,
+            allowedOrigins: config.sites.map((site) => site.origin),
+            agentKey: keys.agentKey,
+            revokeGrant: (grantId) => runtime.revokeGrant(grantId),
+            attention,
+            log,
+        })
+    }
+    log(`listening api=${server.url} mode=${config?.authMode ?? 'harness'} admin=${admin.port ?? 'socket'} broker=${broker ? 'socket' : 'off'} flock=${flockHeld} profiles=${profiles.length}`)
 
     const shutdown = async () => {
         clearInterval(sweep)
         clearInterval(heartbeat)
         await server.close()
+        await admin.close()
+        await broker?.close()
+        await attention.flush()
         for (const driver of drivers.values()) await driver.close()
         await store.close()
         process.exit(0)
@@ -207,7 +333,7 @@ async function main(): Promise<void> {
 void main().catch((error) => {
     // Messages here are ours (config/lock errors); unexpected errors are reduced to their name.
     const detail = error instanceof BrowserRuntimeError ? `${error.code} ${error.message}`
-        : error instanceof Error && error.message.startsWith('ABP_') ? error.message
+        : error instanceof Error && error.message.startsWith('ABP') ? error.message
             : error instanceof Error ? error.name : 'unknown'
     process.stderr.write(`[abp-runtime] fatal ${detail}\n`)
     process.exit(1)

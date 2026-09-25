@@ -65,6 +65,8 @@ export interface RuntimeServerOptions {
     host?: string
     port: number
     health: () => object
+    /** Readiness checks (browser connection, writer lock, disk); every value must be true. */
+    ready?: () => Promise<Record<string, boolean>>
     log?: (line: string) => void
 }
 
@@ -150,6 +152,11 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
         const url = new URL(req.url ?? '/', 'http://localhost')
         try {
             if (req.method === 'GET' && url.pathname === '/v1/health') return send(res, 200, { ok: true, ...opts.health() })
+            if (req.method === 'GET' && url.pathname === '/v1/ready' && opts.ready) {
+                const checks = await opts.ready()
+                const ready = Object.values(checks).every(Boolean)
+                return send(res, ready ? 200 : 503, { ok: ready, ready, checks })
+            }
             if (req.method === 'GET' && url.pathname === '/console') {
                 res.writeHead(200, {
                     'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',

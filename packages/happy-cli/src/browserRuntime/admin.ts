@@ -1,13 +1,20 @@
 /**
- * Admin API of the Browser Runtime: stands in for the auth server (grant
- * revocation) and the trusted fixture postcondition (reconciliation). Never
- * reachable with an agent grant or an interactive capability.
+ * Admin API of the Browser Runtime: revocation, trusted reconciliation and
+ * metrics. Never reachable with an agent grant or an interactive capability.
+ *
+ * Production: a unix socket only (host /run/abp/admin.sock, 0600) — file
+ * permissions are the authentication. Harness: the PoC TCP port with a bearer
+ * admin token, so the existing E2E suites keep working.
  */
 import { timingSafeEqual } from 'node:crypto'
+import { statfs } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { listenOnSocket } from './broker'
 import { BrowserRuntimeError, type ActionId, type GrantId, type ProfileId, type TaskId } from './contracts'
 import type { CdpDriver } from './drivers/cdpDriver'
 import type { BrowserRuntime } from './runtime'
+import type { TaskStore } from './taskStore'
 
 function adminAuthorized(req: IncomingMessage, adminToken: string): boolean {
     const header = req.headers.authorization ?? ''
@@ -32,14 +39,22 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     res.end(JSON.stringify(body))
 }
 
-/**
- * Admin operations stand in for the auth server and the trusted fixture
- * postcondition. They are never reachable with an agent grant.
- */
-export function startAdminServer(input: { runtime: BrowserRuntime; drivers: Map<ProfileId, CdpDriver>; adminToken: string; host: string; port: number }) {
+export interface AdminServerInput {
+    runtime: Pick<BrowserRuntime, 'revokeGrant' | 'reconcileAction' | 'pinnedProfiles'>
+    drivers: Map<ProfileId, Pick<CdpDriver, 'isConnected' | 'debugCounts'>>
+    listen: { socketPath: string } | { host: string; port: number; adminToken: string }
+    metrics(): Promise<unknown>
+    /** Immediate revocation of an interactive capability (e.g. a lost viewer). */
+    revokeCapability(capabilityId: string): Promise<void>
+}
+
+export interface AdminServer { port?: number; close(): Promise<void> }
+
+export async function startAdminServer(input: AdminServerInput): Promise<AdminServer> {
+    const adminToken = 'adminToken' in input.listen ? input.listen.adminToken : undefined
     const server = createServer((req, res) => {
         void (async () => {
-            if (!adminAuthorized(req, input.adminToken)) return sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED' } })
+            if (adminToken !== undefined && !adminAuthorized(req, adminToken)) return sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED' } })
             const path = new URL(req.url ?? '/', 'http://admin').pathname
             try {
                 if (req.method === 'GET' && path === '/admin/debug') {
@@ -49,10 +64,16 @@ export function startAdminServer(input: { runtime: BrowserRuntime; drivers: Map<
                     }]))
                     return sendJson(res, 200, { ok: true, result: { drivers, pinnedProfiles: input.runtime.pinnedProfiles(), memory: process.memoryUsage() } })
                 }
+                if (req.method === 'GET' && path === '/admin/metrics') return sendJson(res, 200, { ok: true, result: await input.metrics() })
                 if (req.method !== 'POST') return sendJson(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION' } })
                 const body = await readBody(req)
                 if (path === '/admin/revoke-grant') {
                     await input.runtime.revokeGrant(String(body.grantId) as GrantId)
+                    return sendJson(res, 200, { ok: true, result: { revoked: true } })
+                }
+                if (path === '/admin/revoke-capability') {
+                    if (typeof body.capabilityId !== 'string' || !body.capabilityId) throw new BrowserRuntimeError('INVALID_REQUEST', 'capabilityId is required')
+                    await input.revokeCapability(body.capabilityId)
                     return sendJson(res, 200, { ok: true, result: { revoked: true } })
                 }
                 if (path === '/admin/reconcile-action') {
@@ -66,5 +87,48 @@ export function startAdminServer(input: { runtime: BrowserRuntime; drivers: Map<
             }
         })()
     })
-    return new Promise<void>((resolve) => server.listen(input.port, input.host, resolve))
+    if ('socketPath' in input.listen) await listenOnSocket(server, input.listen.socketPath, 0o600)
+    else {
+        const { host, port } = input.listen
+        await new Promise<void>((resolve) => server.listen(port, host, resolve))
+    }
+    const address = server.address()
+    return {
+        ...(address && typeof address === 'object' ? { port: (address as AddressInfo).port } : {}),
+        close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) }),
+    }
+}
+
+export interface RuntimeMetrics {
+    tasks: Record<string, number>
+    uncertainTasks: number
+    uncertainActions: number
+    fenceAck: { count: number; p50Ms?: number; maxMs?: number }
+    browsers: Record<string, { connected: boolean }>
+    disk: { freeBytes: number; totalBytes: number }
+}
+
+export async function collectRuntimeMetrics(input: {
+    store: Pick<TaskStore, 'listTasks'>
+    drivers: Map<string, Pick<CdpDriver, 'isConnected'>>
+    stateDir: string
+    /** Recent cancel fence ACK latencies. */
+    fenceAcksMs: readonly number[]
+}): Promise<RuntimeMetrics> {
+    const tasks: Record<string, number> = {}
+    let uncertainTasks = 0
+    let uncertainActions = 0
+    for (const task of input.store.listTasks()) {
+        tasks[task.status] = (tasks[task.status] ?? 0) + 1
+        if (task.uncertainActions.length) uncertainTasks++
+        uncertainActions += task.uncertainActions.length
+    }
+    const sorted = [...input.fenceAcksMs].sort((a, b) => a - b)
+    const disk = await statfs(input.stateDir)
+    return {
+        tasks, uncertainTasks, uncertainActions,
+        fenceAck: { count: sorted.length, ...(sorted.length ? { p50Ms: sorted[Math.floor((sorted.length - 1) / 2)], maxMs: sorted.at(-1) } : {}) },
+        browsers: Object.fromEntries([...input.drivers].map(([profileId, driver]) => [profileId, { connected: driver.isConnected() }])),
+        disk: { freeBytes: disk.bavail * disk.bsize, totalBytes: disk.blocks * disk.bsize },
+    }
 }
