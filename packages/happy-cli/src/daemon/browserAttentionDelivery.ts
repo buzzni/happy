@@ -41,6 +41,25 @@ export function pollBrowserAttention(config: BrowserTaskBrokerConfig, afterSeq: 
     })
 }
 
+/** Resolve attention ownership separately from the general resume lookup. */
+export function findBrowserAttentionSession(
+    sessionId: string,
+    tracked: Iterable<TrackedSession>,
+    finished: ReadonlyMap<string, TrackedSession>,
+    isAlive: (pid: number) => boolean,
+): TrackedSession | undefined {
+    let ended: TrackedSession | undefined
+    for (const session of tracked) {
+        const pendingResume = !session.happySessionId && session.resumeTargetSessionId === sessionId
+        if (session.happySessionId !== sessionId && !pendingResume) continue
+        // A replacement awaiting its webhook still owns this attention. Never
+        // checkpoint the old process's exit while that replacement is alive.
+        if (isAlive(session.pid)) return session
+        ended ??= session
+    }
+    return ended ?? finished.get(sessionId)
+}
+
 interface DeliveryOptions {
     serverUrl: string
     findSession(sessionId: string): TrackedSession | undefined
@@ -53,6 +72,7 @@ export async function deliverBrowserAttention(event: AttentionEvent, signal: Abo
     if (!session) return 'unowned'
     if (!options.isAlive(session.pid)) return 'ended'
     if (session.startedBy !== 'daemon') return 'unowned'
+    if (session.happySessionId !== event.agentSessionId) throw new Error('Attention session identity unavailable')
     if (!session.encryption) throw new Error('Attention session encryption unavailable')
     const token = await options.readToken(session)
     if (!token) throw new Error('Attention session credential unavailable')

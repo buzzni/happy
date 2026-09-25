@@ -137,7 +137,7 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { createBrowserTaskSessionBroker, type BrowserTaskSessionBroker } from './browserTaskBroker';
-import { startBrowserAttentionWatcher } from './browserAttentionDelivery';
+import { findBrowserAttentionSession, startBrowserAttentionWatcher } from './browserAttentionDelivery';
 import {
   createProcFs,
   createProcProcessProbe,
@@ -4786,7 +4786,9 @@ export async function startDaemon(): Promise<void> {
       happyHomeDir: configuration.happyHomeDir,
       serverUrl: configuration.serverUrl,
       machineId,
-      findSession: findTrackedSessionById,
+      findSession: (sessionId) => findBrowserAttentionSession(
+        sessionId, pidToTrackedSession.values(), sessionIdToFinishedSession, isPidAlive,
+      ),
       isAlive: (pid) => pid > 0 && isPidAlive(pid),
       readToken: async (session) => session.userHomeDir
         ? readStagedTokenFromHomeDir(session.userHomeDir)

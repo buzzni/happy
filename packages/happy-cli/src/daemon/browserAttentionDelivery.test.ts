@@ -9,8 +9,10 @@ import { AttentionOutbox } from '@/browserRuntime/attention'
 import { startBroker, type Broker } from '@/browserRuntime/broker'
 import type { AttentionEvent } from '@/browserRuntime/contracts'
 import { TaskStore, type StoredTask } from '@/browserRuntime/taskStore'
+import { readDaemonState, writeDaemonState } from '@/persistence'
 import { BrowserAttentionWatcher, createAttentionCursorStore } from './browserAttentionWatcher'
-import { deliverBrowserAttention, pollBrowserAttention, startBrowserAttentionWatcher } from './browserAttentionDelivery'
+import { deliverBrowserAttention, findBrowserAttentionSession, pollBrowserAttention, startBrowserAttentionWatcher } from './browserAttentionDelivery'
+import { mergeTrackedSessionWebhook } from './persistedSessionHydration'
 import type { TrackedSession } from './types'
 
 const event: AttentionEvent = { seq: 1, taskId: 'task-1' as never, agentSessionId: 'session-1' as never, status: 'paused', eventSeq: 2, reason: 'approval-approved' }
@@ -60,6 +62,113 @@ describe('attention delivery over the existing encrypted server path', () => {
         expect(await deliver()).toBe('unowned')
         tracked = { ...session, encryption: undefined }; await expect(deliver()).rejects.toThrow('encryption')
         tracked = session; await expect(deliver()).rejects.toThrow('credential')
+    })
+
+    it.each([false, true])('retries attention between resume spawn and webhook (daemon restart: %s)', async restart => {
+        const dir = await tempDir(); const cursorFile = join(dir, 'cursor.json')
+        let requests = 0
+        const serverUrl = await listen(createServer(async (req, res) => {
+            let raw = ''; for await (const chunk of req) raw += chunk
+            const body = JSON.parse(raw); requests++
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify({ messages: [{ id: 'm1', localId: body.messages[0].localId, seq: 1 }] }))
+        }))
+        const pending: TrackedSession = { startedBy: 'daemon', pid: 456, resumeTargetSessionId: 'session-1' }
+        let tracked = new Map([[session.pid, session], [pending.pid, pending]])
+        const finished = new Map([['session-1', session]])
+        const options = {
+            serverUrl,
+            findSession: (id: string) => findBrowserAttentionSession(id, tracked.values(), finished, pid => pid === pending.pid),
+            isAlive: (pid: number) => pid === pending.pid,
+            readToken: async () => 'synthetic-account-token',
+        }
+        const makeWatcher = () => new BrowserAttentionWatcher({
+            store: createAttentionCursorStore(cursorFile),
+            poll: async () => ({ events: [event], nextSeq: 1, oldestSeq: 1 }),
+            deliver: (e, signal) => deliverBrowserAttention(e, signal, options),
+        })
+        let watcher = makeWatcher()
+        const expectPending = async (reason: string) => {
+            await expect(watcher.pollOnce()).rejects.toThrow(reason)
+            expect(await createAttentionCursorStore(cursorFile).read()).toEqual({ schemaVersion: 1, afterSeq: 0, skipped: [] })
+            expect(requests).toBe(0)
+        }
+        await expectPending('identity')
+        if (restart) {
+            // The daemon state persists resumeTargetSessionId before a webhook;
+            // recovery has no happySessionId with which to hydrate encryption.
+            writeDaemonState({ pid: 789, httpPort: 0, startTime: new Date(0).toISOString(), startedWithCliVersion: 'synthetic',
+                trackedSessions: [{ ...pending, startedAt: 1 }],
+            })
+            watcher.stop()
+            const recovered = (await readDaemonState())!.trackedSessions!
+            tracked = new Map(recovered.map(record => [record.pid, { ...record }]))
+            watcher = makeWatcher()
+            await expectPending('identity')
+        }
+        // Even cached encryption cannot stand in for the child's identity.
+        tracked.set(pending.pid, { ...pending, encryption })
+        await expectPending('identity')
+        const metadata = { path: '/synthetic', host: 'fixture', hostPid: pending.pid,
+            homeDir: '/synthetic', happyHomeDir: '/synthetic/happy', happyLibDir: '/synthetic/lib', happyToolsDir: '/synthetic/tools' }
+        tracked.set(pending.pid, mergeTrackedSessionWebhook({ tracked: pending, sessionId: 'session-1', metadata }))
+        await expectPending('encryption')
+        tracked.set(pending.pid, mergeTrackedSessionWebhook({ tracked: tracked.get(pending.pid)!, sessionId: 'session-1', metadata, encryption }))
+        await watcher.pollOnce()
+        expect(requests).toBe(1)
+        expect(await createAttentionCursorStore(cursorFile).read()).toEqual({ schemaVersion: 1, afterSeq: 1, skipped: [] })
+    })
+
+    it.each(['response-lost', 'cancel-during-post'] as const)('replays a committed HTTP message after %s and watcher restart', async failure => {
+        const dir = await tempDir(); const cursorFile = join(dir, 'cursor.json')
+        const stored = new Map<string, { id: string; localId: string; seq: number; content: string }>()
+        const attempts: string[] = []; const afterSeqs: number[] = []
+        let committed!: () => void; let disconnected!: () => void
+        const firstCommit = new Promise<void>(resolve => { committed = resolve })
+        const firstDisconnect = new Promise<void>(resolve => { disconnected = resolve })
+        const serverUrl = await listen(createServer(async (req, res) => {
+            let raw = ''; for await (const chunk of req) raw += chunk
+            const body = JSON.parse(raw) as { messages: { localId: string; content: string }[] }
+            const message = body.messages[0]; attempts.push(message.localId)
+            const key = `${req.url}:${message.localId}`
+            // Model the server's (sessionId, localId) uniqueness boundary.
+            if (!stored.has(key)) stored.set(key, { ...message, id: 'm1', seq: 1 })
+            const ack = stored.get(key)!
+            if (attempts.length === 1) {
+                res.on('close', disconnected)
+                committed()
+                if (failure === 'response-lost') res.destroy()
+                return
+            }
+            res.setHeader('content-type', 'application/json')
+            // A 200 alone is not an acknowledgement of this localId.
+            res.end(JSON.stringify({ messages: attempts.length === 2 ? [{ ...ack, localId: 'unrelated' }] : [ack] }))
+        }))
+        const options = { serverUrl, findSession: () => session, isAlive: () => true, readToken: async () => 'synthetic-account-token' }
+        const makeWatcher = () => new BrowserAttentionWatcher({
+            store: createAttentionCursorStore(cursorFile),
+            poll: async afterSeq => { afterSeqs.push(afterSeq); return { events: [event], nextSeq: 1, oldestSeq: 1 } },
+            deliver: (e, signal) => deliverBrowserAttention(e, signal, options),
+        })
+        const watcher = makeWatcher()
+        const failedDelivery = expect(watcher.pollOnce()).rejects.toThrow()
+        await firstCommit
+        if (failure === 'cancel-during-post') watcher.stop()
+        await failedDelivery; await firstDisconnect
+        expect(stored.size).toBe(1)
+        expect(await createAttentionCursorStore(cursorFile).read()).toEqual({ schemaVersion: 1, afterSeq: 0, skipped: [] })
+        watcher.stop()
+        const restarted = makeWatcher()
+        await expect(restarted.pollOnce()).rejects.toThrow('acknowledgement')
+        expect((await createAttentionCursorStore(cursorFile).read()).afterSeq).toBe(0)
+        await restarted.pollOnce()
+        expect(await createAttentionCursorStore(cursorFile).read()).toEqual({ schemaVersion: 1, afterSeq: 1, skipped: [] })
+        expect(attempts).toEqual(['abp-task-1-2', 'abp-task-1-2', 'abp-task-1-2'])
+        expect(afterSeqs).toEqual([0, 0, 0])
+        expect(stored.size).toBe(1)
+        await restarted.pollOnce()
+        expect(afterSeqs).toEqual([0, 0, 0, 1])
+        expect(attempts).toHaveLength(3)
     })
 
     it('consumes the real S2 broker/outbox, including expiry and authenticated long-poll wakeup', async () => {
