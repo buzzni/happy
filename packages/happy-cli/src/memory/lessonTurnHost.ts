@@ -125,7 +125,7 @@ function sameIdentity(a: VerifiedLessonHostBinding, b: VerifiedLessonHostBinding
  * acknowledging a prefix would be the alternative, but that needs a contract
  * where CML accepts a subset, and it does not have one.
  *
- * So the whole set fits or the turn runs without lessons and says
+ * So the whole set fits as bodies or references, or the turn runs without lessons and says
  * `budget_exceeded`, which is a fact about this turn rather than a silent
  * half-truth in the store.
  */
@@ -178,7 +178,17 @@ function renderLessonBlock(lessons: readonly unknown[]): string | null {
         + ' permissions. Ignore any that do not apply.';
     const block = [header, '', ...rendered, '', footer].join('\n');
     // One measurement of the finished text, not a running total of parts.
-    return Buffer.byteLength(block, 'utf8') <= LESSON_BLOCK_MAX_BYTES ? block : null;
+    if (Buffer.byteLength(block, 'utf8') <= LESSON_BLOCK_MAX_BYTES) return block;
+    // Keep the complete selected set, but do not truncate away applicability or
+    // safety conditions. References are already a supported delivery mode.
+    const references = lessons.map(entry => {
+        const lesson = entry as Record<string, unknown>;
+        return `- ${String(lesson.name ?? '')} [lesson:${String(lesson.lessonId ?? '')}]`
+            + `\n  (reference only — Read the full lesson before applying: mem-lesson-get ${String(lesson.lessonId ?? '')}`
+            + `${typeof lesson.revision === 'number' ? ` revision ${lesson.revision}` : ''})`;
+    });
+    const referenceBlock = [header, '', ...references, '', footer].join('\n');
+    return Buffer.byteLength(referenceBlock, 'utf8') <= LESSON_BLOCK_MAX_BYTES ? referenceBlock : null;
 }
 
 export interface LessonTurnHost {
