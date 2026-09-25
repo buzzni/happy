@@ -236,11 +236,25 @@ ${ELEMENT_NAMING}
  * the point in that iframe's client coordinates) through every same-process
  * ancestor document, requiring each to hit the iframe element itself at the
  * point, i.e. nothing of a parent document covers it.
- * Returns { covered } | { top } | { point, levels } when the next parent is in
- * another process (the caller continues there; levels = frames climbed here).
+ * Returns { covered } | { top } | { unsupported } | { point, levels } when the
+ * next parent is in another process (the caller continues there; levels =
+ * frames climbed here). The mapping below is a plain offset: when the iframe or
+ * any ancestor is transformed or zoomed it is wrong, so that is reported as
+ * unsupported (the action is handed to the user) instead of being guessed.
  */
 export const CLIMB_FRAMES = String.raw`function climbFrames(incoming) {
+    const plainGeometry = (owner) => {
+        for (let node = owner; node; ) {
+            const style = node.ownerDocument.defaultView.getComputedStyle(node)
+            if (style.transform !== 'none' || (style.rotate && style.rotate !== 'none') || (style.scale && style.scale !== 'none')
+                || (style.translate && style.translate !== 'none') || (style.zoom && style.zoom !== '1' && style.zoom !== 'normal')) return false
+            const root = node.getRootNode()
+            node = node.assignedSlot ?? node.parentElement ?? (root && root.host ? root.host : null)
+        }
+        return true
+    }
     const hitOwner = (owner, p) => {
+        if (!plainGeometry(owner)) return { unsupported: true }
         const rect = owner.getBoundingClientRect()
         const style = owner.ownerDocument.defaultView.getComputedStyle(owner)
         const x = rect.left + owner.clientLeft + parseFloat(style.paddingLeft || '0') + p.x
@@ -252,6 +266,7 @@ export const CLIMB_FRAMES = String.raw`function climbFrames(incoming) {
     let point
     if (incoming) {
         const first = hitOwner(this, incoming)
+        if (first.unsupported) return { unsupported: true }
         if (!first.hit) return { covered: true }
         point = first.point
     } else {
@@ -268,6 +283,7 @@ export const CLIMB_FRAMES = String.raw`function climbFrames(incoming) {
         try { owner = win.frameElement } catch { owner = null }
         if (!owner) return { point, levels }
         const next = hitOwner(owner, point)
+        if (next.unsupported) return { unsupported: true }
         if (!next.hit) return { covered: true }
         point = next.point
         doc = owner.ownerDocument

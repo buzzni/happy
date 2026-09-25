@@ -1497,7 +1497,10 @@ export class CdpDriver implements BrowserDriver {
         for (let hop = 0; hop < MAX_FRAME_DEPTH; hop++) {
             const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: CLIMB_FRAMES, objectId: target,
                 arguments: [{ value: incoming }], returnByValue: true }, sessionId)
-            const climb = result.value as { covered?: true; top?: true; point?: { x: number; y: number }; levels?: number } | undefined
+            const climb = result.value as { covered?: true; top?: true; unsupported?: true; point?: { x: number; y: number }; levels?: number } | undefined
+            if (climb?.unsupported) {
+                throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'the element\'s frame is transformed or zoomed; its overlay check cannot be verified, hand this action to the user', false, false)
+            }
             if (!climb || climb.covered) throw covered()
             if (climb.top) return
             // The climb stopped where the parent is in another process: that must be this session's root frame.

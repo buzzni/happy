@@ -112,6 +112,15 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         const framed = (src: string, overlay: boolean) => `${HIT_SCRIPT}<body style="margin:0">
             <iframe src="${src}" style="position:absolute;left:30px;top:30px;width:300px;height:200px;border:5px solid black;padding:3px"></iframe>
             ${overlay ? `<div style="position:absolute;left:0;top:0;width:500px;height:400px;z-index:10;opacity:0.01" onclick="hit('overlay')"></div>` : ''}</body>`
+        // The inner button sits at 40..160 x 40..80 of the frame; scaled x2 from the frame's corner (30+5+3=38)
+        // it is really at 118..358 x 118..198. The overlay covers only that real area; unscaled maths would
+        // check (138, 98) — outside the overlay — and wrongly pass.
+        const transformed = (transform: string) => `${HIT_SCRIPT}<body style="margin:0">
+            <iframe src="/inner-btn" style="position:absolute;left:30px;top:30px;width:300px;height:200px;border:5px solid black;padding:3px;transform:${transform};transform-origin:0 0"></iframe>
+            <div style="position:absolute;left:200px;top:110px;width:200px;height:100px;z-index:10;opacity:0.01" onclick="hit('overlay')"></div></body>`
+        a.route('/frame-scaled', transformed('scale(2)'))
+        a.route('/frame-rotated', transformed('rotate(3deg)'))
+        a.route('/frame-zoomed-parent', `${HIT_SCRIPT}<body style="margin:0"><div style="zoom:2"><iframe src="/inner-btn" style="width:300px;height:200px;border:0"></iframe></div></body>`)
         a.route('/frame-clear-same', framed('/inner-btn', false))
         a.route('/frame-overlay-same', framed('/inner-btn', true))
         a.route('/frame-clear-oopif', () => framed(b.url('/frame-btn'), false))
@@ -551,6 +560,18 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
             await driver.click(tab.tabId, refOf(obs, 'Frame go'), obs.snapshotId, OPTS)
             expect(await eventually(() => b.hits('frame-btn'), (n) => n === 1)).toBe(1)
+        })
+
+        it('hands off a click in a transformed or zoomed frame instead of trusting untransformed geometry (no dispatch)', async () => {
+            for (const path of ['/frame-scaled', '/frame-rotated', '/frame-zoomed-parent']) {
+                const tab = await open(path, [a.origin])
+                const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+                const error = await expectCode(driver.click(tab.tabId, refOf(obs, 'Inner go'), obs.snapshotId, OPTS), 'APPROVAL_REQUIRED')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+                await delay(300)
+                expect(a.hits('inner-btn'), path).toBe(0)
+                expect(a.hits('overlay'), path).toBe(0)
+            }
         })
 
         it('refuses a click whose iframe is covered by an element of the parent document (same-process and OOPIF)', async () => {
