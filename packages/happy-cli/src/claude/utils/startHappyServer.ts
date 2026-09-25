@@ -8,7 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createServer } from "node:http";
-import type { ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { AddressInfo } from "node:net";
 import { z } from "zod";
@@ -22,10 +22,11 @@ import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 import { readFile } from 'node:fs/promises';
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, chownSync, mkdtempSync, rmSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { projectPath } from '@/projectPath';
+import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
 import { BrowserRuntimeError } from '@/browserRuntime/contracts';
@@ -433,7 +434,24 @@ export async function startHappyServer(
     }
 
     const changeTitle = createChangeTitleHandler(client);
-    const privateDir = options.mandatorySandbox ? mkdtempSync(join(process.platform === 'linux' ? '/tmp' : tmpdir(), 'happy-mcp-')) : undefined;
+    const linuxMandatory = options.mandatorySandbox && process.platform === 'linux';
+    let mcpGroup: number | undefined;
+    let privateDir: string | undefined;
+    try {
+        mcpGroup = linuxMandatory ? Number(execFileSync('/usr/bin/id', ['-g', 'agent-sbx'], { encoding: 'utf8' }).trim()) : undefined;
+        if (linuxMandatory) {
+            const root = lstatSync('/run/abp-mcp');
+            if (!root.isDirectory() || root.uid !== process.getuid?.() || root.gid !== mcpGroup || (root.mode & 0o777) !== 0o710) throw new Error('Mandatory MCP directory permissions invalid');
+        }
+        privateDir = options.mandatorySandbox ? mkdtempSync(join(linuxMandatory ? '/run/abp-mcp' : tmpdir(), 'happy-mcp-')) : undefined;
+        if (privateDir && mcpGroup !== undefined) {
+            chownSync(privateDir, process.getuid!(), mcpGroup);
+            chmodSync(privateDir, 0o710);
+        }
+    } catch {
+        if (privateDir) rmSync(privateDir, { recursive: true, force: true });
+        throw new MandatorySandboxError('capability-unavailable', 'MCP socket directory or group unavailable');
+    }
     const socketPath = privateDir ? join(privateDir, 'mcp.sock') : undefined;
     const token = privateDir ? randomBytes(32).toString('hex') : undefined;
 
@@ -478,8 +496,11 @@ export async function startHappyServer(
         server.once('error', reject);
         if (socketPath) {
             server.listen(socketPath, () => {
-                chmodSync(socketPath, 0o600);
-                resolve(new URL('http://127.0.0.1:3129'));
+                try {
+                    if (mcpGroup !== undefined) chownSync(socketPath, process.getuid!(), mcpGroup);
+                    chmodSync(socketPath, mcpGroup === undefined ? 0o600 : 0o660);
+                    resolve(new URL('http://localhost/'));
+                } catch { reject(new MandatorySandboxError('capability-unavailable', 'MCP socket permissions unavailable')); }
             });
         } else {
             server.listen(0, '127.0.0.1', () => {
@@ -495,8 +516,7 @@ export async function startHappyServer(
     const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string } = socketPath
         ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs')], env: {
             SAYCODE_MCP_SOCKET: socketPath,
-            HAPPY_HTTP_MCP_URL: baseUrl.toString(),
-            HAPPY_HTTP_MCP_HEADERS: JSON.stringify({ Authorization: `Bearer ${token}` }),
+            SAYCODE_MCP_TOKEN: token!,
         } }
         : { type: 'http', url: baseUrl.toString() };
 

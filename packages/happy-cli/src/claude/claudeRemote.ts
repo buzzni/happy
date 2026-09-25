@@ -329,9 +329,8 @@ async function runClaudeRemote(
             additionalDenyWrite: providerSandbox?.filesystem?.denyWrite,
             mcpSocketPath: (opts.mcpServers?.happy as { env?: Record<string, string> } | undefined)?.env?.SAYCODE_MCP_SOCKET,
         }) : undefined;
-    if (processSandbox && opts.sessionId && !opts.completeTurn && !claudeCheckSession(opts.sessionId, opts.path, processSandbox.claudeConfigDir)) {
-        startFrom = null;
-    }
+    // Claude owns its separate-UID session state; the Happy UID cannot pre-read it.
+
 
     // Handle /compact command
     let isCompactCommand = false;
@@ -409,10 +408,9 @@ async function runClaudeRemote(
         skills: skillGovernance.skills,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal; toolUseID: string }) => opts.canCallTool(toolName, input, mode, options),
         abort: opts.signal,
-        settingsPath: opts.hookSettingsPath,
+        settingsPath: processSandbox ? undefined : opts.hookSettingsPath,
         promptSuggestions: true,
-        // The outer OS boundary already covers Bash and every other tool. Nested SDK
-        // sandboxing would attempt to create Unix sockets after seccomp is active.
+        // The outer UID and OS boundary already covers Bash and every other tool.
         sandbox: processSandbox ? { enabled: false } : providerSandbox,
         permissionsDeny: opts.permissionsDeny,
         /*
@@ -781,7 +779,9 @@ function readTurnText(content: unknown): string {
 
                 // Session id is still in memory, wait until session file is written to disk
                 // Start a watcher for to detect the session id
-                if (systemInit.session_id) {
+                if (systemInit.session_id && processSandbox) {
+                    opts.onSessionFound(systemInit.session_id);
+                } else if (systemInit.session_id) {
                     logger.debug(`[claudeRemote] Waiting for session file to be written to disk: ${systemInit.session_id}`);
                     const projectDir = getProjectPath(providerPath, processSandbox?.claudeConfigDir);
                     const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`), 30000);

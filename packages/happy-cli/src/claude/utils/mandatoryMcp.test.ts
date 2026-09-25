@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { request } from 'node:http';
 import { startHappyServer } from './startHappyServer';
 import type { ApiSessionClient } from '@/api/apiSession';
@@ -21,10 +21,13 @@ it('authenticates the Unix MCP endpoint and exposes exactly the mandatory browse
     const client = { sessionId: 'synthetic-session', hasTitle: () => true } as ApiSessionClient;
     const previous = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
     process.env.HAPPY_BROWSER_TASK_RUNTIME_URL = 'http://127.0.0.1:1';
+    // Linux group permissions are exercised in the privileged container; the unit
+    // transport test uses an isolated current-user socket on every developer OS.
+    vi.stubGlobal('process', { ...process, platform: 'darwin' });
     const server = await startHappyServer(client, { mandatorySandbox: true, proposeLesson: () => ({ accepted: false }) });
     try {
         expect(server.socketPath).toBeTruthy();
-        const token = JSON.parse(server.mcpConfig.env!.HAPPY_HTTP_MCP_HEADERS).Authorization.slice(7);
+        const token = server.mcpConfig.env!.SAYCODE_MCP_TOKEN;
         expect((await rpc(server.socketPath!, 'wrong-synthetic', 'tools/list')).status).toBe(401);
         const response = await rpc(server.socketPath!, token, 'tools/list');
         expect(response.status).toBe(200);
@@ -36,6 +39,7 @@ it('authenticates the Unix MCP endpoint and exposes exactly the mandatory browse
         }
     } finally {
         server.stop();
+        vi.unstubAllGlobals();
         if (previous === undefined) delete process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
         else process.env.HAPPY_BROWSER_TASK_RUNTIME_URL = previous;
     }

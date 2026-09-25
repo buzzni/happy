@@ -1,126 +1,151 @@
-# Mandatory remote Claude sandbox (S1)
+# Mandatory browser sandbox — S1 rework
 
-Scope: dedicated Linux machines with `/etc/aplus/sandbox-policy.json` set to
-`{"mode":"mandatory"}` and an enabled session sandbox config. Owner-choice
-sessions retain their existing behavior. No deployment or daemon mutation is
-performed by these changes.
+The SDK spawn hook runs `/usr/bin/sudo -n -u agent-sbx
+/usr/local/libexec/abp/claude-sbx-launch 0`. The launcher is installed **outside**
+the Happy package, root-owned 0755 with root-owned, non-writable ancestors.
+Owner-choice sessions retain their existing path. No runtime seccomp program or
+socat relay is used by this mandatory path.
 
-`claudeProcessSandbox.ts` prepares sandbox-runtime 0.0.37 before SDK query and
-probes it with `/bin/true`. The synchronous SDK hook returns the actual bwrap
-ChildProcess; checkpoint process tracking and provider exit observation remain
-attached to that object. Preparation failures terminate the mandatory launch
-with `MandatorySandboxError`, without the ordinary provider retry loop.
+The one argv descriptor is stdin (fd 0): a JSON metadata field followed by NUL,
+then exactly `argc` NUL-terminated arguments, then ordinary SDK stdin. The
+metadata contains version 1, argc, cwd, env, denyRead, denyWrite and
+networkBlocked. Total prefix limit: 4 MiB; argument limit: 65536. Sudo keeps only
+stdio, so no closefrom override or temporary argv path is needed. The launcher
+validates and consumes the same stream, reapplies its environment allowlist,
+and passes argv to bwrap without a shell. Partial headers time out after 10 s;
+truncated/malformed frames fail with exit 125. No tokens are put in logs or
+sudo command-line arguments.
 
-The package launcher `bin/claude-sandbox-launcher.sh` consumes a unique 0600
-NUL-delimited argv file (`O_EXCL`, `O_NOFOLLOW`) in a host-only 0700 directory
-under `/tmp`. It rejects changed modes, symlink files and non-private parents,
-unlinks the file, and execs argv without shell evaluation. The package prefix
-is read-only inside bwrap. Host tmp is hidden before runtime mount restrictions
-are applied; only the working directory, private tmp and private Claude state
-are writable. PID/net namespaces, fresh proc, dropped capabilities,
-die-with-parent and the runtime's AF_UNIX seccomp filter are mandatory.
+Bwrap creates user/PID/IPC/UTS namespaces, fresh proc/dev and private tmp, drops
+capabilities, uses `--new-session` and `--die-with-parent`, mounts the root
+read-only, and permits writes to the workspace and `/home/agent-sbx` only.
+The supervisor kills bwrap on cancellation or loss of its sudo parent; death
+of the PID namespace init kills detached/setsid descendants as well. UID
+permissions are the security boundary; mounts reduce exposure in addition.
 
-The outer launcher uses a fixed system PATH, not a session-provided helper path.
-The child env is an allowlist; Happy/daemon/browser grants, NODE_OPTIONS,
-BASH_ENV, arbitrary proxy variables and unrelated credentials do not pass.
-Claude authentication variables are allowed. Nonessential traffic and automatic
-updates are disabled. CLI SDK 0.3.276 and sandbox-runtime 0.0.37 are pinned in the
-package manifest and lockfile; no application dependency was added.
+Claude keeps authentication, refreshed credentials and transcripts in
+`/home/agent-sbx/.claude`. Provision it as that user (S6 login procedure); Happy
+does not seed credentials from the agent user's home. The Happy parent uses SDK
+session events rather than reading or waiting on this private transcript, and
+does not pass its inaccessible hook settings file to Claude. The normal SDK
+stream still forwards remote output; host transcript scanners/local transitions
+are not a supported source of sandbox session state.
 
-An optional root-owned, non-group/world-writable, non-symlink file
-`/etc/aplus/claude-sandbox.json` can contain:
+## S6 installation interface and explicit additions to D1
 
-```json
-{"allowedDomains":["api.anthropic.com","claude.ai","platform.claude.com"]}
-```
+1. Create `agent`, `agent-sbx`, `abp-proxy`, `abp-session`, `abp-work`. Only agent
+   belongs to abp-session; agent-sbx may belong only to agent-sbx and abp-work.
+   Agent also needs supplementary agent-sbx membership to chgrp its MCP sockets.
+   `/home/agent` and `/home/agent-sbx`: respective owner, 0700. Workspaces must
+   be `/work` or beneath it, shared abp-work group, setgid. This fixed workspace
+   prefix is a conservative **additional restriction** beyond D1.
+2. Install Node at `/usr/bin/node`, bwrap at `/usr/bin/bwrap`, sudo at
+   `/usr/bin/sudo`, and the fixed launcher. All executable targets/ancestors must
+   be root-owned and not group/world writable. Install the Happy package in a
+   root-owned, readable location outside the private agent home and `/tmp`.
+3. Sudoers (validate with visudo):
 
-Those are also the defaults. Only exact DNS names are accepted. Empty domains
-or a session's blocked network mode deny all proxy destinations. Session deny
-rules may narrow the installation policy; session extra writable paths cannot
-widen the process boundary.
+   ```sudoers
+   Defaults:agent env_reset,!use_pty
+   agent ALL=(agent-sbx) NOPASSWD: /usr/local/libexec/abp/claude-sbx-launch 0
+   ```
 
-## MCP and private provider state
+4. **Contract addition:** live iptables reads need privilege not available to
+   either unprivileged UID. Compile `scripts/agent-browser/abp-firewall-read.c`
+   and install as `/usr/local/libexec/abp/abp-firewall-read`, root:abp-session
+   **4750**. This small native reader takes no arguments, uses fixed absolute
+   iptables-save/ip6tables-save executables with a clean environment, and only
+   dumps the filter tables. It cannot mutate rules or execute caller-supplied
+   commands. Do not authorize general sudo, grant CAP_NET_ADMIN to Node, or
+   substitute a stale rules snapshot. This additional privileged component
+   needs S6/security review before deployment.
+5. Install the ordered OUTPUT prefix emitted by `firewallRules(4|6, sbxUid,
+   proxyUid)` in `sandboxPreflight.ts`, **before every other OUTPUT rule**.
+   Preflight compares the live prefix, so missing, reordered or shadowed rules
+   refuse a session. IPv4 agent-sbx can originate TCP only to 127.0.0.1:3128;
+   IPv6 agent-sbx is entirely rejected. Proxy can originate public TCP 443 only.
+   **Necessary clarification:** proxy replies from loopback source port 3128
+   to established loopback clients are allowed. These are responses to the
+   listener, not a Runtime/API exception. Private/loopback/CGNAT/link-local,
+   documentation, multicast and translation prefixes are denied before public
+   allow rules; IPv6 permits only native 2000::/3 minus reserved ranges.
+6. Run `node <package>/dist/sandbox/egressProxyMain.mjs` as **abp-proxy** under
+   systemd, restart on failure. The entry refuses other users. It listens only
+   on 127.0.0.1:3128. No Happy environment or credentials are needed. Its optional
+   root-owned `/etc/aplus/claude-sandbox.json` holds exact `allowedDomains`; defaults
+   are api.anthropic.com, claude.ai, platform.claude.com. Only CONNECT port 443 is
+   accepted. Every resolved address must be public; the connection uses the
+   validated numeric address without another DNS lookup. No HTTP forwarding,
+   SOCKS, redirects or wildcard domains.
+7. **Resolver prerequisite:** public-443-only owner rules deliberately disallow
+   direct DNS. Configure glibc NSS `nss-resolve` to use systemd-resolved's Unix
+   socket (or root-managed static hosts). `dns.lookup` uses that OS resolver.
+   A normal UDP DNS setup fails closed; do not add a proxy UDP DNS exception.
+   NSS integration still requires S6 machine validation; the container uses
+   `/etc/hosts` for deterministic DNS/rebinding fixtures.
+8. `/run/abp-mcp`: agent:agent-sbx 0710. Happy creates per-session directories
+   with the same owner/group/mode, and socket 0660. MCP uses a random session
+   token and the stdio bridge connects directly over Unix HTTP. The bridge gets
+   only SAYCODE_MCP_SOCKET and SAYCODE_MCP_TOKEN, no Happy credential variables.
+   Registered tools remain change_title + the twelve browser_task tools;
+   guessed shell/automation/legacy/lesson calls are rejected.
+9. Mandatory Happy and AI credential staging uses passwd-home `.happy-staging`
+   0700, and private per-spawn directories/0600 keys; TMPDIR cannot move it.
+   Insecure or symlinked staging roots are refused. Agent home permissions
+   protect credentials created after sandbox preparation. Non-mandatory staging
+   keeps its existing location. Custom Happy homes outside the passwd home must
+   themselves be private. Broker/admin/docker/stack permissions remain S6 duties.
 
-Mandatory Claude sessions expose `change_title` and, when the browser Runtime
-is configured, the 12 `browser_task_*` tools. `bash_stream`, script automations,
-legacy browser tools and lesson proposals are not registered, including for
-callers that guess their names. The session server listens only on its private
-0600 Unix socket and authenticates every HTTP request with a random session
-token. Ordinary sessions keep their HTTP transport and tool surface.
+Network-blocked sessions additionally use bwrap `--unshare-net`. A session
+requesting custom/denied domains is refused rather than silently ignoring its
+restriction: domain policy must be installed on the separate proxy. No writable
+extra path can widen the `/work` boundary. Proxy unreachability, missing sudo,
+bwrap, rule reader, identities, MCP permissions or firewall rules fail closed
+with MandatorySandboxError before SDK query.
 
-**Contract deviation:** sandbox-runtime's Linux seccomp blocks *all* AF_UNIX
-socket creation; its `allowUnixSockets` is not a path exception on Linux.
-The fixed launcher therefore starts a socat relay *before* seccomp, listening
-only on 127.0.0.1:3129 **inside the new network namespace**, bound to the one
-session Unix socket. `happy-mcp` speaks stdio to Claude and authenticated HTTP
-through that relay. No host-loopback TCP endpoint is opened. The runtime uses
-the same pre-seccomp relay mechanism for its HTTP/SOCKS proxies.
+## Reproduction and evidence (2026-09-25)
 
-Claude uses session-private configuration/state under the MCP private directory,
-backed by host private tmp and mounted into the sandbox. Only `.credentials.json`
-is seeded (without following a credential-file symlink); settings/plugins are
-not copied and filesystem setting sources are disabled. Refresh writes and
-transcripts survive provider respawns in this session. State is removed when
-the session MCP server closes. Shared Claude configuration is never written.
-
-## Evidence and reproduction (2026-09-25)
-
-Run from `packages/happy-cli` after installing the locked workspace dependencies:
+From `packages/happy-cli`:
 
 ```sh
 pnpm typecheck
-pnpm exec vitest run --project unit src/sandbox/claudeProcessSandbox.test.ts src/sandbox/claudeSdkSandbox.test.ts src/sandbox/config.test.ts src/sandbox/sandboxPolicy.test.ts src/claude/utils/mandatoryMcp.test.ts src/claude/utils/startHappyServer.test.ts src/claude/utils/path.test.ts src/claude/utils/claudeCheckSession.test.ts src/claude/claudeRemote.test.ts src/claude/claudeRemoteLauncher.test.ts src/claude/claudeRemoteManagedBoundary.test.ts src/claude/sdk/query.test.ts
-DOCKER_BUILDKIT=0 docker build -t happy-s1-sandbox-smoke -f scripts/sandbox-linux-smoke.Dockerfile scripts
-docker run --rm --privileged -v "$PWD/../..:/w:ro" happy-s1-sandbox-smoke
+pnpm exec vitest run --project unit src/sandbox src/claude/utils/mandatoryMcp.test.ts src/claude/utils/startHappyServer.test.ts src/claude/utils/path.test.ts src/claude/utils/claudeCheckSession.test.ts src/claude/claudeRemote.test.ts src/claude/claudeRemoteLauncher.test.ts src/claude/claudeRemoteManagedBoundary.test.ts src/claude/sdk/query.test.ts src/daemon/stageUserCredentials.test.ts src/daemon/stagedCredentialRoot.test.ts src/daemon/aiCredentialRuntime.test.ts --cache=false
+BUILDX_CONFIG="$PWD/.s1-buildx" docker build -f scripts/sandbox-linux-smoke.Dockerfile -t abp-s1-rework-test .
+docker run --rm --privileged --name abp-s1-rework-test --mount "type=bind,src=$PWD/../..,dst=/w,readonly" abp-s1-rework-test
 ```
 
-Final unit result: **200 passed, 1 existing platform skip across 12 files**.
-`pnpm typecheck` passed. The unit command builds the package first (Vitest global setup). BuildKit was
-unavailable because its host activity-file update was denied; the legacy local
-builder worked. The container is privileged to allow nested bwrap, but the
-fixture and sandbox execute as non-root `node`. The workspace is mounted
-read-only. No `abp-exec`, real daemon directory, account key, API call or
-production site is used. Test tokens and credential contents are synthetic.
+Verified: pnpm typecheck passed; the standard unit command passed **390 tests
+across 23 files**, with one existing platform skip. The build passed with its
+existing bin/chunk warnings. The ARM64 container integration exited 0 with all
+assertions above passing. git diff --check passed.
 
-Linux proof passes: eight concurrent real launches preserve empty/quoted/newline
-argv; staged/Happy/stack canaries cannot be read; the launcher cannot be changed;
-private proc/tmp and environment filtering hold; synthetic credential refresh
-survives another spawn without changing its source; AF_UNIX creation is denied;
-host loopback is unreachable; a disallowed domain returns proxy 403; the actual
-packaged happy-mcp bridge lists exactly 13 permitted tools under seccomp;
-cancellation produces an observed bwrap exit.
+Vitest's normal global setup builds the package. The disposable container uses
+OrbStack ARM64, three distinct UIDs, sudoers, owner rules in its **own** network
+namespace, bwrap and a read-only source mount. It does not mount the Docker socket,
+use real daemons, make production deployments, or use real credentials. Buildx
+state is local to this worktree because host buildx activity writes are denied.
 
-## Worktree handoff
+The integration asserts eight genuinely concurrent launches, malformed/truncated
+argv refusal, late credential staging despite TMPDIR=/work, private/loopback and
+direct public TCP denial, allowlisted hostname resolving to 127.0.0.1 rejection,
+authenticated MCP with exactly 13 tools, the packaged happy-mcp stdio bridge,
+raw `socket(0x100000001, ...)`, cross-UID ptrace denial, and cancellation of
+setsid descendants (host PIDs gone/zombie plus stopped heartbeat). A second raw
+syscall/credential/ptrace check runs **without bwrap or seccomp**, demonstrating
+permission denials rather than inferring them from masked paths. Deleting a live
+IPv6 rule causes application preflight to refuse startup.
 
-Changes are in `feat/abp-s1-sandbox`'s assigned worktree. Commit creation was
-blocked by `Operation not permitted` when Git tried to create the worktree
-`index.lock` in the shared repository metadata outside this worktree. No commit,
-push or production mutation occurred. The planned structural-only first commit
-extracts the `runClaudeRemote` body; the behavior/tests/pins follow separately.
-Both intended commit messages must end with:
+Synthetic refresh is an actual HTTPS POST to the pinned CLI refresh path
+`https://platform.claude.com/v1/oauth/token` through CONNECT, against a TLS fixture
+bound to a public-address alias inside the disposable netns. The fixture accepts
+an old synthetic refresh token, returns rotated synthetic tokens, and the dummy
+provider atomically writes state that the next spawn reads. This does **not**
+claim an authenticated Claude OAuth refresh or real model turn. x86_64 and a
+systemd-installed execution machine have not been exercised here. GD1/GD6 and
+the broader S9 acceptance gates remain deployment-stream work.
 
-```text
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-```
-
-## Remaining deployment gates / explicit limitations
-
-- **D1 is not fully closed:** sandbox-runtime 0.0.37 checks hostnames before
-  HTTP CONNECT/HTTP/SOCKS connections, but exposes no connect-time resolved-IP
-  policy. It can resolve an allowed name to a loopback, private, link-local or
-  IPv6 ULA address. DNS rebinding protection is **not implemented or claimed**.
-  Production needs a proxy that validates and pins resolved public addresses
-  on every connection, or a runtime extension with equivalent behavior.
-- Live Claude OAuth refresh and a real model turn were not run (real credentials
-  were prohibited). Synthetic refresh verifies writable isolation and retention,
-  not provider refresh semantics. Rotated refresh tokens are not copied back to
-  shared auth; a new session needs valid bootstrap auth. Private transcripts do
-  not survive session closure, so cross-session provider resume is not proven.
-- This is the remote Claude path. Local-mode/provider transitions, a deployed
-  systemd machine, production packaging/install permissions and real browser
-  acceptance still need the deployment stream's validation. Existing hook
-  callbacks to host loopback are intentionally unreachable; SDK events remain
-  the remote session identity source.
-- Package/private-path mounts and syscall filtering constrain sandboxed code.
-  Same-UID hostile code already running outside the sandbox is outside this
-  trust model. The domain exception above prevents a deployment-ready D1 claim.
+This rework remains uncommitted at the user's instruction (base de9a70bd).
+Minimal changes outside sandbox/claude are the codex-owned shared MCP bridge,
+daemon credential staging, the proxy package export, and container harness.
+No new npm dependency was added. The native rule reader uses libc; NSS resolver
+support is an explicit installation prerequisite, not an application dependency.

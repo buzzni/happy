@@ -73,6 +73,9 @@
         "types": "./dist/managed/imageRuntimeEntry.d.mts",
         "default": "./dist/managed/imageRuntimeEntry.mjs"
       }
+    },
+    "./sandbox/egressProxyMain": {
+      "import": "./dist/sandbox/egressProxyMain.mjs"
     }
   },
   "files": [
