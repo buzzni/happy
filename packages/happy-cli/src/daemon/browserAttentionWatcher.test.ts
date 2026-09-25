@@ -71,7 +71,7 @@ describe('daemon attention watcher durability', () => {
         const state = await store.read(); expect(state.afterSeq).toBe(150); expect(state.skipped).toHaveLength(100)
         expect(state.skipped.at(-1)).toMatchObject({ taskId: 'task-1', eventSeq: 160, reason: 'unowned' })
         expect((await readFile(file, 'utf8')).length).toBeLessThan(20_000)
-    })
+    }, 30_000) // 150 fsync'd cursor writes: slow on a loaded disk, not a correctness limit
 
     it('fails closed on corrupt cursors and invalid or oversized feeds', async () => {
         const { store, file } = await fixture(); let delivered = false
