@@ -12,8 +12,10 @@
  * framed and length-checked by rfb.ts before they reach the viewer.
  */
 import { randomBytes } from 'node:crypto'
-import type { IncomingMessage } from 'node:http'
+import { readFile, realpath, stat } from 'node:fs/promises'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { connect as connectTcp, type Socket } from 'node:net'
+import { extname, join, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
 import { assertOperation } from './auth'
@@ -40,6 +42,46 @@ const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]'])
 const CLOSE_POLICY = 1008
 const CLOSE_UPSTREAM = 1011
 const CLOSE_CAPABILITY = 4001
+
+export const VIEWER_ASSET_PREFIX = '/viewer/'
+const VIEWER_ASSET_TYPES: Record<string, string> = {
+    '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+    '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json',
+    '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.mp3': 'audio/mpeg', '.oga': 'audio/ogg',
+}
+/** noVNC's pages use inline module scripts; everything else, the WebSocket included, is same-origin. */
+const VIEWER_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+    + "connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'"
+
+/**
+ * Serves the pinned noVNC client (the Runtime image copies the Debian novnc
+ * package files; no CDN). `/viewer/` is vnc_lite.html. Returns false for
+ * anything that is not a known file type inside `root` (symlinks resolved).
+ */
+export async function serveViewerAsset(root: string, pathname: string, res: ServerResponse): Promise<boolean> {
+    let relative: string
+    try {
+        relative = decodeURIComponent(pathname.slice(VIEWER_ASSET_PREFIX.length)) || 'vnc_lite.html'
+    } catch {
+        return false
+    }
+    if (relative.includes('\0') || relative.startsWith('/') || relative.split(/[/\\]/).some((segment) => segment === '..' || segment === '.')) return false
+    const type = VIEWER_ASSET_TYPES[extname(relative).toLowerCase()]
+    if (!type) return false
+    let file: string
+    try {
+        const base = await realpath(root)
+        file = await realpath(join(base, relative))
+        if (!file.startsWith(base + sep) || !(await stat(file)).isFile()) return false
+    } catch {
+        return false
+    }
+    const body = await readFile(file)
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer', 'content-security-policy': VIEWER_CSP })
+    res.end(body)
+    return true
+}
 
 export interface ViewerEndpoint { host: string; port: number }
 

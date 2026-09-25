@@ -19,13 +19,16 @@
  *   ABP_STATE_DIR            durable store directory (volume), required
  *   ABP_CONFIG_FILE          runtime config file (config mode)
  *   ABP_KEYS_FILE            JSON {agentKey, interactiveKey, adminToken} (harness; optional in config mode)
- *   ABP_PROFILES             JSON [{profileId, cdpHttpUrl, instanceUrl}] (config mode: fills missing endpoints)
+ *   ABP_PROFILES             JSON [{profileId, cdpHttpUrl, instanceUrl, vncAddress?}] (config mode: fills missing endpoints)
  *   ABP_RUNTIME_HOST/PORT    task API bind in harness mode (default 0.0.0.0:8787 in the container)
  *   ABP_ADMIN_PORT           harness admin API port (default 8788)
  *   ABP_WRITER_FLOCK         lock file the entrypoint holds with flock -F (set by the entrypoint)
+ *   ABP_VNC_PASSWORD_FILE    per-run x11vnc password (or ABP_VNC_PASSWORD); enables the viewer (D2)
+ *   ABP_VIEWER_ORIGINS       comma-separated tunnel origins for the viewer (harness; config: viewerOrigins)
+ *   ABP_VIEWER_ASSETS_DIR    pinned noVNC client served at /viewer/ (default /usr/share/novnc)
  */
 import { randomBytes } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { open, readFile, statfs } from 'node:fs/promises'
 import { join } from 'node:path'
 import { collectRuntimeMetrics, startAdminServer, type AdminServer } from './admin'
@@ -38,12 +41,15 @@ import { BrowserRuntime } from './runtime'
 import { loadRuntimeConfig, type RuntimeConfig } from './runtimeConfig'
 import { startRuntimeServer } from './server'
 import { TaskStore } from './taskStore'
+import { ViewerProxy, type ViewerEndpoint } from './viewerProxy'
 import { holdsWriterFlock } from './writerFlock'
 
 interface ProfileConfig {
     profileId: ProfileId
     cdpHttpUrl: string
     instanceUrl: string
+    /** x11vnc on the profile network (`host:port`); without it the profile has no viewer. */
+    vncAddress?: string
 }
 
 interface KeysFile extends AuthKeys {
@@ -159,8 +165,31 @@ function configProfiles(config: RuntimeConfig): ProfileConfig[] {
         const cdpHttpUrl = profile.cdpHttpUrl ?? endpoints?.cdpHttpUrl
         const instanceUrl = profile.instanceUrl ?? endpoints?.instanceUrl
         if (!cdpHttpUrl || !instanceUrl) throw new Error(`ABP profile ${profile.profileId} has no browser endpoints`)
-        return { profileId: profile.profileId as ProfileId, cdpHttpUrl, instanceUrl }
+        const vncAddress = profile.vncAddress ?? endpoints?.vncAddress
+        return { profileId: profile.profileId as ProfileId, cdpHttpUrl, instanceUrl, ...(vncAddress ? { vncAddress } : {}) }
     })
+}
+
+/** RFB passwords are at most 8 characters; the value is dropped from the environment once read. */
+function loadVncPassword(): string | undefined {
+    const file = process.env.ABP_VNC_PASSWORD_FILE
+    let password: string | undefined
+    try {
+        password = file ? readFileSync(file, 'utf8').trim() : process.env.ABP_VNC_PASSWORD
+    } catch {
+        throw new Error('ABP_VNC_PASSWORD_FILE is unreadable')
+    }
+    delete process.env.ABP_VNC_PASSWORD
+    if (!password) return undefined
+    if (password.length > 8) throw new Error('ABP VNC password must be at most 8 characters')
+    return password
+}
+
+function vncEndpoint(address: string): ViewerEndpoint {
+    const separator = address.lastIndexOf(':')
+    const port = Number(address.slice(separator + 1))
+    if (separator <= 0 || !Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('ABP profile vncAddress must be host:port')
+    return { host: address.slice(0, separator), port }
 }
 
 const MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
@@ -270,6 +299,19 @@ async function main(): Promise<void> {
         },
     })
 
+    // D2: the Runtime is the only viewer endpoint; x11vnc is reachable on the profile networks only.
+    const vncPassword = loadVncPassword()
+    const vncEndpoints = new Map(profiles.flatMap((profile) => profile.vncAddress ? [[profile.profileId, vncEndpoint(profile.vncAddress)] as const] : []))
+    const viewer = vncPassword && vncEndpoints.size ? new ViewerProxy({
+        leases: runtime.leases,
+        endpoint: (profileId) => vncEndpoints.get(profileId),
+        vncPassword,
+        isCapabilityLive: (capability) => capability.expiresAtMs > Date.now() && !store.isRevoked(capability.capabilityId),
+        allowedOrigins: config?.viewerOrigins ?? (process.env.ABP_VIEWER_ORIGINS ?? '').split(',').filter(Boolean),
+        log,
+    }) : undefined
+    const viewerAssetsDir = process.env.ABP_VIEWER_ASSETS_DIR ?? '/usr/share/novnc'
+
     const startedAtMs = Date.now()
     const server = await startRuntimeServer({
         api,
@@ -290,6 +332,8 @@ async function main(): Promise<void> {
             }
         },
         log: (line: string) => log(line),
+        ...(viewer ? { viewer } : {}),
+        ...(existsSync(viewerAssetsDir) ? { viewerAssetsDir } : {}),
     })
     const admin: AdminServer = await startAdminServer({
         runtime, drivers,
@@ -313,7 +357,7 @@ async function main(): Promise<void> {
             log,
         })
     }
-    log(`listening api=${server.url} mode=${config?.authMode ?? 'harness'} admin=${admin.port ?? 'socket'} broker=${broker ? 'socket' : 'off'} flock=${flockHeld} profiles=${profiles.length}`)
+    log(`listening api=${server.url} mode=${config?.authMode ?? 'harness'} admin=${admin.port ?? 'socket'} broker=${broker ? 'socket' : 'off'} flock=${flockHeld} profiles=${profiles.length} viewer=${viewer ? vncEndpoints.size : 'off'}`)
 
     const shutdown = async () => {
         clearInterval(sweep)

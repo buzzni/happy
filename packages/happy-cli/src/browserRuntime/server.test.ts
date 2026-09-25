@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type TaskEvent, type TaskView } from './contracts'
 import { startRuntimeServer, type RuntimeServer } from './server'
@@ -199,5 +202,39 @@ describe('viewer ticket route (D2)', () => {
         const { base } = await start()
         const res = await post(base, 'viewerTicket', { profileId: 'p1' })
         expect([res.status, res.json.error.code]).toEqual([503, 'RUNTIME_UNAVAILABLE'])
+    })
+})
+
+describe('viewer client assets (D2)', () => {
+    it('serves the pinned noVNC files under /viewer/ with a same-origin CSP and nothing outside its directory', async () => {
+        const root = mkdtempSync(join(tmpdir(), 'abp-viewer-assets-'))
+        const outside = mkdtempSync(join(tmpdir(), 'abp-viewer-outside-'))
+        try {
+            mkdirSync(join(root, 'core'))
+            writeFileSync(join(root, 'vnc_lite.html'), '<title>noVNC</title>')
+            writeFileSync(join(root, 'core', 'rfb.js'), 'export default 1')
+            writeFileSync(join(root, 'notes.txt'), 'x')
+            writeFileSync(join(outside, 'secret.js'), 'secret')
+            symlinkSync(join(outside, 'secret.js'), join(root, 'escape.js'))
+            const fake = makeFake()
+            server = await startRuntimeServer({ api: fake.api, verifyToken, port: 0, health: () => ({}), viewerAssetsDir: root })
+            const page = await fetch(`${server.url}/viewer/`)
+            expect([page.status, await page.text()]).toEqual([200, '<title>noVNC</title>'])
+            expect(page.headers.get('content-security-policy')).toContain("connect-src 'self'")
+            expect(page.headers.get('x-content-type-options')).toBe('nosniff')
+            const script = await fetch(`${server.url}/viewer/core/rfb.js`)
+            expect([script.status, script.headers.get('content-type')]).toEqual([200, 'text/javascript; charset=utf-8'])
+            for (const path of ['/viewer/escape.js', '/viewer/notes.txt', '/viewer/..%2f..%2fetc%2fpasswd', '/viewer/core/..%2f..%2fserver.js', '/viewer/missing.js', '/viewer/core']) {
+                expect((await fetch(`${server.url}${path}`)).status, path).toBe(404)
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true })
+            rmSync(outside, { recursive: true, force: true })
+        }
+    })
+
+    it('answers 404 under /viewer/ when no assets directory is configured', async () => {
+        const { base } = await start()
+        expect((await fetch(`${base}/viewer/`)).status).toBe(404)
     })
 })

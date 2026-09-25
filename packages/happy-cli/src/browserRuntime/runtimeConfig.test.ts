@@ -46,4 +46,14 @@ describe('parseRuntimeConfig', () => {
     it('rejects site origins that are not bare origins', () => {
         expect(() => parseRuntimeConfig({ ...valid(), sites: [{ origin: 'https://shop.example/path' }] })).toThrow(/origin/)
     })
+
+    it('accepts viewer settings: a profile x11vnc address and tunnel origins (D2)', () => {
+        const config = parseRuntimeConfig({ ...valid(), profiles: [{ ...valid().profiles[0], vncAddress: 'abp-browser-a:5900' }],
+            viewerOrigins: ['https://machine-h.tunnel.example'] })
+        expect(config.profiles[0].vncAddress).toBe('abp-browser-a:5900')
+        expect(config.viewerOrigins).toEqual(['https://machine-h.tunnel.example'])
+        expect(parseRuntimeConfig(valid()).viewerOrigins).toEqual([])
+        expect(() => parseRuntimeConfig({ ...valid(), viewerOrigins: ['https://tunnel.example/viewer'] })).toThrow(/viewerOrigins/)
+        expect(() => parseRuntimeConfig({ ...valid(), profiles: [{ ...valid().profiles[0], vncAddress: 'http://browser:5900' }] })).toThrow(/vncAddress/)
+    })
 })

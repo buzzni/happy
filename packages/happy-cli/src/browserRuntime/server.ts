@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net'
 import { z } from 'zod'
 import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type ProfileId, type RuntimeErrorBody, type TaskId } from './contracts'
 import { renderConsolePage } from './consolePage'
-import { VIEWER_WEBSOCKET_PATH, type ViewerProxy } from './viewerProxy'
+import { VIEWER_ASSET_PREFIX, VIEWER_WEBSOCKET_PATH, serveViewerAsset, type ViewerProxy } from './viewerProxy'
 
 const MAX_BODY_BYTES = 1024 * 1024
 export const MAX_BATCH_WAIT_MS = 120_000
@@ -72,6 +72,8 @@ export interface RuntimeServerOptions {
     log?: (line: string) => void
     /** Runtime viewer (D2). Without it viewerTicket answers RUNTIME_UNAVAILABLE. */
     viewer?: Pick<ViewerProxy, 'issueTicket' | 'handleUpgrade' | 'close'>
+    /** Pinned noVNC client files served at /viewer/. */
+    viewerAssetsDir?: string
 }
 
 export interface RuntimeServer { url: string; port: number; close(): Promise<void> }
@@ -172,6 +174,8 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
                 })
                 return res.end(renderConsolePage())
             }
+            if (req.method === 'GET' && url.pathname.startsWith(VIEWER_ASSET_PREFIX) && opts.viewerAssetsDir
+                && await serveViewerAsset(opts.viewerAssetsDir, url.pathname, res)) return
             const m = /^\/v1\/ops\/([A-Za-z]+)$/.exec(url.pathname)
             if (req.method === 'POST' && m) return send(res, 200, { ok: true, result: await handleOp(req, m[1]) })
             send(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION', message: 'not found', retryable: false, mayHaveSideEffects: false } })
