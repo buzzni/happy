@@ -10,6 +10,17 @@
  * password, shared). Viewer messages are parsed and re-decided one by one:
  * display messages pass, input passes only under control. Server messages are
  * framed and length-checked by rfb.ts before they reach the viewer.
+ *
+ * Input authorization (review P0-1..3): every input message is bound to this
+ * viewer's authorization epoch at its first byte, checked again when it is
+ * complete and once more right before it is written upstream. Releases are
+ * generated from what was actually written. Bytes already written cannot be
+ * recalled, so a viewer that loses control after sending input releases what
+ * it holds, closes (4002, reconnect with a new ticket) and keeps the profile
+ * fenced for agents until x11vnc closes its side: x11vnc processes messages in
+ * order and closes only after reading our EOF, so its close proves every
+ * earlier byte was consumed. (A FramebufferUpdateRequest round-trip cannot
+ * prove this: libvncserver merges requests and may answer an older one.)
  */
 import { randomBytes } from 'node:crypto'
 import { readFile, realpath, stat } from 'node:fs/promises'
@@ -42,6 +53,9 @@ const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]'])
 const CLOSE_POLICY = 1008
 const CLOSE_UPSTREAM = 1011
 const CLOSE_CAPABILITY = 4001
+const CLOSE_CONTROL = 4002
+const MAX_HELD_KEYS = 16
+const FENCE_WARNING_MS = 10_000
 
 export const VIEWER_ASSET_PREFIX = '/viewer/'
 const VIEWER_ASSET_TYPES: Record<string, string> = {
@@ -89,6 +103,7 @@ export interface ViewerEndpoint { host: string; port: number }
 export interface ViewerLeaseView {
     userControl(profileId: ProfileId): { tabs: Array<{ tabId: TabId; leaseEpoch: number; owner: Extract<InputOwner, { kind: 'user' }> }>; settling: boolean }
     subscribe(listener: () => void): () => void
+    fenceProfile(profileId: ProfileId): () => void
 }
 
 export interface ViewerProxyOptions {
@@ -145,6 +160,13 @@ export class ViewerProxy {
         })
     }
 
+    /** Called synchronously by every revocation path, before the revocation is persisted. */
+    revokeCapability(capabilityId: string): void {
+        for (const connection of [...this.connections]) {
+            if (connection.capabilityId === capabilityId) connection.close(CLOSE_CAPABILITY, 'capability revoked')
+        }
+    }
+
     async close(): Promise<void> {
         for (const connection of [...this.connections]) connection.close(1001, 'runtime stopping')
         await new Promise<void>((resolve) => this.webSockets.close(() => resolve()))
@@ -195,8 +217,16 @@ export class ViewerProxy {
     }
 }
 
+interface UpstreamWrite {
+    bytes: Buffer
+    /** Input is revalidated against `authEpoch` right before it is written; display messages are not. */
+    kind: 'display' | 'input'
+    authEpoch: number
+}
+
 /** One viewer WebSocket and its own x11vnc session. */
 class ViewerConnection {
+    readonly capabilityId: string
     private readonly session: RfbSession = { width: 0, height: 0, bytesPerPixel: 0, encodings: new Set() }
     private readonly upstream: Socket
     private readonly upstreamFramer: StreamFramer
@@ -207,22 +237,32 @@ class ViewerConnection {
     private readonly heldForViewer: Buffer[] = []
     private heldForViewerLength = 0
     private upstreamOpen = false
-    /** Writes waiting for the upstream to drain; input entries are dropped when control is lost. */
-    private readonly pendingUpstream: Array<{ bytes: Buffer; input: boolean }> = []
+    /** Writes waiting for the upstream to drain. */
+    private readonly pendingUpstream: UpstreamWrite[] = []
     private pendingUpstreamLength = 0
     private upstreamPaused = false
-    private readonly heldKeys = new Set<number>()
-    private buttonMask = 0
-    private pointer = { x: 0, y: 0 }
-    /** The lease (tab@epoch list) this connection's input is bound to; undefined without control. */
+    /** Bumped on every change of this viewer's control (gain, loss, new epoch). */
+    private authEpoch = 0
+    /** The lease (tab@epoch list) this viewer's input is bound to; undefined without control. */
     private boundControl: string | undefined
-    private closed = false
+    /** authEpoch at the current viewer message's type byte. */
+    private messageEpoch = -1
+    /** Key-downs accepted from the viewer and not yet released: the cap on held keys. */
+    private readonly acceptedKeys = new Set<number>()
+    /** What x11vnc was actually sent; releases are generated from this, never from queued intent. */
+    private readonly dispatchedKeys = new Set<number>()
+    private dispatchedButtons = 0
+    private dispatchedPointer = { x: 0, y: 0 }
+    private inputDispatched = false
+    private closing = false
+    private releaseFence: (() => void) | undefined
     private readonly timers: NodeJS.Timeout[] = []
     private readonly unsubscribe: () => void
     private readonly log: (line: string) => void
 
     constructor(private readonly ws: WebSocket, private readonly capability: InteractiveCapability, private readonly profileId: ProfileId,
         endpoint: ViewerEndpoint, private readonly options: ViewerProxyOptions, private readonly onClosed: () => void) {
+        this.capabilityId = capability.capabilityId
         this.log = options.log ?? (() => undefined)
         this.upstream = options.connectUpstream?.(endpoint) ?? connectTcp({ host: endpoint.host, port: endpoint.port })
         this.upstream.setNoDelay(true)
@@ -234,7 +274,7 @@ class ViewerConnection {
         this.upstream.on('data', (chunk: Buffer) => this.guard(CLOSE_UPSTREAM, 'browser display protocol error', () => this.upstreamFramer.push(chunk)))
         this.upstream.on('drain', () => this.flushUpstream())
         this.upstream.on('error', () => this.close(CLOSE_UPSTREAM, 'browser display unavailable'))
-        this.upstream.on('close', () => this.close(CLOSE_UPSTREAM, 'browser display unavailable'))
+        this.upstream.on('close', () => this.onUpstreamClosed())
         ws.on('message', (data: Buffer, isBinary: boolean) => this.guard(CLOSE_POLICY, 'protocol error', () => this.fromViewer(data, isBinary)))
         ws.on('close', () => this.close())
         ws.on('error', () => this.close())
@@ -242,30 +282,57 @@ class ViewerConnection {
         this.timers.push(
             setTimeout(() => { if (!this.viewerReady) this.close(CLOSE_POLICY, 'handshake timeout') }, HANDSHAKE_TIMEOUT_MS),
             setTimeout(() => this.close(CLOSE_CAPABILITY, 'capability expired'), Math.min(Math.max(0, capability.expiresAtMs - now()), 2 ** 31 - 1)),
-            setInterval(() => { if (!options.isCapabilityLive(capability)) this.close(CLOSE_CAPABILITY, 'capability no longer valid') }, LIVENESS_CHECK_MS),
+            setInterval(() => this.refreshControl(), LIVENESS_CHECK_MS),
         )
-        this.unsubscribe = options.leases.subscribe(() => this.checkControl())
+        this.unsubscribe = options.leases.subscribe(() => this.refreshControl())
     }
 
+    /**
+     * Stops the viewer. Queued writes are dropped; keys and buttons x11vnc
+     * was sent are released; the upstream gets EOF. If input ever went out,
+     * the profile stays fenced until x11vnc closes (it consumed everything).
+     */
     close(code = 1000, reason = ''): void {
-        if (this.closed) return
-        // What this viewer holds is released before the upstream goes away.
-        this.releaseInput()
-        this.closed = true
+        if (this.closing) return
+        this.closing = true
         for (const timer of this.timers) clearTimeout(timer)
         this.unsubscribe()
+        this.pendingUpstream.length = 0
+        this.pendingUpstreamLength = 0
         if (this.upstream.writable) {
-            for (const { bytes } of this.pendingUpstream.splice(0)) this.upstream.write(bytes)
+            if (this.upstreamOpen) {
+                for (const keysym of this.dispatchedKeys) this.upstream.write(keyEvent(false, keysym))
+                if (this.dispatchedButtons) this.upstream.write(pointerEvent(0, this.dispatchedPointer.x, this.dispatchedPointer.y))
+                if (this.inputDispatched) {
+                    this.releaseFence = this.options.leases.fenceProfile(this.profileId)
+                    const warning = setTimeout(() => this.log(`[viewer] profile=${this.profileId} still fenced: browser display has not closed`), FENCE_WARNING_MS)
+                    warning.unref()
+                    this.timers.push(warning)
+                }
+            }
             this.upstream.end()
         }
-        setTimeout(() => this.upstream.destroy(), 2_000).unref()
+        // Keep reading (and discarding) so x11vnc's EOF, which lifts the fence, is observed.
+        this.upstream.resume()
+        // Without a fence nothing depends on x11vnc's close; do not wait long for it.
+        if (!this.releaseFence) setTimeout(() => this.upstream.destroy(), 2_000).unref()
         if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) this.ws.close(code, reason)
-        this.log(`[viewer] profile=${this.profileId} closed code=${code}${reason ? ` reason=${reason}` : ''}`)
+        this.log(`[viewer] profile=${this.profileId} closed code=${code}${reason ? ` reason=${reason}` : ''}${this.releaseFence ? ' fenced-until-display-closes' : ''}`)
         this.onClosed()
     }
 
+    private onUpstreamClosed(): void {
+        if (this.releaseFence) {
+            for (const timer of this.timers) clearTimeout(timer)
+            this.releaseFence()
+            this.releaseFence = undefined
+            this.log(`[viewer] profile=${this.profileId} browser display closed; fence released`)
+        }
+        this.close(CLOSE_UPSTREAM, 'browser display unavailable')
+    }
+
     private guard(code: number, reason: string, action: () => void): void {
-        if (this.closed) return
+        if (this.closing) return
         try {
             action()
         } catch (error) {
@@ -293,6 +360,11 @@ class ViewerConnection {
                 this.viewerReady = true
                 for (const bytes of this.heldForViewer.splice(0)) this.sendViewer(bytes)
             },
+            onMessageStart: (type) => {
+                if (type < 4 || type > 6) return
+                this.refreshControl()
+                this.messageEpoch = this.authEpoch
+            },
             onMessage: (message) => this.onViewerMessage(message),
         }), () => undefined, MAX_VIEWER_BACKLOG_BYTES)
         for (const bytes of this.earlyViewerBytes.splice(0)) this.viewerFramer.push(bytes)
@@ -302,84 +374,104 @@ class ViewerConnection {
         switch (message.kind) {
             case 'setPixelFormat':
                 this.session.bytesPerPixel = message.bytesPerPixel
-                return this.writeUpstream(message.bytes, false)
+                return this.writeUpstream(message.bytes, 'display')
             case 'setEncodings': {
                 const encodings = message.encodings.filter((encoding) => ALLOWED_ENCODINGS.has(encoding))
                 for (const encoding of encodings) this.session.encodings.add(encoding)
-                return this.writeUpstream(setEncodingsMessage(encodings), false)
+                return this.writeUpstream(setEncodingsMessage(encodings), 'display')
             }
             case 'framebufferUpdateRequest':
-                return this.writeUpstream(message.bytes, false)
+                return this.writeUpstream(message.bytes, 'display')
             case 'key':
-                if (!this.hasControl()) return
-                if (message.down) this.heldKeys.add(message.keysym)
-                else this.heldKeys.delete(message.keysym)
-                return this.writeUpstream(message.bytes, true)
+                if (!this.inputAuthorized()) return
+                if (message.down) {
+                    // Excess distinct key-downs are dropped: nothing is held for them.
+                    if (!this.acceptedKeys.has(message.keysym) && this.acceptedKeys.size >= MAX_HELD_KEYS) return
+                    this.acceptedKeys.add(message.keysym)
+                } else {
+                    this.acceptedKeys.delete(message.keysym)
+                }
+                return this.writeUpstream(message.bytes, 'input')
             case 'pointer':
-                if (!this.hasControl()) return
-                this.buttonMask = message.buttonMask
-                this.pointer = { x: message.x, y: message.y }
-                return this.writeUpstream(message.bytes, true)
             case 'cutText':
-                if (!this.hasControl()) return
-                return this.writeUpstream(message.bytes, true)
+                if (!this.inputAuthorized()) return
+                return this.writeUpstream(message.bytes, 'input')
         }
     }
 
-    private hasControl(): boolean {
-        if (!this.options.isCapabilityLive(this.capability)) {
-            this.close(CLOSE_CAPABILITY, 'capability no longer valid')
-            return false
-        }
-        return this.checkControl()
+    /** The message's authorization is the one at its first byte; it must be unchanged and still current now. */
+    private inputAuthorized(): boolean {
+        const startEpoch = this.messageEpoch
+        this.messageEpoch = -1
+        return this.refreshControl() && startEpoch === this.authEpoch
     }
 
     /**
      * Input is allowed while every user-owned tab of the profile belongs to
-     * this capability's viewer and no takeover is settling. Any change of that
-     * lease (release, new epoch, another owner) first releases what was held.
+     * this capability's viewer, no takeover is settling and the capability is
+     * live. Any change bumps the authorization epoch.
      */
-    private checkControl(): boolean {
-        if (this.closed) return false
+    private refreshControl(): boolean {
+        if (this.closing) return false
+        if (!this.options.isCapabilityLive(this.capability)) {
+            this.close(CLOSE_CAPABILITY, 'capability no longer valid')
+            return false
+        }
         const { tabs, settling } = this.options.leases.userControl(this.profileId)
         const mine = !settling && tabs.length > 0 && tabs.every(({ owner }) =>
             owner.principalId === this.capability.principalId && owner.viewerSessionId === this.capability.viewerSessionId)
         const control = mine ? tabs.map(({ tabId, leaseEpoch }) => `${tabId}@${leaseEpoch}`).sort().join(',') : undefined
-        if (this.boundControl !== undefined && control !== this.boundControl) this.releaseInput()
-        this.boundControl = control
-        return control !== undefined
+        if (control !== this.boundControl) {
+            const lost = this.boundControl !== undefined
+            this.authEpoch += 1
+            this.boundControl = control
+            if (lost) this.onControlLost()
+        }
+        return control !== undefined && !this.closing
     }
 
-    /** Drops queued input and sends key-up / button-up for everything this viewer still holds. */
-    private releaseInput(): void {
+    private onControlLost(): void {
+        // Input queued under the old authorization never goes out.
+        this.acceptedKeys.clear()
         for (let index = this.pendingUpstream.length - 1; index >= 0; index--) {
-            if (!this.pendingUpstream[index].input) continue
+            if (this.pendingUpstream[index].kind !== 'input') continue
             this.pendingUpstreamLength -= this.pendingUpstream[index].bytes.length
             this.pendingUpstream.splice(index, 1)
         }
-        if (!this.upstreamOpen || this.closed) return
-        for (const keysym of this.heldKeys) this.writeUpstream(keyEvent(false, keysym), false)
-        if (this.buttonMask) this.writeUpstream(pointerEvent(0, this.pointer.x, this.pointer.y), false)
-        this.heldKeys.clear()
-        this.buttonMask = 0
+        // Input already written may still be on its way to x11vnc: release and prove consumption by closing.
+        if (this.inputDispatched) this.close(CLOSE_CONTROL, 'control changed')
     }
 
-    private writeUpstream(bytes: Buffer, input: boolean): void {
-        if (this.closed || !this.upstream.writable) return
-        if (this.pendingUpstream.length === 0 && !this.upstream.writableNeedDrain) {
-            this.upstream.write(bytes)
-            return
-        }
-        this.pendingUpstream.push({ bytes, input })
+    private writeUpstream(bytes: Buffer, kind: UpstreamWrite['kind']): void {
+        if (this.closing || !this.upstream.writable) return
+        const entry = { bytes, kind, authEpoch: this.authEpoch }
+        if (this.pendingUpstream.length === 0 && !this.upstream.writableNeedDrain) return this.dispatch(entry)
+        this.pendingUpstream.push(entry)
         this.pendingUpstreamLength += bytes.length
         if (this.pendingUpstreamLength > MAX_UPSTREAM_BACKLOG_BYTES) this.close(CLOSE_UPSTREAM, 'browser display too slow')
     }
 
     private flushUpstream(): void {
-        while (!this.closed && this.pendingUpstream.length && !this.upstream.writableNeedDrain) {
-            const { bytes } = this.pendingUpstream.shift()!
-            this.pendingUpstreamLength -= bytes.length
-            this.upstream.write(bytes)
+        while (!this.closing && this.pendingUpstream.length && !this.upstream.writableNeedDrain) {
+            const entry = this.pendingUpstream.shift()!
+            this.pendingUpstreamLength -= entry.bytes.length
+            this.dispatch(entry)
+        }
+    }
+
+    /** The last check before bytes leave the Runtime: input must still hold the authorization it was accepted under. */
+    private dispatch(entry: UpstreamWrite): void {
+        if (entry.kind === 'input' && !(this.refreshControl() && entry.authEpoch === this.authEpoch)) return
+        this.upstream.write(entry.bytes)
+        if (entry.kind !== 'input') return
+        this.inputDispatched = true
+        if (entry.bytes[0] === 4) {
+            const keysym = entry.bytes.readUInt32BE(4)
+            if (entry.bytes[1]) this.dispatchedKeys.add(keysym)
+            else this.dispatchedKeys.delete(keysym)
+        } else if (entry.bytes[0] === 5) {
+            this.dispatchedButtons = entry.bytes[1]
+            this.dispatchedPointer = { x: entry.bytes.readUInt16BE(2), y: entry.bytes.readUInt16BE(4) }
         }
     }
 

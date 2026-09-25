@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { createServer, type Server, type Socket } from 'node:net'
+import { connect as connectTcp, createServer, type Server, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
 import { BrowserRuntimeError, type AuthContext, type InteractiveCapability, type ProfileId, type TabId } from './contracts'
@@ -31,7 +31,7 @@ function proxy(options: { now?: () => number; revoked?: Set<string> } = {}) {
         endpoint: (profileId) => profileId === PROFILE ? { host: '127.0.0.1', port: 1 } : undefined,
         vncPassword: 'synthpw1',
         allowedOrigins: [],
-        leases: { userControl: () => ({ tabs: [], settling: false }), subscribe: () => () => undefined },
+        leases: { userControl: () => ({ tabs: [], settling: false }), subscribe: () => () => undefined, fenceProfile: () => () => undefined },
     })
 }
 
@@ -99,6 +99,8 @@ class FakeX11vnc {
     readonly sockets: Socket[] = []
     readonly sharedFlags: number[] = []
     authFailures = 0
+    /** Connections this fake closed after reading the proxy's EOF (it had consumed every earlier byte). */
+    closedAfterEof = 0
     private readonly raw: Buffer[] = []
     private constructor(private readonly server: Server, readonly port: number) {}
 
@@ -134,7 +136,12 @@ class FakeX11vnc {
         }
         const framer = new StreamFramer(serve(), (bytes) => this.raw.push(Buffer.from(bytes)), 1 << 20)
         socket.on('data', (chunk) => framer.push(chunk))
+        socket.on('end', () => { this.closedAfterEof += 1 })
     }
+
+    /** Stop reading, as a busy x11vnc would: bytes and EOF wait in the socket until resume(). */
+    stall(): void { for (const socket of this.sockets) socket.pause() }
+    resume(): void { for (const socket of this.sockets) socket.resume() }
 
     /** Everything received after ClientInit, parsed as viewer messages. */
     messages(): ClientMessage[] {
@@ -153,6 +160,8 @@ class FakeX11vnc {
 
 const fbur = (marker: number) => Buffer.concat([Buffer.from([3, 1]), u16(marker), u16(0), u16(1), u16(1)])
 const cutText = (text: string) => Buffer.concat([Buffer.from([6, 0, 0, 0]), u32(text.length), Buffer.from(text)])
+const keys = (x11vnc: FakeX11vnc) => x11vnc.inputs().map((m) => m.kind === 'key' ? `${m.down ? 'down' : 'up'}:${m.keysym.toString(16)}` : m.kind === 'pointer' ? `ptr:${m.buttonMask}` : m.kind)
+const AGENT = { kind: 'agent' as const, agentSessionId: 'a' as never, taskId: 'task-1' as never, segmentId: 'batch-1' as never }
 const markerSeen = (x11vnc: FakeX11vnc, marker: number) => () => x11vnc.messages().some((m) => m.kind === 'framebufferUpdateRequest' && m.bytes.readUInt16BE(2) === marker)
 
 let cleanups: Array<() => Promise<void> | void> = []
@@ -165,12 +174,18 @@ async function viewerStack(options: { allowedOrigins?: string[] } = {}) {
     const x11vnc = await FakeX11vnc.start()
     const leases = new InputLeaseManager()
     const revoked = new Set<string>()
+    const upstreams: Socket[] = []
     const proxy = new ViewerProxy({
         leases,
         endpoint: (profileId) => profileId === PROFILE ? { host: '127.0.0.1', port: x11vnc.port } : undefined,
         vncPassword: PASSWORD,
         isCapabilityLive: (cap) => cap.expiresAtMs > Date.now() && !revoked.has(cap.capabilityId),
         allowedOrigins: options.allowedOrigins ?? ['https://tunnel.example'],
+        connectUpstream: (endpoint) => {
+            const socket = connectTcp({ host: endpoint.host, port: endpoint.port, writableHighWaterMark: 1 } as never)
+            upstreams.push(socket)
+            return socket
+        },
     })
     const server: RuntimeServer = await startRuntimeServer({ api: {} as never, verifyToken: () => { throw new BrowserRuntimeError('UNAUTHORIZED', 'x') },
         port: 0, health: () => ({}), viewer: proxy })
@@ -184,7 +199,7 @@ async function viewerStack(options: { allowedOrigins?: string[] } = {}) {
         cleanups.push(() => viewer.ws.terminate())
         return viewer
     }
-    return { x11vnc, leases, revoked, proxy, server, origin, ticket, url, connect }
+    return { x11vnc, leases, revoked, proxy, server, origin, ticket, url, connect, upstreams }
 }
 
 describe('viewer proxy connection', () => {
@@ -209,25 +224,26 @@ describe('viewer proxy connection', () => {
         const { x11vnc, leases, connect } = await viewerStack()
         const viewer = await connect()
         await viewer.handshake()
-        leases.acquire(TAB, PROFILE, { kind: 'agent', agentSessionId: 'a' as never, taskId: 'task-1' as never, segmentId: 'batch-1' as never })
+        leases.acquire(TAB, PROFILE, AGENT)
         leases.fenceForTakeover(TAB, PROFILE, 'task-1' as never, OWNER)
         viewer.send(Buffer.concat([keyEvent(true, 0x62), keyEvent(false, 0x62), fbur(1)]))
         await waitFor(markerSeen(x11vnc, 1), 'settling marker')
         expect(x11vnc.inputs()).toEqual([])
-
-        leases.completePendingTakeovers('task-1' as never)
-        viewer.send(Buffer.concat([keyEvent(true, 0x63), keyEvent(false, 0x63), pointerEvent(0, 7, 8), cutText('ok'), fbur(2)]))
-        await waitFor(markerSeen(x11vnc, 2), 'owner marker')
-        expect(x11vnc.inputs().map((m) => m.kind)).toEqual(['key', 'key', 'pointer', 'cutText'])
-
         leases.release(TAB, PROFILE)
         leases.takeOver(TAB, PROFILE, OTHER_VIEWER)
-        viewer.send(Buffer.concat([keyEvent(true, 0x64), keyEvent(false, 0x64), fbur(3)]))
-        await waitFor(markerSeen(x11vnc, 3), 'other-owner marker')
-        expect(x11vnc.inputs()).toHaveLength(4)
+        viewer.send(Buffer.concat([keyEvent(true, 0x64), keyEvent(false, 0x64), fbur(2)]))
+        await waitFor(markerSeen(x11vnc, 2), 'other-owner marker')
+        expect(x11vnc.inputs()).toEqual([])
+        leases.release(TAB, PROFILE)
+        leases.takeOver(TAB, PROFILE, OWNER)
+        viewer.send(Buffer.concat([keyEvent(true, 0x63), keyEvent(false, 0x63), pointerEvent(0, 7, 8), cutText('ok'), fbur(3)]))
+        await waitFor(markerSeen(x11vnc, 3), 'owner marker')
+        expect(x11vnc.inputs().map((m) => m.kind)).toEqual(['key', 'key', 'pointer', 'cutText'])
+        // Losing control without having sent input keeps a view-only connection open.
+        expect(viewer.ws.readyState).toBe(WebSocket.OPEN)
     })
 
-    it('drops input right after release and releases held keys and buttons upstream on control loss', async () => {
+    it('after input, control loss releases held keys and buttons, fences the profile until x11vnc consumed them, and closes 4002', async () => {
         const { x11vnc, leases, connect } = await viewerStack()
         const viewer = await connect()
         await viewer.handshake()
@@ -235,15 +251,11 @@ describe('viewer proxy connection', () => {
         viewer.send(Buffer.concat([keyEvent(true, 0xffe1 /* Shift_L */), keyEvent(true, 0x61), pointerEvent(1, 5, 6), fbur(10)]))
         await waitFor(markerSeen(x11vnc, 10), 'held marker')
         leases.release(TAB, PROFILE)
-        await waitFor(() => x11vnc.inputs().length === 6, 'releases after control loss')
-        expect(x11vnc.inputs().slice(3)).toEqual(expect.arrayContaining([
-            expect.objectContaining({ kind: 'key', down: false, keysym: 0xffe1 }),
-            expect.objectContaining({ kind: 'key', down: false, keysym: 0x61 }),
-            expect.objectContaining({ kind: 'pointer', buttonMask: 0, x: 5, y: 6 }),
-        ]))
-        viewer.send(Buffer.concat([keyEvent(true, 0x62), pointerEvent(1, 1, 1), cutText('late'), fbur(11)]))
-        await waitFor(markerSeen(x11vnc, 11), 'after-release marker')
-        expect(x11vnc.inputs()).toHaveLength(6)
+        expect(leases.isUserFenced(PROFILE), 'fenced synchronously with the release').toBe(true)
+        expect(await viewer.closed).toMatchObject({ code: 4002 })
+        await waitFor(() => !leases.isUserFenced(PROFILE), 'fence lifted after x11vnc closed')
+        expect(x11vnc.closedAfterEof).toBe(1)
+        expect(keys(x11vnc)).toEqual(['down:ffe1', 'down:61', 'ptr:1', 'up:ffe1', 'up:61', 'ptr:0'])
     })
 
     it('treats a new lease epoch as control loss even when the same viewer takes over again', async () => {
@@ -256,8 +268,119 @@ describe('viewer proxy connection', () => {
         leases.release(TAB, PROFILE)
         leases.takeOver(TAB, PROFILE, OWNER)
         viewer.send(Buffer.concat([keyEvent(true, 0x62), fbur(21)]))
-        await waitFor(markerSeen(x11vnc, 21), 'retake marker')
-        expect(x11vnc.inputs().map((m) => m.kind === 'key' && [m.down, m.keysym])).toEqual([[true, 0x61], [false, 0x61], [true, 0x62]])
+        expect(await viewer.closed).toMatchObject({ code: 4002 })
+        await waitFor(() => x11vnc.closedAfterEof === 1, 'upstream closed')
+        expect(keys(x11vnc)).toEqual(['down:61', 'up:61'])
+    })
+
+    it('holds the profile fence while a stalled x11vnc still has input to consume', async () => {
+        const { x11vnc, leases, connect } = await viewerStack()
+        const viewer = await connect()
+        await viewer.handshake()
+        leases.takeOver(TAB, PROFILE, OWNER)
+        viewer.send(Buffer.concat([keyEvent(true, 0x61), pointerEvent(1, 2, 3), fbur(50)]))
+        await waitFor(markerSeen(x11vnc, 50), 'first marker')
+        x11vnc.stall()
+        viewer.send(keyEvent(true, 0x62))
+        await sleep(50)
+        leases.release(TAB, PROFILE)
+        expect(() => leases.acquire(TAB, PROFILE, AGENT)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+        await sleep(300)
+        expect(leases.isUserFenced(PROFILE), 'x11vnc has not read the in-flight key yet').toBe(true)
+        x11vnc.resume()
+        await waitFor(() => !leases.isUserFenced(PROFILE), 'fence lifted after the stalled x11vnc drained and closed')
+        expect(keys(x11vnc)).toEqual(['down:61', 'ptr:1', 'down:62', 'up:61', 'up:62', 'ptr:0'])
+        expect(leases.acquire(TAB, PROFILE, AGENT)).toBeGreaterThan(0)
+    })
+
+    it('generates releases from what was dispatched, not from queued key-up / button-up that control loss discards', async () => {
+        const { x11vnc, leases, connect, upstreams } = await viewerStack()
+        const viewer = await connect()
+        await viewer.handshake()
+        leases.takeOver(TAB, PROFILE, OWNER)
+        viewer.send(Buffer.concat([keyEvent(true, 0x61), pointerEvent(1, 5, 6), fbur(60)]))
+        await waitFor(markerSeen(x11vnc, 60), 'down marker')
+        upstreams[0].cork()
+        viewer.send(Buffer.concat([fbur(61), keyEvent(false, 0x61), pointerEvent(0, 5, 6)]))
+        await sleep(50)
+        leases.release(TAB, PROFILE)
+        upstreams[0].uncork()
+        await waitFor(() => x11vnc.closedAfterEof === 1, 'upstream closed')
+        expect(keys(x11vnc)).toEqual(['down:61', 'ptr:1', 'up:61', 'ptr:0'])
+    })
+
+    it('revalidates queued input right before writing it: revoked or expired capabilities never drain input', async () => {
+        for (const how of ['revoked', 'expired'] as const) {
+            const { x11vnc, leases, revoked, connect, upstreams } = await viewerStack()
+            const viewer = await connect({ capabilityId: `cap-${how}`, expiresAtMs: Date.now() + (how === 'expired' ? 600 : 240_000) })
+            await viewer.handshake()
+            leases.takeOver(TAB, PROFILE, OWNER)
+            upstreams[0].cork()
+            viewer.send(Buffer.concat([fbur(70), keyEvent(true, 0x71), keyEvent(false, 0x71)]))
+            await sleep(50)
+            if (how === 'revoked') revoked.add(`cap-${how}`)
+            else await sleep(700)
+            upstreams[0].uncork()
+            expect(await viewer.closed, how).toMatchObject({ code: 4001 })
+            await waitFor(markerSeen(x11vnc, 70), `${how} marker`)
+            await sleep(50)
+            expect(x11vnc.inputs(), how).toEqual([])
+            for (const cleanup of cleanups.reverse()) await cleanup()
+            cleanups = []
+        }
+    })
+
+    it('closes at once when the Runtime revokes the capability, without waiting for the liveness poll', async () => {
+        const { proxy, revoked, connect } = await viewerStack()
+        const viewer = await connect({ capabilityId: 'cap-now' })
+        await viewer.handshake()
+        const started = Date.now()
+        revoked.add('cap-now')
+        proxy.revokeCapability('cap-now')
+        expect(await viewer.closed).toMatchObject({ code: 4001 })
+        expect(Date.now() - started).toBeLessThan(200)
+    })
+
+    it.each([
+        ['key', keyEvent(true, 0x41)],
+        ['pointer', pointerEvent(1, 9, 9)],
+        ['cut text', cutText('abc')],
+    ])('binds a %s message to the authorization at its first byte: a transition at any later byte discards it and keeps framing', async (_name, message) => {
+        const { x11vnc, leases, connect } = await viewerStack()
+        const viewer = await connect()
+        await viewer.handshake()
+        let marker = 100
+        for (let cut = 1; cut < message.length; cut++) {
+            for (const transition of ['gain', 'epoch'] as const) {
+                if (transition === 'epoch') leases.takeOver(TAB, PROFILE, OWNER)
+                viewer.send(message.subarray(0, cut))
+                await sleep(15)
+                if (transition === 'epoch') leases.release(TAB, PROFILE)
+                leases.takeOver(TAB, PROFILE, OWNER)
+                viewer.send(Buffer.concat([message.subarray(cut), fbur(++marker)]))
+                await waitFor(markerSeen(x11vnc, marker), `cut ${cut} ${transition}`)
+                expect(x11vnc.inputs(), `cut ${cut} ${transition}`).toEqual([])
+                leases.release(TAB, PROFILE)
+            }
+        }
+        // Authorized from its first byte: forwarded.
+        leases.takeOver(TAB, PROFILE, OWNER)
+        viewer.send(Buffer.concat([message, fbur(++marker)]))
+        await waitFor(markerSeen(x11vnc, marker), 'authorized message')
+        expect(x11vnc.inputs()).toHaveLength(1)
+    })
+
+    it('caps simultaneously held keys and releases exactly the dispatched ones', async () => {
+        const { x11vnc, leases, connect } = await viewerStack()
+        const viewer = await connect()
+        await viewer.handshake()
+        leases.takeOver(TAB, PROFILE, OWNER)
+        viewer.send(Buffer.concat([...Array.from({ length: 40 }, (_, i) => keyEvent(true, 0x100 + i)), fbur(80)]))
+        await waitFor(markerSeen(x11vnc, 80), 'flood marker')
+        expect(keys(x11vnc).filter((k) => k.startsWith('down'))).toHaveLength(16)
+        viewer.ws.close()
+        await waitFor(() => x11vnc.closedAfterEof === 1, 'upstream closed')
+        expect(keys(x11vnc).filter((k) => k.startsWith('up'))).toHaveLength(16)
     })
 
     it('releases held keys when the viewer disconnects', async () => {
