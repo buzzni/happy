@@ -220,6 +220,18 @@ describe('system files', () => {
 })
 
 describe('browser networks and egress firewall', () => {
+    it('lets a test-only allow list through before the private deny, and nothing else', () => {
+        const plain = egressRules(stackLayout(mergeInstallOptions(base(), {})), mergeInstallOptions(base(), {}))[4].chains['ABP-EGRESS']
+        expect(plain.some((rule: string) => rule.includes('-d 10.20.30.40/32 -j RETURN'))).toBe(false)
+        const withTest = mergeInstallOptions(base(), { testAllowCidrs: ['10.20.30.40/32'] })
+        const chain = egressRules(stackLayout(withTest), withTest)[4].chains['ABP-EGRESS']
+        const allow = chain.findIndex((rule: string) => rule.endsWith('-d 10.20.30.40/32 -j RETURN'))
+        const deny = chain.findIndex((rule: string) => rule.includes('--match-set abp-deny4 dst -j REJECT'))
+        expect(allow).toBeGreaterThanOrEqual(0)
+        expect(allow).toBeLessThan(deny)
+        expect(() => mergeInstallOptions(base(), { testAllowCidrs: ['0.0.0.0/0'] })).toThrow(/testAllowCidrs/)
+    })
+
     const install = mergeInstallOptions(base(), {
         profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }],
         denyCidrs: ['203.0.114.0/24'], browserDns: ['10.0.0.2'],

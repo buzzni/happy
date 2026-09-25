@@ -109,6 +109,9 @@ export function mergeInstallOptions(saved, flags) {
     browserSubnetPool: DEFAULT_BROWSER_SUBNET_POOL,
     denyCidrs: [],
     browserDns: [],
+    // TEST ONLY (acceptance fixtures on a private address). Never set on a production machine;
+    // `check` and `status` warn while it is non-empty.
+    testAllowCidrs: [],
     ...saved,
     ...Object.fromEntries(Object.entries(flags).filter(([key, value]) => value !== undefined && key !== "issuers")),
   };
@@ -157,6 +160,11 @@ export function mergeInstallOptions(saved, flags) {
   }
   if (!Array.isArray(merged.denyCidrs) || merged.denyCidrs.length > 256) fail("denyCidrs", "at most 256");
   merged.denyCidrs.forEach((cidr, index) => { if (!parseCidr(cidr)) fail(`denyCidrs[${index}]`, "must be an aligned IPv4 CIDR such as 10.20.0.0/16"); });
+  if (!Array.isArray(merged.testAllowCidrs) || merged.testAllowCidrs.length > 8) fail("testAllowCidrs", "at most 8");
+  merged.testAllowCidrs.forEach((cidr, index) => {
+    const parsed = parseCidr(cidr);
+    if (!parsed || parsed[1] < 24) fail(`testAllowCidrs[${index}]`, "must be an aligned IPv4 CIDR no wider than /24");
+  });
   if (!Array.isArray(merged.browserDns) || merged.browserDns.length > 8) fail("browserDns", "at most 8");
   merged.browserDns.forEach((ip, index) => { if (!IPV4.test(ip)) fail(`browserDns[${index}]`, "must be an IPv4 address"); });
   // The sandbox launcher and preflight require root-owned, non-writable executables outside private homes and /tmp.
@@ -280,6 +288,7 @@ export function egressRules(layout, install) {
     for (const dns of install.browserDns) {
       chain.push(`-s ${b} -d ${dns}/32 -p udp -m udp --dport 53 -j RETURN`, `-s ${b} -d ${dns}/32 -p tcp -m tcp --dport 53 -j RETURN`);
     }
+    for (const cidr of install.testAllowCidrs ?? []) chain.push(`-s ${b} -d ${cidr} -j RETURN`);
     chain.push(`-s ${b} -m set --match-set abp-deny4 dst -j REJECT`, `-s ${b} -j RETURN`);
   }
   chain.push("-j REJECT");

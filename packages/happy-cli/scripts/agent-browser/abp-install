@@ -18,6 +18,7 @@
 #   --issuer <kid>=<public-key.pem>... --sites <policy.json> --runtime-port <n> --max-agent-windows <n>
 #   --retention-days <n> --viewer-origin <origin>... --egress-domain <domain>... --happy-prefix <dir>
 #   --browser-subnet-pool <private /20> --deny-cidr <cidr>... --browser-dns <ipv4>...
+#   --test-allow-cidr <cidr ≤/24>...  TEST ONLY: acceptance fixtures on a private address (check warns)
 #
 # Written for bash 3.2+ (the dry-run also runs on developer Macs).
 set -euo pipefail
@@ -488,6 +489,9 @@ main_check() {
     expect_not "agent may not run a shell as agent-sbx" as agent /usr/bin/sudo -n -l -u agent-sbx /bin/sh
     expect "sandbox policy is mandatory" grep -Eq '"mode"[[:space:]]*:[[:space:]]*"mandatory"' /etc/aplus/sandbox-policy.json
     expect "owner firewall rules lead OUTPUT (IPv4, IPv6)" "$LIBEXEC/abp-firewall" check
+    if grep -Eq '"testAllowCidrs"[[:space:]]*:[[:space:]]*\[[[:space:]]*"' /etc/abp/install.json 2>/dev/null; then
+        warn "testAllowCidrs is set: browsers may reach those private addresses (acceptance fixtures only, never production)"
+    fi
     expect "browser egress rules are live (DOCKER-USER, INPUT, IPv6)" "$LIBEXEC/abp-firewall" check-egress
     expect "agent can read the live rules (preflight)" as agent "$LIBEXEC/abp-firewall-read"
     for unit in $UNITS; do

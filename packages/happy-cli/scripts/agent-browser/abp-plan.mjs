@@ -53,6 +53,7 @@ export function parseOptionFlags(argv) {
       case "--happy-prefix": flags.happyPrefix = value; break;
       case "--browser-subnet-pool": flags.browserSubnetPool = value; break;
       case "--deny-cidr": list("denyCidrs", value); break;
+      case "--test-allow-cidr": list("testAllowCidrs", value); break;
       case "--browser-dns": list("browserDns", value); break;
       default: throw new Error(`unknown option ${name}`);
     }
