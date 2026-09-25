@@ -66,6 +66,8 @@ const MAX_POPUP_REPORTS = 100
 const MAX_CLOSED_TABS = 1_000
 const CLOSE_CONFIRM_MS = 2_000
 const CONNECT_TIMEOUT_MS = 10_000
+const CLOSE_RETRIES = 3
+const CLOSE_RETRY_MS = 200
 
 async function withDeadline<T>(ms: number, message: string, body: () => Promise<T>): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -375,10 +377,21 @@ export class CdpDriver implements BrowserDriver {
                 }
                 tab.goneListeners.add(onGone)
                 op.markDispatch()
-                conn.send('Page.close', {}, tab.sessionId).catch((error) => {
-                    cleanup()
-                    reject(error)
-                })
+                // Page.close can fail transiently while the page is navigating/reloading.
+                // Retry a few times (never Target.closeTarget: that would skip beforeunload);
+                // a tab that disappears meanwhile resolves through onGone.
+                const attemptClose = (attempt: number): void => {
+                    conn.send('Page.close', {}, tab.sessionId).catch((error) => {
+                        if (!this.tabs.has(tabId)) return
+                        if (attempt < CLOSE_RETRIES && error instanceof CdpProtocolError) {
+                            setTimeout(() => { if (this.tabs.has(tabId) && !op.aborted) attemptClose(attempt + 1) }, CLOSE_RETRY_MS)
+                            return
+                        }
+                        cleanup()
+                        reject(error)
+                    })
+                }
+                attemptClose(1)
             })
         }, true)
     }

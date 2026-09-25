@@ -82,6 +82,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/dialogs', `${HIT_SCRIPT}<body><button onclick="alert('hello'); hit('after-alert')">Alert</button><button onclick="hit(confirm('sure?') ? 'confirmed' : 'declined')">Confirm</button></body>`)
         a.route('/focus-thief', `<body><label>Code <input id="code" onfocus="document.getElementById('other').focus()"></label><label>Other <input id="other"></label></body>`)
         a.route('/slow-load', `<body>slow<script>const until = Date.now() + 4000; while (Date.now() < until) {}</script></body>`)
+        a.route('/reload-loop', `<body>reloading<script>setTimeout(() => location.reload(), 150)</script></body>`)
         for (const [name, color] of [['red', '#ff0000'], ['green', '#00ff00'], ['blue', '#0000ff']]) {
             a.route(`/color/${name}`, `<body style="margin:0;background:${color};height:100vh"></body>`)
         }
@@ -229,6 +230,18 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await driver.click(tab.tabId, refOf(obs, 'Send'), obs.snapshotId, OPTS)
             expect(await eventually(() => a.hits('v-Neo'), (n) => n === 1)).toBe(1)
             expect(a.hits('v-old')).toBe(0)
+        })
+    })
+
+    describe('closeTab during a reload', () => {
+        it('closes a tab that is reloading itself (20x) and leaves no registrations', async () => {
+            const before = driver.debugCounts()
+            for (let i = 0; i < 20; i++) {
+                const tab = await driver.openTab(a.url('/reload-loop'), [a.origin], OPTS)
+                await delay(100 + (i % 5) * 20)
+                expect(await driver.closeTab(tab.tabId, OPTS)).toEqual({ closed: true })
+            }
+            expect(driver.debugCounts()).toEqual(before)
         })
     })
 
