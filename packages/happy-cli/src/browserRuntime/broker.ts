@@ -16,6 +16,10 @@
  * workspace, machine, allowed profiles and origins) comes from the Runtime
  * config, never from a request. Registrations are persisted (secret hashes
  * only) so a Runtime restart does not strand running sessions.
+ *
+ * Revocation first persists a tombstone (`revoking`), then revokes each grant,
+ * then drops the registration: interrupted at any point, issuance stays
+ * blocked and the grant ids stay known until a retry or restart finishes it.
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmod, chown, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
@@ -37,6 +41,12 @@ interface Registration {
     agentSessionId?: string
     createdAtMs: number
     grantIds: string[]
+    /**
+     * Revocation started: no grant is issued any more, and the registration (with
+     * its grant ids) stays until every grant is revoked. A crash or a failed
+     * revokeGrant leaves it for the daemon's retry or the next start-up.
+     */
+    revoking?: true
 }
 interface RegistryFile { schemaVersion: 1; registrations: Record<string, Registration> }
 
@@ -144,6 +154,23 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
     const findByAgentSession = (agentSessionId: string): [string, Registration] | undefined =>
         Object.entries(registry.registrations).find(([, registration]) => registration.agentSessionId === agentSessionId)
 
+    /** Tombstone, revoke every grant, then forget the registration. Callers hold `exclusive`. */
+    const finishRevocation = async (registrationId: string, registration: Registration): Promise<number> => {
+        if (!registration.revoking) {
+            // Set before persisting: even if the write fails, this process issues nothing more.
+            registration.revoking = true
+            await persist().catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'revocation could not be recorded', true) })
+        }
+        for (const grantId of registration.grantIds) {
+            await options.revokeGrant(grantId as GrantId)
+                .catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'grant revocation is incomplete', true) })
+        }
+        delete registry.registrations[registrationId]
+        await persist()
+        log(`broker session revoked grants=${registration.grantIds.length}`)
+        return registration.grantIds.length
+    }
+
     const routes: Record<string, (req: IncomingMessage, url: URL) => Promise<unknown>> = {
         'POST /v1/sessions/register': async (req) => {
             assertDaemon(req)
@@ -161,7 +188,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             const body = parse(schemas.bind, await readJson(req))
             return exclusive(async () => {
                 const registration = registry.registrations[body.registrationId]
-                if (!registration) throw new BrowserRuntimeError('SCOPE_DENIED', 'unknown registration')
+                if (!registration || registration.revoking) throw new BrowserRuntimeError('SCOPE_DENIED', 'unknown registration')
                 if (registration.agentSessionId === body.agentSessionId) return { bound: true }
                 const other = findByAgentSession(body.agentSessionId)
                 if (registration.agentSessionId || other) throw new BrowserRuntimeError('CONFLICT', 'registration or session is already bound')
@@ -178,12 +205,8 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
                     ? (registry.registrations[body.registrationId] ? [body.registrationId, registry.registrations[body.registrationId]] as const : undefined)
                     : findByAgentSession(body.agentSessionId)
                 if (!entry) return { revoked: false, grants: 0 }
-                const [registrationId, registration] = entry
-                delete registry.registrations[registrationId]
-                await persist()
-                for (const grantId of registration.grantIds) await options.revokeGrant(grantId as GrantId)
-                log(`broker session revoked grants=${registration.grantIds.length}`)
-                return { revoked: true, grants: registration.grantIds.length }
+                const grants = await finishRevocation(...entry)
+                return { revoked: true, grants }
             })
         },
         'POST /v1/agent-grants': async (req) => {
@@ -194,7 +217,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
                 // Looked up only now: the registration may have been revoked while the body arrived.
                 const secretSha256 = sha256(secret).toString('hex')
                 const entry = Object.entries(registry.registrations).find(([, registration]) => registration.secretSha256 === secretSha256)
-                if (!entry) throw new BrowserRuntimeError('UNAUTHORIZED', 'session is not registered')
+                if (!entry || entry[1].revoking) throw new BrowserRuntimeError('UNAUTHORIZED', 'session is not registered')
                 const [, registration] = entry
                 if (!registration.agentSessionId) throw new BrowserRuntimeError('CONFLICT', 'session registration is not bound yet', true)
                 if (registration.agentSessionId !== body.agentSessionId) throw new BrowserRuntimeError('SCOPE_DENIED', 'secret belongs to another session')
@@ -234,6 +257,12 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         })
     })
 
+    // Revocations a crash interrupted are finished before any session can connect.
+    for (const [registrationId, registration] of Object.entries(registry.registrations)) {
+        if (!registration.revoking) continue
+        await exclusive(() => finishRevocation(registrationId, registration))
+            .catch(() => log('broker revocation recovery incomplete; the daemon retries it'))
+    }
     await listenOnSocket(server, options.socketPath, 0o660, options.socketGid)
     return {
         close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) }).then(() => writeTail.catch(() => undefined)),
