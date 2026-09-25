@@ -193,16 +193,23 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     if (privilege.getuid() === 0) {
         if (!config) throw new Error('ABP refuses to run as root without ABP_CONFIG_FILE')
         const target = runtimeIdentity(process.env)
-        if (config.brokerSocketGid !== undefined) joinGroup(config.brokerSocketGid, privilege)
-        if (config.daemonTokenSha256) {
-            boundBroker = createServer()
-            await listenOnSocket(boundBroker, config.brokerSocketPath, 0o660, config.brokerSocketGid)
+        try {
+            if (config.brokerSocketGid !== undefined) joinGroup(config.brokerSocketGid, privilege)
+            if (config.daemonTokenSha256) {
+                boundBroker = createServer()
+                await listenOnSocket(boundBroker, config.brokerSocketPath, 0o660, config.brokerSocketGid)
+            }
+            if (adminOnSocket) {
+                boundAdmin = createServer()
+                await listenOnSocket(boundAdmin, config.adminSocketPath, 0o600)
+            }
+            await dropRoot(target, privilege)
+        } catch (error) {
+            // Nothing past this point has run (no state, browser or task API); release the sockets too.
+            await Promise.all([boundBroker, boundAdmin].map((server) => server?.listening
+                ? new Promise<void>((resolve) => server.close(() => resolve())) : undefined))
+            throw error
         }
-        if (adminOnSocket) {
-            boundAdmin = createServer()
-            await listenOnSocket(boundAdmin, config.adminSocketPath, 0o600)
-        }
-        await dropRoot(target, privilege)
         log(`dropped root uid=${target.uid} gid=${target.gid}`)
     }
     // Production never accepts a harness interactive key or admin token.
