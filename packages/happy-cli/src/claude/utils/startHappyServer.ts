@@ -24,6 +24,7 @@ import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browse
 import { readFile } from 'node:fs/promises';
 import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
+import { createBrokerGrantSource } from '@/browserRuntime/brokerGrantSource';
 import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 
 // chat-tool-output-streaming Phase 3 — bash_stream emits its agent-side
@@ -398,9 +399,35 @@ function registerBrowserTools(mcp: McpServer): void {
     }, async (args) => runBrowserTool({ request: bridge, status, method: 'tabs_close', params: { profile: args.profile, tabId: args.tabId } }));
 }
 
-function createBrowserTaskRuntimeClient(): RuntimeClient | undefined {
+/**
+ * The per-session broker secret is taken out of the environment on first read,
+ * so nothing this process spawns (claude, MCP children) inherits it.
+ */
+let browserTaskSessionSecret: string | undefined;
+function takeBrowserTaskSessionSecret(): string | undefined {
+    browserTaskSessionSecret ??= process.env.HAPPY_BROWSER_TASK_SESSION_SECRET || undefined;
+    delete process.env.HAPPY_BROWSER_TASK_SESSION_SECRET;
+    return browserTaskSessionSecret;
+}
+
+function createBrowserTaskRuntimeClient(client: ApiSessionClient): RuntimeClient | undefined {
     const baseUrl = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
     if (!baseUrl) return undefined;
+    const socketPath = process.env.HAPPY_BROWSER_TASK_BROKER_SOCKET;
+    const sessionSecret = takeBrowserTaskSessionSecret();
+    if (socketPath && sessionSecret) {
+        // Execution machine H: the Runtime broker issues this session's grant (D4).
+        return new RuntimeClient({
+            baseUrl,
+            token: createBrokerGrantSource({
+                socketPath,
+                sessionSecret,
+                agentSessionId: () => client.sessionId,
+                profileId: process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default',
+            }),
+        });
+    }
+    // Harness only: the E2E harness writes a grant file for the session.
     const grantFile = process.env.HAPPY_BROWSER_TASK_GRANT_FILE;
     // Read at call time so a rotated grant is picked up without a restart.
     const token = async () => {
@@ -421,7 +448,7 @@ export async function startHappyServer(
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
-    const browserTaskRuntime = createBrowserTaskRuntimeClient();
+    const browserTaskRuntime = createBrowserTaskRuntimeClient(client);
     if (browserTaskRuntime) {
         logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
     }

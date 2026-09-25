@@ -304,6 +304,20 @@ describe('browser task runtime PoC flag', () => {
         }
     });
 
+    it('takes the broker session secret out of the environment so spawned children never inherit it', async () => {
+        vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', 'http://127.0.0.1:1');
+        vi.stubEnv('HAPPY_BROWSER_TASK_BROKER_SOCKET', '/nonexistent/broker.sock');
+        vi.stubEnv('HAPPY_BROWSER_TASK_SESSION_SECRET', 'synthetic-session-secret');
+        const server = await startHappyServer(client());
+        try {
+            expect(process.env.HAPPY_BROWSER_TASK_SESSION_SECRET).toBeUndefined();
+            expect(server.toolNames).toContain('browser_task_submit_batch');
+        } finally {
+            server.stop();
+            vi.unstubAllEnvs();
+        }
+    });
+
     it('replaces legacy browser tools with browser_task tools when the flag is set', async () => {
         vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', 'http://127.0.0.1:1');
         vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', '/nonexistent/grant');
