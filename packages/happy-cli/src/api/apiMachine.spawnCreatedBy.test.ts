@@ -292,6 +292,23 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         }));
     });
 
+    it('forwards the current additional directories so a resume replaces the granted roots', async () => {
+        const resumeSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ resumeSession }));
+        const resume = handlersFrom(client).get('machine-1:resume-happy-session');
+
+        await resume?.({ sessionId: 'happy-1', additionalDirectories: ['/repo/app'] });
+        await resume?.({ sessionId: 'happy-1', additionalDirectories: [] });
+        await resume?.({ sessionId: 'happy-1' });
+
+        expect(resumeSession.mock.calls.map(([, options]) => options.additionalDirectories))
+            .toEqual([['/repo/app'], [], undefined]);
+        await expect(resume?.({ sessionId: 'happy-1', additionalDirectories: ['relative'] }))
+            .rejects.toThrow('safe absolute paths');
+    });
+
     it('returns a structured untracked error without throwing away its code', async () => {
         const resumeSession = vi.fn().mockResolvedValue({
             type: 'error',

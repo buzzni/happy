@@ -259,7 +259,7 @@ import {
   ADDITIONAL_DIRECTORIES_CAPABILITY,
   prepareAdditionalDirectories,
 } from './additionalDirectories';
-import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
+import { mergeAdditionalDirectoriesIntoSandboxEnvironment, replaceAdditionalDirectoriesInEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
   injectCheckpointSpawnContext,
   readCheckpointSpawnContext,
@@ -2429,6 +2429,8 @@ export async function startDaemon(): Promise<void> {
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
+      /** Present = replace the roots granted at spawn (a live child is left untouched). */
+      additionalDirectories?: string[];
       checkpointRestart?: true;
       automation?: {
         directory: string;
@@ -2705,6 +2707,16 @@ export async function startDaemon(): Promise<void> {
             }
             : undefined,
         ), Object.keys(managedAiCredentialEnvironment).length > 0);
+        if (options?.additionalDirectories !== undefined) {
+          // Roots registered while the session was stopped only reach the sandbox here:
+          // the OS sandbox profile is fixed for the life of the child process.
+          const additionalDirectoryResult = await prepareAdditionalDirectories({
+            requested: options.additionalDirectories,
+            primaryDirectory: launch.cwd,
+            allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+          });
+          replaceAdditionalDirectoriesInEnvironment(resumedEnvironment, additionalDirectoryResult.accepted);
+        }
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,
