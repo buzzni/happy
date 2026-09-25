@@ -90,12 +90,28 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
   session id does not exist yet), binds the registration when the session reports its id, and
   revokes it at exit; session processes get 55-minute grants with their per-session secret
   (`brokerGrantSource.ts`) and renew 5 minutes early. `GET /v1/attention` serves the outbox.
+  Registry changes, issuance and revocation are serialized after the request body is read.
+  Revocation persists a `revoking` tombstone (issuance blocked, grant ids kept), revokes each
+  grant, then drops the registration; start-up finishes interrupted ones. The daemon keeps
+  unconfirmed revocations in `~/.happy/browser-task-revocations.json` and retries them with
+  backoff (≤ 5 min), across restarts.
 - Attention outbox (`attention.ts`): transitions are tagged `data.attention` at commit time
   (approval decided, takeover released, user resume, recovery); the outbox observes TaskStore
   commits and `reconcile()` repairs a crash between the task commit and the outbox write.
+  Readers see only sequences already on disk (a failed write is retried), so repair never
+  reassigns a sequence the daemon acknowledged. A per-task `unresolved` index, independent of
+  the 1,000-event retention, feeds the `CURSOR_EXPIRED` snapshot. Expiry: `afterSeq + 1 < oldestSeq`.
 - User resume (D8): interactive `resume` only from `user-input-complete`, and only while the
   task's stored grant is valid; approval waits, uncertain writes, cancel requests and
-  browser replacement are never released by the user.
+  browser replacement are never released by the user. The final write rechecks task state,
+  grant validity and input ownership, since the login check awaits the browser.
 - Writer lock (D9): the image entrypoint runs `exec flock -n -E 75 -F <state>/runtime.flock node`;
   production refuses to start unless `/proc/locks` shows this pid holding it. The heartbeat
-  lease and fencing token stay. The container runs as uid 10870 (no host login user).
+  lease and fencing token stay. The Runtime runs as uid 10870 (no host login user).
+- Production start (`privilegeDrop.ts`): the installed permissions are `/etc/abp/runtime.json`
+  root 0600 and `/run/abp` root:abp-session 0750, so the container starts as root with only
+  SETUID/SETGID (`--user 0:0 --cap-drop ALL --cap-add SETUID --cap-add SETGID
+  --security-opt no-new-privileges`). The entrypoint creates the state dir and lock file as the
+  runtime user; node reads the config, binds broker (root:abp-session 0660, group by
+  membership) and admin (root 0600) sockets, then drops to `ABP_RUNTIME_UID/GID` and exits if
+  any capability is left. The harness still runs the image as uid 10870 directly.
