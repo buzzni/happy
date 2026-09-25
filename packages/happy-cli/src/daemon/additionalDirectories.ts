@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import { isAbsolute, relative } from 'node:path'
+import { replaceAdditionalDirectoriesInEnvironment } from '@/utils/additionalDirectoriesEnv'
 
 export const ADDITIONAL_DIRECTORIES_CAPABILITY = {
   version: 1 as const,
@@ -100,4 +101,23 @@ export async function prepareAdditionalDirectories(input: {
     accepted.push(entry.canonical)
   }
   return { accepted, skipped }
+}
+
+/**
+ * Resume-time counterpart of the spawn path: replaces the roots recorded in `env`
+ * with the canonical current list. Unlike spawn it never throws — a resume is how
+ * the person continues the chat, so a root that escapes the allowed root keeps the
+ * previous grant instead of blocking the conversation.
+ */
+export async function reapplyAdditionalDirectoriesOnResume(
+  env: Record<string, string>,
+  input: { requested: readonly string[]; primaryDirectory: string; allowedRoot: string },
+): Promise<{ applied: boolean }> {
+  try {
+    const { accepted } = await prepareAdditionalDirectories(input)
+    replaceAdditionalDirectoriesInEnvironment(env, accepted)
+    return { applied: true }
+  } catch {
+    return { applied: false }
+  }
 }

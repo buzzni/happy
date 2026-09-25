@@ -7,6 +7,7 @@ import {
   ADDITIONAL_DIRECTORIES_CAPABILITY,
   parseAdditionalDirectories,
   prepareAdditionalDirectories,
+  reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories'
 
 describe('additional directories spawn contract', () => {
@@ -87,5 +88,39 @@ describe('prepareAdditionalDirectories', () => {
       primaryDirectory,
       allowedRoot,
     })).rejects.toThrow('canonical boundary')
+  })
+
+  it('swaps the granted roots for the canonical current list on resume', async () => {
+    const allowedRoot = await realpath(await mkdtemp(join(tmpdir(), 'happy-additional-resume-')))
+    const primaryDirectory = join(allowedRoot, 'primary')
+    const app = join(allowedRoot, 'app')
+    await mkdir(primaryDirectory)
+    await mkdir(app)
+    const env: Record<string, string> = {
+      HAPPY_ADDITIONAL_DIRECTORIES: JSON.stringify([join(allowedRoot, 'old')]),
+      HAPPY_PROJECT_SANDBOX_CONFIG: JSON.stringify({ extraWritePaths: ['/tmp', join(allowedRoot, 'old')] }),
+    }
+
+    await expect(reapplyAdditionalDirectoriesOnResume(env, {
+      requested: [app, join(allowedRoot, 'missing')], primaryDirectory, allowedRoot,
+    })).resolves.toEqual({ applied: true })
+
+    expect(JSON.parse(env.HAPPY_ADDITIONAL_DIRECTORIES)).toEqual([app])
+    expect(JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG).extraWritePaths).toEqual(['/tmp', app])
+  })
+
+  it('keeps the granted roots instead of failing the resume when a root escapes the allowed root', async () => {
+    // A resume is how the person continues the chat; one bad root must not block it.
+    const allowedRoot = await mkdtemp(join(tmpdir(), 'happy-additional-resume-'))
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'happy-additional-outside-'))
+    const primaryDirectory = join(allowedRoot, 'primary')
+    await mkdir(primaryDirectory)
+    await symlink(outsideRoot, join(allowedRoot, 'escape'))
+    const env: Record<string, string> = { HAPPY_ADDITIONAL_DIRECTORIES: '["/kept"]' }
+
+    await expect(reapplyAdditionalDirectoriesOnResume(env, {
+      requested: [join(allowedRoot, 'escape')], primaryDirectory, allowedRoot,
+    })).resolves.toEqual({ applied: false })
+    expect(env).toEqual({ HAPPY_ADDITIONAL_DIRECTORIES: '["/kept"]' })
   })
 })
