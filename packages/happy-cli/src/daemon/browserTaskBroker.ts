@@ -103,11 +103,9 @@ function writeQueueFileDurably(file: string, data: string): void {
     try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
 }
 
-export function createBrowserTaskSessionBroker(
-    env: NodeJS.ProcessEnv = process.env,
-    request: typeof brokerRequest = brokerRequest,
-    options: BrowserTaskSessionBrokerOptions = {},
-): BrowserTaskSessionBroker | undefined {
+export interface BrowserTaskBrokerConfig { socketPath: string; daemonToken: string }
+
+export function readBrowserTaskBrokerConfig(env: NodeJS.ProcessEnv = process.env): BrowserTaskBrokerConfig | undefined {
     const socketPath = env.HAPPY_BROWSER_TASK_BROKER_SOCKET
     if (!socketPath) return undefined
     let daemonToken: string
@@ -118,6 +116,17 @@ export function createBrowserTaskSessionBroker(
         return undefined
     }
     if (!daemonToken) return undefined
+    return { socketPath, daemonToken }
+}
+
+export function createBrowserTaskSessionBroker(
+    env: NodeJS.ProcessEnv = process.env,
+    request: typeof brokerRequest = brokerRequest,
+    options: BrowserTaskSessionBrokerOptions = {},
+): BrowserTaskSessionBroker | undefined {
+    const config = readBrowserTaskBrokerConfig(env)
+    if (!config) return undefined
+    const { socketPath, daemonToken } = config
     const headers = { 'x-abp-daemon-token': daemonToken }
     /** The reply status, or 0 when the socket was unreachable. */
     const send = async (path: string, body: Record<string, unknown>): Promise<{ status: number; result?: Record<string, unknown> }> => {
