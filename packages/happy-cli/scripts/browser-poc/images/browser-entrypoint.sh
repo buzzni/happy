@@ -38,7 +38,9 @@ while :; do
   # with the old browserInstanceId.
   rm -f /run/abp/instance.json
   browser_id=$(cat /proc/sys/kernel/random/uuid)
-  chromium --user-data-dir=/home/browser/profile --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --site-per-process --no-first-run --no-default-browser-check --disable-dev-shm-usage --disable-crash-reporter --disable-breakpad --no-sandbox --display=:99 --host-resolver-rules="$(host_rules)" about:blank >/tmp/chromium.log 2>&1 &
+  # Every agent tab is its own window; these per-window omnibox WebUI renderers
+  # cost ~17 MiB PSS per window and are never used (no one types in the omnibox).
+  chromium --disable-features=WebUIOmniboxPopup,WebUIOmniboxAimPopup,WebUIOmniboxFullPopup --user-data-dir=/home/browser/profile --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --site-per-process --no-first-run --no-default-browser-check --disable-dev-shm-usage --disable-crash-reporter --disable-breakpad --no-sandbox --display=:99 --host-resolver-rules="$(host_rules)" about:blank >/tmp/chromium.log 2>&1 &
   chrome_pid=$!
   printf '{"browserInstanceId":"%s","chromePid":%s,"startedAtMs":%s}\n' "$browser_id" "$chrome_pid" "$(($(date +%s)*1000))" > /run/abp/instance.json.tmp
   mv /run/abp/instance.json.tmp /run/abp/instance.json

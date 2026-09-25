@@ -7,6 +7,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { BrowserRuntimeError, type BrowserInstanceId, type ElementRef, type Observation, type TabId } from '../contracts'
+import { formDigest } from '../policy'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
 
@@ -91,6 +92,29 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/later', `<body><p>Waiting</p><script>setTimeout(() => { document.body.insertAdjacentHTML('beforeend', '<p>Arrived later</p>'); history.pushState({}, '', '/later/done') }, 400)</script></body>`)
         a.route('/reveal', `${HIT_SCRIPT}<body><button id="r" style="visibility:hidden" onclick="hit('reveal')">Reveal</button><script>setTimeout(() => { document.getElementById('r').style.visibility = 'visible' }, 300)</script></body>`)
         a.route('/form', `${HIT_SCRIPT}<body><input id="name" aria-label="Name" value="old"><button onclick="hit('v-' + encodeURIComponent(document.getElementById('name').value))">Send</button></body>`)
+        a.route('/digest-form', `${HIT_SCRIPT}<body><form id="f" action="/order" method="post" onsubmit="event.preventDefault(); hit('digest-submit')">
+            <input name="item" value="a"><input name="item" value="b">
+            <input type="checkbox" name="gift" value="yes" checked><input type="checkbox" name="wrap" value="yes">
+            <select name="size" multiple><option value="s" selected>S</option><option value="m">M</option><option value="l" selected>L</option></select>
+            <textarea name="note">hi</textarea><input type="hidden" name="token" value="t1">
+            <input name="off" value="ignored" disabled><input type="password" name="pin" value="1234">
+            <input name="action" value="clobber">
+            <button name="op" value="pay">Pay</button>
+            <button name="op" value="alt" formaction="/other" formmethod="get" formenctype="text/plain" type="submit">Alt</button>
+            <button type="button" onclick="hit('plain')">Helper</button>
+            <a href="/help?x=1">Help link</a>
+        </form><button onclick="hit('outside')">Outside</button></body>`)
+        a.route('/relabel', `${HIT_SCRIPT}<body style="margin:0"><button id="b" style="position:absolute;left:20px;top:20px;width:160px;height:40px"
+            onmouseover="this.textContent = 'Pay now'" onclick="hit('relabel-' + this.textContent)">Continue</button></body>`)
+        a.route('/inner-btn', `${HIT_SCRIPT}<body style="margin:0"><button style="position:absolute;left:40px;top:40px;width:120px;height:40px" onclick="hit('inner-btn')">Inner go</button></body>`)
+        b.route('/frame-btn', `${HIT_SCRIPT}<body style="margin:0"><button style="position:absolute;left:40px;top:40px;width:120px;height:40px" onclick="hit('frame-btn')">Frame go</button></body>`)
+        const framed = (src: string, overlay: boolean) => `${HIT_SCRIPT}<body style="margin:0">
+            <iframe src="${src}" style="position:absolute;left:30px;top:30px;width:300px;height:200px;border:5px solid black;padding:3px"></iframe>
+            ${overlay ? `<div style="position:absolute;left:0;top:0;width:500px;height:400px;z-index:10;opacity:0.01" onclick="hit('overlay')"></div>` : ''}</body>`
+        a.route('/frame-clear-same', framed('/inner-btn', false))
+        a.route('/frame-overlay-same', framed('/inner-btn', true))
+        a.route('/frame-clear-oopif', () => framed(b.url('/frame-btn'), false))
+        a.route('/frame-overlay-oopif', () => framed(b.url('/frame-btn'), true))
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -144,6 +168,49 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await expectCode(driver.observe('tab-unknown' as TabId, [a.origin], OPTS), 'TARGET_GONE')
             await expectCode(driver.click('tab-unknown' as TabId, '@e1' as ElementRef, 'snap' as never, OPTS), 'TARGET_GONE')
             expect(driver.hasTab('tab-unknown' as TabId)).toBe(false)
+        })
+    })
+
+    describe('agent window cap', () => {
+        it('gives each owned tab its own window and refuses a tab beyond maxAgentWindows before creating any target', async () => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            try {
+                const first = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                const second = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                const windowOf = async (targetId: string) => (await harness.conn.send('Browser.getWindowForTarget', { targetId })).windowId as number
+                expect(await windowOf(first.targetId)).not.toBe(await windowOf(second.targetId))
+                const before = (await harness.targets()).length
+                const refused = await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                expect(refused.mayHaveSideEffects).toBe(false)
+                expect((await harness.targets()).length).toBe(before)
+                await capped.closeTab(first.tabId, OPTS)
+                const third = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                expect(capped.debugCounts().tabs).toBe(2)
+                await capped.closeTab(second.tabId, OPTS)
+                await capped.closeTab(third.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('counts opens that are still in flight, so concurrent opens never exceed the cap', async () => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            try {
+                const results = await Promise.allSettled([0, 1, 2, 3].map(() => capped.openTab(a.url('/plain'), [a.origin], OPTS)))
+                const opened = results.filter((r) => r.status === 'fulfilled')
+                const refused = results.filter((r) => r.status === 'rejected' && (r.reason as BrowserRuntimeError).code === 'QUOTA_EXCEEDED')
+                expect(opened).toHaveLength(2)
+                expect(refused).toHaveLength(2)
+                for (const r of opened) await capped.closeTab((r as PromiseFulfilledResult<{ tabId: TabId }>).value.tabId, OPTS)
+                // A failed open releases its slot too.
+                await expectCode(capped.openTab('http://unlisted.invalid/', [a.origin], OPTS), 'ORIGIN_DENIED')
+                const again = await Promise.all([0, 1].map(() => capped.openTab(a.url('/plain'), [a.origin], OPTS)))
+                for (const tab of again) await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
         })
     })
 
@@ -325,11 +392,86 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             }
         })
 
+        it('describes the full ordered form submission with submitter overrides and a digest that tracks every change', async () => {
+            const tab = await open('/digest-form', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const pay = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
+            expect(pay.submitsForm).toBe(true)
+            expect(pay.form).toMatchObject({
+                action: a.url('/order'), method: 'post', enctype: 'application/x-www-form-urlencoded', target: '', opaque: false,
+                fields: [['item', 'a'], ['item', 'b'], ['gift', 'yes'], ['size', 's'], ['size', 'l'], ['note', 'hi'], ['token', 't1'],
+                    ['pin', { password: 4 }], ['action', 'clobber'], ['op', 'pay']],
+                submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
+            })
+            expect(pay.form!.digest).toBe(formDigest(pay.form!))
+            expect(JSON.stringify(pay)).not.toContain('1234')
+            const alt = await driver.describeRef(tab.tabId, refOf(obs, 'Alt'), obs.snapshotId, OPTS)
+            expect(alt.form).toMatchObject({ action: a.url('/other'), method: 'get', enctype: 'text/plain',
+                submitter: { name: 'op', value: 'alt', formaction: '/other', formmethod: 'get', formenctype: 'text/plain' } })
+            expect(alt.form!.fields.at(-1)).toEqual(['op', 'alt'])
+            expect(alt.form!.digest).not.toBe(pay.form!.digest)
+            const helper = await driver.describeRef(tab.tabId, refOf(obs, 'Helper'), obs.snapshotId, OPTS)
+            expect(helper).toMatchObject({ submitsForm: false, form: { submitter: null } })
+            expect(helper.form!.fields.map(([name]) => name)).not.toContain('op')
+            const link = await driver.describeRef(tab.tabId, refOf(obs, 'Help link'), obs.snapshotId, OPTS)
+            expect(link).toMatchObject({ linkUrl: a.url('/help?x=1'), currentRole: 'link', currentName: 'Help link' })
+            const outside = await driver.describeRef(tab.tabId, refOf(obs, 'Outside'), obs.snapshotId, OPTS)
+            expect(outside.form).toBeUndefined()
+            // Any change to what would be sent changes the digest: a hidden value, the order, the password.
+            for (const mutate of [
+                "document.querySelector('[name=token]').value = 't2'",
+                "document.getElementById('f').prepend(document.querySelector('[name=note]'))",
+                "document.querySelector('[name=pin]').value = '12345'",
+                "document.getElementById('f').setAttribute('action', '/elsewhere')",
+            ]) {
+                const before = (await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)).form!.digest
+                await harness.evaluate(tab.targetId, mutate)
+                const after = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
+                expect(after.form!.digest, mutate).not.toBe(before)
+            }
+            expect(a.hits('digest-submit')).toBe(0)
+        })
+
         it('fails with STALE_REF when the node behind the ref was replaced', async () => {
             const tab = await open('/spa', [a.origin])
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
             await harness.evaluate(tab.targetId, 'swap()')
             await expectCode(driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS), 'STALE_REF')
+        })
+    })
+
+    describe('dispatch-time label and ancestor overlay checks', () => {
+        it('refuses to click when the same node was relabelled after the snapshot (no dispatch)', async () => {
+            const tab = await open('/relabel', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const error = await expectCode(driver.click(tab.tabId, refOf(obs, 'Continue'), obs.snapshotId, OPTS), 'STALE_REF')
+            expect(error.mayHaveSideEffects).toBe(false)
+            await delay(300)
+            expect(a.hits('relabel-Pay now') + a.hits('relabel-Continue')).toBe(0)
+        })
+
+        it('clicks inside a same-process iframe and an OOPIF when nothing in a parent document covers them', async () => {
+            let tab = await open('/frame-clear-same', [a.origin])
+            let obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Inner go'), obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('inner-btn'), (n) => n === 1)).toBe(1)
+            tab = await open('/frame-clear-oopif', [a.origin, b.origin])
+            obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Frame go'), obs.snapshotId, OPTS)
+            expect(await eventually(() => b.hits('frame-btn'), (n) => n === 1)).toBe(1)
+        })
+
+        it('refuses a click whose iframe is covered by an element of the parent document (same-process and OOPIF)', async () => {
+            for (const [path, name, site, hit] of [['/frame-overlay-same', 'Inner go', a, 'inner-btn'], ['/frame-overlay-oopif', 'Frame go', b, 'frame-btn']] as const) {
+                const tab = await open(path, [a.origin, b.origin])
+                const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+                const error = await expectCode(driver.click(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS), 'INVALID_REQUEST')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+                expect(error.message, path).toContain('covered by a parent document')
+                await delay(300)
+                expect(site.hits(hit), path).toBe(0)
+                expect(a.hits('overlay'), path).toBe(0)
+            }
         })
     })
 

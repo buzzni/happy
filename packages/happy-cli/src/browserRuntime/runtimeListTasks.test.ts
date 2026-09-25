@@ -6,6 +6,7 @@ import type { AgentGrant, InteractiveCapability, ProfileId, RequestId } from './
 import { mintAgentGrant } from './auth'
 import { FakeClock } from './clock'
 import { FakeBrowserDriver } from './testing/fakeDriver'
+import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
 import { TaskStore } from './taskStore'
 import { BrowserRuntime } from './runtime'
 
@@ -17,7 +18,7 @@ async function createHarness() {
     const dir = await mkdtemp(join(tmpdir(), 'abp-list-tasks-')); dirs.push(dir)
     const store = await TaskStore.open(dir); const clock = new FakeClock(100)
     const profileA = 'profile-a' as ProfileId; const profileB = 'profile-b' as ProfileId
-    const runtime = new BrowserRuntime({ store, drivers: new Map([[profileA, new FakeBrowserDriver()], [profileB, new FakeBrowserDriver()]]), clock })
+    const runtime = new BrowserRuntime({ store, drivers: new Map([[profileA, new FakeBrowserDriver()], [profileB, new FakeBrowserDriver()]]), clock, sites: fixtureSitePolicies(['https://fixture.test']) })
     const grant = (principalId: string, profileId: ProfileId): AgentGrant => ({ kind: 'agent-grant', grantId: `g-${principalId}-${profileId}` as never,
         principalId: principalId as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: `a-${principalId}` as never, profileId,
         allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'cancel', 'getTask'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 })

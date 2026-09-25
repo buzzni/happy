@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
-import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type ObservedElement } from './contracts'
+import { z } from 'zod'
+import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type FormFieldValue, type FormSubmission, type Observation } from './contracts'
 
 export function canonicalJson(value: unknown): string {
     if (value === null || typeof value !== 'object') return JSON.stringify(value)
@@ -9,6 +10,32 @@ export function canonicalJson(value: unknown): string {
 
 export function payloadHash(value: unknown): string { return createHash('sha256').update(canonicalJson(value)).digest('hex') }
 
+/**
+ * SHA-256 over the canonical form submission: destination, method, enctype, target,
+ * every field in submission order and the submitter with its overrides. Approvals
+ * bind this, so any change to what would be sent invalidates them.
+ */
+export function formDigest(form: FormSubmission): string {
+    const { action, method, enctype, target, fields, submitter, opaque } = form
+    return payloadHash({ action, method, enctype, target, fields, submitter, opaque })
+}
+
+const SUMMARY_VALUE_CHARS = 40
+const SUMMARY_FIELDS = 12
+
+function summaryValue(value: FormFieldValue): string {
+    if (typeof value !== 'string') return 'password' in value ? '••••' : `[file ${redact(value.file).slice(0, SUMMARY_VALUE_CHARS)}]`
+    const shown = redact(value)
+    return shown.length > SUMMARY_VALUE_CHARS ? `${shown.slice(0, SUMMARY_VALUE_CHARS)}…` : shown
+}
+
+/** Human-readable approval summary. Display only: it is truncated, the digest is not. */
+export function formSummary(form: FormSubmission): string {
+    const shown = form.fields.slice(0, SUMMARY_FIELDS).map(([name, value]) => `${redact(name).slice(0, SUMMARY_VALUE_CHARS)}=${summaryValue(value)}`)
+    if (form.fields.length > SUMMARY_FIELDS) shown.push(`+${form.fields.length - SUMMARY_FIELDS} more`)
+    return `${form.method.toUpperCase()} ${redact(form.action)}: ${shown.join(', ')}`
+}
+
 export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowedOrigins'>): string {
     let origin: string
     try { const parsed = new URL(url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('unsupported URL'); origin = parsed.origin } catch { throw new BrowserRuntimeError('ORIGIN_DENIED', 'Invalid navigation URL') }
@@ -16,35 +43,169 @@ export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowe
     return origin
 }
 
-export function classifyAction(step: BatchStep, element?: ObservedElement | ElementDescription, formAction?: string, currentUrl?: string): 'auto' | 'approval-required' {
-    if (step.kind !== 'click') return 'auto'
-    const riskyPath = (candidate?: string) => {
-        if (!candidate) return false
-        try { const path = new URL(candidate, 'https://fixture.invalid').pathname; return path === '/risky-submit' || path === '/api/risky' } catch { return false }
+// ---------------------------------------------------------------------------
+// Site policy (D7): which origins may be opened and what each action there may
+// do without the user. Configured per deployment; the harness supplies the
+// synthetic fixture's policy.
+// ---------------------------------------------------------------------------
+
+/**
+ * What an action would do, from the step and a fresh describeRef:
+ * navigate (agent URL), link (click on/in a[href]), submit (click on the
+ * button that submits its form), form-click (any other click inside a form),
+ * click (any other click), fill.
+ */
+export type SiteActionKind = 'navigate' | 'link' | 'submit' | 'form-click' | 'click' | 'fill'
+export type SiteActionRisk = 'auto' | 'requires-approval'
+
+export interface SiteActionMatch {
+    kinds?: SiteActionKind[]
+    /** Paths of the destination (navigate URL, link href, form action): exact, or a prefix ending in '*' */
+    targetPaths?: string[]
+    /** Paths of the element's document, same syntax */
+    pagePaths?: string[]
+    /** Case-insensitive prefixes of the element's accessible name (no regular expressions: config must not cost CPU) */
+    namePrefixes?: string[]
+    roles?: string[]
+}
+
+export interface SitePolicy {
+    origin: string
+    /** First matching rule wins; a rule matches when every condition it names matches. */
+    actions: Array<{ match: SiteActionMatch; risk: SiteActionRisk }>
+    /** Login is complete when the page URL starts with urlPrefix and the optional text / element is present. */
+    loginCompleteWhen?: { urlPrefix: string; text?: string; elementName?: string }
+}
+
+const WRITE_CAPABLE: ReadonlySet<SiteActionKind> = new Set(['submit', 'form-click', 'click'])
+
+function isOrigin(value: string): boolean {
+    try {
+        const url = new URL(value)
+        return ['http:', 'https:'].includes(url.protocol) && url.origin === value
+    } catch {
+        return false
     }
-    if (/^(pay|buy now|send|submit order|confirm payment)/i.test(element?.name ?? '')) return 'approval-required'
-    if ('pageUrl' in (element ?? {})) currentUrl = (element as ElementDescription).pageUrl
-    if ('formAction' in (element ?? {})) formAction = (element as ElementDescription).formAction
-    if ('frameOrigin' in (element ?? {}) && !('pageUrl' in (element ?? {})))
-        formAction = formAction ?? (element as ObservedElement).formAction
-    const submitControl = ['button', 'submit'].includes(element?.role.toLowerCase() ?? '')
-    const targetUrl = element && 'targetUrl' in element ? element.targetUrl : undefined
-    if (submitControl && (riskyPath(formAction) || riskyPath(element?.formAction)
-        || riskyPath(targetUrl) || riskyPath(currentUrl))) return 'approval-required'
-    return 'auto'
 }
 
-export interface FormValue {
-    name: string
-    value: string
+const pathPattern = z.string().max(512).regex(/^\/\S*$/)
+const siteSchema = z.object({
+    origin: z.string().refine(isOrigin, 'origin must be scheme://host[:port]'),
+    actions: z.array(z.object({
+        match: z.object({
+            kinds: z.array(z.enum(['navigate', 'link', 'submit', 'form-click', 'click', 'fill'])).min(1).optional(),
+            targetPaths: z.array(pathPattern).min(1).optional(),
+            pagePaths: z.array(pathPattern).min(1).optional(),
+            namePrefixes: z.array(z.string().min(1).max(120)).min(1).optional(),
+            roles: z.array(z.string().min(1).max(40)).min(1).optional(),
+        }).strict(),
+        risk: z.enum(['auto', 'requires-approval']),
+    }).strict()).max(200),
+    loginCompleteWhen: z.object({
+        urlPrefix: z.string().max(1024),
+        text: z.string().min(1).max(200).optional(),
+        elementName: z.string().min(1).max(120).optional(),
+    }).strict().optional(),
+}).strict().refine((site) => !site.loginCompleteWhen || originOf(site.loginCompleteWhen.urlPrefix) === site.origin,
+    'loginCompleteWhen.urlPrefix must be on the site origin')
+
+/** Validates a deployment's `sites` configuration; throws on anything unexpected. */
+export function parseSitePolicies(value: unknown): SitePolicy[] {
+    const sites = z.array(siteSchema).max(100).parse(value) as SitePolicy[]
+    if (new Set(sites.map((site) => site.origin)).size !== sites.length) throw new Error('sites: duplicate origin')
+    return sites
 }
 
-export function observedFormValues(elements: ObservedElement[]): FormValue[] {
-    return elements.flatMap((element) => {
-        if (element.value === undefined || /password/i.test(element.name))
-            return []
-        return [{ name: element.name, value: element.value }]
-    })
+export function originOf(url: string | undefined): string {
+    if (!url) return ''
+    try {
+        const origin = new URL(url).origin
+        return origin === 'null' ? '' : origin
+    } catch {
+        return ''
+    }
+}
+
+function pathOf(url: string | undefined): string | undefined {
+    if (!url) return undefined
+    try {
+        return new URL(url).pathname
+    } catch {
+        return undefined
+    }
+}
+
+function pathMatches(patterns: string[] | undefined, path: string | undefined): boolean {
+    if (!patterns) return true
+    if (path === undefined) return false
+    return patterns.some((pattern) => pattern.endsWith('*') ? path.startsWith(pattern.slice(0, -1)) : path === pattern)
+}
+
+export function siteFor(sites: SitePolicy[], origin: string): SitePolicy | undefined {
+    return sites.find((site) => site.origin === origin)
+}
+
+/** Refuses an origin that has no site policy (openPage, navigate). */
+export function assertSiteAllowed(sites: SitePolicy[], url: string): void {
+    if (!siteFor(sites, originOf(url))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'Origin has no site policy')
+}
+
+export function siteActionKind(step: BatchStep, element?: ElementDescription): SiteActionKind | undefined {
+    if (step.kind === 'navigate') return 'navigate'
+    if (step.kind === 'fill') return 'fill'
+    if (step.kind !== 'click') return undefined
+    if (element?.submitsForm) return 'submit'
+    if (element?.linkUrl) return 'link'
+    if (element?.form || element?.formAction) return 'form-click'
+    return 'click'
+}
+
+/**
+ * Classifies one step against the site policy. Reads are always automatic.
+ * Unmatched write-capable actions (submit, other clicks in or outside forms)
+ * need the user; links, navigation and plain fills do not unless a rule says so.
+ * Whatever a rule says, an action is held for approval when its effect cannot be
+ * bound or ruled out: a form posting outside the site list, a form with a value
+ * the digest cannot cover, an element without a snapshot label (a relabel cannot
+ * be detected), or an element in a frame whose site has no policy.
+ */
+export function classifySiteAction(sites: SitePolicy[], step: BatchStep, element?: ElementDescription): SiteActionRisk {
+    const kind = siteActionKind(step, element)
+    if (!kind) return 'auto'
+    const target = kind === 'navigate' ? step.url
+        : kind === 'link' ? element?.linkUrl
+            : kind === 'submit' || kind === 'form-click' ? element?.form?.action ?? element?.formAction
+                : undefined
+    const site = siteFor(sites, kind === 'navigate' ? originOf(step.url) : element?.frameOrigin ?? '')
+    if (kind !== 'navigate') {
+        if (!element || !site) return 'requires-approval'
+        if (!element.role && !element.name) return 'requires-approval'
+        if (element.form?.opaque && kind !== 'fill') return 'requires-approval'
+        if ((kind === 'submit' || kind === 'form-click') && target && !siteFor(sites, originOf(target))) return 'requires-approval'
+    }
+    const name = (element?.currentName ?? element?.name ?? '').toLowerCase()
+    const role = (element?.currentRole ?? element?.role ?? '').toLowerCase()
+    const rule = site?.actions.find(({ match }) =>
+        (!match.kinds || match.kinds.includes(kind))
+        && pathMatches(match.targetPaths, pathOf(target))
+        && pathMatches(match.pagePaths, pathOf(element?.pageUrl))
+        && (!match.namePrefixes || match.namePrefixes.some((prefix) => name.startsWith(prefix.toLowerCase())))
+        && (!match.roles || match.roles.some((candidate) => candidate.toLowerCase() === role)))
+    if (rule) return rule.risk
+    return WRITE_CAPABLE.has(kind) ? 'requires-approval' : 'auto'
+}
+
+/**
+ * Login is complete per the site's loginCompleteWhen (URL prefix + optional
+ * text/element); without one, the PoC rule applies (the page left the login path).
+ */
+export function loginCompleted(sites: SitePolicy[], observation: Pick<Observation, 'url' | 'text' | 'elements'>, notPathPrefix: string,
+    loginOrigin = originOf(observation.url)): boolean {
+    const condition = siteFor(sites, loginOrigin)?.loginCompleteWhen
+    if (!condition) return !(pathOf(observation.url) ?? '').startsWith(notPathPrefix)
+    return observation.url.startsWith(condition.urlPrefix)
+        && (!condition.text || observation.text.includes(condition.text))
+        && (!condition.elementName || observation.elements.some((element) => element.name === condition.elementName))
 }
 
 export function classifyUserWait(url: string): 'login' | 'captcha' | undefined {

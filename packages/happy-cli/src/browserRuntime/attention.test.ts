@@ -6,6 +6,7 @@ import type { AgentGrant, InteractiveCapability, ProfileId, RequestId, TaskId } 
 import { AttentionOutbox } from './attention'
 import { FakeClock } from './clock'
 import { FakeBrowserDriver } from './testing/fakeDriver'
+import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
 import { TaskStore, type StoredTask } from './taskStore'
 import { BrowserRuntime } from './runtime'
 
@@ -187,7 +188,7 @@ describe('BrowserRuntime attention transitions', () => {
         const store = await TaskStore.open(dir); const clock = new FakeClock(100)
         const outbox = await AttentionOutbox.open(dir); outbox.attach(store)
         const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock, sites: fixtureSitePolicies(['https://fixture.test']) })
         const grant: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never,
             machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'],
             operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'observe', 'resume'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }

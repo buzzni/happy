@@ -311,6 +311,27 @@ export interface ObservedElement {
     formAction?: string
 }
 
+/**
+ * A form field value as it would be submitted. Password values are never read
+ * out (only their length is bound) and files are bound by name/size/type.
+ */
+export type FormFieldValue = string | { password: number } | { file: string; size: number; type: string }
+
+/** What activating an element would submit, after submitter overrides (HTML form submission). */
+export interface FormSubmission {
+    /** Absolute action URL */
+    action: string
+    method: string
+    enctype: string
+    target: string
+    /** The complete entry list in submission (tree) order; duplicates kept */
+    fields: Array<[string, FormFieldValue]>
+    /** The activated submit button, or null when the element does not submit the form itself */
+    submitter: { name: string; value: string; formaction: string | null; formmethod: string | null; formenctype: string | null } | null
+    /** A control whose submitted value cannot be read (form-associated custom element): the digest cannot cover it */
+    opaque: boolean
+}
+
 export interface ElementDescription {
     ref: ElementRef
     role: string
@@ -330,6 +351,16 @@ export interface ElementDescription {
     documentGeneration: number
     /** Opaque, non-secret element identity that restoreRef can re-bind after a Runtime-only restart. */
     identity: string
+    /** Role/name computed now; `role`/`name` above are the snapshot's ('' for a restored ref). */
+    currentRole?: string
+    currentName?: string
+    tag?: string
+    /** Absolute href when the element is (inside) a link */
+    linkUrl?: string
+    /** The enclosing form's submission and its SHA-256 digest (policy.formDigest) */
+    form?: FormSubmission & { digest: string }
+    /** True when activating the element submits `form` (submit button / image input) */
+    submitsForm?: boolean
 }
 
 export interface ObservedFrame {

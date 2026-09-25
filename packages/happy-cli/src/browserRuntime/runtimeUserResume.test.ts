@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { AgentGrant, InteractiveCapability, ProfileId, RequestId, TabId } from './contracts'
 import { FakeClock } from './clock'
 import { FakeBrowserDriver } from './testing/fakeDriver'
+import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
 import { TaskStore } from './taskStore'
 import { BrowserRuntime } from './runtime'
 
@@ -16,7 +17,7 @@ async function createHarness(options: { grantExpiresAtMs?: number; url?: string 
     const dir = await mkdtemp(join(tmpdir(), 'abp-user-resume-')); dirs.push(dir)
     const store = await TaskStore.open(dir); const clock = new FakeClock(100)
     const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-    const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+    const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock, sites: fixtureSitePolicies(['https://fixture.test']) })
     const grant: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never,
         machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'],
         operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'finishTask', 'resume'],

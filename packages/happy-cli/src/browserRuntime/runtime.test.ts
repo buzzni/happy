@@ -2,7 +2,12 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BrowserRuntimeError, type AgentGrant, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type FormSubmission, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
+import type { FakePage } from './testing/fakeDriver'
+import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
+import type { SitePolicy } from './policy'
+
+const FIXTURE_SITES = fixtureSitePolicies(['https://fixture.test'])
 import { FakeClock } from './clock'
 import { FakeBrowserDriver } from './testing/fakeDriver'
 import { TaskStore } from './taskStore'
@@ -11,11 +16,11 @@ import { BrowserRuntime } from './runtime'
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
 
-async function createHarness(prefix: string, expiresAtMs = 3_600_000) {
+async function createHarness(prefix: string, expiresAtMs = 3_600_000, sites: SitePolicy[] = FIXTURE_SITES) {
     const dir = await mkdtemp(join(tmpdir(), prefix)); dirs.push(dir)
     const store = await TaskStore.open(dir); const clock = new FakeClock(100)
     const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-    const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+    const runtime = new BrowserRuntime({ sites, store, drivers: new Map([[profileId, driver]]), clock })
     const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'subscribe', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs }
     const auth = { credential, verifiedAtMs: clock.now() }
     const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
@@ -159,7 +164,7 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
         h.clock.set(600_101)
         const store = await TaskStore.open(h.dir)
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         await runtime.sweep(h.clock.now())
         const expired = await runtime.getTask(h.auth, { taskId: task.taskId })
         await runtime.resume(h.auth, { taskId: task.taskId, expectedVersion: expired.stateVersion,
@@ -197,7 +202,7 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
         h.driver.failNext('adoptTab', new Error('setupSession timed out'))
         const store = await TaskStore.open(h.dir)
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         const recovered = await runtime.getTask(h.auth, { taskId: h.task.taskId })
         expect(recovered.status).toBe('paused')
         expect(recovered.pauseReason).toBe('outcome-unknown')
@@ -218,7 +223,7 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
         h.clock.set(201)
         const store = await TaskStore.open(h.dir)
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         const recoveryAuth = { ...h.auth, credential: { ...h.auth.credential, expiresAtMs: 10_000 } }
         const recovered = await runtime.getTask(recoveryAuth, { taskId: task.taskId })
         expect(recovered.pauseReason).toBe('outcome-unknown')
@@ -349,7 +354,7 @@ describe('BrowserRuntime durable request contract', () => {
         const dir = await mkdtemp(join(tmpdir(), 'abp-runtime-version-')); dirs.push(dir)
         const store = await TaskStore.open(dir); const clock = new FakeClock(100)
         const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[profileId, driver]]), clock })
         const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }
         const auth = { credential, verifiedAtMs: clock.now() }
         const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
@@ -408,7 +413,7 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
 
         const store = await TaskStore.open(h.dir)
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         const dispatchCount = h.driver.dispatchCounts.size
         const replay = await runtime.cancel(h.auth, request)
 
@@ -558,7 +563,7 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
 
         const store = await TaskStore.open(h.dir)
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         const task = await runtime.getTask(h.auth, { taskId: h.task.taskId })
         const restoredLeases = (runtime as unknown as { leases: { owner(tabId: string, profileId: ProfileId): { leaseEpoch: number } } }).leases
 
@@ -585,7 +590,7 @@ describe('BrowserRuntime durable request contract', () => {
         await store.close()
 
         const restartedStore = await TaskStore.open(h.dir)
-        const restartedRuntime = new BrowserRuntime({ store: restartedStore, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const restartedRuntime = new BrowserRuntime({ sites: FIXTURE_SITES, store: restartedStore, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         await restartedRuntime.getTask(h.auth, { taskId: h.task.taskId })
         const restartedLeases = (restartedRuntime as unknown as {
             leases: {
@@ -607,7 +612,7 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
 
         const store = await TaskStore.open(h.dir)
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         const task = await runtime.getTask(h.auth, { taskId: h.task.taskId })
 
         expect(task.pauseReason).toBe('browser-replaced')
@@ -769,7 +774,7 @@ describe('BrowserRuntime durable request contract', () => {
         const store = await TaskStore.open(dir); const clock = new FakeClock(100)
         const profileId = 'profile-1' as ProfileId
         const driver = new FakeBrowserDriver()
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[profileId, driver]]), clock })
         const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }
         const auth = { credential, verifiedAtMs: clock.now() }
         const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
@@ -820,7 +825,7 @@ describe('BrowserRuntime durable request contract', () => {
         const dir = await mkdtemp(join(tmpdir(), 'abp-runtime-cancel-')); dirs.push(dir)
         const store = await TaskStore.open(dir); const clock = new FakeClock(100)
         const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[profileId, driver]]), clock })
         const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }
         const auth = { credential, verifiedAtMs: clock.now() }
         const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
@@ -884,7 +889,7 @@ describe('BrowserRuntime durable request contract', () => {
         const dir = await mkdtemp(join(tmpdir(), 'abp-runtime-recovery-')); dirs.push(dir)
         let store = await TaskStore.open(dir); const clock = new FakeClock(100)
         const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[profileId, driver]]), clock })
         const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }
         const auth = { credential, verifiedAtMs: clock.now() }
         const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
@@ -893,7 +898,7 @@ describe('BrowserRuntime durable request contract', () => {
         await store.commit(task.taskId, { status: 'running', actions: { 'uncertain-action': { state: 'intent-committed', kind: 'click', payloadHash: 'synthetic', batchId: 'batch-x' as never, leaseEpoch: 3, browserInstanceId: driver.browserInstanceId() } } }, { type: 'action-intent', atMs: 101, stateVersion: 10, leaseEpoch: 3, data: { actionId: 'uncertain-action' } })
         await store.close()
         store = await TaskStore.open(dir)
-        const recovered = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const recovered = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[profileId, driver]]), clock })
         const view = await recovered.getTask(auth, { taskId: task.taskId })
         expect(view.status).toBe('paused')
         expect(view.pauseReason).toBe('outcome-unknown')
@@ -907,7 +912,7 @@ describe('BrowserRuntime durable request contract', () => {
         const dir = await mkdtemp(join(tmpdir(), 'abp-runtime-approval-')); dirs.push(dir)
         const store = await TaskStore.open(dir); const clock = new FakeClock(100)
         const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
-        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock })
+        const runtime = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[profileId, driver]]), clock })
         const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 3_600_000 }
         const auth = { credential, verifiedAtMs: clock.now() }
         const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
@@ -1420,7 +1425,7 @@ describe('BrowserRuntime durable request contract', () => {
         h.driver.forgetSnapshots()
 
         const store = await TaskStore.open(h.dir)
-        const restarted = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const restarted = new BrowserRuntime({ sites: FIXTURE_SITES, store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
         const recovered = await restarted.getTask(h.auth, { taskId: h.task.taskId })
         expect(recovered.tabLeases?.[0]?.leaseEpoch).toBeGreaterThan(oldEpoch ?? 0)
         const uiCredential: InteractiveCapability = {
@@ -1569,6 +1574,22 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('returns a driver window quota refusal without marking the task failed or uncertain', async () => {
+        const h = await createHarness('abp-runtime-open-window-quota-')
+        h.driver.failNext('openTab', new BrowserRuntimeError('QUOTA_EXCEEDED', 'agent window limit reached', true, false))
+        await expect(h.runtime.openPage(h.auth, {
+            taskId: h.task.taskId,
+            url: 'https://fixture.test/second',
+            requestId: 'open-window-quota' as RequestId,
+        })).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED', mayHaveSideEffects: false })
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(task).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        const retried = await h.runtime.openPage(h.auth, { taskId: h.task.taskId, url: 'https://fixture.test/second',
+            requestId: 'open-window-quota-retry' as RequestId })
+        expect(retried.task.status).toBe('paused')
+        await h.store.close()
+    })
+
     it('exposes persisted lease epochs and the current input owner on each task tab', async () => {
         const h = await createHarness('abp-runtime-task-view-leases-')
         const view = await h.runtime.getTask(h.auth, { taskId: h.task.taskId }) as typeof h.task & {
@@ -1597,6 +1618,174 @@ describe('BrowserRuntime durable request contract', () => {
         const journal = await readTree(h.dir)
         expect(journal).not.toContain('synthetic-password-value')
         expect(journal).not.toContain('ABP-CANARY-')
+        await h.store.close()
+    })
+})
+
+describe('approval binding to the complete submission (D6)', () => {
+    const payForm: FormSubmission = {
+        action: 'https://fixture.test/order', method: 'post', enctype: 'application/x-www-form-urlencoded', target: '',
+        fields: [['item', 'a'], ['item', 'b'], ['token', 't1'], ['note', `${'n'.repeat(50)}-tail`], ['op', 'pay']],
+        submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
+        opaque: false,
+    }
+    const payPage = (form: FormSubmission = payForm): FakePage => ({ url: 'https://fixture.test/checkout', form,
+        elements: [{ ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true, frameOrigin: 'https://fixture.test' }] })
+
+    async function pendingApproval(prefix: string) {
+        const h = await createHarness(prefix)
+        h.driver.seedTab(h.opened.tabId, payPage())
+        await observeHarnessTab(h)
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const submitted = await h.runtime.submitBatch(h.auth, { taskId: h.task.taskId, expectedVersion: current.stateVersion,
+            requestId: `${prefix}-batch` as RequestId, steps: [{ stepId: 'pay' as never, actionId: 'pay-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@pay' as never, timeoutMs: 1000 }] }, { waitMs: 1000 })
+        const approval = submitted.result?.pendingApproval
+        if (!approval) throw new Error('test requires a pending approval')
+        const uiCredential: InteractiveCapability = { kind: 'interactive', capabilityId: `${prefix}-ui` as never, principalId: 'p' as never,
+            workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer', profileId: h.profileId, operations: ['approve'],
+            issuedAtMs: 0, expiresAtMs: 3_600_000 }
+        const approve = () => h.runtime.approve({ credential: uiCredential, verifiedAtMs: h.clock.now() }, { taskId: h.task.taskId,
+            approvalId: approval.approvalId, bindingHash: approval.bindingHash, requestId: `${prefix}-approve` as RequestId, decision: 'approve' })
+        return { h, approval, approve }
+    }
+
+    it('shows the method, destination and a truncated field summary while binding the full values', async () => {
+        const { h, approval } = await pendingApproval('abp-d6-summary-')
+        expect(approval.description).toContain('POST https://fixture.test/order')
+        expect(approval.description).toContain('item=a, item=b, token=t1')
+        expect(approval.description).toContain('…')
+        expect(approval.description).not.toContain('-tail')
+        await h.store.close()
+    })
+
+    it('refuses to dispatch when anything that would be sent changed after the approval was shown', async () => {
+        const mutations: Array<[string, FormSubmission]> = [
+            ['hidden value', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'token' ? 't2' : value]) }],
+            ['truncated tail', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'note' ? `${'n'.repeat(50)}-TAIL` : value]) }],
+            ['field order', { ...payForm, fields: [payForm.fields[1], payForm.fields[0], ...payForm.fields.slice(2)] }],
+            ['destination', { ...payForm, action: 'https://fixture.test/elsewhere' }],
+            ['method', { ...payForm, method: 'get' }],
+            ['submitter override', { ...payForm, submitter: { ...payForm.submitter!, formaction: '/refund' }, action: 'https://fixture.test/refund' }],
+        ]
+        for (const [label, mutated] of mutations) {
+            const { h, approve } = await pendingApproval(`abp-d6-${label.replace(/ /g, '-')}-`)
+            h.driver.seedTab(h.opened.tabId, payPage(mutated))
+            await expect(approve(), label).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+            expect(h.driver.dispatchCounts.get('pay-action') ?? 0, label).toBe(0)
+            await h.store.close()
+        }
+    })
+
+    it('refuses to dispatch when the element re-bound right before dispatch is not the approved one', async () => {
+        const { h, approve } = await pendingApproval('abp-d6-identity-')
+        h.driver.seedTab(h.opened.tabId, { ...payPage(), identitySalt: 'rebound' })
+        await expect(approve()).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+        expect(h.driver.dispatchCounts.get('pay-action') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('refuses to dispatch when the approved element was relabelled in place', async () => {
+        const { h, approve } = await pendingApproval('abp-d6-relabel-')
+        h.driver.seedTab(h.opened.tabId, { ...payPage(), currentNames: { '@pay': 'Pay 10x now' } })
+        await expect(approve()).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+        expect(h.driver.dispatchCounts.get('pay-action') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('dispatches exactly once when nothing changed', async () => {
+        const { h, approve } = await pendingApproval('abp-d6-unchanged-')
+        expect((await approve()).outcome).toBe('approved')
+        expect(h.driver.dispatchCounts.get('pay-action')).toBe(1)
+        await h.store.close()
+    })
+})
+
+describe('site policy at the runtime (D7)', () => {
+    const origin = 'https://fixture.test'
+    const ui = (h: Awaited<ReturnType<typeof createHarness>>, operations: InteractiveCapability['operations']) => ({ verifiedAtMs: h.clock.now(),
+        credential: { kind: 'interactive', capabilityId: 'd7-ui' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never,
+            viewerSessionId: 'viewer', profileId: h.profileId, operations, issuedAtMs: 0, expiresAtMs: 3_600_000 } as InteractiveCapability })
+    async function runStep(h: Awaited<ReturnType<typeof createHarness>>, id: string, step: Record<string, unknown>) {
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        return (await h.runtime.submitBatch(h.auth, { taskId: h.task.taskId, expectedVersion: current.stateVersion, requestId: `${id}-batch` as RequestId,
+            steps: [{ stepId: id as never, actionId: id as never, tabId: h.opened.tabId, timeoutMs: 1000, ...step } as never] }, { waitMs: 1000 })).result!
+    }
+
+    it('refuses to open an origin the grant allows but no site policy lists, before any tab exists', async () => {
+        const h = await createHarness('abp-d7-unsited-')
+        const wider = { ...h.auth, credential: { ...h.auth.credential, allowedOrigins: [origin, 'https://unsited.test'] } as AgentGrant }
+        const tabsBefore = h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length
+        await expect(h.runtime.openPage(wider, { taskId: h.task.taskId, url: 'https://unsited.test/start', requestId: 'd7-open' as RequestId }))
+            .rejects.toMatchObject({ code: 'ORIGIN_DENIED' })
+        expect(h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length).toBe(tabsBefore)
+        const navigated = await runStep({ ...h, auth: wider }, 'd7-nav-unsited', { kind: 'navigate', url: 'https://unsited.test/x' })
+        expect(navigated.outcome).toBe('failed')
+        expect(h.driver.dispatchCounts.get('d7-nav-unsited') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('holds an unmatched non-form click for approval on a site without auto rules', async () => {
+        const h = await createHarness('abp-d7-strict-', undefined, [{ origin, actions: [] }])
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/cart`, elements: [{ ref: '@go' as never, role: 'button', name: 'Continue', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        const result = await runStep(h, 'd7-click', { kind: 'click', ref: '@go' })
+        expect(result.outcome).toBe('awaiting-user')
+        expect(result.pendingApproval?.actionId).toBe('d7-click')
+        expect(h.driver.dispatchCounts.get('d7-click') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('hands a navigation or fill that the site policy holds to the user without dispatching it', async () => {
+        const sites: SitePolicy[] = [{ origin, actions: [
+            { match: { kinds: ['navigate'], targetPaths: ['/api/delete*'] }, risk: 'requires-approval' },
+            { match: { kinds: ['fill'], pagePaths: ['/transfer'] }, risk: 'requires-approval' },
+            { match: {}, risk: 'auto' },
+        ] }]
+        const h = await createHarness('abp-d7-handoff-', undefined, sites)
+        const navigated = await runStep(h, 'd7-nav', { kind: 'navigate', url: `${origin}/api/delete?id=1` })
+        expect(navigated).toMatchObject({ outcome: 'failed', mayHaveSideEffects: false })
+        expect(navigated.steps[0].error?.code).toBe('APPROVAL_REQUIRED')
+        expect(h.driver.dispatchCounts.get('d7-nav') ?? 0).toBe(0)
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/transfer`, elements: [{ ref: '@to' as never, role: 'textbox', name: 'Recipient', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        const filled = await runStep(h, 'd7-fill', { kind: 'fill', ref: '@to', value: 'synthetic' })
+        expect(filled.steps[0].error?.code).toBe('APPROVAL_REQUIRED')
+        expect(h.driver.dispatchCounts.get('d7-fill') ?? 0).toBe(0)
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(task).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        await h.store.close()
+    })
+
+    it('refuses a click whose element was relabelled since the snapshot, before classifying or dispatching it', async () => {
+        const h = await createHarness('abp-d7-relabel-')
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/start`, elements: [{ ref: '@go' as never, role: 'button', name: 'Continue', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/start`, currentNames: { '@go': 'Pay now' },
+            elements: [{ ref: '@go' as never, role: 'button', name: 'Continue', visible: true, frameOrigin: origin }] })
+        const result = await runStep(h, 'd7-relabel', { kind: 'click', ref: '@go' })
+        expect(result.outcome).toBe('failed')
+        expect(result.steps[0].error?.code).toBe('STALE_REF')
+        expect(h.driver.dispatchCounts.get('d7-relabel') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('completes a login wait only when the site condition holds, not merely when the page left the login path', async () => {
+        const sites: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }], loginCompleteWhen: { urlPrefix: `${origin}/account`, text: 'Signed in' } }]
+        const h = await createHarness('abp-d7-login-', undefined, sites)
+        const login = await h.runtime.openPage(h.auth, { taskId: h.task.taskId, url: `${origin}/login`, requestId: 'd7-login' as RequestId })
+        const leases = (h.runtime as unknown as { leases: { owner(tabId: string, profileId: ProfileId): { leaseEpoch: number } } }).leases
+        const userTurn = async (page: FakePage, id: string) => {
+            const taken = await h.runtime.takeOver(ui(h, ['takeOver', 'releaseControl']), { taskId: h.task.taskId, tabId: login.tabId,
+                expectedEpoch: leases.owner(login.tabId, h.profileId).leaseEpoch, requestId: `${id}-take` as RequestId })
+            h.driver.seedTab(login.tabId, page)
+            const released = await h.runtime.releaseControl(ui(h, ['takeOver', 'releaseControl']), { taskId: h.task.taskId, tabId: login.tabId,
+                expectedEpoch: taken.leaseEpoch, requestId: `${id}-release` as RequestId })
+            return h.runtime.resume(h.auth, { taskId: h.task.taskId, expectedVersion: released.task.stateVersion, requestId: `${id}-resume` as RequestId })
+        }
+        expect(await userTurn({ url: `${origin}/error`, text: 'Something failed', elements: [] }, 'd7-error')).toMatchObject({ status: 'awaiting-user', waitReason: 'login' })
+        expect(await userTurn({ url: `${origin}/account`, text: 'Welcome', elements: [] }, 'd7-partial')).toMatchObject({ status: 'awaiting-user', waitReason: 'login' })
+        expect(await userTurn({ url: `${origin}/account`, text: 'Welcome. Signed in', elements: [] }, 'd7-done')).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
         await h.store.close()
     })
 })

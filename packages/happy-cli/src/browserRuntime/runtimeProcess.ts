@@ -28,6 +28,8 @@
  *   ABP_ADMIN_PORT           harness admin API port (default 8788)
  *   ABP_WRITER_FLOCK         lock file the entrypoint holds with flock -F (set by the entrypoint)
  *   ABP_RUNTIME_UID/GID      identity to drop to when started as root (set by the image)
+ *   ABP_MAX_AGENT_WINDOWS    agent windows per profile (harness; config: maxAgentWindows; default 4, at most the tab quota)
+ *   ABP_SITE_POLICY          JSON sites[] (policy.parseSitePolicies), harness mode; config mode uses runtime.json sites[]
  *   ABP_VNC_PASSWORD_FILE    per-run x11vnc password (or ABP_VNC_PASSWORD); enables the viewer (D2). Read before dropping root.
  *   ABP_VIEWER_ORIGINS       comma-separated tunnel origins for the viewer (harness; config: viewerOrigins)
  *   ABP_VIEWER_ASSETS_DIR    pinned noVNC client served at /viewer/ (default /usr/share/novnc)
@@ -41,9 +43,10 @@ import { collectRuntimeMetrics, startAdminServer, type AdminServer } from './adm
 import { AttentionOutbox } from './attention'
 import { verifyToken, type AuthKeys, type VerifyPolicy } from './auth'
 import { listenOnSocket, startBroker, withRevokingGrants, type Broker } from './broker'
-import { BrowserRuntimeError, type BrowserInstanceId, type BrowserRuntimeApi, type ProfileId } from './contracts'
-import { CdpDriver } from './drivers/cdpDriver'
+import { BrowserRuntimeError, POC_LIMITS, type BrowserInstanceId, type BrowserRuntimeApi, type ProfileId } from './contracts'
+import { CdpDriver, DEFAULT_MAX_AGENT_WINDOWS } from './drivers/cdpDriver'
 import { dropRoot, joinGroup, processPrivilegeOps, runtimeIdentity, type PrivilegeOps } from './privilegeDrop'
+import { parseSitePolicies, type SitePolicy } from './policy'
 import { BrowserRuntime } from './runtime'
 import { loadRuntimeConfig, type RuntimeConfig } from './runtimeConfig'
 import { startRuntimeServer } from './server'
@@ -192,6 +195,26 @@ function loadVncPassword(): string | undefined {
     return password
 }
 
+function maxAgentWindows(config: RuntimeConfig | undefined): number {
+    const raw = config ? String(config.maxAgentWindows) : process.env.ABP_MAX_AGENT_WINDOWS
+    if (raw === undefined || raw === '') return DEFAULT_MAX_AGENT_WINDOWS
+    const value = Number(raw)
+    if (!Number.isInteger(value) || value < 1 || value > POC_LIMITS.maxActiveTabs) {
+        throw new Error(`ABP maxAgentWindows must be an integer between 1 and ${POC_LIMITS.maxActiveTabs}`)
+    }
+    return value
+}
+
+/** Required: without a site policy nothing may be opened, so refuse to start instead. */
+function loadSites(config: RuntimeConfig | undefined): SitePolicy[] {
+    try {
+        return parseSitePolicies(config ? config.sites : JSON.parse(requiredEnv('ABP_SITE_POLICY')))
+    } catch {
+        // Never echo the parser error: it can quote the configuration.
+        throw new Error('ABP site policy (runtime.json sites[] or ABP_SITE_POLICY) is missing or invalid')
+    }
+}
+
 function vncEndpoint(address: string): ViewerEndpoint {
     const separator = address.lastIndexOf(':')
     const port = Number(address.slice(separator + 1))
@@ -250,6 +273,8 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const profiles = config ? configProfiles(config) : JSON.parse(requiredEnv('ABP_PROFILES')) as ProfileConfig[]
     const host = config?.runtimeHost ?? process.env.ABP_RUNTIME_HOST ?? '0.0.0.0'
     const port = config?.runtimePort ?? Number(process.env.ABP_RUNTIME_PORT ?? '8787')
+    const windows = maxAgentWindows(config)
+    const sites = loadSites(config)
     const adminPort = Number(process.env.ABP_ADMIN_PORT ?? '8788')
     const policy: VerifyPolicy = config
         ? { authMode: config.authMode, machineId: config.machineId, workspaceId: config.workspaceId, trustedIssuers: config.trustedIssuers, profilePrincipals: config.profilePrincipals }
@@ -273,12 +298,12 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
 
     const drivers = new Map<ProfileId, CdpDriver>()
     for (const profile of profiles) {
-        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile) }))
+        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows }))
     }
     // Connect before recovery so it can compare browser instance ids.
     await Promise.all(profiles.map((profile) => connectWithRetry(drivers.get(profile.profileId)!, profile, log)))
 
-    const runtime = new BrowserRuntime({ store, drivers })
+    const runtime = new BrowserRuntime({ store, drivers, sites })
 
     for (const profile of profiles) {
         const driver = drivers.get(profile.profileId)!
