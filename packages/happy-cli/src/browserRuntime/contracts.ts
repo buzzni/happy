@@ -492,6 +492,36 @@ export interface BrowserRuntimeApi {
 }
 
 // ---------------------------------------------------------------------------
+// Attention feed (D10): external transitions after which the owning agent
+// session must look at its task again. Served on the broker socket to the daemon.
+// ---------------------------------------------------------------------------
+
+export const ATTENTION_REASONS = ['approval-approved', 'approval-rejected', 'takeover-released', 'user-resumed', 'recovered'] as const
+export type AttentionReason = (typeof ATTENTION_REASONS)[number]
+
+export interface AttentionEvent {
+    /** Outbox sequence (persistent, strictly increasing). */
+    seq: number
+    taskId: TaskId
+    agentSessionId: AgentSessionId
+    /** Task status right after the transition. */
+    status: TaskStatus
+    /** Task event seq of the transition; the daemon's message localId is `abp-<taskId>-<eventSeq>`. */
+    eventSeq: number
+    reason: AttentionReason
+}
+
+/**
+ * `nextSeq` is the cursor to pass as the next `afterSeq` (the last seq returned).
+ * CURSOR_EXPIRED: the cursor is older than the retained window (or ahead of the
+ * outbox); `snapshot` holds each task's latest attention entry that no agent
+ * batch has followed yet. Delivery stays idempotent through the eventSeq localId.
+ */
+export type AttentionFeed =
+    | { events: AttentionEvent[]; nextSeq: number; oldestSeq: number }
+    | { code: 'CURSOR_EXPIRED'; events: []; snapshot: AttentionEvent[]; nextSeq: number; oldestSeq: number }
+
+// ---------------------------------------------------------------------------
 // PoC defaults (contracts.md "자원·권한 기본값")
 // ---------------------------------------------------------------------------
 

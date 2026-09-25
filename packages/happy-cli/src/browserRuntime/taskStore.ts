@@ -124,6 +124,7 @@ export class TaskStore {
     private readonly taskTails = new Map<TaskId, Promise<void>>()
     private metadataTail: Promise<void> = Promise.resolve()
     private readonly unreadableTasks = new Set<TaskId>()
+    private readonly commitListeners = new Set<(task: StoredTask, event: TaskEvent) => void>()
     private closed = false
     private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector,
         private readonly now: () => number = Date.now) { }
@@ -228,6 +229,11 @@ export class TaskStore {
         await this.writeRevocations()
     }
     getRevocations(): ReadonlySet<string> { return new Set(this.revocations); }
+    /** Called after each task commit is durable. Listeners must not block; errors are ignored. */
+    onCommitted(listener: (task: StoredTask, event: TaskEvent) => void): () => void {
+        this.commitListeners.add(listener)
+        return () => { this.commitListeners.delete(listener) }
+    }
     async createTask(task: StoredTask, event: StoreEventInput): Promise<StoredTask> {
         if (this.tasks.has(task.taskId))
             throw new BrowserRuntimeError('CONFLICT', 'Task already exists')
@@ -306,6 +312,9 @@ export class TaskStore {
             await this.atomicWrite(join(taskDir, 'task.json'), next, 'task-replace')
             next.__events = [...(current.__events as TaskEvent[] | undefined ?? []), body]
             this.tasks.set(id, next)
+            for (const listener of this.commitListeners) {
+                try { listener(structuredClone(next), structuredClone(body)) } catch { /* observers never fail a commit */ }
+            }
             return structuredClone(next)
         }
         catch (error) {

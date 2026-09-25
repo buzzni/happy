@@ -629,7 +629,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 const space = this.requireSpace(task.taskSpaceId)
                 await this.options.store.updateSpace(task.taskSpaceId, { tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)) })
                 await this.commit(task, { status: 'paused', pauseReason: 'browser-replaced', tabs: [], pendingApproval: undefined,
-                    approvals, browserInstanceId: currentInstance }, 'recovered', { driver: 'reconnected', browserReplaced: true })
+                    approvals, browserInstanceId: currentInstance }, 'recovered', { driver: 'reconnected', browserReplaced: true,
+                        attention: 'recovered' })
                 continue
             }
             const previousStatus = task.previousDriverStatus as TaskStatus | undefined
@@ -643,8 +644,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 ? { status: previous, pauseReason: pauseReason ?? 'awaiting-agent' as const,
                     ...(writes.length ? { uncertainActions: [...new Set([...task.uncertainActions, ...writes])] } : {}) }
                 : { status: previous, pauseReason: undefined }
+            // A batch the agent was waiting on ended with the disconnect: the agent must re-plan.
             await this.commit(task, { ...patch, previousDriverStatus: undefined }, 'recovered', { driver: 'reconnected',
-                browserReplaced: false })
+                browserReplaced: false, ...(previousStatus === 'running' && patch.status === 'paused' ? { attention: 'recovered' } : {}) })
         }
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
@@ -783,7 +785,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (req.decision === 'reject') {
             const cancelled = await this.commit(task, { status: 'cancelled', cancelRequested: true, approvals: { ...task.approvals,
-                [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId })
+                [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId,
+                    attention: 'approval-rejected' })
             for (const lease of this.leases.revokeTask(task.taskId))
                 await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
             return { outcome: 'rejected', task: this.view(cancelled) }
@@ -875,7 +878,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             Number(approval.nextStep), approvedStep.actionId)
         const finalTask = this.requireTask(req.taskId)
         await this.commit(finalTask, { approvals: { ...finalTask.approvals, [req.approvalId]: { ...finalTask.approvals[req.approvalId],
-            result } } }, 'agent-attention-required', { approvalId: req.approvalId, outcome: result.outcome })
+            result } } }, 'agent-attention-required', { approvalId: req.approvalId, outcome: result.outcome, attention: 'approval-approved' })
         return { outcome: 'approved', task: this.view(this.requireTask(req.taskId)), batch: result }
     }
     private async takeOverImpl(auth: AuthContext, req: {
@@ -941,7 +944,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, null)
         await this.persistProfileUserOwner(task.profileId, null)
         const next = await this.commit(task, { status: 'paused', pauseReason: 'user-input-complete' }, 'input-owner-changed',
-            { tabId: req.tabId, owner: 'none' }, epoch)
+            { tabId: req.tabId, owner: 'none', attention: 'takeover-released' }, epoch)
         return { leaseEpoch: epoch, owner: { kind: 'none' }, task: this.view(next) }
     }
     private async resumeImpl(auth: AuthContext, req: {
@@ -1580,7 +1583,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             else
                 continue
             await this.commit(task, patch, 'recovered', { previousStatus: task.status, pauseReason: patch.pauseReason,
-                uncertainActions: patch.uncertainActions ?? [] }).catch(() => this.options.store.markUnreadable(task.taskId))
+                uncertainActions: patch.uncertainActions ?? [], attention: 'recovered' }).catch(() => this.options.store.markUnreadable(task.taskId))
         }
     }
     pinnedProfiles(nowMs = this.clock.now()): ProfileId[] {
