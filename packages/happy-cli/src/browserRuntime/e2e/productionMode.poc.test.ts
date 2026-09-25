@@ -120,7 +120,7 @@ describe('Runtime in production mode', () => {
         expect(stderr).toMatch(new RegExp(`dropped root uid=${RUNTIME_UID} gid=${RUNTIME_UID}`))
         expect(stderr).toMatch(/listening .*mode=production admin=socket broker=socket flock=true/)
         expect(docker(['port', name])).not.toMatch(/8788/)
-        expect(await (await fetch(`${runtimeUrl}/v1/ready`)).json()).toEqual({ ok: true, ready: true, checks: { browsers: true, writerLock: true, disk: true } })
+        expect(await (await fetch(`${runtimeUrl}/v1/ready`)).json()).toEqual({ ok: true, ready: true, checks: { browsers: true, writerLock: true, disk: true, revocations: true } })
         const metrics = socketCall('root', '/run/abp/admin.sock', 'GET', '/admin/metrics')
         expect(metrics.status).toBe(200)
         expect(metrics.body.result.browsers).toEqual({ [PROFILE_A]: { connected: true } })

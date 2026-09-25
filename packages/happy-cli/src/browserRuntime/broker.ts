@@ -65,11 +65,25 @@ export interface BrokerOptions {
     revokeGrant(grantId: GrantId): Promise<void>
     attention: AttentionOutbox
     socketGid?: number
+    /** Delay before retrying a start-up revocation replay that failed. */
+    recoveryRetryMs?: number
     now?: () => number
     log?: (line: string) => void
 }
 
-export interface Broker { close(): Promise<void> }
+export interface Broker {
+    close(): Promise<void>
+    /** Grants of registrations being revoked; the task API must deny them until revocation completes. */
+    revokingGrantIds(): ReadonlySet<string>
+    /** Registrations whose revocation has not completed (readiness is false while any remain). */
+    pendingRevocations(): number
+}
+
+/** The credential denylist for the task API: the Runtime's revocations plus grants still being revoked. */
+export function withRevokingGrants(revoked: ReadonlySet<string>, broker?: Pick<Broker, 'revokingGrantIds'>): ReadonlySet<string> {
+    const revoking = broker?.revokingGrantIds()
+    return revoking?.size ? new Set([...revoked, ...revoking]) : revoked
+}
 
 const id = z.string().min(1).max(256)
 const schemas = {
@@ -261,15 +275,32 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         })
     })
 
-    // Revocations a crash interrupted are finished before any session can connect.
-    for (const [registrationId, registration] of Object.entries(registry.registrations)) {
-        if (!registration.revoking) continue
-        await exclusive(() => finishRevocation(registrationId, registration))
-            .catch(() => log('broker revocation recovery incomplete; the daemon retries it'))
+    // Revocations a crash interrupted are replayed in the background. Their grants are
+    // denied from the start (revokingGrantIds) and readiness stays false until done.
+    let closed = false
+    let recoveryTimer: NodeJS.Timeout | undefined
+    const replayRevocations = async (): Promise<void> => {
+        for (const [registrationId, registration] of Object.entries(registry.registrations)) {
+            if (!registration.revoking || closed) continue
+            await exclusive(() => registry.registrations[registrationId] === registration ? finishRevocation(registrationId, registration) : Promise.resolve(0))
+                .catch(() => log('broker revocation recovery incomplete; retrying'))
+        }
+        if (!closed && Object.values(registry.registrations).some((registration) => registration.revoking)) {
+            recoveryTimer = setTimeout(() => void replayRevocations(), options.recoveryRetryMs ?? 5_000)
+            recoveryTimer.unref()
+        }
     }
     if (!options.server) await listenOnSocket(server, options.socketPath, 0o660, options.socketGid)
+    void replayRevocations()
     return {
-        close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) }).then(() => writeTail.catch(() => undefined)),
+        close: () => {
+            closed = true
+            clearTimeout(recoveryTimer)
+            return new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) })
+                .then(() => exclusiveTail.catch(() => undefined)).then(() => writeTail.catch(() => undefined))
+        },
+        revokingGrantIds: () => new Set(Object.values(registry.registrations).filter((registration) => registration.revoking).flatMap((registration) => registration.grantIds)),
+        pendingRevocations: () => Object.values(registry.registrations).filter((registration) => registration.revoking).length,
     }
 }
 

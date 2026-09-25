@@ -37,7 +37,7 @@ import { join } from 'node:path'
 import { collectRuntimeMetrics, startAdminServer, type AdminServer } from './admin'
 import { AttentionOutbox } from './attention'
 import { verifyToken, type AuthKeys, type VerifyPolicy } from './auth'
-import { listenOnSocket, startBroker, type Broker } from './broker'
+import { listenOnSocket, startBroker, withRevokingGrants, type Broker } from './broker'
 import { BrowserRuntimeError, type BrowserInstanceId, type BrowserRuntimeApi, type ProfileId } from './contracts'
 import { CdpDriver } from './drivers/cdpDriver'
 import { dropRoot, joinGroup, runtimeIdentity } from './privilegeDrop'
@@ -296,35 +296,8 @@ async function main(): Promise<void> {
         },
     })
 
-    const startedAtMs = Date.now()
-    const server = await startRuntimeServer({
-        api,
-        verifyToken: (bearer) => verifyToken(bearer, keys, Date.now(), store.getRevocations(), policy),
-        host,
-        port,
-        health: () => ({
-            pid: process.pid,
-            startedAtMs,
-            profiles: profiles.map((profile) => ({ profileId: profile.profileId, connected: drivers.get(profile.profileId)!.isConnected() })),
-        }),
-        ready: async () => {
-            const disk = await statfs(stateDir).catch(() => undefined)
-            return {
-                browsers: profiles.every((profile) => drivers.get(profile.profileId)!.isConnected()),
-                writerLock: Date.now() - heartbeatOkAtMs <= 3 * LOCK_HEARTBEAT_MS && (flockHeld || !production),
-                disk: Boolean(disk && disk.bavail * disk.bsize >= MIN_FREE_DISK_BYTES),
-            }
-        },
-        log: (line: string) => log(line),
-    })
-    const admin: AdminServer = await startAdminServer({
-        runtime, drivers,
-        listen: boundAdmin ? { server: boundAdmin }
-            : adminOnSocket || !harnessKeys?.adminToken ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
-                : { host, port: adminPort, adminToken: harnessKeys.adminToken },
-        metrics: () => collectRuntimeMetrics({ store, drivers, stateDir, fenceAcksMs }),
-        revokeCapability: (capabilityId) => store.revoke(capabilityId),
-    })
+    // Before the task API: grants of revocations a crash interrupted must be denied
+    // from the first request (the broker replays them in the background).
     let broker: Broker | undefined
     if (config?.daemonTokenSha256) {
         broker = await startBroker({
@@ -339,6 +312,36 @@ async function main(): Promise<void> {
             log,
         })
     }
+    const startedAtMs = Date.now()
+    const server = await startRuntimeServer({
+        api,
+        verifyToken: (bearer) => verifyToken(bearer, keys, Date.now(), withRevokingGrants(store.getRevocations(), broker), policy),
+        host,
+        port,
+        health: () => ({
+            pid: process.pid,
+            startedAtMs,
+            profiles: profiles.map((profile) => ({ profileId: profile.profileId, connected: drivers.get(profile.profileId)!.isConnected() })),
+        }),
+        ready: async () => {
+            const disk = await statfs(stateDir).catch(() => undefined)
+            return {
+                browsers: profiles.every((profile) => drivers.get(profile.profileId)!.isConnected()),
+                writerLock: Date.now() - heartbeatOkAtMs <= 3 * LOCK_HEARTBEAT_MS && (flockHeld || !production),
+                disk: Boolean(disk && disk.bavail * disk.bsize >= MIN_FREE_DISK_BYTES),
+                revocations: (broker?.pendingRevocations() ?? 0) === 0,
+            }
+        },
+        log: (line: string) => log(line),
+    })
+    const admin: AdminServer = await startAdminServer({
+        runtime, drivers,
+        listen: boundAdmin ? { server: boundAdmin }
+            : adminOnSocket || !harnessKeys?.adminToken ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
+                : { host, port: adminPort, adminToken: harnessKeys.adminToken },
+        metrics: () => collectRuntimeMetrics({ store, drivers, stateDir, fenceAcksMs }),
+        revokeCapability: (capabilityId) => store.revoke(capabilityId),
+    })
     log(`listening api=${server.url} mode=${config?.authMode ?? 'harness'} admin=${admin.port ?? 'socket'} broker=${broker ? 'socket' : 'off'} flock=${flockHeld} profiles=${profiles.length}`)
 
     const shutdown = async () => {

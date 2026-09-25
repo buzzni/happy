@@ -3,11 +3,11 @@ import { chmod, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GrantId, PrincipalId, ProfileId } from './contracts'
 import { verifyToken } from './auth'
 import { AttentionOutbox } from './attention'
-import { BROKER_GRANT_TTL_MS, startBroker, type Broker } from './broker'
+import { BROKER_GRANT_TTL_MS, startBroker, withRevokingGrants, type Broker } from './broker'
 import { TaskStore } from './taskStore'
 
 const DAEMON_TOKEN = 'synthetic-daemon-token-0123456789abcdef'
@@ -28,7 +28,7 @@ function call(socketPath: string, method: string, path: string, headers: Record<
     })
 }
 
-async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId) => Promise<void> } = {}) {
+async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId) => Promise<void>; recoveryRetryMs?: number } = {}) {
     const dir = options.dir ?? await mkdtemp(join(tmpdir(), 'abp-broker-'))
     if (!options.dir) cleanups.push(() => rm(dir, { recursive: true, force: true }))
     const store = await TaskStore.open(dir)
@@ -44,8 +44,9 @@ async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId)
         profiles: new Map([['profile-a' as ProfileId, 'user-1' as PrincipalId]]),
         allowedOrigins: ['https://shop.example'],
         agentKey: keys.agentKey,
-        revokeGrant: async (grantId) => { await options.revokeGrant?.(grantId); revoked.push(grantId) },
+        revokeGrant: async (grantId) => { await options.revokeGrant?.(grantId); await store.revoke(grantId); revoked.push(grantId) },
         now: () => now,
+        recoveryRetryMs: options.recoveryRetryMs ?? 3_600_000,
     })
     const close = async () => { await broker.close(); await store.close() }
     cleanups.push(close)
@@ -59,7 +60,7 @@ async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId)
     }
     const grant = (secret: string, body: Record<string, unknown> = {}) => call(socketPath, 'POST', '/v1/agent-grants', { 'x-abp-session-secret': secret },
         { schemaVersion: 1, agentSessionId: 'session-1', profileId: 'profile-a', ...body })
-    return { dir, store, attention, socketPath, revoked, daemon, register, grant, close, setNow: (value: number) => { now = value } }
+    return { dir, store, attention, socketPath, revoked, daemon, register, grant, close, broker, setNow: (value: number) => { now = value } }
 }
 
 describe('broker socket', () => {
@@ -199,6 +200,7 @@ describe('broker socket', () => {
         cleanups.splice(cleanups.indexOf(h.close), 1)
         const restarted = await harness({ dir: h.dir })
         expect((await restarted.grant(sessionSecret)).status).toBe(401)
+        await vi.waitFor(() => expect(restarted.broker.pendingRevocations()).toBe(0))
         expect(restarted.revoked).toEqual([issued])
     })
 
@@ -210,10 +212,53 @@ describe('broker socket', () => {
         await h.close()
         cleanups.splice(cleanups.indexOf(h.close), 1)
         const restarted = await harness({ dir: h.dir })
+        expect((await restarted.grant(sessionSecret)).status).toBe(401)
+        await vi.waitFor(() => expect(restarted.broker.pendingRevocations()).toBe(0))
         expect(restarted.revoked.sort()).toEqual(issued.sort())
         expect((await restarted.grant(sessionSecret)).status).toBe(401)
         expect(JSON.parse(await readFile(join(h.dir, 'broker-sessions.json'), 'utf8')).registrations).toEqual({})
         expect((await call(restarted.socketPath, 'POST', '/v1/sessions/revoke', restarted.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })).body.result).toEqual({ revoked: false, grants: 0 })
+    })
+
+    /** A session with one grant whose revocation stopped after the tombstone; returns the grant token and id. */
+    async function interruptedRevocation() {
+        const h = await harness({ revokeGrant: async () => { throw new Error('crashed mid-revoke') } })
+        const { sessionSecret } = await h.register()
+        const { token, grantId } = (await h.grant(sessionSecret)).body.result
+        expect((await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })).status).toBe(503)
+        await h.close()
+        cleanups.splice(cleanups.indexOf(h.close), 1)
+        return { dir: h.dir, token: token as string, grantId: grantId as string }
+    }
+    const apiAccepts = (token: string, restarted: { store: TaskStore; broker: Broker }) => {
+        try { verifyToken(token, keys, 1_000_000, withRevokingGrants(restarted.store.getRevocations(), restarted.broker)); return true } catch { return false }
+    }
+
+    it('denies tombstoned grants to the task API from start-up while the replay is still running', async () => {
+        const interrupted = await interruptedRevocation()
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        const restarted = await harness({ dir: interrupted.dir, revokeGrant: () => gate })
+        expect(restarted.broker.revokingGrantIds()).toEqual(new Set([interrupted.grantId]))
+        expect(restarted.broker.pendingRevocations()).toBe(1)
+        expect(apiAccepts(interrupted.token, restarted)).toBe(false)
+        release()
+        await vi.waitFor(() => expect(restarted.broker.pendingRevocations()).toBe(0))
+        expect(restarted.revoked).toEqual([interrupted.grantId])
+        // Now denied through the Runtime's own durable revocation list.
+        expect(apiAccepts(interrupted.token, restarted)).toBe(false)
+    })
+
+    it('keeps tombstoned grants denied and reports them pending when the replay fails, and retries it', async () => {
+        const interrupted = await interruptedRevocation()
+        let failing = true
+        const restarted = await harness({ dir: interrupted.dir, recoveryRetryMs: 20, revokeGrant: async () => { if (failing) throw new Error('journal down') } })
+        await new Promise((resolve) => setTimeout(resolve, 60))
+        expect(restarted.broker.pendingRevocations()).toBe(1)
+        expect(apiAccepts(interrupted.token, restarted)).toBe(false)
+        failing = false
+        await vi.waitFor(() => expect(restarted.broker.pendingRevocations()).toBe(0))
+        expect(restarted.revoked).toEqual([interrupted.grantId])
     })
 
     it('keeps registrations across a Runtime restart', async () => {
