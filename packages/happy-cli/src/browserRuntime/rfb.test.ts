@@ -41,21 +41,7 @@ describe('StreamFramer + server message framing', () => {
     })
 })
 
-describe('parser hooks for the viewer proxy', () => {
-    it('reports each finished FramebufferUpdate and whether a pixel rectangle starts at the origin', () => {
-        const updates: boolean[] = []
-        const framer = new StreamFramer(serverMessages(session(), { onFramebufferUpdate: (coversOrigin) => updates.push(coversOrigin) }), () => undefined, 1 << 20)
-        const update = (count: number, ...parts: Buffer[]) => Buffer.concat([Buffer.from([0, 0]), u16(count), ...parts])
-        framer.push(update(1, rect(0, 0, 1, 1, ENCODING.raw), Buffer.alloc(4)))
-        framer.push(update(2, rect(1, 0, 1, 1, ENCODING.raw), Buffer.alloc(4), rect(0, 0, 3, 2, ENCODING.cursor), Buffer.alloc(3 * 2 * 4 + 2)))
-        framer.push(Buffer.from([2]))
-        const split = update(2, rect(4, 4, 2, 2, ENCODING.raw), Buffer.alloc(16), rect(0, 0, 2, 2, ENCODING.raw), Buffer.alloc(16))
-        framer.push(split.subarray(0, split.length - 1))
-        expect(updates).toEqual([true, false])
-        framer.push(split.subarray(split.length - 1))
-        expect(updates).toEqual([true, false, true])
-    })
-
+describe('parser hook for the viewer proxy', () => {
     it('announces every viewer message at its type byte, before the rest of it arrives', () => {
         const events: string[] = []
         const framer = new StreamFramer(clientParser({ send: () => undefined, serverInit: Buffer.alloc(0), onReady: () => undefined,

@@ -194,12 +194,7 @@ export function setEncodingsMessage(encodings: readonly number[]): Buffer {
 // Upstream: the proxy is an RFB client of x11vnc.
 // ---------------------------------------------------------------------------
 
-export interface ServerMessageHooks {
-    /** After each complete FramebufferUpdate; `coversOrigin`: a pixel rectangle starts at (0,0) (the viewer's input barrier). */
-    onFramebufferUpdate?(coversOrigin: boolean): void
-}
-
-export interface UpstreamHooks extends ServerMessageHooks {
+export interface UpstreamHooks {
     password: string
     send(bytes: Buffer): void
     onServerInit(init: ServerInit): void
@@ -227,19 +222,17 @@ export function* upstreamParser(session: RfbSession, hooks: UpstreamHooks): RfbP
     session.width = width
     session.height = height
     hooks.onServerInit({ width, height, pixelFormat })
-    yield* serverMessages(session, hooks)
+    yield* serverMessages(session)
 }
 
 /** Server→viewer messages after the handshake; `session` is updated by the viewer direction. */
-export function* serverMessages(session: RfbSession, hooks: ServerMessageHooks = {}): RfbParser {
+export function* serverMessages(session: RfbSession): RfbParser {
     for (;;) {
         const [type] = yield* read(1, true)
         switch (type) {
-            case 0: {
-                const coversOrigin = yield* framebufferUpdate(session)
-                hooks.onFramebufferUpdate?.(coversOrigin)
+            case 0:
+                yield* framebufferUpdate(session)
                 break
-            }
             case 1: { // SetColourMapEntries
                 const header = yield* read(5, true)
                 const count = header.readUInt16BE(3)
@@ -261,9 +254,7 @@ export function* serverMessages(session: RfbSession, hooks: ServerMessageHooks =
     }
 }
 
-/** Returns whether a pixel rectangle started at (0,0). */
-function* framebufferUpdate(session: RfbSession): Generator<Step, boolean, Buffer | undefined> {
-    let coversOrigin = false
+function* framebufferUpdate(session: RfbSession): RfbParser {
     const rectangles = (yield* read(3, true)).readUInt16BE(1)
     for (let index = 0; index < rectangles; index++) {
         const header = yield* read(12, true)
@@ -275,10 +266,7 @@ function* framebufferUpdate(session: RfbSession): Generator<Step, boolean, Buffe
         // Raw is always permitted (RFC 6143 7.7); anything else must have been requested.
         if (encoding !== ENCODING.raw && !session.encodings.has(encoding)) throw new RfbProtocolError(`unrequested encoding ${encoding}`)
         const pixel = session.bytesPerPixel
-        const inside = () => {
-            if (x + w > session.width || y + h > session.height) throw new RfbProtocolError('rectangle outside the framebuffer')
-            if (x === 0 && y === 0 && w > 0 && h > 0) coversOrigin = true
-        }
+        const inside = () => { if (x + w > session.width || y + h > session.height) throw new RfbProtocolError('rectangle outside the framebuffer') }
         switch (encoding) {
             case ENCODING.raw:
                 inside()
@@ -307,7 +295,6 @@ function* framebufferUpdate(session: RfbSession): Generator<Step, boolean, Buffe
                 throw new RfbProtocolError(`unsupported encoding ${encoding}`)
         }
     }
-    return coversOrigin
 }
 
 function* hextile(width: number, height: number, pixel: number): RfbParser {
