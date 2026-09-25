@@ -24,6 +24,7 @@ describe('Claude model changes across provider restarts', () => {
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         queue.pushIsolated('/clear', { permissionMode: 'default', model: 'claude-sonnet-5' });
@@ -62,6 +63,7 @@ describe('Claude model changes across provider restarts', () => {
                 if (metadata.claudeBackgroundTasks) snapshots.push(metadata.claudeBackgroundTasks);
             }), getMetadata: () => metadata,
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
@@ -113,5 +115,48 @@ describe('Claude model changes across provider restarts', () => {
         expect(cancelLessonReview).toHaveBeenCalled();
         expect(lessonReviewLifecycle.controller.signal.aborted).toBe(true);
         expect(client.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'Process exited unexpectedly' }));
+    });
+
+    it('records turn latency for a turn held back behind a provider restart', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const modes: EnhancedMode[] = ['claude-sonnet-5', 'claude-opus-5'].map(model => ({ permissionMode: 'default', model }));
+        const launches: Options[] = [];
+        let received = 0;
+        const client = {
+            sessionId: 'restart-latency-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(), sendTurnLatency: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            launches.push(options!);
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    received++;
+                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: `result-${received}` };
+                    if (received === modes.length) {
+                        void handlers.get('switch')!();
+                        return;
+                    }
+                    queue.push(`turn-${received}`, modes[received], undefined, undefined, { id: `trace-${received}`, receivedAt: performance.now() });
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('turn-0', modes[0], undefined, undefined, { id: 'trace-0', receivedAt: performance.now() });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        await claudeRemoteLauncher(session);
+        expect(launches).toHaveLength(2);
+        expect(client.sendTurnLatency.mock.calls.map(([diagnostic]) => diagnostic.id)).toEqual(['trace-0', 'trace-1']);
     });
 });

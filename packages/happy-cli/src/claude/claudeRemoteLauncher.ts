@@ -11,9 +11,10 @@ import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import React from "react";
-import { claudeRemote, type ClaudeActiveInputSender } from "./claudeRemote";
+import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
+import type { QueueLatencyTrace } from "@/utils/MessageQueue2";
 import { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "./sdk";
 import { formatClaudeMessageForInk } from "@/ui/messageFormatterInk";
 import { logger } from "@/ui/logger";
@@ -21,11 +22,19 @@ import { SDKToLogConverter } from "./utils/sdkToLogConverter";
 import { EnhancedMode } from "./loop";
 import { RawJSONLines } from "@/claude/types";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
+import { installChannelPermissionWiring } from '@/channel/channelPermissionWiring';
+import {
+    createOrderedTurnDispatcher,
+    finalAnswerItem,
+    pendingRequestItem,
+    turnEndItem,
+    type ChannelTurnOrderingTarget,
+} from '@/channel/channelTurnOrdering';
 import { getToolName } from "./utils/getToolName";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
 import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources';
-import type { McpRuntimeServerStatus } from '@slopus/happy-wire';
+import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
@@ -196,14 +205,45 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         emit: (frame) => session.client.sendStreamDelta(frame),
     });
 
-    // Create outgoing message queue
-    const messageQueue = new OutgoingMessageQueue(
-        (logMessage) => session.client.sendClaudeSessionMessage(logMessage)
-    );
+    /*
+     * Outgoing message queue. It also carries the channel turn markers — the correlation id, the
+     * final candidate and the terminal — so all three land in the same order as the transcript
+     * they belong to. See `createOrderedTurnDispatcher` for why each of them must not be called
+     * directly from an SDK callback.
+     */
+    /*
+     * The dispatcher target. Everything but the permission binding is the session client's own
+     * method; the binding needs the handler too, so it is composed here rather than giving the
+     * client a reference to the handler.
+     */
+    let bindChannelPermission: (
+        permissionId: string, toolName: string, instanceSeq: number,
+    ) => void = () => { };
+    const orderingTarget: ChannelTurnOrderingTarget = {
+        setPendingTurnRequestId: (requestId) => session.client.setPendingTurnRequestId(requestId),
+        sendFinalAnswerForChannelTurn: (text) => session.client.sendFinalAnswerForChannelTurn(text),
+        closeClaudeSessionTurn: (status) => session.client.closeClaudeSessionTurn(status),
+        // The dispatcher carries ordinary log messages as `unknown` because it also carries the
+        // markers; the client's own signature is the narrower one.
+        sendClaudeSessionMessage: (logMessage) =>
+            session.client.sendClaudeSessionMessage(logMessage as Parameters<typeof session.client.sendClaudeSessionMessage>[0]),
+        // Late-bound: the queue needs the target, and the wiring needs the queue.
+        bindChannelPermission: (permissionId, toolName, instanceSeq) =>
+            bindChannelPermission(permissionId, toolName, instanceSeq),
+    };
+    const messageQueue = new OutgoingMessageQueue(createOrderedTurnDispatcher(orderingTarget));
 
-    // Set up callback to release delayed messages when permission is requested
-    permissionHandler.setOnPermissionRequest((toolCallId: string) => {
-        messageQueue.releaseToolCall(toolCallId);
+    /*
+     * The prompt→turn binding and the sanitized observation. The ordering this depends on lives in
+     * `channel/channelPermissionWiring.ts` so this launcher and its tests run the same code.
+     */
+    bindChannelPermission = installChannelPermissionWiring({
+        queue: messageQueue,
+        handler: permissionHandler,
+        // Membership, not "what is current" — see `channel/channelPermissionWiring.ts`.
+        turnContextFor: (toolCallId, apply) =>
+            session.client.bindChannelPermissionWhenKnown(toolCallId, apply),
+        publish: (event) => session.client.sendSessionProtocolMessage(createEnvelope('agent', event)),
     });
 
     // Create SDK to Log converter (pass responses from permissions)
@@ -215,6 +255,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
 
     // Handle messages
+    /**
+     * Whether the most recent SDK result reported success.
+     *
+     * `onReady` fires on *any* result, and closed every turn as `completed` regardless. For a
+     * channel request that is the difference between "here is your answer" and "this failed":
+     * the terminal is what makes a candidate deliverable, so a failed run reported as completed
+     * would relay whatever text happened to be standing (Saycode specs/desktop-messenger-channels).
+     */
+    let lastResultSucceeded = true;
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
@@ -253,6 +302,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // (Z.AI 호환 경로의 assistant usage 0 문제, src/usage/claudeTurnUsage.ts).
         if (message.type === 'result') {
             session.client.applyClaudeTurnResult(message as unknown as { uuid?: unknown; usage?: unknown; modelUsage?: unknown });
+            /*
+             * The SDK's own final answer (Saycode specs/desktop-messenger-channels — R14).
+             *
+             * `result` on a successful result message is the text Claude finished with, as the
+             * provider reports it — not something inferred from the position of a tool call in
+             * the transcript. It is published only when the open turn is answering a channel
+             * request, and is still just a candidate: the matching `turn-end` with
+             * `status: 'completed'` is what makes it deliverable.
+             */
+            const result = message as unknown as { subtype?: unknown; is_error?: unknown; result?: unknown };
+            lastResultSucceeded = result.subtype === 'success' && result.is_error !== true;
+            // Only a successful result carries an answer. A failed one must not leave an earlier
+            // candidate standing either — the queue marker with an empty text clears it, and the
+            // terminal that follows then reports no answer rather than an old one.
+            if (result.subtype === 'success' && result.is_error !== true && typeof result.result === 'string') {
+                messageQueue.enqueue(finalAnswerItem(result.result));
+            }
         }
 
         // Track active tool calls
@@ -409,7 +475,28 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              * decision for exactly the turns that were queued behind a mode change.
              */
             requestIds?: string[];
+            inputCount: number;
+            latencyTraces: QueueLatencyTrace[];
+            /** Carried through the deferral so an isolated channel turn keeps its handle. */
+            channelRequestId?: string;
         } | null = null;
+        /*
+         * Queue time ends when a generation takes the batch. A batch held back
+         * behind a provider restart is taken by the next generation, so it is
+         * measured there — its restart cost belongs to its record.
+         */
+        const toTurnLatency = (batch: { inputCount: number; latencyTraces: QueueLatencyTrace[] }): ClaudeTurnLatencyInput | undefined => (
+            batch.latencyTraces.length > 0
+                ? {
+                    attribution: batch.inputCount === 1 ? 'exclusive' : 'coalesced',
+                    inputCount: batch.inputCount,
+                    traces: batch.latencyTraces.map((trace) => ({
+                        ...trace,
+                        queueMs: Math.max(0, performance.now() - trace.receivedAt),
+                    })),
+                }
+                : undefined
+        );
 
         /**
          * Distinguishes one applied execution from the next, so a replayed or
@@ -554,6 +641,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         policyMode: session.sandboxPolicyMode ?? 'owner-choice',
                     }),
                     beforeTurn: session.checkpointComposition?.beforeTurn,
+                    prepareChannelExecution: session.prepareChannelExecution,
+                    beginChannelExecution: session.beginChannelExecution,
                     completeTurn: session.checkpointComposition?.completeTurn,
                     jsRuntime: session.jsRuntime,
                     canCallTool: permissionHandler.handleToolCall,
@@ -564,6 +653,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (pending) {
                             let p = pending;
                             pending = null;
+                            // This is the path an isolated channel turn actually takes: it was
+                            // deferred when the previous query ended, and *this* is the moment it
+                            // becomes the running turn.
+                            messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
                             // This message starts the new provider. Seed its comparison
                             // baseline too, or the next model/effort change is missed.
                             modeHash = p.hash;
@@ -587,7 +680,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 mode = revisedMode;
                                 p = { ...p, mode: revisedMode };
                             }
-                            return p;
+                            return { ...p, latency: toTurnLatency(p) };
                         }
 
                         /*
@@ -657,7 +750,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             }
                             modeHash = msg.hash;
                             mode = msg.mode;
+                            // The batch about to run is what answers the request, so the handle is
+                            // attached here rather than where the message was queued: between those
+                            // two points the queue may have reordered, isolated or dropped it.
+                            // A batch with no channel message clears it, so an in-app turn never
+                            // inherits an id.
+                            messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
                             permissionHandler.handleModeChange(mode.permissionMode);
+                            const latency = toTurnLatency(msg);
 
                             /*
                              * The engine-applied boundary for Claude. This batch's
@@ -718,12 +818,20 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 return {
                                     message: contentBlocks,
                                     mode: msg.mode,
+                                    latency,
+                                    ...(msg.channelRequestId !== undefined ? { channelRequestId: msg.channelRequestId } : {}),
                                 };
                             }
 
+                            // Carried through so the slash-command parser in `claudeRemote` knows
+                            // this text was relayed rather than typed into the app. A channel
+                            // batch normally reaches that parser via the `pending` branch above,
+                            // but the handle travels on every path so no future route drops it.
                             return {
                                 message: msg.message,
-                                mode: msg.mode
+                                mode: msg.mode,
+                                latency,
+                                ...(msg.channelRequestId !== undefined ? { channelRequestId: msg.channelRequestId } : {}),
                             }
                         }
 
@@ -787,6 +895,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     claudeArgs: session.claudeArgs,
                     onMessage,
                     onStreamEvent: streamRelay.handleStreamEvent,
+                    onTurnLatency: (diagnostic) => session.client.sendTurnLatency(diagnostic),
                     onCompletionEvent: (message: string) => {
                         logger.debug(`[remote]: Completion event: ${message}`);
                         session.client.sendSessionEvent({ type: 'message', message });
@@ -797,7 +906,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         session.onSessionReset?.();
                     },
                     onReady: () => {
-                        session.client.closeClaudeSessionTurn('completed');
+                        // Queued, not called: a terminal emitted ahead of the transcript closes a
+                        // turn that has not received its text yet, and the later flush opens a
+                        // second, unrelated one.
+                        messageQueue.enqueue(turnEndItem(lastResultSucceeded ? 'completed' : 'failed'));
                         if (!pending && session.queue.size() === 0) {
                             // Same reason as the question notification above.
                             // This one matters more: `onReady` fires on ANY SDK

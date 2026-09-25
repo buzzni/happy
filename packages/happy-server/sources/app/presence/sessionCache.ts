@@ -190,10 +190,18 @@ class ActivityCache {
                 // up as "방금" in consumer session lists (web-ui sidebar,
                 // mobile app). updatedAt is reserved for real modifications
                 // (new SessionMessage, metadata write, etc.).
+                //
+                // lastActiveAt 은 `timestamp without time zone` 이라 Date 를
+                // 그대로 바인딩하면 안 된다. Prisma 엔진은 raw 파라미터의 Date
+                // 를 timestamptz 로 보내고, 서버는 세션 TimeZone(prod RDS 는
+                // Asia/Seoul)으로 벽시계 변환을 해 9시간 미래 값을 쓴다. ORM
+                // 쓰기와 timeout.ts 비교는 UTC 라, 죽은 머신·세션이 9시간 넘게
+                // active 로 남았다. epoch ms 로 UTC 벽시계를 직접 만든다.
+                // 아래 machine 브랜치도 같다.
                 await Promise.all(sessionUpdates.map(update =>
                     db.$executeRaw`
                         UPDATE "Session"
-                        SET "lastActiveAt" = ${new Date(update.timestamp)}, "active" = true
+                        SET "lastActiveAt" = to_timestamp(${update.timestamp}::double precision / 1000) AT TIME ZONE 'UTC', "active" = true
                         WHERE "id" = ${update.id}
                     `
                 ));
@@ -231,7 +239,7 @@ class ActivityCache {
                 await Promise.all(machineUpdates.map(update =>
                     db.$executeRaw`
                         UPDATE "Machine"
-                        SET "lastActiveAt" = ${new Date(update.timestamp)}, "active" = true
+                        SET "lastActiveAt" = to_timestamp(${update.timestamp}::double precision / 1000) AT TIME ZONE 'UTC', "active" = true
                         WHERE "accountId" = ${update.userId} AND "id" = ${update.id}
                     `
                 ));

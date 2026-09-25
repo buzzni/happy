@@ -316,6 +316,23 @@ describe('ApiSessionClient v3 messages API migration', () => {
             .toEqual({ messageId: 'msg_1', index: 0, offset: 3, delta: 'Hel', final: false });
     });
 
+    it('sends opt-in turn latency as an opaque volatile stream frame', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        client.sendTurnLatency({
+            version: 1, type: 'turn-latency', id: 'trace-1', attribution: 'exclusive', inputCount: 1,
+            queueMs: 4, sdkSubmitMs: 9, firstSdkTextMs: 20, outcome: 'text',
+        });
+
+        const [event, payload] = mockSocket.volatile.emit.mock.calls[0];
+        expect(event).toBe('session-stream');
+        expect(payload.sid).toBe('test-session-id');
+        expect(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(payload.data))).toEqual({
+            version: 1, type: 'turn-latency', id: 'trace-1', attribution: 'exclusive', inputCount: 1,
+            queueMs: 4, sdkSubmitMs: 9, firstSdkTextMs: 20, outcome: 'text',
+        });
+    });
+
     it('reapplies a metadata patch to the newest server document after a version mismatch', async () => {
         session.metadata = {
             ...session.metadata,

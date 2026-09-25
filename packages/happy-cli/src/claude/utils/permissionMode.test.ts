@@ -154,3 +154,21 @@ describe('resolveRemoteClaudePermissionMode', () => {
         expect(resolveRemoteClaudePermissionMode('default', 'plan', true)).toBe('bypassPermissions');
     });
 });
+
+describe('channel-origin turns leave the session mode alone', () => {
+    // Saycode specs/desktop-messenger-channels R9. Desktop's shared message builder hardcodes
+    // `permissionMode: 'bypassPermissions'` for in-app sends; the channel path deliberately sends
+    // no mode at all, and this is the behaviour that relies on.
+    it('keeps a plan-mode session in plan when no mode is supplied', () => {
+        expect(resolveRemoteClaudePermissionMode('plan', undefined, false)).toBe('plan');
+        expect(resolveRemoteClaudePermissionMode('plan', undefined, true)).toBe('plan');
+    });
+
+    it('keeps a default-mode session in default when no mode is supplied', () => {
+        expect(resolveRemoteClaudePermissionMode('default', undefined, false)).toBe('default');
+    });
+
+    it('does not invent a mode for a session that has none yet', () => {
+        expect(resolveRemoteClaudePermissionMode(undefined, undefined, false)).toBeUndefined();
+    });
+});
