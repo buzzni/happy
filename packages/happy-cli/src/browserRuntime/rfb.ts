@@ -130,10 +130,10 @@ export class StreamFramer {
     }
 }
 
-/** Bytes per pixel of a 16-byte PIXEL_FORMAT, or a protocol error. */
+/** Bytes per pixel of a 16-byte PIXEL_FORMAT, or a protocol error. The flags are booleans where any non-zero is true (x11vnc sends 0xff). */
 function bytesPerPixel(format: Buffer): number {
-    const [bits, depth, bigEndian, trueColour] = format
-    if (![8, 16, 32].includes(bits) || depth === 0 || depth > bits || bigEndian > 1 || trueColour > 1) throw new RfbProtocolError('unsupported pixel format')
+    const [bits, depth] = format
+    if (![8, 16, 32].includes(bits) || depth === 0 || depth > bits) throw new RfbProtocolError('unsupported pixel format')
     return bits / 8
 }
 

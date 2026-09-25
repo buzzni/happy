@@ -105,6 +105,14 @@ describe('upstream (x11vnc) handshake', () => {
         expect(Buffer.concat(forwarded)).toEqual(Buffer.from([2]))
     })
 
+    it('accepts any non-zero big-endian and true-colour flag, as x11vnc sends 0xff (RFC 6143 7.4)', () => {
+        const inits: Array<{ width: number }> = []
+        const x11vncPixelFormat = Buffer.from('201800ff00ff00ff00ff100800000000', 'hex')
+        new StreamFramer(upstreamParser(session(), { password: 'x', send: () => undefined, onServerInit: (init) => inits.push(init) }), () => undefined, 1 << 20)
+            .push(Buffer.concat([Buffer.from(RFB_VERSION, 'latin1'), Buffer.from([1, 2]), Buffer.alloc(16), u32(0), u16(1280), u16(900), x11vncPixelFormat, u32(0)]))
+        expect(inits).toMatchObject([{ width: 1280 }])
+    })
+
     it('refuses an upstream without VNC authentication or that rejects the password', () => {
         const start = (bytes: Buffer) => new StreamFramer(upstreamParser(session(), { password: 'x', send: () => undefined, onServerInit: () => undefined }), () => undefined, 1 << 20).push(bytes)
         expect(() => start(Buffer.concat([Buffer.from(RFB_VERSION, 'latin1'), Buffer.from([1, 1])]))).toThrowError(RfbProtocolError)
