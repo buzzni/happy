@@ -217,6 +217,13 @@ describe('system files', () => {
         expect(env).toContain('HAPPY_BROWSER_TASK_PROFILE_ID=main')
         expect(env).not.toMatch(/SECRET|GRANT_FILE|TOKEN=/)
     })
+
+    it('gives every daemon session an enabled sandbox config bounded to /work (mandatory machine)', () => {
+        const line = daemonEnv(base()).split('\n').find((entry: string) => entry.startsWith('HAPPY_PROJECT_SANDBOX_CONFIG='))!
+        const value = line.slice('HAPPY_PROJECT_SANDBOX_CONFIG='.length)
+        expect(value.startsWith("'") && value.endsWith("'")).toBe(true)
+        expect(JSON.parse(value.slice(1, -1))).toMatchObject({ enabled: true, workspaceRoot: '/work', sessionIsolation: 'workspace', extraWritePaths: [] })
+    })
 })
 
 describe('browser networks and egress firewall', () => {

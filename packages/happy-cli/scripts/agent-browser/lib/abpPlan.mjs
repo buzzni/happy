@@ -333,6 +333,9 @@ export function tmpfilesConf() {
   ].join("\n");
 }
 
+/** Default sandbox config of H's daemon sessions (S1 whole-process sandbox; network via the egress proxy). */
+const SESSION_SANDBOX_CONFIG = { enabled: true, workspaceRoot: "/work", sessionIsolation: "workspace", extraWritePaths: [], networkMode: "allowed" };
+
 export function daemonEnv(install) {
   return [
     "# Managed by abp-install. No secret here: the daemon reads its broker token from the file below.",
@@ -340,6 +343,9 @@ export function daemonEnv(install) {
     `HAPPY_BROWSER_TASK_BROKER_SOCKET=${PATHS.brokerSocket}`,
     `HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE=${PATHS.daemonToken}`,
     `HAPPY_BROWSER_TASK_PROFILE_ID=${install.agentProfileId}`,
+    // The machine policy is mandatory: a session without an enabled sandbox config refuses to
+    // start. Every daemon session gets this one (writes bounded to its /work workspace).
+    `HAPPY_PROJECT_SANDBOX_CONFIG='${JSON.stringify(SESSION_SANDBOX_CONFIG)}'`,
     "",
   ].join("\n");
 }
