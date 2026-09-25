@@ -7,6 +7,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { BrowserRuntimeError, type BrowserInstanceId, type ElementRef, type Observation, type TabId } from '../contracts'
+import { formDigest } from '../policy'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
 
@@ -91,6 +92,18 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/later', `<body><p>Waiting</p><script>setTimeout(() => { document.body.insertAdjacentHTML('beforeend', '<p>Arrived later</p>'); history.pushState({}, '', '/later/done') }, 400)</script></body>`)
         a.route('/reveal', `${HIT_SCRIPT}<body><button id="r" style="visibility:hidden" onclick="hit('reveal')">Reveal</button><script>setTimeout(() => { document.getElementById('r').style.visibility = 'visible' }, 300)</script></body>`)
         a.route('/form', `${HIT_SCRIPT}<body><input id="name" aria-label="Name" value="old"><button onclick="hit('v-' + encodeURIComponent(document.getElementById('name').value))">Send</button></body>`)
+        a.route('/digest-form', `${HIT_SCRIPT}<body><form id="f" action="/order" method="post" onsubmit="event.preventDefault(); hit('digest-submit')">
+            <input name="item" value="a"><input name="item" value="b">
+            <input type="checkbox" name="gift" value="yes" checked><input type="checkbox" name="wrap" value="yes">
+            <select name="size" multiple><option value="s" selected>S</option><option value="m">M</option><option value="l" selected>L</option></select>
+            <textarea name="note">hi</textarea><input type="hidden" name="token" value="t1">
+            <input name="off" value="ignored" disabled><input type="password" name="pin" value="1234">
+            <input name="action" value="clobber">
+            <button name="op" value="pay">Pay</button>
+            <button name="op" value="alt" formaction="/other" formmethod="get" formenctype="text/plain" type="submit">Alt</button>
+            <button type="button" onclick="hit('plain')">Helper</button>
+            <a href="/help?x=1">Help link</a>
+        </form><button onclick="hit('outside')">Outside</button></body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -366,6 +379,46 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 await restarted.close()
                 await driver.closeTab(tab.tabId, OPTS)
             }
+        })
+
+        it('describes the full ordered form submission with submitter overrides and a digest that tracks every change', async () => {
+            const tab = await open('/digest-form', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const pay = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
+            expect(pay.submitsForm).toBe(true)
+            expect(pay.form).toMatchObject({
+                action: a.url('/order'), method: 'post', enctype: 'application/x-www-form-urlencoded', target: '', opaque: false,
+                fields: [['item', 'a'], ['item', 'b'], ['gift', 'yes'], ['size', 's'], ['size', 'l'], ['note', 'hi'], ['token', 't1'],
+                    ['pin', { password: 4 }], ['action', 'clobber'], ['op', 'pay']],
+                submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
+            })
+            expect(pay.form!.digest).toBe(formDigest(pay.form!))
+            expect(JSON.stringify(pay)).not.toContain('1234')
+            const alt = await driver.describeRef(tab.tabId, refOf(obs, 'Alt'), obs.snapshotId, OPTS)
+            expect(alt.form).toMatchObject({ action: a.url('/other'), method: 'get', enctype: 'text/plain',
+                submitter: { name: 'op', value: 'alt', formaction: '/other', formmethod: 'get', formenctype: 'text/plain' } })
+            expect(alt.form!.fields.at(-1)).toEqual(['op', 'alt'])
+            expect(alt.form!.digest).not.toBe(pay.form!.digest)
+            const helper = await driver.describeRef(tab.tabId, refOf(obs, 'Helper'), obs.snapshotId, OPTS)
+            expect(helper).toMatchObject({ submitsForm: false, form: { submitter: null } })
+            expect(helper.form!.fields.map(([name]) => name)).not.toContain('op')
+            const link = await driver.describeRef(tab.tabId, refOf(obs, 'Help link'), obs.snapshotId, OPTS)
+            expect(link).toMatchObject({ linkUrl: a.url('/help?x=1'), currentRole: 'link', currentName: 'Help link' })
+            const outside = await driver.describeRef(tab.tabId, refOf(obs, 'Outside'), obs.snapshotId, OPTS)
+            expect(outside.form).toBeUndefined()
+            // Any change to what would be sent changes the digest: a hidden value, the order, the password.
+            for (const mutate of [
+                "document.querySelector('[name=token]').value = 't2'",
+                "document.getElementById('f').prepend(document.querySelector('[name=note]'))",
+                "document.querySelector('[name=pin]').value = '12345'",
+                "document.getElementById('f').setAttribute('action', '/elsewhere')",
+            ]) {
+                const before = (await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)).form!.digest
+                await harness.evaluate(tab.targetId, mutate)
+                const after = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
+                expect(after.form!.digest, mutate).not.toBe(before)
+            }
+            expect(a.hits('digest-submit')).toBe(0)
         })
 
         it('fails with STALE_REF when the node behind the ref was replaced', async () => {

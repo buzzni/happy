@@ -249,17 +249,90 @@ export const FRAME_HAS_TEXT = String.raw`function frameHasText(needle) {
     return !!body && ((body).innerText || '').includes(needle)
 }`
 
-/** Runs on a resolved element; reads its form context without touching page state. */
+/**
+ * Runs on a resolved element; reads its current role/name, link and form context
+ * without touching page state. The form entry list is built by hand (HTML
+ * "constructing the entry list") instead of `new FormData(form)`, which would
+ * fire the page's `formdata` handlers. Form attributes are read through the
+ * prototype getters: a control named "action" or "elements" shadows them.
+ */
 export const DESCRIBE_ELEMENT = String.raw`function describeElement() {
+${ELEMENT_NAMING}
     const element = this
+    const tag = element.tagName.toLowerCase()
+    const type = (element.getAttribute('type') || '').toLowerCase()
+    const result = { pageUrl: String(location.href), role: roleOf(element), name: nameOf(element), tag, formValues: {} }
+    const link = element.closest && element.closest('a[href]')
+    if (link) result.linkUrl = String(link.href)
     const form = element.form || (element.closest && element.closest('form'))
-    const formValues = {}
-    if (form) {
-        for (const field of Array.from(form.elements)) {
-            if (!field.name || field.type === 'password' || field.type === 'file') continue
-            if ((field.type === 'checkbox' || field.type === 'radio') && !field.checked) continue
-            formValues[field.name] = String(field.value ?? '').slice(0, 200)
-        }
+    if (!form) return result
+    const formProp = (name) => Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, name).get.call(form)
+    const controls = Array.from(formProp('elements'))
+    for (const field of controls) {
+        if (!field.name || field.type === 'password' || field.type === 'file') continue
+        if ((field.type === 'checkbox' || field.type === 'radio') && !field.checked) continue
+        result.formValues[field.name] = String(field.value ?? '').slice(0, 200)
     }
-    return { pageUrl: String(location.href), formAction: form ? String(form.action || location.href) : undefined, formValues }
+    const formAction = String(formProp('action') || location.href)
+    result.formAction = formAction
+    const submits = (tag === 'button' && (type === '' || type === 'submit')) || (tag === 'input' && (type === 'submit' || type === 'image'))
+    const submitter = submits ? element : null
+    const override = (attribute, property, fallback) => submitter && submitter.hasAttribute(attribute) ? String(submitter[property]) : fallback
+    const attr = (attribute) => submitter.hasAttribute(attribute) ? submitter.getAttribute(attribute) : null
+    const fields = []
+    let opaque = false
+    for (const field of controls) {
+        const fieldTag = field.tagName.toLowerCase()
+        const fieldType = String(field.type || '').toLowerCase()
+        if (fieldTag.includes('-')) { opaque = true; continue }
+        if (fieldTag === 'object' || fieldTag === 'fieldset' || fieldTag === 'output') continue
+        if (field.matches(':disabled')) continue
+        const isButton = fieldTag === 'button' || (fieldTag === 'input' && ['submit', 'image', 'reset', 'button'].includes(fieldType))
+        if (isButton && field !== submitter) continue
+        const name = field.getAttribute('name') || ''
+        if (fieldTag === 'input' && fieldType === 'image') {
+            // The coordinates are where the driver presses: the element's centre.
+            const prefix = name ? name + '.' : ''
+            fields.push([prefix + 'x', 'centre'], [prefix + 'y', 'centre'])
+            continue
+        }
+        if (!name) continue
+        if (fieldTag === 'select') {
+            for (const option of Array.from(field.options)) if (option.selected && !option.disabled) fields.push([name, String(option.value)])
+            continue
+        }
+        if (fieldTag === 'input' && (fieldType === 'checkbox' || fieldType === 'radio')) {
+            if (field.checked) fields.push([name, field.hasAttribute('value') ? String(field.value) : 'on'])
+            continue
+        }
+        if (fieldTag === 'input' && fieldType === 'file') {
+            const files = Array.from(field.files || [])
+            if (!files.length) fields.push([name, { file: '', size: 0, type: 'application/octet-stream' }])
+            for (const file of files) fields.push([name, { file: String(file.name), size: file.size, type: String(file.type) }])
+            continue
+        }
+        if (fieldTag === 'input' && fieldType === 'password') {
+            fields.push([name, { password: String(field.value).length }])
+            continue
+        }
+        if (fieldTag === 'input' && fieldType === 'hidden' && name.toLowerCase() === '_charset_' && !field.hasAttribute('value')) {
+            fields.push([name, 'UTF-8'])
+            continue
+        }
+        fields.push([name, String(field.value ?? '')])
+        const dirname = field.getAttribute('dirname')
+        if (dirname && (fieldTag === 'textarea' || fieldType === 'text' || fieldType === 'search')) fields.push([dirname, field.matches(':dir(rtl)') ? 'rtl' : 'ltr'])
+    }
+    result.submitsForm = submits
+    result.form = {
+        action: override('formaction', 'formAction', formAction),
+        method: override('formmethod', 'formMethod', String(formProp('method') || 'get')).toLowerCase(),
+        enctype: override('formenctype', 'formEnctype', String(formProp('enctype') || 'application/x-www-form-urlencoded')).toLowerCase(),
+        target: override('formtarget', 'formTarget', String(formProp('target') || '')),
+        fields,
+        submitter: submitter ? { name: submitter.getAttribute('name') || '', value: String(submitter.value ?? ''),
+            formaction: attr('formaction'), formmethod: attr('formmethod'), formenctype: attr('formenctype') } : null,
+        opaque,
+    }
+    return result
 }`

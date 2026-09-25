@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type ObservedElement } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type FormFieldValue, type FormSubmission, type ObservedElement } from './contracts'
 
 export function canonicalJson(value: unknown): string {
     if (value === null || typeof value !== 'object') return JSON.stringify(value)
@@ -8,6 +8,32 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function payloadHash(value: unknown): string { return createHash('sha256').update(canonicalJson(value)).digest('hex') }
+
+/**
+ * SHA-256 over the canonical form submission: destination, method, enctype, target,
+ * every field in submission order and the submitter with its overrides. Approvals
+ * bind this, so any change to what would be sent invalidates them.
+ */
+export function formDigest(form: FormSubmission): string {
+    const { action, method, enctype, target, fields, submitter, opaque } = form
+    return payloadHash({ action, method, enctype, target, fields, submitter, opaque })
+}
+
+const SUMMARY_VALUE_CHARS = 40
+const SUMMARY_FIELDS = 12
+
+function summaryValue(value: FormFieldValue): string {
+    if (typeof value !== 'string') return 'password' in value ? '••••' : `[file ${redact(value.file).slice(0, SUMMARY_VALUE_CHARS)}]`
+    const shown = redact(value)
+    return shown.length > SUMMARY_VALUE_CHARS ? `${shown.slice(0, SUMMARY_VALUE_CHARS)}…` : shown
+}
+
+/** Human-readable approval summary. Display only: it is truncated, the digest is not. */
+export function formSummary(form: FormSubmission): string {
+    const shown = form.fields.slice(0, SUMMARY_FIELDS).map(([name, value]) => `${redact(name).slice(0, SUMMARY_VALUE_CHARS)}=${summaryValue(value)}`)
+    if (form.fields.length > SUMMARY_FIELDS) shown.push(`+${form.fields.length - SUMMARY_FIELDS} more`)
+    return `${form.method.toUpperCase()} ${redact(form.action)}: ${shown.join(', ')}`
+}
 
 export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowedOrigins'>): string {
     let origin: string

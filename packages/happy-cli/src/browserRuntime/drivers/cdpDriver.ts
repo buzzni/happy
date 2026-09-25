@@ -23,6 +23,7 @@ import {
     type DriverTabHandle,
     type ElementDescription,
     type ElementRef,
+    type FormSubmission,
     type Observation,
     type ObservedElement,
     type ObservedFrame,
@@ -31,6 +32,7 @@ import {
     type TabId,
     type WaitPredicate,
 } from '../contracts'
+import { formDigest } from '../policy'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
 import { CHECK_ELEMENT, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, SELECT_CONTENT, type CollectedFrame, type ElementState } from './pageScripts'
 
@@ -84,6 +86,19 @@ async function withDeadline<T>(ms: number, message: string, body: () => Promise<
     } finally {
         clearTimeout(timer)
     }
+}
+
+/** What DESCRIBE_ELEMENT returns (page-provided; typed here, not trusted beyond this driver). */
+interface DescribedElement {
+    pageUrl: string
+    role: string
+    name: string
+    tag: string
+    linkUrl?: string
+    formAction?: string
+    formValues: Record<string, string>
+    form?: FormSubmission
+    submitsForm?: boolean
 }
 
 interface RefBinding {
@@ -583,7 +598,7 @@ export class CdpDriver implements BrowserDriver {
             const { binding, objectId } = await this.resolveRef(conn, tab, ref, snapshotId)
             const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: DESCRIBE_ELEMENT, objectId, returnByValue: true }, binding.sessionId)
             this.assertFresh(tab, binding, snapshotId)
-            const context = result.value as { pageUrl: string; formAction?: string; formValues: Record<string, string> }
+            const context = result.value as DescribedElement
             return {
                 ref,
                 role: binding.role,
@@ -594,6 +609,11 @@ export class CdpDriver implements BrowserDriver {
                 formValues: context.formValues,
                 documentGeneration: documentIdentity(binding.frameId, binding.loaderId),
                 identity: encodeIdentity(binding),
+                currentRole: context.role,
+                currentName: context.name,
+                tag: context.tag,
+                ...(context.linkUrl ? { linkUrl: context.linkUrl } : {}),
+                ...(context.form ? { form: { ...context.form, digest: formDigest(context.form) }, submitsForm: context.submitsForm === true } : {}),
             }
         })
     }

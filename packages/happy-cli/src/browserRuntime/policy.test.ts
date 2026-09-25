@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { BrowserRuntimeError, type BatchStep, type ElementRef } from './contracts'
-import { assertAllowedOrigin, approvalBinding, classifyAction, classifyUserWait, redact } from './policy'
+import { BrowserRuntimeError, type BatchStep, type ElementRef, type FormSubmission } from './contracts'
+import { assertAllowedOrigin, approvalBinding, classifyAction, classifyUserWait, formDigest, formSummary, redact } from './policy'
 
 const step: BatchStep = { stepId: 's' as never, actionId: 'a' as never, tabId: 't' as never, kind: 'click', ref: '@e1' as ElementRef, timeoutMs: 1000 }
 
@@ -50,5 +50,49 @@ describe('fixture action policy', () => {
         const base = { principalId: 'p', workspaceId: 'w', taskId: 't', actionId: 'a', origin: 'https://fixture.test', payloadHash: 'hash', leaseEpoch: 1, browserInstanceId: 'b', documentGeneration: 1, expiresAtMs: 10 }
         expect(approvalBinding(base)).not.toBe(approvalBinding({ ...base, leaseEpoch: 2 }))
         expect(approvalBinding(base)).not.toBe(approvalBinding({ ...base, documentGeneration: 2 }))
+    })
+})
+
+describe('form digest', () => {
+    const base: FormSubmission = {
+        action: 'https://fixture.test/order', method: 'post', enctype: 'application/x-www-form-urlencoded', target: '',
+        fields: [['item', 'a'], ['item', 'b'], ['amount', '10'], ['pin', { password: 4 }]],
+        submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
+        opaque: false,
+    }
+
+    it('is a stable SHA-256 over every submitted part', () => {
+        expect(formDigest(base)).toMatch(/^[0-9a-f]{64}$/)
+        expect(formDigest(structuredClone(base))).toBe(formDigest(base))
+    })
+
+    it('changes with field order, duplicates, values, destination, method, enctype and submitter overrides', () => {
+        const variants: FormSubmission[] = [
+            { ...base, fields: [['item', 'b'], ['item', 'a'], ['amount', '10'], ['pin', { password: 4 }]] },
+            { ...base, fields: [['item', 'a'], ['amount', '10'], ['pin', { password: 4 }]] },
+            { ...base, fields: [['item', 'a'], ['item', 'b'], ['amount', '11'], ['pin', { password: 4 }]] },
+            { ...base, fields: [['item', 'a'], ['item', 'b'], ['amount', '10'], ['pin', { password: 5 }]] },
+            { ...base, action: 'https://fixture.test/other' },
+            { ...base, method: 'get' },
+            { ...base, enctype: 'text/plain' },
+            { ...base, target: '_blank' },
+            { ...base, submitter: { ...base.submitter!, value: 'refund' } },
+            { ...base, submitter: { ...base.submitter!, formaction: '/other' } },
+            { ...base, submitter: null },
+            { ...base, opaque: true },
+        ]
+        const digests = new Set([formDigest(base), ...variants.map(formDigest)])
+        expect(digests.size).toBe(variants.length + 1)
+    })
+
+    it('truncates only the display summary, never the bound values', () => {
+        const long = 'x'.repeat(60)
+        const a = { ...base, fields: [['note', `${long}A`]] as FormSubmission['fields'] }
+        const b = { ...base, fields: [['note', `${long}B`]] as FormSubmission['fields'] }
+        expect(formSummary(a)).toBe(formSummary(b))
+        expect(formDigest(a)).not.toBe(formDigest(b))
+        expect(formSummary(base)).toBe('POST https://fixture.test/order: item=a, item=b, amount=10, pin=••••')
+        const many = { ...base, fields: Array.from({ length: 20 }, (_, i) => [`f${i}`, String(i)]) as FormSubmission['fields'] }
+        expect(formSummary(many)).toMatch(/f11=11, \+8 more$/)
     })
 })
