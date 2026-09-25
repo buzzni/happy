@@ -314,7 +314,10 @@ export interface FormSubmission {
     fields: Array<[string, FormFieldValue]>
     /** The activated submit button, or null when the element does not submit the form itself */
     submitter: { name: string; value: string; formaction: string | null; formmethod: string | null; formenctype: string | null } | null
-    /** A control whose submitted value cannot be read (form-associated custom element): the digest cannot cover it */
+    /**
+     * The digest cannot cover everything that would be sent: a form-associated custom
+     * element (unreadable value), a non-empty password or a chosen file (content not bound).
+     */
     opaque: boolean
 }
 
@@ -343,6 +346,8 @@ export interface ElementDescription {
     tag?: string
     /** Absolute href when the element is (inside) a link */
     linkUrl?: string
+    /** The link's effective browsing-context target (its own, else <base target>, else '') */
+    linkTarget?: string
     /** The enclosing form's submission and its SHA-256 digest (policy.formDigest) */
     form?: FormSubmission & { digest: string }
     /** True when activating the element submits `form` (submit button / image input) */

@@ -334,8 +334,14 @@ ${ELEMENT_NAMING}
     const tag = element.tagName.toLowerCase()
     const type = (element.getAttribute('type') || '').toLowerCase()
     const result = { pageUrl: String(location.href), role: roleOf(element), name: nameOf(element), tag, formValues: {} }
+    // A browsing-context name set on the link or form wins; else the document's <base target>.
+    const base = document.querySelector('base[target]')
+    const baseTarget = base ? String(base.getAttribute('target') || '') : ''
     const link = element.closest && element.closest('a[href]')
-    if (link) result.linkUrl = String(link.href)
+    if (link) {
+        result.linkUrl = String(link.href)
+        result.linkTarget = link.hasAttribute('target') ? String(link.getAttribute('target') || '') : baseTarget
+    }
     const form = element.form || (element.closest && element.closest('form'))
     if (!form) return result
     const formProp = (name) => Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, name).get.call(form)
@@ -346,6 +352,7 @@ ${ELEMENT_NAMING}
         result.formValues[field.name] = String(field.value ?? '').slice(0, 200)
     }
     const formAction = String(formProp('action') || location.href)
+    const formHasTarget = form.hasAttribute('target')
     result.formAction = formAction
     const submits = (tag === 'button' && (type === '' || type === 'submit')) || (tag === 'input' && (type === 'submit' || type === 'image'))
     const submitter = submits ? element : null
@@ -379,11 +386,14 @@ ${ELEMENT_NAMING}
         }
         if (fieldTag === 'input' && fieldType === 'file') {
             const files = Array.from(field.files || [])
+            if (files.length) opaque = true
             if (!files.length) fields.push([name, { file: '', size: 0, type: 'application/octet-stream' }])
             for (const file of files) fields.push([name, { file: String(file.name), size: file.size, type: String(file.type) }])
             continue
         }
         if (fieldTag === 'input' && fieldType === 'password') {
+            // Never read out; a non-empty one cannot be bound, so the form is opaque.
+            if (String(field.value) !== '') opaque = true
             fields.push([name, { password: String(field.value).length }])
             continue
         }
@@ -400,7 +410,7 @@ ${ELEMENT_NAMING}
         action: override('formaction', 'formAction', formAction),
         method: override('formmethod', 'formMethod', String(formProp('method') || 'get')).toLowerCase(),
         enctype: override('formenctype', 'formEnctype', String(formProp('enctype') || 'application/x-www-form-urlencoded')).toLowerCase(),
-        target: override('formtarget', 'formTarget', String(formProp('target') || '')),
+        target: override('formtarget', 'formTarget', formHasTarget ? String(formProp('target') || '') : baseTarget),
         fields,
         submitter: submitter ? { name: submitter.getAttribute('name') || '', value: String(submitter.value ?? ''),
             formaction: attr('formaction'), formmethod: attr('formmethod'), formenctype: attr('formenctype') } : null,

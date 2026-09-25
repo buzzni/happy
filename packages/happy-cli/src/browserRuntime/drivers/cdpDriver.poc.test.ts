@@ -141,6 +141,12 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             <button onclick="window.open('${a.url('/hit/over-cap')}')">Open over cap</button>
             <iframe src="${c.url('/hit/frame')}"></iframe></body>`)
         a.route('/meta-refresh', () => `<head><meta http-equiv="refresh" content="1;url=${c.url('/hit/meta')}"></head><body>Refreshing</body>`)
+        a.route('/base-target', `${HIT_SCRIPT}<head><base target="_blank"></head><body>
+            <form action="/order" method="post"><input name="q" value="1"><button>Order</button></form>
+            <a href="/help">Help</a><a href="/self" target="_self">Stay</a>
+            <form action="/login"><input type="password" name="pw" value="synthetic-pw"><button>Sign in</button></form>
+            <form action="/login2"><input type="password" name="pw"><button>Sign in empty</button></form>
+            <form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="f"><button>Upload</button></form></body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -499,7 +505,8 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const pay = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
             expect(pay.submitsForm).toBe(true)
             expect(pay.form).toMatchObject({
-                action: a.url('/order'), method: 'post', enctype: 'application/x-www-form-urlencoded', target: '', opaque: false,
+                // A filled password cannot be bound: the form is opaque (the runtime hands it to the user).
+                action: a.url('/order'), method: 'post', enctype: 'application/x-www-form-urlencoded', target: '', opaque: true,
                 fields: [['item', 'a'], ['item', 'b'], ['gift', 'yes'], ['size', 's'], ['size', 'l'], ['note', 'hi'], ['token', 't1'],
                     ['pin', { password: 4 }], ['action', 'clobber'], ['op', 'pay']],
                 submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
@@ -531,6 +538,21 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 expect(after.form!.digest, mutate).not.toBe(before)
             }
             expect(a.hits('digest-submit')).toBe(0)
+        })
+
+        it('reports effective targets including <base target>, and marks forms whose submitted content cannot be bound', async () => {
+            const tab = await open('/base-target', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const describe = (name: string) => driver.describeRef(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS)
+            expect((await describe('Order')).form).toMatchObject({ target: '_blank', opaque: false })
+            expect(await describe('Help')).toMatchObject({ linkUrl: a.url('/help'), linkTarget: '_blank' })
+            expect(await describe('Stay')).toMatchObject({ linkTarget: '_self' })
+            expect((await describe('Sign in')).form?.opaque).toBe(true)
+            expect((await describe('Sign in empty')).form?.opaque).toBe(false)
+            expect((await describe('Upload')).form?.opaque).toBe(false)
+            // A chosen file's content cannot be bound either.
+            await harness.evaluate(tab.targetId, `(() => { const input = document.querySelector('[name=f]'); const data = new DataTransfer(); data.items.add(new File(['synthetic'], 'a.txt')); input.files = data.files; return 1 })()`)
+            expect((await describe('Upload')).form?.opaque).toBe(true)
         })
 
         it('fails with STALE_REF when the node behind the ref was replaced', async () => {

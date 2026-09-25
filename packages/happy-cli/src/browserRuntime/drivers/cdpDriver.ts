@@ -117,6 +117,7 @@ interface DescribedElement {
     name: string
     tag: string
     linkUrl?: string
+    linkTarget?: string
     formAction?: string
     formValues: Record<string, string>
     form?: FormSubmission
@@ -825,7 +826,7 @@ export class CdpDriver implements BrowserDriver {
                 currentRole: context.role,
                 currentName: context.name,
                 tag: context.tag,
-                ...(context.linkUrl ? { linkUrl: context.linkUrl } : {}),
+                ...(context.linkUrl ? { linkUrl: context.linkUrl, linkTarget: context.linkTarget ?? '' } : {}),
                 ...(context.form ? { form: { ...context.form, digest: formDigest(context.form) }, submitsForm: context.submitsForm === true } : {}),
             }
         })
