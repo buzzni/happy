@@ -1,4 +1,5 @@
 import { DIFFICULTY_CLASSIFIER_REVISION } from './difficultyRoutingArtifacts';
+import { healInstallArtifacts } from './installArtifactsHeal';
 import fs from 'fs/promises';
 import os from 'os';
 import * as tmp from 'tmp';
@@ -706,6 +707,11 @@ export async function startDaemon(): Promise<void> {
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   try {
+    // npm 12 blocks install scripts it was not told to allow, so a plain
+    // `npm i -g` can leave the postinstall artifacts behind. Restore them before
+    // any RPC (ripgrep, terminal) can need them. Never throws.
+    await healInstallArtifacts();
+
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
     if (caffeinateStarted) {

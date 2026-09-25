@@ -9,7 +9,7 @@ import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
-import { MessageQueue2, type PendingAttachment } from '@/utils/MessageQueue2';
+import { MessageQueue2, type PendingAttachment, type QueueLatencyTrace } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { specialCommandResponse } from '@/claude/specialCommandResponse';
 import { getEnvironmentInfo } from '@/ui/doctor';
@@ -1469,6 +1469,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         const queuedText = deferredTurn?.text ?? pushText;
         try {
             if (deferredTurn) recordAppPrompt(queuedText);
+            const latencyTrace: QueueLatencyTrace | undefined = message.meta?.latencyTrace
+                ? { id: message.meta.latencyTrace.id, receivedAt: performance.now() }
+                : undefined;
             messageQueue.push(
                 queuedText,
                 enhancedModeForThisMessage,
@@ -1478,6 +1481,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 routed
                     ? [routed.pending.clientRequestId]
                     : localDecision ? [localDecision.clientRequestId] : undefined,
+                latencyTrace,
             );
             deferredTurn?.commit();
             if (routed) {
