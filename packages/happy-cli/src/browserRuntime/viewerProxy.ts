@@ -21,7 +21,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { assertOperation } from './auth'
 import { BrowserRuntimeError, VIEWER_LIMITS, type AuthContext, type InputOwner, type InteractiveCapability, type ProfileId, type TabId,
     type ViewerTicket, type ViewerTicketRequest } from './contracts'
-import { ALLOWED_ENCODINGS, StreamFramer, clientParser, keyEvent, pointerEvent, serverInitMessage, setEncodingsMessage, upstreamParser,
+import { ALLOWED_ENCODINGS, RfbProtocolError, StreamFramer, clientParser, keyEvent, pointerEvent, serverInitMessage, setEncodingsMessage, upstreamParser,
     type ClientMessage, type RfbSession, type ServerInit } from './rfb'
 
 export const VIEWER_WEBSOCKET_PATH = '/v1/viewer/websockify'
@@ -263,7 +263,9 @@ class ViewerConnection {
         if (this.closed) return
         try {
             action()
-        } catch {
+        } catch (error) {
+            // Protocol error messages are ours and carry no payload bytes; anything else is reduced to its name.
+            this.log(`[viewer] profile=${this.profileId} ${reason}: ${error instanceof RfbProtocolError ? error.message : error instanceof Error ? error.name : 'unknown'}`)
             this.close(code, reason)
         }
     }
