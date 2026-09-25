@@ -18,22 +18,38 @@ function validate(meta, args) {
     if (!meta || meta.version !== 1 || !Number.isSafeInteger(meta.argc) || meta.argc < 1 || meta.argc > 65536 || args.length !== meta.argc || !args[0].startsWith('/') || !path.isAbsolute(meta.cwd) || !meta.env || typeof meta.env !== 'object') throw Error();
     if (!Array.isArray(meta.denyRead) || !Array.isArray(meta.denyWrite) || [...meta.denyRead, ...meta.denyWrite].some(p => typeof p !== 'string' || !path.isAbsolute(p) || p.includes('\0'))) throw Error();
 }
+function contains(parent, child) {
+    return parent === child || child.startsWith(parent === '/' ? '/' : parent + '/');
+}
+function normalizeRestrictions(read, write) {
+    const roots = paths => {
+        const normalized = [...new Set(paths.map(p => path.resolve(p)))];
+        return normalized.filter(p => !normalized.some(parent => parent !== p && contains(parent, p)));
+    };
+    const masks = roots(read);
+    return { read: masks, write: roots(write).filter(p => !masks.some(parent => contains(parent, p))) };
+}
 function bwrapArgs(meta, args) {
     validate(meta, args);
     const cwd = realpathSync(meta.cwd);
     if (!cwd.startsWith('/work/') && cwd !== '/work') throw Error();
+    const restrictions = normalizeRestrictions(['/home/agent', '/etc/abp', '/var/lib/abp', '/var/lib/nscd', '/var/cache/nscd', '/var/lib/sss', ...meta.denyRead], meta.denyWrite);
     const result = [...(meta.networkBlocked ? ['--unshare-net'] : []), '--unshare-user', '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/var/tmp', '--bind', '/home/agent-sbx', '/home/agent-sbx', '--bind', cwd, cwd];
-    // UID permissions are authoritative; masks also cover world-readable stack metadata.
-    for (const p of [...new Set(['/home/agent', '/etc/abp', '/var/lib/abp', '/run/abp', '/run/docker.sock', ...meta.denyRead])]) {
-        try {
-            const stat = lstatSync(p);
-            result.push(...(stat.isDirectory() ? ['--tmpfs', p] : ['--ro-bind', '/dev/null', p]));
-        } catch (error) { if (!['ENOENT', 'EACCES'].includes(error.code)) throw error; }
-    }
-    for (const p of meta.denyWrite) {
+    // Never bind a host source covered by a read mask, including inaccessible Happy descendants.
+    for (const p of restrictions.write) {
+        if (contains('/run', p)) continue;
         try { lstatSync(p); result.push('--ro-bind', p, p); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
-    return [...result, '--chdir', cwd, '--', ...args];
+    // Host services must not resolve names or send traffic on behalf of the sandbox UID.
+    result.push('--tmpfs', '/run', '--ro-bind', '/run/abp-mcp', '/run/abp-mcp');
+    // Read masks are last: an ancestor write bind must never restore their host contents.
+    for (const p of restrictions.read) {
+        try {
+            const stat = lstatSync(p);
+            result.push(...(stat.isDirectory() ? ['--tmpfs', p, '--remount-ro', p] : ['--ro-bind', '/dev/null', p]));
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    return [...result, '--remount-ro', '/run', '--chdir', cwd, '--', ...args];
 }
 function main() {
     if (process.argv.length !== 3 || process.argv[2] !== '0' || execFileSync('/usr/bin/id', ['-un'], { encoding: 'utf8' }).trim() !== 'agent-sbx') throw Error();
@@ -73,5 +89,5 @@ function main() {
     process.stdin.on('data', consume);
     process.stdin.on('end', () => { if (!child) stop(); });
 }
-module.exports = { filterEnv, validate, bwrapArgs };
+module.exports = { filterEnv, validate, normalizeRestrictions, bwrapArgs };
 if (require.main === module) { try { main(); } catch { process.exit(125); } }

@@ -1,5 +1,5 @@
 FROM node:22-bookworm@sha256:363e1587494626837fa7f9a23bdb453d13b0ff3c67c705c2805cfc69c2d2fad7
-RUN apt-get update -qq && apt-get install -y -qq bubblewrap sudo iptables iproute2 gcc libc6-dev python3 curl \
+RUN apt-get update -qq && apt-get install -y -qq bubblewrap sudo iptables iproute2 gcc libc6-dev python3 curl dbus systemd-resolved libnss-resolve nscd \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --prefix /test --no-audit --no-fund tsx@4.20.6
 RUN groupadd abp-session && groupadd abp-work \

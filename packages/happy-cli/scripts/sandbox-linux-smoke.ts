@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
 import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { firewallRules } from '../src/sandbox/sandboxPreflight';
+import { buildSandboxRuntimeConfig } from '../src/sandbox/config';
+import { checkProxyReachable, firewallRules } from '../src/sandbox/sandboxPreflight';
 import { prepareClaudeProcessSandbox } from '../src/sandbox/claudeProcessSandbox';
 import { startHappyServer } from '../src/claude/utils/startHappyServer';
 import type { ApiSessionClient } from '../src/api/apiSession';
@@ -27,14 +28,22 @@ if (process.getuid!() === 0) {
     const broker = createServer((_req, res) => res.end('must-not-read'));
     await new Promise<void>(resolve => broker.listen('/run/abp/broker.sock', resolve));
     chmodSync('/run/abp/broker.sock', 0o660); chownSync('/run/abp/broker.sock', 0, Number(execFileSync('getent', ['group', 'abp-session'], { encoding: 'utf8' }).split(':')[2]));
-    const protectedSockets = ['/run/abp/admin.sock', '/run/docker.sock'].map(() => createServer((_req, res) => res.end('must-not-read')));
-    await Promise.all(protectedSockets.map((server, index) => new Promise<void>(resolve => { const path = ['/run/abp/admin.sock', '/run/docker.sock'][index]; server.listen(path, () => { chmodSync(path, 0o600); resolve(); }); })));
+    const protectedPaths = ['/run/abp/admin.sock', '/run/docker.sock', '/run/systemd/private'];
+    const protectedSockets = protectedPaths.map(() => createServer((_req, res) => res.end('must-not-read')));
+    await Promise.all(protectedSockets.map((server, index) => new Promise<void>(resolve => { const path = protectedPaths[index]; server.listen(path, () => { chmodSync(path, path === '/run/systemd/private' ? 0o666 : 0o600); resolve(); }); })));
     // A synthetic public-address TLS endpoint exercises CONNECT + the refresh URL without internet credentials.
     execFileSync('/usr/sbin/ip', ['addr', 'add', '8.8.8.8/32', 'dev', 'lo']);
     execFileSync('/usr/bin/openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', '/tmp/refresh.key', '-out', '/tmp/refresh.crt', '-subj', '/CN=platform.claude.com', '-days', '1'], { stdio: 'ignore' });
     writeFileSync('/tmp/refresh-server.py', `import http.server, ssl, json\nclass H(http.server.BaseHTTPRequestHandler):\n def do_POST(self):\n  assert self.path == '/v1/oauth/token'\n  assert b'synthetic-refresh-old' in self.rfile.read(int(self.headers['Content-Length']))\n  self.send_response(200); self.end_headers(); self.wfile.write(json.dumps({'access_token':'synthetic-access-new','refresh_token':'synthetic-refresh-new'}).encode())\n def log_message(self,*args): pass\ns=http.server.HTTPServer(('8.8.8.8',443),H); c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain('/tmp/refresh.crt','/tmp/refresh.key'); s.socket=c.wrap_socket(s.socket,server_side=True); s.serve_forever()\n`);
     const refresh = spawn('/usr/bin/python3', ['/tmp/refresh-server.py'], { stdio: 'inherit' });
     const proxy = spawn('/usr/sbin/runuser', ['-u', 'abp-proxy', '--', '/usr/local/bin/node', '--import', '/test/node_modules/tsx/dist/loader.mjs', 'src/sandbox/egressProxyMain.ts'], { stdio: 'inherit' });
+    for (let i = 0; ; i++) {
+        try { await checkProxyReachable(); break; }
+        catch (error) { if (i === 99) throw error; await new Promise(resolve => setTimeout(resolve, 50)); }
+    }
+    const regressions = spawn('/usr/sbin/runuser', ['-u', 'agent', '--', '/usr/local/bin/node', '--import', '/test/node_modules/tsx/dist/loader.mjs', 'scripts/sandbox-linux-regressions.ts'], { env: { ...process.env, HOME: '/home/agent', HAPPY_HOME_DIR: '/home/agent/.happy-synthetic' }, stdio: 'inherit' });
+    const regressionCode = await new Promise<number | null>(resolve => regressions.on('exit', resolve));
+    if (regressionCode !== 0) process.exit(1);
     const child = spawn('/usr/sbin/runuser', ['-u', 'agent', '--', '/usr/local/bin/node', '--import', '/test/node_modules/tsx/dist/loader.mjs', 'scripts/sandbox-linux-smoke.ts'], { env: { ...process.env, HOME: '/home/agent', HAPPY_HOME_DIR: '/home/agent/.happy-synthetic' }, stdio: 'inherit' });
     const code = await new Promise<number | null>(resolve => child.on('exit', resolve));
     proxy.kill('SIGTERM'); refresh.kill('SIGTERM'); broker.close(); protectedSockets.forEach(server => server.close());
@@ -75,7 +84,9 @@ print('PASS: WITHOUT bwrap or seccomp, UID permissions deny raw AF_UNIX broker, 
     const happy = await startHappyServer({ sessionId: 'synthetic-session', hasTitle: () => true } as ApiSessionClient, { mandatorySandbox: true });
     // Proxy startup is asynchronous; bounded readiness before asserting production preflight.
     for (let i = 0; i < 100; i++) { try { execFileSync('curl', ['-s', '--max-time', '1', 'http://127.0.0.1:3128'], { stdio: 'ignore' }); break; } catch { await new Promise(resolve => setTimeout(resolve, 50)); } }
-    const sandbox = await prepareClaudeProcessSandbox({ sandboxConfig: config, sessionPath: '/work', mcpSocketPath: happy.socketPath });
+    const providerSandbox = buildSandboxRuntimeConfig(config, '/work', 'mandatory');
+    const sandbox = await prepareClaudeProcessSandbox({ sandboxConfig: config, sessionPath: '/work', mcpSocketPath: happy.socketPath,
+        additionalDenyRead: providerSandbox.filesystem.denyRead, additionalDenyWrite: providerSandbox.filesystem.denyWrite });
     async function run(command: string, args: string[], signal = new AbortController().signal, endInput = true): Promise<{ code: number | null; output: string }> {
         const child = sandbox.spawn({ command, args, cwd: '/work', signal, env: { ...process.env, ...happy.mcpConfig.env, HAPPY_MASTER_SECRET: 'synthetic-secret' } });
         let output = ''; child.stdout!.on('data', data => { output += data; });
