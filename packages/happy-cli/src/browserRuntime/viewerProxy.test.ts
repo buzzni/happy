@@ -358,7 +358,7 @@ describe('viewer proxy connection', () => {
             const clientStream = Buffer.concat([
                 Buffer.from(RFB_VERSION, 'latin1'), Buffer.from([1]), Buffer.from([1]),
                 Buffer.from([0, 0, 0, 0]), PIXEL_FORMAT_32,
-                setEncodingsMessage([ENCODING.hextile, ENCODING.zrle, ENCODING.copyRect, ENCODING.cursor, ENCODING.desktopSize, 7]),
+                setEncodingsMessage([ENCODING.hextile, 16 /* ZRLE, filtered */, ENCODING.copyRect, ENCODING.cursor, ENCODING.desktopSize, 7]),
                 keyEvent(true, 0x61), keyEvent(false, 0x61), pointerEvent(2, 9, 9), pointerEvent(0, 9, 9), cutText('fragmented'),
                 fbur(60 + seed),
             ])

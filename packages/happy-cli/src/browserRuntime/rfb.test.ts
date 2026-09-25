@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { ENCODING, RFB_VERSION, RfbProtocolError, StreamFramer, clientParser, keyEvent, pointerEvent, serverMessages, setEncodingsMessage,
+import { ALLOWED_ENCODINGS, ENCODING, RFB_VERSION, RfbProtocolError, StreamFramer, clientParser, keyEvent, pointerEvent, serverMessages, setEncodingsMessage,
     upstreamParser, vncAuthResponse, type ClientMessage, type RfbSession } from './rfb'
 import { PIXEL_FORMAT_32, prng, randomSplit, rect, s32, serverStream, u16, u32 } from './testing/rfbFixtures'
 
 function session(overrides: Partial<RfbSession> = {}): RfbSession {
-    return { width: 64, height: 48, bytesPerPixel: 4, encodings: new Set([ENCODING.copyRect, ENCODING.hextile, ENCODING.zrle, ENCODING.desktopSize, ENCODING.cursor]), ...overrides }
+    return { width: 64, height: 48, bytesPerPixel: 4, encodings: new Set([ENCODING.copyRect, ENCODING.hextile, ENCODING.desktopSize, ENCODING.cursor]), ...overrides }
 }
+
+const ZRLE = 16
 
 describe('StreamFramer + server message framing', () => {
     it('forwards a valid server stream byte-exact under 200 random fragmentations', () => {
@@ -29,7 +31,10 @@ describe('StreamFramer + server message framing', () => {
         expect(refuse(Buffer.concat([header, rect(60, 0, 8, 1, ENCODING.raw)]))).toEqual(header)
         expect(refuse(Buffer.concat([header, rect(0, 0, 1, 1, 7 /* tight */)]))).toEqual(header)
         expect(refuse(Buffer.concat([header, rect(0, 0, 1, 1, ENCODING.hextile)]), session({ encodings: new Set() }))).toEqual(header)
-        expect(refuse(Buffer.concat([header, rect(0, 0, 8, 8, ENCODING.zrle), u32(1 << 20)]))).toEqual(Buffer.concat([header, rect(0, 0, 8, 8, ENCODING.zrle)]))
+        // ZRLE is never offered (its compressed payload cannot be bounded without inflating it), so it is
+        // refused even if it somehow reached the requested set: a 1x1 rectangle could otherwise carry a zlib bomb.
+        expect(ALLOWED_ENCODINGS.has(ZRLE)).toBe(false)
+        expect(refuse(Buffer.concat([header, rect(0, 0, 1, 1, ZRLE), u32(531)]), session({ encodings: new Set([ZRLE]) }))).toEqual(header)
         expect(refuse(Buffer.concat([header, rect(0, 0, 32, 32, ENCODING.hextile), Buffer.from([64])]))).toHaveLength(16)
         expect(refuse(Buffer.from([3, 0, 0, 0, 0x7f, 0, 0, 0]))).toEqual(Buffer.from([3]))
         expect(refuse(Buffer.from([150]))).toHaveLength(0)

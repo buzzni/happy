@@ -41,11 +41,10 @@ export function serverStream(): Buffer {
         Buffer.from([0]), // same background
     ])
     return Buffer.concat([
-        Buffer.from([0, 0]), u16(6),
+        Buffer.from([0, 0]), u16(5),
         rect(0, 0, 4, 2, ENCODING.raw), Buffer.alloc(4 * 2 * 4, 9),
         rect(8, 8, 10, 10, ENCODING.copyRect), u16(0), u16(0),
         rect(0, 0, 32, 32, ENCODING.hextile), hextileTiles,
-        rect(0, 0, 8, 8, ENCODING.zrle), u32(5), Buffer.from('zzzzz'),
         rect(1, 1, 3, 2, ENCODING.cursor), Buffer.alloc(3 * 2 * 4 + 1 * 2, 4),
         rect(0, 0, 80, 60, ENCODING.desktopSize),
         Buffer.from([2]), // Bell

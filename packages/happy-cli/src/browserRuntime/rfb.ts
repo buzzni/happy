@@ -8,10 +8,12 @@
  * with its length fixed by an accepted header. Reads are bounded, so
  * fragmentation and coalescing of WebSocket/TCP chunks cannot change the result.
  *
- * Server→viewer framing is limited to encodings whose length follows from
- * their headers (Raw, CopyRect, Hextile, ZRLE, DesktopSize, Cursor); the proxy
- * never forwards any other encoding in the viewer's SetEncodings, so the
- * server has no reason to use one and a server that does is cut off.
+ * Server→viewer framing is limited to encodings whose length and structure
+ * follow from their headers (Raw, CopyRect, Hextile, DesktopSize, Cursor); the
+ * proxy never forwards any other encoding in the viewer's SetEncodings, so the
+ * server has no reason to use one and a server that does is cut off. ZRLE and
+ * Tight are excluded on purpose: their zlib payload could only be bounded by
+ * inflating it here (a 1x1 rectangle can expand to hundreds of KiB).
  */
 import { createCipheriv } from 'node:crypto'
 import { VIEWER_LIMITS } from './contracts'
@@ -26,7 +28,7 @@ const MAX_DESKTOP_NAME_BYTES = 4096
 const MAX_CURSOR_DIMENSION = 512
 const MAX_SERVER_CUT_TEXT_BYTES = 1024 * 1024
 
-export const ENCODING = { raw: 0, copyRect: 1, hextile: 5, zrle: 16, desktopSize: -223, cursor: -239 } as const
+export const ENCODING = { raw: 0, copyRect: 1, hextile: 5, desktopSize: -223, cursor: -239 } as const
 /** Encodings the server→viewer framer can bound; everything else is removed from SetEncodings. */
 export const ALLOWED_ENCODINGS: ReadonlySet<number> = new Set(Object.values(ENCODING))
 
@@ -280,15 +282,6 @@ function* framebufferUpdate(session: RfbSession): RfbParser {
                 inside()
                 yield* hextile(w, h, pixel)
                 break
-            case ENCODING.zrle: {
-                inside()
-                const length = (yield* read(4, true)).readUInt32BE(0)
-                // Worst case: raw CPIXELs plus one subencoding byte per 64x64 tile, plus zlib's stored-block overhead.
-                const bound = Math.ceil((w * h * pixel + Math.ceil(w / 64) * Math.ceil(h / 64)) * 1.01) + 1024
-                if (length > bound) throw new RfbProtocolError('ZRLE rectangle too long')
-                yield { skip: length }
-                break
-            }
             case ENCODING.desktopSize:
                 if (w === 0 || h === 0 || w > MAX_DIMENSION || h > MAX_DIMENSION) throw new RfbProtocolError('invalid desktop size')
                 session.width = w
