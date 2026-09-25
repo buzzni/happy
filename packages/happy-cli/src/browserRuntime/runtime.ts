@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, type ActionId, type AgentGrant, type AuthContext, type BatchId,
+import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, type ActionId, type AgentGrant, type AuthContext, type BatchId,
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
@@ -23,6 +23,11 @@ type DriverWithAction = BrowserDriver & {
     armAction?: (actionId: string) => void
 }
 /** Durable, scoped task runtime. Driver awaits never hold the task commit queue. */
+/** Finished tasks are not offered to the console; the listing is bounded (D12). */
+const FINISHED_STATUSES: ReadonlySet<TaskStatus> = new Set(TERMINAL_STATUSES)
+const LIST_TASKS_LIMIT = 50
+
+
 export class BrowserRuntime implements BrowserRuntimeApi {
     readonly leases = new InputLeaseManager()
     private readonly drivers: Map<ProfileId, BrowserDriver>
@@ -545,6 +550,19 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         taskId: TaskId
     }): Promise<TaskView> { await this.recovery; const task = this.requireTask(req.taskId); this.authorizeTask(auth, 'getTask',
         task); return this.view(task); }
+    /** Interactive only (assertOperation refuses agent grants): unfinished tasks of the credential's owner on its profile. */
+    async listTasks(auth: AuthContext, req: { profileId: ProfileId }): Promise<{ tasks: TaskView[] }> {
+        await this.recovery
+        if (auth.credential.kind !== 'interactive') throw new BrowserRuntimeError('SCOPE_DENIED', 'Task listing needs an interactive capability')
+        this.checkCredential(auth, 'listTasks', req.profileId)
+        const { principalId, workspaceId, machineId } = auth.credential
+        const tasks = this.options.store.listTasks()
+            .filter((task) => task.profileId === req.profileId && task.owner.principalId === principalId
+                && task.owner.workspaceId === workspaceId && task.owner.machineId === machineId && !FINISHED_STATUSES.has(task.status))
+            .sort((a, b) => b.createdAtMs - a.createdAtMs || (a.taskId < b.taskId ? -1 : 1))
+            .slice(0, LIST_TASKS_LIMIT)
+        return { tasks: tasks.map((task) => this.view(task)) }
+    }
     async subscribe(auth: AuthContext, req: {
         taskId: TaskId
         afterSeq: number

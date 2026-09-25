@@ -49,6 +49,7 @@ export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
     cancel: z.object({ taskId: id, requestId: id }).strict(),
     closeSpace: z.object({ taskSpaceId: id, requestId: id }).strict(),
     viewerTicket: z.object({ profileId: id }).strict(),
+    listTasks: z.object({ profileId: id }).strict(),
 }
 
 const STATUS: Partial<Record<ErrorCode, number>> = {

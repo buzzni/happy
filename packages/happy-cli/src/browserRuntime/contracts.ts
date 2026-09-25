@@ -92,7 +92,7 @@ export class BrowserRuntimeError extends Error {
 export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
-    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket'
+    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
@@ -432,6 +432,9 @@ export interface ScreenshotRequest { taskId: TaskId; tabId: TabId }
 export interface SubmitBatchRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId; steps: BatchStep[] }
 export interface FinishTaskRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
 export interface GetTaskRequest { taskId: TaskId }
+/** Interactive: the principal's unfinished tasks on one profile (console task discovery, D12). */
+export interface ListTasksRequest { profileId: ProfileId }
+export interface ListTasksResult { tasks: TaskView[] }
 export interface SubscribeRequest { taskId: TaskId; afterSeq: number }
 export interface ApproveRequest { taskId: TaskId; approvalId: ApprovalId; bindingHash: string; requestId: RequestId; decision: 'approve' | 'reject' }
 export interface TakeOverRequest { taskId: TaskId; tabId: TabId; expectedEpoch: number; requestId: RequestId }
@@ -479,6 +482,7 @@ export interface BrowserRuntimeApi {
     submitBatch(auth: AuthContext, req: SubmitBatchRequest, opts?: { waitMs?: number }): Promise<{ batchId: BatchId; accepted: true; task: TaskView; result?: BatchResult }>
     finishTask(auth: AuthContext, req: FinishTaskRequest): Promise<TaskView>
     getTask(auth: AuthContext, req: GetTaskRequest): Promise<TaskView>
+    listTasks(auth: AuthContext, req: ListTasksRequest): Promise<ListTasksResult>
     subscribe(auth: AuthContext, req: SubscribeRequest): Promise<SubscribeResult>
     approve(auth: AuthContext, req: ApproveRequest): Promise<ApproveResult>
     takeOver(auth: AuthContext, req: TakeOverRequest): Promise<ControlResult>

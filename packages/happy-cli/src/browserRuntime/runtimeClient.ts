@@ -40,6 +40,7 @@ export class RuntimeClient {
     }
     finishTask(req: Req<'finishTask'>) { return this.call('finishTask', req) }
     getTask(req: Req<'getTask'>) { return this.call('getTask', req) }
+    listTasks(req: Req<'listTasks'>) { return this.call('listTasks', req) }
     subscribe(req: Req<'subscribe'>, opts?: { waitMs?: number }) {
         return this.call('subscribe', { ...req, ...(opts?.waitMs !== undefined ? { waitMs: opts.waitMs } : {}) })
     }

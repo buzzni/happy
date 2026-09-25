@@ -17,13 +17,14 @@ export interface VerifyPolicy {
     profilePrincipals?: ReadonlyMap<ProfileId, PrincipalId>
 }
 const harnessPolicy: VerifyPolicy = { authMode: 'harness' }
-const forbiddenAgentOperations = new Set<Operation>(INTERACTIVE_OPERATIONS)
+const forbiddenAgentOperations = new Set<Operation>([...INTERACTIVE_OPERATIONS, 'listTasks'])
 const interactiveCapabilityOperations = new Set<Operation>([
     ...INTERACTIVE_OPERATIONS,
     'cancel',
     'resume',
     'getTask',
     'subscribe',
+    'listTasks',
 ])
 const issuedAtClockSkewMs = 30_000
 
