@@ -15,6 +15,10 @@
  *    generated inside the state volume, admin is a unix socket only, and the
  *    writer flock taken by the container entrypoint must be held.
  *
+ * Started as root (the production launcher, see privilegeDrop.ts), it only
+ * reads the root-only config and binds the sockets, then drops to
+ * ABP_RUNTIME_UID/GID before it touches the state volume or a browser.
+ *
  * Environment:
  *   ABP_STATE_DIR            durable store directory (volume), required
  *   ABP_CONFIG_FILE          runtime config file (config mode)
@@ -23,17 +27,20 @@
  *   ABP_RUNTIME_HOST/PORT    task API bind in harness mode (default 0.0.0.0:8787 in the container)
  *   ABP_ADMIN_PORT           harness admin API port (default 8788)
  *   ABP_WRITER_FLOCK         lock file the entrypoint holds with flock -F (set by the entrypoint)
+ *   ABP_RUNTIME_UID/GID      identity to drop to when started as root (set by the image)
  */
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { open, readFile, statfs } from 'node:fs/promises'
+import { createServer, type Server } from 'node:http'
 import { join } from 'node:path'
 import { collectRuntimeMetrics, startAdminServer, type AdminServer } from './admin'
 import { AttentionOutbox } from './attention'
 import { verifyToken, type AuthKeys, type VerifyPolicy } from './auth'
-import { startBroker, type Broker } from './broker'
+import { listenOnSocket, startBroker, type Broker } from './broker'
 import { BrowserRuntimeError, type BrowserInstanceId, type BrowserRuntimeApi, type ProfileId } from './contracts'
 import { CdpDriver } from './drivers/cdpDriver'
+import { dropRoot, joinGroup, runtimeIdentity } from './privilegeDrop'
 import { BrowserRuntime } from './runtime'
 import { loadRuntimeConfig, type RuntimeConfig } from './runtimeConfig'
 import { startRuntimeServer } from './server'
@@ -173,6 +180,25 @@ async function main(): Promise<void> {
     const production = config?.authMode === 'production'
     const harnessKeys = process.env.ABP_KEYS_FILE ? loadKeys(process.env.ABP_KEYS_FILE, config ? ['agentKey'] : undefined) : undefined
     if (!config && !harnessKeys) throw new Error('ABP_KEYS_FILE is required without ABP_CONFIG_FILE')
+    const adminOnSocket = production || !harnessKeys?.adminToken
+
+    let boundBroker: Server | undefined
+    let boundAdmin: Server | undefined
+    if (process.getuid?.() === 0) {
+        if (!config) throw new Error('ABP refuses to run as root without ABP_CONFIG_FILE')
+        const target = runtimeIdentity(process.env)
+        if (config.brokerSocketGid !== undefined) joinGroup(config.brokerSocketGid)
+        if (config.daemonTokenSha256) {
+            boundBroker = createServer()
+            await listenOnSocket(boundBroker, config.brokerSocketPath, 0o660, config.brokerSocketGid)
+        }
+        if (adminOnSocket) {
+            boundAdmin = createServer()
+            await listenOnSocket(boundAdmin, config.adminSocketPath, 0o600)
+        }
+        await dropRoot(target)
+        log(`dropped root uid=${target.uid} gid=${target.gid}`)
+    }
     // Production never accepts a harness interactive key or admin token.
     const keys: AuthKeys = production || !harnessKeys
         ? { agentKey: await loadOrCreateAgentKey(stateDir) }
@@ -293,16 +319,16 @@ async function main(): Promise<void> {
     })
     const admin: AdminServer = await startAdminServer({
         runtime, drivers,
-        listen: production || !harnessKeys?.adminToken
-            ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
-            : { host, port: adminPort, adminToken: harnessKeys.adminToken },
+        listen: boundAdmin ? { server: boundAdmin }
+            : adminOnSocket || !harnessKeys?.adminToken ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
+                : { host, port: adminPort, adminToken: harnessKeys.adminToken },
         metrics: () => collectRuntimeMetrics({ store, drivers, stateDir, fenceAcksMs }),
         revokeCapability: (capabilityId) => store.revoke(capabilityId),
     })
     let broker: Broker | undefined
     if (config?.daemonTokenSha256) {
         broker = await startBroker({
-            socketPath: config.brokerSocketPath, socketGid: config.brokerSocketGid, stateDir,
+            socketPath: config.brokerSocketPath, socketGid: config.brokerSocketGid, server: boundBroker, stateDir,
             daemonTokenSha256: config.daemonTokenSha256,
             identity: { machineId: config.machineId, workspaceId: config.workspaceId },
             profiles: config.profilePrincipals,
