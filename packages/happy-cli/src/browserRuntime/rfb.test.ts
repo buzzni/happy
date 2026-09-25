@@ -90,7 +90,7 @@ describe('client message parsing', () => {
     function run(bytes: Buffer, split?: () => number) {
         const sent: Buffer[] = []
         const messages: ClientMessage[] = []
-        const framer = new StreamFramer(clientParser({ send: (b) => sent.push(Buffer.from(b)), serverInit: () => Buffer.from('INIT'), onMessage: (m) => messages.push(m) }),
+        const framer = new StreamFramer(clientParser({ send: (b) => sent.push(Buffer.from(b)), serverInit: Buffer.from('INIT'), onReady: () => undefined, onMessage: (m) => messages.push(m) }),
             () => undefined, 128 * 1024)
         for (const piece of split ? randomSplit(bytes, split) : [bytes]) framer.push(piece)
         return { sent: Buffer.concat(sent), messages }
@@ -129,7 +129,7 @@ describe('client message parsing', () => {
 
     it('refuses a peer that runs too far ahead of a bounded read', () => {
         const sent: Buffer[] = []
-        const framer = new StreamFramer(clientParser({ send: (b) => sent.push(b), serverInit: () => Buffer.alloc(0), onMessage: () => undefined }), () => undefined, 1024)
+        const framer = new StreamFramer(clientParser({ send: (b) => sent.push(b), serverInit: Buffer.alloc(0), onReady: () => undefined, onMessage: () => undefined }), () => undefined, 1024)
         framer.push(handshake())
         expect(() => framer.push(Buffer.concat([Buffer.from([6, 0, 0, 0]), u32(2000), Buffer.alloc(1500)]))).toThrowError(RfbProtocolError)
     })

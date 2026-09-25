@@ -340,7 +340,9 @@ export type ClientMessage =
 export interface ClientHooks {
     send(bytes: Buffer): void
     /** ServerInit for the viewer, available because the upstream handshake finished first. */
-    serverInit(): Buffer
+    serverInit: Buffer
+    /** Called right after ServerInit was sent: server messages may follow from here on. */
+    onReady(): void
     onMessage(message: ClientMessage): void
 }
 
@@ -352,7 +354,8 @@ export function* clientParser(hooks: ClientHooks): RfbParser {
     hooks.send(Buffer.alloc(4))
     // ClientInit's shared flag is ignored: the upstream session is always shared.
     yield* read(1)
-    hooks.send(hooks.serverInit())
+    hooks.send(hooks.serverInit)
+    hooks.onReady()
     for (;;) {
         const type = (yield* read(1))[0]
         switch (type) {
