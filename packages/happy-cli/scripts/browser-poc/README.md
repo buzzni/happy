@@ -48,3 +48,17 @@ ABP_IMAGE_TAG=e2ed node scripts/browser-poc/rollback.mjs --run <running-run>
 
 - `a02a04` suites (A02/A04 E2E) add per-tag routes under `/login-strict|protected-strict|challenge-strict|captcha-protected|a02a04-after|a02a04-tick/<tag>` (strict password `correct-horse`, ledger kinds `a02a04-*`).
 Suite-specific fixture routes (`// ---- a05a06a08a09a11 routes ----` block, site A only): `/x5/panel?label=&color=&key=` (coloured panel with a `Press <label>` button and an optional barrier-driven `GATE OPEN` text), `/x5/controls?n=` (disabled + hidden buttons and `n` items inside a form, for truncation/subtree observation), `/x5/frame-reattach?key=` (site B iframe replaced by a fresh one when the barrier is released), `/x5/risky-mutating?key=&mode=reload|origin|value|node` (risky payment form whose document/origin/field value/button node changes when the barrier is released; shows `PAYMENT SENT` once the write is acknowledged), `/x5/spa?key=&mode=swap|hover` (button replaced by a decoy when the barrier is released, or on the first pointer move after it). All clicks are recorded as ledger `click` entries with the target label.
+
+## Real-agent runs (A01 / A08 / sandbox)
+
+These need (1) an isolated Happy daemon running this branch — `node scripts/install-isolated.cjs`, then copy an authenticated `access.key` into its home and `happy daemon start` with `HAPPY_HOME_DIR` set (see the script's printed commands; remove the key copy afterwards), and (2) a Desktop checkout with `desktop-session-client.ts.txt` copied to `.abp-harness/sessionClient.ts` (set `ABP_SESSION_CLIENT_DIR` to that checkout). Then:
+
+```sh
+pnpm exec tsx src/browserRuntime/e2e/stackCli.ts up <run>
+pnpm exec tsx src/browserRuntime/e2e/realAgentA01.ts --run <run> --iteration 1
+pnpm exec tsx src/browserRuntime/e2e/realAgentA08.ts --run <run> --iteration 1
+pnpm exec tsx src/browserRuntime/e2e/realAgentSandbox.ts --run <run>
+node scripts/browser-poc/poc.mjs down --run <run> --purge
+```
+
+Note: the server can push a happy-cli update to every registered machine, which restarts the isolated daemon on the globally installed CLI (the `browser_task_*` tools disappear). Check `daemon.state.json` → `startedWithCliVersion` before a run.
