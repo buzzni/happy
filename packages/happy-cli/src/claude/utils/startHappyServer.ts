@@ -14,7 +14,7 @@ import { AddressInfo } from "node:net";
 import { z } from "zod";
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
-import { randomUUID } from "node:crypto";
+import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { createId } from "@paralleldrive/cuid2";
 import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
@@ -22,6 +22,10 @@ import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 import { readFile } from 'node:fs/promises';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { projectPath } from '@/projectPath';
 import { registerBrowserTaskTools, BROWSER_TASK_TOOL_NAMES } from '@/browserRuntime/agentTools';
 import { RuntimeClient } from '@/browserRuntime/runtimeClient';
 import { BrowserRuntimeError } from '@/browserRuntime/contracts';
@@ -41,6 +45,7 @@ export interface HappyServerHandlers {
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
     browserTaskRuntime?: RuntimeClient;
+    mandatorySandbox?: boolean;
 }
 
 // The first title generated through change_title is the one users rely on to
@@ -93,7 +98,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         version: "1.0.0",
     });
 
-    if (handlers.proposeLesson) {
+    if (handlers.proposeLesson && !handlers.mandatorySandbox) {
         mcp.registerTool('propose_lesson', {
             title: 'Propose Project Lesson',
             description: 'Stage one verified lesson proposal for the current foreground turn. Requires its current token. This does not save or approve a lesson; normal turn completion and human approval are required.',
@@ -101,7 +106,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         }, async (input) => ({ content: [{ type: 'text' as const, text: JSON.stringify(handlers.proposeLesson!(input)) }] }));
     }
 
-    mcp.registerTool('script_automations', {
+    if (!handlers.mandatorySandbox) mcp.registerTool('script_automations', {
         title: 'Manage Project Script Automations',
         description: 'Manage Node bundle scripts in the project Execution > Automations admin without an LLM session. List before registering scheduled collection or batch work. Supports list/get/upsert/run/list_runs/set_enabled; use registrationKey and expectedRevision for safe retries. upsert reads sourcePath relative to this project, encrypts the bundle, and supports schedule=null or at/interval/daily/weekly, externalEnabled, JSON inputSchema, allowlisted origins and env:<mountedGroupId>:<KEY> secret references. No API keys are issued by this tool. Return and use the same admin ID; do not install OS cron or hidden background timers.',
         inputSchema: { request: scriptAutomationToolRequestSchema },
@@ -158,7 +163,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // chat can tail the output. MVP scope: single-line shell commands (no
     // heredoc, timeouts, cancellation). The system prompt steers the agent
     // to fall back to Claude's built-in Bash for everything outside that.
-    mcp.registerTool('bash_stream', {
+    if (!handlers.mandatorySandbox) mcp.registerTool('bash_stream', {
         description:
             'Run a shell command via `bash -c` and stream stdout/stderr live to the chat UI. Use this for long-running batch commands (npm install, pytest, build, etc.) so the user sees output as it happens. For short read-only commands or anything with heredocs/multiline scripts, prefer the built-in Bash tool.',
         title: 'Bash (streamed)',
@@ -237,7 +242,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // which fall back to the active tab and would bypass the task lease.
     if (handlers.browserTaskRuntime) {
         registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId });
-    } else {
+    } else if (!handlers.mandatorySandbox) {
         registerBrowserTools(mcp);
     }
 
@@ -414,6 +419,7 @@ function createBrowserTaskRuntimeClient(): RuntimeClient | undefined {
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
+        mandatorySandbox?: boolean;
         proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
@@ -427,11 +433,23 @@ export async function startHappyServer(
     }
 
     const changeTitle = createChangeTitleHandler(client);
+    const privateDir = options.mandatorySandbox ? mkdtempSync(join(process.platform === 'linux' ? '/tmp' : tmpdir(), 'happy-mcp-')) : undefined;
+    const socketPath = privateDir ? join(privateDir, 'mcp.sock') : undefined;
+    const token = privateDir ? randomBytes(32).toString('hex') : undefined;
 
     const server = createServer(async (req, res) => {
+        if (token) {
+            const supplied = Buffer.from(req.headers.authorization ?? '');
+            const expected = Buffer.from(`Bearer ${token}`);
+            if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+                res.writeHead(401).end();
+                return;
+            }
+        }
         const mcp = createMcpServer({
             changeTitle,
             client,
+            mandatorySandbox: options.mandatorySandbox,
             proposeLesson: options.proposeLesson,
             protectedBashCwd: options.protectedBashCwd,
             trackProtectedBashProcess: options.trackProtectedBashProcess,
@@ -456,21 +474,45 @@ export async function startHappyServer(
         }
     });
 
-    const baseUrl = await new Promise<URL>((resolve) => {
-        server.listen(0, "127.0.0.1", () => {
-            const addr = server.address() as AddressInfo;
-            resolve(new URL(`http://127.0.0.1:${addr.port}`));
-        });
+    const baseUrl = await new Promise<URL>((resolve, reject) => {
+        server.once('error', reject);
+        if (socketPath) {
+            server.listen(socketPath, () => {
+                chmodSync(socketPath, 0o600);
+                resolve(new URL('http://127.0.0.1:3129'));
+            });
+        } else {
+            server.listen(0, '127.0.0.1', () => {
+                const addr = server.address() as AddressInfo;
+                resolve(new URL(`http://127.0.0.1:${addr.port}`));
+            });
+        }
+    }).catch(error => {
+        server.close();
+        if (privateDir) rmSync(privateDir, { recursive: true, force: true });
+        throw error;
     });
+    const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string } = socketPath
+        ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs')], env: {
+            SAYCODE_MCP_SOCKET: socketPath,
+            HAPPY_HTTP_MCP_URL: baseUrl.toString(),
+            HAPPY_HTTP_MCP_HEADERS: JSON.stringify({ Authorization: `Bearer ${token}` }),
+        } }
+        : { type: 'http', url: baseUrl.toString() };
 
     logger.debug(`[happyMCP] server:ready sessionId=${client.sessionId} url=${baseUrl.toString()}`);
 
     return {
         url: baseUrl.toString(),
-        toolNames: [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)],
+        socketPath,
+        mcpConfig,
+        toolNames: options.mandatorySandbox
+            ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
+            : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
-            server.close();
+            server.close(() => { if (privateDir) rmSync(privateDir, { recursive: true, force: true }); });
+            server.closeAllConnections();
         }
     }
 }

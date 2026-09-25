@@ -19,6 +19,18 @@ describe('claudeRemote', () => {
         vi.mocked(query).mockReset();
     });
 
+    it('refuses a mandatory session without config before starting the SDK', async () => {
+        await expect(claudeRemote({
+            sessionId: null, path: process.cwd(), allowedTools: [],
+            sandboxPolicyMode: 'mandatory', sandbox: { enabled: false },
+            hookSettingsPath: '/tmp/synthetic-settings.json',
+            nextMessage: async () => ({ message: 'synthetic prompt', mode }),
+            onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false, onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(),
+        })).rejects.toMatchObject({ name: 'MandatorySandboxError', reason: 'missing-config' });
+        expect(query).not.toHaveBeenCalled();
+    });
+
     it('reports that the provider never started when mode switching aborts before the first message', async () => {
         const result = await claudeRemote({
             sessionId: null,
