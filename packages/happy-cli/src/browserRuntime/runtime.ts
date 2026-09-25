@@ -817,6 +817,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             || await driver.currentOrigin(approvedStep.tabId) !== approval.origin)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed')
         let description: ElementDescription | undefined
+        // After a Runtime-only restart the new driver connection has no snapshots:
+        // re-bind the approved element from its persisted identity. The driver only
+        // does so if the element's document is unchanged; anything else expires the approval.
+        if (approvedStep.snapshotId && approval.elementIdentity && driver.restoreRef) {
+            const restored = await driver.restoreRef(approvedStep.tabId, approvedStep.snapshotId, approvedStep.ref as ElementRef,
+                approval.elementIdentity, { timeoutMs: approvedStep.timeoutMs })
+            if (restored === 'gone') throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval reference was replaced')
+        }
         if (approvedStep.snapshotId && driver.describeRef) {
             try {
                 description = await driver.describeRef(approvedStep.tabId, approvedStep.ref as ElementRef,
@@ -1727,6 +1735,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         frameOrigin: description!.frameOrigin,
                         currentPageUrl: description!.pageUrl,
                         elementName: description?.name,
+                        elementIdentity: description?.identity,
                         formValues: description ? Object.entries(description.formValues).map(([name, value]) => ({ name, value })) : [],
                         expiresAtMs,
                     })

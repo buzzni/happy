@@ -1416,6 +1416,8 @@ describe('BrowserRuntime durable request contract', () => {
         if (!approval) throw new Error('test requires pending approval')
         const oldEpoch = h.store.getTask(h.task.taskId)?.tabLeaseEpochs?.[h.opened.tabId]
         await h.store.close()
+        // The restarted Runtime reconnects with a fresh driver connection: snapshots are gone.
+        h.driver.forgetSnapshots()
 
         const store = await TaskStore.open(h.dir)
         const restarted = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })

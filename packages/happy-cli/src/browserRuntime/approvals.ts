@@ -18,6 +18,8 @@ export function createApproval(input: {
     currentPageUrl: string
     expiresAtMs: number
     elementName?: string
+    /** Driver element identity (non-secret), used to re-bind the element after a Runtime-only restart */
+    elementIdentity?: string
     formValues?: FormValue[]
 }): { summary: PendingApprovalSummary; record: ApprovalRecord } {
     const approvalId = `approval-${randomUUID()}` as ApprovalId
@@ -63,6 +65,7 @@ export function createApproval(input: {
             browserInstanceId: input.browserInstanceId,
             snapshotId: input.snapshotId,
             frameOrigin: input.frameOrigin,
+            ...(input.elementIdentity ? { elementIdentity: input.elementIdentity } : {}),
             formValues: Object.fromEntries(Object.entries(formValuesByName).map(([name, value]) => [name, payloadHash(value)])),
         },
     }

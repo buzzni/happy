@@ -281,6 +281,37 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             expect(await eventually(() => a.hits('submit'), (n) => n === 1)).toBe(1)
         })
 
+        it('restores a ref from its persisted identity on a new driver (Runtime-only restart) only while the document is unchanged', async () => {
+            const tab = await open('/pay-form', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const confirm = refOf(obs, 'Confirm payment')
+            const described = await driver.describeRef(tab.tabId, confirm, obs.snapshotId, OPTS)
+            expect(Buffer.from(described.identity, 'base64url').toString()).not.toContain('Confirm payment')
+            const restarted = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId })
+            try {
+                await restarted.connect()
+                expect(await restarted.adoptTab(tab.tabId, tab.targetId, [a.origin], OPTS)).toBe(true)
+                expect(await restarted.restoreRef(tab.tabId, obs.snapshotId, confirm, described.identity, OPTS)).toBe('restored')
+                const again = await restarted.describeRef(tab.tabId, confirm, obs.snapshotId, OPTS)
+                expect(again.documentGeneration).toBe(described.documentGeneration)
+                expect(again.formValues).toEqual(described.formValues)
+                // A reload is a new document: the persisted identity no longer binds.
+                await harness.evaluate(tab.targetId, 'location.reload()')
+                await delay(1_000)
+                const fresh = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId })
+                await fresh.connect()
+                try {
+                    expect(await fresh.adoptTab(tab.tabId, tab.targetId, [a.origin], OPTS)).toBe(true)
+                    expect(await fresh.restoreRef(tab.tabId, obs.snapshotId, confirm, described.identity, OPTS)).toBe('gone')
+                } finally {
+                    await fresh.close()
+                }
+            } finally {
+                await restarted.close()
+                await driver.closeTab(tab.tabId, OPTS)
+            }
+        })
+
         it('fails with STALE_REF when the node behind the ref was replaced', async () => {
             const tab = await open('/spa', [a.origin])
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)

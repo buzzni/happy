@@ -48,6 +48,7 @@ export interface ApprovalRecord {
     browserInstanceId?: BrowserInstanceId
     snapshotId?: SnapshotId
     frameOrigin?: string
+    elementIdentity?: string
     formValues?: Record<string, string>
     result?: BatchResult
 }
