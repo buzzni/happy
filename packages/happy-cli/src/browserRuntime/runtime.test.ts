@@ -1569,6 +1569,22 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('returns a driver window quota refusal without marking the task failed or uncertain', async () => {
+        const h = await createHarness('abp-runtime-open-window-quota-')
+        h.driver.failNext('openTab', new BrowserRuntimeError('QUOTA_EXCEEDED', 'agent window limit reached', true, false))
+        await expect(h.runtime.openPage(h.auth, {
+            taskId: h.task.taskId,
+            url: 'https://fixture.test/second',
+            requestId: 'open-window-quota' as RequestId,
+        })).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED', mayHaveSideEffects: false })
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(task).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        const retried = await h.runtime.openPage(h.auth, { taskId: h.task.taskId, url: 'https://fixture.test/second',
+            requestId: 'open-window-quota-retry' as RequestId })
+        expect(retried.task.status).toBe('paused')
+        await h.store.close()
+    })
+
     it('exposes persisted lease epochs and the current input owner on each task tab', async () => {
         const h = await createHarness('abp-runtime-task-view-leases-')
         const view = await h.runtime.getTask(h.auth, { taskId: h.task.taskId }) as typeof h.task & {

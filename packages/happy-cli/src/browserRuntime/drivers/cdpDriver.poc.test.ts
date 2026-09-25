@@ -147,6 +147,49 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         })
     })
 
+    describe('agent window cap', () => {
+        it('gives each owned tab its own window and refuses a tab beyond maxAgentWindows before creating any target', async () => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            try {
+                const first = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                const second = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                const windowOf = async (targetId: string) => (await harness.conn.send('Browser.getWindowForTarget', { targetId })).windowId as number
+                expect(await windowOf(first.targetId)).not.toBe(await windowOf(second.targetId))
+                const before = (await harness.targets()).length
+                const refused = await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                expect(refused.mayHaveSideEffects).toBe(false)
+                expect((await harness.targets()).length).toBe(before)
+                await capped.closeTab(first.tabId, OPTS)
+                const third = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                expect(capped.debugCounts().tabs).toBe(2)
+                await capped.closeTab(second.tabId, OPTS)
+                await capped.closeTab(third.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('counts opens that are still in flight, so concurrent opens never exceed the cap', async () => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            try {
+                const results = await Promise.allSettled([0, 1, 2, 3].map(() => capped.openTab(a.url('/plain'), [a.origin], OPTS)))
+                const opened = results.filter((r) => r.status === 'fulfilled')
+                const refused = results.filter((r) => r.status === 'rejected' && (r.reason as BrowserRuntimeError).code === 'QUOTA_EXCEEDED')
+                expect(opened).toHaveLength(2)
+                expect(refused).toHaveLength(2)
+                for (const r of opened) await capped.closeTab((r as PromiseFulfilledResult<{ tabId: TabId }>).value.tabId, OPTS)
+                // A failed open releases its slot too.
+                await expectCode(capped.openTab('http://unlisted.invalid/', [a.origin], OPTS), 'ORIGIN_DENIED')
+                const again = await Promise.all([0, 1].map(() => capped.openTab(a.url('/plain'), [a.origin], OPTS)))
+                for (const tab of again) await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+    })
+
     describe('OOPIF and snapshot', () => {
         it('attaches the cross-site iframe as a separate child target and observes both frames', async () => {
             const tab = await open('/oopif', [a.origin, b.origin])

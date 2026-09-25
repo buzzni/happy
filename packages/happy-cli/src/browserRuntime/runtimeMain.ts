@@ -12,13 +12,14 @@
  *   ABP_PROFILES             JSON [{profileId, cdpHttpUrl, instanceUrl}]
  *   ABP_RUNTIME_HOST/PORT    task API bind (default 0.0.0.0:8787 in the container)
  *   ABP_ADMIN_PORT           admin API port (default 8788)
+ *   ABP_MAX_AGENT_WINDOWS    optional, agent windows per profile (default 4, at most the tab quota)
  */
 import { readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
 import { verifyToken, type AuthKeys } from './auth'
-import { BrowserRuntimeError, type ActionId, type BrowserInstanceId, type GrantId, type ProfileId, type TaskId } from './contracts'
-import { CdpDriver } from './drivers/cdpDriver'
+import { BrowserRuntimeError, POC_LIMITS, type ActionId, type BrowserInstanceId, type GrantId, type ProfileId, type TaskId } from './contracts'
+import { CdpDriver, DEFAULT_MAX_AGENT_WINDOWS } from './drivers/cdpDriver'
 import { BrowserRuntime } from './runtime'
 import { startRuntimeServer } from './server'
 import { TaskStore } from './taskStore'
@@ -96,6 +97,16 @@ async function openStoreWaitingForStaleLease(stateDir: string, log: (line: strin
             await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS))
         }
     }
+}
+
+function maxAgentWindows(): number {
+    const raw = process.env.ABP_MAX_AGENT_WINDOWS
+    if (raw === undefined || raw === '') return DEFAULT_MAX_AGENT_WINDOWS
+    const value = Number(raw)
+    if (!Number.isInteger(value) || value < 1 || value > POC_LIMITS.maxActiveTabs) {
+        throw new Error(`ABP_MAX_AGENT_WINDOWS must be an integer between 1 and ${POC_LIMITS.maxActiveTabs}`)
+    }
+    return value
 }
 
 /** Every key must be present and long; an empty admin token would otherwise match an empty bearer. */
@@ -182,6 +193,7 @@ async function main(): Promise<void> {
     const host = process.env.ABP_RUNTIME_HOST ?? '0.0.0.0'
     const port = Number(process.env.ABP_RUNTIME_PORT ?? '8787')
     const adminPort = Number(process.env.ABP_ADMIN_PORT ?? '8788')
+    const windows = maxAgentWindows()
 
     // A second live Runtime on the same state dir is refused (writer lock). After a
     // crash the old lock's heartbeat is still fresh for up to its lease, so wait that
@@ -190,7 +202,7 @@ async function main(): Promise<void> {
 
     const drivers = new Map<ProfileId, CdpDriver>()
     for (const profile of profiles) {
-        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile) }))
+        drivers.set(profile.profileId, new CdpDriver({ browserWsUrl: '', browserInstanceIdProvider: instanceIdProvider(profile), maxAgentWindows: windows }))
     }
     // Connect before recovery so it can compare browser instance ids.
     await Promise.all(profiles.map((profile) => connectWithRetry(drivers.get(profile.profileId)!, profile, log)))

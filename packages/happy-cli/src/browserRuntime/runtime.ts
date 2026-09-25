@@ -219,6 +219,16 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 }, 'action-failed', { actionId, error: safeError(error) }, epoch)
                 throw error
             }
+            // The driver refuses before creating any target when its agent windows are all in use:
+            // nothing happened, so the agent may close a page and open again.
+            if (error instanceof BrowserRuntimeError && error.code === 'QUOTA_EXCEEDED' && !error.mayHaveSideEffects) {
+                await this.commit(current, {
+                    status: 'paused',
+                    pauseReason: 'awaiting-agent',
+                    actions: { ...current.actions, [actionId]: { ...current.actions[actionId], state: 'failed' } },
+                }, 'action-failed', { actionId, error: safeError(error) }, epoch)
+                throw error
+            }
             if (!current.cancelRequested)
                 await this.commit(current, { status: 'paused', pauseReason: 'outcome-unknown', actions: { ...current.actions,
                     [actionId]: { ...current.actions[actionId], state: 'uncertain' } }, uncertainActions: [...current.uncertainActions,

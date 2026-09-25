@@ -39,6 +39,8 @@ export interface CdpDriverOptions {
     browserWsUrl: string
     /** Read from the trusted browser start path; never derived from CDP. */
     browserInstanceIdProvider: () => Promise<BrowserInstanceId>
+    /** Owned tabs (= agent windows) this driver keeps open at once; default DEFAULT_MAX_AGENT_WINDOWS. */
+    maxAgentWindows?: number
     /** Test seams. Not for production wiring. */
     testHooks?: {
         afterCapture?: (tabId: TabId) => Promise<void>
@@ -68,6 +70,7 @@ const CLOSE_CONFIRM_MS = 2_000
 const CONNECT_TIMEOUT_MS = 10_000
 const CLOSE_RETRIES = 3
 const CLOSE_RETRY_MS = 200
+export const DEFAULT_MAX_AGENT_WINDOWS = 4
 
 async function withDeadline<T>(ms: number, message: string, body: () => Promise<T>): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -194,6 +197,8 @@ export class CdpDriver implements BrowserDriver {
     private readonly popups = new Map<string, PopupReport>()
     private readonly disconnectListeners = new Set<() => void>()
     private readonly dialogs: DialogReport[] = []
+    /** openTab calls that hold a window slot but have not registered (or dropped) their tab yet */
+    private opening = 0
 
     constructor(private readonly options: CdpDriverOptions) {
         this.browserWsUrl = options.browserWsUrl
@@ -289,22 +294,34 @@ export class CdpDriver implements BrowserDriver {
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle> {
         return this.run(opts, async (op, conn) => {
             if (!allowedOrigins.includes(originOf(url))) throw originDenied('requested origin is not allowed')
-            op.markDispatch()
-            // Each owned tab gets its own background window: in a headful browser a
-            // background tab inside the user's window is hidden, so it neither paints
-            // (screenshots hang) nor reliably receives input, and activating it would
-            // steal the tab the user is looking at.
-            const { targetId } = await conn.send('Target.createTarget', { url: 'about:blank', background: true, newWindow: true })
-            let tab: TabState | undefined
+            // Every owned tab is a window, and windows are what cost browser memory:
+            // the cap counts opens still in flight so concurrent calls cannot overshoot it.
+            if (this.tabs.size + this.opening >= (this.options.maxAgentWindows ?? DEFAULT_MAX_AGENT_WINDOWS)) {
+                throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'agent window limit reached; close a page first', true, false)
+            }
+            this.opening += 1
             try {
-                const { sessionId } = await conn.send('Target.attachToTarget', { targetId, flatten: true })
-                tab = this.registerTab(targetId, sessionId, allowedOrigins)
-                await this.setupSession(conn, sessionId, true)
-                await this.navigateInternal(conn, tab, url, allowedOrigins, op)
-                return { tabId: tab.tabId, targetId }
-            } catch (error) {
-                await this.discardTarget(conn, targetId, tab)
-                throw error
+                op.markDispatch()
+                // Each owned tab gets its own background window: in a headful browser a
+                // background tab inside the user's window is hidden, so it neither paints
+                // (screenshots hang) nor reliably receives input, and activating it would
+                // steal the tab the user is looking at. Opening the tab from a driver-owned
+                // anchor tab instead (window.open) moves X input focus to that window
+                // under the viewer's window-manager-less X server (spike, Chromium 153).
+                const { targetId } = await conn.send('Target.createTarget', { url: 'about:blank', background: true, newWindow: true })
+                let tab: TabState | undefined
+                try {
+                    const { sessionId } = await conn.send('Target.attachToTarget', { targetId, flatten: true })
+                    tab = this.registerTab(targetId, sessionId, allowedOrigins)
+                    await this.setupSession(conn, sessionId, true)
+                    await this.navigateInternal(conn, tab, url, allowedOrigins, op)
+                    return { tabId: tab.tabId, targetId }
+                } catch (error) {
+                    await this.discardTarget(conn, targetId, tab)
+                    throw error
+                }
+            } finally {
+                this.opening -= 1
             }
         })
     }
