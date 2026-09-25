@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# abp-firewall — owner firewall rules of the Agent Browser sandbox (S1 contract):
+# agent-sbx may reach only the loopback CONNECT proxy, abp-proxy only public
+# TCP 443. abp-firewall.service runs `apply` at boot before the proxy, the stack
+# and the Happy daemon; the session preflight refuses to start Claude unless the
+# live OUTPUT chains begin with exactly these rules, in this order.
+#
+#   abp-firewall apply    insert /etc/abp/firewall.rules{4,6} as the first OUTPUT rules (idempotent)
+#   abp-firewall check    exit 0 only if both OUTPUT chains start with those rules
+#   abp-firewall remove   delete every copy of those rules
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+RULES_DIR=${ABP_FIREWALL_RULES_DIR:-/etc/abp}
+
+rules() { grep '^-A OUTPUT ' "$RULES_DIR/firewall.rules$1"; }
+tool() { if [ "$1" = 4 ]; then echo iptables; else echo ip6tables; fi; }
+
+# Deletes every copy of one rule ("-A OUTPUT <spec>"), so a re-run never duplicates it.
+delete_rule() {
+    local family=$1 spec
+    read -ra spec <<<"${2#-A OUTPUT }"
+    while "$(tool "$family")" -w -t filter -D OUTPUT "${spec[@]}" 2>/dev/null; do :; done
+}
+
+apply() {
+    local family rule position spec
+    for family in 4 6; do
+        mapfile -t list < <(rules "$family")
+        [ "${#list[@]}" -gt 0 ] || { echo "abp-firewall: no rules in $RULES_DIR/firewall.rules$family" >&2; exit 1; }
+        for rule in "${list[@]}"; do delete_rule "$family" "$rule"; done
+        position=1
+        for rule in "${list[@]}"; do
+            read -ra spec <<<"${rule#-A OUTPUT }"
+            "$(tool "$family")" -w -t filter -I OUTPUT "$position" "${spec[@]}"
+            position=$((position + 1))
+        done
+    done
+    check
+}
+
+check() {
+    local family expected live failed=0
+    for family in 4 6; do
+        expected=$(rules "$family")
+        # Same normalization as the session preflight (sandboxPreflight.assertFirewallRules).
+        live=$("$(tool "$family")-save" -t filter | grep '^-A OUTPUT ' \
+            | sed -E 's/ --reject-with (icmp-port-unreachable|icmp6-port-unreachable)$//' \
+            | head -n "$(printf '%s\n' "$expected" | wc -l)")
+        if [ "$live" != "$expected" ]; then
+            echo "abp-firewall: IPv$family OUTPUT does not start with the installed owner rules" >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+remove() {
+    local family rule
+    for family in 4 6; do
+        [ -r "$RULES_DIR/firewall.rules$family" ] || continue
+        while IFS= read -r rule; do delete_rule "$family" "$rule"; done < <(rules "$family")
+    done
+}
+
+case "${1:-}" in
+    apply) apply ;;
+    check) check ;;
+    remove) remove ;;
+    *) echo "usage: abp-firewall apply|check|remove" >&2; exit 2 ;;
+esac
