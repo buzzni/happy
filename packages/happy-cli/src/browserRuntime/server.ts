@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net'
 import { z } from 'zod'
 import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type ProfileId, type RuntimeErrorBody, type TaskId } from './contracts'
 import { renderConsolePage } from './consolePage'
-import type { ViewerProxy } from './viewerProxy'
+import { VIEWER_WEBSOCKET_PATH, type ViewerProxy } from './viewerProxy'
 
 const MAX_BODY_BYTES = 1024 * 1024
 export const MAX_BATCH_WAIT_MS = 120_000
@@ -71,7 +71,7 @@ export interface RuntimeServerOptions {
     ready?: () => Promise<Record<string, boolean>>
     log?: (line: string) => void
     /** Runtime viewer (D2). Without it viewerTicket answers RUNTIME_UNAVAILABLE. */
-    viewer?: Pick<ViewerProxy, 'issueTicket'>
+    viewer?: Pick<ViewerProxy, 'issueTicket' | 'handleUpgrade' | 'close'>
 }
 
 export interface RuntimeServer { url: string; port: number; close(): Promise<void> }
@@ -183,11 +183,19 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
         }
     })
 
+    server.on('upgrade', (req, socket, head) => {
+        if (opts.viewer && new URL(req.url ?? '/', 'http://localhost').pathname === VIEWER_WEBSOCKET_PATH) return opts.viewer.handleUpgrade(req, socket, head)
+        socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    })
+
     await new Promise<void>((resolve) => server.listen(opts.port, opts.host ?? '127.0.0.1', resolve))
     const port = (server.address() as AddressInfo).port
     return {
         url: `http://${opts.host ?? '127.0.0.1'}:${port}`,
         port,
-        close: () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()) }),
+        close: async () => {
+            await opts.viewer?.close()
+            await new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()) })
+        },
     }
 }
