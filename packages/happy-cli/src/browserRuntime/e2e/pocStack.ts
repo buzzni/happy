@@ -71,7 +71,7 @@ export interface PocStack {
     run: string
     runtimeUrl: string
     env: PocEnvJson
-    keys: AuthKeys & { adminToken: string }
+    keys: Required<AuthKeys> & { adminToken: string }
     mintAgent(options?: GrantOptions): { token: string; grantId: GrantId }
     mintInteractive(options?: { principalId?: PrincipalId; profileId?: ProfileId; ttlMs?: number; viewerSessionId?: string }): string
     client(token: string): RuntimeClient

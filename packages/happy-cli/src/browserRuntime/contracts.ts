@@ -130,7 +130,21 @@ export interface InteractiveCapability {
     operations: Operation[]
     issuedAtMs: number
     expiresAtMs: number
+    /** abp2 only: the Happy machineId the capability is for (must equal the Runtime's configured machineId). */
+    aud?: string
+    /** abp2 only: always INTERACTIVE_CAPABILITY_ISSUER. */
+    iss?: string
 }
+
+/** `iss` of every server-signed (abp2) interactive capability. */
+export const INTERACTIVE_CAPABILITY_ISSUER = 'saycode-server'
+
+/**
+ * Runtime auth mode. `harness` keeps the PoC behaviour (abp1 HMAC interactive
+ * capabilities minted by the E2E harness). `production` accepts interactive
+ * capabilities only as abp2 (Ed25519, signed by the Saycode server).
+ */
+export type AuthMode = 'harness' | 'production'
 
 /** Client (UI) read access: getTask/subscribe for the principal's tasks. */
 export type Credential = AgentGrant | InteractiveCapability
@@ -489,6 +503,8 @@ export const POC_LIMITS = {
     maxWaitForTimeoutMs: 120_000,
     taskTimeLimitMs: 60 * 60_000,
     maxGrantLifetimeMs: 60 * 60_000,
+    /** Server-signed (abp2) interactive capabilities; clients re-issue 1 minute before expiry. */
+    maxInteractiveLifetimeMs: 5 * 60_000,
     workerHeartbeatMs: 10_000,
     workerStaleMs: 60_000,
     userWaitMs: 10 * 60_000,
