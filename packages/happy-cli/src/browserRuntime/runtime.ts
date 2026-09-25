@@ -982,6 +982,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }): Promise<TaskView> {
         const task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'resume', task)
+        if (auth.credential.kind === 'interactive')
+            return this.userResume(task)
         if (task.cancelRequested || ['user-control', 'quota', 'task-time-limit', 'outcome-unknown',
             'cancelled-with-unknown-effect'].includes(task.pauseReason ?? '') || task.uncertainActions.length)
             throw new BrowserRuntimeError('CONFLICT', 'Task pause cannot be resumed directly')
@@ -1066,6 +1068,61 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return this.view(task)
         return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', agentGrant: auth.credential },
             'state-changed', { status: 'paused', pauseReason: 'awaiting-agent' }))
+    }
+    /**
+     * D8: the user can only hand a task back to the agent after something the user
+     * resolved (a released takeover, possibly finishing a login/challenge wait), and
+     * only while the task's stored execution grant is still valid. Approval waits,
+     * uncertain writes, cancel requests and browser replacement are never released here.
+     */
+    private async userResume(task: StoredTask): Promise<TaskView> {
+        if (task.status === 'paused' && task.pauseReason === 'awaiting-agent')
+            return this.view(task)
+        if (task.cancelRequested || task.uncertainActions.length || task.status !== 'paused'
+            || task.pauseReason !== 'user-input-complete' || task.pendingApproval)
+            throw new BrowserRuntimeError('CONFLICT', 'Task pause cannot be resumed by the user')
+        const grant = task.agentGrant as AgentGrant | undefined
+        if (!grant || grant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(grant.grantId))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Task execution grant is expired or revoked')
+        const wait = task.waitCompletion as {
+            batchId?: string
+            nextStep?: number
+            tabId: TabId
+            predicate?: BatchStep['until']
+            notPathPrefix?: string
+        } | undefined
+        if (task.waitReason && wait) {
+            if (Number(task.waitExpiresAtMs ?? 0) > 0 && this.clock.now() > Number(task.waitExpiresAtMs))
+                return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
+                    { pauseReason: 'user-wait-expired', waitReason: task.waitReason }))
+            const observation = await this.driver(task.profileId).observe(wait.tabId, grant.allowedOrigins, { timeoutMs: 10000 })
+            const waitCompleted = wait.notPathPrefix
+                ? !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
+                : Boolean(wait.predicate && matchesWait(wait.predicate, observation))
+            if (!waitCompleted)
+                return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
+                    waitReason: task.waitReason }))
+        }
+        const batchId = wait?.batchId as BatchId | undefined
+        const batch = batchId ? task.batches[batchId] : undefined
+        // The agent re-plans the rest of an interrupted batch; the user never continues agent steps.
+        // Steps from nextStep on were never dispatched (the wait was committed before them).
+        const remaining = batch ? batch.steps.slice(Number(wait?.nextStep ?? 0)) : []
+        const completed = batch ? batch.steps.filter((step) => task.actions[step.actionId]?.state === 'confirmed') : []
+        const result: BatchResult | undefined = batch && batchId ? {
+            batchId, taskId: task.taskId, outcome: remaining.length ? 'failed' : 'succeeded',
+            completedSteps: completed.map((step) => step.stepId), ...(remaining.length ? { failedStep: remaining[0].stepId } : {}),
+            mayHaveSideEffects: false, lastCheckpointSeq: task.highWatermarkSeq + 1,
+            steps: [...completed.map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded' as const })),
+                ...remaining.map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'skipped' as const }))],
+        } : undefined
+        if (batchId)
+            this.liveBatchSteps.delete(batchId)
+        return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
+            waitCompletion: undefined, waitExpiresAtMs: undefined,
+            ...(result && batch && batchId ? { currentBatchId: undefined, lastBatch: result, batches: { ...task.batches, [batchId]: { ...batch, result } } } : {}),
+        }, 'agent-attention-required', { attention: 'user-resumed', ...(task.waitReason ? { waitCompleted: task.waitReason } : {}),
+            ...(batchId ? { batchId, skippedSteps: remaining.length } : {}) }))
     }
     private async cancelImpl(auth: AuthContext, req: {
         taskId: TaskId
