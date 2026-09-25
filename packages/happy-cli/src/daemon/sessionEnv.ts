@@ -33,6 +33,7 @@ import {
     resolveAppliedAiAuthSource,
     type AiAuthSource,
 } from '@/usage/aiAuthSource'
+import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
@@ -57,7 +58,7 @@ const SAYCODE_AGENT_ENV_KEYS = [
 
 type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | 'HAPPY_PROJECT_SANDBOX_CONFIG'
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
 
@@ -186,11 +187,25 @@ export function captureSaycodeAgentEnvironment(
     if (env.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined) {
         captured.HAPPY_PROJECT_SANDBOX_CONFIG = env.HAPPY_PROJECT_SANDBOX_CONFIG
     }
+    // Which sandbox roots were user-granted, so a resume can keep or replace exactly those.
+    const additionalDirectories = env[ADDITIONAL_DIRECTORIES_ENV]
+    if (additionalDirectories !== undefined && isValidAdditionalDirectories(additionalDirectories)) {
+        captured[ADDITIONAL_DIRECTORIES_ENV] = additionalDirectories
+    }
     const encodedCheckpointContext = env[CHECKPOINT_CONTEXT_KEY]
     if (encodedCheckpointContext && readCheckpointSpawnContext(env)) {
         captured[CHECKPOINT_CONTEXT_KEY] = encodedCheckpointContext
     }
     return Object.keys(captured).length > 0 ? captured : undefined
+}
+
+function isValidAdditionalDirectories(value: string): boolean {
+    try {
+        readAdditionalDirectoriesEnvironment({ [ADDITIONAL_DIRECTORIES_ENV]: value })
+        return true
+    } catch {
+        return false
+    }
 }
 
 /** Restores one tracked session's capability without inheriting the caller's. */

@@ -529,6 +529,8 @@ type MachineRpcHandlers = {
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
+        /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
+        additionalDirectories?: string[];
     }) => Promise<ResumeSessionResult>;
     recoverSession?: (sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>;
     stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -758,6 +760,8 @@ export class ApiMachineClient {
         mcpCallerGrantEnvelope?: string;
         mcpConfigProjectId?: string;
         expectedConnectors?: string[];
+        /** Present = authoritative (empty withdraws every root); absent = keep the session's roots. */
+        additionalDirectories?: string[];
     }) => Promise<ResumeSessionResult>) | null = null;
     private recoverSessionHandler: ((sessionId: string, options: RecoverSessionOptions) => Promise<RecoverSessionResult>) | null = null;
     private linkSpawnedSessionHandler: ((input: { sessionId: string; directory: string }) => void | Promise<void>) | null = null;
@@ -2998,11 +3002,16 @@ export class ApiMachineClient {
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
                         expectedConnectors,
+                        additionalDirectories,
                     } = params || {};
 
                     if (!sessionId || typeof sessionId !== 'string') {
                         throw new Error('Session ID is required');
                     }
+                    // Unlike spawn, an empty list is meaningful here: it withdraws the roots.
+                    const validAdditionalDirectories = Array.isArray(additionalDirectories) && additionalDirectories.length === 0
+                        ? []
+                        : parseAdditionalDirectories(additionalDirectories);
                     if (
                         environmentVariables !== undefined
                         && (
@@ -3034,6 +3043,7 @@ export class ApiMachineClient {
                         mcpCallerGrantEnvelope,
                         mcpConfigProjectId,
                         expectedConnectors: validExpectedConnectors,
+                        ...(validAdditionalDirectories !== undefined ? { additionalDirectories: validAdditionalDirectories } : {}),
                     });
                     switch (result.type) {
                         case 'success':

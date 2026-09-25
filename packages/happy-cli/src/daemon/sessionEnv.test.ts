@@ -276,6 +276,15 @@ describe('buildSpawnRequestEnvironment', () => {
 })
 
 describe('Saycode agent resume environment', () => {
+    it('captures the granted additional directories so a resume keeps and can replace them', () => {
+        expect(captureSaycodeAgentEnvironment({
+            HAPPY_ADDITIONAL_DIRECTORIES: '["/repo/app"]',
+        })).toEqual({ HAPPY_ADDITIONAL_DIRECTORIES: '["/repo/app"]' })
+        expect(captureSaycodeAgentEnvironment({
+            HAPPY_ADDITIONAL_DIRECTORIES: 'not-json',
+        })).toBeUndefined()
+    })
+
     it('captures only the validated Saycode agent capability fields', () => {
         expect(captureSaycodeAgentEnvironment({
             SAYCODE_AGENT_ENV: '1',

@@ -258,6 +258,7 @@ import {
 import {
   ADDITIONAL_DIRECTORIES_CAPABILITY,
   prepareAdditionalDirectories,
+  reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
@@ -2429,6 +2430,8 @@ export async function startDaemon(): Promise<void> {
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
+      /** Present = replace the roots granted at spawn (a live child is left untouched). */
+      additionalDirectories?: string[];
       checkpointRestart?: true;
       automation?: {
         directory: string;
@@ -2705,6 +2708,18 @@ export async function startDaemon(): Promise<void> {
             }
             : undefined,
         ), Object.keys(managedAiCredentialEnvironment).length > 0);
+        if (options?.additionalDirectories !== undefined) {
+          // Roots registered while the session was stopped only reach the sandbox here:
+          // the OS sandbox profile is fixed for the life of the child process.
+          const reapplied = await reapplyAdditionalDirectoriesOnResume(resumedEnvironment, {
+            requested: options.additionalDirectories,
+            primaryDirectory: launch.cwd,
+            allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+          });
+          if (!reapplied.applied) {
+            logger.debug(`[DAEMON RUN] Kept the granted additional directories for ${happySessionId}: the requested list was rejected`);
+          }
+        }
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,
