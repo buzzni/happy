@@ -91,10 +91,15 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
   revokes it at exit; session processes get 55-minute grants with their per-session secret
   (`brokerGrantSource.ts`) and renew 5 minutes early. `GET /v1/attention` serves the outbox.
   Registry changes, issuance and revocation are serialized after the request body is read.
-  Revocation persists a `revoking` tombstone (issuance blocked, grant ids kept), revokes each
-  grant, then drops the registration; start-up finishes interrupted ones. The daemon keeps
-  unconfirmed revocations in `~/.happy/browser-task-revocations.json` and retries them with
-  backoff (≤ 5 min), across restarts.
+  Every revocation attempt first persists a `revoking` tombstone (issuance blocked, grant ids
+  kept; registry rename + directory fsync), revokes each grant, then drops the registration.
+  From start-up, tombstoned grant ids are on the task API's credential denylist
+  (`withRevokingGrants`, broker started before the API) and `/v1/ready` reports
+  `revocations: false` until the background replay (retried) finishes them. The daemon keeps
+  unconfirmed revocations in `~/.happy/browser-task-revocations.json` (exclusive temp file,
+  fsync, rename, directory fsync; failed writes retried) and retries them with backoff
+  (≤ 5 min) across restarts; an unreadable or malformed queue disables the daemon broker
+  instead of being read as empty.
 - Attention outbox (`attention.ts`): transitions are tagged `data.attention` at commit time
   (approval decided, takeover released, user resume, recovery); the outbox observes TaskStore
   commits and `reconcile()` repairs a crash between the task commit and the outbox write.
@@ -114,4 +119,7 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
   --security-opt no-new-privileges`). The entrypoint creates the state dir and lock file as the
   runtime user; node reads the config, binds broker (root:abp-session 0660, group by
   membership) and admin (root 0600) sockets, then drops to `ABP_RUNTIME_UID/GID` and exits if
-  any capability is left. The harness still runs the image as uid 10870 directly.
+  any capability is left. If that fails it closes the sockets and exits before the state
+  volume, any browser or the task API is opened (`runtimeProcess.test.ts`). The production
+  smoke audits `/proc/1/fd`: no config descriptor, one `runtime.flock`, the two listeners.
+  The harness still runs the image as uid 10870 directly.
