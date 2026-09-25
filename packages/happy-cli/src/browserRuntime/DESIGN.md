@@ -75,3 +75,27 @@ project). Browser E2E suites are `src/browserRuntime/e2e/*.poc.test.ts` in the
 - Writer lock = heartbeat lease (5 s refresh, stale after 20 s) + fencing token;
   `runtimeMain` waits for a dead writer's lease to expire before giving up.
 - Acceptance results, gates and the No-go verdict: Saydo `specs/agent-browser-poc/results.md`.
+
+## Deployment readiness (S2, 2026-09-25)
+
+Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
+
+- Modes: without `ABP_CONFIG_FILE` the Runtime runs exactly as the PoC harness (abp1 keys file,
+  TCP admin with bearer). With `/etc/abp/runtime.json` (`runtimeConfig.ts`, schema-validated)
+  identity, profile owners (`profiles[].principalId`) and `trustedIssuers` come from the file.
+  `authMode: "production"` accepts interactive capabilities only as `abp2` (Ed25519, `aud` =
+  machineId, `iss` = saycode-server, lifetime ≤ 5 min), keeps internally minted abp1 agent
+  grants, creates the agent key inside the state volume, and serves admin on a 0600 unix socket.
+- Broker (`broker.ts`, `/run/abp/broker.sock` 0660): the daemon registers at spawn (the Happy
+  session id does not exist yet), binds the registration when the session reports its id, and
+  revokes it at exit; session processes get 55-minute grants with their per-session secret
+  (`brokerGrantSource.ts`) and renew 5 minutes early. `GET /v1/attention` serves the outbox.
+- Attention outbox (`attention.ts`): transitions are tagged `data.attention` at commit time
+  (approval decided, takeover released, user resume, recovery); the outbox observes TaskStore
+  commits and `reconcile()` repairs a crash between the task commit and the outbox write.
+- User resume (D8): interactive `resume` only from `user-input-complete`, and only while the
+  task's stored grant is valid; approval waits, uncertain writes, cancel requests and
+  browser replacement are never released by the user.
+- Writer lock (D9): the image entrypoint runs `exec flock -n -E 75 -F <state>/runtime.flock node`;
+  production refuses to start unless `/proc/locks` shows this pid holding it. The heartbeat
+  lease and fencing token stay. The container runs as uid 10870 (no host login user).
