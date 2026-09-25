@@ -136,6 +136,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
+import { createBrowserTaskSessionBroker } from './browserTaskBroker';
 import {
   createProcFs,
   createProcProcessProbe,
@@ -1641,6 +1642,9 @@ export async function startDaemon(): Promise<void> {
     ): Promise<Record<string, string>> => ({});
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
+    // Execution machine H only: per-session Agent Browser grants via the Runtime broker.
+    const browserTaskBroker = createBrowserTaskSessionBroker();
+
     const spawnSession = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
@@ -1702,6 +1706,12 @@ export async function startDaemon(): Promise<void> {
       }
 
       let stagedDeferredContinuationContextFile: string | undefined;
+      let browserTaskRegistration: { registrationId: string; sessionSecret: string } | undefined;
+      const releaseBrowserTaskRegistration = async (): Promise<void> => {
+        const registration = browserTaskRegistration;
+        browserTaskRegistration = undefined;
+        if (registration) await browserTaskBroker?.revoke({ registrationId: registration.registrationId });
+      };
       const cleanupStagedDeferredContinuationContext = (): void => {
         if (!stagedDeferredContinuationContextFile) return;
         const file = stagedDeferredContinuationContextFile;
@@ -1724,6 +1734,11 @@ export async function startDaemon(): Promise<void> {
             if (result.type !== 'success') {
               cleanupStagedDeferredContinuationContext();
             }
+            // The Happy session id exists only now; an unbound registration never issues a grant.
+            if (browserTaskRegistration && !(result.type === 'success'
+              && await browserTaskBroker?.bind(browserTaskRegistration.registrationId, result.sessionId))) {
+              await releaseBrowserTaskRegistration();
+            }
             if (result.type !== 'success') return result;
             const reported: SpawnSessionResult = appliedAiAuthSource === undefined
               ? result
@@ -1739,6 +1754,7 @@ export async function startDaemon(): Promise<void> {
             };
           } catch (error) {
             cleanupStagedDeferredContinuationContext();
+            await releaseBrowserTaskRegistration();
             throw error;
           }
         };
@@ -2013,6 +2029,11 @@ export async function startDaemon(): Promise<void> {
             additionalDirectoryResult.accepted,
           );
         }
+        browserTaskRegistration = await browserTaskBroker?.register();
+        if (browserTaskRegistration) {
+          // Session process only; it removes the secret from its env before spawning claude.
+          extraEnv.HAPPY_BROWSER_TASK_SESSION_SECRET = browserTaskRegistration.sessionSecret;
+        }
 
         // Isolated sessions must not inherit unrelated daemon credentials.
         const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
@@ -2217,6 +2238,7 @@ export async function startDaemon(): Promise<void> {
         }));
       } catch (error) {
         cleanupStagedDeferredContinuationContext();
+        await releaseBrowserTaskRegistration();
         const errorMessage = error instanceof Error ? error.message : String(error);
         logger.debug('[DAEMON RUN] Failed to spawn session:', error);
         return {
@@ -3178,6 +3200,8 @@ export async function startDaemon(): Promise<void> {
         logger.debug(`[DAEMON RUN] Child exit of PID ${pid} not yet on a receipt; deferred`);
       }
       if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
+      // Revokes the session's broker registration and every agent grant it received.
+      if (tracked?.happySessionId) void browserTaskBroker?.revoke({ agentSessionId: tracked.happySessionId });
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
