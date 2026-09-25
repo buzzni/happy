@@ -104,6 +104,17 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             <button type="button" onclick="hit('plain')">Helper</button>
             <a href="/help?x=1">Help link</a>
         </form><button onclick="hit('outside')">Outside</button></body>`)
+        a.route('/relabel', `${HIT_SCRIPT}<body style="margin:0"><button id="b" style="position:absolute;left:20px;top:20px;width:160px;height:40px"
+            onmouseover="this.textContent = 'Pay now'" onclick="hit('relabel-' + this.textContent)">Continue</button></body>`)
+        a.route('/inner-btn', `${HIT_SCRIPT}<body style="margin:0"><button style="position:absolute;left:40px;top:40px;width:120px;height:40px" onclick="hit('inner-btn')">Inner go</button></body>`)
+        b.route('/frame-btn', `${HIT_SCRIPT}<body style="margin:0"><button style="position:absolute;left:40px;top:40px;width:120px;height:40px" onclick="hit('frame-btn')">Frame go</button></body>`)
+        const framed = (src: string, overlay: boolean) => `${HIT_SCRIPT}<body style="margin:0">
+            <iframe src="${src}" style="position:absolute;left:30px;top:30px;width:300px;height:200px;border:5px solid black;padding:3px"></iframe>
+            ${overlay ? `<div style="position:absolute;left:0;top:0;width:500px;height:400px;z-index:10;opacity:0.01" onclick="hit('overlay')"></div>` : ''}</body>`
+        a.route('/frame-clear-same', framed('/inner-btn', false))
+        a.route('/frame-overlay-same', framed('/inner-btn', true))
+        a.route('/frame-clear-oopif', () => framed(b.url('/frame-btn'), false))
+        a.route('/frame-overlay-oopif', () => framed(b.url('/frame-btn'), true))
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -426,6 +437,41 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
             await harness.evaluate(tab.targetId, 'swap()')
             await expectCode(driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS), 'STALE_REF')
+        })
+    })
+
+    describe('dispatch-time label and ancestor overlay checks', () => {
+        it('refuses to click when the same node was relabelled after the snapshot (no dispatch)', async () => {
+            const tab = await open('/relabel', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const error = await expectCode(driver.click(tab.tabId, refOf(obs, 'Continue'), obs.snapshotId, OPTS), 'STALE_REF')
+            expect(error.mayHaveSideEffects).toBe(false)
+            await delay(300)
+            expect(a.hits('relabel-Pay now') + a.hits('relabel-Continue')).toBe(0)
+        })
+
+        it('clicks inside a same-process iframe and an OOPIF when nothing in a parent document covers them', async () => {
+            let tab = await open('/frame-clear-same', [a.origin])
+            let obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Inner go'), obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('inner-btn'), (n) => n === 1)).toBe(1)
+            tab = await open('/frame-clear-oopif', [a.origin, b.origin])
+            obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Frame go'), obs.snapshotId, OPTS)
+            expect(await eventually(() => b.hits('frame-btn'), (n) => n === 1)).toBe(1)
+        })
+
+        it('refuses a click whose iframe is covered by an element of the parent document (same-process and OOPIF)', async () => {
+            for (const [path, name, site, hit] of [['/frame-overlay-same', 'Inner go', a, 'inner-btn'], ['/frame-overlay-oopif', 'Frame go', b, 'frame-btn']] as const) {
+                const tab = await open(path, [a.origin, b.origin])
+                const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+                const error = await expectCode(driver.click(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS), 'INVALID_REQUEST')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+                expect(error.message, path).toContain('covered by a parent document')
+                await delay(300)
+                expect(site.hits(hit), path).toBe(0)
+                expect(a.hits('overlay'), path).toBe(0)
+            }
         })
     })
 

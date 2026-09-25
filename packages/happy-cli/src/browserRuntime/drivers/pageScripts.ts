@@ -224,6 +224,62 @@ export const HIT_TEST = String.raw`function hitTest() {
     return !!hit && (hit === element || element.contains(hit))
 }`
 
+/** `this` = the target element. Its role and accessible name now, computed like the snapshot's. */
+export const LABEL_OF = String.raw`function labelOf() {
+${ELEMENT_NAMING}
+    return { role: roleOf(this), name: nameOf(this) }
+}`
+
+/**
+ * Walks up from an element (incoming = null: start at its centre, the point
+ * HIT_TEST checks) or from an iframe element in a parent document (incoming =
+ * the point in that iframe's client coordinates) through every same-process
+ * ancestor document, requiring each to hit the iframe element itself at the
+ * point, i.e. nothing of a parent document covers it.
+ * Returns { covered } | { top } | { point, levels } when the next parent is in
+ * another process (the caller continues there; levels = frames climbed here).
+ */
+export const CLIMB_FRAMES = String.raw`function climbFrames(incoming) {
+    const hitOwner = (owner, p) => {
+        const rect = owner.getBoundingClientRect()
+        const style = owner.ownerDocument.defaultView.getComputedStyle(owner)
+        const x = rect.left + owner.clientLeft + parseFloat(style.paddingLeft || '0') + p.x
+        const y = rect.top + owner.clientTop + parseFloat(style.paddingTop || '0') + p.y
+        const root = owner.getRootNode()
+        const hit = (typeof root.elementFromPoint === 'function' ? root : owner.ownerDocument).elementFromPoint(x, y)
+        return { hit: hit === owner, point: { x, y } }
+    }
+    let point
+    if (incoming) {
+        const first = hitOwner(this, incoming)
+        if (!first.hit) return { covered: true }
+        point = first.point
+    } else {
+        const rect = this.getBoundingClientRect()
+        point = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+    }
+    let doc = this.ownerDocument
+    let levels = 0
+    for (;;) {
+        const win = doc.defaultView
+        if (!win) return { covered: true }
+        if (win === win.top) return { top: true }
+        let owner = null
+        try { owner = win.frameElement } catch { owner = null }
+        if (!owner) return { point, levels }
+        const next = hitOwner(owner, point)
+        if (!next.hit) return { covered: true }
+        point = next.point
+        doc = owner.ownerDocument
+        levels += 1
+    }
+}`
+
+/** `this` = a node resolved into some frame's isolated world; true when it belongs to that frame's document. */
+export const IN_THIS_DOCUMENT = String.raw`function inThisDocument() {
+    return this.ownerDocument === document
+}`
+
 /** `this` = the target element; selects its current content so insertText replaces it. */
 /** Focuses and selects the element; returns whether it (still) holds focus, so text never goes elsewhere. */
 export const SELECT_CONTENT = String.raw`function selectContent() {

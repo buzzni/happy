@@ -34,7 +34,7 @@ import {
 } from '../contracts'
 import { formDigest } from '../policy'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
-import { CHECK_ELEMENT, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, SELECT_CONTENT, type CollectedFrame, type ElementState } from './pageScripts'
+import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, type CollectedFrame, type ElementState } from './pageScripts'
 
 export interface CdpDriverOptions {
     /** Browser-level endpoint from `/json/version` (webSocketDebuggerUrl). */
@@ -72,6 +72,8 @@ const CLOSE_CONFIRM_MS = 2_000
 const CONNECT_TIMEOUT_MS = 10_000
 const CLOSE_RETRIES = 3
 const CLOSE_RETRY_MS = 200
+/** Deeper frame nesting than this is refused rather than walked for overlays. */
+const MAX_FRAME_DEPTH = 16
 export const DEFAULT_MAX_AGENT_WINDOWS = 4
 
 async function withDeadline<T>(ms: number, message: string, body: () => Promise<T>): Promise<T> {
@@ -136,10 +138,13 @@ interface SessionInfo {
     tab: TabState
     targetId: string
     isMain: boolean
+    /** OOPIF sessions: the session of the document that embeds this frame */
+    parentSessionId?: string
 }
 
 interface LiveFrame {
     frameId: string
+    parentId?: string
     loaderId: string
     url: string
     origin: string
@@ -585,6 +590,8 @@ export class CdpDriver implements BrowserDriver {
             if (Math.abs(settled.x - point.x) > 1 || Math.abs(settled.y - point.y) > 1) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'element moved while the pointer arrived; not interacting', true, false)
             }
+            await this.assertSameLabel(conn, binding, objectId)
+            this.assertFresh(tab, binding, snapshotId)
             op.markDispatch()
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
@@ -658,6 +665,7 @@ export class CdpDriver implements BrowserDriver {
             await conn.send('DOM.focus', { backendNodeId: binding.backendNodeId }, binding.sessionId)
             const { result: focus } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: SELECT_CONTENT, objectId, returnByValue: true }, binding.sessionId)
             if (focus.value !== true) throw new BrowserRuntimeError('INVALID_REQUEST', 'focus moved away from the element; not typing', true, false)
+            await this.assertSameLabel(conn, binding, objectId)
             this.assertFresh(tab, binding, snapshotId)
             op.markDispatch()
             if (value) {
@@ -872,7 +880,7 @@ export class CdpDriver implements BrowserDriver {
             }
             const tab = parent.tab
             tab.sessions.add(childSessionId)
-            this.sessions.set(childSessionId, { tab, targetId: targetInfo.targetId, isMain: false })
+            this.sessions.set(childSessionId, { tab, targetId: targetInfo.targetId, isMain: false, parentSessionId })
             this.touch(tab, targetInfo.targetId)
             const setup = this.setupSession(conn, childSessionId, false).catch(() => undefined)
             tab.pendingSetups.add(setup)
@@ -1041,10 +1049,13 @@ export class CdpDriver implements BrowserDriver {
             return { sessionId, frameTree }
         }))
         const byId = new Map<string, LiveFrame & { owner: boolean }>()
+        const parents = new Map<string, string>()
         const order: string[] = []
         for (const { sessionId, frameTree } of trees) {
             const info = this.sessions.get(sessionId)
             const walk = (node: any) => {
+                // An OOPIF's own session may not name its parent; the parent session's tree does.
+                for (const child of node.childFrames ?? []) parents.set(child.frame.id, node.frame.id)
                 const frame = node.frame
                 const owner = frame.id === info?.targetId
                 const existing = byId.get(frame.id)
@@ -1071,7 +1082,8 @@ export class CdpDriver implements BrowserDriver {
         }
         return order.map((id) => {
             const { owner: _owner, ...frame } = byId.get(id)!
-            return frame
+            const parentId = parents.get(id)
+            return parentId ? { ...frame, parentId } : frame
         })
     }
 
@@ -1187,6 +1199,7 @@ export class CdpDriver implements BrowserDriver {
         await check()
         const { result: hit } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: HIT_TEST, objectId, returnByValue: true }, binding.sessionId)
         if (hit.value !== true) throw new BrowserRuntimeError('INVALID_REQUEST', 'element is covered by another element; not interacting', true, false)
+        await this.assertFrameChainUncovered(conn, tab, binding, objectId)
         const { quads } = await conn.send('DOM.getContentQuads', { backendNodeId: binding.backendNodeId }, binding.sessionId)
         const quad: number[] | undefined = quads?.[0]
         if (!quad) throw new BrowserRuntimeError('INVALID_REQUEST', 'element has no box; not interacting', false, false)
@@ -1194,6 +1207,72 @@ export class CdpDriver implements BrowserDriver {
             x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
             y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
         }
+    }
+
+    /**
+     * The same node can be relabelled in place ("Continue" becomes "Pay"): the ref
+     * still resolves, so compare the role/name with the snapshot's right before
+     * input. A restored ref has no snapshot label (not persisted) and is skipped;
+     * its approval binds the label instead.
+     */
+    private async assertSameLabel(conn: CdpConnection, binding: RefBinding, objectId: string): Promise<void> {
+        if (!binding.role && !binding.name) return
+        const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: LABEL_OF, objectId, returnByValue: true }, binding.sessionId)
+        const label = result.value as { role: string; name: string } | undefined
+        if (label?.role !== binding.role || label.name !== binding.name) throw staleRef('element label changed since the snapshot')
+    }
+
+    /**
+     * HIT_TEST only sees the element's own document. For an element inside an
+     * iframe, every ancestor document must hit the iframe element itself at the
+     * click point, so an overlay placed by a parent document (same-process or
+     * OOPIF) is refused like an in-document one. Same-process ancestors are
+     * climbed in the isolated world; at a process boundary the walk continues in
+     * the embedding session through DOM.getFrameOwner. Anything that cannot be
+     * verified (unknown parent, same-process cross-origin parent, too deep) is refused.
+     */
+    private async assertFrameChainUncovered(conn: CdpConnection, tab: TabState, binding: RefBinding, objectId: string): Promise<void> {
+        if (binding.frameId === tab.targetId) return
+        const covered = () => new BrowserRuntimeError('INVALID_REQUEST', 'element\'s frame is covered by a parent document; not interacting', true, false)
+        const frames = await this.collectFrames(conn, tab)
+        const parentOf = new Map(frames.map((frame) => [frame.frameId, frame.parentId]))
+        let sessionId = binding.sessionId
+        let frameId = binding.frameId
+        let target = objectId
+        let incoming: { x: number; y: number } | null = null
+        for (let hop = 0; hop < MAX_FRAME_DEPTH; hop++) {
+            const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: CLIMB_FRAMES, objectId: target,
+                arguments: [{ value: incoming }], returnByValue: true }, sessionId)
+            const climb = result.value as { covered?: true; top?: true; point?: { x: number; y: number }; levels?: number } | undefined
+            if (!climb || climb.covered) throw covered()
+            if (climb.top) return
+            // The climb stopped where the parent is in another process: that must be this session's root frame.
+            let reached: string | undefined = frameId
+            for (let level = 0; level < (climb.levels ?? 0) && reached; level++) reached = parentOf.get(reached)
+            const info = this.sessions.get(sessionId)
+            if (!info || info.isMain || reached !== info.targetId || !info.parentSessionId || !climb.point) throw covered()
+            const parentSessionId: string = info.parentSessionId
+            const owner = await conn.send('DOM.getFrameOwner', { frameId: info.targetId }, parentSessionId).catch(() => undefined)
+            if (!owner?.backendNodeId) throw covered()
+            let ownerFrame: { frameId: string; objectId: string } | undefined
+            for (const frame of frames.filter((candidate) => candidate.sessionId === parentSessionId)) {
+                const contextId = await this.isolatedContext(conn, tab, parentSessionId, frame.frameId, this.stampOf(tab, frame.frameId))
+                const resolved = await conn.send('DOM.resolveNode', { backendNodeId: owner.backendNodeId, executionContextId: contextId }, parentSessionId).catch(() => undefined)
+                if (!resolved?.object?.objectId) continue
+                const { result: mine } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: IN_THIS_DOCUMENT,
+                    objectId: resolved.object.objectId, returnByValue: true }, parentSessionId)
+                if (mine.value === true) {
+                    ownerFrame = { frameId: frame.frameId, objectId: resolved.object.objectId }
+                    break
+                }
+            }
+            if (!ownerFrame) throw covered()
+            sessionId = parentSessionId
+            frameId = ownerFrame.frameId
+            target = ownerFrame.objectId
+            incoming = climb.point
+        }
+        throw covered()
     }
 }
 
