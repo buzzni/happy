@@ -5,5 +5,5 @@ COPY scripts/browser-poc/images/instance-server.py /usr/local/bin/instance-serve
 COPY scripts/browser-poc/images/cdp-proxy.py /usr/local/bin/cdp-proxy
 RUN chmod 755 /usr/local/bin/browser-entrypoint /usr/local/bin/instance-server /usr/local/bin/cdp-proxy
 USER browser
-EXPOSE 6080 9223 9224
+EXPOSE 5900 6080 9223 9224
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/browser-entrypoint"]

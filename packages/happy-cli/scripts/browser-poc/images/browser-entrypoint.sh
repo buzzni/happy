@@ -2,12 +2,18 @@
 set -eu
 export DISPLAY=:99
 Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &
-# The viewer is the only human input path, so it must authenticate: the harness
-# (standing in for the relay) hands the per-run password to the user's viewer only.
+# Human input reaches this display only through the Runtime's viewer proxy (D2),
+# which enforces the takeover lease. x11vnc therefore listens on the profile
+# network (never published) and still requires the per-run password, which only
+# the Runtime holds.
 test -n "${ABP_VNC_PASSWORD:-}"
 x11vnc -storepasswd "$ABP_VNC_PASSWORD" /tmp/vncpass >/dev/null 2>&1
-x11vnc -display :99 -rfbport 5900 -localhost -forever -shared -rfbauth /tmp/vncpass >/tmp/x11vnc.log 2>&1 &
-websockify --web /usr/share/novnc/ 0.0.0.0:6080 127.0.0.1:5900 >/tmp/websockify.log 2>&1 &
+unset ABP_VNC_PASSWORD
+x11vnc -display :99 -rfbport 5900 -forever -shared -rfbauth /tmp/vncpass >/tmp/x11vnc.log 2>&1 &
+# PoC harness only (ABP_HARNESS_NOVNC=1): direct noVNC on 6080 for the A11 raw-surface checks.
+if [ "${ABP_HARNESS_NOVNC:-0}" = "1" ]; then
+  websockify --web /usr/share/novnc/ 0.0.0.0:6080 127.0.0.1:5900 >/tmp/websockify.log 2>&1 &
+fi
 socat TCP-LISTEN:9223,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9225 &
 python3 /usr/local/bin/cdp-proxy &
 python3 /usr/local/bin/instance-server &
