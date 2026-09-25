@@ -4,7 +4,7 @@
 // arguments). Pure functions, no I/O, no dependency beyond node:crypto, so the
 // installed copy runs with /usr/bin/node alone and the unit tests pin it.
 // Errors name the field, never the value (issuer keys, tokens).
-import { createPublicKey } from "node:crypto";
+import { createHash, createPublicKey } from "node:crypto";
 
 export const DEFAULT_RUNTIME_PORT = 38700;
 export const PACKAGE_NAME = "@buzzni/happy-cli";
@@ -17,6 +17,7 @@ export const PATHS = {
   daemonEnv: "/etc/abp/happy-daemon.env",
   seccompProfile: "/etc/abp/seccomp-chromium.json",
   firewallRules: { 4: "/etc/abp/firewall.rules4", 6: "/etc/abp/firewall.rules6" },
+  egressRules: { 4: "/etc/abp/egress.rules4", 6: "/etc/abp/egress.rules6" },
   varLib: "/var/lib/abp",
   daemonToken: "/var/lib/abp/daemon-token",
   secrets: "/var/lib/abp/secrets",
@@ -40,7 +41,11 @@ export const PATHS = {
   units: "/etc/systemd/system",
   happyPrefix: "/opt/abp/happy",
   stackLock: "/run/abp-stack.lock",
+  /** Serializes mutating operations (install, upgrade, rollback, rotate-keys, set-principal, up/down). */
+  opsLock: "/run/abp-stack-ops.lock",
 };
+export const DEFAULT_BROWSER_SUBNET_POOL = "10.249.240.0/20";
+const MAX_PROFILES = 16;
 /** Container-side paths (fixed by the images). */
 const IN_CONTAINER = { secrets: "/run/secrets/abp", vncPassword: "/run/secrets/abp/vnc-password", state: "/var/lib/abp", stateDir: "/var/lib/abp/state", profile: "/home/browser/profile" };
 export const STACK_LABEL = "ai.saycode.abp=stack";
@@ -53,6 +58,23 @@ const PROFILE_ID = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const TEXT_ID = /^[^\u0000-\u001f\u007f]{1,256}$/;
 const DOMAIN = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/;
 const IMAGE_ID = /^sha256:[0-9a-f]{64}$/;
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const ipToInt = (ip) => ip.split(".").reduce((n, byte) => n * 256 + Number(byte), 0);
+const intToIp = (n) => [24, 16, 8, 0].map((shift) => Math.floor(n / 2 ** shift) % 256).join(".");
+/** [network, bits] of an aligned IPv4 CIDR, or undefined. */
+function parseCidr(value) {
+  const [ip, bits, extra] = String(value).split("/");
+  const prefix = Number(bits);
+  if (extra !== undefined || !IPV4.test(ip ?? "") || !/^\d{1,2}$/.test(bits ?? "") || prefix > 32) return undefined;
+  const network = ipToInt(ip);
+  return network % 2 ** (32 - prefix) === 0 ? [network, prefix] : undefined;
+}
+const inside = (cidr, outer) => {
+  const [network, bits] = parseCidr(cidr);
+  const [base, outerBits] = parseCidr(outer);
+  return bits >= outerBits && Math.floor(network / 2 ** (32 - outerBits)) === Math.floor(base / 2 ** (32 - outerBits));
+};
 
 function fail(field, message) {
   throw new Error(`abp install option ${field}: ${message}`);
@@ -84,6 +106,9 @@ export function mergeInstallOptions(saved, flags) {
     egressDomains: [],
     sites: [],
     happyPrefix: PATHS.happyPrefix,
+    browserSubnetPool: DEFAULT_BROWSER_SUBNET_POOL,
+    denyCidrs: [],
+    browserDns: [],
     ...saved,
     ...Object.fromEntries(Object.entries(flags).filter(([key, value]) => value !== undefined && key !== "issuers")),
   };
@@ -96,6 +121,7 @@ export function mergeInstallOptions(saved, flags) {
     if (typeof merged[field] !== "string" || !TEXT_ID.test(merged[field])) fail(field, "is required (1-256 printable characters)");
   }
   if (!Array.isArray(merged.profiles) || merged.profiles.length === 0) fail("profiles", "at least one --profile <id>=<principalId> is required");
+  if (merged.profiles.length > MAX_PROFILES) fail("profiles", `at most ${MAX_PROFILES} (one /24 of the browser subnet pool each)`);
   const seen = new Set();
   for (const [index, profile] of merged.profiles.entries()) {
     if (!PROFILE_ID.test(profile?.profileId ?? "")) fail(`profiles[${index}].profileId`, "must be lowercase letters, digits and hyphens (max 31), it names containers and volumes");
@@ -108,10 +134,14 @@ export function mergeInstallOptions(saved, flags) {
   if (!Array.isArray(merged.trustedIssuers) || merged.trustedIssuers.length === 0) fail("trustedIssuers", "at least one --issuer <kid>=<public-key.pem> is required");
   merged.trustedIssuers = merged.trustedIssuers.map((issuer, index) => {
     if (!TEXT_ID.test(issuer?.kid ?? "")) fail(`trustedIssuers[${index}].kid`, "is required");
-    let type;
-    try { type = createPublicKey(issuer.publicKeyPem).asymmetricKeyType; } catch { type = undefined; }
-    if (type !== "ed25519" || issuer.publicKeyPem.length > 4096) fail(`trustedIssuers[${index}].publicKeyPem`, "must be an Ed25519 public key (PEM)");
-    return { kid: issuer.kid, publicKeyPem: issuer.publicKeyPem };
+    // createPublicKey also accepts a private key (deriving its public half): refuse that, then keep only the canonical SPKI.
+    let key;
+    try {
+      if (typeof issuer.publicKeyPem !== "string" || issuer.publicKeyPem.length > 4096 || /PRIVATE KEY/.test(issuer.publicKeyPem)) throw new Error();
+      key = createPublicKey({ key: issuer.publicKeyPem, format: "pem" });
+    } catch { key = undefined; }
+    if (key?.asymmetricKeyType !== "ed25519") fail(`trustedIssuers[${index}].publicKeyPem`, "must be an Ed25519 public key (PEM, SPKI), never a private key");
+    return { kid: issuer.kid, publicKeyPem: key.export({ type: "spki", format: "pem" }).toString() };
   });
   if (!Array.isArray(merged.sites)) fail("sites", "must be a JSON array of site policies");
   merged.sites.forEach((site, index) => bareOrigin(site?.origin, `sites[${index}].origin`));
@@ -121,6 +151,14 @@ export function mergeInstallOptions(saved, flags) {
   merged.viewerOrigins.forEach((origin, index) => bareOrigin(origin, `viewerOrigins[${index}]`));
   if (merged.egressDomains.length > 64) fail("egressDomains", "at most 64");
   merged.egressDomains.forEach((domain, index) => { if (!DOMAIN.test(domain)) fail(`egressDomains[${index}]`, "must be an exact lowercase domain (no wildcard)"); });
+  const pool = parseCidr(merged.browserSubnetPool);
+  if (!pool || pool[1] !== 20 || !["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"].some((range) => inside(merged.browserSubnetPool, range))) {
+    fail("browserSubnetPool", "must be a private IPv4 /20 (one /24 per profile)");
+  }
+  if (!Array.isArray(merged.denyCidrs) || merged.denyCidrs.length > 256) fail("denyCidrs", "at most 256");
+  merged.denyCidrs.forEach((cidr, index) => { if (!parseCidr(cidr)) fail(`denyCidrs[${index}]`, "must be an aligned IPv4 CIDR such as 10.20.0.0/16"); });
+  if (!Array.isArray(merged.browserDns) || merged.browserDns.length > 8) fail("browserDns", "at most 8");
+  merged.browserDns.forEach((ip, index) => { if (!IPV4.test(ip)) fail(`browserDns[${index}]`, "must be an IPv4 address"); });
   // The sandbox launcher and preflight require root-owned, non-writable executables outside private homes and /tmp.
   if (!/^\/[A-Za-z0-9._/-]+$/.test(merged.happyPrefix) || /(^|\/)\.\.?(\/|$)/.test(merged.happyPrefix) || /^\/(home|tmp|var\/tmp|root|work|run)(\/|$)/.test(merged.happyPrefix)) {
     fail("happyPrefix", "must be an absolute root-owned location outside /home, /root, /tmp, /var/tmp, /run and /work");
@@ -168,6 +206,8 @@ export function permissionTable() {
     row(PATHS.seccompProfile, "file", "root", "root", "0644"),
     row(PATHS.firewallRules[4], "file", "root", "root", "0644"),
     row(PATHS.firewallRules[6], "file", "root", "root", "0644"),
+    row(PATHS.egressRules[4], "file", "root", "root", "0644"),
+    row(PATHS.egressRules[6], "file", "root", "root", "0644"),
     // agent traverses to its token (abp-session); agent-sbx cannot enter.
     row(PATHS.varLib, "dir", "root", "abp-session", "0710"),
     row(PATHS.daemonToken, "secret", "agent", "agent", "0400", { secret: true }),
@@ -207,6 +247,63 @@ export function firewallRules(family, sandboxUid, proxyUid) {
   for (const cidr of family === 4 ? DENIED_IPV4 : DENIED_IPV6) rules.push(`-A OUTPUT -d ${cidr} -m owner --uid-owner ${proxyUid} -j REJECT`);
   rules.push(`-A OUTPUT${family === 6 ? " -d 2000::/3" : ""} -p tcp -m owner --uid-owner ${proxyUid} -m tcp --dport 443 -j ACCEPT`, `${proxy} -j REJECT`);
   return rules;
+}
+
+/** firewall.rules4/6: the S1 owner prefix, then (IPv4) the jump to the stack's admission fence chain. */
+export function firewallRulesFile(family, sandboxUid, proxyUid) {
+  return `${[...firewallRules(family, sandboxUid, proxyUid), ...family === 4 ? ["-A OUTPUT -j ABP-FENCE"] : []].join("\n")}\n`;
+}
+
+/**
+ * Admission fence (upgrade, key rotation, stop): host-originated packets to the Runtime API port are reset,
+ * including requests on kept-alive connections, while the Runtime finishes running batches. The published
+ * port and the container port are the same number, so this matches both the docker-proxy and the DNAT path.
+ */
+export function fenceRule(runtimePort) {
+  return ["-p", "tcp", "-m", "tcp", "--dport", String(runtimePort), "-j", "REJECT", "--reject-with", "tcp-reset"];
+}
+
+/**
+ * Browser egress (FORWARD via DOCKER-USER, host via INPUT). Pages may reach public addresses only:
+ * private, special, metadata, host and deployment ranges are rejected, except DNS to the configured
+ * resolvers. The Runtime may only reach its own browser; the browser may only answer the Runtime.
+ * Rules are in iptables-save form so abp-firewall can compare them with the live chains.
+ * IPv6: browser networks are IPv4-only, so everything IPv6 from a browser bridge is rejected.
+ */
+export function egressRules(layout, install) {
+  const chain = [];
+  for (const browser of layout.browsers) {
+    const b = `${browser.browserIp}/32`;
+    const r = `${browser.runtimeIp}/32`;
+    chain.push(`-s ${r} -d ${b} -j RETURN`);
+    chain.push(`-s ${b} -d ${r} -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j RETURN`);
+    for (const dns of install.browserDns) {
+      chain.push(`-s ${b} -d ${dns}/32 -p udp -m udp --dport 53 -j RETURN`, `-s ${b} -d ${dns}/32 -p tcp -m tcp --dport 53 -j RETURN`);
+    }
+    chain.push(`-s ${b} -m set --match-set abp-deny4 dst -j REJECT`, `-s ${b} -j RETURN`);
+  }
+  chain.push("-j REJECT");
+  return {
+    4: {
+      sets: { "abp-deny4": [...new Set([...DENIED_IPV4, ...install.denyCidrs])] },
+      chains: { "ABP-EGRESS": chain, "ABP-INPUT": ["-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN", "-j REJECT"] },
+      jumps: [["DOCKER-USER", "-i br-abp+ -j ABP-EGRESS"], ["INPUT", "-i br-abp+ -j ABP-INPUT"]],
+    },
+    6: {
+      sets: {},
+      chains: { "ABP-EGRESS": ["-j REJECT"], "ABP-INPUT": ["-j REJECT"] },
+      jumps: [["FORWARD", "-i br-abp+ -j ABP-EGRESS"], ["INPUT", "-i br-abp+ -j ABP-INPUT"]],
+    },
+  };
+}
+
+/** egress.rules4/6 for abp-firewall: `set <name> <cidr>`, `chain <name> <spec>`, `jump <parent> <spec>` lines. */
+export function egressRulesFile(rules) {
+  const lines = [];
+  for (const [name, members] of Object.entries(rules.sets)) for (const cidr of members) lines.push(`set ${name} ${cidr}`);
+  for (const [name, specs] of Object.entries(rules.chains)) for (const spec of specs) lines.push(`chain ${name} ${spec}`);
+  for (const [parent, spec] of rules.jumps) lines.push(`jump ${parent} ${spec}`);
+  return `${lines.join("\n")}\n`;
 }
 
 export function sudoersDropIn() {
@@ -285,19 +382,37 @@ export function systemdUnits({ happyPrefix = PATHS.happyPrefix } = {}) {
       "[Install]",
       "WantedBy=multi-user.target",
     ]),
+    "abp-egress.service": unit([
+      "[Unit]",
+      "Description=Agent Browser browser egress firewall (DOCKER-USER, INPUT)",
+      // Restarted with Docker, which rebuilds its own chains; abp-stack also checks the rules before starting containers.
+      "PartOf=docker.service",
+      "After=docker.service abp-firewall.service",
+      "Before=abp-stack.service",
+      "",
+      "[Service]",
+      "Type=oneshot",
+      "RemainAfterExit=yes",
+      `ExecStart=${PATHS.libexec}/abp-firewall apply-egress`,
+      `ExecReload=${PATHS.libexec}/abp-firewall apply-egress`,
+      "",
+      "[Install]",
+      "WantedBy=multi-user.target docker.service",
+    ]),
     "abp-stack.service": unit([
       "[Unit]",
       "Description=Agent Browser stack (Runtime + one browser per profile)",
-      "Requires=docker.service",
-      "After=docker.service abp-firewall.service systemd-tmpfiles-setup.service network-online.target",
+      "Requires=docker.service abp-firewall.service abp-egress.service",
+      "After=docker.service abp-firewall.service abp-egress.service systemd-tmpfiles-setup.service network-online.target",
       "Wants=network-online.target",
       "",
       "[Service]",
       "Type=simple",
-      `ExecStart=/usr/bin/flock -n ${PATHS.stackLock} ${PATHS.stackBin} run`,
-      // run stops the Runtime first (tasks recover paused), then the browsers.
+      // -F (no fork): node is the main process and gets SIGTERM, so it can fence, drain and stop the containers.
+      `ExecStart=/usr/bin/flock -n -F ${PATHS.stackLock} ${PATHS.stackBin} run`,
       "KillMode=mixed",
-      "TimeoutStopSec=90",
+      // Drain (up to 60 s) + Runtime stop (30 s) + browser stops.
+      "TimeoutStopSec=150",
       "Restart=always",
       "RestartSec=5",
       "",
@@ -334,40 +449,73 @@ export function systemdUnits({ happyPrefix = PATHS.happyPrefix } = {}) {
 
 /**
  * Docker's default seccomp profile (vendored, moby/profiles seccomp/v0.2.3)
- * plus the namespace calls of Chromium's own sandbox: it creates a user/PID/net
- * namespace (clone, unshare), chroots its renderers into an empty directory and
- * joins namespaces for its zygote (setns). The default profile allows these only
- * with CAP_SYS_ADMIN, which the container must not have. Everything else stays
- * as in the default, so the only widening is what Chromium needs to sandbox
- * itself instead of running with --no-sandbox.
+ * plus the namespace calls of Chromium's own sandbox: it creates user, PID and
+ * network namespaces (clone, unshare) and chroots its sandboxed processes into an
+ * empty directory. The default profile allows these only with CAP_SYS_ADMIN, which
+ * the container must not have. clone/unshare stay denied for mount, UTS, IPC and
+ * cgroup namespaces, setns stays denied; everything else is as in the default.
  */
+// CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC must stay clear; CLONE_NEWUSER/NEWPID/NEWNET may be set.
+const FORBIDDEN_NAMESPACE_FLAGS = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000;
+// Docker/libseccomp masked compare: (arg & value) == valueTwo.
+const nsArg = (index) => ({ index, value: FORBIDDEN_NAMESPACE_FLAGS, valueTwo: 0, op: "SCMP_CMP_MASKED_EQ" });
+
 export function chromiumSeccompProfile(base) {
   if (base?.defaultAction !== "SCMP_ACT_ERRNO" || !Array.isArray(base.syscalls)) throw new Error("seccomp base must be a default-deny profile");
   return {
     ...base,
     syscalls: [
       ...base.syscalls,
-      { names: ["chroot", "clone", "setns", "unshare"], action: "SCMP_ACT_ALLOW", comment: "Chromium namespace sandbox without CAP_SYS_ADMIN (abp-install)" },
+      { names: ["chroot"], action: "SCMP_ACT_ALLOW", comment: "Chromium chroots its sandboxed processes into an empty directory (abp-install)" },
+      { names: ["clone"], action: "SCMP_ACT_ALLOW", args: [nsArg(0)], excludes: { arches: ["s390", "s390x"] }, comment: "Chromium sandbox: user/PID/net namespaces only (abp-install)" },
+      { names: ["clone"], action: "SCMP_ACT_ALLOW", args: [nsArg(1)], includes: { arches: ["s390", "s390x"] }, comment: "s390 clone argument order (abp-install)" },
+      { names: ["unshare"], action: "SCMP_ACT_ALLOW", args: [nsArg(0)], comment: "Chromium sandbox: user/PID/net namespaces only (abp-install)" },
     ],
   };
 }
 
-/** Production layout: one network per profile shared only by that browser and the Runtime. */
+/**
+ * Production layout: one bridge per profile shared only by that browser and the Runtime.
+ * Profile i gets the i-th /24 of the browser subnet pool (gateway .1, browser .2, Runtime .3) and a
+ * bridge named br-abp-<8 hex of sha256(profileId)> (15 characters, the Linux limit), so the egress
+ * firewall can name exact addresses and match every browser bridge with br-abp+.
+ */
 export function stackLayout(install) {
-  const browsers = install.profiles.map(({ profileId }) => ({
-    profileId,
-    container: `abp-browser-${profileId}`,
-    alias: `browser-${profileId}`,
-    network: `abp-net-${profileId}`,
-    volume: `abp-profile-${profileId}`,
-  }));
+  const [pool] = parseCidr(install.browserSubnetPool ?? DEFAULT_BROWSER_SUBNET_POOL);
+  const browsers = install.profiles.map(({ profileId }, index) => {
+    const base = pool + index * 256;
+    return {
+      profileId,
+      container: `abp-browser-${profileId}`,
+      alias: `browser-${profileId}`,
+      network: `abp-net-${profileId}`,
+      volume: `abp-profile-${profileId}`,
+      bridge: `br-abp-${createHash("sha256").update(profileId).digest("hex").slice(0, 8)}`,
+      subnet: `${intToIp(base)}/24`,
+      gateway: intToIp(base + 1),
+      browserIp: intToIp(base + 2),
+      runtimeIp: intToIp(base + 3),
+    };
+  });
   return {
     runtimePort: install.runtimePort,
     networks: browsers.map((browser) => browser.network),
     volumes: ["abp-state", ...browsers.map((browser) => browser.volume)],
     browsers,
-    runtime: { container: "abp-runtime", alias: "runtime", networks: browsers.map((browser) => browser.network), volume: "abp-state" },
+    runtime: {
+      container: "abp-runtime",
+      alias: "runtime",
+      network: browsers[0].network,
+      ip: browsers[0].runtimeIp,
+      attach: browsers.slice(1).map((browser) => ({ network: browser.network, ip: browser.runtimeIp })),
+      volume: "abp-state",
+    },
   };
+}
+
+export function networkCreateArgs(browser) {
+  return ["network", "create", "--driver=bridge", `--label=${STACK_LABEL}`, `--subnet=${browser.subnet}`, `--gateway=${browser.gateway}`,
+    `--opt=com.docker.network.bridge.name=${browser.bridge}`, browser.network];
 }
 
 function imageRef(image) {
@@ -387,7 +535,7 @@ export function runtimeCreateArgs(layout, image) {
   }));
   return [
     "create", `--name=${layout.runtime.container}`, `--label=${STACK_LABEL}`, "--label=ai.saycode.abp.role=runtime", `--label=ai.saycode.abp.image=${imageRef(image)}`,
-    `--network=${layout.runtime.networks[0]}`, `--network-alias=${layout.runtime.alias}`,
+    `--network=${layout.runtime.network}`, `--ip=${layout.runtime.ip}`, `--network-alias=${layout.runtime.alias}`,
     // S2 production start: root with only SETUID/SETGID to read the root-only config and bind the sockets, then drop.
     "--user=0:0", "--cap-drop=ALL", "--cap-add=SETUID", "--cap-add=SETGID", "--security-opt=no-new-privileges",
     "--read-only", "--tmpfs=/tmp:rw,size=64m", "--pids-limit=256", "--memory=1g", "--cpus=1", "--restart=no", ...logOpts,
@@ -409,7 +557,7 @@ export function browserCreateArgs(layout, browser, image) {
   const tmpfs = (path, size) => `--tmpfs=${path}:rw,uid=${uid},gid=${uid},size=${size}`;
   return [
     "create", `--name=${browser.container}`, `--label=${STACK_LABEL}`, "--label=ai.saycode.abp.role=browser", `--label=ai.saycode.abp.profile=${browser.profileId}`, `--label=ai.saycode.abp.image=${imageRef(image)}`,
-    `--network=${browser.network}`, `--network-alias=${browser.alias}`,
+    `--network=${browser.network}`, `--ip=${browser.browserIp}`, `--network-alias=${browser.alias}`,
     `--user=${uid}:${uid}`, "--cap-drop=ALL", "--security-opt=no-new-privileges", `--security-opt=seccomp=${PATHS.seccompProfile}`,
     "--read-only", "--tmpfs=/tmp:rw,size=128m", tmpfs("/run/abp", "1m"), tmpfs("/home/browser/.cache", "64m"), tmpfs("/home/browser/.config", "64m"), tmpfs("/home/browser/.local", "64m"),
     "--pids-limit=512", "--memory=2g", "--cpus=2", "--shm-size=256m", "--restart=no", ...logOpts,

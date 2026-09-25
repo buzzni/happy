@@ -5,8 +5,9 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { parseRuntimeConfig } from '../../src/browserRuntime/runtimeConfig'
 import {
-    DEFAULT_RUNTIME_PORT, PATHS, browserCreateArgs, chromiumSeccompProfile, daemonEnv, firewallRules, mergeInstallOptions,
-    permissionTable, runtimeConfig, runtimeCreateArgs, stackLayout, sudoersDropIn, systemdUnits, tmpfilesConf,
+    DEFAULT_RUNTIME_PORT, PATHS, browserCreateArgs, chromiumSeccompProfile, daemonEnv, egressRules, egressRulesFile, fenceRule, firewallRules,
+    firewallRulesFile, mergeInstallOptions, networkCreateArgs, permissionTable, runtimeConfig, runtimeCreateArgs, stackLayout, sudoersDropIn,
+    systemdUnits, tmpfilesConf,
 } from './lib/abpPlan.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -51,11 +52,31 @@ describe('install options', () => {
             ['relative Happy prefix', { happyPrefix: 'opt/happy' }],
             ['Happy prefix under a writable tree', { happyPrefix: '/tmp/happy' }],
             ['Happy prefix in a private home', { happyPrefix: '/home/agent/happy' }],
+            ['public browser subnet pool', { browserSubnetPool: '8.8.0.0/20' }],
+            ['browser subnet pool not a /20', { browserSubnetPool: '10.249.0.0/16' }],
+            ['deny CIDR not a network', { denyCidrs: ['10.0.0.1/33'] }],
+            ['browser DNS not an IPv4 address', { browserDns: ['dns.example'] }],
+            ['more than 16 profiles', { profiles: Array.from({ length: 17 }, (_, i) => ({ profileId: `p${i}`, principalId: 'u' })) }],
         ]
         for (const [name, override] of bad) {
             expect(() => mergeInstallOptions(base(), override), name).toThrow()
         }
         expect(() => mergeInstallOptions(undefined, { workspaceId: 'w', profiles: [{ profileId: 'a', principalId: 'u' }], issuers: [{ kid: 'k', publicKeyPem: pem() }] }), 'missing machineId').toThrow(/machineId/)
+    })
+
+    it('refuses a private key given as the issuer key and never echoes it', () => {
+        const privatePem = generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
+        let message = ''
+        try { mergeInstallOptions(base(), { issuers: [{ kid: 'k', publicKeyPem: privatePem }] }) } catch (error) { message = (error as Error).message }
+        expect(message).toMatch(/public key/)
+        expect(message).not.toContain(privatePem.split('\n')[1])
+    })
+
+    it('stores only the canonical SPKI PEM of an issuer key', () => {
+        const canonical = pem()
+        const messy = `${canonical.replace(/\n/g, '\r\n')}\r\n\r\n`
+        const options = mergeInstallOptions(base(), { issuers: [{ kid: 'k', publicKeyPem: messy }] })
+        expect(options.trustedIssuers[0].publicKeyPem).toBe(canonical)
     })
 
     it('never quotes key material in an error', () => {
@@ -94,6 +115,7 @@ describe('permissions', () => {
 
     it('matches the installed layout the Runtime, broker and sandbox preflight expect', () => {
         expect(entry('/etc/abp/runtime.json')).toMatchObject({ owner: 'root', group: 'root', mode: '0600' })
+        expect(entry('/etc/abp/egress.rules4')).toMatchObject({ owner: 'root', group: 'root', mode: '0644' })
         expect(entry('/etc/abp')).toMatchObject({ owner: 'root', group: 'root', mode: '0700' })
         expect(entry('/run/abp')).toMatchObject({ owner: 'root', group: 'abp-session', mode: '0750' })
         expect(entry('/run/abp-mcp')).toMatchObject({ owner: 'agent', group: 'agent-sbx', mode: '0710' })
@@ -160,12 +182,17 @@ describe('system files', () => {
 
     it('orders firewall before proxy, stack and daemon, and supervises the stack and daemon', () => {
         const units = systemdUnits({ happyPrefix: '/opt/abp/happy' })
-        expect(Object.keys(units).sort()).toEqual(['abp-egress-proxy.service', 'abp-firewall.service', 'abp-happy-daemon.service', 'abp-stack.service'])
+        expect(Object.keys(units).sort()).toEqual(['abp-egress-proxy.service', 'abp-egress.service', 'abp-firewall.service', 'abp-happy-daemon.service', 'abp-stack.service'])
         expect(units['abp-firewall.service']).toMatch(/Type=oneshot[\s\S]*RemainAfterExit=yes/)
         expect(units['abp-firewall.service']).toMatch(/Before=.*abp-egress-proxy\.service.*abp-stack\.service.*abp-happy-daemon\.service/)
         expect(units['abp-stack.service']).toMatch(/Restart=always/)
-        expect(units['abp-stack.service']).toMatch(/Requires=docker\.service/)
-        expect(units['abp-stack.service']).toContain('ExecStart=/usr/bin/flock -n /run/abp-stack.lock /usr/local/sbin/abp-stack run')
+        expect(units['abp-stack.service']).toMatch(/Requires=docker\.service abp-firewall\.service abp-egress\.service/)
+        // -F: node itself holds the lock and receives SIGTERM, so it can fence, drain and stop the containers.
+        expect(units['abp-stack.service']).toContain('ExecStart=/usr/bin/flock -n -F /run/abp-stack.lock /usr/local/sbin/abp-stack run')
+        expect(units['abp-egress.service']).toMatch(/After=docker\.service/)
+        expect(units['abp-egress.service']).toMatch(/PartOf=docker\.service/)
+        expect(units['abp-egress.service']).toMatch(/Before=abp-stack\.service/)
+        expect(units['abp-egress.service']).toContain('ExecStart=/usr/local/libexec/abp/abp-firewall apply-egress')
         const daemon = units['abp-happy-daemon.service']
         expect(daemon).toContain('User=agent')
         expect(daemon).toContain('ExecStart=/opt/abp/happy/bin/happy daemon start-sync')
@@ -192,15 +219,90 @@ describe('system files', () => {
     })
 })
 
+describe('browser networks and egress firewall', () => {
+    const install = mergeInstallOptions(base(), {
+        profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }],
+        denyCidrs: ['203.0.114.0/24'], browserDns: ['10.0.0.2'],
+    })
+    const layout = stackLayout(install)
+
+    it('gives every profile a fixed bridge name and fixed addresses from the pool', () => {
+        expect(layout.browsers.map((b: any) => [b.bridge, b.subnet, b.gateway, b.browserIp, b.runtimeIp])).toEqual([
+            [expect.stringMatching(/^br-abp-[0-9a-f]{8}$/), '10.249.240.0/24', '10.249.240.1', '10.249.240.2', '10.249.240.3'],
+            [expect.stringMatching(/^br-abp-[0-9a-f]{8}$/), '10.249.241.0/24', '10.249.241.1', '10.249.241.2', '10.249.241.3'],
+        ])
+        expect(layout.browsers[0].bridge).toHaveLength(15)
+        expect(stackLayout(install).browsers[0].bridge).toBe(layout.browsers[0].bridge)
+        expect(networkCreateArgs(layout.browsers[0])).toEqual(['network', 'create', '--driver=bridge', '--label=ai.saycode.abp=stack',
+            '--subnet=10.249.240.0/24', '--gateway=10.249.240.1', `--opt=com.docker.network.bridge.name=${layout.browsers[0].bridge}`, 'abp-net-main'])
+        const image = 'sha256:' + '2'.repeat(64)
+        expect(browserCreateArgs(layout, layout.browsers[1], image)).toContain('--ip=10.249.241.2')
+        expect(runtimeCreateArgs(layout, 'sha256:' + '1'.repeat(64))).toContain('--ip=10.249.240.3')
+        expect(layout.runtime.attach).toEqual([{ network: 'abp-net-ops', ip: '10.249.241.3' }])
+    })
+
+    it('denies browsers private, special, metadata and deployment ranges but lets the Runtime reach them and DNS through', () => {
+        const rules = egressRules(layout, install)
+        const deny = rules[4].sets['abp-deny4']
+        for (const cidr of ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '127.0.0.0/8', '224.0.0.0/3', '203.0.114.0/24']) expect(deny).toContain(cidr)
+        expect(rules[4].jumps).toEqual([['DOCKER-USER', '-i br-abp+ -j ABP-EGRESS'], ['INPUT', '-i br-abp+ -j ABP-INPUT']])
+        const chain = rules[4].chains['ABP-EGRESS']
+        const at = (rule: string) => chain.indexOf(rule)
+        const main = layout.browsers[0]
+        expect(at(`-s ${main.runtimeIp}/32 -d ${main.browserIp}/32 -j RETURN`)).toBeGreaterThanOrEqual(0)
+        const reply = at(`-s ${main.browserIp}/32 -d ${main.runtimeIp}/32 -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j RETURN`)
+        const dns = at(`-s ${main.browserIp}/32 -d 10.0.0.2/32 -p udp -m udp --dport 53 -j RETURN`)
+        const denied = at(`-s ${main.browserIp}/32 -m set --match-set abp-deny4 dst -j REJECT`)
+        const allowed = at(`-s ${main.browserIp}/32 -j RETURN`)
+        expect(reply).toBeGreaterThanOrEqual(0)
+        expect(dns).toBeGreaterThan(reply)
+        expect(chain).toContain(`-s ${main.browserIp}/32 -d 10.0.0.2/32 -p tcp -m tcp --dport 53 -j RETURN`)
+        expect(denied).toBeGreaterThan(dns)
+        expect(allowed).toBeGreaterThan(denied)
+        // The Runtime, and anything else on a browser bridge, may not leave it.
+        expect(chain.at(-1)).toBe('-j REJECT')
+        expect(chain).not.toContain(`-s ${main.runtimeIp}/32 -j RETURN`)
+        expect(rules[4].chains['ABP-INPUT']).toEqual(['-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN', '-j REJECT'])
+    })
+
+    it('rejects all IPv6 from browser bridges (they have no IPv6 addresses to use)', () => {
+        const rules = egressRules(layout, install)
+        expect(rules[6].jumps).toEqual([['FORWARD', '-i br-abp+ -j ABP-EGRESS'], ['INPUT', '-i br-abp+ -j ABP-INPUT']])
+        expect(rules[6].chains).toEqual({ 'ABP-EGRESS': ['-j REJECT'], 'ABP-INPUT': ['-j REJECT'] })
+    })
+
+    it('writes line files abp-firewall applies (sets, chains, jumps)', () => {
+        const text = egressRulesFile(egressRules(layout, install)[4])
+        expect(text).toMatch(/^set abp-deny4 10\.0\.0\.0\/8$/m)
+        expect(text).toMatch(/^chain ABP-EGRESS -j REJECT$/m)
+        expect(text).toMatch(/^jump DOCKER-USER -i br-abp\+ -j ABP-EGRESS$/m)
+    })
+
+    it('adds the admission fence jump right after the S1 owner rules, and a fence rule for the Runtime port', () => {
+        const lines = firewallRulesFile(4, 1001, 1002).trim().split('\n')
+        expect(lines.slice(0, -1)).toEqual(firewallRules(4, 1001, 1002))
+        expect(lines.at(-1)).toBe('-A OUTPUT -j ABP-FENCE')
+        expect(fenceRule(38700)).toEqual(['-p', 'tcp', '-m', 'tcp', '--dport', '38700', '-j', 'REJECT', '--reject-with', 'tcp-reset'])
+    })
+})
+
 describe('Chromium seccomp profile', () => {
     const baseProfile = JSON.parse(readFileSync(join(here, 'seccomp/moby-default.json'), 'utf8'))
 
-    it('is Docker\'s default profile plus only the namespace calls the Chromium sandbox needs', () => {
+    it('is Docker\'s default profile plus only the namespace calls the Chromium sandbox needs, with mount/UTS/IPC/cgroup namespaces still denied', () => {
         const profile = chromiumSeccompProfile(baseProfile)
         expect(profile.defaultAction).toBe(baseProfile.defaultAction)
         expect(profile.syscalls.slice(0, baseProfile.syscalls.length)).toEqual(baseProfile.syscalls)
         const added = profile.syscalls.slice(baseProfile.syscalls.length)
-        expect(added).toEqual([{ names: ['chroot', 'clone', 'setns', 'unshare'], action: 'SCMP_ACT_ALLOW', comment: expect.any(String) }])
+        // CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC must be clear; USER/PID/NET may be set.
+        const forbidden = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000
+        expect(added).toEqual([
+            { names: ['chroot'], action: 'SCMP_ACT_ALLOW', comment: expect.any(String) },
+            { names: ['clone'], action: 'SCMP_ACT_ALLOW', args: [{ index: 0, value: forbidden, valueTwo: 0, op: 'SCMP_CMP_MASKED_EQ' }], excludes: { arches: ['s390', 's390x'] }, comment: expect.any(String) },
+            { names: ['clone'], action: 'SCMP_ACT_ALLOW', args: [{ index: 1, value: forbidden, valueTwo: 0, op: 'SCMP_CMP_MASKED_EQ' }], includes: { arches: ['s390', 's390x'] }, comment: expect.any(String) },
+            { names: ['unshare'], action: 'SCMP_ACT_ALLOW', args: [{ index: 0, value: forbidden, valueTwo: 0, op: 'SCMP_CMP_MASKED_EQ' }], comment: expect.any(String) },
+        ])
+        expect(JSON.stringify(added)).not.toContain('setns')
     })
 
     it('refuses a base that is not a default-deny profile', () => {
@@ -218,7 +320,7 @@ describe('stack containers', () => {
         const main = browserCreateArgs(layout, layout.browsers[0], IMAGE_B)
         expect(main).toContain('--network=abp-net-main')
         expect(main.join(' ')).not.toContain('abp-net-ops')
-        expect(layout.runtime.networks).toEqual(['abp-net-main', 'abp-net-ops'])
+        expect(layout.runtime.network).toBe('abp-net-main')
     })
 
     it('publishes only the Runtime API on 127.0.0.1:38700 and runs it with the S2 production privileges', () => {

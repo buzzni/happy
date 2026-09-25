@@ -7,7 +7,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
-  chromiumSeccompProfile, daemonEnv, firewallRules, mergeInstallOptions, permissionTable, runtimeConfig, sudoersDropIn, systemdUnits, tmpfilesConf,
+  chromiumSeccompProfile, daemonEnv, egressRules, egressRulesFile, firewallRulesFile, mergeInstallOptions, permissionTable, runtimeConfig, stackLayout,
+  sudoersDropIn, systemdUnits, tmpfilesConf,
 } from "./lib/abpPlan.mjs";
 
 function readJson(path, what) {
@@ -50,6 +51,9 @@ export function parseOptionFlags(argv) {
       case "--viewer-origin": list("viewerOrigins", value); break;
       case "--egress-domain": list("egressDomains", value); break;
       case "--happy-prefix": flags.happyPrefix = value; break;
+      case "--browser-subnet-pool": flags.browserSubnetPool = value; break;
+      case "--deny-cidr": list("denyCidrs", value); break;
+      case "--browser-dns": list("browserDns", value); break;
       default: throw new Error(`unknown option ${name}`);
     }
   }
@@ -95,7 +99,11 @@ export function main(argv, out = (text) => process.stdout.write(text)) {
       const { egressDomains } = readJson(option(args, "--install"), "install options");
       return egressDomains.length ? out(`${JSON.stringify({ allowedDomains: egressDomains }, null, 2)}\n`) : undefined;
     }
-    case "firewall": return out(`${firewallRules(Number(option(args, "--family")), Number(option(args, "--sbx-uid")), Number(option(args, "--proxy-uid"))).join("\n")}\n`);
+    case "firewall": return out(firewallRulesFile(Number(option(args, "--family")), Number(option(args, "--sbx-uid")), Number(option(args, "--proxy-uid"))));
+    case "egress": {
+      const install = readJson(option(args, "--install"), "install options");
+      return out(egressRulesFile(egressRules(stackLayout(install), install)[Number(option(args, "--family"))]));
+    }
     case "permissions": return out(permissionTable().map((row) => [row.path, row.type, row.owner, row.group, row.mode].join("\t")).join("\n") + "\n");
     case "sudoers": return out(sudoersDropIn());
     case "tmpfiles": return out(tmpfilesConf());
