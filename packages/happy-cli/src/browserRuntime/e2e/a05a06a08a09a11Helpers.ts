@@ -386,7 +386,7 @@ export async function cleanupSpace(stack: PocStack, c: RuntimeClient, taskSpaceI
  */
 export function activateTargetAsUser(stack: PocStack, profile: 'a' | 'b', targetId: string): void {
     if (!/^[A-F0-9]{16,64}$/i.test(targetId)) throw new Error('unexpected target id')
-    const out = docker(['exec', `abp-${stack.run}-browser-${profile}`, 'curl', '-fsS', `http://127.0.0.1:9223/json/activate/${targetId}`])
+    const out = docker(['exec', `abp-${stack.run}-browser-${profile}`, 'curl', '-fsS', `http://127.0.0.1:9222/json/activate/${targetId}`])
     if (!/activated/i.test(out)) throw new Error(`activate failed: ${out}`)
 }
 

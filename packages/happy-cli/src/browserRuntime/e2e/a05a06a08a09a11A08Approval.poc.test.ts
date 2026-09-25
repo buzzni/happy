@@ -28,6 +28,9 @@ const SETTLE_MS = 1_500
 let stack: PocStack
 
 /** Recreate the stack if a previous iteration left it unusable (dead Runtime / leaked quota). */
+/** Fixture pages poll their barrier every 500 ms; give the mutation several polls. */
+const MUTATION_SETTLE_MS = 3_000
+
 async function ensureStack(reason?: string): Promise<void> {
     let healthy = !reason
     if (healthy) {
@@ -164,11 +167,13 @@ describe('A08 approval without a client', () => {
         it.each(range(N))(`changed ${mode} after the approval request: old approval executes nothing #%i`, async (i) => {
             const r = await reachApproval(`a08-${mode}-${i}`, { path: '/x5/risky-mutating', params: { key: 'mut', mode } })
             try {
-                const before = await r.agent.observe({ taskId: r.t.taskId, tabId: r.t.tabId })
+                // While the approval is pending the agent may not observe the bound tab (it would
+                // supersede the snapshot the approval is bound to).
+                await expectCode(r.agent.observe({ taskId: r.t.taskId, tabId: r.t.tabId }), ['CONFLICT'], 'agent observe of an approval-bound tab')
                 await releaseBarrier(stack, r.L, 'mut', `n${i}`)
-                const changed = await observeUntil(r.agent, r.t.taskId, r.t.tabId, (o) => mode === 'reload' ? o.documentGeneration > before.documentGeneration
-                    : mode === 'origin' ? new URL(o.url).origin === SITE_B
-                        : mode === 'value' ? o.text.includes('VALUE CHANGED') : o.text.includes('NODE CHANGED'))
+                // The page applies the change on its next barrier poll (every 500 ms). A late change
+                // can only make approve succeed and fail this test, never pass it falsely.
+                await new Promise((resolve) => setTimeout(resolve, MUTATION_SETTLE_MS))
                 let outcome: string
                 try {
                     const result = await approve(r)
@@ -177,7 +182,7 @@ describe('A08 approval without a client', () => {
                     outcome = `rejected:${(error as { code?: string }).code}`
                 }
                 const ledger = await settledLedger(stack, r.L, SETTLE_MS)
-                evidence('A08', { path: `changed-${mode}`, i, generationBefore: before.documentGeneration, generationAfter: changed.documentGeneration, outcome, riskyWrites: count(ledger, 'risky'), amounts: ledger.filter((e) => e.kind === 'risky').map((e) => e.amount) })
+                evidence('A08', { path: `changed-${mode}`, i, outcome, riskyWrites: count(ledger, 'risky'), amounts: ledger.filter((e) => e.kind === 'risky').map((e) => e.amount) })
                 expect(count(ledger, 'risky'), `CONTRACT: approval bound to the old ${mode} must not execute`).toBe(0)
                 expect(outcome.startsWith('rejected:'), `CONTRACT: approve must be refused after ${mode} change, got ${outcome}`).toBe(true)
             } finally {

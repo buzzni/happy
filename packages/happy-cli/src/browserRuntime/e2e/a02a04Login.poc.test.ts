@@ -225,14 +225,27 @@ async function humanSolves(flow: Flow, tag: string, password = STRICT_PASSWORD) 
 }
 
 /** Full happy handoff; returns the continued task. */
-async function completeHandoff(flow: Flow, tag: string, t: { client: RuntimeClient; taskId: TaskId; tabId: TabId }) {
+async function completeHandoff(flow: Flow, tag: string, t: { client: RuntimeClient; taskId: TaskId; tabId: TabId }, options: { afterRuntimeRestart?: boolean } = {}) {
     const { human, epoch } = await takeOver(t.taskId, t.tabId)
     const attempts = await humanSolves(flow, tag)
     expect(attempts.at(-1)?.ok).toBe(true)
     await release(human, t.taskId, t.tabId, epoch)
     const resumed = await resume(t.client, t.taskId)
     expect(resumed, `resume after ${flow} failed: ${resumed instanceof Error ? resumed.message : ''}`).not.toBeInstanceOf(Error)
-    const done = await waitForTask(t.client, t.taskId, (task) => task.status !== 'running')
+    let done = await waitForTask(t.client, t.taskId, (task) => task.status !== 'running')
+    if (options.afterRuntimeRestart) {
+        // The restarted Runtime no longer holds the submitted (unredacted) steps, so it must
+        // not replay the persisted redacted ones: the batch ends interrupted with nothing
+        // sent, and the agent resubmits the continuation on the same task.
+        expect(done.lastBatch?.outcome, 'interrupted batch after a Runtime restart').toBe('failed')
+        expect(done.lastBatch?.mayHaveSideEffects).toBe(false)
+        const before = await stack.waitForLedger(() => true, { settleMs: 1_500 })
+        expect(count(before, 'a02a04-after', tag).length, 'a redacted step must never be replayed').toBe(0)
+        await t.client.submitBatch({ taskId: t.taskId, expectedVersion: done.stateVersion, requestId: rid(), steps: [
+            step(t.tabId, 'navigate', { url: `${SITE_A}/a02a04-after/${tag}?run=${stack.run}` }),
+        ] }, { waitMs: 30_000 })
+        done = await waitForTask(t.client, t.taskId, (task) => task.status !== 'running')
+    }
     const ledger = await stack.waitForLedger((entries) => count(entries, 'a02a04-after', tag).length > 0)
     const after = count(ledger, 'a02a04-after', tag)
     expect(after.length, `same task must continue exactly once after the handoff at the SUBMITTED url (…?run=<run>; a resumed step replayed from `
@@ -355,7 +368,7 @@ describe.each(['login', 'captcha'] as const)('A04 handoff across Runtime restart
         const viewer = clientFor(stack, mintInteractive(stack, { profileId: PROFILE_B }))
         const lease = (await viewer.getTask({ taskId: t.taskId })).tabLeases?.find((l) => l.tabId === t.tabId)
         expect(lease, 'task tab must be re-adopted after a Runtime-only restart').toBeDefined()
-        await completeHandoff(flow, tag, t)
+        await completeHandoff(flow, tag, t, { afterRuntimeRestart: true })
         evidence({ card: 'A04', path: `runtime-restart-${flow}`, iteration: i, taskId: t.taskId })
     }, 240_000)
 })
