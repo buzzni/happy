@@ -127,6 +127,16 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         return writeTail
     }
 
+    // Registry changes, grant issuance and revocation run one at a time, after the
+    // request body is read: a revoke can never interleave with an issuance that
+    // already looked its registration up.
+    let exclusiveTail: Promise<unknown> = Promise.resolve()
+    const exclusive = <T>(work: () => Promise<T>): Promise<T> => {
+        const run = exclusiveTail.then(work, work)
+        exclusiveTail = run.catch(() => undefined)
+        return run
+    }
+
     const assertDaemon = (req: IncomingMessage): void => {
         const supplied = sha256(header(req, 'x-abp-daemon-token'))
         if (!header(req, 'x-abp-daemon-token') || !timingSafeEqual(supplied, expectedDaemonToken)) throw new BrowserRuntimeError('UNAUTHORIZED', 'daemon token required')
@@ -138,62 +148,71 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         'POST /v1/sessions/register': async (req) => {
             assertDaemon(req)
             parse(schemas.register, await readJson(req))
-            const registrationId = `reg-${randomUUID()}`
-            const sessionSecret = randomBytes(32).toString('base64url')
-            registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [] }
-            await persist()
-            return { registrationId, sessionSecret }
+            return exclusive(async () => {
+                const registrationId = `reg-${randomUUID()}`
+                const sessionSecret = randomBytes(32).toString('base64url')
+                registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [] }
+                await persist()
+                return { registrationId, sessionSecret }
+            })
         },
         'POST /v1/sessions/bind': async (req) => {
             assertDaemon(req)
             const body = parse(schemas.bind, await readJson(req))
-            const registration = registry.registrations[body.registrationId]
-            if (!registration) throw new BrowserRuntimeError('SCOPE_DENIED', 'unknown registration')
-            if (registration.agentSessionId === body.agentSessionId) return { bound: true }
-            const other = findByAgentSession(body.agentSessionId)
-            if (registration.agentSessionId || other) throw new BrowserRuntimeError('CONFLICT', 'registration or session is already bound')
-            registration.agentSessionId = body.agentSessionId
-            await persist()
-            return { bound: true }
+            return exclusive(async () => {
+                const registration = registry.registrations[body.registrationId]
+                if (!registration) throw new BrowserRuntimeError('SCOPE_DENIED', 'unknown registration')
+                if (registration.agentSessionId === body.agentSessionId) return { bound: true }
+                const other = findByAgentSession(body.agentSessionId)
+                if (registration.agentSessionId || other) throw new BrowserRuntimeError('CONFLICT', 'registration or session is already bound')
+                registration.agentSessionId = body.agentSessionId
+                await persist()
+                return { bound: true }
+            })
         },
         'POST /v1/sessions/revoke': async (req) => {
             assertDaemon(req)
             const body = parse(schemas.revoke, await readJson(req))
-            const entry = 'registrationId' in body
-                ? (registry.registrations[body.registrationId] ? [body.registrationId, registry.registrations[body.registrationId]] as const : undefined)
-                : findByAgentSession(body.agentSessionId)
-            if (!entry) return { revoked: false, grants: 0 }
-            const [registrationId, registration] = entry
-            // Remove first: a renewal racing this revoke must already fail.
-            delete registry.registrations[registrationId]
-            await persist()
-            for (const grantId of registration.grantIds) await options.revokeGrant(grantId as GrantId)
-            log(`broker session revoked grants=${registration.grantIds.length}`)
-            return { revoked: true, grants: registration.grantIds.length }
+            return exclusive(async () => {
+                const entry = 'registrationId' in body
+                    ? (registry.registrations[body.registrationId] ? [body.registrationId, registry.registrations[body.registrationId]] as const : undefined)
+                    : findByAgentSession(body.agentSessionId)
+                if (!entry) return { revoked: false, grants: 0 }
+                const [registrationId, registration] = entry
+                delete registry.registrations[registrationId]
+                await persist()
+                for (const grantId of registration.grantIds) await options.revokeGrant(grantId as GrantId)
+                log(`broker session revoked grants=${registration.grantIds.length}`)
+                return { revoked: true, grants: registration.grantIds.length }
+            })
         },
         'POST /v1/agent-grants': async (req) => {
             const secret = header(req, 'x-abp-session-secret')
-            const secretSha256 = secret ? sha256(secret).toString('hex') : ''
-            const entry = Object.entries(registry.registrations).find(([, registration]) => registration.secretSha256 === secretSha256)
-            if (!secret || !entry) throw new BrowserRuntimeError('UNAUTHORIZED', 'session is not registered')
+            if (!secret) throw new BrowserRuntimeError('UNAUTHORIZED', 'session is not registered')
             const body = parse(schemas.grant, await readJson(req))
-            const [, registration] = entry
-            if (!registration.agentSessionId) throw new BrowserRuntimeError('CONFLICT', 'session registration is not bound yet', true)
-            if (registration.agentSessionId !== body.agentSessionId) throw new BrowserRuntimeError('SCOPE_DENIED', 'secret belongs to another session')
-            const principalId = options.profiles.get(body.profileId as ProfileId)
-            if (!principalId) throw new BrowserRuntimeError('SCOPE_DENIED', 'profile is not allowed')
-            const issuedAtMs = now()
-            const grantId = `grant-${randomUUID()}` as GrantId
-            const expiresAtMs = issuedAtMs + BROKER_GRANT_TTL_MS
-            const token = mintAgentGrant({
-                kind: 'agent-grant', grantId, principalId, workspaceId: options.identity.workspaceId, machineId: options.identity.machineId,
-                agentSessionId: body.agentSessionId as AgentSessionId, profileId: body.profileId as ProfileId,
-                allowedOrigins: [...options.allowedOrigins], operations: [...AGENT_OPERATIONS], taskSpaceIds: [], issuedAtMs, expiresAtMs,
-            }, { agentKey: options.agentKey }, issuedAtMs)
-            // Recorded before it is handed out, so a revoke always covers it.
-            registration.grantIds.push(grantId)
-            await persist()
-            return { token, grantId, expiresAtMs }
+            return exclusive(async () => {
+                // Looked up only now: the registration may have been revoked while the body arrived.
+                const secretSha256 = sha256(secret).toString('hex')
+                const entry = Object.entries(registry.registrations).find(([, registration]) => registration.secretSha256 === secretSha256)
+                if (!entry) throw new BrowserRuntimeError('UNAUTHORIZED', 'session is not registered')
+                const [, registration] = entry
+                if (!registration.agentSessionId) throw new BrowserRuntimeError('CONFLICT', 'session registration is not bound yet', true)
+                if (registration.agentSessionId !== body.agentSessionId) throw new BrowserRuntimeError('SCOPE_DENIED', 'secret belongs to another session')
+                const principalId = options.profiles.get(body.profileId as ProfileId)
+                if (!principalId) throw new BrowserRuntimeError('SCOPE_DENIED', 'profile is not allowed')
+                const issuedAtMs = now()
+                const grantId = `grant-${randomUUID()}` as GrantId
+                const expiresAtMs = issuedAtMs + BROKER_GRANT_TTL_MS
+                const token = mintAgentGrant({
+                    kind: 'agent-grant', grantId, principalId, workspaceId: options.identity.workspaceId, machineId: options.identity.machineId,
+                    agentSessionId: body.agentSessionId as AgentSessionId, profileId: body.profileId as ProfileId,
+                    allowedOrigins: [...options.allowedOrigins], operations: [...AGENT_OPERATIONS], taskSpaceIds: [], issuedAtMs, expiresAtMs,
+                }, { agentKey: options.agentKey }, issuedAtMs)
+                // Recorded before it is handed out, so a revoke always covers it.
+                registration.grantIds.push(grantId)
+                await persist()
+                return { token, grantId, expiresAtMs }
+            })
         },
         'GET /v1/attention': async (req, url) => {
             assertDaemon(req)

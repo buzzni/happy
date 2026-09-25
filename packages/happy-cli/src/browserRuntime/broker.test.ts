@@ -119,6 +119,34 @@ describe('broker socket', () => {
         expect((await h.grant(sessionSecret)).status).toBe(401)
     })
 
+    it('refuses a grant whose request body finishes after the session was revoked', async () => {
+        const h = await harness()
+        const { sessionSecret } = await h.register()
+        const body = JSON.stringify({ schemaVersion: 1, agentSessionId: 'session-1', profileId: 'profile-a' })
+        let sent!: () => void
+        const headersSent = new Promise<void>((resolve) => { sent = resolve })
+        const reply = new Promise<Reply>((resolve, reject) => {
+            const req = request({ socketPath: h.socketPath, method: 'POST', path: '/v1/agent-grants',
+                headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), 'x-abp-session-secret': sessionSecret } }, (res) => {
+                let raw = ''
+                res.on('data', (chunk) => { raw += chunk })
+                res.on('end', () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(raw) }))
+            })
+            req.on('error', reject)
+            req.flushHeaders()
+            req.write(body.slice(0, 10), () => sent())
+            void (async () => {
+                await headersSent
+                await new Promise((resolve) => setTimeout(resolve, 50))
+                const revoked = await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })
+                expect(revoked.body.result).toEqual({ revoked: true, grants: 0 })
+                req.end(body.slice(10))
+            })()
+        })
+        expect((await reply).status).toBe(401)
+        expect(h.revoked).toEqual([])
+    })
+
     it('keeps registrations across a Runtime restart', async () => {
         const h = await harness()
         const { sessionSecret } = await h.register()
