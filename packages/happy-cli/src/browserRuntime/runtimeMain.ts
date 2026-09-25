@@ -80,6 +80,23 @@ async function connectWithRetry(driver: CdpDriver, profile: ProfileConfig, log: 
 }
 
 const MIN_SECRET_LENGTH = 32
+/** Longer than the store's 20 s heartbeat lease, so a dead writer's lock always expires first. */
+const LOCK_WAIT_MS = 30_000
+const LOCK_RETRY_MS = 1_000
+
+async function openStoreWaitingForStaleLease(stateDir: string, log: (line: string) => void): Promise<TaskStore> {
+    const deadline = Date.now() + LOCK_WAIT_MS
+    for (;;) {
+        try {
+            return await TaskStore.open(stateDir)
+        } catch (error) {
+            const liveWriter = error instanceof BrowserRuntimeError && /live writer/.test(error.message)
+            if (!liveWriter || Date.now() >= deadline) throw error
+            log('writer lock held by a recent heartbeat; waiting for it to expire')
+            await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS))
+        }
+    }
+}
 
 /** Every key must be present and long; an empty admin token would otherwise match an empty bearer. */
 function loadKeys(path: string): KeysFile {
@@ -166,8 +183,10 @@ async function main(): Promise<void> {
     const port = Number(process.env.ABP_RUNTIME_PORT ?? '8787')
     const adminPort = Number(process.env.ABP_ADMIN_PORT ?? '8788')
 
-    // A second Runtime on the same state dir fails here (writer lock).
-    const store = await TaskStore.open(stateDir)
+    // A second live Runtime on the same state dir is refused (writer lock). After a
+    // crash the old lock's heartbeat is still fresh for up to its lease, so wait that
+    // long before giving up instead of exiting while the previous writer is merely dead.
+    const store = await openStoreWaitingForStaleLease(stateDir, log)
 
     const drivers = new Map<ProfileId, CdpDriver>()
     for (const profile of profiles) {
