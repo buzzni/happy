@@ -99,3 +99,34 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
 - Writer lock (D9): the image entrypoint runs `exec flock -n -E 75 -F <state>/runtime.flock node`;
   production refuses to start unless `/proc/locks` shows this pid holding it. The heartbeat
   lease and fencing token stay. The container runs as uid 10870 (no host login user).
+
+## Runtime viewer (S4, 2026-09-25)
+
+Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `server.ts` routes.
+
+- `POST /v1/ops/viewerTicket` (interactive operation) → one-time ticket, 30 s or the capability's expiry,
+  bound to the capability and profile. `GET /v1/viewer/websockify?ticket=` spends the ticket even when
+  refused; `Origin` must be a configured tunnel origin (`viewerOrigins`) or `http://<Host>` for a
+  loopback Host literal (a DNS-rebound name never matches).
+- Two independent RFB sessions per connection: RFB 3.8 server to the viewer (security None — the ticket
+  authenticated it; desktop name replaced), RFB client of x11vnc (VNC authentication with the per-run
+  password, shared). x11vnc listens on the profile network (no `-localhost`), is never published.
+- Viewer→upstream: every message is parsed (`rfb.ts` generator parsers + `StreamFramer`). SetPixelFormat,
+  SetEncodings (≤ 64, filtered to Raw/CopyRect/Hextile/ZRLE/DesktopSize/Cursor) and
+  FramebufferUpdateRequest pass. Key/Pointer/ClientCutText (≤ 64 KiB) pass only while every user-owned
+  tab of the profile belongs to this capability's viewer, no takeover is settling, and the bound
+  `tab@epoch` set is unchanged. Any change (release, new epoch, other owner) drops queued input and sends
+  key-up for held keys and a button release first; `InputLeaseManager.subscribe` makes this immediate.
+  Capability expiry closes (4001) after the same release; revocation is polled every second and on input.
+- Upstream→viewer: framed, not byte-passthrough. The server stream's lengths follow from headers only
+  for the filtered encodings, so the proxy validates every header (message type, rectangle inside the
+  framebuffer, encoding actually requested, ZRLE/cut-text length bounds) before forwarding and streams
+  the payload. A malformed or unexpected server message closes the connection (1011) instead of reaching
+  the viewer's decoder. Cost: Tight is not offered, so noVNC 1.3 uses Hextile (more bandwidth).
+- `/viewer/` serves the pinned noVNC client (Runtime image copies Debian bookworm `novnc=1:1.3.0-1`,
+  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`).
+- Harness: `poc.mjs up --viewer runtime` (pocStack `viewer: 'runtime'`) is the production layout — no
+  websockify, nothing published but the Runtime. The default harness layout still starts and publishes
+  noVNC (`ABP_HARNESS_NOVNC=1`) because A11 probes it directly; A04/A09 inject human input with xdotool
+  on the display and do not depend on either viewer. The browser image starts websockify only when
+  `ABP_HARNESS_NOVNC=1`.
