@@ -6,7 +6,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserInstanceId, type ElementRef, type Observation, type TabId } from '../contracts'
+import { BrowserRuntimeError, type BrowserInstanceId, type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type TabId } from '../contracts'
 import { formDigest } from '../policy'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
@@ -147,6 +147,19 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             <form action="/login"><input type="password" name="pw" value="synthetic-pw"><button>Sign in</button></form>
             <form action="/login2"><input type="password" name="pw"><button>Sign in empty</button></form>
             <form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="f"><button>Upload</button></form></body>`)
+        const guarded = (buttonAttrs: string, script = '') => () => `${HIT_SCRIPT}<body><form id="f" action="/hit/g-post" method="post">
+            <input type="hidden" name="token" value="t1"><input name="amount" value="10">
+            <button id="pay" name="op" value="pay" style="width:120px;height:40px" ${buttonAttrs}>Pay</button></form>
+            <script>const f = document.getElementById('f'), pay = document.getElementById('pay'), token = f.querySelector('[name=token]'); ${script}</script></body>`
+        a.route('/guard-plain', guarded(''))
+        a.route('/guard-hover-value', guarded(`onmouseover="token.value = 't2'"`))
+        a.route('/guard-hover-action', guarded(`onmouseover="pay.setAttribute('formaction', '/hit/g-other')"`))
+        a.route('/guard-hover-method', guarded(`onmouseover="f.method = 'get'"`))
+        a.route('/guard-hover-target', guarded(`onmouseover="f.target = '_blank'"`))
+        a.route('/guard-down', guarded(`onmousedown="token.value = 't2'"`))
+        a.route('/guard-click', guarded(`onclick="pay.setAttribute('formaction', '/hit/g-other')"`))
+        a.route('/guard-submit-late', guarded('', `f.addEventListener('submit', () => { token.value = 't2' })`))
+        a.route('/guard-formdata', guarded('', `f.addEventListener('formdata', (e) => e.formData.set('amount', '999'))`))
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -607,6 +620,41 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 expect(site.hits(hit), path).toBe(0)
                 expect(a.hits('overlay'), path).toBe(0)
             }
+        })
+    })
+
+    describe('dispatch-time binding and submission guard', () => {
+        const expectationOf = (d: ElementDescription): DispatchExpectation => ({ role: d.currentRole ?? d.role, name: d.currentName ?? d.name,
+            ...(d.linkUrl ? { linkUrl: d.linkUrl, linkTarget: d.linkTarget ?? '' } : {}), ...(d.form ? { formDigest: d.form.digest } : {}) })
+        async function clickExpecting(path: string) {
+            const tab = await open(path, [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const ref = refOf(obs, 'Pay')
+            const expectation = expectationOf(await driver.describeRef(tab.tabId, ref, obs.snapshotId, OPTS))
+            return driver.click(tab.tabId, ref, obs.snapshotId, { ...OPTS, expect: expectation })
+        }
+
+        it('submits exactly the described form when nothing changed', async () => {
+            await clickExpecting('/guard-plain')
+            expect(await eventually(() => a.hits('g-post'), (n) => n === 1)).toBe(1)
+        })
+
+        it('refuses before pressing when hovering changed a value, formaction, method or target (no dispatch)', async () => {
+            for (const path of ['/guard-hover-value', '/guard-hover-action', '/guard-hover-method', '/guard-hover-target']) {
+                const error = await expectCode(clickExpecting(path), 'STALE_REF')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+            }
+            await delay(500)
+            expect(a.hits('g-post') + a.hits('g-other')).toBe(0)
+        })
+
+        it('stops the submission when mousedown, click or later submit/formdata handlers changed it', async () => {
+            for (const path of ['/guard-down', '/guard-click', '/guard-submit-late', '/guard-formdata']) {
+                const error = await expectCode(clickExpecting(path), 'APPROVAL_EXPIRED')
+                expect(error.mayHaveSideEffects, path).toBe(true)
+            }
+            await delay(800)
+            expect(a.hits('g-post') + a.hits('g-other')).toBe(0)
         })
     })
 

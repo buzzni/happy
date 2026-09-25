@@ -430,3 +430,61 @@ ${FORM_SUBMISSION}
     result.form = submissionOf(form, result.submitsForm ? element : null)
     return result
 }`
+
+/**
+ * `this` = the element about to be clicked. Arms a one-shot guard on its form:
+ * a capturing `submit` listener (isolated world) recomputes the submission and
+ * cancels it when it differs from `expected`; a `formdata` listener compares the
+ * final entry list and destination (page handlers that run later) and marks the
+ * guard so the driver fails the resulting request before it is sent. Verdicts go
+ * to the driver through the isolated-world binding `__abpGuardReport`.
+ */
+export const SUBMIT_GUARD = String.raw`function armSubmitGuard(expected, ttlMs) {
+${FORM_SUBMISSION}
+    const canonical = (value) => {
+        if (value === null || typeof value !== 'object') return JSON.stringify(value)
+        if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']'
+        return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+    }
+    const element = this
+    const form = element.form || (element.closest && element.closest('form'))
+    if (!form) return false
+    const win = form.ownerDocument.defaultView
+    const want = canonical(expected)
+    const state = { status: 'armed' }
+    // The driver binding exists only in this isolated world; the page cannot call it.
+    const report = (status) => {
+        state.status = status
+        if (typeof globalThis.__abpGuardReport === 'function') globalThis.__abpGuardReport(status)
+    }
+    const onSubmit = (event) => {
+        if (event.target !== form || state.status !== 'armed') return
+        if (canonical(submissionOf(form, event.submitter || null)) !== want) {
+            event.preventDefault()
+            event.stopImmediatePropagation()
+            report('blocked')
+            return
+        }
+        report('submitted')
+    }
+    // Non-empty passwords and files make a form opaque (handed to the user), so here they are empty.
+    const expectedEntry = (value) => value && typeof value === 'object' && 'password' in value ? '' : value
+    const entry = (value) => typeof value === 'string' ? value : { file: String(value.name), size: value.size, type: String(value.type) }
+    const onFormData = (event) => {
+        if (event.target !== form || state.status === 'blocked') return
+        const actual = Array.from(event.formData.entries()).map(([name, value]) => [name, entry(value)])
+        const sameFields = actual.length === expected.fields.length && actual.every(([name, value], i) => name === expected.fields[i][0]
+            && (expected.fields[i][1] === 'centre' || canonical(value) === canonical(expectedEntry(expected.fields[i][1]))))
+        const head = submissionOf(form, expected.submitter ? element : null)
+        const sameHead = head.action === expected.action && head.method === expected.method && head.enctype === expected.enctype && head.target === expected.target
+        if (!sameFields || !sameHead) report('blocked')
+    }
+    win.addEventListener('submit', onSubmit, true)
+    form.addEventListener('formdata', onFormData)
+    setTimeout(() => {
+        win.removeEventListener('submit', onSubmit, true)
+        form.removeEventListener('formdata', onFormData)
+        if (state.status === 'armed') report('expired')
+    }, ttlMs)
+    return true
+}`

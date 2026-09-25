@@ -397,9 +397,25 @@ export interface DriverTabHandle {
     targetId: string
 }
 
+/**
+ * The element as the runtime classified (or the user approved) it. The driver
+ * re-checks it after pointer preparation and guards the submission the click
+ * makes; a mismatch is refused (before input) or stopped (after it).
+ */
+export interface DispatchExpectation {
+    role: string
+    name: string
+    linkUrl?: string
+    linkTarget?: string
+    /** formDigest of the submission the element would make */
+    formDigest?: string
+}
+
 export interface DriverOptions {
     signal?: AbortSignal
     timeoutMs: number
+    /** click only */
+    expect?: DispatchExpectation
 }
 
 export interface BrowserDriver {

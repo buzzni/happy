@@ -24,6 +24,7 @@ import {
     BrowserRuntimeError,
     type BrowserDriver,
     type BrowserInstanceId,
+    type DispatchExpectation,
     type DriverOptions,
     type DriverTabHandle,
     type ElementDescription,
@@ -39,7 +40,7 @@ import {
 } from '../contracts'
 import { formDigest } from '../policy'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
-import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, type CollectedFrame, type ElementState } from './pageScripts'
+import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, SUBMIT_GUARD, type CollectedFrame, type ElementState } from './pageScripts'
 
 export interface CdpDriverOptions {
     /** Browser-level endpoint from `/json/version` (webSocketDebuggerUrl). */
@@ -92,6 +93,13 @@ const CLAIM_MS = 2_000
 /** Requests that navigate or can carry data to their destination; checked before they are sent. */
 const FETCH_PATTERNS = ['Document', 'XHR', 'Fetch', 'Ping', 'EventSource', 'Other', 'CSPViolationReport']
     .map((resourceType) => ({ urlPattern: '*', resourceType, requestStage: 'Request' }))
+/** How long a click's submission guard stays armed. */
+const SUBMIT_GUARD_MS = 10_000
+/** A document request waits this long for the guard's verdict when it has not arrived yet. */
+const GUARD_VERDICT_MS = 1_500
+const GUARD_BINDING = '__abpGuardReport'
+/** After the click, how long to wait for a verdict of a submission the click may have started. */
+const GUARD_SETTLE_MS = 300
 /** Deeper frame nesting than this is refused rather than walked for overlays. */
 const MAX_FRAME_DEPTH = 16
 export const DEFAULT_MAX_AGENT_WINDOWS = 4
@@ -146,6 +154,8 @@ interface TabState {
     generation: number
     /** main-frame navigations stopped by destination enforcement */
     blockedMain: number
+    /** Armed by a click on a form element: document requests of this tab consult it before they are sent */
+    submitGuard?: SubmitGuard
     /** frameId → generation value of the last event that touched it */
     stamps: Map<string, number>
     frameKeys: Map<string, string>
@@ -155,6 +165,16 @@ interface TabState {
     worlds: Map<string, { stamp: number; contextId: number }>
     pendingSetups: Set<Promise<unknown>>
     goneListeners: Set<() => void>
+}
+
+interface SubmitGuard {
+    sessionId: string
+    frameId: string
+    expected: FormSubmission
+    untilMs: number
+    /** last verdict reported by the page: armed | submitted | blocked | expired */
+    lastStatus: string
+    waiters: Set<() => void>
 }
 
 interface SessionInfo {
@@ -798,11 +818,17 @@ export class CdpDriver implements BrowserDriver {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'element moved while the pointer arrived; not interacting', true, false)
             }
             await this.assertSameLabel(conn, binding, objectId)
+            // The page ran its hover handlers: what the runtime classified/approved must still hold.
+            const live = opts.expect ? await this.assertExpectation(conn, binding, objectId, opts.expect) : undefined
             this.assertFresh(tab, binding, snapshotId)
+            if (live?.form) await this.armSubmitGuard(conn, tab, binding, objectId, live.form)
             op.markDispatch()
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
+            if (live?.form && tab.submitGuard && await this.submitGuardStatus(tab.submitGuard, GUARD_SETTLE_MS) === 'blocked') {
+                throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
+            }
         }, true)
     }
 
@@ -1168,11 +1194,23 @@ export class CdpDriver implements BrowserDriver {
             // A popup closed over the cap may still have its first request paused in the opener's session.
             const closedPopup = this.popups.get(params.frameId)?.closed === true
             if (tab && !closedPopup && this.destinationAllowed(params.request.url, tab.allowedOrigins)) {
-                conn.send('Fetch.continueRequest', { requestId: params.requestId }, sessionId).catch(() => undefined)
+                void this.submissionAllowed(tab, params).catch(() => false).then((allowed) => {
+                    if (allowed) {
+                        conn.send('Fetch.continueRequest', { requestId: params.requestId }, sessionId).catch(() => undefined)
+                        return
+                    }
+                    if (tab.submitGuard) tab.submitGuard.lastStatus = 'blocked'
+                    conn.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => undefined)
+                    this.onBlocked(conn, tab, sessionId, params)
+                })
                 return
             }
             conn.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => undefined)
             if (tab) this.onBlocked(conn, tab, sessionId, params)
+        })
+        conn.on('Runtime.bindingCalled', (params, sessionId) => {
+            if (!current() || !sessionId || params.name !== GUARD_BINDING) return
+            this.onGuardReport(sessionId, String(params.payload))
         })
         conn.on('Target.targetCreated', (params) => current() && this.onTargetInfo(conn, params.targetInfo))
         conn.on('Target.targetInfoChanged', (params) => current() && this.onTargetInfo(conn, params.targetInfo))
@@ -1475,6 +1513,81 @@ export class CdpDriver implements BrowserDriver {
         const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: LABEL_OF, objectId, returnByValue: true }, binding.sessionId)
         const label = result.value as { role: string; name: string } | undefined
         if (label?.role !== binding.role || label.name !== binding.name) throw staleRef('element label changed since the snapshot')
+    }
+
+    /** Re-describes the element and compares it with what the runtime classified/approved. */
+    private async assertExpectation(conn: CdpConnection, binding: RefBinding, objectId: string, expected: DispatchExpectation): Promise<DescribedElement> {
+        const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: DESCRIBE_ELEMENT, objectId, returnByValue: true }, binding.sessionId)
+        const live = result.value as DescribedElement
+        const same = live.role === expected.role && live.name === expected.name
+            && (live.linkUrl ?? undefined) === expected.linkUrl
+            && (live.linkUrl ? (live.linkTarget ?? '') : undefined) === (expected.linkUrl ? (expected.linkTarget ?? '') : undefined)
+            && (live.form ? formDigest(live.form) : undefined) === expected.formDigest
+        if (!same) throw staleRef('the element or what it would submit changed while the pointer arrived')
+        return live
+    }
+
+    private async armSubmitGuard(conn: CdpConnection, tab: TabState, binding: RefBinding, objectId: string, expected: FormSubmission): Promise<void> {
+        // The guard reports through a binding exposed only in the driver's isolated world. Bindings
+        // need the Runtime domain on (only for the guard's lifetime) and must be added after it is,
+        // to reach an isolated world that already exists.
+        await conn.send('Runtime.enable', {}, binding.sessionId)
+        await conn.send('Runtime.addBinding', { name: GUARD_BINDING, executionContextName: ISOLATED_WORLD }, binding.sessionId)
+        setTimeout(() => {
+            if (tab.submitGuard?.sessionId !== binding.sessionId || Date.now() >= tab.submitGuard.untilMs) conn.send('Runtime.disable', {}, binding.sessionId).catch(() => undefined)
+        }, SUBMIT_GUARD_MS + 100)
+        const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: SUBMIT_GUARD, objectId,
+            arguments: [{ value: expected }, { value: SUBMIT_GUARD_MS }], returnByValue: true }, binding.sessionId)
+        if (result.value !== true) throw staleRef('the element is no longer in a form')
+        tab.submitGuard = { sessionId: binding.sessionId, frameId: binding.frameId, expected, untilMs: Date.now() + SUBMIT_GUARD_MS, lastStatus: 'armed', waiters: new Set() }
+    }
+
+    /**
+     * The guard's verdict. It is reported synchronously from the page's submit/formdata
+     * handling, so it is known once the click's input has been acknowledged; a request
+     * that arrives first waits briefly (the page cannot be queried while its navigation
+     * request is paused).
+     */
+    private async submitGuardStatus(guard: SubmitGuard, waitMs = 0): Promise<string> {
+        if (guard.lastStatus === 'armed' && waitMs > 0) {
+            await new Promise<void>((resolve) => {
+                const done = () => {
+                    clearTimeout(timer)
+                    guard.waiters.delete(done)
+                    resolve()
+                }
+                const timer = setTimeout(done, waitMs)
+                guard.waiters.add(done)
+            })
+        }
+        return guard.lastStatus
+    }
+
+    private onGuardReport(sessionId: string, status: string): void {
+        const tab = this.sessions.get(sessionId)?.tab
+        const guard = tab?.submitGuard
+        if (!guard || guard.sessionId !== sessionId || guard.lastStatus === 'blocked') return
+        guard.lastStatus = status
+        for (const done of [...guard.waiters]) done()
+    }
+
+    /**
+     * While a submission guard is armed, a document request of the tab waits for its
+     * verdict: stopped when the guard blocked, or when the guarded form's frame (or a
+     * new browsing context it targets) navigates with another method or destination.
+     */
+    private async submissionAllowed(tab: TabState, params: any): Promise<boolean> {
+        const guard = tab.submitGuard
+        if (!guard || params.resourceType !== 'Document' || Date.now() > guard.untilMs) return true
+        const status = await this.submitGuardStatus(guard, GUARD_VERDICT_MS)
+        if (status === 'blocked') return false
+        if (status !== 'submitted') return true
+        const newContext = !['', '_self'].includes(guard.expected.target)
+        if (params.frameId !== guard.frameId && !(newContext && this.popupTabs.has(params.frameId))) return true
+        tab.submitGuard = undefined
+        const withoutQuery = (url: string) => url.split('#')[0].split('?')[0]
+        const method = String(params.request.method).toLowerCase()
+        return method === guard.expected.method && withoutQuery(params.request.url) === withoutQuery(guard.expected.action)
     }
 
     /**
