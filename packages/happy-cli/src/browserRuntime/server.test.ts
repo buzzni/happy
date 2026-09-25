@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -236,5 +237,41 @@ describe('viewer client assets (D2)', () => {
     it('answers 404 under /viewer/ when no assets directory is configured', async () => {
         const { base } = await start()
         expect((await fetch(`${base}/viewer/`)).status).toBe(404)
+    })
+})
+
+describe('malformed request targets (D2 review P0-4)', () => {
+    /** Sends raw bytes and resolves with whatever comes back before the socket closes (or 2 s). */
+    function rawRequest(port: number, request: string): Promise<string> {
+        return new Promise((resolve) => {
+            const socket = connect(port, '127.0.0.1', () => socket.write(request))
+            let response = ''
+            socket.on('data', (chunk) => { response += chunk.toString('latin1') })
+            socket.on('error', () => undefined)
+            socket.on('close', () => resolve(response))
+            setTimeout(() => { socket.destroy(); resolve(response) }, 2_000)
+        })
+    }
+
+    it('refuses an unparsable upgrade or request URL and keeps serving', async () => {
+        const fake = makeFake()
+        const upgrades: string[] = []
+        const viewer = { issueTicket: () => ({ ticket: 't', expiresAtMs: 1 }), handleUpgrade: (req: { url?: string }) => { upgrades.push(req.url ?? '') }, close: async () => undefined }
+        server = await startRuntimeServer({ api: fake.api, verifyToken, port: 0, health: () => ({}), viewer })
+        const upgrade = await rawRequest(server.port, 'GET //[ HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n')
+        expect(upgrade).toMatch(/^HTTP\/1.1 400/)
+        const plain = await rawRequest(server.port, 'GET //[ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n')
+        expect(plain).toMatch(/^HTTP\/1.1 400/)
+        expect(upgrades).toEqual([])
+        expect((await fetch(`${server.url}/v1/health`)).status).toBe(200)
+    })
+
+    it('contains a throwing upgrade handler to its own socket', async () => {
+        const fake = makeFake()
+        const viewer = { issueTicket: () => ({ ticket: 't', expiresAtMs: 1 }), handleUpgrade: () => { throw new Error('viewer bug') }, close: async () => undefined }
+        server = await startRuntimeServer({ api: fake.api, verifyToken, port: 0, health: () => ({}), viewer })
+        const response = await rawRequest(server.port, 'GET /v1/viewer/websockify?ticket=x HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+        expect(response).toMatch(/^(HTTP\/1.1 400|)$/m)
+        expect((await fetch(`${server.url}/v1/health`)).status).toBe(200)
     })
 })

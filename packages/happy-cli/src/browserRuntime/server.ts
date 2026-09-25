@@ -112,6 +112,15 @@ function errorBody(err: unknown): { status: number; body: RuntimeErrorBody } {
     return { status: 500, body: { code: 'RUNTIME_UNAVAILABLE', message: 'internal error', retryable: true, mayHaveSideEffects: true } }
 }
 
+/** The request target, or undefined when it does not parse (e.g. `//[`). */
+function parseTarget(target: string | undefined): URL | undefined {
+    try {
+        return new URL(target ?? '/', 'http://localhost')
+    } catch {
+        return undefined
+    }
+}
+
 export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<RuntimeServer> {
     const { api, verifyToken } = opts
     const log = opts.log ?? (() => {})
@@ -159,7 +168,8 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
     }
 
     const server = createServer(async (req, res) => {
-        const url = new URL(req.url ?? '/', 'http://localhost')
+        const url = parseTarget(req.url)
+        if (!url) return send(res, 400, { ok: false, error: { code: 'INVALID_REQUEST', message: 'malformed request target', retryable: false, mayHaveSideEffects: false } })
         try {
             if (req.method === 'GET' && url.pathname === '/v1/health') return send(res, 200, { ok: true, ...opts.health() })
             if (req.method === 'GET' && url.pathname === '/v1/ready' && opts.ready) {
@@ -187,9 +197,18 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
         }
     })
 
+    // Unauthenticated input: nothing here may throw past this handler.
     server.on('upgrade', (req, socket, head) => {
-        if (opts.viewer && new URL(req.url ?? '/', 'http://localhost').pathname === VIEWER_WEBSOCKET_PATH) return opts.viewer.handleUpgrade(req, socket, head)
-        socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+        socket.on('error', () => socket.destroy())
+        try {
+            const url = parseTarget(req.url)
+            if (!url) return socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+            if (opts.viewer && url.pathname === VIEWER_WEBSOCKET_PATH) return opts.viewer.handleUpgrade(req, socket, head)
+            socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+        } catch {
+            log('[browserRuntime] upgrade handler failed')
+            socket.destroy()
+        }
     })
 
     await new Promise<void>((resolve) => server.listen(opts.port, opts.host ?? '127.0.0.1', resolve))

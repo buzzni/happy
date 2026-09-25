@@ -127,7 +127,12 @@ export class ViewerProxy {
         const refuse = (status: number, text: string) => {
             socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
         }
-        const ticket = new URL(req.url ?? '/', 'http://localhost').searchParams.get('ticket')
+        let ticket: string | null
+        try {
+            ticket = new URL(req.url ?? '/', 'http://localhost').searchParams.get('ticket')
+        } catch {
+            return refuse(400, 'Bad Request')
+        }
         const granted = ticket ? this.consumeTicket(ticket) : undefined
         if (!this.originAllowed(req)) return refuse(403, 'Forbidden')
         if (!granted) return refuse(401, 'Unauthorized')
