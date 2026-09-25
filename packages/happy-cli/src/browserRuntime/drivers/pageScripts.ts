@@ -32,14 +32,12 @@ export interface CollectedFrame {
     elements: CollectedElement[]
 }
 
-export const COLLECT_FRAME = String.raw`function collectFrame(limits, scope) {
-    const INTERACTIVE = [
-        'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
-        '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]', '[role="tab"]',
-        '[role="menuitem"]', '[role="textbox"]', '[role="switch"]', '[role="option"]',
-        '[contenteditable="true"]', '[contenteditable=""]',
-    ].join(',')
-    // Containers get refs so a later observe can be scoped to their subtree.
+/**
+ * Role and accessible-name logic shared by the collector and the per-element
+ * scripts, so a label read at dispatch time is computed exactly like the one the
+ * agent saw in its snapshot. Spliced into each function body (a source snippet).
+ */
+const ELEMENT_NAMING = String.raw`    // Containers get refs so a later observe can be scoped to their subtree.
     const CONTAINER = [
         'form', 'dialog', 'fieldset', 'nav', 'main', 'section[aria-label]', 'section[aria-labelledby]',
         '[role="region"]', '[role="group"]', '[role="dialog"]', '[role="list"]', '[role="listbox"]',
@@ -48,48 +46,6 @@ export const COLLECT_FRAME = String.raw`function collectFrame(limits, scope) {
     const MAX_NAME = 120
     const clean = (text) => (text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_NAME)
 
-    const parentAcrossShadow = (element) => {
-        if (element.assignedSlot) return element.assignedSlot
-        if (element.parentElement) return element.parentElement
-        const root = element.getRootNode()
-        return root && (root).host ? (root).host : null
-    }
-    const styles = new Map()
-    const styleOf = (element) => {
-        let style = styles.get(element)
-        if (!style) {
-            style = element.ownerDocument.defaultView.getComputedStyle(element)
-            styles.set(element, style)
-        }
-        return style
-    }
-    const hiddenTrees = new Map()
-    const isInHiddenTree = (element) => {
-        const cached = hiddenTrees.get(element)
-        if (cached !== undefined) return cached
-        const parent = parentAcrossShadow(element)
-        const style = styleOf(element)
-        const firstSummary = parent?.tagName === 'DETAILS'
-            ? Array.from(parent.children).find((child) => child.tagName === 'SUMMARY')
-            : null
-        const collapsedByDetails = parent?.tagName === 'DETAILS' && !parent.hasAttribute('open') && element !== firstSummary
-        const hidden = element.hasAttribute('hidden')
-            || element.hasAttribute('inert')
-            || element.getAttribute('aria-hidden') === 'true'
-            || style.display === 'none'
-            || collapsedByDetails
-            || (parent ? styleOf(parent).contentVisibility === 'hidden' : false)
-            || (parent ? isInHiddenTree(parent) : false)
-        hiddenTrees.set(element, hidden)
-        return hidden
-    }
-    const isVisible = (element) => {
-        if (isInHiddenTree(element)) return false
-        const visibility = styleOf(element).visibility
-        if (visibility === 'hidden' || visibility === 'collapse') return false
-        const rect = element.getBoundingClientRect()
-        return rect.width > 0 && rect.height > 0
-    }
     const roleOf = (element) => {
         const explicit = element.getAttribute('role')
         if (explicit) return explicit
@@ -136,6 +92,58 @@ export const COLLECT_FRAME = String.raw`function collectFrame(limits, scope) {
         return clean(element.getAttribute('name') || element.getAttribute('title') || '')
     }
 
+`
+
+export const COLLECT_FRAME = String.raw`function collectFrame(limits, scope) {
+    const INTERACTIVE = [
+        'a[href]', 'button', 'input', 'select', 'textarea', 'summary',
+        '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]', '[role="tab"]',
+        '[role="menuitem"]', '[role="textbox"]', '[role="switch"]', '[role="option"]',
+        '[contenteditable="true"]', '[contenteditable=""]',
+    ].join(',')
+${ELEMENT_NAMING}
+    const parentAcrossShadow = (element) => {
+        if (element.assignedSlot) return element.assignedSlot
+        if (element.parentElement) return element.parentElement
+        const root = element.getRootNode()
+        return root && (root).host ? (root).host : null
+    }
+    const styles = new Map()
+    const styleOf = (element) => {
+        let style = styles.get(element)
+        if (!style) {
+            style = element.ownerDocument.defaultView.getComputedStyle(element)
+            styles.set(element, style)
+        }
+        return style
+    }
+    const hiddenTrees = new Map()
+    const isInHiddenTree = (element) => {
+        const cached = hiddenTrees.get(element)
+        if (cached !== undefined) return cached
+        const parent = parentAcrossShadow(element)
+        const style = styleOf(element)
+        const firstSummary = parent?.tagName === 'DETAILS'
+            ? Array.from(parent.children).find((child) => child.tagName === 'SUMMARY')
+            : null
+        const collapsedByDetails = parent?.tagName === 'DETAILS' && !parent.hasAttribute('open') && element !== firstSummary
+        const hidden = element.hasAttribute('hidden')
+            || element.hasAttribute('inert')
+            || element.getAttribute('aria-hidden') === 'true'
+            || style.display === 'none'
+            || collapsedByDetails
+            || (parent ? styleOf(parent).contentVisibility === 'hidden' : false)
+            || (parent ? isInHiddenTree(parent) : false)
+        hiddenTrees.set(element, hidden)
+        return hidden
+    }
+    const isVisible = (element) => {
+        if (isInHiddenTree(element)) return false
+        const visibility = styleOf(element).visibility
+        if (visibility === 'hidden' || visibility === 'collapse') return false
+        const rect = element.getBoundingClientRect()
+        return rect.width > 0 && rect.height > 0
+    }
     const elements = []
     const nodes = []
     let truncated = false
