@@ -12,6 +12,18 @@ export class InputLeaseManager {
     private readonly taskTabs = new Map<TaskId, Set<TabId>>()
     private readonly pendingTakeovers = new Map<TabId, PendingTakeover>()
     private readonly listeners = new Set<() => void>()
+    private readonly externalFences = new Map<symbol, ProfileId>()
+
+    /**
+     * Keeps agent input off the profile until the returned function is called
+     * (idempotent). The viewer holds this while x11vnc may still be consuming
+     * human input written before control was lost (D2).
+     */
+    fenceProfile(profileId: ProfileId): () => void {
+        const token = Symbol('fence')
+        this.externalFences.set(token, profileId)
+        return () => { this.externalFences.delete(token) }
+    }
 
     /** Called after every lease change; viewer connections re-check their control here (D2). */
     subscribe(listener: () => void): () => void {
@@ -133,7 +145,8 @@ export class InputLeaseManager {
     }
 
     isUserFenced(profileId: ProfileId): boolean {
-        return [...this.tabs.values()].some((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
+        return [...this.externalFences.values()].includes(profileId)
+            || [...this.tabs.values()].some((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
             || [...this.pendingTakeovers.keys()].some((tabId) => this.tabs.get(tabId)?.profileId === profileId)
     }
 

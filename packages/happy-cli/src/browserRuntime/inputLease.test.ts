@@ -129,4 +129,21 @@ describe('user control view for the viewer proxy (D2)', () => {
         leases.release(tab, profile)
         expect(seen).toHaveLength(8)
     })
+
+    it('keeps agent input off a profile while any external fence is held (viewer input barrier)', () => {
+        const leases = new InputLeaseManager()
+        const release = leases.fenceProfile(profile)
+        const second = leases.fenceProfile(profile)
+        expect(leases.isUserFenced(profile)).toBe(true)
+        expect(leases.isUserFenced('other' as never)).toBe(false)
+        expect(() => leases.acquire(tab, profile, agent)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+        release()
+        release()
+        expect(leases.isUserFenced(profile)).toBe(true)
+        second()
+        expect(leases.isUserFenced(profile)).toBe(false)
+        expect(leases.acquire(tab, profile, agent)).toBe(0)
+        // A user takeover is not blocked by the fence: only agent input is.
+        expect(() => leases.fenceProfile(profile) && leases.takeOver(tab, profile, user)).not.toThrow()
+    })
 })
