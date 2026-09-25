@@ -1024,7 +1024,8 @@ describe('BrowserRuntime durable request contract', () => {
         expect(batch.result?.completedSteps).toContain('fill-amount')
         expect(batch.result?.pendingApproval?.actionId).toBe('submit-order')
         expect(batch.result?.pendingApproval?.description).toContain('Confirm payment')
-        expect(batch.result?.pendingApproval?.description).toContain('Amount=5')
+        expect(batch.result?.pendingApproval?.description).toContain('Amount')
+        expect(batch.result?.pendingApproval?.description).not.toContain('Amount=5')
         expect(h.driver.dispatchCounts.get('fill-amount')).toBe(1)
         expect(h.driver.dispatchCounts.get('submit-order') ?? 0).toBe(0)
 
@@ -1625,7 +1626,7 @@ describe('BrowserRuntime durable request contract', () => {
 describe('approval binding to the complete submission (D6)', () => {
     const payForm: FormSubmission = {
         action: 'https://fixture.test/order', method: 'post', enctype: 'application/x-www-form-urlencoded', target: '',
-        fields: [['item', 'a'], ['item', 'b'], ['token', 't1'], ['note', `${'n'.repeat(50)}-tail`], ['op', 'pay']],
+        fields: [['item', 'a'], ['item', 'b'], ['token', 'synthetic-secret-123'], ['note', `${'n'.repeat(50)}-tail`], ['op', 'pay']],
         submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
         opaque: false,
     }
@@ -1650,18 +1651,21 @@ describe('approval binding to the complete submission (D6)', () => {
         return { h, approval, approve }
     }
 
-    it('shows the method, destination and a truncated field summary while binding the full values', async () => {
+    it('shows the method, destination and field names but never a value, and persists no value (P0-6)', async () => {
         const { h, approval } = await pendingApproval('abp-d6-summary-')
         expect(approval.description).toContain('POST https://fixture.test/order')
-        expect(approval.description).toContain('item=a, item=b, token=t1')
-        expect(approval.description).toContain('…')
-        expect(approval.description).not.toContain('-tail')
+        expect(approval.description).toContain('item, item, token, note, op')
+        for (const value of ['synthetic-secret-123', '-tail', '=a']) expect(approval.description).not.toContain(value)
+        // Nothing durable (journal, task record, approval record) holds the values.
+        const journal = await readTree(h.dir)
+        expect(journal).not.toContain('synthetic-secret-123')
+        expect(journal).not.toContain('-tail')
         await h.store.close()
     })
 
     it('refuses to dispatch when anything that would be sent changed after the approval was shown', async () => {
         const mutations: Array<[string, FormSubmission]> = [
-            ['hidden value', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'token' ? 't2' : value]) }],
+            ['hidden value', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'token' ? 'synthetic-secret-124' : value]) }],
             ['truncated tail', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'note' ? `${'n'.repeat(50)}-TAIL` : value]) }],
             ['field order', { ...payForm, fields: [payForm.fields[1], payForm.fields[0], ...payForm.fields.slice(2)] }],
             ['destination', { ...payForm, action: 'https://fixture.test/elsewhere' }],

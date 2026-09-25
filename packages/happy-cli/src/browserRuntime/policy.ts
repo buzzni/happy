@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
-import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type FormFieldValue, type FormSubmission, type Observation } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type BatchStep, type ElementDescription, type FormSubmission, type Observation } from './contracts'
 
 export function canonicalJson(value: unknown): string {
     if (value === null || typeof value !== 'object') return JSON.stringify(value)
@@ -20,20 +20,20 @@ export function formDigest(form: FormSubmission): string {
     return payloadHash({ action, method, enctype, target, fields, submitter, opaque })
 }
 
-const SUMMARY_VALUE_CHARS = 40
+const SUMMARY_NAME_CHARS = 40
 const SUMMARY_FIELDS = 12
 
-function summaryValue(value: FormFieldValue): string {
-    if (typeof value !== 'string') return 'password' in value ? '••••' : `[file ${redact(value.file).slice(0, SUMMARY_VALUE_CHARS)}]`
-    const shown = redact(value)
-    return shown.length > SUMMARY_VALUE_CHARS ? `${shown.slice(0, SUMMARY_VALUE_CHARS)}…` : shown
-}
-
-/** Human-readable approval summary. Display only: it is truncated, the digest is not. */
+/**
+ * Human-readable approval summary: method, destination (query stripped), a new
+ * browsing context if targeted, and field names. It is persisted with the approval,
+ * so it never contains a value; the digest binds the values. The user sees the
+ * values themselves in the viewer.
+ */
 export function formSummary(form: FormSubmission): string {
-    const shown = form.fields.slice(0, SUMMARY_FIELDS).map(([name, value]) => `${redact(name).slice(0, SUMMARY_VALUE_CHARS)}=${summaryValue(value)}`)
-    if (form.fields.length > SUMMARY_FIELDS) shown.push(`+${form.fields.length - SUMMARY_FIELDS} more`)
-    return `${form.method.toUpperCase()} ${redact(form.action)}: ${shown.join(', ')}`
+    const names = form.fields.slice(0, SUMMARY_FIELDS).map(([name]) => redact(name).slice(0, SUMMARY_NAME_CHARS))
+    if (form.fields.length > SUMMARY_FIELDS) names.push(`+${form.fields.length - SUMMARY_FIELDS} more`)
+    const target = ['', '_self'].includes(form.target) ? '' : ' (new window)'
+    return `${form.method.toUpperCase()} ${redact(form.action)}${target}: ${names.join(', ')}`
 }
 
 export function assertAllowedOrigin(url: string, grant: Pick<AgentGrant, 'allowedOrigins'>): string {

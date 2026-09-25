@@ -35,12 +35,13 @@ export function createApproval(input: {
     const { description } = input
     const approvalId = `approval-${randomUUID()}` as ApprovalId
     const stepHash = approvalPayloadHash(input.step, description)
-    // Display only: truncated. The binding above covers the full submission.
+    // Persisted with the approval: names only, never a value (the binding above covers the values).
     const formText = description.form
         ? formSummary(description.form)
-        : Object.entries(description.formValues).map(([name, value]) => `${name}=${redact(value)}`).join(', ')
+        : Object.keys(description.formValues).map((name) => redact(name)).join(', ')
     const label = description.currentName ?? description.name
     const targetName = label ? ` "${redact(label)}"` : ` ${input.step.kind}`
+    const verb = input.step.kind === 'fill' ? 'Fill' : 'Confirm'
     const bindingHash = approvalBinding({
         principalId: input.grant.principalId,
         workspaceId: input.grant.workspaceId,
@@ -58,7 +59,9 @@ export function createApproval(input: {
         approvalId,
         actionId: input.step.actionId,
         origin: input.origin,
-        description: `Confirm${targetName}${formText ? ` (${formText})` : ''}`,
+        description: input.step.kind === 'fill'
+            ? `${verb}${targetName} (value hidden)`
+            : `${verb}${targetName}${formText ? ` (${formText})` : ''}`,
         bindingHash,
         expiresAtMs: input.expiresAtMs,
     }
@@ -77,7 +80,6 @@ export function createApproval(input: {
             snapshotId: input.snapshotId,
             frameOrigin: description.frameOrigin,
             elementIdentity: description.identity,
-            formValues: Object.fromEntries(Object.entries(description.formValues).map(([name, value]) => [name, payloadHash(value)])),
         },
     }
 }

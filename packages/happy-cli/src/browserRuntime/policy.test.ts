@@ -84,15 +84,16 @@ describe('form digest', () => {
         expect(digests.size).toBe(variants.length + 1)
     })
 
-    it('truncates only the display summary, never the bound values', () => {
-        const long = 'x'.repeat(60)
-        const a = { ...base, fields: [['note', `${long}A`]] as FormSubmission['fields'] }
-        const b = { ...base, fields: [['note', `${long}B`]] as FormSubmission['fields'] }
+    it('summarises without any value (it is persisted), while the digest binds every value', () => {
+        const a = { ...base, fields: [['token', 'synthetic-secret-123']] as FormSubmission['fields'] }
+        const b = { ...base, fields: [['token', 'synthetic-secret-124']] as FormSubmission['fields'] }
         expect(formSummary(a)).toBe(formSummary(b))
+        expect(formSummary(a)).not.toContain('synthetic-secret')
         expect(formDigest(a)).not.toBe(formDigest(b))
-        expect(formSummary(base)).toBe('POST https://fixture.test/order: item=a, item=b, amount=10, pin=••••')
+        expect(formSummary(base)).toBe('POST https://fixture.test/order: item, item, amount, pin')
+        expect(formSummary({ ...base, target: '_blank' })).toBe('POST https://fixture.test/order (new window): item, item, amount, pin')
         const many = { ...base, fields: Array.from({ length: 20 }, (_, i) => [`f${i}`, String(i)]) as FormSubmission['fields'] }
-        expect(formSummary(many)).toMatch(/f11=11, \+8 more$/)
+        expect(formSummary(many)).toMatch(/f11, \+8 more$/)
     })
 })
 
