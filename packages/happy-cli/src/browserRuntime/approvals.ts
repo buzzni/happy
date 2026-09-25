@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto'
-import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, PendingApprovalSummary, SnapshotId, TaskId } from './contracts'
+import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, ElementDescription, PendingApprovalSummary, SnapshotId, TaskId } from './contracts'
 import { approvalBinding, payloadHash, redact, type FormValue } from './policy'
 import type { ApprovalRecord } from './taskStore'
+
+/** Hash of what an approval covers; recomputed from a fresh describeRef right before dispatch. */
+export function approvalPayloadHash(step: BatchStep, description: Pick<ElementDescription, 'formValues' | 'frameOrigin' | 'pageUrl'>): string {
+    return payloadHash({ step, formValues: description.formValues, frameOrigin: description.frameOrigin,
+        currentPageUrl: description.pageUrl })
+}
 
 export function createApproval(input: {
     grant: AgentGrant
@@ -24,8 +30,8 @@ export function createApproval(input: {
 }): { summary: PendingApprovalSummary; record: ApprovalRecord } {
     const approvalId = `approval-${randomUUID()}` as ApprovalId
     const formValuesByName = Object.fromEntries((input.formValues ?? []).map(({ name, value }) => [name, value]))
-    const stepHash = payloadHash({ step: input.step, formValues: formValuesByName,
-        frameOrigin: input.frameOrigin, currentPageUrl: input.currentPageUrl })
+    const stepHash = approvalPayloadHash(input.step, { formValues: formValuesByName, frameOrigin: input.frameOrigin,
+        pageUrl: input.currentPageUrl })
     const formSummary = (input.formValues ?? [])
         .map(({ name, value }) => `${name}=${redact(value)}`)
         .join(', ')

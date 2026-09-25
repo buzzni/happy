@@ -6,7 +6,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, type ActionId, type Ag
                 type TabId, type ApprovalId,
                 type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
-import { createApproval } from './approvals'
+import { approvalPayloadHash, createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
@@ -841,8 +841,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (this.clock.now() >= Number(approval.expiresAtMs) || originalGrant.expiresAtMs <= this.clock.now()
             || this.options.store.isRevoked(originalGrant.grantId))
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval or execution grant expired before dispatch')
-        const currentApprovalPayloadHash = payloadHash({ step: approvedStep, formValues: description.formValues,
-            frameOrigin: description.frameOrigin, currentPageUrl: description.pageUrl })
+        const currentApprovalPayloadHash = approvalPayloadHash(approvedStep, description)
         if (description.documentGeneration !== Number(approval.documentGeneration)
             || description.frameOrigin !== approval.frameOrigin
             || new URL(description.pageUrl).origin !== approval.origin
@@ -1692,9 +1691,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (approvedActionId === step.actionId) {
                     const boundApproval = Object.values(task.approvals).find((item) => item.actionId === step.actionId
                         && item.batchId === batchId && item.state === 'consumed')
-                    const currentBindingHash = description ? payloadHash({ step: effectiveStep,
-                        formValues: description.formValues, frameOrigin: description.frameOrigin,
-                        currentPageUrl: description.pageUrl }) : ''
+                    const currentBindingHash = description ? approvalPayloadHash(effectiveStep, description) : ''
                     const recomputedApprovalBinding = boundApproval ? approvalBinding({
                         principalId: grant.principalId,
                         workspaceId: grant.workspaceId,
