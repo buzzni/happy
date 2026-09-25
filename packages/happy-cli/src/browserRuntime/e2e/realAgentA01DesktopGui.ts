@@ -23,7 +23,7 @@ import { join } from 'node:path'
 import type { TaskEvent, TaskId } from '../contracts'
 import { DesktopGui, desktopProcesses, launchDesktop, quitDesktop } from './desktopGuiClient'
 import {
-    clientProcessCount, evidenceFile, execDaemonSessions, execMachine, fixtureControl, ledger, loadRun, now, parseArgs, sleep,
+    clientProcessCount, evidenceFile, execDaemonSessions, execMachine, fixtureControl, prodIdentity, ledger, loadRun, now, parseArgs, sleep,
     userClient, waitForTranscript, writeAgentGrant,
 } from './realAgentHarness'
 
@@ -59,13 +59,14 @@ async function main(): Promise<void> {
     save()
 
     // 2. Bind an agent grant to exactly that session.
-    evidence.grantId = await writeAgentGrant(ctx, sessionId, `a01-gui-${iteration}`, DAEMON_GRANT_FILE)
+    // Production layout: the Runtime broker already issued this session's grant at spawn.
+    evidence.grantId = prodIdentity ? 'broker' : await writeAgentGrant(ctx, sessionId, `a01-gui-${iteration}`, DAEMON_GRANT_FILE)
     await waitForTranscript(sessionId, (rows) => rows.some((row) => row.t === 'turn-end'), 180_000)
 
     // 3. The A01 task from the same chat, then the Desktop quits.
     evidence.promptTemplateSha256 = createHash('sha256').update(PROMPT_TEMPLATE).digest('hex')
     evidence.guiSendStartedAtMs = now()
-    await gui.sendInOpenChat(PROMPT_TEMPLATE.replace('__RUN__', ctx.run).replace('__KEY__', barrierKey).replace(/\n/g, ' '))
+    await gui.sendInOpenChat(PROMPT_TEMPLATE.replace('__PROFILE__', prodIdentity?.profileId ?? 'profile-a').replace('__RUN__', ctx.run).replace('__KEY__', barrierKey).replace(/\n/g, ' '))
     const sentAt = now()
     // Delivered = the agent has started working on it on H (not just "left the composer").
     const started = await waitForTranscript(sessionId, (rows) => rows.some((row) => row.t === 'tool-call-start' && row.time > sentAt), 180_000)

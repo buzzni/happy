@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import type { TaskEvent, TaskId } from '../contracts'
 import {
     clientProcessCount, evidenceFile, ledger, loadRun, now, parseArgs, sessionClient, sleep, spawnAgentSession,
-    userClient, waitForTranscript,
+    userClient, waitForTranscript, prodIdentity,
 } from './realAgentHarness'
 
 const PROMPT_TEMPLATE = readFileSync(join(import.meta.dirname, 'realAgentA08.prompt.txt'), 'utf8')
@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     save()
 
     // 1. The client sends the task and exits; the agent runs alone until it hits the approval gate.
-    await sessionClient('send', sessionId, PROMPT_TEMPLATE.replace('__RUN__', ctx.run))
+    await sessionClient('send', sessionId, PROMPT_TEMPLATE.replace('__PROFILE__', prodIdentity?.profileId ?? 'profile-a').replace('__RUN__', ctx.run))
     evidence.clientExitedAtMs = now()
     evidence.clientProcessesAfterExit = await clientProcessCount()
     let rows = await waitForTranscript(sessionId, (list) => list.some((row) => row.t === 'text' && row.text?.includes('A08-WAITING')), 300_000)
@@ -79,9 +79,17 @@ async function main(): Promise<void> {
     save()
     if (!attention) throw new Error('no agent-attention-required event')
 
-    // 4. The client that handled the approval wakes the owning agent session, then exits.
-    const wakeAt = now()
-    await sessionClient('send', sessionId, followUp(taskId, `${afterApproval.status}:${afterApproval.pauseReason ?? ''}`, attention.seq))
+    // 4. Wake the owning agent session. Production layout: nobody sends it — the daemon on H
+    //    delivers the attention event itself (D10); no client process exists at that point.
+    const wakeAt = prodIdentity ? approvedAt : now()
+    if (prodIdentity) {
+        evidence.wakeBy = 'daemon-attention-watcher'
+        evidence.clientProcessesAtWake = await clientProcessCount()
+        const woke = await waitForTranscript(sessionId, (list2) => list2.some((row) => row.t === 'text' && row.time > approvedAt && /\[agent-browser\]/.test(row.text ?? '')), 300_000)
+        evidence.daemonWakeSeen = woke.some((row) => row.time > approvedAt && /\[agent-browser\]/.test(row.text ?? ''))
+    } else {
+        await sessionClient('send', sessionId, followUp(taskId, `${afterApproval.status}:${afterApproval.pauseReason ?? ''}`, attention.seq))
+    }
     evidence.clientProcessesAfterWake = await clientProcessCount()
     rows = await waitForTranscript(sessionId, (list2) => list2.some((row) => row.t === 'turn-end' && row.time > wakeAt), 300_000)
     evidence.agentToolCallsAfterWake = rows.filter((row) => row.t === 'tool-call-start' && row.time > wakeAt && row.name?.includes('browser_task_')).map((row) => row.name!.replace('mcp__happy__', ''))
@@ -109,6 +117,7 @@ async function main(): Promise<void> {
     evidence.pass = before.status === 'awaiting-user' && before.riskyWrites === 0
         && evidence.approveOutcome === 'approved' && after.riskyWrites === 1
         && evidence.finalStatus === 'succeeded'
+        && (!prodIdentity || (evidence.daemonWakeSeen === true && evidence.clientProcessesAtWake === 0))
         && dup.newDispatchEvents === 0 && dup.riskyWrites === 1 && dup.status === 'succeeded'
     save()
     console.log(JSON.stringify({ pass: evidence.pass, taskId }))
