@@ -5,7 +5,7 @@
  * a separate short-lived process), and reads independent evidence from the
  * fixture ledger and the Runtime journal.
  */
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -27,7 +27,79 @@ export interface RunContext {
     runDir: string
     env: { ports: { control: number; runtime: number }; harnessToken: string }
     keys: { agentKey: string; interactiveKey: string }
+    /** Where the harness reaches the Runtime (the execution machine's address when it is separate). */
     runtimeUrl: string
+    /** Where the agent reaches the Runtime from its own machine. */
+    agentRuntimeUrl: string
+}
+
+/**
+ * Separate execution machine H (OrbStack Linux machine): the stack, the Happy daemon
+ * and the agent run there; this process plays the auth server and the user's client.
+ * ABP_EXEC_MACHINE = orb machine name, ABP_EXEC_HOST = its address.
+ */
+export const execMachine = process.env.ABP_EXEC_MACHINE
+const execHost = () => process.env.ABP_EXEC_HOST ?? '127.0.0.1'
+export const execHappyHome = () => process.env.ABP_EXEC_HAPPY_HOME ?? '/home/agent/.happy-cli-isolated-abp/home'
+export const execUser = () => process.env.ABP_EXEC_USER ?? 'agent'
+
+/**
+ * fetch for calls from this machine to H. macOS Local Network privacy blocks the
+ * harness' node process from LAN addresses (EHOSTUNREACH) while the system curl
+ * is allowed, so requests go through curl; headers and body travel on stdin
+ * (curl config), never on the command line.
+ */
+export const execFetch: typeof fetch = (input, init = {}) => new Promise((resolve, reject) => {
+    const quote = (value: string) => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+    const headers = new Headers(init.headers)
+    const config = [
+        `url = ${quote(String(input))}`,
+        `request = ${quote(init.method ?? 'GET')}`,
+        ...[...headers].map(([key, value]) => `header = ${quote(`${key}: ${value}`)}`),
+        ...init.body !== undefined && init.body !== null ? [`data-binary = ${quote(String(init.body))}`] : [],
+        'silent', 'show-error', 'max-time = 180', `write-out = "\\n%{http_code}"`,
+    ].join('\n')
+    const child = spawn('/usr/bin/curl', ['-K', '-'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    let out = ''
+    let err = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.stderr.on('data', (chunk) => { err += chunk })
+    child.on('error', reject)
+    child.on('close', (code) => {
+        if (code !== 0) return reject(new TypeError(`fetch failed (curl ${code}): ${err.trim().slice(0, 200)}`))
+        const split = out.lastIndexOf('\n')
+        resolve(new Response(out.slice(0, split), { status: Number(out.slice(split + 1)) }))
+    })
+    child.stdin.end(config)
+})
+const harnessFetch: typeof fetch = (input, init) => execMachine ? execFetch(input, init) : fetch(input, init)
+
+/** Run a root shell script on the execution machine, optionally feeding stdin. */
+export function onExecMachine(script: string, stdin?: string): Promise<string> {
+    if (!execMachine) throw new Error('ABP_EXEC_MACHINE is not set')
+    return new Promise((resolve, reject) => {
+        const child = spawn('orb', ['-m', execMachine, '-u', 'root', 'bash', '-c', script], { stdio: ['pipe', 'pipe', 'pipe'] })
+        let out = ''
+        let err = ''
+        child.stdout.on('data', (chunk) => { out += chunk })
+        child.stderr.on('data', (chunk) => { err += chunk })
+        child.on('error', reject)
+        child.on('close', (code) => code === 0 ? resolve(out) : reject(new Error(`exec machine script failed (${code}): ${err.slice(0, 300)}`)))
+        child.stdin.end(stdin ?? '')
+    })
+}
+
+/** The stack's harness-only run directory on the execution machine (root-only there). */
+export const execRunDir = (run: string) => `${process.env.ABP_EXEC_RUN_ROOT ?? '/opt/happy/packages/happy-cli/scripts/browser-poc/.abp'}/${run}`
+
+const daemonCall = (path: string) => `S=${execHappyHome()}/daemon.state.json; `
+    + `curl -fsS -X POST -H "authorization: Bearer $(jq -r .controlSecret $S)" -H 'content-type: application/json' `
+    + `--data-binary @- "http://127.0.0.1:$(jq -r .httpPort $S)${path}"`
+
+/** Session ids the execution machine's daemon is tracking right now. */
+export async function execDaemonSessions(): Promise<string[]> {
+    const list = JSON.parse(await onExecMachine(daemonCall('/list'), '{}')) as { children: Array<{ happySessionId: string }> }
+    return list.children.map((child) => child.happySessionId)
 }
 
 export function parseArgs(argv: string[]): Record<string, string> {
@@ -42,7 +114,7 @@ export function loadRun(run: string): RunContext {
     const runDir = join(import.meta.dirname, '../../../scripts/browser-poc/.abp', run)
     const env = JSON.parse(readFileSync(join(runDir, 'env.json'), 'utf8'))
     const keys = JSON.parse(readFileSync(join(runDir, 'keys.json'), 'utf8'))
-    return { run, runDir, env, keys, runtimeUrl: `http://127.0.0.1:${env.ports.runtime}` }
+    return { run, runDir, env, keys, runtimeUrl: `http://${execHost()}:${env.ports.runtime}`, agentRuntimeUrl: `http://127.0.0.1:${env.ports.runtime}` }
 }
 
 /** Evidence file that is rewritten after every step, so a harness failure never loses what happened. */
@@ -56,32 +128,56 @@ export function evidenceFile(path: string): { data: Record<string, unknown>; sav
 const happyHome = () => process.env.ABP_HAPPY_HOME ?? join(homedir(), '.happy-cli-isolated-abp/home')
 const clientDir = () => process.env.ABP_SESSION_CLIENT_DIR ?? '/Users/justin/workspace/aplus-dev-studio-desktop/.aplus/worktrees/abp-desktop'
 
-/** Spawn a real agent session through the isolated daemon and bind an agent grant to it. */
-export async function spawnAgentSession(ctx: RunContext, label: string, extraEnv: Record<string, string> = {}): Promise<{ sessionId: string; grantId: GrantId }> {
-    const daemon = JSON.parse(readFileSync(join(happyHome(), 'daemon.state.json'), 'utf8'))
-    const workspace = join(homedir(), 'abp-poc-agent-ws', `${ctx.run}-${label}`)
-    mkdirSync(workspace, { recursive: true })
-    const grantDir = join(happyHome(), '..', 'grants')
-    mkdirSync(grantDir, { recursive: true, mode: 0o700 })
-    const grantFile = join(grantDir, `${ctx.run}-${label}.token`)
-    const response = await fetch(`http://127.0.0.1:${daemon.httpPort}/spawn-session`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${daemon.controlSecret}`, 'content-type': 'application/json' },
-        body: JSON.stringify({
-            directory: workspace,
-            agent: 'claude',
-            environmentVariables: { ...extraEnv, HAPPY_BROWSER_TASK_RUNTIME_URL: ctx.runtimeUrl, HAPPY_BROWSER_TASK_GRANT_FILE: grantFile },
-        }),
-    })
-    const spawned = await response.json() as { success: boolean; sessionId: string }
-    if (!spawned.success) throw new Error('spawn failed')
+/** Mint an agent grant bound to one agent session and put it where that session reads it. */
+export async function writeAgentGrant(ctx: RunContext, agentSessionId: string, label: string, file: string): Promise<GrantId> {
     const issuedAt = now()
     const grantId = `grant-${ctx.run}-${label}` as GrantId
-    writeFileSync(grantFile, mintAgentGrant({
+    const token = mintAgentGrant({
         kind: 'agent-grant', grantId, principalId: PRINCIPAL_A, workspaceId: WORKSPACE, machineId: MACHINE,
-        agentSessionId: spawned.sessionId as AgentSessionId, profileId: PROFILE_A, allowedOrigins: [SITE_A, SITE_B],
+        agentSessionId: agentSessionId as AgentSessionId, profileId: PROFILE_A, allowedOrigins: [SITE_A, SITE_B],
         operations: [...AGENT_OPERATIONS], taskSpaceIds: [], issuedAtMs: issuedAt, expiresAtMs: issuedAt + 55 * 60_000,
-    }, ctx.keys, issuedAt), { mode: 0o600 })
+    }, ctx.keys, issuedAt)
+    if (execMachine) {
+        await onExecMachine(`umask 077; install -d -o ${execUser()} -m 700 "$(dirname '${file}')"; cat > '${file}'; chown ${execUser()} '${file}'; chmod 600 '${file}'`, token)
+    } else {
+        writeFileSync(file, token, { mode: 0o600 })
+    }
+    return grantId
+}
+
+/** Spawn a real agent session through the isolated daemon and bind an agent grant to it. */
+export async function spawnAgentSession(ctx: RunContext, label: string, extraEnv: Record<string, string> = {}): Promise<{ sessionId: string; grantId: GrantId }> {
+    let spawned: { success: boolean; sessionId: string }
+    let grantFile: string
+    if (execMachine) {
+        const workspace = `/home/${execUser()}/abp-poc-agent-ws/${ctx.run}-${label}`
+        grantFile = `/home/${execUser()}/abp-grants/${ctx.run}-${label}.token`
+        await onExecMachine(`install -d -o ${execUser()} -m 700 '${workspace}'`)
+        spawned = JSON.parse(await onExecMachine(daemonCall('/spawn-session'), JSON.stringify({
+            directory: workspace,
+            agent: 'claude',
+            environmentVariables: { ...extraEnv, HAPPY_BROWSER_TASK_RUNTIME_URL: ctx.agentRuntimeUrl, HAPPY_BROWSER_TASK_GRANT_FILE: grantFile },
+        })))
+    } else {
+        const daemon = JSON.parse(readFileSync(join(happyHome(), 'daemon.state.json'), 'utf8'))
+        const workspace = join(homedir(), 'abp-poc-agent-ws', `${ctx.run}-${label}`)
+        mkdirSync(workspace, { recursive: true })
+        const grantDir = join(happyHome(), '..', 'grants')
+        mkdirSync(grantDir, { recursive: true, mode: 0o700 })
+        grantFile = join(grantDir, `${ctx.run}-${label}.token`)
+        const response = await fetch(`http://127.0.0.1:${daemon.httpPort}/spawn-session`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${daemon.controlSecret}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+                directory: workspace,
+                agent: 'claude',
+                environmentVariables: { ...extraEnv, HAPPY_BROWSER_TASK_RUNTIME_URL: ctx.agentRuntimeUrl, HAPPY_BROWSER_TASK_GRANT_FILE: grantFile },
+            }),
+        })
+        spawned = await response.json() as { success: boolean; sessionId: string }
+    }
+    if (!spawned.success) throw new Error('spawn failed')
+    const grantId = await writeAgentGrant(ctx, spawned.sessionId, label, grantFile)
     return { sessionId: spawned.sessionId, grantId }
 }
 
@@ -93,7 +189,7 @@ export function userClient(ctx: RunContext, viewerSessionId: string): RuntimeCli
         workspaceId: WORKSPACE, machineId: MACHINE, viewerSessionId, profileId: PROFILE_A,
         operations: [...INTERACTIVE_OPERATIONS, 'getTask', 'subscribe'], issuedAtMs: issuedAt, expiresAtMs: issuedAt + 10 * 60_000,
     }, ctx.keys, issuedAt)
-    return new RuntimeClient({ baseUrl: ctx.runtimeUrl, token })
+    return new RuntimeClient({ baseUrl: ctx.runtimeUrl, token, fetchImpl: harnessFetch })
 }
 
 function clientEnv(): NodeJS.ProcessEnv {
@@ -145,7 +241,7 @@ export async function waitForTranscript(sessionId: string, predicate: (rows: Tra
 }
 
 export async function fixtureControl(ctx: RunContext, method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
-    const response = await fetch(`http://127.0.0.1:${ctx.env.ports.control}${path}`, {
+    const response = await harnessFetch(`http://${execHost()}:${ctx.env.ports.control}${path}`, {
         method,
         headers: { 'x-harness-token': ctx.env.harnessToken, 'content-type': 'application/json' },
         ...(body ? { body: JSON.stringify(body) } : {}),

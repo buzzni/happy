@@ -62,3 +62,27 @@ node scripts/browser-poc/poc.mjs down --run <run> --purge
 ```
 
 Note: the server can push a happy-cli update to every registered machine, which restarts the isolated daemon on the globally installed CLI (the `browser_task_*` tools disappear). Check `daemon.state.json` → `startedWithCliVersion` before a run.
+
+## Separate execution machine H + Desktop GUI client
+
+H is a Linux machine (tested: OrbStack isolated machine `orb create --isolated ubuntu abp-exec`, no Mac file sharing) that runs the stack as root, and the Happy daemon plus the agent as an unprivileged user `agent` (not in the `docker` group; the run directory `.abp/` stays root-only). This Mac plays the auth server and runs the Desktop dev build (`npx electron-vite dev --remoteDebuggingPort 9444` with `APLUS_DESKTOP_USER_DATA_DIR`) as client C.
+
+On H:
+
+```sh
+ABP_PUBLISH_HOST=0.0.0.0 ABP_PORT_BASE=38700 pnpm exec tsx src/browserRuntime/e2e/stackCli.ts up <run>   # as root
+HAPPY_CLI_ISOLATED_ROOT=/home/agent/.happy-cli-isolated-abp node scripts/install-isolated.cjs            # then chown -R agent
+# systemd unit for the daemon (User=agent, HAPPY_HOME_DIR, HAPPY_BROWSER_TASK_RUNTIME_URL=http://127.0.0.1:38700,
+# HAPPY_BROWSER_TASK_GRANT_FILE=/home/agent/abp-grants/current.token, ExecStart=happy daemon start-sync, ExecStop=happy daemon stop)
+```
+
+`ABP_PORT_BASE` pins the host ports (runtime, admin +1, control +2, noVNC +3/+4); without it docker reassigns them when H reboots and a service configured with the Runtime URL points at another container. The agent user also needs `claude` logged in. Copy `.abp/<run>/env.json` and `keys.json` from H to the same path here (harness role), then:
+
+```sh
+export ABP_EXEC_MACHINE=abp-exec ABP_EXEC_HOST=<H address> ABP_DESKTOP_USER_DATA_DIR=<Desktop user data dir>
+pnpm exec tsx src/browserRuntime/e2e/realAgentA01DesktopGui.ts --run <run> --iteration 1 --machine <H machineId prefix>
+pnpm exec tsx src/browserRuntime/e2e/realAgentSandbox.ts --run <run> [--no-sandbox]
+pnpm exec tsx src/browserRuntime/e2e/execMachineReboot.ts --run <run> --iteration 1
+```
+
+The Desktop GUI run starts a personal chat on H from the Desktop, binds the grant to the session H's daemon spawned, sends the A01 task from the same chat, terminates every Desktop process (SIGTERM, then SIGKILL, including native helpers such as `network-path-monitor`) and only then releases the barrier; afterwards it relaunches the Desktop and reopens the chat. Calls from this Mac to H go through the system `curl` (`execFetch`): macOS Local Network privacy returns `EHOSTUNREACH` to the harness' node process for LAN addresses.
