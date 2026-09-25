@@ -173,8 +173,10 @@ export class ViewerProxy {
     }
 
     /**
-     * The tunnel origins from the configuration, or the Runtime's own origin
-     * when reached on a loopback address: a DNS-rebound name never passes.
+     * The tunnel origins from the configuration, or any http loopback origin when
+     * the Runtime itself is reached on a loopback Host: Desktop's local tunnel picks
+     * its port at runtime, while a DNS-rebound name (non-loopback Host) never passes.
+     * The one-time ticket stays the authorization; this only narrows who may try.
      */
     private originAllowed(req: IncomingMessage): boolean {
         const origin = req.headers.origin
@@ -183,7 +185,9 @@ export class ViewerProxy {
         const host = req.headers.host
         if (!host) return false
         try {
-            return LOOPBACK_HOSTNAMES.has(new URL(`http://${host}`).hostname) && origin === `http://${host}`
+            const parsedOrigin = new URL(origin)
+            return LOOPBACK_HOSTNAMES.has(new URL(`http://${host}`).hostname)
+                && parsedOrigin.protocol === 'http:' && LOOPBACK_HOSTNAMES.has(parsedOrigin.hostname) && parsedOrigin.origin === origin
         } catch {
             return false
         }

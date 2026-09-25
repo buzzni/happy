@@ -415,11 +415,20 @@ describe('viewer proxy connection', () => {
         expect(await viewer.closed).toMatchObject({ code: 4001 })
     })
 
-    it('rejects a missing or foreign Origin, and a self origin on a non-loopback Host', async () => {
+    it('accepts any http loopback Origin on a loopback Host and rejects missing, foreign or rebound ones', async () => {
         const { origin, ticket, url, connect } = await viewerStack()
         await expect(RawRfbViewer.open(url(ticket()))).rejects.toThrow('HTTP 403')
         await expect(RawRfbViewer.open(url(ticket()), 'https://evil.example')).rejects.toThrow('HTTP 403')
-        await expect(RawRfbViewer.open(url(ticket()), origin.replace('127.0.0.1', 'localhost'))).rejects.toThrow('HTTP 403')
+        await expect(RawRfbViewer.open(url(ticket()), 'https://localhost:1')).rejects.toThrow('HTTP 403')
+        const loopbackOriginForeignHost = await new Promise<number>((resolve) => {
+            const ws = new WebSocket(url(ticket()), { headers: { origin: 'http://localhost:5555', host: 'rebind.example:1234' } })
+            ws.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0))
+            ws.once('open', () => resolve(101))
+        })
+        expect(loopbackOriginForeignHost).toBe(403)
+        // Desktop reaches the Runtime through a local tunnel whose port is chosen at runtime.
+        const tunnelPort = await RawRfbViewer.open(url(ticket()), 'http://localhost:49152')
+        tunnelPort.ws.terminate()
         const rebound = await new Promise<number>((resolve) => {
             const ws = new WebSocket(url(ticket()), { headers: { origin: 'http://rebind.example:1234', host: 'rebind.example:1234' } })
             ws.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0))
