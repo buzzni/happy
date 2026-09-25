@@ -255,7 +255,12 @@ async function completeHandoff(flow: Flow, tag: string, t: { client: RuntimeClie
     expect(done.taskId).toBe(t.taskId)
     expect(done.pauseReason).toBe('awaiting-agent')
     const events = await allEvents(human, t.taskId)
-    expect(events.some((e) => e.type === 'state-changed' && e.data.resumedAfter === flow)).toBe(true)
+    if (options.afterRuntimeRestart) {
+        // The resume found no live steps and recorded the interruption instead of replaying.
+        expect(events.some((e) => e.type === 'recovered' && e.data.interrupted === true)).toBe(true)
+    } else {
+        expect(events.some((e) => e.type === 'state-changed' && e.data.resumedAfter === flow)).toBe(true)
+    }
     return done
 }
 
