@@ -308,7 +308,14 @@ export interface ElementDescription {
     formAction?: string
     /** Current values of the enclosing form's fields; password fields are omitted */
     formValues: Record<string, string>
+    /**
+     * Identity of the element's document (derived from frame + loader), stable
+     * across Runtime restarts and changed by any navigation/reload of that frame.
+     * Unlike Observation.documentGeneration it is not a per-driver counter.
+     */
     documentGeneration: number
+    /** Opaque, non-secret element identity that restoreRef can re-bind after a Runtime-only restart. */
+    identity: string
 }
 
 export interface ObservedFrame {
@@ -379,6 +386,13 @@ export interface BrowserDriver {
      * approval binding right before dispatch.
      */
     describeRef?(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription>
+    /**
+     * After a Runtime-only restart (same browser instance, tab re-adopted), re-bind
+     * `ref` of `snapshotId` from a persisted ElementDescription.identity, only if
+     * the element's document (loader) is unchanged. 'present' = the snapshot is
+     * already live, 'restored' = re-bound, 'gone' = document or node changed.
+     */
+    restoreRef?(tabId: TabId, snapshotId: SnapshotId, ref: ElementRef, identity: string, opts: DriverOptions): Promise<'present' | 'restored' | 'gone'>
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }>
     observe(tabId: TabId, allowedOrigins: string[], opts: DriverOptions & { maxElements?: number; maxTextChars?: number; scopeRef?: ElementRef }): Promise<Observation>
     screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult>

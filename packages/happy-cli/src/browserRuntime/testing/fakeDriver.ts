@@ -33,6 +33,11 @@ export class FakeBrowserDriver implements BrowserDriver {
 
     browserInstanceId(): BrowserInstanceId { return this.instance }
     swapInstance(): BrowserInstanceId { return this.instance = `browser-${randomUUID()}` as BrowserInstanceId }
+    /** A Runtime-only restart: the new driver connection has no snapshots, the browser (and its nodes) is unchanged. */
+    forgetSnapshots(): void {
+        this.snapshotElements.clear()
+        this.snapshotGenerations.clear()
+    }
     armAction(actionId: string): void { this.currentActionId = actionId }
     setDelay(operation: Operation, ms: number): void { this.delays.set(operation, ms) }
     setIgnoreWaitAbort(ignore: boolean): void { this.ignoreWaitAbort = ignore }
@@ -100,7 +105,19 @@ export class FakeBrowserDriver implements BrowserDriver {
         const formValues = Object.fromEntries(Object.entries(values).filter(([name]) => !/password/i.test(name)))
         return { ref, role: described.role, name: described.name, frameOrigin: described.frameOrigin,
             pageUrl: page.url, formAction: page.formAction ?? described.formAction,
-            formValues: structuredClone(formValues), documentGeneration: page.documentGeneration ?? 1 }
+            formValues: structuredClone(formValues), documentGeneration: page.documentGeneration ?? 1,
+            identity: Buffer.from(JSON.stringify({ element: described, documentGeneration: page.documentGeneration ?? 1 })).toString('base64url') }
+    }
+    async restoreRef(tabId: TabId, snapshotId: SnapshotId, ref: ElementRef, identity: string, opts: DriverOptions): Promise<'present' | 'restored' | 'gone'> {
+        await this.delay('describeRef', opts)
+        const page = this.requirePage(tabId)
+        if (this.snapshotElements.get(snapshotId)?.has(ref)) return 'present'
+        const stored = JSON.parse(Buffer.from(identity, 'base64url').toString('utf8')) as { element: ObservedElement; documentGeneration: number }
+        const current = page.elements?.find((element) => element.ref === ref)
+        if ((page.documentGeneration ?? 1) !== stored.documentGeneration || !current || !sameNode(stored.element, current)) return 'gone'
+        this.snapshotElements.set(snapshotId, new Map([[ref, structuredClone(stored.element)]]))
+        this.snapshotGenerations.set(snapshotId, stored.documentGeneration)
+        return 'restored'
     }
     async screenshot(tabId: TabId, allowedOrigins: string[], opts: DriverOptions): Promise<ScreenshotResult> {
         await this.delay('screenshot', opts); this.throwNextFailure('screenshot'); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !allowedOrigins.includes(origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')

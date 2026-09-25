@@ -14,7 +14,7 @@
  *   position or label.
  * - Frames whose origin is not allowed contribute no text, refs or pixels.
  */
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
     BrowserRuntimeError,
     type BrowserDriver,
@@ -562,8 +562,38 @@ export class CdpDriver implements BrowserDriver {
                 pageUrl: context.pageUrl,
                 ...(context.formAction ? { formAction: context.formAction } : {}),
                 formValues: context.formValues,
-                documentGeneration: tab.generation,
+                documentGeneration: documentIdentity(binding.frameId, binding.loaderId),
+                identity: encodeIdentity(binding),
             }
+        })
+    }
+
+    restoreRef(tabId: TabId, snapshotId: SnapshotId, ref: ElementRef, identity: string, opts: DriverOptions): Promise<'present' | 'restored' | 'gone'> {
+        return this.run(opts, async (_op, conn) => {
+            const tab = this.requireTab(tabId)
+            if (tab.snapshot?.snapshotId === snapshotId && tab.snapshot.refs.has(ref)) return 'present'
+            // Never replace a snapshot the agent took after the restart.
+            if (tab.snapshot) return 'gone'
+            const stored = decodeIdentity(identity)
+            if (!stored) return 'gone'
+            for (const sessionId of tab.sessions) {
+                const { frameTree } = await conn.send('Page.getFrameTree', {}, sessionId).catch(() => ({ frameTree: undefined }))
+                const frame = frameTree ? findFrame(frameTree, stored.frameId) : undefined
+                if (!frame) continue
+                if (frame.loaderId !== stored.loaderId) return 'gone'
+                // Role/name are not persisted (page text); a restored ref describes the node without them.
+                const binding: RefBinding = { ...stored, role: '', name: '', sessionId, stamp: this.stampOf(tab, stored.frameId) }
+                tab.snapshot = { snapshotId, refs: new Map([[ref, binding]]) }
+                // The node itself must still exist in that document.
+                try {
+                    await this.resolveRef(conn, tab, ref, snapshotId)
+                } catch {
+                    tab.snapshot = undefined
+                    return 'gone'
+                }
+                return 'restored'
+            }
+            return 'gone'
         })
     }
 
@@ -1114,6 +1144,29 @@ export class CdpDriver implements BrowserDriver {
             x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
             y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
         }
+    }
+}
+
+/** Stable number for a frame's current document (changes with its loaderId). */
+function documentIdentity(frameId: string, loaderId: string): number {
+    return Number.parseInt(createHash('sha256').update(`${frameId}\0${loaderId}`).digest('hex').slice(0, 12), 16)
+}
+
+/** Only structural ids: the identity is persisted, so it must not carry page text (names, labels). */
+type StoredIdentity = Pick<RefBinding, 'frameId' | 'loaderId' | 'backendNodeId' | 'frameOrigin'>
+
+function encodeIdentity(binding: RefBinding): string {
+    const stored: StoredIdentity = { frameId: binding.frameId, loaderId: binding.loaderId, backendNodeId: binding.backendNodeId, frameOrigin: binding.frameOrigin }
+    return Buffer.from(JSON.stringify(stored)).toString('base64url')
+}
+
+function decodeIdentity(identity: string): StoredIdentity | undefined {
+    try {
+        const value = JSON.parse(Buffer.from(identity, 'base64url').toString('utf8')) as StoredIdentity
+        if (typeof value.frameId !== 'string' || typeof value.loaderId !== 'string' || !Number.isInteger(value.backendNodeId)) return undefined
+        return value
+    } catch {
+        return undefined
     }
 }
 
