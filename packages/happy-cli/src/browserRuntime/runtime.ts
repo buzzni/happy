@@ -1087,6 +1087,18 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const grant = task.agentGrant as AgentGrant | undefined
         if (!grant || grant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(grant.grantId))
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Task execution grant is expired or revoked')
+        // Rechecked inside the final write: the page check below awaits the browser, and a
+        // revoke, expiry, cancel or new takeover may land meanwhile.
+        const unchanged = (current: StoredTask) => {
+            if (current.stateVersion !== task.stateVersion || current.status !== task.status || current.pauseReason !== task.pauseReason
+                || current.cancelRequested || current.uncertainActions.length || current.pendingApproval
+                || current.tabs.some((tabId) => this.leases.owner(tabId, current.profileId).owner.kind === 'user'))
+                throw new BrowserRuntimeError('CONFLICT', 'Task changed during resume')
+            const currentGrant = current.agentGrant as AgentGrant | undefined
+            if (!currentGrant || currentGrant.grantId !== grant.grantId || currentGrant.expiresAtMs <= this.clock.now()
+                || this.options.store.isRevoked(currentGrant.grantId))
+                throw new BrowserRuntimeError('SCOPE_DENIED', 'Task execution grant is expired or revoked')
+        }
         const wait = task.waitCompletion as {
             batchId?: string
             nextStep?: number
@@ -1104,7 +1116,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 : Boolean(wait.predicate && matchesWait(wait.predicate, observation))
             if (!waitCompleted)
                 return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
-                    waitReason: task.waitReason }))
+                    waitReason: task.waitReason }, 0, false, unchanged))
         }
         const batchId = wait?.batchId as BatchId | undefined
         const batch = batchId ? task.batches[batchId] : undefined
@@ -1119,13 +1131,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             steps: [...completed.map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded' as const })),
                 ...remaining.map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'skipped' as const }))],
         } : undefined
-        if (batchId)
-            this.liveBatchSteps.delete(batchId)
-        return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
+        const resumed = await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
             waitCompletion: undefined, waitExpiresAtMs: undefined,
             ...(result && batch && batchId ? { currentBatchId: undefined, lastBatch: result, batches: { ...task.batches, [batchId]: { ...batch, result } } } : {}),
         }, 'agent-attention-required', { attention: 'user-resumed', ...(task.waitReason ? { waitCompleted: task.waitReason } : {}),
-            ...(batchId ? { batchId, skippedSteps: remaining.length } : {}) }))
+            ...(batchId ? { batchId, skippedSteps: remaining.length } : {}) }, 0, false, unchanged)
+        if (batchId)
+            this.liveBatchSteps.delete(batchId)
+        return this.view(resumed)
     }
     private async cancelImpl(auth: AuthContext, req: {
         taskId: TaskId
@@ -2069,16 +2082,28 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         signal: AbortSignal): ReturnType<typeof dispatchStep> {
         return dispatchStep(driver, step, grant, signal)
     }
+    /**
+     * `guard` runs against the current task inside the serialized write; if it throws,
+     * nothing is committed and its error is returned as is (leases stay untouched).
+     */
     private async commit(task: StoredTask, patch: Partial<StoredTask>, type: TaskEvent['type'], data: Record<string, unknown>,
-        leaseEpoch = 0, business = false): Promise<StoredTask> {
+        leaseEpoch = 0, business = false, guard?: (current: StoredTask) => void): Promise<StoredTask> {
         const previous = this.commitTails.get(task.taskId) ?? Promise.resolve()
         let release!: () => void
         const current = new Promise<void>((resolve) => { release = resolve; })
         const queued = previous.then(() => current)
         this.commitTails.set(task.taskId, queued)
         await previous
+        let guardFailure: unknown
         try {
             const committed = await this.options.store.mutate(task.taskId, (current) => {
+                try {
+                    guard?.(current)
+                }
+                catch (error) {
+                    guardFailure = error
+                    return null
+                }
                 const rebased = rebaseTaskPatch(task, current, patch)
                 if (current.cancelRequested && !task.cancelRequested && rebased.status !== 'cancelled') {
                     delete rebased.status
@@ -2090,6 +2115,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     business,
                 }
             })
+            if (guardFailure)
+                throw guardFailure
             if (!committed)
                 throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Task disappeared during commit')
             for (const wake of this.eventWaiters.get(task.taskId) ?? [])
@@ -2097,6 +2124,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return committed
         }
         catch (error) {
+            if (guardFailure && error === guardFailure)
+                throw error
             this.leases.revokeTask(task.taskId)
             this.controllers.get(task.taskId)?.abort(new Error('journal unavailable'))
             throw error

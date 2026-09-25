@@ -36,7 +36,7 @@ async function createHarness(options: { grantExpiresAtMs?: number; url?: string 
         return (await runtime.releaseControl(ui, { taskId: task.taskId, tabId: opened.tabId, expectedEpoch: taken.leaseEpoch, requestId: `release-${Math.random()}` as RequestId })).task
     }
     const userResume = (expectedVersion: number) => runtime.resume(ui, { taskId: task.taskId, expectedVersion, requestId: `resume-${Math.random()}` as RequestId })
-    return { store, clock, profileId, driver, runtime, auth, ui, task, opened, takeOverAndRelease, userResume }
+    return { store, clock, profileId, driver, runtime, auth, ui, task, opened, epoch, takeOverAndRelease, userResume }
 }
 
 describe('user resume from the client (interactive capability)', () => {
@@ -132,6 +132,27 @@ describe('user resume of a batch that stopped at a login page', () => {
         expect(resumed.currentBatchId).toBeUndefined()
         expect(resumed.lastBatch?.steps.map((step) => `${step.stepId}:${step.outcome}`)).toEqual(['nav:succeeded', 'after:skipped'])
         expect(h.driver.dispatchCounts.get('after') ?? 0).toBe(0)
+        await h.store.close()
+    })
+})
+
+describe('user resume revalidates the task when it commits', () => {
+    type Harness = Awaited<ReturnType<typeof createHarness>>
+    it.each<[string, (h: Harness) => Promise<unknown>]>([
+        ['the execution grant is revoked', (h) => h.store.revoke('g')],
+        ['the execution grant expires', async (h) => h.clock.set(3_600_001)],
+        ['the agent cancels the task', (h) => h.runtime.cancel(h.auth, { taskId: h.task.taskId, requestId: 'cancel' as RequestId })],
+        ['the user takes control again', (h) => h.runtime.takeOver(h.ui, { taskId: h.task.taskId, tabId: h.opened.tabId, expectedEpoch: h.epoch(h.opened.tabId), requestId: 'take-again' as RequestId })],
+    ])('does not hand the task back when %s while the page is checked', async (_label, interfere) => {
+        const h = await createHarness({ url: 'https://fixture.test/login' })
+        const loggedIn = await h.takeOverAndRelease(() => h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/account', text: 'Signed in', elements: [] }))
+        const held = h.driver.holdAfterNextDispatch('observe')
+        const resuming = h.userResume(loggedIn.stateVersion)
+        await held.entered
+        await interfere(h)
+        held.release()
+        await expect(resuming).rejects.toMatchObject({ code: expect.stringMatching(/^(SCOPE_DENIED|CONFLICT)$/) })
+        expect(h.store.getTask(h.task.taskId)?.pauseReason).not.toBe('awaiting-agent')
         await h.store.close()
     })
 })
