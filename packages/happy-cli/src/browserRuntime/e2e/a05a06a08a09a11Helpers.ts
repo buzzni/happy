@@ -352,18 +352,26 @@ export function docker(args: string[]): string {
  */
 export async function cleanupSpace(stack: PocStack, c: RuntimeClient, taskSpaceId: TaskSpaceId, taskIds: TaskId[]): Promise<string | undefined> {
     const reconcileErrors: string[] = []
-    for (const taskId of taskIds) {
-        try {
-            let task = await c.getTask({ taskId })
-            if (!['succeeded', 'failed', 'cancelled'].includes(task.status)) task = (await c.cancel({ taskId, requestId: rid() })).task
-            for (const actionId of task.uncertainActions) {
-                await admin(stack, '/admin/reconcile-action', { taskId, actionId, confirmed: true }).catch((error: Error) => reconcileErrors.push(error.message.slice(0, 160)))
-            }
-        } catch { /* reported by closeSpace below */ }
+    const reconciled = new Set<string>()
+    // Stop every task, then (trusted harness path) settle each uncertain action. A cancelled
+    // in-flight driver call can turn uncertain only after it unwinds, so this runs again on
+    // every retry instead of once up front.
+    const settle = async () => {
+        for (const taskId of taskIds) {
+            try {
+                let task = await c.getTask({ taskId })
+                if (!['succeeded', 'failed', 'cancelled'].includes(task.status) && !task.cancelRequested) task = (await c.cancel({ taskId, requestId: rid() })).task
+                for (const actionId of task.uncertainActions) {
+                    if (reconciled.has(`${taskId}/${actionId}`)) continue
+                    reconciled.add(`${taskId}/${actionId}`)
+                    await admin(stack, '/admin/reconcile-action', { taskId, actionId, confirmed: true }).catch((error: Error) => reconcileErrors.push(error.message.slice(0, 160)))
+                }
+            } catch { /* reported by closeSpace below */ }
+        }
     }
-    // An aborted batch worker may still be unwinding (closeSpace reports it as in-flight).
     let last = ''
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+        await settle()
         try {
             await c.closeSpace({ taskSpaceId, requestId: rid() })
             return undefined

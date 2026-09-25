@@ -186,7 +186,9 @@ describe('A08 approval without a client', () => {
                 expect(count(ledger, 'risky'), `CONTRACT: approval bound to the old ${mode} must not execute`).toBe(0)
                 expect(outcome.startsWith('rejected:'), `CONTRACT: approve must be refused after ${mode} change, got ${outcome}`).toBe(true)
             } finally {
-                expect(await cleanupSpace(stack, r.agent, r.t.taskSpaceId, [r.t.taskId])).toBeUndefined()
+                const leak = await cleanupSpace(stack, r.agent, r.t.taskSpaceId, [r.t.taskId])
+                if (leak) console.log(`[cleanup-leak] changed-${mode} #${i}: ${leak}`)
+                expect(leak).toBeUndefined()
             }
         })
     }
