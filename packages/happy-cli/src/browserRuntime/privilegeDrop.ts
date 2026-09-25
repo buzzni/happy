@@ -37,16 +37,39 @@ export function capabilitiesCleared(procStatus: string): boolean {
     return sets.every((value) => value !== undefined && /^0+$/.test(value))
 }
 
-/** Join `gid` so a root-owned socket can be given that group without CAP_CHOWN. */
-export function joinGroup(gid: number): void {
-    process.setgroups!([gid])
+/** Identity syscalls, injectable so tests can make each step fail. */
+export interface PrivilegeOps {
+    getuid(): number
+    geteuid(): number
+    getgid(): number
+    getegid(): number
+    setgroups(groups: number[]): void
+    setgid(id: number): void
+    setuid(id: number): void
+    readStatus(): Promise<string>
 }
 
-export async function dropRoot(target: RuntimeIdentity, readStatus = () => readFile('/proc/self/status', 'utf8')): Promise<void> {
-    process.setgroups!([])
-    process.setgid!(target.gid)
-    process.setuid!(target.uid)
-    if (process.getuid!() !== target.uid || process.geteuid!() !== target.uid || process.getgid!() !== target.gid || process.getegid!() !== target.gid)
+export const processPrivilegeOps: PrivilegeOps = {
+    getuid: () => process.getuid?.() ?? -1,
+    geteuid: () => process.geteuid?.() ?? -1,
+    getgid: () => process.getgid?.() ?? -1,
+    getegid: () => process.getegid?.() ?? -1,
+    setgroups: (groups) => process.setgroups!(groups),
+    setgid: (id) => process.setgid!(id),
+    setuid: (id) => process.setuid!(id),
+    readStatus: () => readFile('/proc/self/status', 'utf8'),
+}
+
+/** Join `gid` so a root-owned socket can be given that group without CAP_CHOWN. */
+export function joinGroup(gid: number, ops: PrivilegeOps = processPrivilegeOps): void {
+    ops.setgroups([gid])
+}
+
+export async function dropRoot(target: RuntimeIdentity, ops: PrivilegeOps = processPrivilegeOps): Promise<void> {
+    ops.setgroups([])
+    ops.setgid(target.gid)
+    ops.setuid(target.uid)
+    if (ops.getuid() !== target.uid || ops.geteuid() !== target.uid || ops.getgid() !== target.gid || ops.getegid() !== target.gid)
         throw new Error('ABP runtime could not drop root')
-    if (!capabilitiesCleared(await readStatus())) throw new Error('ABP runtime still holds capabilities after dropping root')
+    if (!capabilitiesCleared(await ops.readStatus())) throw new Error('ABP runtime still holds capabilities after dropping root')
 }
