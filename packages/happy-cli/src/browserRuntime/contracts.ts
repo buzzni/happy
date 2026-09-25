@@ -92,7 +92,7 @@ export class BrowserRuntimeError extends Error {
 export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
-    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace'
+    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
@@ -100,7 +100,7 @@ export const AGENT_OPERATIONS: readonly Operation[] = [
     'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace',
 ]
 /** Operations that require an interactive (human UI) capability. */
-export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl']
+export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket']
 
 export interface AgentGrant {
     kind: 'agent-grant'
@@ -439,6 +439,10 @@ export interface ReleaseControlRequest { taskId: TaskId; tabId: TabId; expectedE
 export interface ResumeRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
 export interface CancelRequest { taskId: TaskId; requestId: RequestId }
 export interface CloseSpaceRequest { taskSpaceId: TaskSpaceId; requestId: RequestId }
+/** Served by the viewer proxy (viewerProxy.ts), not by BrowserRuntimeApi. */
+export interface ViewerTicketRequest { profileId: ProfileId }
+/** One-time WebSocket ticket for `GET /v1/viewer/websockify?ticket=`, bound to the capability and profile. */
+export interface ViewerTicket { ticket: string; expiresAtMs: number }
 
 export type SubscribeResult =
     | { kind: 'events'; events: TaskEvent[]; highWatermarkSeq: number }
@@ -546,4 +550,12 @@ export const POC_LIMITS = {
     journalControlReserveEvents: 100,
     terminalBrowserIdleMs: 5 * 60_000,
     eventRetentionMs: 7 * 24 * 60 * 60_000,
+} as const
+
+/** Viewer proxy (D2) limits. */
+export const VIEWER_LIMITS = {
+    ticketTtlMs: 30_000,
+    maxOutstandingTickets: 256,
+    maxSetEncodings: 64,
+    maxClientCutTextBytes: 64 * 1024,
 } as const

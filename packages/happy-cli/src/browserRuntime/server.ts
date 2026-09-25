@@ -5,8 +5,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { z } from 'zod'
-import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody, type TaskId } from './contracts'
+import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type ProfileId, type RuntimeErrorBody, type TaskId } from './contracts'
 import { renderConsolePage } from './consolePage'
+import type { ViewerProxy } from './viewerProxy'
 
 const MAX_BODY_BYTES = 1024 * 1024
 export const MAX_BATCH_WAIT_MS = 120_000
@@ -47,6 +48,7 @@ export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
     resume: z.object({ taskId: id, expectedVersion: version, requestId: id }).strict(),
     cancel: z.object({ taskId: id, requestId: id }).strict(),
     closeSpace: z.object({ taskSpaceId: id, requestId: id }).strict(),
+    viewerTicket: z.object({ profileId: id }).strict(),
 }
 
 const STATUS: Partial<Record<ErrorCode, number>> = {
@@ -68,6 +70,8 @@ export interface RuntimeServerOptions {
     /** Readiness checks (browser connection, writer lock, disk); every value must be true. */
     ready?: () => Promise<Record<string, boolean>>
     log?: (line: string) => void
+    /** Runtime viewer (D2). Without it viewerTicket answers RUNTIME_UNAVAILABLE. */
+    viewer?: Pick<ViewerProxy, 'issueTicket'>
 }
 
 export interface RuntimeServer { url: string; port: number; close(): Promise<void> }
@@ -137,7 +141,11 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
             throw new BrowserRuntimeError('INVALID_REQUEST', `invalid ${op} request: ${detail}`)
         }
         const { waitMs, ...dto } = parsed.data as { waitMs?: number } & Record<string, unknown>
-        const call = api[op as Operation] as (a: AuthContext, r: unknown, o?: unknown) => Promise<unknown>
+        if (op === 'viewerTicket') {
+            if (!opts.viewer) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'viewer is not configured')
+            return opts.viewer.issueTicket(auth, dto as { profileId: ProfileId })
+        }
+        const call = api[op as keyof typeof api] as (a: AuthContext, r: unknown, o?: unknown) => Promise<unknown>
         if (op === 'submitBatch') return call.call(api, auth, dto, waitMs !== undefined ? { waitMs } : undefined)
         if (op === 'subscribe') {
             const first = (await call.call(api, auth, dto)) as { kind: string; events?: unknown[] }

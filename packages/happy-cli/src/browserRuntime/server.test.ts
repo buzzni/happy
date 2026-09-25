@@ -176,3 +176,28 @@ describe('runtime readiness', () => {
         expect([notReady.status, await notReady.json()]).toEqual([503, { ok: false, ready: false, checks }])
     })
 })
+
+describe('viewer ticket route (D2)', () => {
+    it('issues a ticket through the viewer service with the verified auth and a validated body', async () => {
+        const fake = makeFake()
+        const issued: Array<{ auth: AuthContext; req: unknown }> = []
+        const viewer = {
+            issueTicket: (auth: AuthContext, req: { profileId: string }) => { issued.push({ auth, req }); return { ticket: 'tk', expiresAtMs: 42 } },
+            handleUpgrade: () => undefined,
+            close: async () => undefined,
+        }
+        server = await startRuntimeServer({ api: fake.api, verifyToken, port: 0, health: () => ({}), viewer })
+        const ok = await post(server.url, 'viewerTicket', { profileId: 'p1' })
+        expect([ok.status, ok.json.result]).toEqual([200, { ticket: 'tk', expiresAtMs: 42 }])
+        expect(issued).toEqual([{ auth: { credential: { kind: 'agent-grant' }, verifiedAtMs: 1 }, req: { profileId: 'p1' } }])
+        expect((await post(server.url, 'viewerTicket', { profileId: 'p1', extra: true })).status).toBe(400)
+        expect((await post(server.url, 'viewerTicket', { profileId: 'p1' }, null)).status).toBe(401)
+        expect(issued).toHaveLength(1)
+    })
+
+    it('answers 503 when the Runtime has no viewer configured', async () => {
+        const { base } = await start()
+        const res = await post(base, 'viewerTicket', { profileId: 'p1' })
+        expect([res.status, res.json.error.code]).toEqual([503, 'RUNTIME_UNAVAILABLE'])
+    })
+})

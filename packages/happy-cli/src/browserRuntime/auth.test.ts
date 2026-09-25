@@ -73,6 +73,12 @@ describe('server-signed interactive capabilities (abp2)', () => {
         expect(auth.credential).toMatchObject({ kind: 'interactive', principalId: 'p1', operations: ['approve', 'getTask'] })
     })
 
+    it('accepts the viewerTicket operation on a server capability but never on an agent grant (D2)', () => {
+        const auth = verifyToken(signWith(capability({ operations: ['viewerTicket', 'takeOver'] })), keys, now, new Set(), production)
+        expect(auth.credential.operations).toEqual(['viewerTicket', 'takeOver'])
+        expect(() => mintAgentGrant({ ...grant(['viewerTicket']), issuedAtMs: now, expiresAtMs: now + 1000 }, keys, now)).toThrowError(BrowserRuntimeError)
+    })
+
     it('rejects a forged signature under a trusted kid', () => {
         rejects(signWith(capability(), otherIssuer.privateKey))
     })
