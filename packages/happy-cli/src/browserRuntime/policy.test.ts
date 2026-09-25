@@ -148,6 +148,8 @@ describe('site action policy (D7)', () => {
         const valid = [{ origin, actions: [{ match: { kinds: ['submit'], targetPaths: ['/pay*'], namePrefixes: ['Pay'] }, risk: 'requires-approval' }],
             loginCompleteWhen: { urlPrefix: `${origin}/account`, text: 'Signed in' } }]
         expect(parseSitePolicies(valid)).toEqual(valid)
+        // An origin-only site is allowed and has no automatic writes: every write needs approval.
+        expect(parseSitePolicies([{ origin }])).toEqual([{ origin, actions: [] }])
         for (const bad of [
             [{ origin: `${origin}/path`, actions: [] }],
             [{ origin: 'ftp://shop.test', actions: [] }],

@@ -100,7 +100,7 @@ const siteSchema = z.object({
             roles: z.array(z.string().min(1).max(40)).min(1).optional(),
         }).strict(),
         risk: z.enum(['auto', 'requires-approval']),
-    }).strict()).max(200),
+    }).strict()).max(200).default([]),
     loginCompleteWhen: z.object({
         urlPrefix: z.string().max(1024),
         text: z.string().min(1).max(200).optional(),
