@@ -107,14 +107,33 @@ describe('site action policy (D7)', () => {
     const click: BatchStep = { ...step, kind: 'click' }
     const strict: SitePolicy[] = [{ origin, actions: [] }]
 
-    it('holds every unmatched write-capable action for approval and lets reads, links and plain fills run', () => {
+    it('holds every potentially effectful action the policy does not allow, and lets reads, plain links and navigation run', () => {
         expect(classifySiteAction(strict, click, element())).toBe('requires-approval')
         expect(classifySiteAction(strict, click, element({ form: form(`${origin}/cart/update`) }))).toBe('requires-approval')
         expect(classifySiteAction(strict, click, element({ form: form(`${origin}/checkout`), submitsForm: true }))).toBe('requires-approval')
         expect(classifySiteAction(strict, click, element({ role: 'link', currentRole: 'link', tag: 'a', linkUrl: `${origin}/help` }))).toBe('auto')
-        expect(classifySiteAction(strict, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('auto')
+        // A fill can trigger autosave: approval unless the policy marks it automatic.
+        expect(classifySiteAction(strict, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('requires-approval')
         expect(classifySiteAction(strict, { ...step, kind: 'navigate', url: `${origin}/cart` })).toBe('auto')
         expect(classifySiteAction(strict, { ...step, kind: 'observe' })).toBe('auto')
+    })
+
+    it('treats a link inside a form as a form click, and refuses executable or unsited link and form destinations outright', () => {
+        const link = { role: 'link', currentRole: 'link', tag: 'a' }
+        const permissive: SitePolicy[] = [{ origin, actions: [{ match: { kinds: ['link'] }, risk: 'auto' }] }]
+        expect(classifySiteAction(permissive, click, element({ ...link, linkUrl: `${origin}/next`, form: form(`${origin}/order`) }))).toBe('requires-approval')
+        for (const href of ['javascript:submitOrder()', 'JavaScript:void(0)', 'data:text/html,<p>x', 'vbscript:msgbox(1)', 'mailto:someone@shop.test']) {
+            expect(classifySiteAction(permissive, click, element({ ...link, linkUrl: href })), href).toBe('deny')
+        }
+        expect(classifySiteAction(permissive, click, element({ ...link, linkUrl: 'https://elsewhere.test/x' }))).toBe('deny')
+        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form('javascript:alert(1)') }))).toBe('deny')
+        expect(classifySiteAction(permissive, { ...step, kind: 'navigate', url: 'javascript:alert(1)' })).toBe('deny')
+    })
+
+    it('marks an explicitly automatic fill as automatic', () => {
+        const sites: SitePolicy[] = [{ origin, actions: [{ match: { kinds: ['fill'], namePrefixes: ['search'] }, risk: 'auto' }] }]
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox', name: 'Search', currentName: 'Search' }))).toBe('auto')
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox', name: 'Amount', currentName: 'Amount' }))).toBe('requires-approval')
     })
 
     it('applies the first matching rule; a rule matches only when all of its conditions do', () => {
@@ -130,14 +149,15 @@ describe('site action policy (D7)', () => {
         expect(classifySiteAction(sites, { ...step, kind: 'navigate', url: `${origin}/api/delete?id=1` })).toBe('requires-approval')
         expect(classifySiteAction(sites, click, element({ role: 'link', currentRole: 'link', tag: 'a', linkUrl: `${origin}/api/delete?id=1` }))).toBe('requires-approval')
         expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox', pageUrl: `${origin}/transfer` }))).toBe('requires-approval')
-        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('auto')
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('requires-approval')
     })
 
-    it('holds an action for approval when its effect cannot be bound or its destination is outside the site list', () => {
+    it('hands an action to the user when its effect cannot be bound, and refuses a destination outside the site list', () => {
         const permissive: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }] }]
         expect(classifySiteAction(permissive, click, element())).toBe('auto')
-        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form('https://elsewhere.test/collect') }))).toBe('requires-approval')
-        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form(`${origin}/x`, { opaque: true }) }))).toBe('requires-approval')
+        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form('https://elsewhere.test/collect') }))).toBe('deny')
+        expect(classifySiteAction(permissive, click, element({ submitsForm: true, form: form(`${origin}/x`, { opaque: true }) }))).toBe('handoff')
+        expect(classifySiteAction(permissive, click, element({ form: form(`${origin}/x`, { opaque: true }) }))).toBe('handoff')
         // A restored ref carries no snapshot label: a relabel cannot be ruled out.
         expect(classifySiteAction(permissive, click, element({ role: '', name: '' }))).toBe('requires-approval')
         // An element of a frame whose site has no policy.

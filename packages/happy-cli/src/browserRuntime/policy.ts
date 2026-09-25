@@ -77,7 +77,14 @@ export interface SitePolicy {
     loginCompleteWhen?: { urlPrefix: string; text?: string; elementName?: string }
 }
 
-const WRITE_CAPABLE: ReadonlySet<SiteActionKind> = new Set(['submit', 'form-click', 'click'])
+/** Potentially effectful kinds: without a rule saying otherwise they need the user. */
+const WRITE_CAPABLE: ReadonlySet<SiteActionKind> = new Set(['submit', 'form-click', 'click', 'fill'])
+
+/**
+ * The outcome of classifying one action: run it, ask the user to approve it, hand it
+ * to the user (it cannot be bound for approval), or refuse it outright.
+ */
+export type SiteDecision = SiteActionRisk | 'handoff' | 'deny'
 
 function isOrigin(value: string): boolean {
     try {
@@ -155,33 +162,45 @@ export function siteActionKind(step: BatchStep, element?: ElementDescription): S
     if (step.kind === 'fill') return 'fill'
     if (step.kind !== 'click') return undefined
     if (element?.submitsForm) return 'submit'
-    if (element?.linkUrl) return 'link'
+    // Inside a form any click (a link too) may drive the form: it is a form click.
     if (element?.form || element?.formAction) return 'form-click'
+    if (element?.linkUrl) return 'link'
     return 'click'
+}
+
+function isWebUrl(url: string | undefined): boolean {
+    try {
+        return !!url && ['http:', 'https:'].includes(new URL(url).protocol)
+    } catch {
+        return false
+    }
 }
 
 /**
  * Classifies one step against the site policy. Reads are always automatic.
- * Unmatched write-capable actions (submit, other clicks in or outside forms)
- * need the user; links, navigation and plain fills do not unless a rule says so.
- * Whatever a rule says, an action is held for approval when its effect cannot be
- * bound or ruled out: a form posting outside the site list, a form with a value
- * the digest cannot cover, an element without a snapshot label (a relabel cannot
- * be detected), or an element in a frame whose site has no policy.
+ * Refused outright: destinations (navigation, link, form) that are not http(s)
+ * — javascript:, data:, vbscript:, mailto: … — or not on a sited origin.
+ * Handed to the user: a submit or form click whose form the digest cannot bind
+ * (opaque: unreadable control, password or file content).
+ * Held for approval whatever a rule says: an element without a snapshot label (a
+ * relabel cannot be detected) or in a frame whose site has no policy.
+ * Otherwise the first matching rule decides; unmatched submits, clicks and fills
+ * need approval, links and navigation do not.
  */
-export function classifySiteAction(sites: SitePolicy[], step: BatchStep, element?: ElementDescription): SiteActionRisk {
+export function classifySiteAction(sites: SitePolicy[], step: BatchStep, element?: ElementDescription): SiteDecision {
     const kind = siteActionKind(step, element)
     if (!kind) return 'auto'
     const target = kind === 'navigate' ? step.url
         : kind === 'link' ? element?.linkUrl
             : kind === 'submit' || kind === 'form-click' ? element?.form?.action ?? element?.formAction
                 : undefined
+    const destinations = [target, ...(kind !== 'navigate' && element?.linkUrl ? [element.linkUrl] : [])].filter((url): url is string => url !== undefined)
+    if (destinations.some((url) => !isWebUrl(url) || !siteFor(sites, originOf(url)))) return 'deny'
     const site = siteFor(sites, kind === 'navigate' ? originOf(step.url) : element?.frameOrigin ?? '')
     if (kind !== 'navigate') {
         if (!element || !site) return 'requires-approval'
         if (!element.role && !element.name) return 'requires-approval'
-        if (element.form?.opaque && kind !== 'fill') return 'requires-approval'
-        if ((kind === 'submit' || kind === 'form-click') && target && !siteFor(sites, originOf(target))) return 'requires-approval'
+        if (element.form?.opaque && (kind === 'submit' || kind === 'form-click')) return 'handoff'
     }
     const name = (element?.currentName ?? element?.name ?? '').toLowerCase()
     const role = (element?.currentRole ?? element?.role ?? '').toLowerCase()

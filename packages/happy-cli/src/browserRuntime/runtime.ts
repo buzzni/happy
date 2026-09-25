@@ -4,7 +4,7 @@ import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, type ActionId, type Ag
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
                 type TabId, type ApprovalId,
-                type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
+                type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
 import { approvalPayloadHash, createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
@@ -149,6 +149,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached')
         }
         assertSiteAllowed(this.options.sites, req.url)
+        // The same navigation policy as a navigate step; a held page is not opened (there is no tab to hand over yet).
+        const navigation = classifySiteAction(this.options.sites, { kind: 'navigate', url: req.url } as BatchStep)
+        if (navigation === 'deny')
+            throw new BrowserRuntimeError('ORIGIN_DENIED', 'Site policy refuses this destination')
+        if (navigation !== 'auto')
+            throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Site policy requires the user for this page; it was not opened', false, false)
         const grant = this.agentGrant(auth)
         const origin = assertAllowedOrigin(req.url, grant)
         const driver = this.driver(task.profileId)
@@ -811,7 +817,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             nextStep: number
             grant?: AgentGrant
         }
-        const storedStep = batchRecord.steps[Number(approval.nextStep)]
+        // Fill values are never persisted: they come back from this process's memory, or the approval cannot be used.
+        const live = this.liveBatchSteps.get(approval.batchId as BatchId)
+        const batchSteps = batchRecord.steps.map((candidate) => candidate.kind === 'fill' && candidate.value === undefined
+            ? { ...candidate, value: live?.find((step) => step.actionId === candidate.actionId)?.value } : candidate)
+        const storedStep = batchSteps[Number(approval.nextStep)]
+        if (storedStep.kind === 'fill' && storedStep.value === undefined)
+            throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'The approved value is no longer available; submit the step again')
         const approvedStep = { ...storedStep, snapshotId: approval.snapshotId ?? storedStep.snapshotId }
         const driver = this.driver(task.profileId)
         const lease = this.leases.owner(approvedStep.tabId, task.profileId)
@@ -885,7 +897,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         })
         if (!consumed)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval changed before consumption')
-        const result = await this.runBatch(consumed, approval.batchId as BatchId, batchRecord.steps, originalAuth,
+        const result = await this.runBatch(consumed, approval.batchId as BatchId, batchSteps, originalAuth,
             Number(approval.nextStep), approvedStep.actionId)
         const finalTask = this.requireTask(req.taskId)
         await this.commit(finalTask, { approvals: { ...finalTask.approvals, [req.approvalId]: { ...finalTask.approvals[req.approvalId],
@@ -1010,6 +1022,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (Number(task.waitExpiresAtMs ?? 0) > 0 && this.clock.now() > Number(task.waitExpiresAtMs))
                 return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
                     { pauseReason: 'user-wait-expired', waitReason: task.waitReason }))
+            // A handed-off action was done (or not) by the user: nothing to verify, the agent re-observes.
+            if (task.waitReason === 'handoff')
+                return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
+                    waitCompletion: undefined, waitExpiresAtMs: undefined, agentGrant: auth.credential }, 'state-changed',
+                    { status: 'paused', pauseReason: 'awaiting-agent', handoffEnded: true }))
             const wait = task.waitCompletion as {
                 batchId?: string
                 nextStep?: number
@@ -1574,6 +1591,20 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const pendingPostconditions: Array<{ actionId: ActionId; stepId: BatchStep['stepId']; tabId: TabId }> = []
         const namedObservations = new Map<string, Observation>()
         let preserveLeases = false
+        /** The step is not executed; the task waits for the user (takeover), then the agent re-observes. */
+        const handOff = async (current: StoredTask, step: BatchStep, index: number, leaseEpoch: number, reason: BrowserRuntimeError) => {
+            const waiting = await this.commit(current, {
+                status: 'awaiting-user',
+                waitReason: 'handoff',
+                waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
+                waitCompletion: { batchId, nextStep: index, tabId: step.tabId, handoff: true },
+                actions: { ...current.actions, [step.actionId]: { ...current.actions[step.actionId], state: 'failed' } },
+            }, 'state-changed', { status: 'awaiting-user', waitReason: 'handoff', actionId: step.actionId, error: safeError(reason) }, leaseEpoch)
+            preserveLeases = true
+            results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'awaiting-user', error: safeError(reason) })
+            return this.saveBatchResult(waiting, batchId, { batchId, taskId: waiting.taskId, outcome: 'awaiting-user', completedSteps,
+                mayHaveSideEffects: false, lastCheckpointSeq: waiting.highWatermarkSeq + 1, steps: results, waitReason: 'handoff' })
+        }
         try {
             for (let index = fromIndex; index < steps.length; index++) {
                 const step = steps[index]
@@ -1667,6 +1698,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Action intent was not committed')
                 task = intent
                 let description: ElementDescription | undefined
+                let decision: ReturnType<typeof classifySiteAction> = 'auto'
                 try {
                     if (['click', 'fill'].includes(step.kind)) {
                         if (refResolutionError)
@@ -1685,10 +1717,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             && (description.currentName !== description.name || description.currentRole !== description.role))
                             throw new BrowserRuntimeError('STALE_REF', 'Element label changed since the snapshot; observe again', false, false)
                     }
-                    // A navigation or fill the site policy holds has no element approval to bind: hand it to the user.
-                    if (['navigate', 'fill'].includes(step.kind) && step.actionId !== approvedActionId
-                        && classifySiteAction(this.options.sites, effectiveStep, description) === 'requires-approval')
-                        throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Site policy requires the user for this action', false, false)
+                    if (step.actionId !== approvedActionId)
+                        decision = classifySiteAction(this.options.sites, effectiveStep, description)
+                    if (decision === 'deny')
+                        throw new BrowserRuntimeError('ORIGIN_DENIED', 'Site policy refuses this destination', false, false)
                 }
                 catch (error) {
                     // Description is read-only preflight; input has not been sent.
@@ -1742,8 +1774,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         || recomputedApprovalBinding !== boundApproval.bindingHash)
                         throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed before dispatch')
                 }
-                if (step.kind === 'click' && classifySiteAction(this.options.sites, effectiveStep, description) === 'requires-approval'
-                    && step.actionId !== approvedActionId) {
+                // Nothing to bind an approval to (a navigation) or nothing that can be bound: the user does it.
+                if (decision === 'handoff' || (step.kind === 'navigate' && decision === 'requires-approval'))
+                    return handOff(task, step, index, leaseEpoch, new BrowserRuntimeError('APPROVAL_REQUIRED',
+                        'Site policy hands this action to the user', false, false))
+                if (['click', 'fill'].includes(step.kind) && decision === 'requires-approval') {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
                     const approval = createApproval({
                         grant,
@@ -1811,7 +1846,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 armed.armAction?.(step.actionId)
                 this.inFlightDriverCalls.add(task.taskId)
                 try {
-                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal)
+                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal,
+                        step.kind === 'click' && description ? dispatchExpectation(description) : undefined)
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!grant.allowedOrigins.includes(finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
@@ -1860,8 +1896,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             }
                         }
                     }
-                    const requiresPostcondition = ['click', 'fill', 'navigate'].includes(step.kind)
-                        && classifySiteAction(this.options.sites, effectiveStep, description) === 'requires-approval'
+                    // An approved (or held) click or navigation is confirmed only by a trusted postcondition;
+                    // a fill's own effect is the value it typed.
+                    const requiresPostcondition = ['click', 'navigate'].includes(step.kind)
+                        && classifySiteAction(this.options.sites, effectiveStep, description) !== 'auto'
                     const hasPostconditionStep = steps.slice(index + 1).some((candidate) => candidate.tabId === step.tabId
                         && candidate.kind === 'waitFor')
                     if (requiresPostcondition && !hasPostconditionStep) {
@@ -1962,6 +2000,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         outcome = 'cancelled'
                         break
                     }
+                    // The driver could not verify the action (e.g. a transformed frame) and sent nothing: the user does it.
+                    if (error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
+                        return handOff(task, step, index, leaseEpoch, error)
                     const write = ['click', 'fill', 'navigate'].includes(step.kind)
                     const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
                     const deniedOrigin = runtimeError?.code === 'ORIGIN_DENIED'
@@ -2025,8 +2066,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async dispatch(driver: BrowserDriver, step: BatchStep, grant: AgentGrant,
-        signal: AbortSignal): ReturnType<typeof dispatchStep> {
-        return dispatchStep(driver, step, grant, signal)
+        signal: AbortSignal, expect?: DispatchExpectation): ReturnType<typeof dispatchStep> {
+        return dispatchStep(driver, step, grant, signal, expect)
     }
     private async commit(task: StoredTask, patch: Partial<StoredTask>, type: TaskEvent['type'], data: Record<string, unknown>,
         leaseEpoch = 0, business = false): Promise<StoredTask> {
@@ -2241,6 +2282,15 @@ function safeError(error: unknown): RuntimeErrorBody {
     return redact(body)
 }
 
+/** What the driver must find again right before a click: the classified label, link and submission. */
+function dispatchExpectation(description: ElementDescription): DispatchExpectation {
+    return {
+        role: description.currentRole ?? description.role,
+        name: description.currentName ?? description.name,
+        ...(description.linkUrl ? { linkUrl: description.linkUrl, linkTarget: description.linkTarget ?? '' } : {}),
+        ...(description.form ? { formDigest: description.form.digest } : {}),
+    }
+}
 function persistedBatchSteps(steps: BatchStep[]): BatchStep[] {
     return redact(steps.map((step) => step.kind === 'fill' ? { ...step, value: undefined } : step))
 }

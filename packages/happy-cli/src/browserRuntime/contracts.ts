@@ -172,7 +172,8 @@ export const PAUSE_REASONS = [
 ] as const
 export type PauseReason = (typeof PAUSE_REASONS)[number]
 
-export type WaitReason = 'approval' | 'login' | 'captcha'
+/** handoff: the user performs an action the agent may not (it cannot be bound for approval or verified) */
+export type WaitReason = 'approval' | 'login' | 'captcha' | 'handoff'
 
 export type ActionState = 'planned' | 'intent-committed' | 'dispatched' | 'confirmed' | 'uncertain' | 'failed' | 'skipped'
 

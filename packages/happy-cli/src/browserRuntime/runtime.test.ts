@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { BrowserRuntimeError, type AgentGrant, type FormSubmission, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
 import type { FakePage } from './testing/fakeDriver'
 import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
-import type { SitePolicy } from './policy'
+import { formDigest, type SitePolicy } from './policy'
 
 const FIXTURE_SITES = fixtureSitePolicies(['https://fixture.test'])
 import { FakeClock } from './clock'
@@ -1736,24 +1736,98 @@ describe('site policy at the runtime (D7)', () => {
         await h.store.close()
     })
 
-    it('hands a navigation or fill that the site policy holds to the user without dispatching it', async () => {
-        const sites: SitePolicy[] = [{ origin, actions: [
-            { match: { kinds: ['navigate'], targetPaths: ['/api/delete*'] }, risk: 'requires-approval' },
-            { match: { kinds: ['fill'], pagePaths: ['/transfer'] }, risk: 'requires-approval' },
-            { match: {}, risk: 'auto' },
-        ] }]
-        const h = await createHarness('abp-d7-handoff-', undefined, sites)
+    const held: SitePolicy[] = [{ origin, actions: [
+        { match: { kinds: ['navigate'], targetPaths: ['/api/delete*'] }, risk: 'requires-approval' },
+        { match: { kinds: ['link', 'navigate'] }, risk: 'auto' },
+    ] }]
+
+    it('applies the navigation policy to openPage exactly as to a navigate step (P0-1)', async () => {
+        const h = await createHarness('abp-d7-openpage-', undefined, held)
+        const opensBefore = h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length
+        await expect(h.runtime.openPage(h.auth, { taskId: h.task.taskId, url: `${origin}/api/delete?id=1`, requestId: 'd7-open-held' as RequestId }))
+            .rejects.toMatchObject({ code: 'APPROVAL_REQUIRED', mayHaveSideEffects: false })
+        expect(h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length).toBe(opensBefore)
         const navigated = await runStep(h, 'd7-nav', { kind: 'navigate', url: `${origin}/api/delete?id=1` })
-        expect(navigated).toMatchObject({ outcome: 'failed', mayHaveSideEffects: false })
-        expect(navigated.steps[0].error?.code).toBe('APPROVAL_REQUIRED')
+        expect(navigated).toMatchObject({ outcome: 'awaiting-user', waitReason: 'handoff', mayHaveSideEffects: false })
         expect(h.driver.dispatchCounts.get('d7-nav') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('asks for approval before an unmatched fill and dispatches it once after approval, value-free (P0-2)', async () => {
+        const h = await createHarness('abp-d7-fill-', undefined, held)
         h.driver.seedTab(h.opened.tabId, { url: `${origin}/transfer`, elements: [{ ref: '@to' as never, role: 'textbox', name: 'Recipient', visible: true, frameOrigin: origin }] })
         await observeHarnessTab(h)
-        const filled = await runStep(h, 'd7-fill', { kind: 'fill', ref: '@to', value: 'synthetic' })
-        expect(filled.steps[0].error?.code).toBe('APPROVAL_REQUIRED')
+        const filled = await runStep(h, 'd7-fill', { kind: 'fill', ref: '@to', value: 'synthetic-recipient-789' })
+        expect(filled.outcome).toBe('awaiting-user')
         expect(h.driver.dispatchCounts.get('d7-fill') ?? 0).toBe(0)
-        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
-        expect(task).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent', uncertainActions: [] })
+        const approval = filled.pendingApproval!
+        expect(approval.description).toContain('Recipient')
+        expect(approval.description).not.toContain('synthetic-recipient-789')
+        const approved = await h.runtime.approve(ui(h, ['approve']), { taskId: h.task.taskId, approvalId: approval.approvalId,
+            bindingHash: approval.bindingHash, requestId: 'd7-fill-approve' as RequestId, decision: 'approve' })
+        expect(approved.batch?.outcome).toBe('succeeded')
+        expect(h.driver.dispatchCounts.get('d7-fill')).toBe(1)
+        await h.store.close()
+    })
+
+    it('refuses executable and unsited link destinations and links inside forms are held (P0-2)', async () => {
+        const h = await createHarness('abp-d7-links-', undefined, held)
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/cart`, linkUrls: { '@js': 'javascript:submitOrder()', '@away': 'https://elsewhere.test/x' },
+            elements: [{ ref: '@js' as never, role: 'link', name: 'Order now', visible: true, frameOrigin: origin },
+                { ref: '@away' as never, role: 'link', name: 'Away', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        for (const ref of ['@js', '@away']) {
+            const result = await runStep(h, `d7-link-${ref.slice(1)}`, { kind: 'click', ref })
+            expect(result.steps[0].error?.code, ref).toBe('ORIGIN_DENIED')
+            expect(h.driver.dispatchCounts.get(`d7-link-${ref.slice(1)}`) ?? 0, ref).toBe(0)
+        }
+        await h.store.close()
+    })
+
+    it('hands a form it cannot bind to the user instead of asking for approval, and resumes the agent after the user (P0-5)', async () => {
+        const permissive: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }] }]
+        const h = await createHarness('abp-d7-opaque-', undefined, permissive)
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/login`, form: { action: `${origin}/session`, method: 'post', enctype: 'application/x-www-form-urlencoded',
+            target: '', fields: [['user', 'a'], ['pw', { password: 8 }]], submitter: null, opaque: true },
+            elements: [{ ref: '@go' as never, role: 'button', name: 'Sign in', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        const result = await runStep(h, 'd7-opaque', { kind: 'click', ref: '@go' })
+        expect(result).toMatchObject({ outcome: 'awaiting-user', waitReason: 'handoff' })
+        expect(result.pendingApproval).toBeUndefined()
+        expect(h.driver.dispatchCounts.get('d7-opaque') ?? 0).toBe(0)
+        const leases = (h.runtime as unknown as { leases: { owner(tabId: string, profileId: ProfileId): { leaseEpoch: number } } }).leases
+        const control = ui(h, ['takeOver', 'releaseControl'])
+        const taken = await h.runtime.takeOver(control, { taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: leases.owner(h.opened.tabId, h.profileId).leaseEpoch, requestId: 'd7-opaque-take' as RequestId })
+        const released = await h.runtime.releaseControl(control, { taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: taken.leaseEpoch, requestId: 'd7-opaque-release' as RequestId })
+        const resumed = await h.runtime.resume(h.auth, { taskId: h.task.taskId, expectedVersion: released.task.stateVersion, requestId: 'd7-opaque-resume' as RequestId })
+        expect(resumed).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
+        expect(h.driver.dispatchCounts.get('d7-opaque') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('hands the action to the user when the driver cannot verify it (transformed frame), without dispatch (P0-7)', async () => {
+        const permissive: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }] }]
+        const h = await createHarness('abp-d7-geometry-', undefined, permissive)
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/cart`, elements: [{ ref: '@go' as never, role: 'button', name: 'Continue', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        h.driver.failNext('click', new BrowserRuntimeError('APPROVAL_REQUIRED', 'transformed frame', false, false))
+        const result = await runStep(h, 'd7-geometry', { kind: 'click', ref: '@go' })
+        expect(result).toMatchObject({ outcome: 'awaiting-user', waitReason: 'handoff', mayHaveSideEffects: false })
+        expect((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).uncertainActions).toEqual([])
+        await h.store.close()
+    })
+
+    it('passes the classified binding to the driver for re-verification at click time (P0-4)', async () => {
+        const permissive: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }] }]
+        const h = await createHarness('abp-d7-expect-', undefined, permissive)
+        const form: FormSubmission = { action: `${origin}/cart/update`, method: 'post', enctype: 'application/x-www-form-urlencoded', target: '',
+            fields: [['qty', '2']], submitter: null, opaque: false }
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/cart`, form, elements: [{ ref: '@go' as never, role: 'button', name: 'Update', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        await runStep(h, 'd7-expect', { kind: 'click', ref: '@go' })
+        expect(h.driver.clickExpectations.at(-1)).toEqual({ role: 'button', name: 'Update', formDigest: formDigest(form) })
         await h.store.close()
     })
 

@@ -3,6 +3,7 @@ import {
     type AgentGrant,
     type BatchStep,
     type BrowserDriver,
+    type DispatchExpectation,
     type ElementRef,
     type Observation,
 } from './contracts'
@@ -14,6 +15,8 @@ export async function dispatchStep(
     step: BatchStep,
     grant: AgentGrant,
     signal: AbortSignal,
+    /** click: what was classified/approved, re-verified by the driver right before input */
+    expect?: DispatchExpectation,
 ): Promise<Observation | { url: string; documentGeneration: number } | void> {
     const options = { signal, timeoutMs: step.timeoutMs }
     switch (step.kind) {
@@ -29,7 +32,7 @@ export async function dispatchStep(
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'click needs a resolved ref')
             }
             if (!step.snapshotId) throw new BrowserRuntimeError('STALE_REF', 'click has no agent-visible snapshot', false, false)
-            return driver.click(step.tabId, step.ref as ElementRef, step.snapshotId, options)
+            return driver.click(step.tabId, step.ref as ElementRef, step.snapshotId, { ...options, ...(expect ? { expect } : {}) })
         case 'fill':
             if (!step.ref || step.value === undefined) {
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'fill needs ref and value')
