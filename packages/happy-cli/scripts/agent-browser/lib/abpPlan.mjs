@@ -83,6 +83,7 @@ export function mergeInstallOptions(saved, flags) {
     viewerOrigins: [],
     egressDomains: [],
     sites: [],
+    happyPrefix: PATHS.happyPrefix,
     ...saved,
     ...Object.fromEntries(Object.entries(flags).filter(([key, value]) => value !== undefined && key !== "issuers")),
   };
@@ -120,6 +121,10 @@ export function mergeInstallOptions(saved, flags) {
   merged.viewerOrigins.forEach((origin, index) => bareOrigin(origin, `viewerOrigins[${index}]`));
   if (merged.egressDomains.length > 64) fail("egressDomains", "at most 64");
   merged.egressDomains.forEach((domain, index) => { if (!DOMAIN.test(domain)) fail(`egressDomains[${index}]`, "must be an exact lowercase domain (no wildcard)"); });
+  // The sandbox launcher and preflight require root-owned, non-writable executables outside private homes and /tmp.
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(merged.happyPrefix) || /(^|\/)\.\.?(\/|$)/.test(merged.happyPrefix) || /^\/(home|tmp|var\/tmp|root|work|run)(\/|$)/.test(merged.happyPrefix)) {
+    fail("happyPrefix", "must be an absolute root-owned location outside /home, /root, /tmp, /var/tmp, /run and /work");
+  }
   return merged;
 }
 

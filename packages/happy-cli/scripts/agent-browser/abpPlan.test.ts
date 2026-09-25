@@ -24,7 +24,7 @@ const base = () => mergeInstallOptions(undefined, {
 describe('install options', () => {
     it('defaults the Runtime API to loopback port 38700 and keeps identity from flags', () => {
         const options = base()
-        expect(options).toMatchObject({ schemaVersion: 1, machineId: 'machine-1', workspaceId: 'ws-1', runtimePort: DEFAULT_RUNTIME_PORT, maxAgentWindows: 4, retentionDays: 7, agentProfileId: 'main' })
+        expect(options).toMatchObject({ schemaVersion: 1, machineId: 'machine-1', workspaceId: 'ws-1', runtimePort: DEFAULT_RUNTIME_PORT, maxAgentWindows: 4, retentionDays: 7, agentProfileId: 'main', happyPrefix: '/opt/abp/happy' })
         expect(DEFAULT_RUNTIME_PORT).toBe(38700)
     })
 
@@ -48,6 +48,9 @@ describe('install options', () => {
             ['agent profile not configured', { agentProfileId: 'other' }],
             ['non-origin viewer origin', { viewerOrigins: ['tunnel.example'] }],
             ['egress domain wildcard', { egressDomains: ['*.anthropic.com'] }],
+            ['relative Happy prefix', { happyPrefix: 'opt/happy' }],
+            ['Happy prefix under a writable tree', { happyPrefix: '/tmp/happy' }],
+            ['Happy prefix in a private home', { happyPrefix: '/home/agent/happy' }],
         ]
         for (const [name, override] of bad) {
             expect(() => mergeInstallOptions(base(), override), name).toThrow()
