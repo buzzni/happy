@@ -35,6 +35,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
     let driver: CdpDriver
     let harness: HarnessCdp
     const instanceId = `bi-${randomUUID()}` as BrowserInstanceId
+    let bounceCount = () => 0
 
     beforeAll(async () => {
         chrome = await launchChrome()
@@ -115,6 +116,21 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/frame-overlay-same', framed('/inner-btn', true))
         a.route('/frame-clear-oopif', () => framed(b.url('/frame-btn'), false))
         a.route('/frame-overlay-oopif', () => framed(b.url('/frame-btn'), true))
+        let bounces = 0
+        c.route('/bounce', () => { bounces += 1; return { status: 302, headers: { location: a.url('/plain') } } })
+        a.route('/via-c', () => ({ status: 302, headers: { location: c.url('/bounce') } }))
+        a.route('/redir-hit', () => ({ status: 302, headers: { location: c.url('/hit/redirect') } }))
+        bounceCount = () => bounces
+        a.route('/exfil', () => `${HIT_SCRIPT}<body>
+            <button onclick="window.open('${c.url('/hit/open')}')">Open window</button>
+            <button onclick="window.open('${c.url('/hit/noopener')}', '_blank', 'noopener')">Open noopener</button>
+            <a href="${c.url('/hit/blank')}" target="_blank">Blank link</a>
+            <form action="${c.url('/hit/post')}" method="post"><input name="q" value="synthetic"><button>Post away</button></form>
+            <button onclick="fetch('${c.url('/hit/fetch')}', { method: 'POST', mode: 'no-cors', body: 'x' })">Fetch away</button>
+            <button onclick="navigator.sendBeacon('${c.url('/hit/beacon')}', 'x')">Beacon away</button>
+            <button onclick="window.open('${a.url('/plain')}')">Open allowed</button>
+            <iframe src="${c.url('/hit/frame')}"></iframe></body>`)
+        a.route('/meta-refresh', () => `<head><meta http-equiv="refresh" content="0.3;url=${c.url('/hit/meta')}"></head><body>Refreshing</body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -243,8 +259,10 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         it('returns no text or refs from a frame whose origin is not allowed', async () => {
             const tab = await open('/oopif', [a.origin])
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
-            const frameB = obs.frames.find((f) => f.origin === b.origin)
+            // The disallowed frame's document request is stopped unsent: it is reported, not loaded.
+            const frameB = obs.frames.find((f) => f.origin !== a.origin)
             expect(frameB).toMatchObject({ allowed: false })
+            expect(driver.blockedReports().some((r) => r.tabId === tab.tabId && r.origin === b.origin && r.resourceType === 'Document')).toBe(true)
             expect(frameB?.text).toBeUndefined()
             expect(obs.elements.every((e) => e.frameOrigin === a.origin)).toBe(true)
             const serialized = JSON.stringify(obs)
@@ -592,6 +610,54 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         })
     })
 
+    describe('destination enforcement before requests', () => {
+        it('blocks redirect hops to a disallowed origin before they are sent, including one that would bounce back', async () => {
+            await expectCode(driver.openTab(a.url('/redir-hit'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            await expectCode(driver.openTab(a.url('/via-c'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            const tab = await open('/plain', [a.origin])
+            await expectCode(driver.navigate(tab.tabId, a.url('/via-c'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            expect(c.hits('redirect')).toBe(0)
+            expect(bounceCount()).toBe(0)
+        })
+
+        it('never lets an owned page, its frames or its popups reach a disallowed destination', async () => {
+            const tab = await open('/exfil', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            for (const name of ['Open window', 'Open noopener', 'Blank link', 'Fetch away', 'Beacon away', 'Post away']) {
+                await driver.click(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS).catch(() => undefined)
+                await delay(300)
+            }
+            const meta = await open('/meta-refresh', [a.origin])
+            await delay(1_500)
+            for (const hit of ['open', 'noopener', 'blank', 'post', 'fetch', 'beacon', 'frame', 'meta']) expect(c.hits(hit), hit).toBe(0)
+            expect(driver.blockedReports().filter((report) => report.origin === c.origin).length).toBeGreaterThanOrEqual(6)
+            expect(JSON.stringify(driver.blockedReports())).not.toContain('/hit/')
+            // Popups whose document was stopped are closed (the owned tabs keep their error pages).
+            const owned = new Set([tab.targetId, meta.targetId])
+            const stray = (t: Array<{ targetId: string; url: string }>) => t.filter((x) => !owned.has(x.targetId) && x.url.startsWith(c.origin))
+            expect(stray(await eventually(() => harness.targets(), (t) => stray(t).length === 0))).toEqual([])
+            expect(driver.popupReports().filter((p) => p.openerTabId === tab.tabId && p.origin === c.origin).every((p) => p.closed)).toBe(true)
+        })
+
+        it('still lets an owned page open an allowed popup and keeps enforcing inside it', async () => {
+            const tab = await open('/exfil', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Open allowed'), obs.snapshotId, OPTS)
+            const reports = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === a.origin && !p.closed))
+            const popup = reports.find((p) => p.origin === a.origin && !p.closed)!
+            await harness.evaluate(popup.targetId, `location.href = '${c.url('/hit/from-popup')}'`).catch(() => undefined)
+            await delay(800)
+            expect(c.hits('from-popup')).toBe(0)
+            await harness.closeTarget(popup.targetId)
+        })
+
+        it('does not hold or touch tabs the driver does not own', async () => {
+            const user = await harness.openFrontTab(c.url('/hit/user-tab'))
+            await eventually(() => c.hits('user-tab'), (n) => n === 1)
+            await harness.closeTarget(user)
+        })
+    })
+
     describe('navigation origin checks and popups', () => {
         it('refuses to open a disallowed origin or a redirect to one, leaving no owned tab', async () => {
             const before = driver.debugCounts()
@@ -615,13 +681,14 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const before = driver.debugCounts()
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
             await driver.click(tab.tabId, refOf(obs, 'Open C'), obs.snapshotId, OPTS)
-            const reports = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === c.origin && p.closed))
+            const mine = (r: ReturnType<typeof driver.popupReports>) => r.filter((p) => p.openerTabId === tab.tabId)
+            const reports = await eventually(() => mine(driver.popupReports()), (r) => r.some((p) => p.origin === c.origin && p.closed))
             expect(reports.find((p) => p.origin === c.origin)).toMatchObject({ openerTabId: tab.tabId, closed: true })
             const gone = await eventually(() => harness.targets(), (t) => !t.some((x) => x.url.startsWith(c.origin)))
             expect(gone.some((t) => t.url.startsWith(c.origin))).toBe(false)
 
             await driver.click(tab.tabId, refOf(obs, 'Open A'), obs.snapshotId, OPTS)
-            const withA = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === a.origin))
+            const withA = await eventually(() => mine(driver.popupReports()), (r) => r.some((p) => p.origin === a.origin))
             const popupA = withA.find((p) => p.origin === a.origin)!
             expect(popupA.closed).toBe(false)
             expect(driver.debugCounts()).toEqual(before)
