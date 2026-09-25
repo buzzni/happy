@@ -15,24 +15,46 @@ RULES_DIR=${ABP_FIREWALL_RULES_DIR:-/etc/abp}
 rules() { grep '^-A OUTPUT ' "$RULES_DIR/firewall.rules$1"; }
 tool() { if [ "$1" = 4 ]; then echo iptables; else echo ip6tables; fi; }
 
-# Deletes every copy of one rule ("-A OUTPUT <spec>"), so a re-run never duplicates it.
+# Every copy of one rule ("-A OUTPUT <spec>"), for remove.
 delete_rule() {
     local family=$1 spec
     read -ra spec <<<"${2#-A OUTPUT }"
     while "$(tool "$family")" -w -t filter -D OUTPUT "${spec[@]}" 2>/dev/null; do :; done
 }
 
+# OUTPUT rules in iptables-save form, normalized like the session preflight.
+live_rules() {
+    "$(tool "$1")" -w -t filter -S OUTPUT | grep '^-A OUTPUT ' \
+        | sed -E 's/ --reject-with (icmp-port-unreachable|icmp6-port-unreachable)$//' || true
+}
+
+# Never removes a rule before its replacement is in place: the new copies go on
+# top first, then older copies further down are deleted by position (bottom up),
+# so agent-sbx and abp-proxy are never without their REJECT rules.
 apply() {
-    local family rule position spec
+    local family rule position spec count index
+    local -a list live
     for family in 4 6; do
         mapfile -t list < <(rules "$family")
-        [ "${#list[@]}" -gt 0 ] || { echo "abp-firewall: no rules in $RULES_DIR/firewall.rules$family" >&2; exit 1; }
-        for rule in "${list[@]}"; do delete_rule "$family" "$rule"; done
-        position=1
-        for rule in "${list[@]}"; do
-            read -ra spec <<<"${rule#-A OUTPUT }"
-            "$(tool "$family")" -w -t filter -I OUTPUT "$position" "${spec[@]}"
-            position=$((position + 1))
+        count=${#list[@]}
+        [ "$count" -gt 0 ] || { echo "abp-firewall: no rules in $RULES_DIR/firewall.rules$family" >&2; exit 1; }
+        mapfile -t live < <(live_rules "$family")
+        if [ "$(printf '%s\n' "${live[@]:0:count}")" != "$(printf '%s\n' "${list[@]}")" ]; then
+            position=1
+            for rule in "${list[@]}"; do
+                read -ra spec <<<"${rule#-A OUTPUT }"
+                "$(tool "$family")" -w -t filter -I OUTPUT "$position" "${spec[@]}"
+                position=$((position + 1))
+            done
+            mapfile -t live < <(live_rules "$family")
+        fi
+        for ((index = ${#live[@]} - 1; index >= count; index--)); do
+            for rule in "${list[@]}"; do
+                if [ "${live[index]}" = "$rule" ]; then
+                    "$(tool "$family")" -w -t filter -D OUTPUT "$((index + 1))"
+                    break
+                fi
+            done
         done
     done
     check
