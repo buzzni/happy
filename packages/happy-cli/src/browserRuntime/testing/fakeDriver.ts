@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
 
 export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[]; formAction?: string; formValues?: Record<string, string> }
-type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'describeRef' | 'screenshot' | 'click' | 'fill' | 'waitFor'
+type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'describeRef' | 'screenshot' | 'click' | 'fill' | 'waitFor' | 'adoptTab'
 interface HeldDispatch {
     operation: Operation
     entered(): void
@@ -15,7 +15,6 @@ export class FakeBrowserDriver implements BrowserDriver {
     private readonly pages = new Map<TabId, FakePage>()
     private readonly targetIds = new Map<TabId, string>()
     private readonly snapshotGenerations = new Map<SnapshotId, number>()
-    private readonly activeSnapshots = new Map<TabId, SnapshotId>()
     private readonly snapshotElements = new Map<SnapshotId, Map<ElementRef, ObservedElement>>()
     private currentActionId?: string
     readonly dispatchCounts = new Map<string, number>()
@@ -63,11 +62,12 @@ export class FakeBrowserDriver implements BrowserDriver {
         return { tabId, targetId }
     }
     async closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }> {
-        await this.delay('closeTab', opts); const page = this.pages.get(tabId); if (!page) return { closed: false }
+        await this.delay('closeTab', opts); this.throwNextFailure('closeTab'); const page = this.pages.get(tabId); if (!page) return { closed: false }
         this.pages.delete(tabId); this.record(tabId, `target-${tabId}`, 'closeTab'); return { closed: true }
     }
     hasTab(tabId: TabId): boolean { return this.pages.has(tabId) }
     async adoptTab(tabId: TabId, targetId: string, _allowedOrigins: string[], _opts: DriverOptions): Promise<boolean> {
+        this.throwNextFailure('adoptTab')
         const adopted = this.pages.has(tabId) && this.targetIds.get(tabId) === targetId
         this.adoptedTabs.push({ tabId, targetId, adopted })
         return adopted
@@ -81,9 +81,9 @@ export class FakeBrowserDriver implements BrowserDriver {
         const elements = (page.elements ?? []).filter((element) => allowedOrigins.includes(element.frameOrigin)).slice(0, opts.maxElements ?? 100)
         const snapshotId = `snapshot-${randomUUID()}` as SnapshotId
         this.observeCount++
-        this.activeSnapshots.set(tabId, snapshotId)
         this.snapshotGenerations.set(snapshotId, page.documentGeneration ?? 1)
         this.snapshotElements.set(snapshotId, new Map(elements.map((element) => [element.ref, structuredClone(element)])))
+        await this.afterDispatch('observe')
         return { snapshotId, tabId, url: page.url, title: page.title ?? '', documentGeneration: page.documentGeneration ?? 1, elements, frames, truncated: false, text: allowedOrigins.includes(origin) ? (page.text ?? '').slice(0, opts.maxTextChars ?? 20_000) : '' }
     }
     async describeRef(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<ElementDescription> {
@@ -152,7 +152,7 @@ export class FakeBrowserDriver implements BrowserDriver {
             throw failure
     }
     private assertSnapshot(tabId: TabId, snapshotId: SnapshotId, currentGeneration: number, element?: ObservedElement): void {
-        if (this.activeSnapshots.get(tabId) !== snapshotId || this.snapshotGenerations.get(snapshotId) !== currentGeneration || !element)
+        if (this.snapshotGenerations.get(snapshotId) !== currentGeneration || !element)
             throw new BrowserRuntimeError('STALE_REF', 'Reference snapshot is stale', false, false)
     }
     private async delay(operation: Operation, opts: DriverOptions): Promise<void> {

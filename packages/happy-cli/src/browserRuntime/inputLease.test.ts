@@ -37,6 +37,19 @@ describe('input lease fencing', () => {
         expect(leases.isUserFenced(profile)).toBe(true)
     })
 
+    it('rejects an existing agent lease on another tab while profile input belongs to a user', () => {
+        const leases = new InputLeaseManager()
+        const profile = 'p' as never
+        const userTab = 'user-tab' as never
+        const agentTab = 'agent-tab' as never
+        const owner = { kind: 'agent' as const, agentSessionId: 'a' as never, taskId: 'task-2' as never,
+            segmentId: 'batch-2' as never }
+        const epoch = leases.acquire(agentTab, profile, owner)
+        leases.takeOver(userTab, profile, { kind: 'user', principalId: 'p' as never, viewerSessionId: 'viewer' })
+        expect(() => leases.assert(agentTab, profile, owner.taskId, owner.segmentId, epoch))
+            .toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+    })
+
     it('keeps a second same-agent task out of an observe-input-postcondition segment', async () => {
         const leases = new InputLeaseManager()
         const driver = new FakeBrowserDriver()

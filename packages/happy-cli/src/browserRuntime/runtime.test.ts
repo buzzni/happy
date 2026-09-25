@@ -94,6 +94,28 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('fences an in-flight batch using the grant that submitted that batch', async () => {
+        const h = await createHarness('abp-runtime-revoke-batch-grant-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@continue' as never, role: 'button', name: 'Continue', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
+        const observed = await h.runtime.observe(h.auth, { taskId: h.task.taskId, tabId: h.opened.tabId })
+        const alternateAuth = { ...h.auth, credential: { ...h.auth.credential, grantId: 'g2' as never } }
+        h.driver.setDelay('click', 500)
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        await h.runtime.submitBatch(alternateAuth, { taskId: h.task.taskId, expectedVersion: task.stateVersion,
+            requestId: 'batch-grant-g2' as RequestId, steps: [{ stepId: 'g2-step' as never, actionId: 'g2-click' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@continue' as never, snapshotId: observed.snapshotId,
+                timeoutMs: 1000 }] })
+        await h.runtime.revokeGrant('g2' as never)
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(current.status).toBe('paused')
+        expect(current.pauseReason).toMatch(/grant-expired|outcome-unknown/)
+        expect(h.driver.dispatchCounts.get('g2-click') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
     it('expires an approval in sweep and requires a fresh approval after resume', async () => {
         const h = await createHarness('abp-runtime-approval-expiry-')
         h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
@@ -121,6 +143,35 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('does not replay redacted approval steps after Runtime restart and records the interrupted step', async () => {
+        const h = await createHarness('abp-runtime-approval-restart-interrupted-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
+        await observeHarnessTab(h)
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const submitted = await h.runtime.submitBatch(h.auth, { taskId: task.taskId, expectedVersion: task.stateVersion,
+            requestId: 'approval-restart-interrupted' as RequestId, steps: [{ stepId: 'pay-step' as never,
+                actionId: 'pay-action' as never, tabId: h.opened.tabId, kind: 'click', ref: '@pay' as never,
+                timeoutMs: 1000 }] }, { waitMs: 1000 })
+        expect(submitted.result?.outcome).toBe('awaiting-user')
+        await h.store.close()
+        h.clock.set(600_101)
+        const store = await TaskStore.open(h.dir)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        await runtime.sweep(h.clock.now())
+        const expired = await runtime.getTask(h.auth, { taskId: task.taskId })
+        await runtime.resume(h.auth, { taskId: task.taskId, expectedVersion: expired.stateVersion,
+            requestId: 'approval-restart-resume' as RequestId })
+        const recovered = await runtime.getTask(h.auth, { taskId: task.taskId })
+        expect(recovered.status).toBe('paused')
+        expect(recovered.pauseReason).toBe('awaiting-agent')
+        expect(recovered.lastBatch).toMatchObject({ outcome: 'failed', failedStep: 'pay-step', mayHaveSideEffects: false })
+        expect(h.driver.dispatchCounts.get('pay-action') ?? 0).toBe(0)
+        await store.close()
+    })
+
     it('invalidates task tabs when a reconnected driver has a different browser instance', async () => {
         const h = await createHarness('abp-runtime-driver-restart-')
         await h.runtime.onDriverDisconnected(h.profileId)
@@ -134,6 +185,144 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('isolates a failed tab adoption and keeps unrelated task reads available after recovery', async () => {
+        const h = await createHarness('abp-runtime-adopt-failure-')
+        const stored = h.store.getTask(h.task.taskId)!
+        await h.store.commit(h.task.taskId, {
+            status: 'running',
+            currentBatchId: 'batch-crash' as never,
+            actions: { ...stored.actions, 'write-crash': { kind: 'click', batchId: 'batch-crash' as never,
+                state: 'intent-committed', payloadHash: 'hash' } },
+        }, { type: 'action-intent', atMs: h.clock.now(), leaseEpoch: 0, data: { actionId: 'write-crash' } })
+        await h.store.close()
+        h.driver.failNext('adoptTab', new Error('setupSession timed out'))
+        const store = await TaskStore.open(h.dir)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const recovered = await runtime.getTask(h.auth, { taskId: h.task.taskId })
+        expect(recovered.status).toBe('paused')
+        expect(recovered.pauseReason).toBe('outcome-unknown')
+        expect(recovered.uncertainActions).toContain('write-crash')
+        await expect(runtime.createSpace(h.auth, { profileId: h.profileId, requestId: 'recovery-still-live' as RequestId }))
+            .resolves.toHaveProperty('taskSpaceId')
+        await store.close()
+    })
+
+    it('keeps an unresolved write uncertain when recovery finds the task grant expired', async () => {
+        const h = await createHarness('abp-runtime-recovery-expired-write-', 200)
+        const task = h.store.getTask(h.task.taskId)!
+        await h.store.commit(task.taskId, { status: 'running', currentBatchId: 'expired-batch' as never,
+            actions: { ...task.actions, 'expired-write': { kind: 'click', batchId: 'expired-batch' as never,
+                state: 'intent-committed', payloadHash: 'hash' } } }, {
+            type: 'action-intent', atMs: h.clock.now(), leaseEpoch: 0, data: { actionId: 'expired-write' },
+        })
+        await h.store.close()
+        h.clock.set(201)
+        const store = await TaskStore.open(h.dir)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[h.profileId, h.driver]]), clock: h.clock })
+        const recoveryAuth = { ...h.auth, credential: { ...h.auth.credential, expiresAtMs: 10_000 } }
+        const recovered = await runtime.getTask(recoveryAuth, { taskId: task.taskId })
+        expect(recovered.pauseReason).toBe('outcome-unknown')
+        expect(recovered.uncertainActions).toContain('expired-write')
+        await store.close()
+    })
+
+    it('records openPage as a write intent with navigate kind before creating a tab', async () => {
+        const h = await createHarness('abp-runtime-open-kind-')
+        const action = Object.values(h.store.getTask(h.task.taskId)!.actions).find((entry) => entry.state === 'confirmed')
+        expect(action?.kind).toBe('navigate')
+        await h.store.close()
+    })
+
+    it('replays the openPage intent dedupe after an open failure without opening another tab', async () => {
+        const h = await createHarness('abp-runtime-open-intent-dedupe-')
+        const request = { taskId: h.task.taskId, url: 'https://fixture.test/retry-open',
+            requestId: 'open-intent-retry' as RequestId }
+        const opensBefore = h.driver.targetLedger.filter((entry) => entry.operation === 'openTab').length
+        h.driver.failNext('openTab', new Error('response lost'))
+        await expect(h.runtime.openPage(h.auth, request)).rejects.toMatchObject({ code: 'OUTCOME_UNKNOWN' })
+        const retry = await h.runtime.openPage(h.auth, request)
+        expect(retry.tabId).toBeTruthy()
+        expect(h.driver.targetLedger.filter((entry) => entry.operation === 'openTab')).toHaveLength(opensBefore)
+        await h.store.close()
+    })
+
+    it('does not extend paused retention when resuming an already awaiting-agent task', async () => {
+        const h = await createHarness('abp-runtime-resume-bookkeeping-')
+        const initial = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        for (let index = 0; index < 5; index++) {
+            h.clock.advance(180)
+            await h.runtime.resume(h.auth, { taskId: h.task.taskId, expectedVersion: initial.stateVersion,
+                requestId: `resume-noop-${index}` as RequestId })
+        }
+        expect((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).updatedAtMs).toBe(initial.updatedAtMs)
+        await h.store.close()
+    })
+
+    it('atomically claims concurrent resumes with different request IDs', async () => {
+        const h = await createHarness('abp-runtime-resume-race-')
+        const before = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const results = await Promise.allSettled([
+            h.runtime.resume(h.auth, { taskId: h.task.taskId, expectedVersion: before.stateVersion,
+                requestId: 'resume-race-a' as RequestId }),
+            h.runtime.resume(h.auth, { taskId: h.task.taskId, expectedVersion: before.stateVersion,
+                requestId: 'resume-race-b' as RequestId }),
+        ])
+        expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+        expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+        expect((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).updatedAtMs).toBe(before.updatedAtMs)
+        await h.store.close()
+    })
+
+    it('does not mark a space closed when a tab close fails', async () => {
+        const h = await createHarness('abp-runtime-close-space-failure-')
+        await h.runtime.finishTask(h.auth, { taskId: h.task.taskId,
+            expectedVersion: (await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).stateVersion,
+            requestId: 'finish-close-space' as RequestId })
+        h.driver.failNext('closeTab', new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'blocked'))
+        await expect(h.runtime.closeSpace(h.auth, { taskSpaceId: h.space.taskSpaceId,
+            requestId: 'close-space-failure' as RequestId })).rejects.toThrow()
+        expect(h.store.getSpace(h.space.taskSpaceId)?.closed).not.toBe(true)
+        expect(h.store.getSpace(h.space.taskSpaceId)?.tabs).toContain(h.opened.tabId)
+        await h.store.close()
+    })
+
+    it('does not overwrite a grant pause when openPage finishes its final observation', async () => {
+        const h = await createHarness('abp-runtime-open-late-pause-')
+        const held = h.driver.holdAfterNextDispatch('observe')
+        const opening = h.runtime.openPage(h.auth, { taskId: h.task.taskId, url: 'https://fixture.test/late-open',
+            requestId: 'late-open' as RequestId })
+        await held.entered
+        await h.runtime.revokeGrant(h.auth.credential.grantId)
+        held.release()
+        await expect(opening).rejects.toMatchObject({ code: 'OUTCOME_UNKNOWN' })
+        const task = h.store.getTask(h.task.taskId)
+        expect(task?.status).toBe('paused')
+        expect(['grant-expired', 'outcome-unknown']).toContain(task?.pauseReason)
+        expect(task?.tabs).toEqual([h.opened.tabId])
+        expect(h.driver.targetLedger.filter((entry) => entry.operation === 'openTab')).toHaveLength(2)
+        await h.store.close()
+    })
+
+    it('does not revive terminal tasks through resume or input control operations', async () => {
+        const h = await createHarness('abp-runtime-terminal-control-')
+        const finished = await h.runtime.finishTask(h.auth, { taskId: h.task.taskId,
+            expectedVersion: (await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).stateVersion,
+            requestId: 'finish-terminal-control' as RequestId })
+        const uiCredential: InteractiveCapability = { kind: 'interactive', capabilityId: 'terminal-control-ui' as never,
+            principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer',
+            profileId: h.profileId, operations: ['takeOver', 'releaseControl'], issuedAtMs: 0, expiresAtMs: 3_600_000 }
+        const uiAuth = { credential: uiCredential, verifiedAtMs: h.clock.now() }
+        const epoch = h.runtime.leases.takeOver(h.opened.tabId, h.profileId,
+            { kind: 'user', principalId: 'p' as never, viewerSessionId: 'viewer' })
+        await expect(h.runtime.resume(h.auth, { taskId: h.task.taskId, expectedVersion: finished.stateVersion,
+            requestId: 'resume-terminal' as RequestId })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await expect(h.runtime.takeOver(uiAuth, { taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: epoch, requestId: 'takeover-terminal' as RequestId })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await expect(h.runtime.releaseControl(uiAuth, { taskId: h.task.taskId, tabId: h.opened.tabId,
+            expectedEpoch: epoch, requestId: 'release-terminal' as RequestId })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await h.store.close()
+    })
+
     it('restores a disconnected task when the browser instance is unchanged', async () => {
         const h = await createHarness('abp-runtime-driver-resume-')
         await h.runtime.onDriverDisconnected(h.profileId)
@@ -142,6 +331,17 @@ describe('BrowserRuntime durable request contract', () => {
         expect(task.status).toBe('paused')
         expect(task.pauseReason).toBe('awaiting-agent')
         expect(task.tabs).toContain(h.opened.tabId)
+        await h.store.close()
+    })
+
+    it('resolves a recovering task during sweep when the driver is connected and no worker exists', async () => {
+        const h = await createHarness('abp-runtime-sweep-recovering-')
+        const task = h.store.getTask(h.task.taskId)!
+        await h.store.commit(task.taskId, { status: 'recovering', previousDriverStatus: 'running' }, {
+            type: 'recovered', atMs: h.clock.now(), leaseEpoch: 0, data: { test: true },
+        })
+        await h.runtime.sweep(h.clock.now())
+        expect(h.store.getTask(task.taskId)).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
         await h.store.close()
     })
 
@@ -848,6 +1048,31 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('keeps an approval usable after rejecting an agent observe of its bound tab', async () => {
+        const h = await createHarness('abp-runtime-approval-observe-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true, frameOrigin: 'https://fixture.test' },
+        ] })
+        await observeHarnessTab(h)
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const batch = await h.runtime.submitBatch(h.auth, { taskId: h.task.taskId, expectedVersion: current.stateVersion,
+            requestId: 'approval-observe-batch' as RequestId, steps: [{ stepId: 'pay' as never, actionId: 'pay' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@pay' as never, timeoutMs: 1000 }] }, { waitMs: 1000 })
+        const approval = batch.result?.pendingApproval
+        expect(approval).toBeTruthy()
+        await expect(observeHarnessTab(h)).rejects.toMatchObject({ code: 'CONFLICT' })
+        const uiCredential: InteractiveCapability = { kind: 'interactive', capabilityId: 'approval-observe-ui' as never,
+            principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer',
+            profileId: h.profileId, operations: ['approve'], issuedAtMs: 0, expiresAtMs: 3_600_000 }
+        const approved = await h.runtime.approve({ credential: uiCredential, verifiedAtMs: h.clock.now() }, {
+            taskId: h.task.taskId, approvalId: approval!.approvalId, bindingHash: approval!.bindingHash,
+            requestId: 'approval-observe-approve' as RequestId, decision: 'approve',
+        })
+        expect(approved.outcome).toBe('approved')
+        expect(h.driver.dispatchCounts.get('pay')).toBe(1)
+        await h.store.close()
+    })
+
     it('keeps an approved submit click uncertain until a trusted postcondition is observed', async () => {
         const h = await createHarness('abp-runtime-submit-uncertain-')
         h.driver.seedTab(h.opened.tabId, {
@@ -1086,6 +1311,26 @@ describe('BrowserRuntime durable request contract', () => {
         }, { waitMs: 1000 })
         expect(clicked.result?.outcome).toBe('succeeded')
         expect(h.driver.dispatchedSnapshots.at(-1)?.snapshotId).toBe(snapshotId)
+        await h.store.close()
+    })
+
+    it('keeps an unnamed ref bound to the snapshot received before batch submission', async () => {
+        const h = await createHarness('abp-runtime-fixed-batch-snapshot-')
+        h.driver.seedTab(h.opened.tabId, { url: 'https://fixture.test/start', elements: [
+            { ref: '@continue' as never, role: 'button', name: 'Continue', visible: true,
+                frameOrigin: 'https://fixture.test' },
+        ] })
+        const first = await observeHarnessTab(h)
+        const task = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const batch = await h.runtime.submitBatch(h.auth, { taskId: h.task.taskId, expectedVersion: task.stateVersion,
+            requestId: 'fixed-batch-snapshot' as RequestId, steps: [
+                { stepId: 'observe-now' as never, actionId: 'observe-now' as never, tabId: h.opened.tabId,
+                    kind: 'observe', timeoutMs: 1000 },
+                { stepId: 'click-old-ref' as never, actionId: 'click-old-ref' as never, tabId: h.opened.tabId,
+                    kind: 'click', ref: '@continue' as never, timeoutMs: 1000 },
+            ] }, { waitMs: 1000 })
+        expect(h.driver.dispatchedSnapshots.at(-1)?.snapshotId).toBe(first.snapshotId)
+        expect(batch.result?.steps.at(-1)?.outcome).toBe('succeeded')
         await h.store.close()
     })
 
