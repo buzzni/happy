@@ -322,6 +322,106 @@ describe('claudeRemote', () => {
         expect(nextMessage).toHaveBeenCalledOnce();
     });
 
+    function runOnceWithProviderMessages(
+        providerMessages: unknown[],
+        provider: { staysOpen?: boolean; backgroundWaitBudgetMs?: number } = {},
+    ) {
+        vi.mocked(query).mockReturnValue({
+            setPermissionMode: vi.fn(),
+            mcpServerStatus: vi.fn(async () => []),
+            async *[Symbol.asyncIterator]() {
+                yield* providerMessages;
+                // A live provider keeps its stream open while background work runs.
+                if (provider.staysOpen) await new Promise(() => undefined);
+            },
+        } as any);
+        const onReady = vi.fn();
+        const onMessage = vi.fn();
+        const running = claudeRemote({
+            sessionId: null,
+            path: process.cwd(),
+            allowedTools: [],
+            hookSettingsPath: '/tmp/happy-test-settings.json',
+            exitAfterFirstTurn: true,
+            backgroundWaitBudgetMs: provider.backgroundWaitBudgetMs,
+            nextMessage: async () => ({ message: 'scheduled prompt', mode }),
+            onReady,
+            canCallTool: async () => ({ behavior: 'allow' }) as any,
+            isAborted: () => false,
+            onSessionFound: vi.fn(),
+            onThinkingChange: vi.fn(),
+            onMessage,
+        });
+        return { running, onReady, onMessage };
+    }
+
+    const backgroundTasks = (tasks: Array<{ task_type: string; ambient?: boolean }>) => ({
+        type: 'system',
+        subtype: 'background_tasks_changed',
+        tasks: tasks.map((task, index) => ({ task_id: `task-${index}`, description: 'work', ...task })),
+    });
+
+    it('keeps an automation run alive until its background agents report back', async () => {
+        const finalResult = { type: 'result', subtype: 'success', result: 'saw agents' };
+        const { running, onReady, onMessage } = runOnceWithProviderMessages([
+            backgroundTasks([{ task_type: 'local_agent' }]),
+            { type: 'result', subtype: 'success', result: 'launched' },
+            backgroundTasks([]),
+            finalResult,
+        ]);
+
+        await expect(running).resolves.toBe('turn-complete');
+        expect(onMessage).toHaveBeenCalledWith(finalResult);
+        expect(onReady).toHaveBeenCalledOnce();
+    });
+
+    it('ends an automation run while only background shells or ambient tasks remain', async () => {
+        const { running, onMessage } = runOnceWithProviderMessages([
+            backgroundTasks([{ task_type: 'local_bash' }, { task_type: 'local_agent', ambient: true }]),
+            { type: 'result', subtype: 'success', result: 'launched' },
+            { type: 'result', subtype: 'success', result: 'never reached' },
+        ]);
+
+        await expect(running).resolves.toBe('turn-complete');
+        expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ result: 'never reached' }));
+    });
+
+    it('ends an automation run when its background agent never reports back', async () => {
+        const launched = { type: 'result', subtype: 'success', result: 'launched' };
+        const { running, onReady, onMessage } = runOnceWithProviderMessages([
+            backgroundTasks([{ task_type: 'local_agent' }]),
+            launched,
+        ], { staysOpen: true, backgroundWaitBudgetMs: 20 });
+
+        await expect(running).resolves.toBe('turn-complete');
+        expect(onReady).toHaveBeenCalledOnce();
+        expect(onMessage.mock.calls.filter(([message]) => message === launched)).toHaveLength(1);
+    });
+
+    it('ends an automation run at the result after its agent reported back, even before the level catches up', async () => {
+        const { running, onMessage } = runOnceWithProviderMessages([
+            backgroundTasks([{ task_type: 'local_agent' }]),
+            { type: 'result', subtype: 'success', result: 'launched' },
+            { type: 'system', subtype: 'task_notification', task_id: 'task-0', status: 'completed', output_file: '', summary: 'done' },
+            { type: 'result', subtype: 'success', result: 'agent read' },
+            backgroundTasks([]),
+        ], { staysOpen: true, backgroundWaitBudgetMs: 60_000 });
+
+        await expect(running).resolves.toBe('turn-complete');
+        expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ result: 'agent read' }));
+    });
+
+    it('ends an automation run whose empty level lands after the result it belongs to', async () => {
+        const { running } = runOnceWithProviderMessages([
+            backgroundTasks([{ task_type: 'local_agent' }]),
+            { type: 'result', subtype: 'success', result: 'launched' },
+            { type: 'result', subtype: 'success', result: 'agent read' },
+            backgroundTasks([]),
+        ], { staysOpen: true, backgroundWaitBudgetMs: 20 });
+
+        await expect(running).resolves.toBe('turn-complete');
+    });
+
     it.each([false, true])('routes stream_event partials even when diagnostics throw: %s', async (diagnosticThrows) => {
         const streamEvent = {
             type: 'stream_event',
