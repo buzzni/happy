@@ -7,6 +7,7 @@ import { InputLeaseManager } from './inputLease'
 import { ENCODING, RFB_VERSION, StreamFramer, clientParser, keyEvent, pointerEvent, setEncodingsMessage, vncAuthResponse, type ClientMessage, type RfbParser } from './rfb'
 import { startRuntimeServer, type RuntimeServer } from './server'
 import { PIXEL_FORMAT_32, prng, randomSplit, serverStream, u16, u32 } from './testing/rfbFixtures'
+import { RawRfbViewer } from './testing/rfbViewerClient'
 import { ViewerProxy } from './viewerProxy'
 
 const PROFILE = 'profile-a' as ProfileId
@@ -150,51 +151,6 @@ class FakeX11vnc {
     }
 }
 
-/** A viewer speaking raw RFB over the WebSocket, as noVNC does. */
-class RawViewer {
-    private buffered = Buffer.alloc(0)
-    private wake: (() => void) | undefined
-    readonly closed: Promise<{ code: number; reason: string }>
-    private constructor(readonly ws: WebSocket) {
-        ws.on('message', (data: Buffer) => { this.buffered = Buffer.concat([this.buffered, data]); this.wake?.() })
-        this.closed = new Promise((resolve) => ws.on('close', (code, reason) => { this.wake?.(); resolve({ code, reason: reason.toString() }) }))
-    }
-
-    static open(url: string, origin?: string): Promise<RawViewer> {
-        return new Promise((resolve, reject) => {
-            const ws = new WebSocket(url, ['binary'], { headers: origin ? { origin } : {} })
-            ws.once('open', () => resolve(new RawViewer(ws)))
-            ws.once('unexpected-response', (_request, response) => reject(new Error(`HTTP ${response.statusCode}`)))
-            ws.once('error', reject)
-        })
-    }
-
-    async read(length: number): Promise<Buffer> {
-        const deadline = Date.now() + 3_000
-        while (this.buffered.length < length) {
-            if (this.ws.readyState !== WebSocket.OPEN || Date.now() > deadline) throw new Error(`viewer read ${length} failed`)
-            await new Promise<void>((resolve) => { this.wake = resolve; setTimeout(resolve, 50) })
-        }
-        const bytes = this.buffered.subarray(0, length)
-        this.buffered = this.buffered.subarray(length)
-        return bytes
-    }
-    received(): Buffer { return this.buffered }
-    send(bytes: Buffer, options: { fin?: boolean } = {}): void { this.ws.send(bytes, { binary: true, fin: options.fin ?? true }) }
-
-    async handshake(): Promise<{ width: number; height: number; name: string }> {
-        expect((await this.read(12)).toString('latin1')).toBe(RFB_VERSION)
-        this.send(Buffer.from(RFB_VERSION, 'latin1'))
-        expect([...await this.read(2)]).toEqual([1, 1])
-        this.send(Buffer.from([1]))
-        expect((await this.read(4)).readUInt32BE(0)).toBe(0)
-        this.send(Buffer.from([0]))
-        const init = await this.read(24)
-        const name = (await this.read(init.readUInt32BE(20))).toString('utf8')
-        return { width: init.readUInt16BE(0), height: init.readUInt16BE(2), name }
-    }
-}
-
 const fbur = (marker: number) => Buffer.concat([Buffer.from([3, 1]), u16(marker), u16(0), u16(1), u16(1)])
 const cutText = (text: string) => Buffer.concat([Buffer.from([6, 0, 0, 0]), u32(text.length), Buffer.from(text)])
 const markerSeen = (x11vnc: FakeX11vnc, marker: number) => () => x11vnc.messages().some((m) => m.kind === 'framebufferUpdateRequest' && m.bytes.readUInt16BE(2) === marker)
@@ -224,7 +180,7 @@ async function viewerStack(options: { allowedOrigins?: string[] } = {}) {
         proxy.issueTicket(auth(capability({ issuedAtMs: Date.now() - 1_000, expiresAtMs: Date.now() + 240_000, ...overrides })), { profileId: PROFILE }).ticket
     const url = (value: string) => `ws://127.0.0.1:${server.port}/v1/viewer/websockify?ticket=${value}`
     const connect = async (overrides: Partial<InteractiveCapability> = {}) => {
-        const viewer = await RawViewer.open(url(ticket(overrides)), origin)
+        const viewer = await RawRfbViewer.open(url(ticket(overrides)), origin)
         cleanups.push(() => viewer.ws.terminate())
         return viewer
     }
@@ -338,16 +294,16 @@ describe('viewer proxy connection', () => {
 
     it('rejects a missing or foreign Origin, and a self origin on a non-loopback Host', async () => {
         const { origin, ticket, url, connect } = await viewerStack()
-        await expect(RawViewer.open(url(ticket()))).rejects.toThrow('HTTP 403')
-        await expect(RawViewer.open(url(ticket()), 'https://evil.example')).rejects.toThrow('HTTP 403')
-        await expect(RawViewer.open(url(ticket()), origin.replace('127.0.0.1', 'localhost'))).rejects.toThrow('HTTP 403')
+        await expect(RawRfbViewer.open(url(ticket()))).rejects.toThrow('HTTP 403')
+        await expect(RawRfbViewer.open(url(ticket()), 'https://evil.example')).rejects.toThrow('HTTP 403')
+        await expect(RawRfbViewer.open(url(ticket()), origin.replace('127.0.0.1', 'localhost'))).rejects.toThrow('HTTP 403')
         const rebound = await new Promise<number>((resolve) => {
             const ws = new WebSocket(url(ticket()), { headers: { origin: 'http://rebind.example:1234', host: 'rebind.example:1234' } })
             ws.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0))
             ws.once('open', () => resolve(101))
         })
         expect(rebound).toBe(403)
-        const tunnel = await RawViewer.open(url(ticket()), 'https://tunnel.example')
+        const tunnel = await RawRfbViewer.open(url(ticket()), 'https://tunnel.example')
         tunnel.ws.terminate()
         expect((await connect()).ws.readyState).toBe(WebSocket.OPEN)
     })
@@ -355,11 +311,11 @@ describe('viewer proxy connection', () => {
     it('accepts a ticket once: reuse, an unknown ticket and none at all are refused', async () => {
         const { origin, ticket, url } = await viewerStack()
         const once = ticket()
-        const first = await RawViewer.open(url(once), origin)
+        const first = await RawRfbViewer.open(url(once), origin)
         first.ws.terminate()
-        await expect(RawViewer.open(url(once), origin)).rejects.toThrow('HTTP 401')
-        await expect(RawViewer.open(url('not-a-ticket'), origin)).rejects.toThrow('HTTP 401')
-        await expect(RawViewer.open(url('').replace('?ticket=', ''), origin)).rejects.toThrow('HTTP 401')
+        await expect(RawRfbViewer.open(url(once), origin)).rejects.toThrow('HTTP 401')
+        await expect(RawRfbViewer.open(url('not-a-ticket'), origin)).rejects.toThrow('HTTP 401')
+        await expect(RawRfbViewer.open(url('').replace('?ticket=', ''), origin)).rejects.toThrow('HTTP 401')
     })
 
     it('forwards only framable encodings upstream', async () => {
