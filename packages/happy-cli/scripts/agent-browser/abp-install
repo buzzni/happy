@@ -11,12 +11,13 @@
 #   --happy-tarball <tgz>     install this Happy package (npm pack) under the Happy prefix
 #   --images <dir>            load images.tar + manifest.json (abp-stack build --out) on first install
 #   --build-from <happy-cli>  build the images on this machine instead (needs a source checkout with deps)
-#   --install-packages        apt-get the host prerequisites (bubblewrap sudo iptables gcc libc6-dev systemd-resolved libnss-resolve)
+#   --install-packages        apt-get the host prerequisites (bubblewrap sudo iptables ipset gcc libc6-dev systemd-resolved libnss-resolve)
 #   --no-start                write everything, start nothing
 # Machine options (saved in /etc/abp/install.json; see abp-plan.mjs parseOptionFlags):
 #   --machine-id <id|auto> --workspace-id <id> --profile <id>=<principalId>... --agent-profile <id>
 #   --issuer <kid>=<public-key.pem>... --sites <policy.json> --runtime-port <n> --max-agent-windows <n>
 #   --retention-days <n> --viewer-origin <origin>... --egress-domain <domain>... --happy-prefix <dir>
+#   --browser-subnet-pool <private /20> --deny-cidr <cidr>... --browser-dns <ipv4>...
 #
 # Written for bash 3.2+ (the dry-run also runs on developer Macs).
 set -euo pipefail
@@ -32,7 +33,8 @@ INSTALL_JSON=$ETC/install.json
 RUNTIME_JSON=$ETC/runtime.json
 VARLIB=/var/lib/abp
 DAEMON_TOKEN=$VARLIB/daemon-token
-UNITS="abp-firewall.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service"
+UNITS="abp-firewall.service abp-egress.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service"
+OPS_LOCK=/run/abp-stack-ops.lock
 CHANGED=" "
 WORK=""
 
@@ -58,6 +60,7 @@ trap cleanup EXIT
 
 # write_file <path> <owner> <group> <mode> [show] — content on stdin. Unchanged content keeps the
 # file (owner and mode are still enforced); otherwise temp file + rename. `show` prints it in dry-run.
+# Never call it at the end of a pipeline (`… | write_file`): that runs it in a subshell and loses CHANGED.
 write_file() {
     local path=$1 owner=$2 group=$3 mode=$4 show=${5:-} content tmp
     content=$(cat; printf x)
@@ -67,32 +70,76 @@ write_file() {
         if [ "$show" = show ]; then printf '%s' "$content" | sed 's/^/    | /'; fi
         return 0
     fi
+    safe_path "$path" file "$owner"
     if [ -f "$path" ] && [ "$(cat "$path"; printf x)" = "${content}x" ]; then
-        chown "$owner:$group" "$path"
+        chown -h "$owner:$group" "$path"
         chmod "$mode" "$path"
         return 0
     fi
     tmp=$(mktemp "$(dirname "$path")/.abp-install.XXXXXX")
     printf '%s' "$content" > "$tmp"
-    chown "$owner:$group" "$tmp"
+    chown -h "$owner:$group" "$tmp"
     chmod "$mode" "$tmp"
     sync "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$path"
     CHANGED="$CHANGED$path "
 }
 
+# emit <path> <owner> <group> <mode> <show|-> <abp-plan args...>: generate into a temp file, then write_file
+# in this shell (so CHANGED is kept for the restart decisions).
+emit() {
+    local path=$1 owner=$2 group=$3 mode=$4 show=$5
+    shift 5
+    plan "$@" > "$WORK/emit"
+    write_file "$path" "$owner" "$group" "$mode" "$show" < "$WORK/emit"
+}
+
+# safe_path <path> <dir|file> <owner>: refuses a symlink or wrong file type, and a path whose ancestors
+# are symlinks, owned by anyone but root or the intended owner, or writable by group or others (who
+# could swap an entry between this check and the chown/chmod/rename that follows).
+safe_path() {
+    local path=$1 kind=$2 owner dir uid mode
+    [ "$DRY_RUN" = 1 ] && return 0
+    owner=$(id -u "$3")
+    [ -L "$path" ] && die "$path is a symbolic link"
+    if [ -e "$path" ]; then
+        case "$kind" in
+            dir) [ -d "$path" ] || die "$path is not a directory" ;;
+            file) [ -f "$path" ] || die "$path is not a regular file" ;;
+        esac
+    fi
+    dir=$(dirname "$path")
+    while :; do
+        [ -L "$dir" ] && die "$dir (above $path) is a symbolic link"
+        # Missing ancestors are created by ensure_dir (root, 0755).
+        if [ ! -e "$dir" ]; then dir=$(dirname "$dir"); continue; fi
+        [ -d "$dir" ] || die "$dir (above $path) is not a directory"
+        read -r uid mode <<<"$(stat -c '%u %a' "$dir" 2>/dev/null || stat -f '%u %Lp' "$dir")"
+        [ "$uid" = 0 ] || [ "$uid" = "$owner" ] || die "$dir (above $path) is not owned by root"
+        (( (8#$mode & 8#022) == 0 )) || die "$dir (above $path) is writable by group or others"
+        [ "$dir" = / ] && break
+        dir=$(dirname "$dir")
+    done
+}
+
 ensure_dir() { # path owner group mode
+    safe_path "$1" dir "$2"
+    # Missing parents: root 0755 (install -d would give them this script's umask 077).
+    local parent
+    parent=$(dirname "$1")
+    if [ ! -e "$parent" ] && [ "$DRY_RUN" = 0 ]; then ensure_dir "$parent" root root 0755; fi
     run install -d -o "$2" -g "$3" -m "$4" "$1"
-    run chown "$2:$3" "$1"
+    run chown -h "$2:$3" "$1"
     run chmod "$4" "$1"
 }
 
 # place_secret <tmpfile> <path> <owner> <group> <mode>: atomic replace, never printed.
 place_secret() {
     local tmp
+    safe_path "$2" file "$3"
     tmp=$(mktemp "$(dirname "$2")/.abp-secret.XXXXXX")
     cat "$1" > "$tmp"
-    chown "$3:$4" "$tmp"
+    chown -h "$3:$4" "$tmp"
     chmod "$5" "$tmp"
     sync "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$2"
@@ -100,7 +147,8 @@ place_secret() {
 
 ensure_secret() { # path owner group mode kind
     if [ "$DRY_RUN" = 1 ]; then printf '+ secret %s (%s:%s %s) if missing\n' "$1" "$2" "$3" "$4"; return 0; fi
-    if [ -s "$1" ]; then chown "$2:$3" "$1"; chmod "$4" "$1"; return 0; fi
+    safe_path "$1" file "$2"
+    if [ -s "$1" ]; then chown -h "$2:$3" "$1"; chmod "$4" "$1"; return 0; fi
     plan secret "$5" > "$WORK/secret"
     place_secret "$WORK/secret" "$1" "$2" "$3" "$4"
     rm -f "$WORK/secret"
@@ -114,9 +162,11 @@ ensure_vnc_password() {
         printf '+ secret %s (same value; abp-runtime:root 0440, abp-browser:abp-browser 0400) if missing\n' "$VARLIB/secrets/{runtime,browser}/vnc-password"
         return 0
     fi
+    safe_path "$runtime" file abp-runtime
+    safe_path "$browser" file abp-browser
     if [ -s "$runtime" ] && [ -s "$browser" ] && cmp -s "$runtime" "$browser"; then
-        chown abp-runtime:root "$runtime"; chmod 0440 "$runtime"
-        chown abp-browser:abp-browser "$browser"; chmod 0400 "$browser"
+        chown -h abp-runtime:root "$runtime"; chmod 0440 "$runtime"
+        chown -h abp-browser:abp-browser "$browser"; chmod 0400 "$browser"
         return 0
     fi
     plan secret vnc-password > "$WORK/secret"
@@ -169,10 +219,10 @@ preflight() {
     fi
     if [ "$INSTALL_PACKAGES" = 1 ]; then
         run apt-get update
-        run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap sudo iptables gcc libc6-dev systemd-resolved libnss-resolve util-linux ca-certificates
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap sudo iptables ipset gcc libc6-dev systemd-resolved libnss-resolve util-linux ca-certificates
     fi
     local missing="" cmd
-    for cmd in docker bwrap sudo visudo iptables ip6tables iptables-save ip6tables-save cc flock getent useradd usermod groupadd gpasswd systemctl systemd-tmpfiles cmp; do
+    for cmd in docker bwrap sudo visudo iptables ip6tables iptables-save ip6tables-save ipset cc flock getent useradd usermod groupadd gpasswd systemctl systemd-tmpfiles cmp; do
         command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
     for cmd in /usr/bin/node /usr/bin/bwrap /usr/bin/sudo; do [ -x "$cmd" ] || missing="$missing $cmd"; done
@@ -214,7 +264,10 @@ install_happy() {
     say "Happy package ($HAPPY_PREFIX)"
     if [ -n "$HAPPY_TARBALL" ]; then
         [ -f "$HAPPY_TARBALL" ] || [ "$DRY_RUN" = 1 ] || die "--happy-tarball $HAPPY_TARBALL does not exist"
+        # install -d would create missing parents with this script's umask (077), hiding the package from agent-sbx.
+        [ -d "$(dirname "$HAPPY_PREFIX")" ] || ensure_dir "$(dirname "$HAPPY_PREFIX")" root root 0755
         ensure_dir "$HAPPY_PREFIX" root root 0755
+        safe_path "$HAPPY_PREFIX/lib" dir root
         run npm install --global --prefix "$HAPPY_PREFIX" --omit=dev --no-audit --no-fund "$HAPPY_TARBALL"
         # Root-owned and not writable by anyone else (sandbox preflight), readable by agent, agent-sbx and abp-proxy.
         run chown -R root:root "$HAPPY_PREFIX"
@@ -233,6 +286,8 @@ install_tools() {
     say "sandbox launcher, firewall reader and stack tools ($LIBEXEC)"
     ensure_dir "$LIBEXEC" root root 0755
     ensure_dir "$LIBEXEC/lib" root root 0755
+    local target
+    for target in claude-sbx-launch abp-firewall-read abp-firewall abp-stack.mjs abp-plan.mjs lib/abpPlan.mjs; do safe_path "$LIBEXEC/$target" file root; done
     run install -o root -g root -m 0755 "$here/claude-sbx-launch" "$LIBEXEC/claude-sbx-launch"
     # setuid-root reader of the filter tables only (S1 contract addition), usable by abp-session (agent).
     run cc -O2 -Wall -Wextra -Werror -o "$WORK/abp-firewall-read" "$here/abp-firewall-read.c"
@@ -241,7 +296,8 @@ install_tools() {
     run install -o root -g root -m 0644 "$here/abp-stack.mjs" "$LIBEXEC/abp-stack.mjs"
     run install -o root -g root -m 0644 "$here/abp-plan.mjs" "$LIBEXEC/abp-plan.mjs"
     run install -o root -g root -m 0644 "$here/lib/abpPlan.mjs" "$LIBEXEC/lib/abpPlan.mjs"
-    printf '#!/bin/sh\nexec /usr/bin/node %s/abp-stack.mjs "$@"\n' "$LIBEXEC" | write_file /usr/local/sbin/abp-stack root root 0755
+    printf '#!/bin/sh\nexec /usr/bin/node %s/abp-stack.mjs "$@"\n' "$LIBEXEC" > "$WORK/wrapper"
+    write_file /usr/local/sbin/abp-stack root root 0755 < "$WORK/wrapper"
 }
 
 # The proxy (abp-proxy) may not send DNS through the firewall: glibc asks systemd-resolved over its socket.
@@ -268,9 +324,25 @@ main_install() {
     done
     if [ "$DRY_RUN" = 0 ] && [ "$(id -u)" != 0 ]; then die "run as root"; fi
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/abp-install.XXXXXX")
+    if [ "$DRY_RUN" = 0 ]; then
+        # One mutating operation at a time (abp-stack upgrade/rollback/rotate-keys/set-principal use the same lock).
+        exec 9>"$OPS_LOCK"
+        flock -n 9 || die "another abp-install or abp-stack operation is running"
+        export ABP_STACK_OPS_LOCKED=1
+    fi
 
     # Validate everything first: nothing is changed when the options are wrong.
     plan install-options --saved "$INSTALL_JSON" ${forward[@]+"${forward[@]}"} > "$WORK/install.json"
+    # Browser DNS: the resolvers Docker's embedded DNS forwards to (the host's upstream servers), unless configured.
+    if [ "$("$NODE" -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).browserDns.length))' "$WORK/install.json")" = 0 ]; then
+        local resolv=/etc/resolv.conf dns dns_flags=()
+        [ -r /run/systemd/resolve/resolv.conf ] && resolv=/run/systemd/resolve/resolv.conf
+        for dns in $(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ && $2 !~ /^127\./ { print $2 }' "$resolv" 2>/dev/null | head -n 8); do dns_flags+=(--browser-dns "$dns"); done
+        if [ ${#dns_flags[@]} -gt 0 ]; then
+            plan install-options --saved "$WORK/install.json" "${dns_flags[@]}" > "$WORK/install.dns.json"
+            mv "$WORK/install.dns.json" "$WORK/install.json"
+        fi
+    fi
     HAPPY_PREFIX=$("$NODE" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).happyPrefix)' "$WORK/install.json")
     preflight
 
@@ -287,7 +359,7 @@ main_install() {
     ensure_dir /home/agent agent agent 0700
     ensure_dir /home/agent-sbx agent-sbx agent-sbx 0700
     ensure_dir /work agent abp-work 2770
-    plan tmpfiles | write_file /etc/tmpfiles.d/abp.conf root root 0644 show
+    emit /etc/tmpfiles.d/abp.conf root root 0644 show tmpfiles
     run systemd-tmpfiles --create /etc/tmpfiles.d/abp.conf
 
     install_tools
@@ -297,7 +369,8 @@ main_install() {
     plan sudoers > "$WORK/sudoers"
     run visudo -cf "$WORK/sudoers"
     write_file /etc/sudoers.d/abp-agent-sbx root root 0440 show < "$WORK/sudoers"
-    printf '{\n  "mode": "mandatory"\n}\n' | write_file /etc/aplus/sandbox-policy.json root root 0644 show
+    printf '{\n  "mode": "mandatory"\n}\n' > "$WORK/policy.json"
+    write_file /etc/aplus/sandbox-policy.json root root 0644 show < "$WORK/policy.json"
     plan egress-policy --install "$WORK/install.json" > "$WORK/egress.json"
     if [ -s "$WORK/egress.json" ]; then
         write_file /etc/aplus/claude-sandbox.json root root 0644 show < "$WORK/egress.json"
@@ -305,14 +378,15 @@ main_install() {
         run rm -f /etc/aplus/claude-sandbox.json
     fi
 
-    say "owner firewall rules and Chromium seccomp profile"
+    say "owner firewall rules, browser egress rules and Chromium seccomp profile"
     local sbx proxy family
     sbx=$(uid_of agent-sbx 60001)
     proxy=$(uid_of abp-proxy 60002)
     for family in 4 6; do
-        plan firewall --family "$family" --sbx-uid "$sbx" --proxy-uid "$proxy" | write_file "$ETC/firewall.rules$family" root root 0644 show
+        emit "$ETC/firewall.rules$family" root root 0644 show firewall --family "$family" --sbx-uid "$sbx" --proxy-uid "$proxy"
+        emit "$ETC/egress.rules$family" root root 0644 show egress --install "$WORK/install.json" --family "$family"
     done
-    plan seccomp --base "$here/seccomp/moby-default.json" | write_file "$ETC/seccomp-chromium.json" root root 0644
+    emit "$ETC/seccomp-chromium.json" root root 0644 - seccomp --base "$here/seccomp/moby-default.json"
 
     say "secrets (generated only when missing)"
     ensure_secret "$DAEMON_TOKEN" agent agent 0400 daemon-token
@@ -329,13 +403,13 @@ main_install() {
             printf '%s' "${ABP_DRY_RUN_SECRET:-dry-run-synthetic-daemon-token-0000000000}" > "$WORK/token"
             token_file=$WORK/token
         fi
-        plan runtime-config --install "$WORK/install.json" --machine-id "$machine_id" --session-gid "$(gid_of abp-session 60003)" --daemon-token-file "$token_file" \
-            | write_file "$RUNTIME_JSON" root root 0600 show
+        emit "$RUNTIME_JSON" root root 0600 show runtime-config --install "$WORK/install.json" --machine-id "$machine_id" \
+            --session-gid "$(gid_of abp-session 60003)" --daemon-token-file "$token_file"
     else
         warn "machine id unresolved: log the agent in to Happy (sudo -iu agent happy auth login) and run abp-install again"
     fi
     write_file "$INSTALL_JSON" root root 0600 show < "$WORK/install.json"
-    plan daemon-env --install "$WORK/install.json" | write_file "$ETC/happy-daemon.env" root root 0644 show
+    emit "$ETC/happy-daemon.env" root root 0644 show daemon-env --install "$WORK/install.json"
 
     say "images"
     if [ -n "$IMAGES_DIR" ]; then
@@ -349,7 +423,7 @@ main_install() {
     say "systemd units"
     local name
     for name in $UNITS; do
-        plan unit --install "$WORK/install.json" --name "$name" | write_file "/etc/systemd/system/$name" root root 0644 show
+        emit "/etc/systemd/system/$name" root root 0644 show unit --install "$WORK/install.json" --name "$name"
     done
     run systemctl daemon-reload
     # shellcheck disable=SC2086 # unit names have no spaces
@@ -358,15 +432,20 @@ main_install() {
     if [ "$NO_START" = 1 ]; then say "not starting (--no-start)"; return 0; fi
     say "start"
     run systemctl restart abp-firewall.service
+    # Browser egress rules are swapped in atomically; the stack refuses to run browsers without them.
+    run systemctl restart abp-egress.service
     run systemctl restart abp-egress-proxy.service
     if [ -n "$machine_id" ] && { [ "$DRY_RUN" = 1 ] || [ -s "$VARLIB/stack-state.json" ]; }; then
-        # A restart moves running tasks to paused; only do it when the stack's inputs changed.
-        if changed "$RUNTIME_JSON" || changed "$VARLIB/secrets/runtime/vnc-password" || changed /etc/systemd/system/abp-stack.service; then
+        # A restart fences, drains and pauses running tasks; only do it when the stack's inputs changed.
+        if changed "$RUNTIME_JSON" || changed "$VARLIB/secrets/runtime/vnc-password" || changed /etc/systemd/system/abp-stack.service \
+            || changed "$ETC/egress.rules4" || changed "$ETC/seccomp-chromium.json"; then
+            say "restarting abp-stack (inputs changed)"
             run systemctl restart abp-stack.service
         else
             run systemctl start abp-stack.service
         fi
         if changed "$ETC/happy-daemon.env" || changed /etc/systemd/system/abp-happy-daemon.service || changed "$DAEMON_TOKEN"; then
+            say "restarting abp-happy-daemon (inputs changed)"
             run systemctl restart abp-happy-daemon.service
         else
             run systemctl start abp-happy-daemon.service
@@ -409,6 +488,7 @@ main_check() {
     expect_not "agent may not run a shell as agent-sbx" as agent /usr/bin/sudo -n -l -u agent-sbx /bin/sh
     expect "sandbox policy is mandatory" grep -Eq '"mode"[[:space:]]*:[[:space:]]*"mandatory"' /etc/aplus/sandbox-policy.json
     expect "owner firewall rules lead OUTPUT (IPv4, IPv6)" "$LIBEXEC/abp-firewall" check
+    expect "browser egress rules are live (DOCKER-USER, INPUT, IPv6)" "$LIBEXEC/abp-firewall" check-egress
     expect "agent can read the live rules (preflight)" as agent "$LIBEXEC/abp-firewall-read"
     for unit in $UNITS; do
         expect "$unit enabled" systemctl is-enabled --quiet "$unit"
@@ -434,6 +514,8 @@ main_check() {
     printf 'all checks passed\n'
 }
 
+# Sourcing (tests) loads the functions only.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 HAPPY_TARBALL=""
 IMAGES_DIR=""
 BUILD_FROM=""

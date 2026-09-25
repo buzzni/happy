@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -97,7 +97,10 @@ describe('abp-install --dry-run', () => {
         expect(out).toMatch(/ {4}\| -A OUTPUT -d 127\.0\.0\.1\/32 -p tcp -m owner --uid-owner \d+ -m tcp --dport 3128 -j ACCEPT/)
         expect(out).toContain('+ write /etc/systemd/system/abp-stack.service (root:root 0644')
         expect(out).toContain('+ write /etc/abp/happy-daemon.env (root:root 0644')
-        expect(out).toContain('+ systemctl enable abp-firewall.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service')
+        expect(out).toContain('+ systemctl enable abp-firewall.service abp-egress.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service')
+        expect(out).toContain('+ write /etc/abp/egress.rules4 (root:root 0644')
+        expect(out).toMatch(/ {4}\| jump DOCKER-USER -i br-abp\+ -j ABP-EGRESS/)
+        expect(out).toContain('+ systemctl restart abp-egress.service')
         expect(out).toMatch(/\+ \S*node \S+abp-stack\.mjs load \S+images --set-initial/)
         expect(out).toContain('+ systemd-tmpfiles --create /etc/tmpfiles.d/abp.conf')
     })
@@ -117,17 +120,93 @@ describe('abp-install --dry-run', () => {
     })
 })
 
-describe('abp-uninstall --dry-run', () => {
+describe('abp-install internals (sourced)', () => {
+    /** Runs a snippet with abp-install's functions loaded (main does not run when sourced). */
+    const sourced = (snippet: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0; ${snippet}`, 'test', join(here, 'abp-install')], {
+        encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, ABP_NODE: process.execPath },
+    })
+    const me = spawnSync('id', ['-un'], { encoding: 'utf8' }).stdout.trim()
+    const group = spawnSync('id', ['-gn'], { encoding: 'utf8' }).stdout.trim()
+
+    it('never pipes into write_file (a pipeline runs it in a subshell and loses the change record)', () => {
+        const source = readFileSync(join(here, 'abp-install'), 'utf8')
+        expect(source.split('\n').filter((line) => /\|\s*write_file\b/.test(line) && !line.trim().startsWith('#'))).toEqual([])
+    })
+
+    it('records a changed file in the parent shell and not an unchanged one, so restarts follow real changes', () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), 'abp-emit-')))
+        chmodSync(root, 0o755)
+        const target = join(root, 'config.json')
+        const result = sourced(`
+            emit() { printf '%s' "$4" > "$WORK/x"; write_file "$1" "$2" "$3" 0600 < "$WORK/x"; }
+            WORK=$(mktemp -d)
+            emit ${target} ${me} ${group} one; changed ${target} && echo first-changed
+            CHANGED=" "; emit ${target} ${me} ${group} one; changed ${target} || echo second-unchanged
+            CHANGED=" "; emit ${target} ${me} ${group} two; changed ${target} && echo third-changed`)
+        expect(result.stderr).toBe('')
+        expect(result.stdout.split('\n').filter(Boolean)).toEqual(['first-changed', 'second-unchanged', 'third-changed'])
+        expect(readFileSync(target, 'utf8')).toBe('two')
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('refuses to write through a symlink, under a symlinked or group-writable directory', () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), 'abp-path-')))
+        chmodSync(root, 0o755)
+        mkdirSync(join(root, 'real'), { mode: 0o755 })
+        writeFileSync(join(root, 'elsewhere'), 'x')
+        symlinkSync(join(root, 'elsewhere'), join(root, 'real', 'link'))
+        symlinkSync(join(root, 'real'), join(root, 'linkdir'))
+        mkdirSync(join(root, 'open'), { mode: 0o775 })
+        chmodSync(join(root, 'open'), 0o775)
+        expect(sourced(`safe_path ${join(root, 'real', 'ok')} file ${me} && echo fine`).stdout.trim()).toBe('fine')
+        expect(sourced(`safe_path ${join(root, 'real', 'link')} file ${me}`).stderr).toMatch(/symbolic link/)
+        expect(sourced(`safe_path ${join(root, 'linkdir', 'file')} file ${me}`).stderr).toMatch(/symbolic link/)
+        expect(sourced(`safe_path ${join(root, 'open', 'file')} file ${me}`).stderr).toMatch(/writable by group or others/)
+        expect(sourced(`safe_path ${join(root, 'real')} file ${me}`).stderr).toMatch(/not a regular file/)
+        rmSync(root, { recursive: true, force: true })
+    })
+})
+
+describe('abp-uninstall', () => {
     it('keeps profile and journal volumes, configuration and secrets unless --purge', () => {
         const kept = bash('abp-uninstall', ['--dry-run'])
         expect(kept.status).toBe(0)
         expect(kept.stdout).toMatch(/\+ systemctl disable --now abp-happy-daemon\.service/)
-        expect(kept.stdout).toMatch(/\+ \/usr\/local\/libexec\/abp\/abp-firewall remove/)
+        expect(kept.stdout).toMatch(/\+ \/usr\/local\/libexec\/abp\/abp-firewall remove$/m)
         expect(kept.stdout).not.toMatch(/volume rm|rm -rf \/etc\/abp|rm -rf \/var\/lib\/abp/)
         const purged = bash('abp-uninstall', ['--dry-run', '--purge'])
         expect(purged.status).toBe(0)
         expect(purged.stdout).toMatch(/docker volume rm/)
         expect(purged.stdout).toMatch(/\+ rm -rf \/etc\/abp \/var\/lib\/abp/)
+    })
+
+    it('fences new sessions, terminates every session process, and only then removes the owner firewall rules', () => {
+        const lines = bash('abp-uninstall', ['--dry-run']).stdout.split('\n')
+        const at = (text: string) => lines.findIndex((line) => line === text)
+        const sudoers = at('+ rm -f /etc/sudoers.d/abp-agent-sbx')
+        const daemon = at('+ systemctl disable --now abp-happy-daemon.service')
+        const kill = at('+ pkill -KILL -u agent-sbx')
+        const rules = at('+ /usr/local/libexec/abp/abp-firewall remove')
+        expect(sudoers).toBeGreaterThanOrEqual(0)
+        expect(daemon).toBeGreaterThan(sudoers)
+        expect(at('+ pkill -TERM -u agent-sbx')).toBeGreaterThan(daemon)
+        expect(at('+ pkill -TERM -u agent')).toBeGreaterThan(daemon)
+        expect(rules).toBeGreaterThan(kill)
+    })
+
+    it('keeps the firewall rules and fails when a session process survives SIGKILL', () => {
+        const script = `set -euo pipefail; source "$1"
+            run() { printf '+ %s\\n' "$*"; }
+            id() { echo 1000; }
+            pkill() { :; }
+            pgrep() { echo 4242; }
+            TERM_WAIT_S=0
+            main_uninstall`
+        const result = spawnSync('bash', ['-c', script, 'test', join(here, 'abp-uninstall')], { encoding: 'utf8' })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toMatch(/survived SIGKILL/)
+        expect(result.stdout).toMatch(/KEPT the owner firewall rules/)
+        expect(result.stdout).not.toMatch(/abp-firewall remove|docker rm|disable --now abp-stack/)
     })
 })
 
