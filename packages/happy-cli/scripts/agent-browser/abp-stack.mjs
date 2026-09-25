@@ -292,7 +292,8 @@ export function createStack(deps) {
       const containers = [[plan.runtime.container, state.current?.runtime], ...plan.browsers.map((browser) => [browser.container, state.current?.browser])];
       for (const [name, image] of containers) {
         const [running, label] = docker(["inspect", "-f", `{{.State.Running}} ${IMAGE_LABEL}`, name], { allowFail: true }).stdout.split(" ");
-        check(`container ${name}`, running === "true" && label === image, `running=${running ?? "missing"} image=${label === image ? "pinned" : label ?? "?"}`);
+        const pinned = Boolean(image) && label === image;
+        check(`container ${name}`, running === "true" && pinned, `running=${running || "missing"} image=${pinned ? "pinned" : label || "none"}`);
       }
       const published = docker(["ps", "--filter", `label=${STACK_LABEL}`, "--format", "{{.Names}}\t{{.Ports}}"], { allowFail: true }).stdout
         .split("\n").filter(Boolean).flatMap((line) => {
