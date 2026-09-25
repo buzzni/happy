@@ -8,6 +8,13 @@ import { endManagedTurnInput } from '@/managed/managedGracefulStop';
  * has ended, before anything forces it.
  */
 const MANAGED_TURN_END_INPUT_BUDGET_MS = 30_000;
+/**
+ * How long an automation's one turn may keep its provider alive for the
+ * background work it launched. Work that has not reported back by then is cut
+ * off with the run, as all of it was before the run waited at all — a run
+ * that never ends also keeps its automation from ever running again.
+ */
+const RUN_ONCE_BACKGROUND_WAIT_BUDGET_MS = 60 * 60_000;
 import { spawn } from 'node:child_process';
 import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
@@ -48,6 +55,46 @@ import {
 import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
 
 export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
+
+/**
+ * The provider's messages, except that when `release()` settles before the
+ * provider's next message, its value is yielded in that message's place.
+ *
+ * A provider waiting on background work that never reports back stays
+ * silent, so a wait on it cannot be bounded by a loop that only wakes on the
+ * provider's messages.
+ */
+async function* releasableMessages(
+    source: AsyncIterable<SDKMessage>,
+    release: () => Promise<SDKMessage> | null,
+): AsyncGenerator<SDKMessage, void, undefined> {
+    const iterator = source[Symbol.asyncIterator]();
+    let pending: Promise<IteratorResult<SDKMessage>> | null = null;
+    try {
+        while (true) {
+            pending ??= iterator.next();
+            const released = release();
+            const next = await (released
+                ? Promise.race([pending, released.then((value) => ({ released: value }))])
+                : pending);
+            if ('released' in next) {
+                yield next.released;
+                continue;
+            }
+            pending = null;
+            if (next.done) return;
+            yield next.value;
+        }
+    } finally {
+        if (pending) {
+            // Ending the provider must not wait behind a read it may never answer.
+            pending.catch(() => undefined);
+            void Promise.resolve(iterator.return?.()).catch(() => undefined);
+        } else {
+            await iterator.return?.();
+        }
+    }
+}
 
 export async function claudeRemote(opts: {
 
@@ -135,6 +182,8 @@ export async function claudeRemote(opts: {
     onActiveInputReady?: (sender: ClaudeActiveInputSender | null) => void,
     onSDKMetadata?: (metadata: { tools?: string[]; slashCommands?: string[]; mcpServers?: { name: string; status: string }[]; skills?: string[]; plugins?: { name: string; path: string }[] }) => void,
     exitAfterFirstTurn?: boolean,
+    /** How long a run-once result may wait on background work before ending anyway. */
+    backgroundWaitBudgetMs?: number,
 }) {
 
     // Check if session is valid
@@ -569,12 +618,28 @@ function readTurnText(content: unknown): string {
      * reported success while the agents it launched were cut off mid-task.
      * Background shells are excluded: they are often servers that never end,
      * and tearing them down with the run is what they have always relied on.
+     *
+     * Held as ids rather than a count: a task's own notification removes it,
+     * so the result of the turn it triggers is not held back by a level
+     * message that has not caught up yet — the SDK leaves that order open.
+     * A task that reported an end is never awaited again.
      */
-    let awaitedBackgroundTasks = 0;
+    const awaitedBackgroundTaskIds = new Set<string>();
+    const reportedBackgroundTaskIds = new Set<string>();
+    /*
+     * The latest held result, handled after all once the wait's budget runs
+     * out, and the budget's expiry, armed at the first held result.
+     */
+    let heldResult: SDKMessage | null = null;
+    let backgroundWaitExpiry: Promise<SDKMessage> | null = null;
+    let backgroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
-        for await (const message of response) {
+        for await (const message of releasableMessages(response, () => backgroundWaitExpiry)) {
+            // The held result again, its wait over: already forwarded once.
+            const released = message === heldResult;
+            if (released) backgroundWaitExpiry = null;
             logger.debugLargeJson(`[claudeRemote] Message ${message.type}`, message);
 
             /*
@@ -641,12 +706,18 @@ function readTurnText(content: unknown): string {
             const outboundMessage = isCompactCommand && message.type === 'assistant'
                 ? { ...message, isCompactSummary: true } as SDKMessage
                 : message;
-            opts.onMessage(outboundMessage);
+            if (!released) opts.onMessage(outboundMessage);
 
             if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
-                awaitedBackgroundTasks = message.tasks
-                    .filter((task) => !task.ambient && task.task_type !== 'local_bash')
-                    .length;
+                awaitedBackgroundTaskIds.clear();
+                for (const task of message.tasks) {
+                    if (task.ambient || task.task_type === 'local_bash' || reportedBackgroundTaskIds.has(task.task_id)) continue;
+                    awaitedBackgroundTaskIds.add(task.task_id);
+                }
+            }
+            if (message.type === 'system' && message.subtype === 'task_notification') {
+                reportedBackgroundTaskIds.add(message.task_id);
+                awaitedBackgroundTaskIds.delete(message.task_id);
             }
 
             // Handle special system messages
@@ -693,11 +764,21 @@ function readTurnText(content: unknown): string {
 
             // Handle result messages
             if (message.type === 'result') {
-                if (opts.exitAfterFirstTurn && awaitedBackgroundTasks > 0) {
+                if (opts.exitAfterFirstTurn && awaitedBackgroundTaskIds.size > 0 && !released) {
                     // The provider starts the next turn itself when that work
                     // reports back; the run ends at the result after it.
-                    logger.debug(`[claudeRemote] Run-once result deferred: ${awaitedBackgroundTasks} background task(s) still running`);
+                    logger.debug(`[claudeRemote] Run-once result deferred: ${awaitedBackgroundTaskIds.size} background task(s) still running`);
+                    heldResult = message;
+                    backgroundWaitExpiry ??= new Promise((resolve) => {
+                        backgroundWaitTimer = setTimeout(
+                            () => resolve(heldResult!),
+                            opts.backgroundWaitBudgetMs ?? RUN_ONCE_BACKGROUND_WAIT_BUDGET_MS,
+                        );
+                    });
                     continue;
+                }
+                if (released) {
+                    logger.debug(`[claudeRemote] Run-once background wait ran out with ${awaitedBackgroundTaskIds.size} task(s) still running`);
                 }
                 acceptsPromptSuggestion = true;
                 acceptsActiveInput = false;
@@ -940,6 +1021,7 @@ function readTurnText(content: unknown): string {
             throw e;
         }
     } finally {
+        clearTimeout(backgroundWaitTimer);
         opts.lessonProposalTurn?.cancel();
         opts.signal?.removeEventListener('abort', cancelProposal);
         queryClosed = true;
