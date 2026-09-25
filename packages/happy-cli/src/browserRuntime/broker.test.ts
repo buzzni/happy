@@ -180,6 +180,28 @@ describe('broker socket', () => {
         expect((await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })).body.result).toEqual({ revoked: true, grants: 1 })
     })
 
+    it('persists the tombstone again on a retry after its first write failed, so a restart still finishes the revocation', async () => {
+        let revokeFails = false
+        const h = await harness({ revokeGrant: async () => { if (revokeFails) throw new Error('crashed mid-revoke') } })
+        const { sessionSecret } = await h.register()
+        const issued = (await h.grant(sessionSecret)).body.result.grantId
+        await chmod(h.dir, 0o500)
+        try {
+            expect((await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })).status).toBe(503)
+        } finally {
+            await chmod(h.dir, 0o700)
+        }
+        // The daemon retries; this attempt is interrupted while revoking grants.
+        revokeFails = true
+        expect((await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })).status).toBe(503)
+        expect(Object.values(JSON.parse(await readFile(join(h.dir, 'broker-sessions.json'), 'utf8')).registrations)).toEqual([expect.objectContaining({ revoking: true, grantIds: [issued] })])
+        await h.close()
+        cleanups.splice(cleanups.indexOf(h.close), 1)
+        const restarted = await harness({ dir: h.dir })
+        expect((await restarted.grant(sessionSecret)).status).toBe(401)
+        expect(restarted.revoked).toEqual([issued])
+    })
+
     it('finishes a revocation interrupted after its tombstone was persisted when the Runtime restarts', async () => {
         const h = await harness({ revokeGrant: async () => { throw new Error('crashed mid-revoke') } })
         const { sessionSecret } = await h.register()

@@ -131,6 +131,8 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
                 const handle = await open(temporary, 'wx', 0o600)
                 try { await handle.writeFile(snapshot); await handle.sync() } finally { await handle.close() }
                 await rename(temporary, registryPath)
+                const dir = await open(options.stateDir, 'r')
+                try { await dir.sync() } finally { await dir.close() }
             } catch (error) {
                 await rm(temporary, { force: true })
                 throw error
@@ -158,11 +160,10 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
 
     /** Tombstone, revoke every grant, then forget the registration. Callers hold `exclusive`. */
     const finishRevocation = async (registrationId: string, registration: Registration): Promise<number> => {
-        if (!registration.revoking) {
-            // Set before persisting: even if the write fails, this process issues nothing more.
-            registration.revoking = true
-            await persist().catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'revocation could not be recorded', true) })
-        }
+        // Set before persisting, so this process issues nothing more even if the write fails;
+        // written on every attempt, so no grant is revoked before the tombstone is on disk.
+        registration.revoking = true
+        await persist().catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'revocation could not be recorded', true) })
         for (const grantId of registration.grantIds) {
             await options.revokeGrant(grantId as GrantId)
                 .catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'grant revocation is incomplete', true) })
