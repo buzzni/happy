@@ -23,7 +23,7 @@
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmod, chown, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { mintAgentGrant } from './auth'
@@ -52,6 +52,8 @@ interface RegistryFile { schemaVersion: 1; registrations: Record<string, Registr
 
 export interface BrokerOptions {
     socketPath: string
+    /** Already listening on `socketPath` (bound before the Runtime dropped root); otherwise the broker binds it. */
+    server?: Server
     /** Registrations are persisted here (the Runtime state volume). */
     stateDir: string
     daemonTokenSha256: string
@@ -244,7 +246,8 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         },
     }
 
-    const server = createServer((req, res) => {
+    const server = options.server ?? createServer()
+    server.on('request', (req: IncomingMessage, res: ServerResponse) => {
         const url = new URL(req.url ?? '/', 'http://broker')
         const route = routes[`${req.method} ${url.pathname}`]
         if (!route) return send(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION', message: 'not found', retryable: false, mayHaveSideEffects: false } })
@@ -263,7 +266,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         await exclusive(() => finishRevocation(registrationId, registration))
             .catch(() => log('broker revocation recovery incomplete; the daemon retries it'))
     }
-    await listenOnSocket(server, options.socketPath, 0o660, options.socketGid)
+    if (!options.server) await listenOnSocket(server, options.socketPath, 0o660, options.socketGid)
     return {
         close: () => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) }).then(() => writeTail.catch(() => undefined)),
     }

@@ -8,7 +8,7 @@
  */
 import { timingSafeEqual } from 'node:crypto'
 import { statfs } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { listenOnSocket } from './broker'
 import { BrowserRuntimeError, type ActionId, type GrantId, type ProfileId, type TaskId } from './contracts'
@@ -42,7 +42,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 export interface AdminServerInput {
     runtime: Pick<BrowserRuntime, 'revokeGrant' | 'reconcileAction' | 'pinnedProfiles'>
     drivers: Map<ProfileId, Pick<CdpDriver, 'isConnected' | 'debugCounts'>>
-    listen: { socketPath: string } | { host: string; port: number; adminToken: string }
+    /** `server`: already listening on the admin socket (bound before the Runtime dropped root). */
+    listen: { socketPath: string } | { server: Server } | { host: string; port: number; adminToken: string }
     metrics(): Promise<unknown>
     /** Immediate revocation of an interactive capability (e.g. a lost viewer). */
     revokeCapability(capabilityId: string): Promise<void>
@@ -52,7 +53,8 @@ export interface AdminServer { port?: number; close(): Promise<void> }
 
 export async function startAdminServer(input: AdminServerInput): Promise<AdminServer> {
     const adminToken = 'adminToken' in input.listen ? input.listen.adminToken : undefined
-    const server = createServer((req, res) => {
+    const server = 'server' in input.listen ? input.listen.server : createServer()
+    server.on('request', (req: IncomingMessage, res: ServerResponse) => {
         void (async () => {
             if (adminToken !== undefined && !adminAuthorized(req, adminToken)) return sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED' } })
             const path = new URL(req.url ?? '/', 'http://admin').pathname
@@ -88,7 +90,7 @@ export async function startAdminServer(input: AdminServerInput): Promise<AdminSe
         })()
     })
     if ('socketPath' in input.listen) await listenOnSocket(server, input.listen.socketPath, 0o600)
-    else {
+    else if ('host' in input.listen) {
         const { host, port } = input.listen
         await new Promise<void>((resolve) => server.listen(port, host, resolve))
     }
