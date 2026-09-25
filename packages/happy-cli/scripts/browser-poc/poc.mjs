@@ -34,9 +34,16 @@ function opt(argv, name, fallback) {
   const i = argv.indexOf(name);
   return i < 0 ? fallback : argv[i + 1];
 }
+// Loopback by default. ABP_PUBLISH_HOST=0.0.0.0 is for a separate execution machine whose
+// harness/client runs elsewhere; every published port still needs its own token or password.
+const PUBLISH_HOST = process.env.ABP_PUBLISH_HOST ?? "127.0.0.1";
+// ABP_PORT_BASE pins host ports (runtime base, admin +1, control +2, noVNC a/b +3/+4) so a
+// service configured with the Runtime URL still reaches it after the machine reboots.
+const PORT_BASE = process.env.ABP_PORT_BASE ? Number(process.env.ABP_PORT_BASE) : undefined;
+const publish = (offset, internal) => `${PUBLISH_HOST}:${PORT_BASE === undefined ? "" : PORT_BASE + offset}:${internal}`;
 function port(id, internal) {
   const text = docker("port", id, String(internal));
-  const match = text.match(/127\.0\.0\.1:(\d+)/);
+  const match = text.match(/(?:\d+\.){3}\d+:(\d+)/);
   if (!match) throw new Error(`missing localhost port for ${id}:${internal}`);
   return Number(match[1]);
 }
@@ -73,16 +80,14 @@ function up(run, argv) {
   const harnessToken = randomBytes(32).toString("hex");
   // RFB passwords are at most 8 characters.
   const vncPassword = randomBytes(6).toString("base64url").slice(0, 8);
-  const fixture = runContainer(names.fixture, run, ["--network", browserNetworks.a, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", "127.0.0.1::9099", "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, IMAGES.fixture]);
+  const fixture = runContainer(names.fixture, run, ["--network", browserNetworks.a, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", publish(2, 9099), "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, IMAGES.fixture]);
   docker("network", "connect", "--alias", "a.poc-one.test", "--alias", "b.poc-two.test", "--alias", "c.poc-three.test", browserNetworks.b, fixture);
-  const fixtureIpOn = (net) => docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${net}").IPAddress}}`, fixture);
-  const hostRulesFor = (net) => { const ip = fixtureIpOn(net); return `MAP a.poc-one.test ${ip},MAP b.poc-two.test ${ip},MAP c.poc-three.test ${ip}`; };
   const browsers = {};
-  for (const profile of ["a", "b"]) browsers[profile] = runContainer(names[profile === "a" ? "browserA" : "browserB"], run, ["--network", browserNetworks[profile], "--network-alias", `browser-${profile}`, "-e", `ABP_VNC_PASSWORD=${vncPassword}`, "-e", `ABP_CDP_HOST=browser-${profile}:9223`, "--read-only", "--tmpfs", "/tmp:rw,size=128m", "--tmpfs", "/run/abp:rw,uid=1000,gid=1000,size=1m", "--tmpfs", "/home/browser/.cache:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.config:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.local:rw,uid=1000,gid=1000,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2", "--shm-size", "256m", "-v", `${profile === "a" ? names.profileA : names.profileB}:/home/browser/profile`, "-e", `ABP_HOST_RULES=${hostRulesFor(browserNetworks[profile])}`, "-p", "127.0.0.1::6080", IMAGES.browser]);
+  for (const profile of ["a", "b"]) browsers[profile] = runContainer(names[profile === "a" ? "browserA" : "browserB"], run, ["--network", browserNetworks[profile], "--network-alias", `browser-${profile}`, "-e", `ABP_VNC_PASSWORD=${vncPassword}`, "-e", `ABP_CDP_HOST=browser-${profile}:9223`, "--read-only", "--tmpfs", "/tmp:rw,size=128m", "--tmpfs", "/run/abp:rw,uid=1000,gid=1000,size=1m", "--tmpfs", "/home/browser/.cache:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.config:rw,uid=1000,gid=1000,size=64m", "--tmpfs", "/home/browser/.local:rw,uid=1000,gid=1000,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2", "--shm-size", "256m", "-v", `${profile === "a" ? names.profileA : names.profileB}:/home/browser/profile`, "-e", "ABP_FIXTURE_ALIAS=a.poc-one.test", "-p", publish(profile === "a" ? 3 : 4, 6080), IMAGES.browser]);
   let runtime;
   if (runtimeBundle) {
     const env = envFile ? JSON.parse(readFileSync(resolve(envFile), "utf8")) : {};
-    const args = ["--network", browserNetworks.a, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", "127.0.0.1::8787", "-p", "127.0.0.1::8788"];
+    const args = ["--network", browserNetworks.a, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", publish(0, 8787), "-p", publish(1, 8788)];
     if (keysFile) args.push("-v", `${resolve(keysFile)}:/app/keys.json:ro`);
     for (const [k, v] of Object.entries(env)) args.push("-e", `${k}=${v}`);
     runtime = runContainer(names.runtime, run, [...args, IMAGES.runtime]);
