@@ -45,7 +45,16 @@ async function openLoginTask(tag: string) {
     const agent = clientFor(stack, token)
     const { taskSpaceId } = await agent.createSpace({ profileId: PROFILE_A, requestId: rid() })
     const task = await agent.createTask({ taskSpaceId, requestId: rid() })
-    const opened = await agent.openPage({ taskId: task.taskId, url: `${SITE_A}/login-strict/${tag}?run=${stack.run}`, requestId: rid() })
+    // A viewer that just lost control keeps the profile fenced until x11vnc consumed its input (milliseconds).
+    let opened: Awaited<ReturnType<typeof agent.openPage>> | undefined
+    for (let attempt = 0; !opened; attempt++) {
+        try {
+            opened = await agent.openPage({ taskId: task.taskId, url: `${SITE_A}/login-strict/${tag}?run=${stack.run}`, requestId: rid() })
+        } catch (error) {
+            if ((error as { code?: string }).code !== 'STALE_LEASE' || attempt >= 20) throw error
+            await sleep(250)
+        }
+    }
     await new Viewer(stack, 'a').bringToFront(`ABP strict login ${tag}`)
     return { agent, taskSpaceId, taskId: task.taskId, tabId: opened.tabId }
 }
@@ -82,6 +91,7 @@ describe('GD2 viewer proxy on the real stack', () => {
             const interactive = mintInteractive(stack)
             const human = clientFor(stack, interactive)
             const { viewer, width, height } = await openViewer(interactive)
+            const viewers = [viewer]
             try {
                 // The display is visible without control: framebuffer data arrives through the framed server stream.
                 const deadline = Date.now() + 10_000
@@ -103,19 +113,23 @@ describe('GD2 viewer proxy on the real stack', () => {
                 const during = await stack.waitForLedger((entries) => logins(entries, tag).length > 0, { timeoutMs: 15_000 })
                 expect(logins(during, tag).map((entry) => entry.ok), 'login during takeover').toEqual([true])
 
-                // 3) Released: a fresh login form gets focus, the viewer types into it, nothing arrives.
+                // 3) Released after input: the viewer is closed (4002) once x11vnc consumed everything; the
+                //    reconnected viewer types into a fresh login form and nothing arrives.
                 await human.releaseControl({ taskId: first.taskId, tabId: first.tabId, expectedEpoch: owned.leaseEpoch, requestId: rid() })
+                expect((await viewer.closed).code, 'viewer closed after control loss with input').toBe(4002)
                 const second = await openLoginTask(`${tag}-r`)
                 tasks.push(second)
-                viewer.send(loginKeystrokes())
+                const again = await openViewer(interactive)
+                viewers.push(again.viewer)
+                again.viewer.send(loginKeystrokes())
                 await sleep(NEGATIVE_WAIT_MS)
                 const after = await stack.ledger()
                 expect(logins(after, `${tag}-r`), 'login after release').toEqual([])
-                expect(viewer.ws.readyState, 'view-only connection stays open').toBe(1)
+                expect(again.viewer.ws.readyState, 'view-only connection stays open').toBe(1)
                 evidence({ gate: 'GD2', i, framebufferBytes, settling: control.settling ?? false, withoutTakeover: 0,
                     duringTakeover: logins(during, tag).length, afterRelease: logins(after, `${tag}-r`).length })
             } finally {
-                viewer.ws.close()
+                for (const open of viewers) open.ws.close()
             }
         } finally {
             for (const task of tasks) await cleanupTask(task.agent, task.taskId, task.taskSpaceId)
