@@ -8,7 +8,9 @@ export interface FakePage { url: string; title?: string; text?: string; elements
     /** Changes describeRef identities without changing anything else (a re-bound node) */
     identitySalt?: string
     /** Current (live) accessible names by ref, when a node was relabelled in place */
-    currentNames?: Record<string, string> }
+    currentNames?: Record<string, string>
+    /** Link hrefs by ref (describeRef linkUrl) */
+    linkUrls?: Record<string, string> }
 type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'describeRef' | 'screenshot' | 'click' | 'fill' | 'waitFor' | 'adoptTab'
 interface HeldDispatch {
     operation: Operation
@@ -28,6 +30,7 @@ export class FakeBrowserDriver implements BrowserDriver {
     readonly targetLedger: Array<{ targetId: string; tabId: TabId; operation: Operation; actionId?: string }> = []
     readonly adoptedTabs: Array<{ tabId: TabId; targetId: string; adopted: boolean }> = []
     readonly dispatchedSnapshots: Array<{ tabId: TabId; snapshotId: SnapshotId; operation: 'click' | 'fill' }> = []
+    readonly clickExpectations: Array<DriverOptions['expect']> = []
     observeCount = 0
     delays = new Map<Operation, number>()
     private readonly failures = new Map<Operation, Error[]>()
@@ -117,6 +120,7 @@ export class FakeBrowserDriver implements BrowserDriver {
             identity: Buffer.from(JSON.stringify({ element: described, documentGeneration: page.documentGeneration ?? 1,
                 ...(page.identitySalt ? { salt: page.identitySalt } : {}) })).toString('base64url'),
             currentRole: currentElement.role, currentName: page.currentNames?.[ref] ?? currentElement.name,
+            ...(page.linkUrls?.[ref] ? { linkUrl: page.linkUrls[ref], linkTarget: '' } : {}),
             ...(page.form ? { form: { ...structuredClone(page.form), digest: formDigest(page.form) }, submitsForm: submits } : {}) }
     }
     async restoreRef(tabId: TabId, snapshotId: SnapshotId, ref: ElementRef, identity: string, opts: DriverOptions): Promise<'present' | 'restored' | 'gone'> {
@@ -134,7 +138,7 @@ export class FakeBrowserDriver implements BrowserDriver {
         await this.delay('screenshot', opts); this.throwNextFailure('screenshot'); const page = this.requirePage(tabId); if ((page.frameOrigins ?? []).some((origin) => !allowedOrigins.includes(origin))) throw new BrowserRuntimeError('ORIGIN_DENIED', 'A frame origin is not allowed')
         return { tabId, mimeType: 'image/png', data: Buffer.from('synthetic').toString('base64'), documentGeneration: page.documentGeneration ?? 1, targetId: `target-${tabId}`, capturedAtMs: Date.now() }
     }
-    async click(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); const element = this.snapshotElements.get(snapshotId)?.get(ref); this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, element); const current = page.elements?.find((candidate) => candidate.ref === ref); if (!current || !sameNode(element!, current)) throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false); this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'click' }); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
+    async click(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, opts: DriverOptions): Promise<void> { this.clickExpectations.push(opts.expect); await this.delay('click', opts); this.throwNextFailure('click'); const page = this.requirePage(tabId); const element = this.snapshotElements.get(snapshotId)?.get(ref); this.assertSnapshot(tabId, snapshotId, page.documentGeneration ?? 1, element); const current = page.elements?.find((candidate) => candidate.ref === ref); if (!current || !sameNode(element!, current)) throw new BrowserRuntimeError('STALE_REF', 'Reference node was replaced', false, false); this.dispatchedSnapshots.push({ tabId, snapshotId, operation: 'click' }); this.record(tabId, `target-${tabId}`, 'click'); await this.afterDispatch('click') }
     async fill(tabId: TabId, ref: ElementRef, snapshotId: SnapshotId, value: string, opts: DriverOptions): Promise<void> {
         await this.delay('fill', opts)
         this.throwNextFailure('fill')

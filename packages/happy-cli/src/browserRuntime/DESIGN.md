@@ -193,29 +193,50 @@ Memory (sum over Chromium processes in the container):
 
 Decision: the anchor pool is **not** used (focus theft would send the viewer's keystrokes into an
 agent tab). Instead: one background window per owned tab as before, at most `maxAgentWindows`
-(default 4, `ABP_MAX_AGENT_WINDOWS`, ≤ tab quota) per profile — counted including opens in
-flight, refused with `QUOTA_EXCEEDED` before any target exists — and the omnibox WebUI features
-off in the browser image. Whether this meets the 30-minute soak criterion is measured by
-`soak.mjs`, which now reports cgroup memory and the Chromium process RSS sum separately.
+(default 4, `ABP_MAX_AGENT_WINDOWS`, ≤ tab quota) per profile, and the omnibox WebUI features off
+in the browser image. Accounting (review P1-8): one reservation per target — taken before
+`createTarget`, moved to the live target in the same tick, released only on `targetDestroyed`
+(a failed cleanup keeps it); popups of owned tabs count too, and a popup over the cap is closed
+with every request of it failed. Whether this meets the 30-minute soak criterion is measured by
+`soak.mjs`, which reports cgroup memory and the Chromium process RSS sum separately.
+
+### Destinations before requests (review P0-3)
+
+The driver auto-attaches every new page at browser level, paused (`waitForDebuggerOnStart`).
+Owned tabs, their OOPIFs and workers, and their popups (recursively, including `noopener`) get
+`Fetch.enable` before they run; other pages are released at once. Document, XHR, Fetch, Ping,
+EventSource, CSP-report and Other requests whose destination is not an allowed origin of the tab
+are failed unsent (redirect hops included); subresources (script, style, image, font, media) are
+not checked. A popup whose document is stopped is closed. `blockedReports()` keeps origins only.
+Not covered: WebSocket/WebTransport/WebRTC, service-worker-initiated fetches, subresource GETs.
+A paused target answers only Fetch/auto-attach until resumed, and a same-site popup shares its
+opener's renderer (it must be resumed — with its requests failed — never left paused).
 
 ### Approval binding (D6)
 
 - `describeRef` returns the complete form submission (`FormSubmission`): absolute action,
-  method, enctype, target, every entry in submission order (duplicates kept), the submitter
-  with `formaction/formmethod/formenctype` overrides. Built by hand (no `formdata` event) and
-  through `HTMLFormElement.prototype` getters (a control named `action`/`elements` cannot shadow them).
-  `formDigest` = SHA-256 of its canonical JSON. Passwords bind only their length and files
-  their name/size/type (the digest is persisted; a plain hash of a short secret would be guessable).
-- The approval payload hash binds the digest, the element's live role/name and link URL; the
-  approval shows `formSummary` (values and field count truncated — display only).
-- Approve and dispatch both re-describe the element; a different element identity, digest,
-  label or document expires the approval (no dispatch).
-- Driver checks right before input: same-node relabel since the snapshot → `STALE_REF`;
-  for elements in iframes every ancestor document must hit the iframe element at the click
-  point (same-process via `frameElement`, across processes via `DOM.getFrameOwner`), otherwise refused.
-- Limits: purely visual relabels (CSS `content`, images, canvas) and changes made by the page's
-  own `submit`/`formdata` handlers at submission time are not detected; CSS transforms on
-  iframes make the overlay check refuse (safe side).
+  method, enctype, effective target (own, else `<base target>`), every entry in submission order
+  (duplicates kept), the submitter with `formaction/formmethod/formenctype` overrides. Built by
+  hand (no `formdata` event) through `HTMLFormElement.prototype` getters. `formDigest` = SHA-256 of
+  its canonical JSON. A form whose content cannot be bound — a non-empty password, a chosen file,
+  a form-associated custom element — is `opaque`: its submit/form click is handed to the user
+  (`awaiting-user`, `waitReason: 'handoff'`), never approved (review P0-5).
+- The approval payload hash binds the digest, the live role/name, link URL and target. The
+  persisted summary is value-free: method, destination without query, new-window flag, field
+  names (review P0-6). The user sees the values in the viewer.
+- Approve and dispatch re-describe the element; a different identity, digest, label or document
+  expires the approval. The click carries the expectation into the driver (`DriverOptions.expect`),
+  which re-checks it after the hover and arms a one-shot in-page guard: a capturing `submit`
+  listener recomputes the submission and cancels a changed one; a `formdata` listener compares the
+  final entries and destination. Verdicts reach the driver through an isolated-world binding
+  (Runtime domain on only while armed); document requests of the tab wait for the verdict and are
+  failed when blocked or when method/destination differ (review P0-4).
+- Driver checks right before input: same-node relabel → `STALE_REF`; for elements in iframes
+  every ancestor document must hit the iframe element at the click point. A transformed or
+  zoomed iframe (or ancestor) is not guessed: handed to the user (review P0-7).
+- Limits: purely visual relabels (CSS `content`, images, canvas); submit/formdata listeners the
+  page adds after the guard (and JS that sends the data itself, e.g. `fetch` in a click handler,
+  to an allowed origin); step payload hashes in the journal are unkeyed.
 
 ### Site policy (D7)
 
@@ -225,10 +246,16 @@ off in the browser image. Whether this meets the 30-minute soak criterion is mea
   `namePrefixes`, `roles` — no regular expressions. First matching rule wins.
 - Origins without a policy cannot be opened; the agent grant's origins are narrowed to sited
   origins for every navigation/redirect/observation.
-- Unmatched submit / click in a form / other click → approval; links, navigation, fill → automatic.
-  Held regardless of rules: form posts to an unsited origin, forms with unreadable controls,
-  elements without a snapshot label, elements in frames of unsited origins. A navigate/fill held by
-  policy has no element approval to bind and is handed over (`APPROVAL_REQUIRED`, not dispatched).
+- Decisions: `auto`, `requires-approval`, `handoff`, `deny`. Refused outright: destinations that
+  are not http(s) (`javascript:`, `data:`, `vbscript:`, `mailto:` …) or not sited, for navigation,
+  links and forms. A link inside a form is a form click. Unmatched submit / form click / other
+  click / fill → approval (fills via the approval flow, value never persisted); links outside forms
+  and navigation → automatic. `openPage` applies the navigation rules (a held page is not opened,
+  `APPROVAL_REQUIRED`); a navigate step held by policy is handed to the user (review P0-1/2).
+  Held for approval regardless of rules: elements without a snapshot label, elements in frames of
+  unsited origins.
+- After a handoff the user takes over, acts, releases; `resume` returns the task to
+  `awaiting-agent` without re-running the step.
 - Login completion uses the site's `loginCompleteWhen` (URL prefix + optional text/element);
   login *detection* is still the fixture's `/login` path rule.
 - Harness mode: `testing/fixtureSitePolicy.ts` reproduces the PoC classifier for the synthetic origins.
