@@ -136,7 +136,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { createBrowserTaskSessionBroker } from './browserTaskBroker';
+import { createBrowserTaskSessionBroker, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import {
   createProcFs,
   createProcProcessProbe,
@@ -1643,9 +1643,18 @@ export async function startDaemon(): Promise<void> {
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
     // Execution machine H only: per-session Agent Browser grants via the Runtime broker.
-    const browserTaskBroker = createBrowserTaskSessionBroker(process.env, undefined, {
-      pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
-    });
+    // A corrupt revocation queue disables browser grants (fail closed) and is left for repair.
+    let browserTaskBroker: BrowserTaskSessionBroker | undefined;
+    try {
+      browserTaskBroker = createBrowserTaskSessionBroker(process.env, undefined, {
+        pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
+      });
+    } catch (error) {
+      logger.warn(`[DAEMON RUN] Browser task broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
+    }
+    const reportBrowserTaskRevokeFailure = (error: unknown): void => {
+      logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
+    };
 
     const spawnSession = async (
       options: SpawnSessionOptions,
@@ -1712,7 +1721,7 @@ export async function startDaemon(): Promise<void> {
       const releaseBrowserTaskRegistration = async (): Promise<void> => {
         const registration = browserTaskRegistration;
         browserTaskRegistration = undefined;
-        if (registration) await browserTaskBroker?.revoke({ registrationId: registration.registrationId });
+        if (registration) await browserTaskBroker?.revoke({ registrationId: registration.registrationId }).catch(reportBrowserTaskRevokeFailure);
       };
       const cleanupStagedDeferredContinuationContext = (): void => {
         if (!stagedDeferredContinuationContextFile) return;
@@ -3203,7 +3212,7 @@ export async function startDaemon(): Promise<void> {
       }
       if (tracked?.happySessionId) autonomousQualityGateRegistry.noteSessionStopped(tracked.happySessionId);
       // Revokes the session's broker registration and every agent grant it received.
-      if (tracked?.happySessionId) void browserTaskBroker?.revoke({ agentSessionId: tracked.happySessionId });
+      if (tracked?.happySessionId) void browserTaskBroker?.revoke({ agentSessionId: tracked.happySessionId }).catch(reportBrowserTaskRevokeFailure);
       const preservedForResume = tracked ? preserveSessionForResume(tracked, `process-exit:${pid}`) : false;
       if (!preservedForResume) {
         logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);

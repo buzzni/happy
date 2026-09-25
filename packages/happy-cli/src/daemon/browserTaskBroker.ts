@@ -11,9 +11,16 @@
  *
  * A revocation the Runtime has not confirmed is kept in a file and retried
  * with exponential backoff (at most 5 minutes apart), across daemon restarts,
- * so an ended session's registration cannot stay renewable.
+ * so an ended session's registration cannot stay renewable. The file is
+ * replaced durably (exclusive temp file, fsync, rename, directory fsync); a
+ * failed write is retried, and a revocation that is neither confirmed nor
+ * saved is reported to the caller. An unreadable or malformed queue file is
+ * never read as empty: the broker refuses to start (no new browser grants)
+ * and the file is left for repair.
  */
-import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { brokerRequest } from '@/browserRuntime/brokerGrantSource'
 import { logger } from '@/ui/logger'
 
@@ -36,18 +43,64 @@ export interface BrowserTaskSessionBrokerOptions {
     pendingRevocationsFile?: string
     /** First retry delay; doubles per failed round up to 5 minutes. */
     retryBaseMs?: number
+    /** Replaces the queue file durably; tests inject write failures. */
+    writeQueueFile?: (file: string, data: string) => void
 }
 
+export class PendingRevocationQueueError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'PendingRevocationQueueError'
+    }
+}
+
+function isRevokeTarget(target: unknown): target is RevokeTarget {
+    if (!target || typeof target !== 'object' || Array.isArray(target)) return false
+    const keys = Object.keys(target)
+    const value = Object.values(target)[0]
+    return keys.length === 1 && ['registrationId', 'agentSessionId'].includes(keys[0]) && typeof value === 'string' && value.length > 0
+}
+
+/** A missing file is an empty queue; anything else that is not a valid queue is an error. */
 function loadPending(file: string | undefined): RevokeTarget[] {
     if (!file) return []
+    let raw: string
     try {
-        const parsed = JSON.parse(readFileSync(file, 'utf8')) as { schemaVersion?: unknown; pending?: unknown }
-        if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.pending)) return []
-        return parsed.pending.filter((target): target is RevokeTarget => Boolean(target) && typeof target === 'object'
-            && (typeof (target as Record<string, unknown>).registrationId === 'string' || typeof (target as Record<string, unknown>).agentSessionId === 'string'))
-    } catch {
-        return []
+        raw = readFileSync(file, 'utf8')
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw new PendingRevocationQueueError(`Browser task revocation queue ${file} is unreadable`)
     }
+    let parsed: { schemaVersion?: unknown; pending?: unknown }
+    try {
+        parsed = JSON.parse(raw) as typeof parsed
+    } catch {
+        throw new PendingRevocationQueueError(`Browser task revocation queue ${file} is not valid JSON`)
+    }
+    if (!parsed || parsed.schemaVersion !== 1 || !Array.isArray(parsed.pending) || !parsed.pending.every(isRevokeTarget))
+        throw new PendingRevocationQueueError(`Browser task revocation queue ${file} has an unsupported format`)
+    return parsed.pending
+}
+
+/** Exclusive temp file, fsync, rename over `file`, then fsync the directory. */
+function writeQueueFileDurably(file: string, data: string): void {
+    const dir = dirname(file)
+    const temporary = join(dir, `.${basename(file)}.${randomUUID()}.tmp`)
+    try {
+        const fd = openSync(temporary, 'wx', 0o600)
+        try {
+            writeFileSync(fd, data)
+            fsyncSync(fd)
+        } finally {
+            closeSync(fd)
+        }
+        renameSync(temporary, file)
+    } catch (error) {
+        rmSync(temporary, { force: true })
+        throw error
+    }
+    const dirFd = openSync(dir, 'r')
+    try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
 }
 
 export function createBrowserTaskSessionBroker(
@@ -85,14 +138,19 @@ export function createBrowserTaskSessionBroker(
     const retryBaseMs = options.retryBaseMs ?? 1_000
     let pending = loadPending(pendingFile)
     const key = (target: RevokeTarget) => JSON.stringify(target)
-    const savePending = (): void => {
-        if (!pendingFile) return
+    const writeQueueFile = options.writeQueueFile ?? writeQueueFileDurably
+    /** True while the file lags the in-memory queue (a write failed); retried with the revocations. */
+    let queueDirty = false
+    const savePending = (): boolean => {
+        if (!pendingFile) return true
         try {
-            const temporary = `${pendingFile}.${process.pid}.tmp`
-            writeFileSync(temporary, JSON.stringify({ schemaVersion: 1, pending }), { mode: 0o600 })
-            renameSync(temporary, pendingFile)
+            writeQueueFile(pendingFile, JSON.stringify({ schemaVersion: 1, pending }))
+            queueDirty = false
+            return true
         } catch (error) {
-            logger.debug(`[DAEMON RUN] Browser task broker pending revocations not saved: ${error instanceof Error ? error.message : 'unknown'}`)
+            queueDirty = true
+            logger.warn(`[DAEMON RUN] Browser task revocation queue not saved (${(error as NodeJS.ErrnoException).code ?? 'error'}); retrying`)
+            return false
         }
     }
     /** Confirmed (200) and invalid requests (400, never retryable) leave the queue. */
@@ -105,13 +163,14 @@ export function createBrowserTaskSessionBroker(
     let retryTimer: NodeJS.Timeout | undefined
     let failedRounds = 0
     const retryPendingRevocations = async (): Promise<number> => {
+        if (queueDirty) savePending()
         for (const target of [...pending]) await attempt(target)
-        failedRounds = pending.length ? failedRounds + 1 : 0
+        failedRounds = pending.length || queueDirty ? failedRounds + 1 : 0
         scheduleRetry()
         return pending.length
     }
     const scheduleRetry = (): void => {
-        if (retryTimer || !pending.length) return
+        if (retryTimer || (!pending.length && !queueDirty)) return
         retryTimer = setTimeout(() => { retryTimer = undefined; void retryPendingRevocations() },
             Math.min(retryBaseMs * 2 ** Math.max(0, failedRounds - 1), MAX_RETRY_DELAY_MS))
         retryTimer.unref()
@@ -129,13 +188,16 @@ export function createBrowserTaskSessionBroker(
             return Boolean(await call('/v1/sessions/bind', { registrationId, agentSessionId }))
         },
         async revoke(target) {
+            let saved = !queueDirty
             if (!pending.some((entry) => key(entry) === key(target))) {
                 pending = [...pending, target]
-                savePending()
+                saved = savePending()
             }
             await attempt(target)
-            if (pending.length) failedRounds = Math.max(failedRounds, 1)
+            const outstanding = pending.some((entry) => key(entry) === key(target))
+            if (pending.length || queueDirty) failedRounds = Math.max(failedRounds, 1)
             scheduleRetry()
+            if (outstanding && !saved) throw new PendingRevocationQueueError('Browser task revocation was neither confirmed nor saved; retrying in memory')
         },
         retryPendingRevocations,
     }
