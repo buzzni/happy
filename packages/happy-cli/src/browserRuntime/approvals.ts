@@ -54,6 +54,7 @@ export function createApproval(input: {
         record: {
             ...summary,
             state: 'pending',
+            grantId: input.grant.grantId,
             batchId: input.batchId,
             nextStep: input.nextStep,
             payloadHash: stepHash,
@@ -62,7 +63,7 @@ export function createApproval(input: {
             browserInstanceId: input.browserInstanceId,
             snapshotId: input.snapshotId,
             frameOrigin: input.frameOrigin,
-            formValues: formValuesByName,
+            formValues: Object.fromEntries(Object.entries(formValuesByName).map(([name, value]) => [name, payloadHash(value)])),
         },
     }
 }

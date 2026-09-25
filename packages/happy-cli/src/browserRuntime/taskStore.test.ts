@@ -33,10 +33,66 @@ describe('TaskStore writer and journal guarantees', () => {
         await restarted.close()
     })
 
+    it('uses the lock heartbeat lease to distinguish a live same-PID writer from a stale one', async () => {
+        const dir = await tempDir()
+        let now = 100
+        const first = await TaskStore.open(dir, undefined, () => now)
+        now = 10_000
+        await first.heartbeat()
+        now = 29_999
+        await expect(TaskStore.open(dir, undefined, () => now)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        now = 30_001
+        const replacement = await TaskStore.open(dir, undefined, () => now)
+        await expect(first.createTask(sample(), event)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        await replacement.close()
+        await first.close()
+    })
+
     it('does not ACK a failed journal append', async () => {
         const dir = await tempDir(); const store = await TaskStore.open(dir, (operation) => { if (operation === 'event-append') throw new Error('ENOSPC') })
         await expect(store.createTask(sample(), event)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
         expect(store.getTask('t1' as TaskId)).toBeUndefined()
+        await store.close()
+    })
+
+    it('does not reuse an event sequence when checkpoint replacement fails', async () => {
+        const dir = await tempDir()
+        let failReplace = true
+        const store = await TaskStore.open(dir, (operation) => {
+            if (operation === 'task-replace' && failReplace) {
+                failReplace = false
+                throw new Error('disk full')
+            }
+        })
+        await expect(store.createTask(sample(), event)).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        await expect(store.createTask(sample(), event)).resolves.toMatchObject({ taskId: 't1' })
+        await store.close()
+        const reopened = await TaskStore.open(dir)
+        expect(reopened.getTask('t1' as TaskId)?.highWatermarkSeq).toBe(1)
+        await reopened.close()
+    })
+
+    it('keeps an in-memory grant revocation when its journal write fails', async () => {
+        const dir = await tempDir()
+        const store = await TaskStore.open(dir, (operation) => {
+            if (operation === 'metadata')
+                throw new Error('disk full')
+        })
+        await expect(store.revoke('grant-1')).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        expect(store.isRevoked('grant-1')).toBe(true)
+        await store.close()
+    })
+
+    it('preserves updatedAtMs for bookkeeping commits', async () => {
+        const dir = await tempDir()
+        const store = await TaskStore.open(dir)
+        const task = await store.createTask(sample(), event)
+        const updated = await store.commit(task.taskId, { stateVersion: task.stateVersion }, {
+            ...event,
+            type: 'state-changed',
+            atMs: 500,
+        })
+        expect(updated.updatedAtMs).toBe(task.updatedAtMs)
         await store.close()
     })
 

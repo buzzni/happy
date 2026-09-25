@@ -76,6 +76,8 @@ export class InputLeaseManager {
     }
 
     assert(tabId: TabId, profileId: ProfileId, taskId: TaskId, segmentId: string, epoch: number): void {
+        if (this.isUserFenced(profileId))
+            throw new BrowserRuntimeError('STALE_LEASE', 'User input fences the whole profile')
         const lease = this.get(tabId, profileId)
         if (lease.owner.kind !== 'agent' || lease.owner.taskId !== taskId || lease.owner.segmentId !== segmentId || lease.epoch !== epoch) {
             throw new BrowserRuntimeError('STALE_LEASE', 'Input lease changed before dispatch')

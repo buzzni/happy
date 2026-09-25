@@ -31,6 +31,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly workers = new Map<TaskId, Promise<BatchResult>>()
     private readonly inFlightDriverCalls = new Set<TaskId>()
     private readonly latestAgentSnapshots = new Map<TabId, SnapshotId>()
+    private readonly liveBatchSteps = new Map<BatchId, BatchStep[]>()
     private readonly latestAgentUrls = new Map<TabId, string>()
     private readonly commitTails = new Map<TaskId, Promise<unknown>>()
     private readonly eventWaiters = new Map<TaskId, Set<() => void>>()
@@ -42,7 +43,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             BrowserDriver
         ][])
         this.clock = options.clock ?? systemClock
-        this.recovery = this.recoverExistingTasks()
+        this.recovery = this.recoverExistingTasks().catch(() => undefined)
     }
     createSpace: BrowserRuntimeApi['createSpace'] = (auth, req) =>
         this.withRequestFlight(auth, req.requestId, { operation: 'createSpace', ...req }, () => this.createSpaceImpl(auth, req))
@@ -167,9 +168,24 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         currentBatchId: undefined,
                         actions: { ...current.actions, [actionId]: {
                             state: 'intent-committed',
+                            kind: 'navigate',
+                            grantId: grant.grantId,
                             payloadHash: payloadHash({ url: req.url }),
                             leaseEpoch: epoch,
                             browserInstanceId: driver.browserInstanceId(),
+                        } },
+                        dedupe: { ...current.dedupe, [requestKey(auth, req.requestId)]: {
+                            hash: payloadHash({ operation: 'openPage', ...req }),
+                            result: redact({ tabId: reservation, actionId, url: req.url,
+                                task: this.view({ ...current, ...next,
+                                    actions: { ...current.actions, [actionId]: { state: 'intent-committed', kind: 'navigate',
+                                        grantId: grant.grantId, payloadHash: payloadHash({ url: req.url }), leaseEpoch: epoch,
+                                        browserInstanceId: driver.browserInstanceId() } },
+                                    stateVersion: current.stateVersion + 1,
+                                    highWatermarkSeq: current.highWatermarkSeq + 1,
+                                    updatedAtMs: this.clock.now(),
+                                } as StoredTask),
+                            }),
                         } },
                     },
                     event: this.event('action-intent', { actionId, kind: 'navigate',
@@ -242,16 +258,35 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const tabEpoch = this.leases.acquire(handle.tabId, task.profileId, { kind: 'agent', agentSessionId: task.agentSessionId,
             taskId: task.taskId, segmentId: actionId })
         const next = this.requireTask(task.taskId)
-        const after = await this.commit(next, {
-            tabs: [...next.tabs, handle.tabId],
-            tabTargets: { ...next.tabTargets, [handle.tabId]: handle.targetId },
-            tabLeaseEpochs: { ...next.tabLeaseEpochs, [handle.tabId]: tabEpoch },
-            status: waitReason ? 'awaiting-user' : 'paused',
-            pauseReason: waitReason ? undefined : 'awaiting-agent',
-            ...(waitReason ? { waitReason, waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
-                waitCompletion: { tabId: handle.tabId, notPathPrefix: waitReason === 'login' ? '/login' : '/challenge' } } : {}),
-            browserInstanceId: driver.browserInstanceId(), actions: { ...next.actions, [actionId]: { ...next.actions[actionId],
-                state: 'confirmed' } } }, 'page-opened', { tabId: handle.tabId, actionId, origin: finalOrigin }, tabEpoch)
+        const after = await this.options.store.mutate(next.taskId, (current) => {
+            if (current.status !== 'running' || current.cancelRequested || !this.isCredentialLive(auth)
+                || current.browserInstanceId !== driver.browserInstanceId())
+                return null
+            return {
+                patch: {
+                    tabs: [...new Set([...current.tabs, handle.tabId])],
+                    tabTargets: { ...current.tabTargets, [handle.tabId]: handle.targetId },
+                    tabLeaseEpochs: { ...current.tabLeaseEpochs, [handle.tabId]: tabEpoch },
+                    status: waitReason ? 'awaiting-user' : 'paused',
+                    pauseReason: waitReason ? undefined : 'awaiting-agent',
+                    ...(waitReason ? { waitReason, waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
+                        waitCompletion: { tabId: handle.tabId,
+                            notPathPrefix: waitReason === 'login' ? '/login' : '/challenge' } } : {}),
+                    browserInstanceId: driver.browserInstanceId(),
+                    actions: { ...current.actions, [actionId]: { ...current.actions[actionId], state: 'confirmed' } },
+                },
+                event: this.event('page-opened', { tabId: handle.tabId, actionId, origin: finalOrigin },
+                    current.stateVersion + 1, tabEpoch),
+            }
+        })
+        if (!after) {
+            await driver.closeTab(handle.tabId, { timeoutMs: 5000 }).catch(() => undefined)
+            const current = this.requireTask(task.taskId)
+            await this.commit(current, { actions: { ...current.actions, [actionId]: { ...current.actions[actionId],
+                state: 'uncertain' } }, uncertainActions: [...new Set([...current.uncertainActions, actionId])] },
+                    'late-result', { actionId, lateOpen: true, ignored: true }, tabEpoch)
+            throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'Page open completed after its execution fence changed', false, true)
+        }
         if (this.controllers.get(task.taskId) === controller)
             this.controllers.delete(task.taskId)
         const space = this.requireSpace(task.taskSpaceId)
@@ -303,6 +338,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const result = await this.driver(space.profileId).closeTab(req.tabId, { timeoutMs: 5000 })
         if (result.beforeUnloadBlocked)
             return { closed: false, handoff: 'beforeunload' }
+        if (!result.closed)
+            return { closed: false }
         const response = { closed: result.closed }
         const { [req.tabId]: _target, ...tabTargets } = space.tabTargets ?? {}
         const { [req.tabId]: _epoch, ...tabLeaseEpochs } = space.tabLeaseEpochs ?? {}
@@ -323,6 +360,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'observe', task)
         this.assertTaskTab(task, req.tabId)
+        if (task.status === 'awaiting-user' && task.waitReason === 'approval'
+            && Object.values(task.approvals).some((approval) => approval.state === 'pending'
+                && task.batches[String(approval.batchId)]?.steps[Number(approval.nextStep)]?.tabId === req.tabId))
+            throw new BrowserRuntimeError('CONFLICT', 'The tab snapshot is bound to a pending approval')
         const result = await this.driver(task.profileId).observe(req.tabId, this.agentGrant(auth).allowedOrigins, { timeoutMs: 30000,
             maxElements: req.maxElements, scopeRef: req.scopeRef })
         if (!this.agentGrant(auth).allowedOrigins.includes(new URL(result.url).origin))
@@ -391,6 +432,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 ? POC_LIMITS.maxWaitForTimeoutMs : POC_LIMITS.maxStepTimeoutMs))
                 throw new BrowserRuntimeError('INVALID_REQUEST', 'Step timeout is outside the allowed range')
         }
+        const submittedSteps = req.steps.map((step) => ['click', 'fill'].includes(step.kind) && !step.snapshotId
+            ? { ...step, ...(this.latestAgentSnapshots.get(step.tabId)
+                ? { snapshotId: this.latestAgentSnapshots.get(step.tabId) } : {}) }
+            : step)
         const batchId = `batch-${randomUUID()}` as BatchId
         let accepted: StoredTask | null
         const hash = payloadHash({ operation: 'submitBatch', ...req })
@@ -406,14 +451,18 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (current.stateVersion !== req.expectedVersion)
                     throw new BrowserRuntimeError('CONFLICT', 'Task version changed')
                 this.assertCanStart(current)
+                if (submittedSteps.some((step) => current.actions[step.actionId]))
+                    throw new BrowserRuntimeError('CONFLICT', 'actionId already has a durable intent')
                 const next = transitionTask({ status: current.status, pauseReason: current.pauseReason }, { type: 'start' })
                 const predictedTask = this.view({ ...current, ...next, currentBatchId: batchId, pauseReason: undefined,
                     waitReason: undefined, stateVersion: current.stateVersion + 1, highWatermarkSeq: current.highWatermarkSeq + 1,
                         updatedAtMs: this.clock.now() } as StoredTask)
                 const dedupe = { ...current.dedupe, [key]: { hash, result: { batchId, accepted: true, task: predictedTask } } }
                 return {
-                    patch: { ...next, currentBatchId: batchId, pauseReason: undefined, waitReason: undefined, dedupe,
-                        batches: { ...current.batches, [batchId]: { steps: persistedBatchSteps(req.steps), nextStep: 0 } } },
+                    patch: { ...next, currentBatchId: batchId, pauseReason: undefined, waitReason: undefined,
+                        waitExpiresAtMs: undefined, dedupe,
+                        batches: { ...current.batches, [batchId]: { steps: persistedBatchSteps(submittedSteps), nextStep: 0,
+                            grant: this.agentGrant(auth) } } },
                     event: this.event('batch-accepted', { batchId, stepCount: req.steps.length }, current.stateVersion + 1),
                     business: true,
                 }
@@ -438,7 +487,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw error
         }
         let resultPromise: Promise<BatchResult>
-        resultPromise = this.runBatch(accepted, batchId, req.steps, auth).catch(async (error) => {
+        this.liveBatchSteps.set(batchId, submittedSteps)
+        resultPromise = this.runBatch(accepted, batchId, submittedSteps, auth).catch(async (error) => {
             if (error instanceof BrowserRuntimeError && error.code === 'JOURNAL_UNAVAILABLE')
                 throw error
             let current = this.requireTask(task.taskId)
@@ -583,49 +633,130 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 continue
             }
             const previousStatus = task.previousDriverStatus as TaskStatus | undefined
-            const previous: TaskStatus = task.pauseReason === 'outcome-unknown' ? 'paused'
-                : previousStatus ?? 'paused'
+            const writes = inFlightWriteActions(task)
+            const workerExists = this.workers.has(task.taskId)
+            const previous: TaskStatus = task.pauseReason === 'outcome-unknown' || writes.length
+                || previousStatus === 'running' && !workerExists ? 'paused' : previousStatus ?? 'paused'
+            const pauseReason = writes.length || task.pauseReason === 'outcome-unknown'
+                ? 'outcome-unknown' : previousStatus === 'running' && !workerExists ? 'awaiting-agent' : task.pauseReason
             const patch: Partial<StoredTask> = previous === 'paused'
-                ? { status: previous, pauseReason: task.pauseReason ?? 'awaiting-agent' as const }
+                ? { status: previous, pauseReason: pauseReason ?? 'awaiting-agent' as const,
+                    ...(writes.length ? { uncertainActions: [...new Set([...task.uncertainActions, ...writes])] } : {}) }
                 : { status: previous, pauseReason: undefined }
             await this.commit(task, { ...patch, previousDriverStatus: undefined }, 'recovered', { driver: 'reconnected',
                 browserReplaced: false })
         }
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
-        await this.options.store.revoke(grantId)
-        await this.sweep(this.clock.now())
+        let failure: unknown
+        try {
+            await this.options.store.revoke(grantId)
+        }
+        catch (error) {
+            failure = error
+        }
+        for (const task of this.options.store.listTasks()) {
+            const usesGrant = (task.agentGrant as AgentGrant | undefined)?.grantId === grantId
+                || Object.values(task.batches).some((batch) => batch.grant?.grantId === grantId)
+                || Object.values(task.actions).some((action) => action.grantId === grantId)
+            if (!usesGrant)
+                continue
+            const revoked = this.leases.revokeTask(task.taskId)
+            this.controllers.get(task.taskId)?.abort(new Error('grant revoked'))
+            for (const lease of revoked)
+                await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch).catch(() => undefined)
+        }
+        try {
+            await this.sweep(this.clock.now())
+        }
+        catch (error) {
+            failure ??= error
+        }
+        if (failure)
+            throw failure
     }
     async sweep(nowMs: number): Promise<void> {
         await this.recovery
         for (const task of this.options.store.listTasks()) {
-            if (['succeeded', 'failed', 'cancelled'].includes(task.status))
+            let fenceReason: string | undefined
+            const changed = await this.options.store.mutate(task.taskId, (current) => {
+                if (['succeeded', 'failed', 'cancelled'].includes(current.status) || current.cancelRequested)
+                    return null
+                const recoveryDriver = this.drivers.get(current.profileId)
+                let driverConnected = false
+                try {
+                    driverConnected = Boolean(recoveryDriver?.browserInstanceId())
+                }
+                catch {
+                    driverConnected = false
+                }
+                if (current.status === 'recovering' && !this.workers.has(current.taskId) && driverConnected) {
+                    const writes = inFlightWriteActions(current)
+                    const actions = { ...current.actions }
+                    for (const actionId of writes)
+                        actions[actionId] = { ...actions[actionId], state: 'uncertain' }
+                    fenceReason = 'recovered-without-worker'
+                    return {
+                        patch: { status: 'paused', pauseReason: writes.length ? 'outcome-unknown' : 'awaiting-agent',
+                            ...(writes.length ? { actions, uncertainActions: [...new Set([...current.uncertainActions, ...writes])] } : {}),
+                            previousDriverStatus: undefined },
+                        event: this.event('recovered', { recoveredWithoutWorker: true, uncertainActions: writes },
+                            current.stateVersion + 1),
+                    }
+                }
+                const grant = current.agentGrant as AgentGrant | undefined
+                const revokedBatchGrant = current.currentBatchId
+                    ? current.batches[current.currentBatchId]?.grant
+                    : undefined
+                const revokedActionIds = Object.entries(current.actions).filter(([, action]) => action.grantId
+                    && this.options.store.isRevoked(action.grantId)
+                    && ['planned', 'intent-committed', 'dispatched'].includes(action.state)).map(([id]) => id as ActionId)
+                let reason: StoredTask['pauseReason'] | undefined
+                if (!grant || grant.expiresAtMs <= nowMs || this.options.store.isRevoked(grant.grantId)
+                    || Boolean(revokedBatchGrant && this.options.store.isRevoked(revokedBatchGrant.grantId))
+                    || revokedActionIds.length)
+                    reason = 'grant-expired'
+                else if (Number(current.waitExpiresAtMs ?? 0) > 0 && Number(current.waitExpiresAtMs) <= nowMs)
+                    reason = current.waitReason === 'approval' ? 'approval-expired' : 'user-wait-expired'
+                else if (nowMs - current.createdAtMs >= POC_LIMITS.taskTimeLimitMs)
+                    reason = 'task-time-limit'
+                if (reason) {
+                    if (current.status === 'paused' && current.pauseReason === reason)
+                        return null
+                    fenceReason = reason
+                    const actions = { ...current.actions }
+                    const uncertainWrites = revokedActionIds.filter((id) => ['intent-committed', 'dispatched']
+                        .includes(actions[id]?.state ?? '') && ['navigate', 'click', 'fill'].includes(String(actions[id]?.kind)))
+                    for (const id of uncertainWrites)
+                        actions[id] = { ...actions[id], state: 'uncertain' }
+                    const approvals = Object.fromEntries(Object.entries(current.approvals).map(([id, approval]) => [id, {
+                        ...approval,
+                        ...(approval.grantId && this.options.store.isRevoked(approval.grantId)
+                            && approval.state === 'pending' ? { state: 'expired' as const } : {}),
+                    }]))
+                    return {
+                        patch: { status: 'paused', pauseReason: uncertainWrites.length ? 'outcome-unknown' : reason,
+                            ...(uncertainWrites.length ? { actions, uncertainActions: [...new Set([...current.uncertainActions,
+                                ...uncertainWrites])] } : {}),
+                            approvals,
+                            ...(reason === 'approval-expired' ? { pendingApproval: undefined } : {}) },
+                        event: this.event('state-changed', { pauseReason: reason }, current.stateVersion + 1),
+                    }
+                }
+                if (current.status === 'running' && !this.inFlightDriverCalls.has(current.taskId)
+                    && nowMs - current.updatedAtMs >= POC_LIMITS.workerStaleMs) {
+                    fenceReason = 'worker-heartbeat-stale'
+                    return { patch: { status: 'recovering' },
+                        event: this.event('recovered', { reason: fenceReason }, current.stateVersion + 1) }
+                }
+                return null
+            })
+            if (!changed || !fenceReason)
                 continue
-            if (task.cancelRequested)
-                continue
-            const grant = task.agentGrant as AgentGrant | undefined
-            let reason: StoredTask['pauseReason'] | undefined
-            if (!grant || grant.expiresAtMs <= nowMs || this.options.store.isRevoked(grant.grantId))
-                reason = 'grant-expired'
-            else if (Number(task.waitExpiresAtMs ?? 0) > 0 && Number(task.waitExpiresAtMs) <= nowMs)
-                reason = task.waitReason === 'approval' ? 'approval-expired' : 'user-wait-expired'
-            else if (nowMs - task.createdAtMs >= POC_LIMITS.taskTimeLimitMs)
-                reason = 'task-time-limit'
-            else if (task.status === 'running' && !this.inFlightDriverCalls.has(task.taskId)
-                && nowMs - task.updatedAtMs >= POC_LIMITS.workerStaleMs)
-                reason = undefined
-            if (reason) {
-                if (task.status === 'paused' && task.pauseReason === reason)
-                    continue
-                this.leases.revokeTask(task.taskId)
-                this.controllers.get(task.taskId)?.abort(new Error(reason))
-                await this.commit(task, { status: 'paused', pauseReason: reason,
-                    ...(reason === 'approval-expired' ? { pendingApproval: undefined } : {}) }, 'state-changed', { pauseReason: reason })
-            }
-            else if (task.status === 'running' && !this.inFlightDriverCalls.has(task.taskId)
-                && nowMs - task.updatedAtMs >= POC_LIMITS.workerStaleMs) {
-                await this.commit(task, { status: 'recovering' }, 'recovered', { reason: 'worker-heartbeat-stale' })
-            }
+            const revoked = this.leases.revokeTask(task.taskId)
+            this.controllers.get(task.taskId)?.abort(new Error(fenceReason))
+            for (const lease of revoked)
+                await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
         }
     }
     private async approveImpl(auth: AuthContext, req: {
@@ -651,19 +782,21 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval expired')
         }
         if (req.decision === 'reject') {
-            const cancelled = await this.commit(task, { status: 'cancelled', approvals: { ...task.approvals,
+            const cancelled = await this.commit(task, { status: 'cancelled', cancelRequested: true, approvals: { ...task.approvals,
                 [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId })
             for (const lease of this.leases.revokeTask(task.taskId))
                 await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
             return { outcome: 'rejected', task: this.view(cancelled) }
         }
-        const originalGrant = task.agentGrant as AgentGrant | undefined
+        const batchGrant = task.batches[String(approval.batchId)]?.grant
+        const originalGrant = (batchGrant?.grantId === approval.grantId ? batchGrant : task.agentGrant) as AgentGrant | undefined
         if (!originalGrant || originalGrant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(originalGrant.grantId))
             throw new BrowserRuntimeError('UNAUTHORIZED', 'Agent execution grant is no longer valid')
         const originalAuth: AuthContext = { credential: originalGrant, verifiedAtMs: this.clock.now() }
         const batchRecord = task.batches[String(approval.batchId)] as {
             steps: BatchStep[]
             nextStep: number
+            grant?: AgentGrant
         }
         const storedStep = batchRecord.steps[Number(approval.nextStep)]
         const approvedStep = { ...storedStep, snapshotId: approval.snapshotId ?? storedStep.snapshotId }
@@ -722,7 +855,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             }
             const { [approvedStep.actionId]: _priorAction, ...remainingActions } = current.actions
             return {
-                patch: { status: 'running', pauseReason: undefined, waitReason: undefined, actions: remainingActions,
+                patch: { status: 'running', pauseReason: undefined, waitReason: undefined, waitExpiresAtMs: undefined,
+                    actions: remainingActions,
                     approvals: { ...current.approvals, [req.approvalId]: { ...latestApproval, state: 'consumed' } } },
                 event: this.event('approval-consumed', { approvalId: req.approvalId }, current.stateVersion + 1),
             }
@@ -745,6 +879,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.recovery
         const task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'takeOver', task)
+        if (['succeeded', 'failed', 'cancelled'].includes(task.status))
+            throw new BrowserRuntimeError('CONFLICT', 'Terminal tasks cannot be taken over')
         this.assertTaskTab(task, req.tabId)
         if (task.waitReason === 'approval')
             throw new BrowserRuntimeError('CONFLICT', 'Approval waits cannot be replaced with user takeover')
@@ -783,6 +919,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.recovery
         const task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'releaseControl', task)
+        if (['succeeded', 'failed', 'cancelled'].includes(task.status))
+            throw new BrowserRuntimeError('CONFLICT', 'Terminal tasks cannot release control')
         this.assertTaskTab(task, req.tabId)
         const current = this.leases.owner(req.tabId, task.profileId)
         const interactive = auth.credential as Extract<AuthContext['credential'], {
@@ -804,6 +942,36 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         requestId: RequestId
     }): Promise<TaskView> {
         await this.recovery
+        const task = this.requireTask(req.taskId)
+        this.authorizeTask(auth, 'resume', task)
+        if (['succeeded', 'failed', 'cancelled'].includes(task.status))
+            throw new BrowserRuntimeError('CONFLICT', 'Terminal tasks cannot be resumed')
+        const claimId = String(req.requestId)
+        await this.options.store.mutate(task.taskId, (current) => {
+            if (['succeeded', 'failed', 'cancelled'].includes(current.status)
+                || current.stateVersion !== req.expectedVersion || current.status !== task.status
+                || current.pauseReason !== task.pauseReason || current.resumeClaimId)
+                throw new BrowserRuntimeError('CONFLICT', 'Task changed before resume')
+            return {
+                patch: { resumeClaimId: claimId, stateVersion: current.stateVersion },
+                event: this.event('state-changed', { resumeClaimed: true }, current.stateVersion),
+            }
+        })
+        try {
+            return await this.resumeClaimedImpl(auth, req)
+        }
+        finally {
+            await this.options.store.mutate(task.taskId, (current) => current.resumeClaimId === claimId ? {
+                patch: { resumeClaimId: undefined, stateVersion: current.stateVersion },
+                event: this.event('state-changed', { resumeClaimReleased: true }, current.stateVersion),
+            } : null).catch(() => undefined)
+        }
+    }
+    private async resumeClaimedImpl(auth: AuthContext, req: {
+        taskId: TaskId
+        expectedVersion: number
+        requestId: RequestId
+    }): Promise<TaskView> {
         const task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'resume', task)
         if (task.cancelRequested || ['user-control', 'quota', 'task-time-limit', 'outcome-unknown',
@@ -850,27 +1018,31 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 steps: BatchStep[]
             }
             const resumeAt = Number(wait.nextStep ?? 0)
+            const liveSteps = this.liveBatchSteps.get(wait.batchId as BatchId)
+            if (!liveSteps)
+                return this.view(await this.interruptPersistedBatch(task, wait.batchId as BatchId, resumeAt))
             const running = await this.commit(task, { status: 'running', pauseReason: undefined, waitReason: undefined,
-                waitCompletion: undefined, browserInstanceId: this.driver(task.profileId).browserInstanceId(),
+                waitCompletion: undefined, waitExpiresAtMs: undefined,
+                browserInstanceId: this.driver(task.profileId).browserInstanceId(),
                     batches: { ...task.batches, [wait.batchId]: { ...record, nextStep: resumeAt } } }, 'state-changed',
                         { status: 'running', resumedAfter: task.waitReason })
-            await this.runBatch(running, wait.batchId as BatchId, record.steps, auth, resumeAt)
+            await this.runBatch(running, wait.batchId as BatchId, liveSteps, auth, resumeAt)
             return this.view(this.requireTask(task.taskId))
         }
         if (task.pauseReason === 'approval-expired' || task.pauseReason === 'user-wait-expired') {
             const approvalEntry = Object.entries(task.approvals).find(([, approval]) => approval.state === 'pending')
             if (approvalEntry) {
                 const [approvalId, approval] = approvalEntry
-                const batch = task.batches[String(approval.batchId)] as {
-                    steps: BatchStep[]
-                    nextStep: number
-                }
+                const liveSteps = this.liveBatchSteps.get(approval.batchId as BatchId)
+                if (!liveSteps)
+                    return this.view(await this.interruptPersistedBatch(task, approval.batchId as BatchId,
+                        Number(approval.nextStep)))
                 const { [String(approval.actionId)]: _oldAction, ...actions } = task.actions
                 const approvals = { ...task.approvals, [approvalId]: { ...approval, state: 'expired' as const } }
                 const running = await this.commit(task, { status: 'running', pauseReason: undefined, waitReason: undefined,
-                    pendingApproval: undefined, agentGrant: auth.credential, actions, approvals }, 'state-changed',
+                    waitExpiresAtMs: undefined, pendingApproval: undefined, agentGrant: auth.credential, actions, approvals }, 'state-changed',
                         { status: 'running', approvalExpired: approvalId })
-                await this.runBatch(running, approval.batchId as BatchId, batch.steps, auth, Number(approval.nextStep))
+                await this.runBatch(running, approval.batchId as BatchId, liveSteps, auth, Number(approval.nextStep))
                 return this.view(this.requireTask(task.taskId))
             }
         }
@@ -905,14 +1077,22 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         for (const lease of revokedLeases)
             await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
         this.controllers.get(task.taskId)?.abort(new Error('cancelled'))
-        const uncertain = [...new Set([...task.uncertainActions, ...Object.entries(task.actions).filter(([, action]) => ['navigate',
-            'click', 'fill'].includes(String(action.kind)) && (action.state === 'intent-committed'
-                || action.state === 'dispatched')).map(([id]) => id as ActionId)])]
-        const next = await this.commit(task, { cancelRequested: true, status: uncertain.length ? 'paused' : 'cancelled',
-            ...(uncertain.length ? { pauseReason: 'cancelled-with-unknown-effect',
-                uncertainActions: [...new Set([...task.uncertainActions, ...uncertain])] } : {}) }, 'cancel-accepted',
-                    { cancelRequested: true, uncertainActions: uncertain })
-        return { status: 'cancel-accepted', task: this.view(next), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        let uncertain: ActionId[] = []
+        const next = await this.options.store.mutate(task.taskId, (current) => {
+            if (['succeeded', 'failed', 'cancelled'].includes(current.status))
+                return null
+            uncertain = [...new Set([...current.uncertainActions, ...Object.entries(current.actions).filter(([, action]) =>
+                ['navigate', 'click', 'fill'].includes(String(action.kind))
+                    && ['intent-committed', 'dispatched'].includes(action.state)).map(([id]) => id as ActionId)])]
+            return {
+                patch: { cancelRequested: true, status: uncertain.length ? 'paused' : 'cancelled',
+                    ...(uncertain.length ? { pauseReason: 'cancelled-with-unknown-effect', uncertainActions: uncertain } : {}) },
+                event: this.event('cancel-accepted', { cancelRequested: true, uncertainActions: uncertain },
+                    current.stateVersion + 1),
+            }
+        })
+        const latest = next ?? this.requireTask(task.taskId)
+        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
     }
     private async closeSpaceImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
@@ -936,8 +1116,19 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         for (const tab of space.tabs) {
             if (this.leases.owner(tab as TabId, space.profileId).owner.kind !== 'none')
                 throw new BrowserRuntimeError('STALE_LEASE', 'Task space has an input owner')
-            await this.driver(space.profileId).closeTab(tab as TabId, { timeoutMs: 5000 })
+            const result = await this.driver(space.profileId).closeTab(tab as TabId, { timeoutMs: 5000 })
+            if (result.beforeUnloadBlocked || !result.closed)
+                throw new BrowserRuntimeError('CONFLICT', 'A task space tab could not be closed')
             closedTabs.push(tab as TabId)
+            const current = this.requireSpace(req.taskSpaceId)
+            const { [tab]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [tab]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            await this.options.store.updateSpace(req.taskSpaceId, {
+                tabs: current.tabs.filter((item) => item !== tab),
+                goneTabs: [...new Set([...(current.goneTabs ?? []), tab as TabId])],
+                tabTargets,
+                tabLeaseEpochs,
+            })
         }
         const response = { closedTabs }
         await this.options.store.updateSpace(req.taskSpaceId, {
@@ -1110,13 +1301,24 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 const allowedOrigins = references.flatMap((task) => (task.agentGrant as AgentGrant | undefined)?.allowedOrigins ?? [])
                 let adopted = false
                 if (browserMatches && targetId && driver.adoptTab) {
-                    adopted = await driver.adoptTab(tabId, targetId, [...new Set(allowedOrigins)], { timeoutMs: 10000 })
+                    try {
+                        adopted = await driver.adoptTab(tabId, targetId, [...new Set(allowedOrigins)], { timeoutMs: 10000 })
+                    }
+                    catch {
+                        adopted = false
+                    }
                 }
                 else if (browserMatches) {
                     adopted = driver.hasTab(tabId)
                 }
                 if (!adopted) {
-                    await this.dropOwnedTab(space, tabId, references)
+                    try {
+                        await this.dropOwnedTab(space, tabId, references)
+                    }
+                    catch {
+                        for (const task of references)
+                            this.options.store.markUnreadable(task.taskId)
+                    }
                     continue
                 }
                 const previousEpoch = Math.max(space.tabLeaseEpochs?.[tabId] ?? 0,
@@ -1151,25 +1353,126 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             }
         })
         for (const task of references) {
+            const current = this.options.store.getTask(task.taskId)
+            if (!current)
+                continue
+            const writes = inFlightWriteActions(current)
+            const actions = { ...current.actions }
+            for (const actionId of writes)
+                actions[actionId] = { ...actions[actionId], state: 'uncertain' }
             await this.commit(task, {
-                tabs: task.tabs.filter((tab) => tab !== tabId),
-                tabTargets: Object.fromEntries(Object.entries(task.tabTargets ?? {}).filter(([tab]) => tab !== tabId)),
-                tabLeaseEpochs: Object.fromEntries(Object.entries(task.tabLeaseEpochs ?? {}).filter(([tab]) => tab !== tabId)),
-            }, 'page-closed', { tabId, reason: 'gone' })
+                tabs: current.tabs.filter((tab) => tab !== tabId),
+                tabTargets: Object.fromEntries(Object.entries(current.tabTargets ?? {}).filter(([tab]) => tab !== tabId)),
+                tabLeaseEpochs: Object.fromEntries(Object.entries(current.tabLeaseEpochs ?? {}).filter(([tab]) => tab !== tabId)),
+                ...(writes.length ? { status: 'paused', pauseReason: 'outcome-unknown', actions,
+                    uncertainActions: [...new Set([...current.uncertainActions, ...writes])] } : {}),
+            }, writes.length ? 'action-uncertain' : 'page-closed', { tabId, reason: 'adoption-failed', uncertainActions: writes })
         }
     }
+    private async interruptPersistedBatch(task: StoredTask, batchId: BatchId, nextStep: number): Promise<StoredTask> {
+        const batch = task.batches[String(batchId)]
+        if (!batch)
+            throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Interrupted batch record is missing')
+        const step = batch.steps[nextStep]
+        const action = step ? task.actions[step.actionId] : undefined
+        const mayHaveSideEffects = Boolean(action && ['intent-committed', 'dispatched', 'uncertain'].includes(action.state)
+            && ['navigate', 'click', 'fill'].includes(String(action.kind)))
+        const actions = { ...task.actions }
+        const uncertainActions = [...task.uncertainActions]
+        if (mayHaveSideEffects && step) {
+            actions[step.actionId] = { ...action, state: 'uncertain' }
+            if (!uncertainActions.includes(step.actionId))
+                uncertainActions.push(step.actionId)
+        }
+        const completedSteps = batch.steps.filter((item) => task.actions[item.actionId]?.state === 'confirmed')
+            .map((item) => item.stepId)
+        const result: BatchResult = {
+            batchId,
+            taskId: task.taskId,
+            outcome: 'failed',
+            completedSteps,
+            ...(step ? { failedStep: step.stepId } : {}),
+            mayHaveSideEffects,
+            lastCheckpointSeq: task.highWatermarkSeq + 1,
+            steps: [
+                ...batch.steps.filter((item) => completedSteps.includes(item.stepId)).map((item) => ({
+                    stepId: item.stepId,
+                    actionId: item.actionId,
+                    outcome: 'succeeded' as const,
+                })),
+                ...(step ? [{ stepId: step.stepId, actionId: step.actionId,
+                    outcome: mayHaveSideEffects ? 'uncertain' as const : 'failed' as const }] : []),
+            ],
+        }
+        const approvals = Object.fromEntries(Object.entries(task.approvals).map(([id, approval]) => [id, {
+            ...approval,
+            ...(approval.batchId === batchId && approval.state === 'pending' ? { state: 'expired' as const } : {}),
+        }]))
+        const interrupted = await this.commit(task, {
+            status: 'paused',
+            pauseReason: 'awaiting-agent',
+            waitReason: undefined,
+            waitCompletion: undefined,
+            waitExpiresAtMs: undefined,
+            currentBatchId: undefined,
+            pendingApproval: undefined,
+            approvals,
+            actions,
+            uncertainActions,
+            lastBatch: result,
+            batches: { ...task.batches, [batchId]: { ...batch, result } },
+        }, 'recovered', { batchId, interrupted: true, failedStep: step?.stepId, mayHaveSideEffects })
+        return interrupted
+    }
     private async recoverExistingTasks(): Promise<void> {
-        await this.restorePersistedTabs()
+        await this.restorePersistedTabs().catch(() => undefined)
         for (const task of this.options.store.listTasks()) {
             if (['succeeded', 'failed', 'cancelled'].includes(task.status))
                 continue
+            if (task.resumeClaimId) {
+                await this.options.store.mutate(task.taskId, (current) => current.resumeClaimId ? {
+                    patch: { resumeClaimId: undefined, stateVersion: current.stateVersion },
+                    event: this.event('recovered', { resumeClaimCleared: true }, current.stateVersion),
+                } : null).catch(() => undefined)
+            }
             const driver = this.drivers.get(task.profileId)
             const taskGrant = task.agentGrant as AgentGrant | undefined
             const pendingWriteIds = inFlightWriteActions(task)
             const pendingWrites = pendingWriteIds.map((id) => [id, task.actions[id]] as const)
+            const revokedSegmentActions = Object.entries(task.actions).filter(([, action]) => action.grantId
+                && this.options.store.isRevoked(action.grantId)
+                && ['planned', 'intent-committed', 'dispatched'].includes(action.state)).map(([id]) => id as ActionId)
             const actions = { ...task.actions }
             for (const [id, action] of pendingWrites)
                 actions[id] = { ...action, state: 'uncertain' }
+            const batchId = task.currentBatchId
+            const batch = batchId ? task.batches[batchId] : undefined
+            const completedSteps = batch?.steps.filter((step) => task.actions[step.actionId]?.state === 'confirmed')
+                .map((step) => step.stepId) ?? []
+            const nextStep = batch?.steps.find((step) => !completedSteps.includes(step.stepId))
+            const interrupted: BatchResult | undefined = batchId && batch ? {
+                batchId,
+                taskId: task.taskId,
+                outcome: 'failed',
+                completedSteps,
+                ...(nextStep ? { failedStep: nextStep.stepId } : {}),
+                mayHaveSideEffects: pendingWrites.length > 0,
+                lastCheckpointSeq: task.highWatermarkSeq + 1,
+                steps: [
+                    ...batch.steps.filter((step) => completedSteps.includes(step.stepId)).map((step) => ({
+                        stepId: step.stepId,
+                        actionId: step.actionId,
+                        outcome: 'succeeded' as const,
+                    })),
+                    ...(nextStep ? [{ stepId: nextStep.stepId, actionId: nextStep.actionId,
+                        outcome: pendingWrites.some(([id]) => id === nextStep.actionId)
+                            ? 'uncertain' as const : 'failed' as const }] : []),
+                ],
+            } : undefined
+            const batchPatch = interrupted && batchId && batch
+                ? { lastBatch: interrupted, currentBatchId: undefined,
+                    batches: { ...task.batches, [batchId]: { ...batch, result: interrupted } } }
+                : {}
             let patch: Partial<StoredTask>
             if (task.cancelRequested) {
                 const unresolved = [...new Set([...task.uncertainActions, ...pendingWrites.map(([id]) => id as ActionId)])]
@@ -1177,50 +1480,42 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     uncertainActions: unresolved, actions } : { status: 'cancelled' }
             }
             else if (!taskGrant || taskGrant.expiresAtMs <= this.clock.now()
-                || this.options.store.isRevoked(taskGrant.grantId)) {
-                patch = { status: 'paused', pauseReason: 'grant-expired', actions }
+                || this.options.store.isRevoked(taskGrant.grantId) || revokedSegmentActions.length) {
+                const approvals = Object.fromEntries(Object.entries(task.approvals).map(([id, approval]) => [id, {
+                    ...approval,
+                    ...(approval.grantId && this.options.store.isRevoked(approval.grantId)
+                        && approval.state === 'pending' ? { state: 'expired' as const } : {}),
+                }]))
+                patch = { status: 'paused', pauseReason: pendingWrites.length ? 'outcome-unknown' : 'grant-expired', actions,
+                    approvals,
+                    ...batchPatch,
+                    ...(pendingWrites.length ? { uncertainActions: [...new Set([...task.uncertainActions,
+                        ...pendingWrites.map(([id]) => id as ActionId)])] } : {}) }
             }
             else if (!driver || !browserInstanceMatches(task, driver.browserInstanceId())) {
-                patch = { status: 'paused', pauseReason: 'browser-replaced', browserInstanceId: driver?.browserInstanceId(), actions,
+                patch = { status: 'paused', pauseReason: pendingWrites.length ? 'outcome-unknown' : 'browser-replaced',
+                    browserInstanceId: driver?.browserInstanceId(), actions,
+                    ...batchPatch,
+                    ...(pendingWrites.length ? { uncertainActions: [...new Set([...task.uncertainActions,
+                        ...pendingWrites.map(([id]) => id as ActionId)])] } : {}),
                     pendingApproval: undefined }
             }
             else if (pendingWrites.length) {
                 patch = { status: 'paused', pauseReason: 'outcome-unknown', uncertainActions: [...new Set([...task.uncertainActions,
-                    ...pendingWrites.map(([id]) => id as ActionId)])], actions }
+                    ...pendingWrites.map(([id]) => id as ActionId)])], actions, ...batchPatch }
             }
             else if (task.status === 'running' || task.status === 'recovering') {
-                const batchId = task.currentBatchId
-                const batch = batchId ? task.batches[batchId] : undefined
-                const completedSteps = batch?.steps
-                    .filter((step) => task.actions[step.actionId]?.state === 'confirmed')
-                    .map((step) => step.stepId) ?? []
-                const interrupted: BatchResult | undefined = batch && batchId ? {
-                    batchId,
-                    taskId: task.taskId,
-                    outcome: 'failed',
-                    completedSteps,
-                    mayHaveSideEffects: false,
-                    lastCheckpointSeq: task.highWatermarkSeq + 1,
-                    steps: batch.steps
-                        .filter((step) => completedSteps.includes(step.stepId))
-                        .map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded' })),
-                } : undefined
-                const interruptedBatch = batch && interrupted ? { ...batch, result: interrupted } : undefined
                 patch = {
                     status: 'paused',
                     pauseReason: 'awaiting-agent',
                     actions,
-                    currentBatchId: undefined,
-                    ...(interrupted && batchId && interruptedBatch ? {
-                        lastBatch: interrupted,
-                        batches: { ...task.batches, [batchId]: interruptedBatch },
-                    } : {}),
+                    ...batchPatch,
                 }
             }
             else
                 continue
             await this.commit(task, patch, 'recovered', { previousStatus: task.status, pauseReason: patch.pauseReason,
-                uncertainActions: patch.uncertainActions ?? [] })
+                uncertainActions: patch.uncertainActions ?? [] }).catch(() => this.options.store.markUnreadable(task.taskId))
         }
     }
     pinnedProfiles(nowMs = this.clock.now()): ProfileId[] {
@@ -1277,7 +1572,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     }
                 }
                 const agentSnapshot = namedSnapshot ?? (['click', 'fill'].includes(step.kind)
-                    ? step.snapshotId ?? this.latestAgentSnapshots.get(step.tabId)
+                    ? step.snapshotId
                     : undefined)
                 const effectiveStep: BatchStep = {
                     ...step,
@@ -1327,11 +1622,26 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         throw new BrowserRuntimeError('CONFLICT', 'actionId was already confirmed in a prior batch')
                     throw new BrowserRuntimeError('OUTCOME_UNKNOWN', 'actionId has an unresolved prior result', false, true)
                 }
-                task = await this.commit(task, { actions: { ...task.actions, [step.actionId]: { state: 'intent-committed',
-                    kind: step.kind, batchId, payloadHash: payloadHash(step), leaseEpoch,
-                        browserInstanceId: driver.browserInstanceId() } }, batches: { ...task.batches, [batchId]: { steps: persistedBatchSteps(steps),
-                            nextStep: index } } }, 'action-intent', { actionId: step.actionId, kind: step.kind,
-                                payloadHash: payloadHash(step) }, leaseEpoch)
+                const intent = await this.options.store.mutate(task.taskId, (current) => {
+                    if (current.actions[step.actionId])
+                        throw new BrowserRuntimeError('CONFLICT', 'actionId already has a durable intent')
+                    if (current.cancelRequested || current.status !== 'running' || !this.isCredentialLive(auth))
+                        throw new BrowserRuntimeError('STALE_LEASE', 'Task execution fence changed')
+                    return {
+                        patch: {
+                            actions: { ...current.actions, [step.actionId]: { state: 'intent-committed', kind: step.kind,
+                                batchId, grantId: grant.grantId, payloadHash: payloadHash(step), leaseEpoch,
+                                browserInstanceId: driver.browserInstanceId() } },
+                            batches: { ...current.batches, [batchId]: { ...current.batches[batchId],
+                                steps: persistedBatchSteps(steps), nextStep: index } },
+                        },
+                        event: this.event('action-intent', { actionId: step.actionId, kind: step.kind,
+                            payloadHash: payloadHash(step) }, current.stateVersion + 1, leaseEpoch),
+                    }
+                })
+                if (!intent)
+                    throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Action intent was not committed')
+                task = intent
                 let description: ElementDescription | undefined
                 try {
                     if (['click', 'fill'].includes(step.kind)) {
@@ -1370,6 +1680,36 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     outcome = uncertain ? 'uncertain' : 'failed'
                     mayHaveSideEffects = uncertain
                     break
+                }
+                if (approvedActionId === step.actionId) {
+                    const boundApproval = Object.values(task.approvals).find((item) => item.actionId === step.actionId
+                        && item.batchId === batchId && item.state === 'consumed')
+                    const currentBindingHash = description ? payloadHash({ step: effectiveStep,
+                        formValues: description.formValues, frameOrigin: description.frameOrigin,
+                        currentPageUrl: description.pageUrl }) : ''
+                    const recomputedApprovalBinding = boundApproval ? approvalBinding({
+                        principalId: grant.principalId,
+                        workspaceId: grant.workspaceId,
+                        taskId: task.taskId,
+                        actionId: step.actionId,
+                        origin: String(boundApproval.origin),
+                        payloadHash: currentBindingHash,
+                        leaseEpoch: Number(boundApproval.leaseEpoch),
+                        browserInstanceId: String(boundApproval.browserInstanceId),
+                        documentGeneration: Number(description?.documentGeneration ?? -1),
+                        expiresAtMs: Number(boundApproval.expiresAtMs),
+                        frameOrigin: String(description?.frameOrigin),
+                    }) : ''
+                    const liveLease = this.leases.owner(step.tabId, task.profileId)
+                    if (!boundApproval || !description || Number(boundApproval.expiresAtMs) <= this.clock.now()
+                        || !this.isCredentialLive(auth) || task.cancelRequested || task.status !== 'running'
+                        || liveLease.leaseEpoch !== Number(task.tabLeaseEpochs?.[step.tabId])
+                        || liveLease.owner.kind !== 'agent' || liveLease.owner.taskId !== task.taskId
+                        || liveLease.owner.segmentId !== batchId || driver.browserInstanceId() !== boundApproval.browserInstanceId
+                        || origin !== boundApproval.origin || description.documentGeneration !== boundApproval.documentGeneration
+                        || description.frameOrigin !== boundApproval.frameOrigin || currentBindingHash !== boundApproval.payloadHash
+                        || recomputedApprovalBinding !== boundApproval.bindingHash)
+                        throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed before dispatch')
                 }
                 if (classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required' && step.actionId !== approvedActionId) {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
@@ -1423,7 +1763,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         task = await this.commit(task, { status: 'awaiting-user', waitReason,
                             waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs, waitCompletion: { batchId, nextStep: index,
                                 tabId: step.tabId, notPathPrefix: waitReason === 'login' ? '/login' : '/challenge',
-                                protectedOrigin: pageUrl } }, 'state-changed',
+                                protectedOrigin: new URL(pageUrl!).origin } }, 'state-changed',
                                     { status: 'awaiting-user', waitReason, actionId: step.actionId }, leaseEpoch)
                         preserveLeases = true
                         return this.saveBatchResult(task, batchId, { batchId, taskId: task.taskId, outcome: 'awaiting-user',
@@ -1514,7 +1854,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         continue
                     }
                     const actions = { ...task.actions, [step.actionId]: { ...task.actions[step.actionId], state: 'confirmed' as const } }
-                    task = await this.commit(task, { actions, batches: { ...task.batches, [batchId]: { steps: persistedBatchSteps(steps),
+                    task = await this.commit(task, { actions, batches: { ...task.batches, [batchId]: {
+                        ...task.batches[batchId], steps: persistedBatchSteps(steps),
                         nextStep: index + 1 } } }, 'action-confirmed', { actionId: step.actionId }, leaseEpoch)
                     results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded',
                         ...(step.kind === 'observe' && dispatchResult && 'snapshotId' in dispatchResult
@@ -1706,6 +2047,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 patch: {
                     lastBatch: result,
                     batches: { ...current.batches, [batchId]: { ...batch, result } },
+                    stateVersion: current.stateVersion,
                 },
                 event: this.event('state-changed', {
                     batchId,
@@ -1796,7 +2138,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (existing) {
                 if (existing.hash !== hash)
                     throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
-                return null
+                return {
+                    patch: { dedupe: { ...current.dedupe, [key]: { hash, result: redactedResult } },
+                        stateVersion: current.stateVersion },
+                    event: this.event('state-changed', { requestStored: true }, current.stateVersion),
+                }
             }
             return {
                 patch: {

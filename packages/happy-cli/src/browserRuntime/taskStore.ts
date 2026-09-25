@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, rm, truncate, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
     BrowserRuntimeError,
@@ -7,6 +7,7 @@ import {
     SCHEMA_VERSION,
     type ActionId,
     type ActionState,
+    type AgentGrant,
     type ApprovalId,
     type BatchId,
     type BatchResult,
@@ -25,6 +26,7 @@ export interface ActionRecord {
     state: ActionState
     kind?: BatchStep['kind']
     batchId?: BatchId
+    grantId?: string
     payloadHash?: string
     leaseEpoch?: number
     browserInstanceId?: BrowserInstanceId
@@ -32,6 +34,7 @@ export interface ActionRecord {
 export interface ApprovalRecord {
     approvalId?: ApprovalId
     actionId?: ActionId
+    grantId?: string
     origin?: string
     description?: string
     bindingHash?: string
@@ -51,6 +54,7 @@ export interface ApprovalRecord {
 export interface BatchRecord {
     steps: BatchStep[]
     nextStep: number
+    grant?: AgentGrant
     result?: BatchResult
 }
 export interface StoredTask extends TaskView {
@@ -120,9 +124,10 @@ export class TaskStore {
     private metadataTail: Promise<void> = Promise.resolve()
     private readonly unreadableTasks = new Set<TaskId>()
     private closed = false
-    private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector) { }
-    static async open(stateDir: string, faultInjector?: FaultInjector): Promise<TaskStore> {
-        const store = new TaskStore(stateDir, faultInjector)
+    private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector,
+        private readonly now: () => number = Date.now) { }
+    static async open(stateDir: string, faultInjector?: FaultInjector, now: () => number = Date.now): Promise<TaskStore> {
+        const store = new TaskStore(stateDir, faultInjector, now)
         try {
             await store.acquire()
             await store.loadMetadata()
@@ -148,6 +153,15 @@ export class TaskStore {
                 await rm(join(this.stateDir, 'writer.lock'), { force: true })
         }
         catch { /* already removed */ }
+    }
+    async heartbeat(): Promise<void> {
+        await this.assertWriter()
+        await this.atomicWrite(join(this.stateDir, 'writer.lock'), {
+            pid: process.pid,
+            processInstanceId,
+            fencingToken: this.fencingToken,
+            heartbeatAtMs: this.now(),
+        }, 'metadata')
     }
     async createSpace(record: SpaceRecord): Promise<void> {
         await this.withMetadataQueue(async () => {
@@ -208,13 +222,10 @@ export class TaskStore {
         }
     }
     isRevoked(id: string): boolean { return this.revocations.has(id); }
-    async revoke(id: string): Promise<void> { this.revocations.add(id); try {
+    async revoke(id: string): Promise<void> {
+        this.revocations.add(id)
         await this.writeRevocations()
     }
-    catch (error) {
-        this.revocations.delete(id)
-        throw error
-    } }
     getRevocations(): ReadonlySet<string> { return new Set(this.revocations); }
     async createTask(task: StoredTask, event: StoreEventInput): Promise<StoredTask> {
         if (this.tasks.has(task.taskId))
@@ -236,6 +247,7 @@ export class TaskStore {
         const value = this.tasks.get(id)
         return value && structuredClone(value)
     }
+    markUnreadable(id: TaskId): void { this.unreadableTasks.add(id) }
     listTasks(): StoredTask[] { return [...this.tasks.values()].map((task) => structuredClone(task)); }
     async commit(id: TaskId, patch: Partial<StoredTask>, event: StoreEventInput, business = false): Promise<StoredTask> {
         return this.withTaskQueue(id, () => this.commitNow(id, patch, event, business))
@@ -265,8 +277,9 @@ export class TaskStore {
         const body: TaskEvent = { schemaVersion: SCHEMA_VERSION, taskId: id, seq: Number(current.highWatermarkSeq) + 1,
             ...structuredClone(event), stateVersion, data: event.data }
         const envelope = { body, checksum: checksum(stable(body)) }
+        const bookkeeping = patch.stateVersion === current.stateVersion
         const next = { ...current, ...structuredClone(patch), stateVersion,
-            updatedAtMs: event.atMs, highWatermarkSeq: body.seq, lastSeq: body.seq } as StoredTask
+            updatedAtMs: bookkeeping ? current.updatedAtMs : event.atMs, highWatermarkSeq: body.seq, lastSeq: body.seq } as StoredTask
         const bytes = Buffer.byteLength(stable(next))
         const eventCount = body.seq
         if (business && (bytes > POC_LIMITS.journalMaxBytesPerTask
@@ -274,13 +287,17 @@ export class TaskStore {
             throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal business quota reached')
         if (!business && eventCount > POC_LIMITS.journalMaxEventsPerTask)
             throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task journal control reserve is exhausted')
+        let previousEventSize: number | undefined
+        let eventAppended = false
         try {
             await mkdir(taskDir, { recursive: true })
             await this.faultInjector?.('event-append')
             const handle = await open(eventFile, 'a', 0o600)
             try {
+                previousEventSize = (await handle.stat()).size
                 await handle.writeFile(`${stable(envelope)}\n`)
                 await handle.sync()
+                eventAppended = true
             }
             finally {
                 await handle.close()
@@ -291,6 +308,14 @@ export class TaskStore {
             return structuredClone(next)
         }
         catch (error) {
+            if (eventAppended && previousEventSize !== undefined) {
+                try {
+                    await truncate(eventFile, previousEventSize)
+                }
+                catch {
+                    this.unreadableTasks.add(id)
+                }
+            }
             throw journalError(error instanceof Error ? `Task journal write failed: ${error.message}` : undefined)
         }
     }
@@ -331,6 +356,8 @@ export class TaskStore {
             let lock: {
                 pid: number
                 processInstanceId?: string
+                heartbeatAtMs?: number
+                started?: number
             } | undefined
             try {
                 lock = JSON.parse(await readFile(lockPath, 'utf8')) as {
@@ -341,19 +368,8 @@ export class TaskStore {
             catch {
                 lock = undefined
             }
-            let alive = false
-            if (lock?.pid && lock.pid !== process.pid) {
-                try {
-                    process.kill(lock.pid, 0)
-                    alive = true
-                }
-                catch (killError) {
-                    alive = (killError as NodeJS.ErrnoException).code === 'EPERM'
-                }
-            }
-            else if (lock?.pid === process.pid && lock.processInstanceId === processInstanceId) {
-                alive = true
-            }
+            const heartbeatAtMs = Number(lock?.heartbeatAtMs ?? lock?.started ?? 0)
+            const alive = heartbeatAtMs > 0 && this.now() - heartbeatAtMs <= 20_000
             if (alive)
                 throw journalError('Task store already has a live writer')
             await rm(lockPath, { force: true })
@@ -375,7 +391,7 @@ export class TaskStore {
             await fence.close()
         }
         await this.lockHandle.writeFile(stable({ pid: process.pid, processInstanceId,
-            fencingToken: this.fencingToken, started: Date.now() }))
+            fencingToken: this.fencingToken, started: this.now(), heartbeatAtMs: this.now() }))
         await this.lockHandle.sync()
         await this.syncDirectory(this.stateDir)
     }
