@@ -2,7 +2,8 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BrowserRuntimeError, type AgentGrant, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type FormSubmission, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
+import type { FakePage } from './testing/fakeDriver'
 import { FakeClock } from './clock'
 import { FakeBrowserDriver } from './testing/fakeDriver'
 import { TaskStore } from './taskStore'
@@ -1613,6 +1614,85 @@ describe('BrowserRuntime durable request contract', () => {
         const journal = await readTree(h.dir)
         expect(journal).not.toContain('synthetic-password-value')
         expect(journal).not.toContain('ABP-CANARY-')
+        await h.store.close()
+    })
+})
+
+describe('approval binding to the complete submission (D6)', () => {
+    const payForm: FormSubmission = {
+        action: 'https://fixture.test/order', method: 'post', enctype: 'application/x-www-form-urlencoded', target: '',
+        fields: [['item', 'a'], ['item', 'b'], ['token', 't1'], ['note', `${'n'.repeat(50)}-tail`], ['op', 'pay']],
+        submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
+        opaque: false,
+    }
+    const payPage = (form: FormSubmission = payForm): FakePage => ({ url: 'https://fixture.test/checkout', form,
+        elements: [{ ref: '@pay' as never, role: 'button', name: 'Pay now', visible: true, frameOrigin: 'https://fixture.test' }] })
+
+    async function pendingApproval(prefix: string) {
+        const h = await createHarness(prefix)
+        h.driver.seedTab(h.opened.tabId, payPage())
+        await observeHarnessTab(h)
+        const current = await h.runtime.getTask(h.auth, { taskId: h.task.taskId })
+        const submitted = await h.runtime.submitBatch(h.auth, { taskId: h.task.taskId, expectedVersion: current.stateVersion,
+            requestId: `${prefix}-batch` as RequestId, steps: [{ stepId: 'pay' as never, actionId: 'pay-action' as never,
+                tabId: h.opened.tabId, kind: 'click', ref: '@pay' as never, timeoutMs: 1000 }] }, { waitMs: 1000 })
+        const approval = submitted.result?.pendingApproval
+        if (!approval) throw new Error('test requires a pending approval')
+        const uiCredential: InteractiveCapability = { kind: 'interactive', capabilityId: `${prefix}-ui` as never, principalId: 'p' as never,
+            workspaceId: 'w' as never, machineId: 'm' as never, viewerSessionId: 'viewer', profileId: h.profileId, operations: ['approve'],
+            issuedAtMs: 0, expiresAtMs: 3_600_000 }
+        const approve = () => h.runtime.approve({ credential: uiCredential, verifiedAtMs: h.clock.now() }, { taskId: h.task.taskId,
+            approvalId: approval.approvalId, bindingHash: approval.bindingHash, requestId: `${prefix}-approve` as RequestId, decision: 'approve' })
+        return { h, approval, approve }
+    }
+
+    it('shows the method, destination and a truncated field summary while binding the full values', async () => {
+        const { h, approval } = await pendingApproval('abp-d6-summary-')
+        expect(approval.description).toContain('POST https://fixture.test/order')
+        expect(approval.description).toContain('item=a, item=b, token=t1')
+        expect(approval.description).toContain('…')
+        expect(approval.description).not.toContain('-tail')
+        await h.store.close()
+    })
+
+    it('refuses to dispatch when anything that would be sent changed after the approval was shown', async () => {
+        const mutations: Array<[string, FormSubmission]> = [
+            ['hidden value', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'token' ? 't2' : value]) }],
+            ['truncated tail', { ...payForm, fields: payForm.fields.map(([name, value]) => [name, name === 'note' ? `${'n'.repeat(50)}-TAIL` : value]) }],
+            ['field order', { ...payForm, fields: [payForm.fields[1], payForm.fields[0], ...payForm.fields.slice(2)] }],
+            ['destination', { ...payForm, action: 'https://fixture.test/elsewhere' }],
+            ['method', { ...payForm, method: 'get' }],
+            ['submitter override', { ...payForm, submitter: { ...payForm.submitter!, formaction: '/refund' }, action: 'https://fixture.test/refund' }],
+        ]
+        for (const [label, mutated] of mutations) {
+            const { h, approve } = await pendingApproval(`abp-d6-${label.replace(/ /g, '-')}-`)
+            h.driver.seedTab(h.opened.tabId, payPage(mutated))
+            await expect(approve(), label).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+            expect(h.driver.dispatchCounts.get('pay-action') ?? 0, label).toBe(0)
+            await h.store.close()
+        }
+    })
+
+    it('refuses to dispatch when the element re-bound right before dispatch is not the approved one', async () => {
+        const { h, approve } = await pendingApproval('abp-d6-identity-')
+        h.driver.seedTab(h.opened.tabId, { ...payPage(), identitySalt: 'rebound' })
+        await expect(approve()).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+        expect(h.driver.dispatchCounts.get('pay-action') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('refuses to dispatch when the approved element was relabelled in place', async () => {
+        const { h, approve } = await pendingApproval('abp-d6-relabel-')
+        h.driver.seedTab(h.opened.tabId, { ...payPage(), currentNames: { '@pay': 'Pay 10x now' } })
+        await expect(approve()).rejects.toMatchObject({ code: 'APPROVAL_EXPIRED' })
+        expect(h.driver.dispatchCounts.get('pay-action') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('dispatches exactly once when nothing changed', async () => {
+        const { h, approve } = await pendingApproval('abp-d6-unchanged-')
+        expect((await approve()).outcome).toBe('approved')
+        expect(h.driver.dispatchCounts.get('pay-action')).toBe(1)
         await h.store.close()
     })
 })

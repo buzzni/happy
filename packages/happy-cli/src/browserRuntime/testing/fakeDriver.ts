@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
+import { BrowserRuntimeError, type BrowserDriver, type BrowserInstanceId, type DriverOptions, type DriverTabHandle, type ElementDescription, type ElementRef, type FormSubmission, type ObservedElement, type Observation, type ScreenshotResult, type SnapshotId, type TabId, type WaitPredicate } from '../contracts'
+import { formDigest } from '../policy'
 
-export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[]; formAction?: string; formValues?: Record<string, string> }
+export interface FakePage { url: string; title?: string; text?: string; elements?: ObservedElement[]; documentGeneration?: number; frameOrigins?: string[]; formAction?: string; formValues?: Record<string, string>
+    /** Form the page's button elements submit (describeRef returns it with its digest) */
+    form?: FormSubmission
+    /** Changes describeRef identities without changing anything else (a re-bound node) */
+    identitySalt?: string
+    /** Current (live) accessible names by ref, when a node was relabelled in place */
+    currentNames?: Record<string, string> }
 type Operation = 'openTab' | 'closeTab' | 'navigate' | 'observe' | 'describeRef' | 'screenshot' | 'click' | 'fill' | 'waitFor' | 'adoptTab'
 interface HeldDispatch {
     operation: Operation
@@ -103,10 +110,14 @@ export class FakeBrowserDriver implements BrowserDriver {
         const values = page.formValues ?? Object.fromEntries((page.elements ?? []).flatMap((element) =>
             element.value !== undefined && !/password/i.test(element.name) ? [[element.name, element.value]] : []))
         const formValues = Object.fromEntries(Object.entries(values).filter(([name]) => !/password/i.test(name)))
+        const submits = !!page.form && described.role === 'button'
         return { ref, role: described.role, name: described.name, frameOrigin: described.frameOrigin,
             pageUrl: page.url, formAction: page.formAction ?? described.formAction,
             formValues: structuredClone(formValues), documentGeneration: page.documentGeneration ?? 1,
-            identity: Buffer.from(JSON.stringify({ element: described, documentGeneration: page.documentGeneration ?? 1 })).toString('base64url') }
+            identity: Buffer.from(JSON.stringify({ element: described, documentGeneration: page.documentGeneration ?? 1,
+                ...(page.identitySalt ? { salt: page.identitySalt } : {}) })).toString('base64url'),
+            currentRole: currentElement.role, currentName: page.currentNames?.[ref] ?? currentElement.name,
+            ...(page.form ? { form: { ...structuredClone(page.form), digest: formDigest(page.form) }, submitsForm: submits } : {}) }
     }
     async restoreRef(tabId: TabId, snapshotId: SnapshotId, ref: ElementRef, identity: string, opts: DriverOptions): Promise<'present' | 'restored' | 'gone'> {
         await this.delay('describeRef', opts)

@@ -848,6 +848,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (!description)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval reference can no longer be verified')
+        if (approval.elementIdentity && description.identity !== approval.elementIdentity)
+            throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval element was re-bound to a different node')
         if (this.clock.now() >= Number(approval.expiresAtMs) || originalGrant.expiresAtMs <= this.clock.now()
             || this.options.store.isRevoked(originalGrant.grantId))
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval or execution grant expired before dispatch')
@@ -1723,6 +1725,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         || liveLease.owner.segmentId !== batchId || driver.browserInstanceId() !== boundApproval.browserInstanceId
                         || origin !== boundApproval.origin || description.documentGeneration !== boundApproval.documentGeneration
                         || description.frameOrigin !== boundApproval.frameOrigin || currentBindingHash !== boundApproval.payloadHash
+                        || (boundApproval.elementIdentity !== undefined && description.identity !== boundApproval.elementIdentity)
                         || recomputedApprovalBinding !== boundApproval.bindingHash)
                         throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed before dispatch')
                 }
@@ -1737,13 +1740,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         origin,
                         leaseEpoch,
                         browserInstanceId: driver.browserInstanceId(),
-                        documentGeneration: description?.documentGeneration ?? 0,
                         snapshotId: agentSnapshot!,
-                        frameOrigin: description!.frameOrigin,
-                        currentPageUrl: description!.pageUrl,
-                        elementName: description?.name,
-                        elementIdentity: description?.identity,
-                        formValues: description ? Object.entries(description.formValues).map(([name, value]) => ({ name, value })) : [],
+                        description: description!,
                         expiresAtMs,
                     })
                     const approvalId = approval.summary.approvalId
