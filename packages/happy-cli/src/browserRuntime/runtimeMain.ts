@@ -35,6 +35,7 @@ interface KeysFile extends AuthKeys {
 
 const RECONNECT_BACKOFF_MS = [250, 500, 1_000, 2_000, 5_000]
 const SWEEP_INTERVAL_MS = 1_000
+const LOCK_HEARTBEAT_MS = 5_000
 
 function requiredEnv(name: string): string {
     const value = process.env[name]
@@ -199,6 +200,13 @@ async function main(): Promise<void> {
         })
     }
 
+    // Keeps the writer lock's heartbeat fresh; another Runtime may only take the
+    // store over once this stops (the lease expires after 20 s without it).
+    const heartbeat = setInterval(() => {
+        void store.heartbeat().catch((error) => log(`lock heartbeat failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+    }, LOCK_HEARTBEAT_MS)
+    heartbeat.unref()
+
     let sweeping = false
     const sweep = setInterval(() => {
         // A slow sweep (journal fsync) must not overlap the next tick.
@@ -228,6 +236,7 @@ async function main(): Promise<void> {
 
     const shutdown = async () => {
         clearInterval(sweep)
+        clearInterval(heartbeat)
         await server.close()
         for (const driver of drivers.values()) await driver.close()
         await store.close()
