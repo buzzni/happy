@@ -163,8 +163,10 @@ describe('runtime HTTP server', () => {
         expect(res.status).toBe(200)
         expect(res.headers.get('content-type')).toContain('text/html')
         const html = await res.text()
-        expect(html).toContain('sessionStorage')
+        // The capability is kept in memory only (fragment hand-off, D12).
+        expect(html).not.toContain('sessionStorage')
         expect(html).not.toContain('localStorage')
+        expect(html).toContain('abp-capability-request')
     })
 })
 
