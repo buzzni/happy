@@ -129,8 +129,9 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             <button onclick="fetch('${c.url('/hit/fetch')}', { method: 'POST', mode: 'no-cors', body: 'x' })">Fetch away</button>
             <button onclick="navigator.sendBeacon('${c.url('/hit/beacon')}', 'x')">Beacon away</button>
             <button onclick="window.open('${a.url('/plain')}')">Open allowed</button>
+            <button onclick="window.open('${a.url('/hit/over-cap')}')">Open over cap</button>
             <iframe src="${c.url('/hit/frame')}"></iframe></body>`)
-        a.route('/meta-refresh', () => `<head><meta http-equiv="refresh" content="0.3;url=${c.url('/hit/meta')}"></head><body>Refreshing</body>`)
+        a.route('/meta-refresh', () => `<head><meta http-equiv="refresh" content="1;url=${c.url('/hit/meta')}"></head><body>Refreshing</body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -226,6 +227,79 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 for (const tab of again) await capped.closeTab(tab.tabId, OPTS)
             } finally {
                 await capped.close()
+            }
+        })
+    })
+
+    describe('window reservations', () => {
+        const cappedDriver = async (maxAgentWindows: number, testHooks?: ConstructorParameters<typeof CdpDriver>[0]['testHooks']) => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows, testHooks })
+            await capped.connect()
+            return capped
+        }
+
+        it('counts a registered tab once while its page is still loading, so a staggered second open fits', async () => {
+            const capped = await cappedDriver(2)
+            try {
+                const slow = capped.openTab(a.url('/slow-load'), [a.origin], { timeoutMs: 20_000 })
+                await eventually(() => capped.debugCounts().tabs, (n) => n === 1)
+                const second = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                const first = await slow
+                expect(capped.debugCounts().windows).toBe(2)
+                await capped.closeTab(first.tabId, OPTS)
+                await capped.closeTab(second.tabId, OPTS)
+                expect(capped.debugCounts().windows).toBe(0)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('keeps a window reserved until its target is confirmed gone, even when cleanup failed', async () => {
+            let closeFails = true
+            const capped = await cappedDriver(1, { discardCloseFails: () => closeFails })
+            try {
+                await expectCode(capped.openTab(a.url('/slow-load'), [a.origin], { timeoutMs: 1_000 }), 'OUTCOME_UNKNOWN')
+                // The discarded tab is forgotten, but its window was never confirmed gone.
+                await eventually(() => capped.debugCounts().tabs, (n) => n === 0, 10_000)
+                expect(capped.debugCounts().windows).toBe(1)
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                closeFails = false
+                const leftover = (await harness.targets()).filter((t) => t.url.includes('/slow-load'))
+                for (const target of leftover) await harness.closeTarget(target.targetId)
+                await eventually(() => capped.debugCounts().windows, (n) => n === 0)
+                const tab = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('counts popups of owned tabs and closes one that would exceed the cap before it loads', async () => {
+            // Its own browser: a second driver on the same browser would release the paused popup.
+            const own = await launchChrome()
+            const capped = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            const ownHarness = await HarnessCdp.connect(own.browserWsUrl)
+            try {
+                const tab = await capped.openTab(a.url('/exfil'), [a.origin], OPTS)
+                const obs = await capped.observe(tab.tabId, [a.origin], OPTS)
+                const press = (name: string) => capped.click(tab.tabId, obs.elements.find((e) => e.name === name)!.ref, obs.snapshotId, OPTS)
+                await press('Open allowed')
+                await eventually(() => capped.debugCounts().windows, (n) => n === 2)
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                await press('Open over cap')
+                await delay(800)
+                expect(a.hits('over-cap')).toBe(0)
+                expect(capped.debugCounts().windows).toBe(2)
+                const popup = capped.popupReports().find((p) => p.origin === a.origin && !p.closed)!
+                await ownHarness.closeTarget(popup.targetId)
+                await eventually(() => capped.debugCounts().windows, (n) => n === 1)
+                await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+                ownHarness.close()
+                await own.stop()
             }
         })
     })
@@ -628,7 +702,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 await delay(300)
             }
             const meta = await open('/meta-refresh', [a.origin])
-            await delay(1_500)
+            await delay(2_500)
             for (const hit of ['open', 'noopener', 'blank', 'post', 'fetch', 'beacon', 'frame', 'meta']) expect(c.hits(hit), hit).toBe(0)
             expect(driver.blockedReports().filter((report) => report.origin === c.origin).length).toBeGreaterThanOrEqual(6)
             expect(JSON.stringify(driver.blockedReports())).not.toContain('/hit/')
@@ -691,7 +765,8 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const withA = await eventually(() => mine(driver.popupReports()), (r) => r.some((p) => p.origin === a.origin))
             const popupA = withA.find((p) => p.origin === a.origin)!
             expect(popupA.closed).toBe(false)
-            expect(driver.debugCounts()).toEqual(before)
+            // Never adopted as an owned tab, but it is a live agent window.
+            expect(driver.debugCounts()).toEqual({ ...before, windows: before.windows + 1 })
             await harness.closeTarget(popupA.targetId)
         })
     })
@@ -802,7 +877,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 await first.kill()
                 await pendingRejected
                 expect(lossy.hasTab(tab.tabId)).toBe(false)
-                expect(lossy.debugCounts()).toEqual({ tabs: 0, sessions: 0 })
+                expect(lossy.debugCounts()).toEqual({ tabs: 0, sessions: 0, windows: 0 })
                 expect(disconnects).toBe(1)
                 expect(lossy.isConnected()).toBe(false)
                 expect(() => lossy.browserInstanceId()).toThrow()

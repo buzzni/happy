@@ -51,6 +51,8 @@ export interface CdpDriverOptions {
     /** Test seams. Not for production wiring. */
     testHooks?: {
         afterCapture?: (tabId: TabId) => Promise<void>
+        /** Simulates a failed cleanup: discardTarget does not send Target.closeTarget while this returns true. */
+        discardCloseFails?: () => boolean
     }
 }
 
@@ -237,8 +239,14 @@ export class CdpDriver implements BrowserDriver {
     private readonly popups = new Map<string, PopupReport>()
     private readonly disconnectListeners = new Set<() => void>()
     private readonly dialogs: DialogReport[] = []
-    /** openTab calls that hold a window slot but have not registered (or dropped) their tab yet */
-    private opening = 0
+    /**
+     * Agent page targets that are alive (owned tabs and their popups): a reservation is
+     * taken before the target exists (pendingWindows), moves here when it does, and is
+     * released only when the browser confirms the target is gone.
+     */
+    private readonly windows = new Set<string>()
+    private pendingWindows = 0
+    private readonly destroyedWaiters = new Map<string, Set<() => void>>()
     /** Every session whose requests are checked → the tab whose allowed origins apply */
     private readonly guarded = new Map<string, TabState>()
     /** Popup target → the owned tab it (transitively) came from */
@@ -329,8 +337,8 @@ export class CdpDriver implements BrowserDriver {
     }
 
     /** For leak checks (A12): owned tabs and attached sessions. */
-    debugCounts(): { tabs: number; sessions: number } {
-        return { tabs: this.tabs.size, sessions: this.sessions.size }
+    debugCounts(): { tabs: number; sessions: number; windows: number } {
+        return { tabs: this.tabs.size, sessions: this.sessions.size, windows: this.windows.size + this.pendingWindows }
     }
 
     /** JavaScript dialogs the driver dismissed on owned tabs (most recent last, bounded). */
@@ -355,13 +363,11 @@ export class CdpDriver implements BrowserDriver {
     openTab(url: string, allowedOrigins: string[], opts: DriverOptions): Promise<DriverTabHandle> {
         return this.run(opts, async (op, conn) => {
             if (!allowedOrigins.includes(originOf(url))) throw originDenied('requested origin is not allowed')
-            // Every owned tab is a window, and windows are what cost browser memory:
-            // the cap counts opens still in flight so concurrent calls cannot overshoot it.
-            if (this.tabs.size + this.opening >= (this.options.maxAgentWindows ?? DEFAULT_MAX_AGENT_WINDOWS)) {
+            // Every owned tab (and popup) is a window, and windows are what cost browser memory.
+            if (!this.windowAvailable()) {
                 throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'agent window limit reached; close a page first', true, false)
             }
-            this.opening += 1
-            try {
+            {
                 op.markDispatch()
                 // Each owned tab gets its own background window: in a headful browser a
                 // background tab inside the user's window is hidden, so it neither paints
@@ -380,10 +386,28 @@ export class CdpDriver implements BrowserDriver {
                     await this.discardTarget(conn, targetId, tab)
                     throw error
                 }
-            } finally {
-                this.opening -= 1
             }
         })
+    }
+
+    /** Resolves once the browser reports the target destroyed (or after `ms`). */
+    private targetDestroyed(targetId: string, ms = CLOSE_CONFIRM_MS): Promise<void> {
+        if (!this.windows.has(targetId)) return Promise.resolve()
+        return new Promise<void>((resolve) => {
+            const waiters = this.destroyedWaiters.get(targetId) ?? new Set()
+            this.destroyedWaiters.set(targetId, waiters)
+            const done = () => {
+                clearTimeout(timer)
+                waiters.delete(done)
+                resolve()
+            }
+            const timer = setTimeout(done, ms)
+            waiters.add(done)
+        })
+    }
+
+    private windowAvailable(): boolean {
+        return this.windows.size + this.pendingWindows < (this.options.maxAgentWindows ?? DEFAULT_MAX_AGENT_WINDOWS)
     }
 
     adoptTab(tabId: TabId, targetId: string, allowedOrigins: string[], opts: DriverOptions): Promise<boolean> {
@@ -394,6 +418,7 @@ export class CdpDriver implements BrowserDriver {
             const target = targetInfos.find((info) => info.targetId === targetId && info.type === 'page')
             if (!target) return false
             const sessionId = await this.attachExplicitly(conn, targetId)
+            this.windows.add(targetId)
             const tab = this.registerTab(targetId, sessionId, allowedOrigins, tabId)
             tab.mainUrl = target.url
             await this.setupSession(conn, sessionId, true)
@@ -408,8 +433,14 @@ export class CdpDriver implements BrowserDriver {
      */
     private async createOwnedTarget(conn: CdpConnection): Promise<{ targetId: string; sessionId: string }> {
         this.creating += 1
+        this.pendingWindows += 1
+        let reserved = true
         try {
             const { targetId } = await conn.send('Target.createTarget', { url: 'about:blank', background: true, newWindow: true })
+            // The reservation moves to the live target in the same tick.
+            this.pendingWindows -= 1
+            reserved = false
+            this.windows.add(targetId)
             const held = this.unclaimed.get(targetId)
             if (held) {
                 this.unclaimed.delete(targetId)
@@ -428,6 +459,7 @@ export class CdpDriver implements BrowserDriver {
             if (claimed) return { targetId, sessionId: claimed }
             return { targetId, sessionId: await this.attachExplicitly(conn, targetId) }
         } finally {
+            if (reserved) this.pendingWindows -= 1
             this.creating -= 1
             if (this.creating === 0) {
                 for (const [targetId, sessionId] of [...this.unclaimed]) {
@@ -484,6 +516,18 @@ export class CdpDriver implements BrowserDriver {
             this.popupTabs.set(info.targetId, openerTab)
             this.popupSessions.set(sessionId, info.targetId)
             this.onTargetInfo(conn, info)
+            if (!this.windowAvailable()) {
+                // Over the window cap. It must still run (a same-site popup shares the opener's
+                // renderer, which stays paused with it), but as a closed popup every request of
+                // it is failed unsent; then it is closed.
+                const report = this.popups.get(info.targetId)
+                if (report) report.closed = true
+                void this.guardSession(conn, sessionId, openerTab)
+                    .then(() => conn.send('Target.closeTarget', { targetId: info.targetId }))
+                    .catch(() => undefined)
+                return
+            }
+            this.windows.add(info.targetId)
             void this.guardSession(conn, sessionId, openerTab)
             return
         }
@@ -529,8 +573,9 @@ export class CdpDriver implements BrowserDriver {
                 setTimeout(resolve, CLOSE_CONFIRM_MS)
             })
             : Promise.resolve()
-        await conn.send('Target.closeTarget', { targetId }).catch(() => undefined)
+        if (!this.options.testHooks?.discardCloseFails?.()) await conn.send('Target.closeTarget', { targetId }).catch(() => undefined)
         await gone
+        await this.targetDestroyed(targetId)
         if (tab) {
             this.closedTabs.delete(tab.tabId)
             this.forgetTab(tab)
@@ -566,7 +611,8 @@ export class CdpDriver implements BrowserDriver {
                 })
                 const onGone = () => {
                     cleanup()
-                    resolve({ closed: true })
+                    // Report closed once the window is really gone (its reservation is released then).
+                    void this.targetDestroyed(tab.targetId).then(() => resolve({ closed: true }))
                 }
                 const cleanup = () => {
                     offDialog()
@@ -1019,6 +1065,7 @@ export class CdpDriver implements BrowserDriver {
         for (const tab of [...this.tabs.values()]) this.forgetTab(tab)
         this.sessions.clear()
         this.guarded.clear()
+        this.windows.clear()
         this.popupTabs.clear()
         this.popupSessions.clear()
         this.unclaimed.clear()
@@ -1028,14 +1075,15 @@ export class CdpDriver implements BrowserDriver {
     private async setupSession(conn: CdpConnection, sessionId: string, isMain: boolean): Promise<void> {
         const tab = this.sessions.get(sessionId)?.tab
         if (tab) this.guarded.set(sessionId, tab)
-        const commands: Array<Promise<unknown>> = [
-            conn.send('Page.enable', {}, sessionId),
+        // A paused target answers only these before it runs; Page/Emulation wait for the resume.
+        await Promise.all([
             conn.send('Fetch.enable', { patterns: FETCH_PATTERNS }, sessionId),
             conn.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId),
-        ]
+        ])
+        await conn.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => undefined)
+        const commands: Array<Promise<unknown>> = [conn.send('Page.enable', {}, sessionId)]
         if (isMain) commands.push(conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId))
         await Promise.all(commands)
-        await conn.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => undefined)
     }
 
     private wire(conn: CdpConnection): void {
@@ -1094,6 +1142,9 @@ export class CdpDriver implements BrowserDriver {
             const popup = this.popups.get(params.targetId)
             if (popup) popup.closed = true
             this.popupTabs.delete(params.targetId)
+            this.windows.delete(params.targetId)
+            for (const done of [...this.destroyedWaiters.get(params.targetId) ?? []]) done()
+            this.destroyedWaiters.delete(params.targetId)
         }
         conn.on('Target.targetDestroyed', onTargetEnded)
         conn.on('Target.targetCrashed', onTargetEnded)
@@ -1113,7 +1164,9 @@ export class CdpDriver implements BrowserDriver {
         conn.on('Fetch.requestPaused', (params, sessionId) => {
             if (!current() || !sessionId) return
             const tab = this.guarded.get(sessionId)
-            if (tab && this.destinationAllowed(params.request.url, tab.allowedOrigins)) {
+            // A popup closed over the cap may still have its first request paused in the opener's session.
+            const closedPopup = this.popups.get(params.frameId)?.closed === true
+            if (tab && !closedPopup && this.destinationAllowed(params.request.url, tab.allowedOrigins)) {
                 conn.send('Fetch.continueRequest', { requestId: params.requestId }, sessionId).catch(() => undefined)
                 return
             }
