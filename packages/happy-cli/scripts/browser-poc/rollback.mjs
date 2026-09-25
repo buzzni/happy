@@ -46,6 +46,6 @@ for(let attempt=0;attempt<30;attempt++){ try { const response=await fetch(`http:
 if(!report.viewerAvailable) throw Error('noVNC viewer unavailable after browser restart');
 // Leave synthetic profile volumes intact for inspection; remove containers/network only.
 docker('rm','-f',...Object.values(env.containers));
-docker('network','rm',env.names.network);
+for (const network of docker('network','ls','-q','--filter',`label=ai.saycode.abp-run=${run}`).split('\n').filter(Boolean)) docker('network','rm',network);
 report.cleanup=true; report.profileVolumesPreserved=[env.names.profileA,env.names.profileB];
 writeFileSync(reportPath,JSON.stringify(report,null,2)); console.log(JSON.stringify(report));

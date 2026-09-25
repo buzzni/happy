@@ -61,9 +61,9 @@ async function control(s, method, path, payload) {
 function up(run, argv) {
   const names = resourceNames(run), rebuild = argv.includes("--rebuild"), runtimeBundle = opt(argv, "--runtime-bundle"), envFile = opt(argv, "--runtime-env"), keysFile = opt(argv, "--runtime-keys");
   const labels = dockerLabels(run), network = names.network;
-  docker("network", "create", ...labels, network);
   // Each browser gets its own network: the Runtime and the fixture join both, but a
   // browser (or a page in it) can never reach the other profile's CDP endpoint.
+  // No shared network: two per run keeps docker's default address pools from running out.
   const browserNetworks = { a: `${network}-a`, b: `${network}-b` };
   for (const net of Object.values(browserNetworks)) docker("network", "create", ...labels, net);
   for (const volume of [names.profileA, names.profileB, names.state, names.fixtureData]) docker("volume", "create", ...labels, volume);
@@ -73,8 +73,8 @@ function up(run, argv) {
   const harnessToken = randomBytes(32).toString("hex");
   // RFB passwords are at most 8 characters.
   const vncPassword = randomBytes(6).toString("base64url").slice(0, 8);
-  const fixture = runContainer(names.fixture, run, ["--network", network, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", "127.0.0.1::9099", "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, IMAGES.fixture]);
-  for (const net of Object.values(browserNetworks)) docker("network", "connect", "--alias", "a.poc-one.test", "--alias", "b.poc-two.test", "--alias", "c.poc-three.test", net, fixture);
+  const fixture = runContainer(names.fixture, run, ["--network", browserNetworks.a, "--network-alias", "a.poc-one.test", "--network-alias", "b.poc-two.test", "--network-alias", "c.poc-three.test", "-p", "127.0.0.1::9099", "-e", `HARNESS_TOKEN=${harnessToken}`, "-e", "FIXTURE_PORT=8080", "-e", "CONTROL_PORT=9099", "-v", `${names.fixtureData}:/var/lib/abp`, IMAGES.fixture]);
+  docker("network", "connect", "--alias", "a.poc-one.test", "--alias", "b.poc-two.test", "--alias", "c.poc-three.test", browserNetworks.b, fixture);
   const fixtureIpOn = (net) => docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${net}").IPAddress}}`, fixture);
   const hostRulesFor = (net) => { const ip = fixtureIpOn(net); return `MAP a.poc-one.test ${ip},MAP b.poc-two.test ${ip},MAP c.poc-three.test ${ip}`; };
   const browsers = {};
@@ -82,11 +82,11 @@ function up(run, argv) {
   let runtime;
   if (runtimeBundle) {
     const env = envFile ? JSON.parse(readFileSync(resolve(envFile), "utf8")) : {};
-    const args = ["--network", network, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", "127.0.0.1::8787", "-p", "127.0.0.1::8788"];
+    const args = ["--network", browserNetworks.a, "--network-alias", "runtime", "--read-only", "--tmpfs", "/tmp:rw,size=64m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g", "--cpus", "1", "-v", `${names.state}:/var/lib/abp`, "-v", `${resolve(runtimeBundle)}:/app/runtime.mjs:ro`, "-p", "127.0.0.1::8787", "-p", "127.0.0.1::8788"];
     if (keysFile) args.push("-v", `${resolve(keysFile)}:/app/keys.json:ro`);
     for (const [k, v] of Object.entries(env)) args.push("-e", `${k}=${v}`);
     runtime = runContainer(names.runtime, run, [...args, IMAGES.runtime]);
-    for (const net of Object.values(browserNetworks)) docker("network", "connect", net, runtime);
+    docker("network", "connect", "--alias", "runtime", browserNetworks.b, runtime);
   }
   const s = { run, names, containers: { fixture, browserA: browsers.a, browserB: browsers.b, ...runtime ? { runtime } : {} }, ports: { control: port(fixture, 9099), novncA: port(browsers.a, 6080), novncB: port(browsers.b, 6080), ...runtime ? { runtime: port(runtime, 8787), admin: port(runtime, 8788) } : {} }, harnessToken, vncPassword, runtimeBundle: runtimeBundle ? resolve(runtimeBundle) : void 0, runtimeEnv: envFile ? resolve(envFile) : void 0 };
   const path = statePath(run);
@@ -118,7 +118,16 @@ function fault(run, argv) {
 }
 async function main(argv = process.argv.slice(2)) {
   const [cmd, ...args] = argv, run = validateRun(opt(args, "--run"));
-  if (cmd === "up") return up(run, args);
+  if (cmd === "up") {
+    try {
+      return up(run, args);
+    } catch (error) {
+      // A half-created run (e.g. network creation failed) must not leak containers or
+      // networks: every later run would inherit the exhausted address pool.
+      try { down(run, false); } catch {}
+      throw error;
+    }
+  }
   if (cmd === "down") return down(run, args.includes("--purge"));
   if (cmd === "ps") return { containers: allLabelled(run, "container"), networks: allLabelled(run, "network"), volumes: allLabelled(run, "volume") };
   if (cmd === "fault") return fault(run, args.slice(0, 1).concat(args.slice(1)));
