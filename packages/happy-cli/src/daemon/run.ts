@@ -1643,7 +1643,9 @@ export async function startDaemon(): Promise<void> {
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
     // Execution machine H only: per-session Agent Browser grants via the Runtime broker.
-    const browserTaskBroker = createBrowserTaskSessionBroker();
+    const browserTaskBroker = createBrowserTaskSessionBroker(process.env, undefined, {
+      pendingRevocationsFile: join(configuration.happyHomeDir, 'browser-task-revocations.json'),
+    });
 
     const spawnSession = async (
       options: SpawnSessionOptions,

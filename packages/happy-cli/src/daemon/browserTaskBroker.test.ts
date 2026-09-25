@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -54,5 +54,40 @@ describe('daemon browser task broker hook', () => {
         expect(await broker.register()).toBeUndefined()
         expect(await broker.bind('reg-1', 'session-1')).toBe(false)
         await expect(broker.revoke({ registrationId: 'reg-1' })).resolves.toBeUndefined()
+    })
+
+    it('keeps a failed revocation on disk and retries it until the Runtime confirms', async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-broker-')); dirs.push(dir)
+        const pendingRevocationsFile = join(dir, 'pending.json')
+        let reachable = false
+        const paths: string[] = []
+        const request = async (_socket: string, _method: 'GET' | 'POST', path: string) => {
+            paths.push(path)
+            if (!reachable) throw new Error('ECONNREFUSED')
+            return { status: 200, body: { ok: true, result: { revoked: true, grants: 1 } } }
+        }
+        const env = { HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }
+        const broker = createBrowserTaskSessionBroker(env, request, { pendingRevocationsFile, retryBaseMs: 3_600_000 })!
+        await broker.revoke({ agentSessionId: 'session-1' })
+        expect(JSON.parse(await readFile(pendingRevocationsFile, 'utf8'))).toEqual({ schemaVersion: 1, pending: [{ agentSessionId: 'session-1' }] })
+        expect(await broker.retryPendingRevocations()).toBe(1)
+
+        // A daemon restart picks the pending revocation up from disk.
+        reachable = true
+        const restarted = createBrowserTaskSessionBroker(env, request, { pendingRevocationsFile, retryBaseMs: 3_600_000 })!
+        expect(await restarted.retryPendingRevocations()).toBe(0)
+        expect(JSON.parse(await readFile(pendingRevocationsFile, 'utf8')).pending).toEqual([])
+        expect(paths.filter((path) => path === '/v1/sessions/revoke').length).toBeGreaterThanOrEqual(3)
+    })
+
+    it('retries a revocation the Runtime could not finish (503) but drops one it rejects as invalid', async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-broker-')); dirs.push(dir)
+        const error = (code: string) => ({ ok: false, error: { code, message: '', retryable: false, mayHaveSideEffects: false } }) as never
+        const replies = [{ status: 503, body: error('RUNTIME_UNAVAILABLE') }, { status: 400, body: error('INVALID_REQUEST') }]
+        const request = async () => replies.shift() ?? { status: 200, body: { ok: true, result: {} } as never }
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() },
+            request, { pendingRevocationsFile: join(dir, 'pending.json'), retryBaseMs: 3_600_000 })!
+        await broker.revoke({ registrationId: 'reg-1' })
+        expect(await broker.retryPendingRevocations()).toBe(0)
     })
 })
