@@ -115,6 +115,22 @@ describe('Runtime in production mode', () => {
         expect(() => docker(['exec', '--user', `${RUNTIME_UID}:${RUNTIME_UID}`, name, 'cat', '/etc/abp/runtime.json'])).toThrow()
     })
 
+    it('keeps only the intended descriptors after dropping root: no config, one flock, the two socket listeners', () => {
+        // The dropped process is not dumpable: a root helper with SYS_PTRACE in its pid namespace reads /proc/1.
+        const audit = docker(['run', '--rm', '--label', `ai.saycode.abp-run=${stack.run}`, '--pid', `container:${name}`, '--user', '0:0',
+            '--cap-drop', 'ALL', '--cap-add', 'SYS_PTRACE', '--entrypoint', 'sh', image, '-c',
+            'for f in /proc/1/fd/*; do echo "fd $(readlink "$f")"; done; grep " /run/abp/" /proc/1/net/unix'])
+        const targets = audit.split('\n').filter((line) => line.startsWith('fd ')).map((line) => line.slice(3))
+        expect(targets.filter((target) => target.startsWith('/etc/abp'))).toEqual([])
+        expect(targets.filter((target) => target === '/var/lib/abp/state/runtime.flock')).toHaveLength(1)
+        expect(targets.filter((target) => !/^(\/dev\/null|pipe:|anon_inode:|socket:|\/var\/lib\/abp\/state\/)/.test(target))).toEqual([])
+        // /proc/net/unix: "<addr>: <refs> <proto> <flags> <type> <state> <inode> <path>"; state 01 = listening.
+        const listeners = audit.split('\n').filter((line) => !line.startsWith('fd ')).map((line) => line.trim().split(/\s+/))
+            .map((fields) => ({ state: fields[5], inode: fields[6], path: fields[7] }))
+        expect(listeners.map((listener) => `${listener.path}:${listener.state}`).sort()).toEqual(['/run/abp/admin.sock:01', '/run/abp/broker.sock:01'])
+        for (const listener of listeners) expect(targets).toContain(`socket:[${listener.inode}]`)
+    })
+
     it('holds the writer flock, publishes no admin port and serves readiness', async () => {
         const stderr = execFileSync('sh', ['-c', 'docker logs "$0" 2>&1', name], { encoding: 'utf8' })
         expect(stderr).toMatch(new RegExp(`dropped root uid=${RUNTIME_UID} gid=${RUNTIME_UID}`))
