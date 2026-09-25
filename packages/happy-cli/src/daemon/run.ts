@@ -137,6 +137,7 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { createBrowserTaskSessionBroker, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { startBrowserAttentionWatcher } from './browserAttentionDelivery';
 import {
   createProcFs,
   createProcProcessProbe,
@@ -707,6 +708,7 @@ export async function startDaemon(): Promise<void> {
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
+  let stopBrowserAttention: () => Promise<void> = async () => undefined;
   try {
     // npm 12 blocks install scripts it was not told to allow, so a plain
     // `npm i -g` can leave the postinstall artifacts behind. Restore them before
@@ -4725,6 +4727,8 @@ export async function startDaemon(): Promise<void> {
     const cleanupAndShutdown = async (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string) => {
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
 
+      await stopBrowserAttention();
+
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {
         clearInterval(restartOnStaleVersionAndHeartbeat);
@@ -4778,12 +4782,25 @@ export async function startDaemon(): Promise<void> {
       process.exit(0);
     };
 
+    stopBrowserAttention = startBrowserAttentionWatcher({
+      happyHomeDir: configuration.happyHomeDir,
+      serverUrl: configuration.serverUrl,
+      machineId,
+      findSession: findTrackedSessionById,
+      isAlive: (pid) => pid > 0 && isPidAlive(pid),
+      readToken: async (session) => session.userHomeDir
+        ? readStagedTokenFromHomeDir(session.userHomeDir)
+        : credentials.token,
+      log: (message) => logger.debug(message),
+    });
+
     logger.debug('[DAEMON RUN] Daemon started successfully, waiting for shutdown request');
 
     // Wait for shutdown request
     const shutdownRequest = await resolvesWhenShutdownRequested;
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
+    await stopBrowserAttention();
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));
