@@ -341,7 +341,11 @@ async function main(): Promise<void> {
             ? { socketPath: config?.adminSocketPath ?? '/run/abp/admin.sock' }
             : { host, port: adminPort, adminToken: harnessKeys.adminToken },
         metrics: () => collectRuntimeMetrics({ store, drivers, stateDir, fenceAcksMs }),
-        revokeCapability: (capabilityId) => store.revoke(capabilityId),
+        // Viewers of the capability stop synchronously, before the revocation is persisted (D2).
+        revokeCapability: (capabilityId) => {
+            viewer?.revokeCapability(capabilityId)
+            return store.revoke(capabilityId)
+        },
     })
     let broker: Broker | undefined
     if (config?.daemonTokenSha256) {
