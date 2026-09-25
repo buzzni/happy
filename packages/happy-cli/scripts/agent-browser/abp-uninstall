@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# abp-uninstall — remove the Agent Browser services from execution machine H.
+#
+#   abp-uninstall [--dry-run] [--purge]
+#
+# Default: stops and removes the services, containers, networks, owner firewall
+# rules, sudoers drop-in, tmpfiles entry and installed tools. KEEPS the profile
+# and journal volumes (abp-profile-*, abp-state), /etc/abp, /var/lib/abp
+# (secrets, image digests), the mandatory sandbox policy, the Happy package and
+# the accounts, so abp-install can bring the machine back without losing tasks.
+# --purge also deletes those volumes, images, /etc/abp, /var/lib/abp, the Happy
+# package and the sandbox/egress policies. Accounts and their homes are never
+# deleted (they hold the agent's Happy and Claude logins); see README.
+set -euo pipefail
+export LC_ALL=C
+DRY_RUN=0
+PURGE=0
+LABEL=ai.saycode.abp=stack
+LIBEXEC=/usr/local/libexec/abp
+
+# Stable across bash versions: plain words as they are, anything else single-quoted.
+quote() {
+    local out="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            "" | *[!A-Za-z0-9_./:=,@+%{}-]*) out="$out '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'" ;;
+            *) out="$out $arg" ;;
+        esac
+    done
+    printf '%s' "${out# }"
+}
+run() { if [ "$DRY_RUN" = 1 ]; then printf '+ %s\n' "$(quote "$@")"; else "$@"; fi; }
+# Best effort: a half-installed machine must still uninstall.
+try() { run "$@" || printf 'abp-uninstall: warning: %s failed\n' "$1" >&2; }
+say() { printf '== %s\n' "$*"; }
+listed() { if [ "$DRY_RUN" = 1 ]; then printf '<%s>\n' "$1"; else docker "$@" 2>/dev/null || true; fi; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        --purge) PURGE=1 ;;
+        *) echo "usage: abp-uninstall [--dry-run] [--purge]" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ "$DRY_RUN" = 0 ] && [ "$(id -u)" != 0 ]; then echo "abp-uninstall: run as root" >&2; exit 1; fi
+
+say "services (the stack stops the Runtime first; running tasks recover paused on a reinstall)"
+try systemctl disable --now abp-happy-daemon.service
+try systemctl disable --now abp-stack.service
+try systemctl disable --now abp-egress-proxy.service
+
+say "containers and networks"
+for id in $(listed ps -aq --filter "label=$LABEL"); do try docker rm -f "$id"; done
+for id in $(listed network ls -q --filter "label=$LABEL"); do try docker network rm "$id"; done
+
+say "owner firewall rules"
+if [ "$DRY_RUN" = 1 ] || [ -x "$LIBEXEC/abp-firewall" ]; then try "$LIBEXEC/abp-firewall" remove; fi
+try systemctl disable abp-firewall.service
+
+say "units, sudoers, tmpfiles, tools"
+try rm -f /etc/systemd/system/abp-firewall.service /etc/systemd/system/abp-egress-proxy.service /etc/systemd/system/abp-stack.service /etc/systemd/system/abp-happy-daemon.service
+try systemctl daemon-reload
+try rm -f /etc/sudoers.d/abp-agent-sbx /etc/tmpfiles.d/abp.conf /usr/local/sbin/abp-stack
+try rm -rf "$LIBEXEC"
+if [ "$DRY_RUN" = 1 ] || [ -L /usr/local/bin/happy ]; then try rm -f /usr/local/bin/happy; fi
+
+if [ "$PURGE" = 0 ]; then
+    say "kept: volumes abp-state and abp-profile-*, /etc/abp, /var/lib/abp, /etc/aplus/sandbox-policy.json, /opt/abp, accounts (use --purge to delete)"
+    exit 0
+fi
+
+say "purge: volumes, images, configuration, secrets, Happy package"
+for id in $(listed volume ls -q --filter "label=$LABEL"); do try docker volume rm "$id"; done
+if [ "$DRY_RUN" = 1 ]; then
+    try docker image rm "<current and previous digests from /var/lib/abp/stack-state.json>"
+elif [ -s /var/lib/abp/stack-state.json ]; then
+    for image in $(/usr/bin/node -e 'const s=JSON.parse(require("fs").readFileSync("/var/lib/abp/stack-state.json","utf8"));for(const d of [s.current,s.previous])if(d)console.log(d.runtime+"\n"+d.browser)'); do
+        try docker image rm "$image"
+    done
+fi
+try rm -rf /etc/abp /var/lib/abp /opt/abp /run/abp /run/abp-mcp
+try rm -f /etc/aplus/sandbox-policy.json /etc/aplus/claude-sandbox.json
+say "accounts agent, agent-sbx, abp-proxy, abp-runtime, abp-browser and groups abp-session, abp-work were kept (userdel/groupdel by hand if wanted)"
