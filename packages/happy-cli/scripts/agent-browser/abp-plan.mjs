@@ -4,7 +4,8 @@
 // Never prints a secret except `secret`, whose output the installer writes
 // straight into the target file.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   chromiumSeccompProfile, daemonEnv, egressRules, egressRulesFile, firewallRulesFile, mergeInstallOptions, permissionTable, runtimeConfig, stackLayout,
@@ -61,6 +62,27 @@ export function parseOptionFlags(argv) {
   return flags;
 }
 
+/**
+ * Content digest of an installed package tree: relative path, type, permission bits, file content
+ * hash and symlink target of every entry, in a fixed order. Timestamps and ownership are ignored.
+ */
+export function packageDigest(root) {
+  const lines = [];
+  const walk = (relative) => {
+    for (const name of readdirSync(join(root, relative)).sort()) {
+      const path = relative ? `${relative}/${name}` : name;
+      const stat = lstatSync(join(root, path));
+      const mode = (stat.mode & 0o7777).toString(8);
+      if (stat.isSymbolicLink()) lines.push(`L ${mode} ${path} ${readlinkSync(join(root, path))}`);
+      else if (stat.isDirectory()) { lines.push(`D ${mode} ${path}`); walk(path); }
+      else if (stat.isFile()) lines.push(`F ${mode} ${path} ${createHash("sha256").update(readFileSync(join(root, path))).digest("hex")}`);
+      else lines.push(`O ${mode} ${path}`);
+    }
+  };
+  walk("");
+  return createHash("sha256").update(lines.join("\n")).digest("hex");
+}
+
 function option(argv, name) {
   const index = argv.indexOf(name);
   if (index < 0 || argv[index + 1] === undefined) throw new Error(`${name} is required`);
@@ -114,6 +136,7 @@ export function main(argv, out = (text) => process.stdout.write(text)) {
       return out(unit);
     }
     case "units": return out(`${Object.keys(systemdUnits()).join("\n")}\n`);
+    case "package-digest": return out(`${packageDigest(option(args, "--dir"))}\n`);
     case "seccomp": return out(`${JSON.stringify(chromiumSeccompProfile(readJson(option(args, "--base"), "seccomp base")), null, 2)}\n`);
     case "secret": {
       const kind = args[0];

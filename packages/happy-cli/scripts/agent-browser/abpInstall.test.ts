@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir, userInfo } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -53,6 +53,47 @@ describe('abp-plan CLI', () => {
     })
 })
 
+describe('Happy package digest (restart the daemon and proxy when the installed code changes)', () => {
+    const digest = (dir: string) => { let out = ''; planMain(['package-digest', '--dir', dir], (text: string) => { out += text }); return out.trim() }
+
+    it('changes with file content, added files, exec bits and symlink targets, not with timestamps', () => {
+        const root = mkdtempSync(join(tmpdir(), 'abp-pkg-'))
+        mkdirSync(join(root, 'dist', 'sandbox'), { recursive: true })
+        writeFileSync(join(root, 'package.json'), '{"version":"1.0.0"}')
+        writeFileSync(join(root, 'dist', 'sandbox', 'egressProxyMain.mjs'), 'v1')
+        symlinkSync('dist/sandbox/egressProxyMain.mjs', join(root, 'entry'))
+        const first = digest(root)
+        expect(first).toMatch(/^[0-9a-f]{64}$/)
+        utimesSync(join(root, 'package.json'), new Date(0), new Date(0))
+        expect(digest(root)).toBe(first)
+        writeFileSync(join(root, 'dist', 'sandbox', 'egressProxyMain.mjs'), 'v2')
+        const second = digest(root)
+        expect(second).not.toBe(first)
+        chmodSync(join(root, 'package.json'), 0o755)
+        const third = digest(root)
+        expect(third).not.toBe(second)
+        writeFileSync(join(root, 'dist', 'new.mjs'), '')
+        const fourth = digest(root)
+        expect(fourth).not.toBe(third)
+        rmSync(join(root, 'entry'))
+        symlinkSync('package.json', join(root, 'entry'))
+        expect(digest(root)).not.toBe(fourth)
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('restarts a service when one of its inputs changed, otherwise only starts it', () => {
+        const decide = (changedPaths: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=1; CHANGED=" ${changedPaths} "
+            restart_or_start abp-happy-daemon.service /etc/abp/happy-daemon.env /var/lib/abp/happy-package.sha256
+            restart_or_start abp-egress-proxy.service /etc/systemd/system/abp-egress-proxy.service /var/lib/abp/happy-package.sha256`, 'test', join(here, 'abp-install')], { encoding: 'utf8' }).stdout
+        expect(decide('/var/lib/abp/happy-package.sha256')).toBe([
+            '== restarting abp-happy-daemon.service (changed: /var/lib/abp/happy-package.sha256)',
+            '+ systemctl restart abp-happy-daemon.service',
+            '== restarting abp-egress-proxy.service (changed: /var/lib/abp/happy-package.sha256)',
+            '+ systemctl restart abp-egress-proxy.service', ''].join('\n'))
+        expect(decide('')).toBe(['+ systemctl start abp-happy-daemon.service', '+ systemctl start abp-egress-proxy.service', ''].join('\n'))
+    })
+})
+
 describe('abp-install --dry-run', () => {
     const run = () => bash('abp-install', ['--dry-run', 'install', '--machine-id', 'machine-1', '--workspace-id', 'ws-1', '--profile', 'main=user-1',
         '--issuer', `k1=${pemFile}`, '--sites', sitesFile, '--images', join(dir, 'images')])
@@ -100,7 +141,12 @@ describe('abp-install --dry-run', () => {
         expect(out).toContain('+ systemctl enable abp-firewall.service abp-egress.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service')
         expect(out).toContain('+ write /etc/abp/egress.rules4 (root:root 0644')
         expect(out).toMatch(/ {4}\| jump DOCKER-USER -i br-abp\+ -j ABP-EGRESS/)
-        expect(out).toContain('+ systemctl restart abp-egress.service')
+        // Re-applying the rules must not restart their dependents (Requires= propagates a restart to the
+        // proxy, the daemon and the whole stack): reload runs ExecReload (apply) without that propagation.
+        expect(out).toContain('+ systemctl reload-or-restart abp-firewall.service')
+        expect(out).toContain('+ systemctl reload-or-restart abp-egress.service')
+        expect(out).not.toMatch(/systemctl restart abp-(firewall|egress)\.service/)
+        expect(out).toMatch(/\+ record the Happy package digest of \/opt\/abp\/happy\/lib\/node_modules\/@buzzni\/happy-cli in \/var\/lib\/abp\/happy-package\.sha256/)
         expect(out).toMatch(/\+ \S*node \S+abp-stack\.mjs load \S+images --set-initial/)
         expect(out).toContain('+ systemd-tmpfiles --create /etc/tmpfiles.d/abp.conf')
         expect(out).toContain('+ runuser -u agent -- install -d -g abp-work -m 2770 /work/agent-workspace')
@@ -130,7 +176,10 @@ describe('abp-install --dry-run', () => {
 /**
  * safe_path refuses paths below directories that others may write (e.g. /tmp, 1777), so its
  * fixtures must live below a directory whose whole ancestor chain passes the same rule: owned by
- * root or this user, not group/other-writable, no symlinks. The first such candidate is used.
+ * root or this user, not group/other-writable, no symlinks. The candidate must also be writable
+ * (proved by creating and removing a directory: a sandboxed or read-only home can pass the ownership
+ * rule and still refuse writes). Candidates are tried in a fixed order; the first one that qualifies
+ * is used, and without one these suites are skipped.
  */
 function trustedBase(): string | undefined {
     const uid = userInfo().uid
@@ -141,10 +190,18 @@ function trustedBase(): string | undefined {
             if (current === '/') return true
         }
     }
-    for (const candidate of [tmpdir(), homedir(), here]) {
+    const writable = (dir: string): boolean => {
+        try {
+            rmSync(mkdtempSync(join(dir, '.abp-probe-')), { recursive: true, force: true })
+            return true
+        } catch {
+            return false
+        }
+    }
+    for (const candidate of [tmpdir(), homedir(), join(here, '..', '..'), here, process.cwd()]) {
         try {
             const real = realpathSync(candidate)
-            if (passes(real)) return real
+            if (passes(real) && writable(real)) return real
         } catch { /* try the next one */ }
     }
     return undefined

@@ -34,6 +34,13 @@ const EGRESS_CHECK_INTERVAL_MS = 10_000;
 const FIREWALL = `${PATHS.libexec}/abp-firewall`;
 /** Set by emergency-stop so the service stop skips the drain; removed by the next start. */
 const EMERGENCY_FLAG = "/run/abp-stack-emergency";
+/**
+ * Set (with its time) while an upgrade or rollback replaces single containers of the running stack, so
+ * the supervisor does not restart the container being replaced. Older than MAINTENANCE_MAX_MS = left
+ * behind by a crashed operation, and ignored.
+ */
+const MAINTENANCE_FLAG = "/run/abp-stack-maintenance";
+const MAINTENANCE_MAX_MS = 15 * 60_000;
 const NETWORK_FORMAT = '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}} {{index .Options "com.docker.network.bridge.name"}}';
 const SERVICE = "abp-stack.service";
 const DAEMON_SERVICE = "abp-happy-daemon.service";
@@ -214,14 +221,14 @@ export function createStack(deps) {
    */
   async function quiesce(action) {
     const { runtime } = layout();
-    if (docker(["inspect", "-f", "{{.State.Running}}", runtime.container], { allowFail: true }).stdout !== "true") {
-      return { fence: "not-needed", drain: { result: "runtime-not-running" } };
-    }
     const abort = (reason, detail) => {
       iptables(["-F", "ABP-FENCE"], { allowFail: true });
       writeState(record(readState(), { action, result: "aborted", reason, ...detail }));
       throw new Error(`${action} aborted: ${reason}; nothing was stopped or changed (abp-stack emergency-stop stops regardless)`);
     };
+    let state;
+    try { state = containerState(runtime.container); } catch (error) { abort(error.message); }
+    if (state !== "running") return { fence: "not-needed", drain: { result: "runtime-not-running" } };
     const fenced = await fence();
     if (!fenced.ok) abort(fenced.reason);
     const drained = await drain(DEFAULT_DRAIN_MS);
@@ -241,16 +248,32 @@ export function createStack(deps) {
   }
   const unfence = () => iptables(["-F", "ABP-FENCE"]);
 
-  /** Every stack container is down; a container that ignores stop is killed; one that survives that is an error. */
+  /**
+   * running | stopped | absent (Docker says the container does not exist). Anything else (Docker
+   * unreachable, permission, unexpected output) is an unknown state and throws: callers must not
+   * treat it as "not running".
+   */
+  function containerState(name) {
+    const result = docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true });
+    if (result.status === 0 && result.stdout === "true") return "running";
+    if (result.status === 0 && result.stdout === "false") return "stopped";
+    if (result.status !== 0 && /No such (object|container)/i.test(result.stderr ?? "")) return "absent";
+    const why = result.status === 0 ? "unexpected output" : (result.stderr ?? "").split("\n")[0] || `status ${result.status}`;
+    throw new Error(`cannot determine whether ${name} is running (docker inspect: ${why})`);
+  }
+
+  /** A container that ignores stop is killed; one that survives that, or whose state cannot be read, is an error. */
+  function ensureStopped(name) {
+    if (containerState(name) !== "running") return;
+    deps.log(`${name} still running after stop; killing it`);
+    docker(["kill", name], { allowFail: true });
+    if (containerState(name) === "running") throw new Error(`${name} is still running`);
+  }
+
+  /** Every stack container is down (verified). */
   function verifyStopped() {
     const plan = layout();
-    for (const name of [plan.runtime.container, ...plan.browsers.map((browser) => browser.container)]) {
-      const running = () => docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true }).stdout === "true";
-      if (!running()) continue;
-      deps.log(`${name} still running after stop; killing it`);
-      docker(["kill", name], { allowFail: true });
-      if (running()) throw new Error(`${name} is still running`);
-    }
+    for (const name of [plan.runtime.container, ...plan.browsers.map((browser) => browser.container)]) ensureStopped(name);
   }
 
   async function waitReady(runtimeImage, timeoutMs) {
@@ -280,8 +303,69 @@ export function createStack(deps) {
     if (!ready.ok) throw new Error("the restarted Runtime is not ready (abp-stack status)");
   }
 
-  /** Stops the stack (the service fences, drains and stops), verifies it, switches digests, starts, waits for /v1/ready. */
+  function createAndStartBrowser(plan, browser, image) {
+    docker(browserCreateArgs(plan, browser, image));
+    docker(["start", browser.container]);
+  }
+
+  function createAndStartRuntime(plan, image) {
+    docker(runtimeCreateArgs(plan, image));
+    for (const { network, ip } of plan.runtime.attach) docker(["network", "connect", `--alias=${plan.runtime.alias}`, `--ip=${ip}`, network, plan.runtime.container]);
+    docker(["start", plan.runtime.container]);
+  }
+
+  /** Stops one container (killed if it ignores stop) and removes it; throws if it cannot be stopped. */
+  function stopAndRemove(name, seconds) {
+    docker(["stop", "-t", String(seconds), name], { allowFail: true });
+    ensureStopped(name);
+    docker(["rm", "-f", name], { allowFail: true });
+  }
+
+  /**
+   * Running stack (the stack's fence and drain are already in place): replaces only the containers whose
+   * running image differs from the target, browsers first, then the Runtime. A Runtime-only change keeps
+   * the browsers with their profile, open pages and anything a pending approval refers to; a browser-only
+   * change keeps the Runtime, which reconnects to the new browsers. The supervisor pauses meanwhile.
+   */
+  async function replaceChanged(target, previous, action, readyTimeoutMs, quiesced) {
+    const before = readState();
+    const plan = layout();
+    const differs = (name, image) => {
+      const [running, label] = docker(["inspect", "-f", `{{.State.Running}} ${IMAGE_LABEL}`, name], { allowFail: true }).stdout.split(" ");
+      return running !== "true" || label !== image;
+    };
+    const browsers = plan.browsers.filter((browser) => differs(browser.container, target.browser));
+    const runtime = differs(plan.runtime.container, target.runtime);
+    const replaced = [...browsers.length ? ["browser"] : [], ...runtime ? ["runtime"] : []];
+    const detail = { replaced, ...quiesced ? { quiesce: quiesced } : {} };
+    deps.writeFileAtomic(MAINTENANCE_FLAG, String(deps.now()), { mode: 0o600, owner: "root", group: "root" });
+    try {
+      if (browsers.length && !egressInPlace()) throw new Error("browser egress firewall is not in place");
+      if (runtime) stopAndRemove(plan.runtime.container, 30);
+      for (const browser of browsers) {
+        stopAndRemove(browser.container, 10);
+        createAndStartBrowser(plan, browser, target.browser);
+      }
+      if (runtime) createAndStartRuntime(plan, target.runtime);
+      writeState({ ...readState(), current: target, previous });
+      unfence();
+      const ready = await waitReady(target.runtime, readyTimeoutMs);
+      writeState(record(readState(), { action, from: before.current, to: target, result: ready.ok ? "ready" : "not-ready", ready: ready.body, ...detail }));
+      return { ok: ready.ok, ready: ready.body, before };
+    } catch (error) {
+      writeState(record(readState(), { action, from: before.current, to: target, result: "failed", error: error instanceof Error ? error.message : "failed", ...detail }));
+      return { ok: false, before };
+    } finally {
+      if (deps.exists(MAINTENANCE_FLAG)) deps.remove(MAINTENANCE_FLAG);
+    }
+  }
+
+  /**
+   * Switches the stack to the target digests. On a running stack only the changed containers are
+   * replaced (replaceChanged); otherwise the stack is stopped, verified down and started with them.
+   */
   async function switchTo(target, previous, action, readyTimeoutMs, quiesced) {
+    if (systemctl(["is-active", SERVICE], { allowFail: true }).stdout === "active") return replaceChanged(target, previous, action, readyTimeoutMs, quiesced);
     const before = readState();
     try {
       systemctl(["stop", SERVICE]);
@@ -317,13 +401,8 @@ export function createStack(deps) {
       for (const volume of plan.volumes) {
         if (docker(["volume", "inspect", volume], { allowFail: true }).status !== 0) docker(["volume", "create", `--label=${STACK_LABEL}`, volume]);
       }
-      for (const browser of plan.browsers) {
-        docker(browserCreateArgs(plan, browser, state.current.browser));
-        docker(["start", browser.container]);
-      }
-      docker(runtimeCreateArgs(plan, state.current.runtime));
-      for (const { network, ip } of plan.runtime.attach) docker(["network", "connect", `--alias=${plan.runtime.alias}`, `--ip=${ip}`, network, plan.runtime.container]);
-      docker(["start", plan.runtime.container]);
+      for (const browser of plan.browsers) createAndStartBrowser(plan, browser, state.current.browser);
+      createAndStartRuntime(plan, state.current.runtime);
       unfence();
       lastEgressCheckMs = deps.now();
       deps.log(`started runtime=${state.current.runtime} browser=${state.current.browser} profiles=${plan.browsers.length}`);
@@ -336,6 +415,7 @@ export function createStack(deps) {
      */
     superviseOnce(backoff) {
       const plan = layout();
+      if (deps.exists(MAINTENANCE_FLAG) && deps.now() - Number(deps.readFile(MAINTENANCE_FLAG)) < MAINTENANCE_MAX_MS) return;
       if (deps.now() - lastEgressCheckMs >= EGRESS_CHECK_INTERVAL_MS) {
         if (!egressInPlace()) {
           deps.log("browser egress firewall missing and not restorable; browsers stopped until it is back");

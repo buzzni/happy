@@ -122,6 +122,7 @@ describe('permissions', () => {
     it('matches the installed layout the Runtime, broker and sandbox preflight expect', () => {
         expect(entry('/etc/abp/runtime.json')).toMatchObject({ owner: 'root', group: 'root', mode: '0600' })
         expect(entry('/etc/abp/egress.rules4')).toMatchObject({ owner: 'root', group: 'root', mode: '0644' })
+        expect(entry('/var/lib/abp/happy-package.sha256')).toMatchObject({ owner: 'root', group: 'root', mode: '0600' })
         expect(entry('/etc/abp')).toMatchObject({ owner: 'root', group: 'root', mode: '0700' })
         expect(entry('/run/abp')).toMatchObject({ owner: 'root', group: 'abp-session', mode: '0750' })
         expect(entry('/run/abp-mcp')).toMatchObject({ owner: 'agent', group: 'agent-sbx', mode: '0710' })

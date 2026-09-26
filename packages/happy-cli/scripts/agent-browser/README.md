@@ -168,7 +168,8 @@ retry after about a minute (existing Happy behaviour, not specific to this insta
 | logs | `journalctl -u abp-stack -u abp-happy-daemon -u abp-egress-proxy`; `docker logs abp-runtime` |
 | metrics | `curl --unix-socket /run/abp/admin.sock http://admin/admin/metrics` (root) |
 | reassign the machine | `abp-stack set-principal <profileId> <studio userId>` (restarts the Runtime) |
-| config change | re-run `abp-install` with the flags; it restarts the stack only when its inputs changed |
+| config change | re-run `abp-install` with the flags; each service restarts only when its inputs changed (the message names the input): stack ← runtime.json, VNC secret, egress rules, seccomp, its unit; daemon ← env, token, unit, **Happy package digest**; egress proxy ← unit, egress policy, **Happy package digest**. The firewall units are re-applied with `reload-or-restart` (a restart would restart everything that `Requires=` them) |
+| new Happy package | `abp-install --happy-tarball <new.tgz>`: the content digest of the installed package (`/var/lib/abp/happy-package.sha256`) changes, so the daemon (sessions stay alive, KillMode=process) and the egress proxy restart onto the new code; the stack is untouched |
 
 The stack survives reboots: `abp-firewall` applies the rules at boot before the proxy, the stack
 and the daemon; tmpfiles recreates `/run/abp*`; `abp-stack.service` recreates the containers
@@ -189,11 +190,26 @@ batch or request on a kept-alive connection gets in) and **verify** it: the rule
 must answer and reach 0 `running`/`recovering` tasks within 60 s. A fence that cannot be
 verified, metrics that do not answer, or a drain timeout **abort** the operation: the fence is
 lifted, nothing is stopped or changed, history records `aborted` with the reason (retry later,
-or use `emergency-stop`). A Runtime that is not running is recorded as `runtime-not-running`
-and needs no fence. Then: stop the stack, verify it is down (kill, else error) → record
-current/previous → start with the new digests (the fence is lifted after start) → wait until the
-Runtime **of the new digest** answers `/v1/ready`. Not ready, or any step fails (e.g. the service
-does not start) → automatic rollback to the previous digests and exit 1. Volumes are never
+or use `emergency-stop`). A Runtime that is not running (Docker reports it stopped, or "no such
+object") is recorded as `runtime-not-running` and needs no fence; a state Docker cannot report
+(daemon unreachable, permission, unexpected output) aborts the operation, and after a stop such
+a container is not counted as stopped. Then, on a running stack, **only the containers whose image digest changes
+are replaced** (a time-limited `/run/abp-stack-maintenance` flag keeps the supervisor from
+restarting them meanwhile):
+
+- Runtime-only upgrade: the Runtime is stopped (killed if needed), removed and recreated; the
+  browsers keep running with their profile, open pages and the document a pending approval refers
+  to (the Runtime restores such an approval after a Runtime-only restart when document and node
+  are unchanged);
+- browser upgrade: each browser is replaced at its fixed address (only behind a live egress
+  firewall) while the Runtime keeps running and reconnects; tasks with open pages come back
+  paused (`browser-replaced`);
+- both: browsers first, then the Runtime.
+
+The fence is lifted after the new containers start → wait until the Runtime **of the new digest**
+answers `/v1/ready`. Not ready, or any step fails (e.g. a container cannot be created) →
+automatic rollback to the previous digests, replacing again only what differs, and exit 1. A stack
+that is not running is simply started with the new digests. History records `replaced`. Volumes are never
 touched. The history entry carries the fence and drain result (`quiesce`). The broker socket is
 not fenced: registrations, grants and attention polls continue during the drain (they do not
 admit work; grants stay valid on the new Runtime, same agent key).
@@ -258,7 +274,7 @@ same tasks, profiles and secrets. Accounts and homes (Happy and Claude logins) a
 ## Not covered
 
 Installing Docker or Node; Saycode server flag and signing key (S7); the machine tunnel and
-Desktop (S8); HA, zero-downtime upgrade (browsers restart on upgrade); rotation of the Runtime
+Desktop (S8); HA, zero-downtime upgrade (a browser image change still replaces the browsers); rotation of the Runtime
 agent key (inside `abp-state`); IPv6 browsing (browser networks are IPv4-only); Docker
 userns-remap; AppArmor profile for Chromium; log shipping and volume backups; x86_64 (only
 arm64 exercised); the S9 acceptance runs (reboot ×3, A01–A12, GD gates).
@@ -271,7 +287,8 @@ arm64 exercised); the S9 acceptance runs (reboot ×3, A01–A12, GD gates).
    admin metrics until no task is `running`/`recovering` (60 s cap). Controlled operations abort
    unless both are verified; only service stop and `emergency-stop` proceed without them.
    A Runtime-side admission fence would additionally let the broker socket refuse grants.
-2. **Upgrade restarts the browsers too** (full stack stop); page state is lost, profiles kept.
+2. **Browser image upgrades replace the browsers** (page state lost, profiles kept); Runtime-only
+   upgrades keep them.
 3. **Port:** the Runtime listens on 38700 inside the container (`runtimeHost` 0.0.0.0 there) and
    is published only on `127.0.0.1:38700`.
 4. **Viewer:** `vncAddress` goes in `ABP_PROFILES` (runtime.json profiles carry identity only) and
@@ -301,7 +318,7 @@ reinstall kept the token; `--purge` removed state.
 
 Second round (after the astra S6 review, on the integration tree with S1/S4/S5): second install
 changing issuer, sites and port restarted the stack and daemon and the new values took effect
-(API only on the new port), a no-change re-run restarted nothing; browser egress: a private
+(API only on the new port); browser egress: a private
 container, the host via three addresses, 169.254.169.254, the Runtime API and IPv6 were
 refused while public HTTPS and DNS worked, and a Chromium page's private `<img>`/`fetch`
 subresources reached the private server 0 times; seccomp: user/PID/net unshare allowed,
@@ -311,6 +328,20 @@ concurrent rotate-keys refused; rotation with all checks; egress rules restored 
 `systemctl restart docker`, a reboot and a manual jump deletion; uninstall with a live
 SIGTERM-ignoring agent-sbx process killed it before removing the rules; a symlinked config
 path made the installer refuse.
+
+Fifth round (2026-09-26, upgrade drill findings): stand-in `@buzzni/happy-cli` tarballs v1/v2
+(real egress proxy bundle; `daemon start-sync` forks a long-lived "session" child). A no-change
+re-run left the daemon, proxy, stack, Runtime and browser PIDs unchanged — **correction:** until
+this round every re-run restarted all of them through `Requires=` propagation from the
+unconditional firewall restarts (round 2 had judged "restarted nothing" from the installer's
+messages, not PIDs). `--happy-tarball` v2 restarted only the daemon and the proxy ("changed:
+/var/lib/abp/happy-package.sha256"), the proxy ran the v2 build, the v1 session child survived,
+stack/Runtime/browser PIDs unchanged. Runtime-only upgrade: new Runtime container, same browser
+container and Chromium process, the task kept its tab on https://example.com/ and stayed
+`awaiting-agent`; history `replaced: ["runtime"]`, fence verified. Browser-changed upgrade: same
+Runtime container, new browser container, task `browser-replaced`; history `replaced: ["browser"]`.
+A pending approval could not be produced on example.com (its link click ran), so approval
+survival across the Runtime-only path rests on the PoC's Runtime-only restart test.
 
 Fourth round (2026-09-26, same kind of host, `acl` package missing at first): the installer
 refused with "missing: setfacl getfacl"; with it, a fresh install created the link and ACLs and
