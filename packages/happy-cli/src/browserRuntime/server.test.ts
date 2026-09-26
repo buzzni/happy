@@ -72,6 +72,22 @@ async function post(base: string, op: string, body: unknown, token: string | nul
 }
 
 describe('runtime HTTP server', () => {
+    it('keeps an idle keep-alive connection open well past client pool idle times, so a reused socket is not closed under a mutation', async () => {
+        const { base } = await start()
+        const socket = connect(Number(new URL(base).port), '127.0.0.1')
+        const replies: string[] = []
+        let buffer = ''
+        socket.on('data', (chunk) => { buffer += chunk.toString(); if (buffer.includes('\r\n\r\n')) { replies.push(buffer); buffer = '' } })
+        const closed = new Promise<boolean>((resolve) => socket.on('close', () => resolve(true)))
+        const request = 'GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n'
+        socket.write(request)
+        await new Promise((r) => setTimeout(r, 8_000))
+        const stillOpen = await Promise.race([closed, Promise.resolve(false)])
+        socket.destroy()
+        expect(replies[0]).toMatch(/^HTTP\/1\.1 200/)
+        expect(stillOpen, 'the server closed an idle keep-alive connection within 8 s').toBe(false)
+    }, 15_000)
+
     it('serves health without auth', async () => {
         const { base } = await start()
         const res = await fetch(`${base}/v1/health`)

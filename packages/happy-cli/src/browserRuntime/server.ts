@@ -198,6 +198,12 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
         }
     })
 
+    // Clients (undici pools, ~4 s idle) reuse keep-alive sockets; with Node's 5 s default the server can close a
+    // socket just as a client sends a mutation on it, which then fails as "maybe reached". Keep idle sockets
+    // well beyond any client pool idle time; shutdown closes them explicitly (closeAllConnections).
+    server.keepAliveTimeout = 65_000
+    server.headersTimeout = 66_000
+
     // Unauthenticated input: nothing here may throw past this handler.
     server.on('upgrade', (req, socket, head) => {
         socket.on('error', () => socket.destroy())
