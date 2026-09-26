@@ -5,8 +5,8 @@
  * Happy daemon and its session processes (user `agent`, outside the claude
  * sandbox) can connect. The agent HMAC key never leaves the Runtime.
  *
- *   GET  /v1/sessions           daemon token   → [{ registrationId, agentSessionId?, owner?, createdAtMs, revoking }]
- *   POST /v1/sessions/register  daemon token   { owner? } → { registrationId, sessionSecret }
+ *   GET  /v1/sessions           daemon token   → [{ registrationId, agentSessionId?, owner?, bootId?, createdAtMs, revoking }]
+ *   POST /v1/sessions/register  daemon token   { owner?, bootId? } → { registrationId, sessionSecret }
  *   POST /v1/sessions/bind      daemon token   { registrationId, agentSessionId, owner? }
  *   POST /v1/sessions/revoke    daemon token   { agentSessionId } | { registrationId }
  *   POST /v1/agent-grants       session secret { agentSessionId, profileId } → { token, grantId, expiresAtMs }
@@ -41,6 +41,8 @@ const MAX_BODY_BYTES = 16 * 1024
 interface Registration {
     secretSha256: string
     owner?: SessionOwner
+    /** Host boot id reported by the daemon at registration (the Runtime's own view may differ in a container). */
+    bootId?: string
     agentSessionId?: string
     createdAtMs: number
     grantIds: string[]
@@ -92,7 +94,7 @@ export function withRevokingGrants(revoked: ReadonlySet<string>, broker?: Pick<B
 
 const id = z.string().min(1).max(256)
 const schemas = {
-    register: z.object({ schemaVersion: z.literal(1), owner: sessionOwnerSchema.optional() }).strict(),
+    register: z.object({ schemaVersion: z.literal(1), owner: sessionOwnerSchema.optional(), bootId: z.string().min(1).max(256).optional() }).strict(),
     bind: z.object({ schemaVersion: z.literal(1), registrationId: id, agentSessionId: id, owner: sessionOwnerSchema.optional() }).strict(),
     revoke: z.union([
         z.object({ schemaVersion: z.literal(1), agentSessionId: id }).strict(),
@@ -202,7 +204,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         'GET /v1/sessions': async (req) => {
             assertDaemon(req)
             return exclusive(async () => Object.entries(registry.registrations).map(([registrationId, registration]) => ({
-                registrationId, agentSessionId: registration.agentSessionId, owner: registration.owner,
+                registrationId, agentSessionId: registration.agentSessionId, owner: registration.owner, bootId: registration.bootId,
                 createdAtMs: registration.createdAtMs, revoking: registration.revoking === true,
             })))
         },
@@ -212,7 +214,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             return exclusive(async () => {
                 const registrationId = `reg-${randomUUID()}`
                 const sessionSecret = randomBytes(32).toString('base64url')
-                registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [], ...(body.owner ? { owner: body.owner } : {}) }
+                registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [], ...(body.owner ? { owner: body.owner } : {}), ...(body.bootId ? { bootId: body.bootId } : {}) }
                 await persist()
                 return { registrationId, sessionSecret }
             })

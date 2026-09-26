@@ -78,6 +78,7 @@ describe('broker socket', () => {
             schemaVersion: 1, registrationId: bound.registrationId, agentSessionId: 'session-1', owner,
         })).status).toBe(200)
         const legacy = await h.register('legacy')
+        const booted = await call(h.socketPath, 'POST', '/v1/sessions/register', h.daemon, { schemaVersion: 1, bootId: 'boot-a' })
         const unauthorizedHeaders: Record<string, string>[] = [{}, { 'x-abp-daemon-token': 'wrong' }, { 'x-abp-session-secret': bound.sessionSecret }]
         for (const headers of unauthorizedHeaders) {
             expect((await call(h.socketPath, 'GET', '/v1/sessions', headers)).status).toBe(401)
@@ -86,6 +87,7 @@ describe('broker socket', () => {
             { registrationId: unbound.body.result.registrationId, owner, createdAtMs: 1_000_000, revoking: false },
             { registrationId: bound.registrationId, agentSessionId: 'session-1', owner, createdAtMs: 1_000_000, revoking: false },
             { registrationId: legacy.registrationId, agentSessionId: 'legacy', createdAtMs: 1_000_000, revoking: false },
+            { registrationId: booted.body.result.registrationId, bootId: 'boot-a', createdAtMs: 1_000_000, revoking: false },
         ]
         // Exact equality excludes secrets, hashes and grant ids.
         expect((await call(h.socketPath, 'GET', '/v1/sessions', h.daemon)).body.result).toEqual(expected)

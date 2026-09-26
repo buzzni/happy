@@ -25,10 +25,7 @@ import { basename, dirname, join } from 'node:path'
 import { brokerRequest } from '@/browserRuntime/brokerGrantSource'
 import { logger } from '@/ui/logger'
 import { sessionRegistrationsSchema, type SessionOwner } from '@/browserRuntime/sessionRegistration'
-import { readBrowserTaskBootId, readBrowserTaskBootTimeMs, readBrowserTaskPidStartTime, readBrowserTaskSessionOwner } from './browserTaskSessionOwner'
-
-/** Clock margin for comparing a registration's Runtime timestamp with the host boot time. */
-const BOOT_TIME_MARGIN_MS = 60_000
+import { readBrowserTaskBootId, readBrowserTaskPidStartTime, readBrowserTaskSessionOwner } from './browserTaskSessionOwner'
 
 const DEFAULT_DAEMON_TOKEN_FILE = '/var/lib/abp/daemon-token'
 const MAX_RETRY_DELAY_MS = 5 * 60_000
@@ -198,7 +195,9 @@ export function createBrowserTaskSessionBroker(
 
     const broker: BrowserTaskSessionBroker = {
         async register() {
-            const result = await call('/v1/sessions/register', {})
+            // The host boot id lets reconciliation drop this registration after a reboot even if no owner is ever bound.
+            const bootId = await readBrowserTaskBootId(options.procRoot).catch(() => undefined)
+            const result = await call('/v1/sessions/register', bootId ? { bootId } : {})
             return typeof result?.registrationId === 'string' && typeof result.sessionSecret === 'string'
                 ? { registrationId: result.registrationId, sessionSecret: result.sessionSecret }
                 : undefined
@@ -222,17 +221,16 @@ export function createBrowserTaskSessionBroker(
                     return
                 }
                 const registrations = sessionRegistrationsSchema.parse(reply.body.result)
-                if (!registrations.length) return
-                // A registration without an owner (made before owners were recorded) is provably dead only
-                // when it predates this boot: no session process survives a reboot.
-                const bootTimeMs = await readBrowserTaskBootTimeMs(options.procRoot)
-                const bootId = registrations.some((registration) => registration.owner) ? await readBrowserTaskBootId(options.procRoot) : undefined
+                if (!registrations.some((registration) => registration.owner || registration.bootId)) return
+                const bootId = await readBrowserTaskBootId(options.procRoot)
                 for (const registration of registrations) {
                     const { owner } = registration
                     try {
+                        // Boot ids only, never wall-clock times (a clock step moves /proc btime). A registration with
+                        // neither an owner nor a boot id (made before these were recorded) is kept.
                         const dead = owner
                             ? owner.bootId !== bootId || await readBrowserTaskPidStartTime(owner.pid, options.procRoot) !== owner.pidStartTime
-                            : bootTimeMs !== undefined && registration.createdAtMs < bootTimeMs - BOOT_TIME_MARGIN_MS
+                            : registration.bootId !== undefined && registration.bootId !== bootId
                         if (dead) {
                             await broker.revoke({ registrationId: registration.registrationId })
                         }

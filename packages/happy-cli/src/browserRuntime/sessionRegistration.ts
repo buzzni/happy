@@ -14,6 +14,8 @@ export const sessionRegistrationsSchema = z.array(z.object({
     registrationId: z.string().min(1),
     agentSessionId: z.string().optional(),
     owner: sessionOwnerSchema.optional(),
+    /** Host boot id the daemon reported at registration: a different current boot proves the session is gone. */
+    bootId: z.string().min(1).max(256).optional(),
     createdAtMs: z.number(),
     revoking: z.boolean(),
 }))

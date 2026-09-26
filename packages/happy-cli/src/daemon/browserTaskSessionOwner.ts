@@ -9,13 +9,6 @@ export async function readBrowserTaskBootId(procRoot = '/proc'): Promise<string>
     return bootId
 }
 
-/** Boot time from /proc/stat `btime` (ms since the epoch), or undefined when it cannot be read. */
-export async function readBrowserTaskBootTimeMs(procRoot = '/proc'): Promise<number | undefined> {
-    const stat = await readFile(join(procRoot, 'stat'), 'utf8').catch(() => '')
-    const seconds = /^btime (\d+)$/m.exec(stat)?.[1]
-    return seconds === undefined ? undefined : Number(seconds) * 1000
-}
-
 /** ENOENT alone proves absence; permissions, malformed data and I/O errors remain unknown. */
 export async function readBrowserTaskPidStartTime(pid: number, procRoot = '/proc'): Promise<string | undefined> {
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid session pid')
