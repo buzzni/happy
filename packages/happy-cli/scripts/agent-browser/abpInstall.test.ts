@@ -141,7 +141,11 @@ describe('abp-install --dry-run', () => {
         expect(out).toContain('+ systemctl enable abp-firewall.service abp-egress.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service')
         expect(out).toContain('+ write /etc/abp/egress.rules4 (root:root 0644')
         expect(out).toMatch(/ {4}\| jump DOCKER-USER -i br-abp\+ -j ABP-EGRESS/)
-        expect(out).toContain('+ systemctl restart abp-egress.service')
+        // Re-applying the rules must not restart their dependents (Requires= propagates a restart to the
+        // proxy, the daemon and the whole stack): reload runs ExecReload (apply) without that propagation.
+        expect(out).toContain('+ systemctl reload-or-restart abp-firewall.service')
+        expect(out).toContain('+ systemctl reload-or-restart abp-egress.service')
+        expect(out).not.toMatch(/systemctl restart abp-(firewall|egress)\.service/)
         expect(out).toMatch(/\+ record the Happy package digest of \/opt\/abp\/happy\/lib\/node_modules\/@buzzni\/happy-cli in \/var\/lib\/abp\/happy-package\.sha256/)
         expect(out).toMatch(/\+ \S*node \S+abp-stack\.mjs load \S+images --set-initial/)
         expect(out).toContain('+ systemd-tmpfiles --create /etc/tmpfiles.d/abp.conf')

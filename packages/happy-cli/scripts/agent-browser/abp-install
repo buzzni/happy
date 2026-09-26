@@ -563,9 +563,10 @@ main_install() {
 
     if [ "$NO_START" = 1 ]; then say "not starting (--no-start)"; return 0; fi
     say "start"
-    run systemctl restart abp-firewall.service
-    # Browser egress rules are swapped in atomically; the stack refuses to run browsers without them.
-    run systemctl restart abp-egress.service
+    # Re-apply the rules through ExecReload: a restart of these units would restart everything that
+    # Requires= them (proxy, daemon, the whole stack). Rules are swapped in atomically either way.
+    run systemctl reload-or-restart abp-firewall.service
+    run systemctl reload-or-restart abp-egress.service
     # A new Happy package (--happy-tarball) changes the digest: the proxy and the daemon then run the new code.
     restart_or_start abp-egress-proxy.service /etc/systemd/system/abp-egress-proxy.service "$HAPPY_DIGEST" /etc/aplus/claude-sandbox.json
     if [ -n "$machine_id" ] && { [ "$DRY_RUN" = 1 ] || [ -s "$VARLIB/stack-state.json" ]; }; then
