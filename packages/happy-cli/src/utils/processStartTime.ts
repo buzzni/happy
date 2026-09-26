@@ -32,3 +32,24 @@ export function getProcessStartedAt(pid: number): number | undefined {
     return undefined;
   }
 }
+
+/**
+ * Windows counterpart of {@link getProcessStartedAt}: `ps` does not exist there.
+ * CIM reports the creation time of any process, including ones the caller may
+ * not open. It costs a PowerShell start, so call it only for a live pid that
+ * actually needs checking. Undefined means "cannot verify", as above.
+ */
+export function getWindowsProcessStartedAt(pid: number): number | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    const output = execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o') }`,
+    ], { encoding: 'utf-8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
+    if (!output) return undefined;
+    const parsed = Date.parse(output);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}

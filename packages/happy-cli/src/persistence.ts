@@ -6,7 +6,7 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync } from 'node:fs'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync, statSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
@@ -15,6 +15,7 @@ import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
 import type { SaycodeAgentEnvironment } from '@/daemon/sessionEnv';
 import { logger } from '@/ui/logger';
+import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime';
 
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(true),
@@ -608,9 +609,20 @@ export async function clearDaemonState(): Promise<void> {
  * The lock file proves the daemon is running and prevents multiple instances.
  * Returns the file handle to hold for the daemon's lifetime, or null if locked.
  */
+// A holder writes the lock after it starts, so a pid whose process started
+// after the write belongs to someone else. The slack absorbs `ps`'s whole-second
+// start times and small clock steps.
+const REUSED_LOCK_PID_SLACK_MS = 2_000
+
+export interface DaemonLockDeps {
+  /** Epoch ms a live process started, or undefined when it cannot be read. */
+  getProcessStartedAt?: (pid: number) => number | undefined
+}
+
 export async function acquireDaemonLock(
   maxAttempts: number = 5,
-  delayIncrementMs: number = 200
+  delayIncrementMs: number = 200,
+  deps: DaemonLockDeps = {}
 ): Promise<FileHandle | null> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -628,10 +640,16 @@ export async function acquireDaemonLock(
         try {
           const lockPid = readFileSync(configuration.daemonLockFile, 'utf-8').trim();
           if (lockPid && !isNaN(Number(lockPid))) {
+            let alive = true;
             try {
               process.kill(Number(lockPid), 0); // Check if process exists
             } catch {
-              // Process doesn't exist, remove stale lock
+              alive = false;
+            }
+            // After a logoff or reboot the dead holder's pid can be handed to an
+            // unrelated process; an existence check alone would then refuse to
+            // start a daemon forever. Unknown start times keep the lock.
+            if (!alive || lockPidWasReused(Number(lockPid), deps)) {
               unlinkSync(configuration.daemonLockFile);
               continue; // Retry acquisition
             }
@@ -649,6 +667,14 @@ export async function acquireDaemonLock(
     }
   }
   return null;
+}
+
+function lockPidWasReused(pid: number, deps: DaemonLockDeps): boolean {
+  const lookup = deps.getProcessStartedAt
+    ?? (process.platform === 'win32' ? getWindowsProcessStartedAt : getProcessStartedAt);
+  const startedAt = lookup(pid);
+  if (startedAt === undefined) return false;
+  return startedAt > statSync(configuration.daemonLockFile).mtimeMs + REUSED_LOCK_PID_SLACK_MS;
 }
 
 /**
