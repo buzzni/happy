@@ -2227,6 +2227,7 @@ describe('org deployment provenance (specs/agent-ai-source-routing observation i
               number: 7,
               email: options.failVerification ? 'someone-else@example.com' : 'owner@example.com',
               organizationUuid: 'org-a',
+              organizationName: 'Corp Inc',
               usageStatus: activated ? 'ok' : 'relogin_required',
             }],
           }),
@@ -2239,8 +2240,11 @@ describe('org deployment provenance (specs/agent-ai-source-routing observation i
     })
   }
 
+  // The outer export names the organization differently from what cswap
+  // imported: the record must carry what was verified after the import, since
+  // that is what the login metadata and accountInfo() will report.
   const payload = claudeOauthPayload([
-    { email: 'owner@example.com', organizationUuid: 'org-a', organizationName: 'Corp Inc' },
+    { email: 'owner@example.com', organizationUuid: 'org-a', organizationName: 'Outer Name' },
   ])
 
   async function recorded(files: Map<string, string>) {
