@@ -63,6 +63,8 @@ export interface BrokerOptions {
     allowedOrigins: string[]
     agentKey: string | Buffer
     revokeGrant(grantId: GrantId): Promise<void>
+    /** The bound agent session ended: cancel its tasks and reclaim its spaces (idempotent). */
+    endSession?(agentSessionId: string): Promise<void>
     attention: AttentionOutbox
     socketGid?: number
     /** Delay before retrying a start-up revocation replay that failed. */
@@ -181,6 +183,11 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         for (const grantId of registration.grantIds) {
             await options.revokeGrant(grantId as GrantId)
                 .catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'grant revocation is incomplete', true) })
+        }
+        // Still under the tombstone: a failure or crash here is retried like a grant revocation.
+        if (registration.agentSessionId && options.endSession) {
+            await options.endSession(registration.agentSessionId)
+                .catch(() => { throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'session end is incomplete', true) })
         }
         delete registry.registrations[registrationId]
         await persist()
