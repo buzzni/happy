@@ -24,6 +24,8 @@ export const PATHS = {
   runtimeSecrets: "/var/lib/abp/secrets/runtime",
   browserSecrets: "/var/lib/abp/secrets/browser",
   stackState: "/var/lib/abp/stack-state.json",
+  /** Content digest of the installed Happy package (abp-install restarts the daemon and proxy when it changes). */
+  happyDigest: "/var/lib/abp/happy-package.sha256",
   run: "/run/abp",
   brokerSocket: "/run/abp/broker.sock",
   adminSocket: "/run/abp/admin.sock",
@@ -231,6 +233,7 @@ export function permissionTable() {
     row(PATHS.browserSecrets, "dir", "abp-browser", "abp-browser", "0500"),
     row(`${PATHS.browserSecrets}/vnc-password`, "secret", "abp-browser", "abp-browser", "0400", { secret: true }),
     row(PATHS.stackState, "file", "root", "root", "0600"),
+    row(PATHS.happyDigest, "file", "root", "root", "0600"),
     row(PATHS.run, "tmpfs-dir", "root", "abp-session", "0750"),
     row(PATHS.mcp, "tmpfs-dir", "agent", "agent-sbx", "0710"),
     row("/home/agent", "dir", "agent", "agent", "0700"),

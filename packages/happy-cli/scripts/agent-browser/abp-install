@@ -35,6 +35,8 @@ INSTALL_JSON=$ETC/install.json
 RUNTIME_JSON=$ETC/runtime.json
 VARLIB=/var/lib/abp
 DAEMON_TOKEN=$VARLIB/daemon-token
+# Content digest of the installed Happy package: a change restarts the daemon and the egress proxy.
+HAPPY_DIGEST=$VARLIB/happy-package.sha256
 UNITS="abp-firewall.service abp-egress.service abp-egress-proxy.service abp-stack.service abp-happy-daemon.service"
 OPS_LOCK=/run/abp-stack-ops.lock
 # Desktop chats: the Saycode server makes the daemon create workspaces under ~agent/workspace, while
@@ -67,7 +69,7 @@ restart_or_start() {
     shift
     for input in "$@"; do
         if changed "$input"; then
-            say "restarting ${unit%.service} (inputs changed)"
+            say "restarting $unit (changed: $input)"
             run systemctl restart "$unit"
             return 0
         fi
@@ -496,6 +498,7 @@ main_install() {
         write_file /etc/aplus/claude-sandbox.json root root 0644 show < "$WORK/egress.json"
     elif [ -e /etc/aplus/claude-sandbox.json ]; then
         run rm -f /etc/aplus/claude-sandbox.json
+        CHANGED="$CHANGED/etc/aplus/claude-sandbox.json "
     fi
 
     say "owner firewall rules, browser egress rules and Chromium seccomp profile"
@@ -540,6 +543,15 @@ main_install() {
         warn "no images installed yet (--images <dir> or --build-from <happy-cli>)"
     fi
 
+    say "Happy package digest"
+    local package=$HAPPY_PREFIX/lib/node_modules/@buzzni/happy-cli
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '+ record the Happy package digest of %s in %s\n' "$package" "$HAPPY_DIGEST"
+    else
+        plan package-digest --dir "$package" > "$WORK/package-digest"
+        write_file "$HAPPY_DIGEST" root root 0600 < "$WORK/package-digest"
+    fi
+
     say "systemd units"
     local name
     for name in $UNITS; do
@@ -554,12 +566,14 @@ main_install() {
     run systemctl restart abp-firewall.service
     # Browser egress rules are swapped in atomically; the stack refuses to run browsers without them.
     run systemctl restart abp-egress.service
-    run systemctl restart abp-egress-proxy.service
+    # A new Happy package (--happy-tarball) changes the digest: the proxy and the daemon then run the new code.
+    restart_or_start abp-egress-proxy.service /etc/systemd/system/abp-egress-proxy.service "$HAPPY_DIGEST" /etc/aplus/claude-sandbox.json
     if [ -n "$machine_id" ] && { [ "$DRY_RUN" = 1 ] || [ -s "$VARLIB/stack-state.json" ]; }; then
         # A stack restart fences, drains and pauses running tasks; only do it when the stack's inputs changed.
         restart_or_start abp-stack.service "$RUNTIME_JSON" "$VARLIB/secrets/runtime/vnc-password" /etc/systemd/system/abp-stack.service \
             "$ETC/egress.rules4" "$ETC/seccomp-chromium.json"
-        restart_or_start abp-happy-daemon.service "$ETC/happy-daemon.env" /etc/systemd/system/abp-happy-daemon.service "$DAEMON_TOKEN"
+        # Sessions outlive the daemon restart (KillMode=process).
+        restart_or_start abp-happy-daemon.service "$ETC/happy-daemon.env" /etc/systemd/system/abp-happy-daemon.service "$DAEMON_TOKEN" "$HAPPY_DIGEST"
     fi
     say "done. Next: see README (Claude login for agent-sbx), then: abp-install check"
 }
