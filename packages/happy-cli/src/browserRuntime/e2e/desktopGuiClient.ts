@@ -91,8 +91,13 @@ export class DesktopGui {
 
     /** "내 채팅" landing → pick the execution machine → first message. */
     async startPersonalChat(machineIdPrefix: string, text: string): Promise<void> {
-        await this.eval(`(()=>{const b=[...document.querySelectorAll('button,a')].find(b=>b.offsetParent&&b.textContent.trim()==='내 채팅'); b?.click()})()`)
-        const picked = await this.waitFor(`[...document.querySelectorAll('select')].some(s=>[...s.options].some(o=>o.value.startsWith(${JSON.stringify(machineIdPrefix)})))`, 30_000)
+        // A freshly launched app may ignore the first click: keep navigating until the machine picker shows.
+        const offered = `[...document.querySelectorAll('select')].some(s=>[...s.options].some(o=>o.value.startsWith(${JSON.stringify(machineIdPrefix)})))`
+        let picked = false
+        for (const deadline = Date.now() + 90_000; !picked && Date.now() < deadline;) {
+            await this.eval(`(()=>{const b=[...document.querySelectorAll('button,a')].find(b=>b.offsetParent&&b.textContent.trim()==='내 채팅'); b?.click()})()`)
+            picked = await this.waitFor(offered, 5_000)
+        }
         if (!picked) throw new Error(`machine ${machineIdPrefix} is not offered by the Desktop`)
         await this.eval(`(()=>{const s=[...document.querySelectorAll('select')].find(s=>[...s.options].some(o=>o.value.startsWith(${JSON.stringify(machineIdPrefix)}))); const o=[...s.options].find(o=>o.value.startsWith(${JSON.stringify(machineIdPrefix)})); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(s,o.value); s.dispatchEvent(new Event('change',{bubbles:true}))})()`)
         await this.typeInComposer(text)
