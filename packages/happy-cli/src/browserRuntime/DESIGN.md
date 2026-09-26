@@ -107,8 +107,19 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
   the 1,000-event retention, feeds the `CURSOR_EXPIRED` snapshot. Expiry: `afterSeq + 1 < oldestSeq`.
 - User resume (D8): interactive `resume` only from `user-input-complete`, and only while the
   task's stored grant is valid; approval waits, uncertain writes, cancel requests and
-  browser replacement are never released by the user. The final write rechecks task state,
-  grant validity and input ownership, since the login check awaits the browser.
+  browser replacement are never released by the user. Completion uses the same rules as the
+  agent's resume (`userWaitCompleted`): a handoff needs no check (the agent re-observes), a
+  login needs the site's `loginCompleteWhen`, other waits their predicate; a wait without a
+  recorded condition is refused. The final write rechecks task state, grant validity and
+  input ownership, since the login check awaits the browser, and records `user-resumed`.
+- Retention (`retentionDays`, config mode, at start and hourly): terminal tasks without
+  uncertain actions whose last change is older than the retention are deleted
+  (`TaskStore.purgeExpiredTasks`). The task directory (journal, checkpoint with approvals,
+  batches and request records) is renamed into `tasks-purged/` — the commit point — then the
+  space references (tabs, targets, lease epochs, request records naming the task) are dropped
+  and the directory removed; an interrupted deletion finishes on the next open or run. The
+  attention outbox forgets the task's cursor and unresolved entry (or prunes them at
+  reconcile after a crash); its old feed events age out.
 - Writer lock (D9): the image entrypoint runs `exec flock -n -E 75 -F <state>/runtime.flock node`;
   production refuses to start unless `/proc/locks` shows this pid holding it. The heartbeat
   lease and fencing token stay. The Runtime runs as uid 10870 (no host login user).

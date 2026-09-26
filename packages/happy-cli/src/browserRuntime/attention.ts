@@ -73,14 +73,22 @@ export class AttentionOutbox {
         return new AttentionOutbox(stateDir, options.maxEvents ?? DEFAULT_MAX_EVENTS, options.retryMs ?? DEFAULT_RETRY_MS, state)
     }
 
-    /** Start recording tagged commits of `store`. */
+    /** Start recording tagged commits of `store`, and forget tasks it deletes (retention). */
     attach(store: TaskStore): void {
         this.store = store
-        this.detach = store.onCommitted((task, event) => this.record(task, event))
+        const stopCommits = store.onCommitted((task, event) => this.record(task, event))
+        const stopPurges = store.onPurged((taskId) => this.forget(taskId))
+        this.detach = () => { stopCommits(); stopPurges() }
     }
 
-    /** Append tagged task events that the outbox missed (crash between commit and outbox write). */
+    /**
+     * Append tagged task events that the outbox missed (crash between commit and outbox
+     * write), and drop cursors of tasks the store no longer has (crash between a
+     * retention deletion and the outbox write).
+     */
     async reconcile(): Promise<void> {
+        for (const taskId of Object.keys(this.state.taskCursors)) if (this.store && !this.store.knowsTask(taskId)) this.forget(taskId)
+        for (const taskId of Object.keys(this.state.unresolved ?? {})) if (this.store && !this.store.knowsTask(taskId)) this.forget(taskId)
         for (const task of this.store?.listTasks() ?? []) {
             for (const event of this.store?.events(task.taskId, this.state.taskCursors[task.taskId] ?? 0) ?? []) this.record(task, event)
         }
@@ -141,6 +149,15 @@ export class AttentionOutbox {
             this.dirty = true
         }
         if (this.dirty) void this.write().catch(() => undefined)
+    }
+
+    /** A deleted task keeps no cursor or unresolved entry; its old feed events age out with retention. */
+    private forget(taskId: string): void {
+        if (this.closed || (!(taskId in this.state.taskCursors) && !(taskId in (this.state.unresolved ?? {})))) return
+        delete this.state.taskCursors[taskId]
+        delete this.state.unresolved?.[taskId]
+        this.dirty = true
+        void this.write().catch(() => undefined)
     }
 
     /** Persist the current state if it changed; readers are woken only once it is on disk. */

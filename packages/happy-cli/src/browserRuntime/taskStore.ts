@@ -5,6 +5,7 @@ import {
     BrowserRuntimeError,
     POC_LIMITS,
     SCHEMA_VERSION,
+    TERMINAL_STATUSES,
     type ActionId,
     type ActionState,
     type AgentGrant,
@@ -81,7 +82,7 @@ export interface StoredTask extends TaskView {
 export interface StoreEventInput extends Omit<TaskEvent, 'seq' | 'schemaVersion' | 'taskId' | 'stateVersion'> {
     stateVersion?: number
 }
-export type FaultInjector = (operation: 'lock' | 'event-append' | 'task-replace' | 'metadata') => void | Promise<void>
+export type FaultInjector = (operation: 'lock' | 'event-append' | 'task-replace' | 'metadata' | 'purge-move' | 'purge-delete') => void | Promise<void>
 export interface SpaceRecord {
     taskSpaceId: TaskSpaceId
     profileId: ProfileId
@@ -114,6 +115,8 @@ const checksum = (body: string): string => createHash('sha256').update(body).dig
 const processInstanceId = randomUUID()
 const journalError = (message = 'Task journal is unavailable'): BrowserRuntimeError => new BrowserRuntimeError('JOURNAL_UNAVAILABLE',
     message, true)
+/** Task directories being deleted by retention; never loaded, finished on the next open. */
+const PURGED_DIR = 'tasks-purged'
 /** Single-writer, fsync-backed JSONL journal plus atomically replaced task checkpoints. */
 export class TaskStore {
     private fencingToken = 0
@@ -125,6 +128,7 @@ export class TaskStore {
     private metadataTail: Promise<void> = Promise.resolve()
     private readonly unreadableTasks = new Set<TaskId>()
     private readonly commitListeners = new Set<(task: StoredTask, event: TaskEvent) => void>()
+    private readonly purgeListeners = new Set<(taskId: TaskId) => void>()
     private closed = false
     private constructor(readonly stateDir: string, private readonly faultInjector?: FaultInjector,
         private readonly now: () => number = Date.now) { }
@@ -135,6 +139,8 @@ export class TaskStore {
             await store.loadMetadata()
             await store.loadRevocations()
             await store.loadTasks()
+            // A deletion a crash interrupted is finished now, or on the next retention run.
+            await store.resumePurges().catch(() => undefined)
             return store
         }
         catch (error) {
@@ -233,6 +239,94 @@ export class TaskStore {
     onCommitted(listener: (task: StoredTask, event: TaskEvent) => void): () => void {
         this.commitListeners.add(listener)
         return () => { this.commitListeners.delete(listener) }
+    }
+    /** Called once a task was deleted by retention. Listeners must not block; errors are ignored. */
+    onPurged(listener: (taskId: TaskId) => void): () => void {
+        this.purgeListeners.add(listener)
+        return () => { this.purgeListeners.delete(listener) }
+    }
+    /** True for every task the store has, including ones whose journal is unreadable. */
+    knowsTask(id: string): boolean { return this.tasks.has(id as TaskId) || this.unreadableTasks.has(id as TaskId) }
+    /**
+     * Retention (retentionDays): deletes terminal tasks without uncertain actions whose
+     * last change is older than `retentionMs`, with their journal, checkpoint (approvals,
+     * batches, request records) and the space records that refer to them. The task
+     * directory is first renamed into tasks-purged/ (from then on the task is gone,
+     * also after a crash); the references are dropped and the directory deleted after
+     * that, and resumed on the next open or run if interrupted.
+     */
+    async purgeExpiredTasks(nowMs: number, retentionMs: number): Promise<TaskId[]> {
+        await this.resumePurges()
+        const expired = [...this.tasks.values()].filter((task) => (TERMINAL_STATUSES as readonly string[]).includes(task.status)
+            && !task.uncertainActions.length && nowMs - Number(task.updatedAtMs) > retentionMs).map((task) => task.taskId)
+        const purged: TaskId[] = []
+        for (const id of expired) {
+            await this.withTaskQueue(id, async () => {
+                await this.assertWriter()
+                const task = this.tasks.get(id)
+                if (!task)
+                    return
+                await this.faultInjector?.('purge-move')
+                const purgedRoot = join(this.stateDir, PURGED_DIR)
+                await mkdir(purgedRoot, { recursive: true })
+                await rename(join(this.stateDir, 'tasks', id), join(purgedRoot, id))
+                await this.syncDirectory(join(this.stateDir, 'tasks'))
+                await this.syncDirectory(purgedRoot)
+                this.tasks.delete(id)
+                purged.push(id)
+                for (const listener of this.purgeListeners) {
+                    try { listener(id) } catch { /* observers never fail a purge */ }
+                }
+                await this.finishPurge(id, task)
+            })
+        }
+        return purged
+    }
+    private async resumePurges(): Promise<void> {
+        const purgedRoot = join(this.stateDir, PURGED_DIR)
+        let ids: string[]
+        try {
+            ids = await readdir(purgedRoot)
+        }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+                return
+            throw error
+        }
+        for (const id of ids) {
+            const task = await readFile(join(purgedRoot, id, 'task.json'), 'utf8').then((raw) => JSON.parse(raw) as StoredTask, () => undefined)
+            await this.finishPurge(id as TaskId, task)
+        }
+    }
+    /** Drop space references (tabs, request records), then delete the moved directory. Idempotent. */
+    private async finishPurge(id: TaskId, task: StoredTask | undefined): Promise<void> {
+        await this.withMetadataQueue(async () => {
+            await this.assertWriter()
+            const stillUsed = new Set([...this.tasks.values()].flatMap((other) => other.tabs.map(String)))
+            const tabs = new Set((task?.tabs ?? []).map(String).filter((tabId) => !stillUsed.has(tabId)))
+            const mentions = (value: unknown) => JSON.stringify(value ?? null).includes(`"${id}"`)
+            let changed = false
+            for (const space of this.spaces.values()) {
+                const next: SpaceRecord = {
+                    ...space,
+                    tabs: space.tabs.filter((tabId) => !tabs.has(tabId)),
+                    ...(space.goneTabs ? { goneTabs: space.goneTabs.filter((tabId) => !tabs.has(tabId)) } : {}),
+                    ...(space.tabTargets ? { tabTargets: Object.fromEntries(Object.entries(space.tabTargets).filter(([tabId]) => !tabs.has(tabId))) } : {}),
+                    ...(space.tabLeaseEpochs ? { tabLeaseEpochs: Object.fromEntries(Object.entries(space.tabLeaseEpochs).filter(([tabId]) => !tabs.has(tabId))) } : {}),
+                    ...(space.profileUserOwner && tabs.has(space.profileUserOwner.tabId) ? { profileUserOwner: null } : {}),
+                    ...(space.dedupe ? { dedupe: Object.fromEntries(Object.entries(space.dedupe).filter(([, entry]) => !mentions(entry.result))) } : {}),
+                }
+                if (stable(next) !== stable(space)) {
+                    this.spaces.set(space.taskSpaceId, next)
+                    changed = true
+                }
+            }
+            if (changed)
+                await this.writeMetadata()
+        })
+        await this.faultInjector?.('purge-delete')
+        await rm(join(this.stateDir, PURGED_DIR, id), { recursive: true, force: true })
+        await this.syncDirectory(join(this.stateDir, PURGED_DIR))
     }
     async createTask(task: StoredTask, event: StoreEventInput): Promise<StoredTask> {
         if (this.tasks.has(task.taskId))
