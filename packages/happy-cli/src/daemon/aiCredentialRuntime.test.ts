@@ -2336,6 +2336,26 @@ describe('org deployment provenance (specs/agent-ai-source-routing observation i
     await expect(recorded(files)).resolves.toBeNull()
   })
 
+  it('fences off the Claude record on a Z.AI apply even when the invalidation write fails', async () => {
+    // A Z.AI lease purges the Claude login. The explicit invalidation is only a
+    // write, and writes can fail; the generation bump is what makes it certain.
+    const { runtime, files, writeFile } = setup({ execFile: workingClaudeExecFile() })
+    await runtime.apply({ provider: 'claude', payload, provenance })
+    await expect(recorded(files)).resolves.not.toBeNull()
+
+    const original = writeFile.getMockImplementation()!
+    writeFile.mockImplementation(async (path: string, content: string) => {
+      if (path.includes('ai-credential-provenance')) throw new Error('disk full')
+      return original(path, content)
+    })
+    await runtime.apply({
+      provider: 'zai',
+      payload: JSON.stringify({ version: 1, kind: 'zai-anthropic', apiKey: 'zai-secret-key' }),
+    })
+
+    await expect(recorded(files)).resolves.toBeNull()
+  })
+
   it('keeps the Claude record when only the Codex credential changes', async () => {
     const { runtime, files } = setup({ execFile: workingClaudeExecFile() })
     await runtime.apply({ provider: 'claude', payload, provenance })

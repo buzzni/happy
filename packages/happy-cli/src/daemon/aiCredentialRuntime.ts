@@ -819,9 +819,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       `${selected.toUpperCase()}_APPLY_FAILED`,
       async () => {
         const applyGeneration = await reserveApplyGeneration(selected)
-        // Claude's generation was just bumped, which already fences off any
-        // earlier record. A Z.AI apply purges the Claude login without touching
-        // that generation, so it has to say so explicitly.
+        // A Claude record is only believed for the current claude generation.
+        // A Claude apply just bumped it; a Z.AI apply purges the Claude login,
+        // so it bumps it too — the fence then holds even if the explicit
+        // invalidation below cannot be written.
+        if (selected === 'zai') await reserveApplyGeneration('claude')
         if (selected === 'claude' || selected === 'zai') {
           await writeClaudeProvenance(serializeInvalidatedClaudeProvenance(applyGeneration))
         }
