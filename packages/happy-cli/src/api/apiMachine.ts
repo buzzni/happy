@@ -208,6 +208,7 @@ import { readClaudeCodeUsage } from '@/claudeCodeUsage/readUsage';
 import { CodexAppServerClient } from '@/codex/codexAppServerClient';
 import { createCodexThreadTransferHandler } from '@/codex/codexThreadTransfer';
 import { ADDITIONAL_DIRECTORIES_CAPABILITY, parseAdditionalDirectories } from '@/daemon/additionalDirectories';
+import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import {
     CodexForkRewindPointNotFoundError,
     forkCodexThread,
@@ -3802,9 +3803,15 @@ export class ApiMachineClient {
             const daemonSessionStateChanged = this.machine.metadata?.daemonSessionState?.version
                 !== (daemonSessionStateAvailable ? 1 : undefined);
 
+            // Compared with what the server holds, not with a previous tick: `POST /v1/machines`
+            // keeps an existing machine's metadata, so a machine first registered by a daemon that
+            // predates the advertisement would otherwise never carry it.
+            const channelSupportStale = JSON.stringify(this.machine.metadata?.channelSupport)
+                !== JSON.stringify(CHANNEL_SUPPORT_CAPABILITY);
+
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged) {
+            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -3827,6 +3834,7 @@ export class ApiMachineClient {
                         rpcAvailable: this.autonomousQualityGateRpcAvailable,
                     },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
+                    channelSupport: CHANNEL_SUPPORT_CAPABILITY,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
