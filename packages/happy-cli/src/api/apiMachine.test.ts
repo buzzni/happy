@@ -7,6 +7,7 @@ import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_
 import { logger } from '@/ui/logger';
 import type { Machine } from './types';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
+import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
 
 const {
     mockIo,
@@ -852,6 +853,30 @@ describe('ApiMachineClient socket reconnection', () => {
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.channelSupport).toEqual(CHANNEL_SUPPORT_CAPABILITY));
+
+        client.shutdown();
+    });
+
+    it('advertises AI auth selection on a machine registered before the advertisement existed', async () => {
+        // Same registration gap as channel support: without the capability the web UI hides the
+        // credential picker and refuses a spawn that carries a selection.
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.aiAuthSelection).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.aiAuthSelection).toEqual(AI_AUTH_SELECTION_CAPABILITY));
 
         client.shutdown();
     });
