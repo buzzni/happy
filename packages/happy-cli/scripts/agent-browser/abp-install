@@ -352,18 +352,41 @@ ensure_accounts() {
     case "$members" in "" | agent) ;; *) die "group abp-session must contain only agent (has: $members)" ;; esac
 }
 
+# replace_happy_package <prefix> <tarball>: npm installs into a sibling staging prefix and the live
+# prefix is swapped only once the new package is complete, so a failed install (a full disk, a
+# network error) leaves the running daemon's files untouched. Relative bin links survive the rename.
+replace_happy_package() {
+    local prefix=$1 tarball=$2 stage=$1.new old=$1.old
+    safe_path "$stage" dir root
+    safe_path "$old" dir root
+    run rm -rf "$stage" "$old"
+    ensure_dir "$stage" root root 0755
+    if ! run npm install --global --prefix "$stage" --omit=dev --no-audit --no-fund "$tarball"; then
+        run rm -rf "$stage"
+        die "npm install of $tarball failed; $prefix is unchanged"
+    fi
+    if [ "$DRY_RUN" = 0 ] && { [ ! -e "$stage/bin/happy" ] || [ ! -e "$stage/lib/node_modules/@buzzni/happy-cli/dist/sandbox/egressProxyMain.mjs" ]; }; then
+        rm -rf "$stage"
+        die "the staged Happy package is incomplete; $prefix is unchanged"
+    fi
+    # Root-owned and not writable by anyone else (sandbox preflight), readable by agent, agent-sbx and abp-proxy.
+    run chown -R root:root "$stage"
+    run chmod -R a+rX,go-w "$stage"
+    if [ -e "$prefix" ] || [ "$DRY_RUN" = 1 ]; then run mv -T "$prefix" "$old"; fi
+    if ! run mv -T "$stage" "$prefix"; then
+        if [ -e "$old" ]; then run mv -T "$old" "$prefix"; fi
+        die "could not move the staged Happy package into $prefix; the previous package was restored"
+    fi
+    run rm -rf "$old"
+}
+
 install_happy() {
     say "Happy package ($HAPPY_PREFIX)"
     if [ -n "$HAPPY_TARBALL" ]; then
         [ -f "$HAPPY_TARBALL" ] || [ "$DRY_RUN" = 1 ] || die "--happy-tarball $HAPPY_TARBALL does not exist"
         # install -d would create missing parents with this script's umask (077), hiding the package from agent-sbx.
         [ -d "$(dirname "$HAPPY_PREFIX")" ] || ensure_dir "$(dirname "$HAPPY_PREFIX")" root root 0755
-        ensure_dir "$HAPPY_PREFIX" root root 0755
-        safe_path "$HAPPY_PREFIX/lib" dir root
-        run npm install --global --prefix "$HAPPY_PREFIX" --omit=dev --no-audit --no-fund "$HAPPY_TARBALL"
-        # Root-owned and not writable by anyone else (sandbox preflight), readable by agent, agent-sbx and abp-proxy.
-        run chown -R root:root "$HAPPY_PREFIX"
-        run chmod -R a+rX,go-w "$HAPPY_PREFIX"
+        replace_happy_package "$HAPPY_PREFIX" "$HAPPY_TARBALL"
     fi
     local entry=$HAPPY_PREFIX/lib/node_modules/@buzzni/happy-cli/dist/sandbox/egressProxyMain.mjs
     require_file "$HAPPY_PREFIX/bin/happy" "the Happy package (--happy-tarball)"

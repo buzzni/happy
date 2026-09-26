@@ -355,6 +355,52 @@ describe.skipIf(!fixtureBase)('abp-install agent workspace (Desktop chats live u
     })
 })
 
+describe('abp-install Happy package replacement', () => {
+    /** Root-only helpers stubbed; `npm` either fails (a full disk) or installs a complete package into --prefix. */
+    const replace = (prefix: string, npmBody: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+        safe_path() { :; }; ensure_dir() { mkdir -p "$1"; }; chown() { :; }
+        mv() { [ "$1" = -T ] && shift; command mv "$@"; }
+        npm() { local p=""; while [ $# -gt 0 ]; do [ "$1" = --prefix ] && p=$2; shift; done; ${npmBody}; }
+        replace_happy_package "$2" /tmp/pkg.tgz`, 'test', join(here, 'abp-install'), prefix], { encoding: 'utf8' })
+    const live = () => {
+        const root = mkdtempSync(join(tmpdir(), '.abp-happy-'))
+        const prefix = join(root, 'happy')
+        mkdirSync(join(prefix, 'bin'), { recursive: true })
+        writeFileSync(join(prefix, 'bin', 'happy'), 'old')
+        return { root, prefix }
+    }
+    const complete = 'mkdir -p "$p/bin" "$p/lib/node_modules/@buzzni/happy-cli/dist/sandbox"; echo new > "$p/bin/happy"; : > "$p/lib/node_modules/@buzzni/happy-cli/dist/sandbox/egressProxyMain.mjs"'
+
+    it('leaves the running package untouched when npm fails part-way (a full disk)', () => {
+        const { root, prefix } = live()
+        const result = replace(prefix, 'mkdir -p "$p/bin"; echo partial > "$p/bin/.happy-tmp"; echo "ENOSPC" >&2; return 1')
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).toMatch(/is unchanged/)
+        expect(readFileSync(join(prefix, 'bin', 'happy'), 'utf8')).toBe('old')
+        expect(() => lstatSync(`${prefix}.new`)).toThrow()
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('refuses an incomplete staged package and keeps the running one', () => {
+        const { root, prefix } = live()
+        const result = replace(prefix, 'mkdir -p "$p/bin"; echo new > "$p/bin/happy"')
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).toMatch(/incomplete/)
+        expect(readFileSync(join(prefix, 'bin', 'happy'), 'utf8')).toBe('old')
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('swaps in a complete package and removes the previous one', () => {
+        const { root, prefix } = live()
+        const result = replace(prefix, complete)
+        expect(result.status).toBe(0)
+        expect(readFileSync(join(prefix, 'bin', 'happy'), 'utf8').trim()).toBe('new')
+        expect(() => lstatSync(`${prefix}.old`)).toThrow()
+        expect(() => lstatSync(`${prefix}.new`)).toThrow()
+        rmSync(root, { recursive: true, force: true })
+    })
+})
+
 describe('abp-install claude-login', () => {
     const sourced = (snippet: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; ${snippet}`, 'test', join(here, 'abp-install')], { encoding: 'utf8' })
     const sdk = '/opt/abp/happy/lib/node_modules/@buzzni/happy-cli/node_modules/@anthropic-ai'
