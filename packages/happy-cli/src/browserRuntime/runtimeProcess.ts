@@ -68,6 +68,8 @@ interface KeysFile extends AuthKeys {
 
 const RECONNECT_BACKOFF_MS = [250, 500, 1_000, 2_000, 5_000]
 const SWEEP_INTERVAL_MS = 1_000
+const RETENTION_INTERVAL_MS = 60 * 60_000
+const DAY_MS = 24 * 60 * 60_000
 const LOCK_HEARTBEAT_MS = 5_000
 
 function requiredEnv(name: string): string {
@@ -348,6 +350,25 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     }, SWEEP_INTERVAL_MS)
     sweep.unref()
 
+    // retentionDays (config mode): finished tasks older than that are deleted, at start
+    // and hourly; an interrupted deletion is finished by the next run.
+    let retention: NodeJS.Timeout | undefined
+    if (config) {
+        const retentionMs = config.retentionDays * DAY_MS
+        let purging = false
+        const purge = () => {
+            if (purging) return
+            purging = true
+            void runtime.purgeExpiredTasks(retentionMs)
+                .then((purged) => { if (purged.length) log(`retention deleted tasks=${purged.length}`) })
+                .catch((error) => log(`retention failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+                .finally(() => { purging = false })
+        }
+        purge()
+        retention = setInterval(purge, RETENTION_INTERVAL_MS)
+        retention.unref()
+    }
+
     const fenceAcksMs: number[] = []
     // Records cancel fence ACK latency for metrics; every other operation goes straight to the Runtime.
     const api = new Proxy(runtime, {
@@ -433,6 +454,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
 
     const shutdown = async () => {
         clearInterval(sweep)
+        clearInterval(retention)
         clearInterval(heartbeat)
         await server.close()
         await admin.close()

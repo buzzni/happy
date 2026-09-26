@@ -697,6 +697,33 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 browserReplaced: false, ...(previousStatus === 'running' && patch.status === 'paused' ? { attention: 'recovered' } : {}) })
         }
     }
+    /**
+     * Retention (retentionDays): deletes terminal tasks whose last change is older than
+     * `retentionMs` (TaskStore.purgeExpiredTasks) and what the Runtime keeps in memory for them.
+     */
+    async purgeExpiredTasks(retentionMs: number): Promise<TaskId[]> {
+        await this.recovery
+        const known = new Map(this.options.store.listTasks().map((task) => [task.taskId, task]))
+        const purged = await this.options.store.purgeExpiredTasks(this.clock.now(), retentionMs)
+        for (const taskId of purged) {
+            const task = known.get(taskId)
+            this.controllers.delete(taskId)
+            this.workers.delete(taskId)
+            this.inFlightDriverCalls.delete(taskId)
+            this.commitTails.delete(taskId)
+            for (const wake of this.eventWaiters.get(taskId) ?? [])
+                wake()
+            this.eventWaiters.delete(taskId)
+            this.leases.revokeTask(taskId)
+            for (const batchId of Object.keys(task?.batches ?? {}))
+                this.liveBatchSteps.delete(batchId as BatchId)
+            for (const tabId of task?.tabs ?? []) {
+                this.latestAgentSnapshots.delete(tabId)
+                this.latestAgentUrls.delete(tabId)
+            }
+        }
+        return purged
+    }
     async revokeGrant(grantId: GrantId): Promise<void> {
         let failure: unknown
         try {
