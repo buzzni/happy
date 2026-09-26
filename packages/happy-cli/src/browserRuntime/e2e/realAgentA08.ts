@@ -9,7 +9,7 @@
  * Usage: tsx src/browserRuntime/e2e/realAgentA08.ts --run <stackRun> --iteration <n>
  */
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { TaskEvent, TaskId } from '../contracts'
 import {
@@ -60,6 +60,18 @@ async function main(): Promise<void> {
     evidence.beforeApproval = { status: pending.status, waitReason: pending.waitReason, hasPendingApproval: Boolean(pending.pendingApproval), riskyWrites: (await riskyCount(ctx)) - riskyBefore }
     save()
     if (!pending.pendingApproval) throw new Error('no pending approval persisted')
+
+    // Optional hold (upgrade/reboot drills): the approval stays pending while the operator acts on H.
+    const hold = process.env.ABP_A08_HOLD_FILE
+    if (hold) {
+        writeFileSync(`${hold}.waiting`, String(taskId))
+        while (!existsSync(hold)) await sleep(2_000)
+        const survived = await user.getTask({ taskId })
+        evidence.afterHold = { status: survived.status, waitReason: survived.waitReason, hasPendingApproval: Boolean(survived.pendingApproval), sameTask: survived.taskId === taskId }
+        save()
+        if (!survived.pendingApproval) throw new Error('the pending approval did not survive the hold')
+        Object.assign(pending, { pendingApproval: survived.pendingApproval })
+    }
 
     // 3. The user reconnects and approves exactly this action.
     const approvedAt = now()
