@@ -25,7 +25,10 @@ import { basename, dirname, join } from 'node:path'
 import { brokerRequest } from '@/browserRuntime/brokerGrantSource'
 import { logger } from '@/ui/logger'
 import { sessionRegistrationsSchema, type SessionOwner } from '@/browserRuntime/sessionRegistration'
-import { readBrowserTaskBootId, readBrowserTaskPidStartTime, readBrowserTaskSessionOwner } from './browserTaskSessionOwner'
+import { readBrowserTaskBootId, readBrowserTaskBootTimeMs, readBrowserTaskPidStartTime, readBrowserTaskSessionOwner } from './browserTaskSessionOwner'
+
+/** Clock margin for comparing a registration's Runtime timestamp with the host boot time. */
+const BOOT_TIME_MARGIN_MS = 60_000
 
 const DEFAULT_DAEMON_TOKEN_FILE = '/var/lib/abp/daemon-token'
 const MAX_RETRY_DELAY_MS = 5 * 60_000
@@ -219,13 +222,18 @@ export function createBrowserTaskSessionBroker(
                     return
                 }
                 const registrations = sessionRegistrationsSchema.parse(reply.body.result)
-                if (!registrations.some((registration) => registration.owner)) return
-                const bootId = await readBrowserTaskBootId(options.procRoot)
+                if (!registrations.length) return
+                // A registration without an owner (made before owners were recorded) is provably dead only
+                // when it predates this boot: no session process survives a reboot.
+                const bootTimeMs = await readBrowserTaskBootTimeMs(options.procRoot)
+                const bootId = registrations.some((registration) => registration.owner) ? await readBrowserTaskBootId(options.procRoot) : undefined
                 for (const registration of registrations) {
                     const { owner } = registration
-                    if (!owner) continue
                     try {
-                        if (owner.bootId !== bootId || await readBrowserTaskPidStartTime(owner.pid, options.procRoot) !== owner.pidStartTime) {
+                        const dead = owner
+                            ? owner.bootId !== bootId || await readBrowserTaskPidStartTime(owner.pid, options.procRoot) !== owner.pidStartTime
+                            : bootTimeMs !== undefined && registration.createdAtMs < bootTimeMs - BOOT_TIME_MARGIN_MS
+                        if (dead) {
                             await broker.revoke({ registrationId: registration.registrationId })
                         }
                     } catch (error) {

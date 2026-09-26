@@ -10,7 +10,7 @@ import { createBrowserTaskSessionBroker, startBrowserTaskReconciliation } from '
 const cleanups: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
 
-async function harness(owner?: SessionOwner, agentSessionId?: string) {
+async function harness(owner?: SessionOwner, agentSessionId?: string, createdAtMs = 1) {
     const dir = await mkdtemp(join(tmpdir(), 'abp-reconcile-'))
     cleanups.push(() => rm(dir, { recursive: true, force: true }))
     const procRoot = join(dir, 'proc')
@@ -26,7 +26,7 @@ async function harness(owner?: SessionOwner, agentSessionId?: string) {
         calls.push({ method, path, body })
         if (path === '/v1/sessions') {
             if (!listAvailable) throw new Error('ECONNREFUSED')
-            return { status: 200, body: { ok: true, result: [{ registrationId: 'reg-1', agentSessionId, owner, createdAtMs: 1, revoking: false }] } }
+            return { status: 200, body: { ok: true, result: [{ registrationId: 'reg-1', agentSessionId, owner, createdAtMs, revoking: false }] } }
         }
         if (path === '/v1/sessions/revoke' && !revokeAvailable) throw new Error('ECONNREFUSED')
         return { status: 200, body: { ok: true, result: {} } }
@@ -82,10 +82,28 @@ describe('browser registration reconciliation', () => {
         expect(h.revoked()).toEqual([])
     })
 
-    it('keeps legacy registrations without an owner', async () => {
+    it('keeps legacy registrations without an owner when the boot time is unknown', async () => {
         const h = await harness()
         await h.broker.reconcile()
         expect(h.revoked()).toEqual([])
+    })
+
+    it('revokes an owner-less registration created before this boot (no process survives a reboot)', async () => {
+        const bootSeconds = 1_790_000_000
+        const h = await harness(undefined, 'session-1', bootSeconds * 1000 - 3_600_000)
+        await writeFile(join(h.procRoot, 'stat'), `cpu  1 2 3\nbtime ${bootSeconds}\nprocesses 9\n`)
+        await h.broker.reconcile()
+        expect(h.revoked()).toEqual(revoked)
+    })
+
+    it('keeps an owner-less registration created after this boot, or within the clock margin of it', async () => {
+        const bootSeconds = 1_790_000_000
+        for (const createdAtMs of [bootSeconds * 1000 + 5_000, bootSeconds * 1000 - 30_000]) {
+            const h = await harness(undefined, 'session-1', createdAtMs)
+            await writeFile(join(h.procRoot, 'stat'), `cpu  1 2 3\nbtime ${bootSeconds}\n`)
+            await h.broker.reconcile()
+            expect(h.revoked()).toEqual([])
+        }
     })
 
     it('attaches the child identity at bind, preserving the stat start time exactly', async () => {
