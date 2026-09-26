@@ -112,6 +112,30 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
   login needs the site's `loginCompleteWhen`, other waits their predicate; a wait without a
   recorded condition is refused. The final write rechecks task state, grant validity and
   input ownership, since the login check awaits the browser, and records `user-resumed`.
+- Task space reclamation (spaces otherwise outlive aborted sessions and fill
+  `maxSpacesPerProfile`, which is runtime.json config, default min(4, maxAgentWindows); the
+  harness keeps the PoC limit of 2):
+  - Session end: the broker's session revocation calls `endSession` under the tombstone
+    (failure or crash retried like a grant revocation). The session's spaces are durably
+    marked `reclaimReason: 'session-ended'` and its unfinished tasks go through the cancel
+    fence.
+  - `reclaimSpaces` (at start, every 30 s, and right after a session ends) closes marked
+    spaces tab by tab once no batch is running. It also closes spaces whose tasks are all
+    finished and that were idle for `spaceIdleReclaimMs` (default 15 min; harness only with
+    `ABP_SPACE_IDLE_RECLAIM_MS`). Closed or reclaiming spaces refuse `createTask` and
+    `openPage` (CONFLICT, "create a new task space").
+  - Retained work: a task whose write outcome is unknown stays paused
+    (`cancelled-with-unknown-effect`, visible in the console) with its space and tabs. That
+    space no longer counts against the quota, except reclaiming spaces beyond 2 per profile
+    (`RECLAIMING_SPACE_RESERVE`), so a pile-up still surfaces as `QUOTA_EXCEEDED`. The
+    operator reconciles the action (admin `reconcile-action`) or force-closes the space.
+    Its windows still count toward `maxAgentWindows`.
+  - A tab blocking unload stays open, is recorded in `reclaimBlockedTabs` and reported, and
+    is retried on each pass.
+  - Operator: admin socket `GET /admin/spaces` (owner session, tasks, tabs, age, counted)
+    and `POST /admin/close-space { taskSpaceId, force? }` (cancel, then close; `force`
+    also closes a space with unknown-outcome tasks, whose records stay for reconcile).
+    TODO (S6 installer stream): wire `abp-stack spaces list|close <id> [--force]` to these.
 - Retention (`retentionDays`, config mode, at start and hourly): terminal tasks without
   uncertain actions whose last change is older than the retention are deleted
   (`BrowserRuntime.purgeExpiredTasks`). Their still-open browser tabs are closed first and
