@@ -190,8 +190,9 @@ export type EphemeralEvent = {
     id: string;
     key: string;
     tokens: Record<string, number>;
-    cost: Record<string, number>;
+    cost: Record<string, number> | null;
     timestamp: number;
+    sourceEventId?: string;
 } | {
     type: 'machine-status';
     machineId: string;
@@ -595,14 +596,21 @@ export function buildMachineActivityEphemeral(machineId: string, active: boolean
     };
 }
 
-export function buildUsageEphemeral(sessionId: string, key: string, tokens: Record<string, number>, cost: Record<string, number>): EphemeralPayload {
+export function buildUsageEphemeral(
+    sessionId: string,
+    key: string,
+    tokens: Record<string, number>,
+    cost: Record<string, number> | null,
+    sourceEventId?: string,
+): EphemeralPayload {
     return {
         type: 'usage',
         id: sessionId,
         key,
         tokens,
         cost,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        ...(sourceEventId ? { sourceEventId } : {}),
     };
 }
 

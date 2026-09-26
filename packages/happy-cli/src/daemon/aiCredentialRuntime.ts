@@ -17,7 +17,15 @@ import { overlayManagedCredentialEnvironment } from './sessionEnv'
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_VERSION = '0.25.0'
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
-const CODEX_MULTI_AUTH_VERSION = '2.8.5'
+const CODEX_MULTI_AUTH_VERSION = '2.16.0'
+// Bundles captured by an earlier pin stay deployable when that release wrote
+// the same account (v3) and settings (v1) files. 2.15.0 and 2.16.0 ship an
+// identical `dist/lib/storage`, so a vault bundle captured before this bump
+// must not start failing apply the moment machines update.
+const READABLE_CODEX_MULTI_AUTH_BUNDLE_VERSIONS: ReadonlySet<string> = new Set([
+  '2.15.0',
+  CODEX_MULTI_AUTH_VERSION,
+])
 const CODEX_MULTI_AUTH_THRESHOLD = 5
 
 export type AiCredentialProvider = 'claude' | 'codex' | 'zai'
@@ -362,6 +370,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     await purgeManagedProvider('zai')
     const apiKeyTargetEmail = claudeApiKeyTargetEmail(payload)
     const importedAccountIdentities = claudeImportedAccountIdentities(payload)
+    const verifyImportedAccounts = (details: ClaudeListDetails) => {
+      if (importedAccountIdentities === null) return
+      const remainingIdentities = new Set(details.accounts.map(claudeListAccountIdentity))
+      if (details.accounts.length !== importedAccountIdentities.size
+        || remainingIdentities.size !== importedAccountIdentities.size
+        || [...importedAccountIdentities].some((identity) => !remainingIdentities.has(identity))) {
+        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      }
+    }
     if (importedAccountIdentities !== null) await deps.supervisor.stop()
     await ensureClaudeSwap()
     const tempDir = await deps.makeTempDir()
@@ -398,11 +415,27 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         })
         details = parseClaudeListDetails(status.stdout)
       }
-      const remainingIdentities = new Set(details.accounts.map(claudeListAccountIdentity))
-      if (details.accounts.length !== importedAccountIdentities.size
-        || remainingIdentities.size !== importedAccountIdentities.size
-        || [...importedAccountIdentities].some((identity) => !remainingIdentities.has(identity))) {
-        throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      verifyImportedAccounts(details)
+      const active = details.accounts.find((account) => (
+        account.number === details.activeAccountNumber && account.disabled !== true
+      ))
+      if (active) {
+        // Import replaces the stored backup, not the live credential (including
+        // macOS Keychain). Even an "ok" or "relogin_required" active slot still
+        // describes the old login. Force activation skips backing that login
+        // up over the imported credential; use the resolved local slot number.
+        await deps.execFile('cswap', [
+          'switch', String(active.number), '--force', '--json',
+        ], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        status = await deps.execFile('cswap', ['list', '--json'], {
+          maxOutputBytes: MAX_PAYLOAD_BYTES,
+          timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
+        })
+        details = parseClaudeListDetails(status.stdout)
+        verifyImportedAccounts(details)
+        if (details.activeAccountNumber !== active.number) {
+          throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+        }
       }
     }
     if (apiKeyTargetEmail !== null) {
@@ -422,6 +455,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
         })
         details = parseClaudeListDetails(status.stdout)
+        verifyImportedAccounts(details)
         target = details.accounts.find((account) => (
           account.email === apiKeyTargetEmail
           && account.usageStatus === 'api_key'
@@ -450,6 +484,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
       details = parseClaudeListDetails(status.stdout)
+      verifyImportedAccounts(details)
       if (!details.activeUsable) {
         throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
       }
@@ -1163,7 +1198,7 @@ type CodexMultiAuthAccount = CodexAccountIdentity & {
 type CodexMultiAuthBundle = {
   version: 1
   kind: 'codex-multi-auth'
-  packageVersion: typeof CODEX_MULTI_AUTH_VERSION
+  packageVersion: string
   accounts: {
     version: 3
     accounts: CodexMultiAuthAccount[]
@@ -1188,7 +1223,8 @@ function parseCodexMultiAuthBundle(payload: string): CodexMultiAuthBundle | null
   }
   if (!isObject(parsed) || parsed.kind !== 'codex-multi-auth') return null
   if (parsed.version !== 1
-    || parsed.packageVersion !== CODEX_MULTI_AUTH_VERSION
+    || typeof parsed.packageVersion !== 'string'
+    || !READABLE_CODEX_MULTI_AUTH_BUNDLE_VERSIONS.has(parsed.packageVersion)
     || !isObject(parsed.accounts)
     || parsed.accounts.version !== 3
     || !Array.isArray(parsed.accounts.accounts)
@@ -1412,9 +1448,11 @@ export function runAiCredentialCommand(
   spawnCommand: typeof spawn = spawn,
 ): Promise<AiCredentialCommandResult> {
   return new Promise((resolve, reject) => {
+    const environment = options.environment ?? process.env
     const child = spawnCommand(command, args, {
-      env: options.environment
-        ?? (command === 'cswap' ? withUvToolBinOnPath() : process.env),
+      env: command === 'uv' || command === 'cswap'
+        ? withUvToolBinOnPath(environment, homedir(), command)
+        : environment,
       stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -1443,7 +1481,9 @@ export function runAiCredentialCommand(
     }
     child.stdout!.on('data', collect(stdout))
     child.stderr!.on('data', collect(stderr))
-    child.on('error', () => fail('COMMAND_NOT_AVAILABLE'))
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      fail(error.code === 'ENOENT' ? 'COMMAND_NOT_AVAILABLE' : 'COMMAND_FAILED')
+    })
     child.on('close', (code) => {
       if (settled) return
       settled = true
@@ -1471,8 +1511,9 @@ export function runAiCredentialCommand(
 export function withUvToolBinOnPath(
   environment: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
+  command: 'uv' | 'cswap' = 'cswap',
 ): NodeJS.ProcessEnv {
-  const toolBin = environment.UV_TOOL_BIN_DIR
+  const toolBin = (command === 'uv' ? environment.UV_INSTALL_DIR : environment.UV_TOOL_BIN_DIR)
     || environment.XDG_BIN_HOME
     || (environment.XDG_DATA_HOME
       ? join(environment.XDG_DATA_HOME, '..', 'bin')

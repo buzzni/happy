@@ -94,7 +94,8 @@ const DEFAULT_SHELL = process.platform === 'win32' ? 'powershell.exe' : '/bin/ba
 export function createPtySession(opts: PtySessionOpts): PtySession {
     const id = randomUUID()
     const shell = opts.shell || process.env.SHELL || DEFAULT_SHELL
-    const args = opts.args ?? ['-l']
+    // Windows shells do not accept the POSIX login-shell flag.
+    const args = opts.args ?? (process.platform === 'win32' ? [] : ['-l'])
     const cwd = opts.cwd || homedir()
     const env: { [key: string]: string } = { ...process.env, ...(opts.env ?? {}) } as { [key: string]: string }
     const initialCols = opts.cols ?? 80

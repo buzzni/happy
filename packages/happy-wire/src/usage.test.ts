@@ -67,3 +67,85 @@ describe('AiUsageEventV1Schema', () => {
         expect(() => AiUsageEventV1Schema.parse(providerEvent)).toThrow();
     });
 });
+
+describe('aiAuth report on a usage event', () => {
+    it('accepts an event from a CLI that does not report an auth source', () => {
+        expect(ProviderUsageEventV1Schema.parse(providerEvent)).toEqual(providerEvent);
+        expect(ProviderUsageEventV1Schema.parse({ ...providerEvent, aiAuth: null }).aiAuth).toBeNull();
+    });
+
+    it('keeps an applied source the receiver does not know yet', () => {
+        const event = {
+            ...providerEvent,
+            aiAuth: { appliedSource: 'some-future-source', connectionVersion: 3 },
+        };
+
+        expect(ProviderUsageEventV1Schema.parse(event)).toEqual(event);
+    });
+
+    it('carries the report through the server boundary schema too', () => {
+        const event = {
+            ...providerEvent,
+            happyAccountId: 'happy-account-1',
+            aiAuth: { appliedSource: 'platform-glm', connectionVersion: null },
+        };
+
+        expect(AiUsageEventV1Schema.parse(event)).toEqual(event);
+    });
+
+    it('stays on schema version 1 so older CLI events keep parsing', () => {
+        expect(ProviderUsageEventV1Schema.parse({
+            ...providerEvent,
+            aiAuth: { appliedSource: 'platform-glm' },
+        }).schemaVersion).toBe(1);
+    });
+
+    it.each([
+        ['a non-string applied source', { appliedSource: 7 }],
+        ['a fractional connection version', { appliedSource: 'org-bundle', connectionVersion: 1.5 }],
+        ['a negative connection version', { appliedSource: 'org-bundle', connectionVersion: -1 }],
+        ['an unexpected field', { appliedSource: 'org-bundle', ownerUserId: 'u1' }],
+    ])('rejects %s', (_label, aiAuth) => {
+        expect(() => ProviderUsageEventV1Schema.parse({ ...providerEvent, aiAuth })).toThrow();
+    });
+});
+
+/**
+ * The CLI and happy-server each bundle their own copy of this schema, and it is
+ * `.strict()`. A field that a deployed peer does not know sinks the whole event:
+ * `usageHandler.ts` drops it with a single warn line that does not name the
+ * field. The release runbook fixes the deploy order (server first); this guard
+ * fixes the shape, so the runbook only ever has to cover one direction.
+ */
+describe('wire compatibility guard', () => {
+    /** Exactly the keys a peer must send. Adding one here breaks every older CLI. */
+    const REQUIRED_KEYS = [
+        'source',
+        'sourceEventId',
+        'schemaVersion',
+        'occurredAt',
+        'sessionId',
+        'provider',
+        'agent',
+        'model',
+        'measurement',
+        'tokens',
+        'cost',
+        'quality',
+    ] as const;
+
+    it('parses an event carrying only the required keys — an older CLI still reports', () => {
+        const minimal = Object.fromEntries(
+            REQUIRED_KEYS.map((key) => [key, providerEvent[key]]),
+        );
+        expect(ProviderUsageEventV1Schema.safeParse(minimal).success).toBe(true);
+    });
+
+    it.each(REQUIRED_KEYS)('still requires %s', (key) => {
+        const missing = Object.fromEntries(
+            REQUIRED_KEYS.filter((other) => other !== key).map((other) => [other, providerEvent[other]]),
+        );
+        expect(ProviderUsageEventV1Schema.safeParse(missing).success).toBe(false);
+    });
+
+});

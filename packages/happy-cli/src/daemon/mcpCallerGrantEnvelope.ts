@@ -50,6 +50,27 @@ export function injectMcpCallerGrant(
                 // code: the default spawn path forwards the daemon's whole
                 // environment, so anything left here is readable by the agent.
                 && !key.startsWith('HAPPY_MANAGED_')
+                /*
+                 * Lesson host settings the daemon owns.
+                 *
+                 * `HAPPY_LESSON_DAEMON_HOME` decides which state root the
+                 * session's settings and spending ledger come from, so a
+                 * caller that could set it would point a session at a
+                 * settings file with recall on and a ledger with no history —
+                 * past both the user's "off" and the machine-wide budget.
+                 */
+                && !key.startsWith('HAPPY_LESSON_')
+                /*
+                 * The memory layer's own configuration, including
+                 * `CLAUDE_MEMORY_LESSON_OWNER` — the marker that tells CML's
+                 * native hook to stand down because this host is injecting.
+                 * A caller setting it would silence the native path while no
+                 * host was running, which is how a session ends up with no
+                 * lessons at all; and
+                 * `CLAUDE_MEMORY_LESSON_HOST_ROOT` names the package a lesson
+                 * store is loaded from.
+                 */
+                && !key.startsWith('CLAUDE_MEMORY_')
             )),
     );
     if (trustedConfigUrl) {

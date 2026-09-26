@@ -1,3 +1,4 @@
+import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
@@ -48,7 +49,7 @@ export interface ServerToClientEvents {
   update: (data: Update) => void
   // `callback` is optional because socket.io does not guarantee an ack on
   // every delivered packet — see createRpcRequestListener.
-  'rpc-request': (data: { method: string, params: string }, callback?: (response: string) => void) => void
+  'rpc-request': (data: RpcRequest, callback?: RpcResponseCallback) => void
   'rpc-registered': (data: { method: string }) => void
   'rpc-unregistered': (data: { method: string }) => void
   'rpc-error': (data: { type: string, error: string }) => void
@@ -163,6 +164,42 @@ export const MachineMetadataSchema = z.object({
     sessionFollowup: z.literal(true).optional(),
     protocolVersion: z.number().int().min(1).optional(),
   }).optional(),
+  /**
+   * External messenger channel support (Saycode specs/desktop-messenger-channels).
+   *
+   * Advertised so Desktop can refuse to relay a channel message to a daemon that predates the
+   * handling. An older daemon ignores `meta.channelOrigin` entirely, which means it would read a
+   * channel `/clear` as session control and clear the queue, and would apply the AX
+   * plan→acceptEdits promotion to an external turn — the two things the field exists to prevent.
+   * Its absence is therefore *not* "probably fine": it is the unsafe case, and Desktop fails
+   * closed on it.
+   *
+   * `engines` lists the agents whose loops actually honour the field and correlate a reply to the
+   * request. It is deliberately explicit rather than "all of them": an engine that has not been
+   * wired yet would otherwise look supported and answer with the wrong turn.
+   */
+  channelSupport: z.object({
+    protocolVersion: z.literal(1),
+    engines: z.array(z.enum(['claude', 'codex', 'gemini', 'openclaw', 'opencode', 'grok'])),
+    /**
+     * One-shot permission approval from a messenger.
+     *
+     * A **separate axis** from `engines`, which only says the loop honours `meta.channelOrigin`
+     * and correlates a reply to the request. Answering a prompt needs more than that: the prompt
+     * must be bound to its turn as it is raised, published without its arguments, consumed
+     * atomically, and withdrawn on every path it leaves by. A daemon can do the first and none of
+     * the rest.
+     *
+     * Its own `protocolVersion` for the same reason `channelSupport` has one: the approval event
+     * shape can move without the channel transport moving. Not derived, not defaulted — absence
+     * means the daemon cannot do it, and a caller that offers the button anyway offers one whose
+     * answers are always refused. `engines` is a claim about each engine's loop, not the build.
+     */
+    approvals: z.object({
+      protocolVersion: z.literal(1),
+      engines: z.array(z.enum(['claude', 'codex', 'gemini', 'openclaw', 'opencode', 'grok'])),
+    }).optional(),
+  }).optional(),
   autonomousQualityGateSupport: AutonomousQualityGateCapabilityAdvertisementSchema.optional(),
   additionalDirectories: z.object({
     version: z.literal(1),
@@ -171,6 +208,16 @@ export const MachineMetadataSchema = z.object({
     access: z.literal('read-write'),
   }).optional(),
   difficultyRouting: DifficultyRoutingCapabilitySchema.optional(),
+  /**
+   * 이 daemon 이 spawn param `aiAuthSelection` 을 이해한다고 광고한다.
+   *
+   * `spawn-happy-session` 은 파라미터를 구조분해만 하므로 구형 daemon 은 선택을
+   * 조용히 버린다. 클라이언트는 이 필드를 보고 나서만 선택을 보낸다. 버전을 두는
+   * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
+   */
+  aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
+  /** Current tracked-child presence via encrypted machine RPC (BYOS only). */
+  daemonSessionState: z.object({ version: z.literal(1) }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -260,6 +307,13 @@ export const MessageMetaSchema = z.object({
   difficultyRoutingIntent: DifficultyRoutingIntentSchema.optional().catch(undefined),
   difficultyRoutingPrompt: z.string().optional(),
   difficultyRoutingAuthorization: z.string().optional(),
+  // Opt-in browser diagnostics only. The opaque id binds one daemon-local
+  // duration record to its originating browser attempt; it is never a user,
+  // session, message, or provider identifier.
+  latencyTrace: z.object({
+    version: z.literal(1),
+    id: z.string().uuid(),
+  }).optional().catch(undefined),
 })
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>
@@ -293,7 +347,12 @@ export const UserMessageSchema = z.object({
   meta: MessageMetaSchema.optional()
 })
 
-export type UserMessage = z.infer<typeof UserMessageSchema>
+// Runtime-only durable identity supplied by ApiSessionClient from the trusted
+// server message row. It is intentionally absent from UserMessageSchema so an
+// encrypted client payload cannot choose or spoof this value.
+export type UserMessage = z.infer<typeof UserMessageSchema> & {
+  serverMessageId?: string
+}
 
 /**
  * File event message — sent by the app as a session envelope before the text message.
@@ -379,6 +438,12 @@ export type Metadata = {
   codexThreadId?: string, // Codex app-server thread ID
   tools?: string[],
   slashCommands?: string[],
+  claudeBackgroundTasks?: {
+    startedAt: number;
+    available: boolean;
+    tasks: Array<{ taskId: string; label: string; kind: 'shell' | 'agent' }> | null;
+  },
+  codexBackgroundTasks?: Array<{ callId: string; command: string; processId?: string; status: 'running' | 'unknown' }>,
   mcpServers?: Array<{ name: string; status: string; error?: string; checkedAt?: number }>,
   skills?: string[],
   plugins?: Array<{ name: string; path: string }>,
@@ -407,11 +472,16 @@ export type Metadata = {
    * doesn't supply it (specs/session-created-by).
    */
   createdBy?: { accountId: string; displayName?: string }
-  difficultyRoutingState?: {
-    difficulty?: 'trivial' | 'routine' | 'hard' | 'escalated'
-    hardTurns?: number
-    updatedAt?: number
-  }
+  /**
+   * Auto-routing state. Deliberately `unknown`: the record may be the pre-v2
+   * shape (`{ difficulty, hardTurns, updatedAt }`), the versioned v2 shape, or
+   * one written by a newer CLI that this build cannot represent. Every reader
+   * goes through `normalizeRoutingSessionState`, which validates it and reports
+   * an unreadable record as an unknown floor rather than as an absent one — a
+   * typed field here would invite exactly the unchecked cast that loses that
+   * distinction.
+   */
+  difficultyRoutingState?: unknown
 };
 
 export type AgentGoalStatus = {

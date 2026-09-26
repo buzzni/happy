@@ -55,6 +55,7 @@ export const McpRuntimeServerStatusSchema = z.strictObject({
   name: z.string().min(1),
   status: z.enum([
     'connected',
+    'disabled',
     'reconnecting',
     'failed',
     'needs-auth',

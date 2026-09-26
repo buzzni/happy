@@ -21,7 +21,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import {
   DifficultyRoutingClassifierHost,
   createDifficultyRoutingHostKey,
-  type DifficultyRoutingRelayRequest,
+  type DifficultyRoutingRelayRequestV2,
 } from './difficultyRoutingClassifierHost'
 
 const modelDir = process.env.HAPPY_DIFFICULTY_ROUTING_MODEL_DIR
@@ -68,7 +68,7 @@ describe.skipIf(!enabled)('difficulty routing sealed relay with the real worker'
     }
   }
 
-  const request = (text: string, overrides: Partial<DifficultyRoutingRelayRequest> = {}): DifficultyRoutingRelayRequest => ({
+  const request = (text: string, overrides: Partial<DifficultyRoutingRelayRequestV2> = {}): DifficultyRoutingRelayRequestV2 => ({
     version: 1,
     requestId: randomUUID(),
     signedGrant: `grant-${randomUUID()}`,
@@ -76,7 +76,7 @@ describe.skipIf(!enabled)('difficulty routing sealed relay with the real worker'
     sourceMachineId: 'machine-source',
     hostMachineId: 'machine-host',
     hostProcessKeyId: hostKey.id,
-    deadlineAt: Date.now() + 900,
+    timingVersion: 2, remainingMs: 3000,
     sealedText: seal(text),
     ...overrides,
   })
@@ -113,7 +113,7 @@ describe.skipIf(!enabled)('difficulty routing sealed relay with the real worker'
   it('refuses a grant that is replayed with the same signature', async () => {
     const first = request('같은 grant 를 두 번 쓰는 요청')
     expect((await host.classify(first)).status).toBe('ok')
-    const replayed = { ...first, requestId: randomUUID(), sealedText: seal('같은 grant 를 두 번 쓰는 요청'), deadlineAt: Date.now() + 900 }
+    const replayed = { ...first, requestId: randomUUID(), sealedText: seal('같은 grant 를 두 번 쓰는 요청'), remainingMs: 3000 }
     expect((await host.classify(replayed)).status).toBe('revoked')
   }, 30_000)
 

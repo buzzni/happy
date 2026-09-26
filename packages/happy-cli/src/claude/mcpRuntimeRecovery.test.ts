@@ -2,6 +2,42 @@ import { describe, expect, it, vi } from 'vitest';
 import { McpRuntimeRecovery, sanitizeMcpError } from './mcpRuntimeRecovery';
 
 describe('McpRuntimeRecovery', () => {
+    it('publishes disabled servers unchanged without reconnecting, including expected connectors', async () => {
+        const reconnectMcpServer = vi.fn();
+        const onStatus = vi.fn();
+        const recovery = new McpRuntimeRecovery({
+            mcpServerStatus: vi.fn(async () => [
+                { name: 'plugin:example:gmail', status: 'disabled' as const },
+                { name: 'gmail', status: 'disabled' as const },
+            ]),
+            reconnectMcpServer,
+        }, { connectorNames: ['gmail'], onStatus, now: () => 123 });
+
+        await recovery.recoverFailedServers();
+
+        expect(onStatus.mock.calls.map(([status]) => status)).toEqual([
+            { name: 'plugin:example:gmail', status: 'disabled', checkedAt: 123 },
+            { name: 'gmail', status: 'disabled', checkedAt: 123 },
+        ]);
+        expect(reconnectMcpServer).not.toHaveBeenCalled();
+    });
+
+    it('stops recovery when the SDK reports disabled instead of overwriting it with failed', async () => {
+        const reconnectMcpServer = vi.fn(async () => {});
+        const onStatus = vi.fn();
+        const recovery = new McpRuntimeRecovery({
+            mcpServerStatus: vi.fn()
+                .mockResolvedValueOnce([{ name: 'argos', status: 'failed' }])
+                .mockResolvedValue([{ name: 'argos', status: 'disabled' }]),
+            reconnectMcpServer,
+        }, { onStatus, backoffMs: 0 });
+
+        await recovery.recoverFailedServers();
+
+        expect(reconnectMcpServer).toHaveBeenCalledTimes(1);
+        expect(onStatus.mock.calls.map(([status]) => status.status)).toEqual(['failed', 'reconnecting', 'disabled']);
+    });
+
     it('retries a failed server at most twice with backoff and reports recovery', async () => {
         const mcpServerStatus = vi.fn()
             .mockResolvedValueOnce([{ name: 'argos', status: 'failed', error: 'offline' }])
@@ -146,4 +182,15 @@ describe('sanitizeMcpError', () => {
             '{"Authorization":"[REDACTED]"}',
         );
     });
+});
+
+
+it('reads healthy Claude SDK status without reconnecting and reports live changes', async () => {
+    const mcpServerStatus = vi.fn().mockResolvedValue([{ name: 'qa', status: 'connected' }]);
+    const reconnectMcpServer = vi.fn();
+    const recovery = new McpRuntimeRecovery({ mcpServerStatus, reconnectMcpServer }, { now: () => 123 });
+    expect(await recovery.readStatuses()).toEqual([{ name: 'qa', status: 'connected', error: undefined, checkedAt: 123 }]);
+    mcpServerStatus.mockResolvedValue([{ name: 'qa', status: 'failed', error: 'Bearer secret' }]);
+    expect(await recovery.readStatuses()).toEqual([{ name: 'qa', status: 'failed', error: 'Bearer [REDACTED]', checkedAt: 123 }]);
+    expect(reconnectMcpServer).not.toHaveBeenCalled();
 });

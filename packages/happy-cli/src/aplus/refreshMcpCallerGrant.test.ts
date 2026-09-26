@@ -52,6 +52,23 @@ describe('refreshMcpCallerGrantIfExpiring', () => {
         });
     });
 
+    it('binds machine renewal to the current project and registered session', async () => {
+        const current = process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(
+            JSON.stringify({ grant: 'fresh-grant' }), { status: 200 },
+        ));
+        vi.stubGlobal('fetch', fetchMock);
+        expect(await refreshMcpCallerGrantIfExpiring('machine-token', 'machine-1', {
+            projectId: 'P-1', sessionId: 'session-1', now: 99_000,
+        })).toBe(true);
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('https://saycode.test/api/projects/P-1/lesson-host/refresh');
+        expect(JSON.parse(String(init?.body))).toEqual({
+            machineId: 'machine-1', sessionId: 'session-1', callerGrant: current,
+        });
+        expect(init?.redirect).toBe('error');
+    });
+
     it('takes the project scope from the config URL when the caller does not pass one', async () => {
         process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'https://saycode.test/api/me/mcp-config?project_id=P-9';
         const fetchMock = vi.fn<typeof fetch>(async () => new Response(

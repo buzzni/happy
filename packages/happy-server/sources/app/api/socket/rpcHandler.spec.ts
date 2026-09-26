@@ -16,6 +16,8 @@ class FakeSocket {
     emitted: Array<{ event: string; payload: unknown }> = [];
     handlers = new Map<string, (...args: any[]) => unknown>();
 
+    get volatile() { return this; }
+
     constructor(readonly id: string) {}
 
     on(event: string, handler: (...args: any[]) => unknown) {
@@ -342,3 +344,207 @@ describe('rpcHandler adapter lookup failures', () => {
         }
     });
 });
+
+describe('opt-in native RPC timing', () => {
+    const rpcLatency = { version: 1, id: '11111111-1111-4111-8111-111111111111' };
+    it('correlates server phases, unwraps new daemon ACKs and preserves the relay timeout', async () => {
+        vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+        try {
+            const caller = new FakeSocket('caller');
+            const target = new FakeSocket('target');
+            const daemon = { ...rpcLatency, spans: [{ stage: 'daemon-handler', durationMs: 1, outcome: 'resolved' }], droppedSpans: 0, clockFailures: 0 };
+            const emit = vi.fn(async () => ({ result: 'encrypted-result', rpcLatency: daemon }));
+            target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+            rpcHandler('u1', caller as any, fakeIo([target]) as any);
+            const callback = vi.fn();
+            await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+            expect(emit).toHaveBeenCalledExactlyOnceWith('rpc-request', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency });
+            expect(target.timeout).toHaveBeenCalledWith(30000);
+            const reply = callback.mock.calls[0][0];
+            expect(reply.result).toBe('encrypted-result');
+            expect(reply.rpcLatency.id).toBe(rpcLatency.id);
+            expect(reply.rpcLatency.daemon).toEqual(daemon);
+            expect(reply.rpcLatency.server.spans.map((s: any) => s.stage)).toEqual(['server-total', 'server-managed-check', 'server-lookup', 'server-relay']);
+            expect(JSON.stringify(reply.rpcLatency)).not.toMatch(/machine-1|encrypted|u1|params/);
+        } finally { vi.unstubAllEnvs(); }
+    });
+    it('accepts old daemon strings, caps requests and ignores tracing when disabled', async () => {
+        vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+        try {
+            const caller = new FakeSocket('caller');
+            const target = new FakeSocket('target');
+            const emit = vi.fn(async (_event: string, _payload: unknown) => 'old-encrypted-result');
+            target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+            rpcHandler('u1', caller as any, fakeIo([target]) as any);
+            const callback = vi.fn();
+            for (let i = 0; i < 11; i++) await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+            expect(callback.mock.calls[0][0]).toMatchObject({ ok: true, result: 'old-encrypted-result', rpcLatency: { daemon: null } });
+            expect(callback.mock.calls[10][0]).toEqual({ ok: true, result: 'old-encrypted-result' });
+            expect(emit).toHaveBeenCalledTimes(11);
+            expect(emit.mock.calls[10][1]).not.toHaveProperty('rpcLatency');
+            vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '0');
+            await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+            expect(callback.mock.calls[11][0]).toEqual({ ok: true, result: 'old-encrypted-result' });
+        } finally { vi.unstubAllEnvs(); }
+    });
+});
+
+it('records failed initial lookup then successful retry without replaying the native call', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    try {
+        const caller = new FakeSocket('caller');
+        const target = new FakeSocket('target');
+        const emit = vi.fn(async () => 'encrypted-result');
+        target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+        const fetchSockets = vi.fn()
+            .mockImplementationOnce(() => new Promise((_, reject) => setTimeout(() => reject(new Error('lookup timeout')), 2000)))
+            .mockResolvedValue([target]);
+        const io = { in: () => ({ timeout: () => ({ fetchSockets }) }), sockets: { sockets: new Map([['target', target]]) } };
+        rpcHandler('u1', caller as any, io as any);
+        const callback = vi.fn();
+        const rpcLatency = { version: 1, id: '11111111-1111-4111-8111-111111111111' };
+        const pending = caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'encrypted', rpcLatency }, callback);
+        await vi.advanceTimersByTimeAsync(2000);
+        await pending;
+        const reply = callback.mock.calls[0][0];
+        expect(reply).toMatchObject({ ok: true, result: 'encrypted-result', rpcLatency: { target: 'local' } });
+        expect(reply.rpcLatency.server.spans.filter((s: any) => s.stage === 'server-lookup').map((s: any) => [s.outcome, s.lookupResult])).toEqual([['rejected', undefined], ['resolved', 'found']]);
+        expect(fetchSockets).toHaveBeenCalledTimes(2);
+        expect(emit).toHaveBeenCalledTimes(1);
+        // ACK completed before the 2s presence poll, which must not delay delivery.
+        expect(callback).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); vi.unstubAllEnvs(); }
+});
+
+it.each([
+    ['machine-1:bash', { version: 1, id: '11111111-1111-4111-8111-111111111111' }],
+    ['machine-1:daemon-session-state', { version: 1, id: 'private-session' }],
+])('ignores diagnostics for ineligible method or invalid ID: %s', async (method, rpcLatency) => {
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    try {
+        const caller = new FakeSocket('caller');
+        const target = new FakeSocket('target');
+        const emit = vi.fn(async (_event: string, _payload: unknown) => 'encrypted');
+        target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method, params: 'input', rpcLatency }, callback);
+        expect(emit).toHaveBeenCalledExactlyOnceWith('rpc-request', { method, params: 'input' });
+        expect(callback).toHaveBeenCalledExactlyOnceWith({ ok: true, result: 'encrypted' });
+    } finally { vi.unstubAllEnvs(); }
+});
+
+
+it('sends opt-in completion only to the original caller without result data', async () => {
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    try {
+        const caller = new FakeSocket('caller');
+        const target = new FakeSocket('target');
+        target.timeout = vi.fn(() => ({ emitWithAck: vi.fn(async () => 'encrypted-result') }));
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        const id = '11111111-1111-4111-8111-111111111111';
+        await caller.trigger('rpc-call', { method: 'machine-1:daemon-session-state', params: 'secret', rpcLatency: { version: 1, id, completionEvent: true } }, callback);
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback.mock.calls[0][0].result).toBe('encrypted-result');
+        expect(caller.emitted).toEqual([{ event: 'rpc-latency-complete', payload: callback.mock.calls[0][0].rpcLatency }]);
+        expect(target.emitted).toEqual([]);
+        expect(JSON.stringify(caller.emitted)).not.toMatch(/secret|encrypted|machine-1|u1|completionEvent/);
+    } finally { vi.unstubAllEnvs(); }
+});
+
+it('keeps the ACK when completion diagnostics cannot be emitted', async () => {
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    try {
+        const caller = new FakeSocket('caller');
+        const emit = vi.spyOn(caller, 'emit').mockImplementation(() => { throw new Error('observer failed'); });
+        const target = new FakeSocket('target');
+        target.timeout = vi.fn(() => ({ emitWithAck: vi.fn(async () => 'encrypted-result') }));
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        await caller.trigger('rpc-call', { method: 'machine:daemon-session-state', params: '', rpcLatency: {
+            version: 1, id: '11111111-1111-4111-8111-111111111111', completionEvent: true,
+        } }, callback);
+        expect(emit).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(callback.mock.calls[0][0]).toMatchObject({ ok: true, result: 'encrypted-result' });
+    } finally { vi.unstubAllEnvs(); }
+});
+
+it.each([
+    { enabled: '0', method: 'daemon-session-state', id: '11111111-1111-4111-8111-111111111111', optIn: true, events: 0 },
+    { enabled: '1', method: 'bash', id: '11111111-1111-4111-8111-111111111111', optIn: true, events: 0 },
+    { enabled: '1', method: 'daemon-session-state', id: 'invalid', optIn: true, events: 0 },
+    { enabled: '1', method: 'daemon-session-state', id: '11111111-1111-4111-8111-111111111111', optIn: false, events: 0 },
+    { enabled: '1', method: 'daemon-session-state', id: '11111111-1111-4111-8111-111111111111', optIn: true, events: 10 },
+])('bounds completion events with the same diagnostic eligibility: %j', async ({ enabled, method, id, optIn, events }) => {
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', enabled);
+    try {
+        const caller = new FakeSocket('caller');
+        const target = new FakeSocket('target');
+        const emit = vi.fn(async () => 'result');
+        target.timeout = vi.fn(() => ({ emitWithAck: emit }));
+        rpcHandler('u1', caller as any, fakeIo([target]) as any);
+        const callback = vi.fn();
+        for (let i = 0; i < 11; i++) await caller.trigger('rpc-call', {
+            method: `machine:${method}`, params: '', rpcLatency: { version: 1, id, completionEvent: optIn },
+        }, callback);
+        expect(callback).toHaveBeenCalledTimes(11);
+        expect(emit).toHaveBeenCalledTimes(11);
+        expect(caller.emitted).toHaveLength(events);
+        expect(callback.mock.calls.every(([reply]) => reply.ok && reply.result === 'result')).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
+});
+
+it('delivers completion over a real socket after the caller ACK deadline without replaying the RPC', async () => {
+    const { Server } = await import('socket.io');
+    const { io: connect } = await import('socket.io-client');
+    const { createServer } = await import('node:http');
+    vi.stubEnv('HAPPY_RPC_LATENCY_DIAGNOSTICS', '1');
+    const http = createServer();
+    const server = new Server(http);
+    const clients: ReturnType<typeof connect>[] = [];
+    try {
+        server.on('connection', socket => {
+            rpcHandler('u1', socket, server);
+            if (socket.handshake.auth.role === 'daemon') socket.join('rpc:u1:machine:daemon-session-state');
+        });
+        await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+        const address = server.httpServer.address() as { port: number };
+        for (const role of ['daemon', 'caller']) {
+            const client = connect(`http://127.0.0.1:${address.port}`, { transports: ['websocket'], auth: { role }, autoConnect: false });
+            clients.push(client);
+            const ready = new Promise<void>(resolve => client.once('connect', resolve));
+            client.connect();
+            await ready;
+        }
+        let requests = 0;
+        clients[0].on('rpc-request', (_request, ack) => {
+            requests++;
+            setTimeout(() => ack('encrypted-result'), 6000);
+        });
+        const completion = new Promise<any>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('completion missing')), 8500);
+            clients[1].once('rpc-latency-complete', value => { clearTimeout(timer); resolve(value); });
+        });
+        let callbacks = 0;
+        const id = '11111111-1111-4111-8111-111111111111';
+        const ackResult = new Promise<unknown>(resolve => {
+            clients[1].timeout(5000).emit('rpc-call', {
+                method: 'machine:daemon-session-state', params: 'encrypted', rpcLatency: { version: 1, id, completionEvent: true },
+            }, (error: Error | null) => { callbacks++; resolve(error); });
+        });
+        expect(await ackResult).toBeInstanceOf(Error);
+        const diagnostic = await completion;
+        expect(diagnostic.id).toBe(id);
+        expect(diagnostic.server.spans.find((span: any) => span.stage === 'server-relay').durationMs).toBeGreaterThanOrEqual(5900);
+        expect(requests).toBe(1);
+        expect(callbacks).toBe(1);
+        expect(JSON.stringify(diagnostic)).not.toMatch(/encrypted|machine|result/);
+    } finally {
+        clients.forEach(client => client.disconnect());
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        vi.unstubAllEnvs();
+    }
+}, 10_000);

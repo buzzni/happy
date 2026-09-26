@@ -316,6 +316,23 @@ describe('ApiSessionClient v3 messages API migration', () => {
             .toEqual({ messageId: 'msg_1', index: 0, offset: 3, delta: 'Hel', final: false });
     });
 
+    it('sends opt-in turn latency as an opaque volatile stream frame', () => {
+        const client = new ApiSessionClient('fake-token', session);
+
+        client.sendTurnLatency({
+            version: 1, type: 'turn-latency', id: 'trace-1', attribution: 'exclusive', inputCount: 1,
+            queueMs: 4, sdkSubmitMs: 9, firstSdkTextMs: 20, outcome: 'text',
+        });
+
+        const [event, payload] = mockSocket.volatile.emit.mock.calls[0];
+        expect(event).toBe('session-stream');
+        expect(payload.sid).toBe('test-session-id');
+        expect(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(payload.data))).toEqual({
+            version: 1, type: 'turn-latency', id: 'trace-1', attribution: 'exclusive', inputCount: 1,
+            queueMs: 4, sdkSubmitMs: 9, firstSdkTextMs: 20, outcome: 'text',
+        });
+    });
+
     it('reapplies a metadata patch to the newest server document after a version mismatch', async () => {
         session.metadata = {
             ...session.metadata,
@@ -723,6 +740,16 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 total: 460,
             },
         });
+        const legacyEvents = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(legacyEvents).toHaveLength(2);
+        expect(legacyEvents[0]).toMatchObject({
+            sourceEventId: 'test-session-id:anthropic:msg-native-1',
+        });
+        expect(legacyEvents[1]).toMatchObject({
+            sourceEventId: 'test-session-id:anthropic:msg-native-1',
+        });
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
             providerTokens: 460,
         }));
@@ -764,6 +791,13 @@ describe('ApiSessionClient v3 messages API migration', () => {
             'test-session-id:anthropic:turn:result-uuid-1',
         ]);
         expect(events[1]).toMatchObject({ model: 'glm-4.7', tokens: { input: 962, output: 3, total: 965 } });
+        const legacyEvents = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'usage-report')
+            .map(([, event]: [string, any]) => event);
+        expect(legacyEvents.map((event: any) => event.sourceEventId)).toEqual([
+            'test-session-id:anthropic:msg-zai-1',
+            'test-session-id:anthropic:turn:result-uuid-1',
+        ]);
         expect(mockNotifyDaemonSessionRuntime).toHaveBeenLastCalledWith('test-session-id', expect.objectContaining({
             providerTokens: 965,
         }));
@@ -1452,7 +1486,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
             after_seq: 0,
             limit: 100
         });
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({
+            ...userMessage,
+            serverMessageId: 'msg-1',
+        });
         expect((client as any).lastSeq).toBe(1);
     });
 
@@ -1494,7 +1531,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         await (client as any).fetchMessages();
 
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1' });
     });
 
     it('fetchMessages uses incremental cursor and paginates while hasMore is true', async () => {
@@ -1620,7 +1657,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await (client as any).fetchMessages();
 
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1' });
         expect(onMessage).toHaveBeenCalledTimes(1);
         expect(onMessage).toHaveBeenCalledWith(agentMessage);
     });
@@ -1724,13 +1761,18 @@ describe('ApiSessionClient v3 messages API migration', () => {
         (client as any).lastSeq = 1;
         const userMessage = {
             role: 'user',
-            content: { type: 'text', text: 'fast-path' }
+            content: { type: 'text', text: 'fast-path' },
+            serverMessageId: 'forged-client-id',
         };
 
         emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
 
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({
+            role: 'user',
+            content: { type: 'text', text: 'fast-path' },
+            serverMessageId: 'msg-2',
+        });
         expect((client as any).lastSeq).toBe(2);
         expect(mockAxiosGet).not.toHaveBeenCalled();
     });
@@ -1775,7 +1817,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await fetchPromise;
 
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({
+            ...userMessage,
+            serverMessageId: 'msg-1',
+        });
         expect((client as any).lastSeq).toBe(1);
     });
 
@@ -1821,7 +1866,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             emitSocketEvent('update', createNewMessageUpdate(1, encryptContent(session, firstMessage)));
 
             expect(onUserMessage).toHaveBeenCalledTimes(1);
-            expect(onUserMessage).toHaveBeenCalledWith(firstMessage);
+            expect(onUserMessage).toHaveBeenCalledWith({ ...firstMessage, serverMessageId: 'msg-1' });
             expect((client as any).lastSeq).toBe(1);
             expect(mockAxiosGet).not.toHaveBeenCalled();
         } finally {
@@ -1892,7 +1937,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
 
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-2' });
         expect((client as any).lastSeq).toBe(2);
         expect(mockAxiosGet).toHaveBeenCalledTimes(1);
     });
@@ -1928,7 +1973,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockAxiosGet.mock.calls[0][1].params.after_seq).toBe(1);
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-2' });
         expect((client as any).lastSeq).toBe(2);
     });
 
@@ -2273,7 +2318,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         await waitForCheck(() => {
             expect(messagesCalls()).toHaveLength(2);
-            expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+            expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1' });
         });
         expect(messagesCalls()[1][1].params.after_seq).toBe(0);
         expect((client as any).lastSeq).toBe(1);

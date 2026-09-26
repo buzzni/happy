@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   DIFFICULTY_ROUTING_MAX_INPUT_CHARS,
+  DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
+  DIFFICULTY_ROUTING_POLICY_VERSION,
+  DifficultyRoutingCapabilitySchema,
   isDelegatedDifficultyRoutingMessage,
   pickDifficultyRoutingPrompt,
 } from './difficultyRouting'
@@ -98,3 +101,40 @@ describe('isDelegatedDifficultyRoutingMessage', () => {
   })
 })
 
+// The server reads timing support out of decrypted machine metadata. A schema that parses the
+// block but drops this field leaves the daemon advertising v2 and the server never seeing it.
+describe('capability timing contracts survive the schema', () => {
+  const base = {
+    version: 1,
+    protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
+    hostProcessKeyId: 'key-1',
+    hostProcessPublicKey: 'pub-1',
+    classifier: {
+      kind: 'transformers-binary',
+      modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
+      maxInputChars: DIFFICULTY_ROUTING_MAX_INPUT_CHARS,
+      onnxSha256: '444c99b6f4d417e50859f73e1557db11943a2ad073ce4050a65f1b7d39403038',
+      tokenizerJsonSha256: 'acadd7d076a55a97edf9fb0521a0a2e9cf8cbbdd62e4d793f2aa3d1900916356',
+      revision: 'rev-1',
+    },
+    limits: { concurrency: 1, queueSize: 8, requestDeadlineMs: 1000 },
+  }
+
+  it('keeps the advertised contracts through parse and re-serialization', () => {
+    const parsed = DifficultyRoutingCapabilitySchema.parse({ ...base, timingVersions: [1, 2], maxRelayTtlMs: 3000 })
+    expect(parsed.maxRelayTtlMs).toBe(3000)
+    expect(JSON.parse(JSON.stringify(parsed)).maxRelayTtlMs).toBe(3000)
+    expect(parsed.timingVersions).toEqual([1, 2])
+    expect(JSON.parse(JSON.stringify(parsed)).timingVersions).toEqual([1, 2])
+  })
+
+  it('treats an older daemon as legacy rather than guessing', () => {
+    expect(DifficultyRoutingCapabilitySchema.parse(base).timingVersions).toBeUndefined()
+  })
+
+  it('refuses a contract list it cannot honour', () => {
+    for (const timingVersions of [[], [3], [1, 3], ['2'], 2, null, [1, null]]) {
+      expect(DifficultyRoutingCapabilitySchema.safeParse({ ...base, timingVersions }).success, JSON.stringify(timingVersions)).toBe(false)
+    }
+  })
+})

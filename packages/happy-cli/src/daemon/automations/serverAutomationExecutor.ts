@@ -1,3 +1,5 @@
+import { stripProviderCredentialOverrides } from '@/managed/managedStartup'
+import type { AutomationProjectEnvironmentResult } from './automationProjectEnvironment'
 import { mergePullRequestFiles, type PullRequestFiles } from './queryGithubPullRequests'
 import { randomUUID } from 'node:crypto'
 
@@ -161,6 +163,7 @@ export interface ServerAutomationExecutorInput {
    * 현재 HEAD 를 읽는다. 읽지 못하면 null 이고, 그때는 재개하지 않는다.
    */
   readHeadSha?: (input: { directory: string }) => Promise<string | null>
+  resolveProjectEnvironment: (input: { runId: string; claimToken: string }) => Promise<AutomationProjectEnvironmentResult>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -1271,6 +1274,17 @@ async function executeStartedRun(
     if (payload.githubTrigger.action === 'agent-task-review') {
       const credentialId = payload.githubTrigger.githubCredentialId
       if (!credentialId) return { outcome: 'ERROR', sessionId: null }
+      // Resolve before claiming a task: failed secret lookup must not strand a
+      // dispatched task without a worker, nor consume its pending GitHub event.
+      const projectEnvironment = await input.resolveProjectEnvironment(run)
+      if (!projectEnvironment.ok) {
+        const failureCode = projectEnvironment.code ?? 'PROJECT_ENVIRONMENT_UNAVAILABLE'
+        input.logDebug?.(`[server-automation] run=${run.runId} precondition=${failureCode} detail=${projectEnvironment.error}`)
+        return {
+          outcome: 'ERROR', sessionId: null,
+          failureCode,
+        }
+      }
       const bridged = await input.dispatchAgentTask({
         runId: run.runId,
         claimToken: run.claimToken,
@@ -1360,6 +1374,23 @@ async function executeStartedRun(
       }
       prompt = buildAgentTaskPrompt(bridged.dispatch, payload.prompt)
       environmentVariables = {
+        ...Object.fromEntries(Object.entries(stripProviderCredentialOverrides(projectEnvironment.environmentVariables) ?? {}).filter(([key, value]) =>
+          // Project settings cannot replace daemon identity, agent authentication,
+          // sandbox policy, or the selected GitHub credential. Application secrets
+          // (DATABASE_URL, service tokens, gateway keys, etc.) remain available.
+          !/^(HAPPY_|APLUS_|SAYCODE_AGENT_|CLAUDE_CODE_|CODEX_|GH_)/i.test(key)
+          && !['GITHUB_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'HOME', 'USERPROFILE'].includes(key.toUpperCase())
+          // A project value is opaque project text, not a reference into the
+          // daemon's own environment — the same reason run.ts injects the
+          // initial prompt after expansion. spawnSession expands `${VAR}`
+          // against the daemon's process.env, so `${ANTHROPIC_API_KEY}` here
+          // would read back, one layer over, exactly the credential the key
+          // filter above withholds; and an ordinary templated value such as
+          // `${APP_NAME} <no-reply@x>` stays unresolved and fails that same
+          // pass's check, killing the review spawn outright. A worker that
+          // does not need the value is better off without it.
+          && !value.includes('${'),
+        )),
         // 2026-09-04 프로덕션 — 리뷰 워커 31건이 뜨자마자 exit 1 로 죽어 3시간 동안
         // 리뷰가 한 건도 완료되지 않았다:
         //   [aplus] MCP topology mismatch expected=gmail,google-drive,knoi,slack

@@ -145,6 +145,92 @@ describe('session protocol schemas', () => {
     expect(parsed.success).toBe(true);
   });
 
+  it('accepts the additive v2 routing fields alongside every v1 field', () => {
+    const parsed = sessionEnvelopeSchema.safeParse({
+      id: 'difficulty-routing-2',
+      time: 1234,
+      role: 'session',
+      ev: {
+        t: 'difficulty-routing',
+        result: {
+          version: 1,
+          clientRequestId: 'client-1',
+          mode: 'auto',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: 7,
+          model: 'claude-opus-5',
+          effort: 'high',
+          difficulty: 'hard',
+          classifierSource: 'p1-local',
+          stage: 'applied',
+          revision: 12,
+          evidence: 'engine-applied',
+          executionId: 'exec-1',
+          clientRequestIds: ['client-1', 'client-2'],
+          candidateDifficulty: 'trivial',
+          baseRoute: { difficulty: 'hard', model: 'claude-opus-5', effort: 'high' },
+          temporaryEscalation: false,
+          decisionReasons: ['sticky-floor-maintained'],
+          providerConfirmedModel: 'claude-opus-5',
+        },
+      },
+    });
+
+    expect(parsed.success).toBe(true);
+  });
+
+  it('still accepts a v1 event that carries none of the v2 fields', () => {
+    const parsed = sessionEnvelopeSchema.safeParse({
+      id: 'difficulty-routing-3',
+      time: 1234,
+      role: 'session',
+      ev: {
+        t: 'difficulty-routing',
+        result: {
+          version: 1,
+          clientRequestId: 'client-1',
+          mode: 'auto',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: null,
+          model: 'claude-opus-5',
+          effort: 'high',
+          difficulty: 'hard',
+          classifierSource: 'p1-local',
+        },
+      },
+    });
+
+    expect(parsed.success).toBe(true);
+    // A v1 event says only that a selection happened. A reader must not read an
+    // absent `stage` as `applied`.
+    expect((parsed as { data: { ev: { result: Record<string, unknown> } } }).data.ev.result.stage).toBeUndefined();
+  });
+
+  it('rejects a stage outside the known lifecycle rather than passing it through', () => {
+    const parsed = sessionEnvelopeSchema.safeParse({
+      id: 'difficulty-routing-4',
+      time: 1234,
+      role: 'session',
+      ev: {
+        t: 'difficulty-routing',
+        result: {
+          version: 1,
+          clientRequestId: 'client-1',
+          mode: 'auto',
+          policyVersion: 'org-shared-difficulty-routing.v1',
+          policyRevision: null,
+          model: 'claude-opus-5',
+          effort: 'high',
+          difficulty: 'hard',
+          classifierSource: 'p1-local',
+          stage: 'provider-confirmed-cache-hit',
+        },
+      },
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+
   it('rejects difficulty-routing from user or agent roles', () => {
     const event = {
       t: 'difficulty-routing',
@@ -163,6 +249,52 @@ describe('session protocol schemas', () => {
 
     expect(sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev: event }).success).toBe(false);
     expect(sessionEnvelopeSchema.safeParse({ id: 'u', time: 1, role: 'user', ev: event }).success).toBe(false);
+  });
+
+  it('accepts lesson-candidate only as a session-owned event', () => {
+    const event = {
+      t: 'lesson-candidate',
+      candidateId: 'cand-1',
+      revision: 2,
+      payloadHash: 'hash-1',
+      lesson: {
+        name: 'rebuild before e2e',
+        trigger: 'e2e fails with missing out/',
+        steps: ['run the build', 'rerun the suite'],
+        scope: 'this repo',
+        validation: ['npm run test:e2e'],
+        reconsiderWhen: 'the build output moves',
+        failureModes: [],
+      },
+    };
+
+    expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev: event }).success).toBe(true);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev: event }).success).toBe(false);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'u', time: 1, role: 'user', ev: event }).success).toBe(false);
+  });
+
+  it('accepts any lesson body the 16KB proposal limit allows', () => {
+    // happy-cli refuses a proposal over 16,384 bytes as a whole; a single long
+    // field inside that must still announce, or the stored candidate has no card.
+    const lesson = {
+      name: 'n', trigger: 't'.repeat(10_000), steps: Array.from({ length: 120 }, (_, i) => `step ${i}`), scope: 'x',
+      validation: ['v'], reconsiderWhen: 'r', failureModes: [],
+    };
+    const ev = { t: 'lesson-candidate', candidateId: 'c', revision: 1, payloadHash: 'h', lesson };
+    expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev }).success).toBe(true);
+  });
+
+  it('rejects a lesson-candidate without the identifiers approval needs', () => {
+    const lesson = {
+      name: 'n', trigger: 't', steps: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [],
+    };
+    const parse = (ev: Record<string, unknown>) =>
+      sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev: { t: 'lesson-candidate', ...ev } }).success;
+
+    expect(parse({ revision: 1, payloadHash: 'h', lesson })).toBe(false);
+    expect(parse({ candidateId: 'c', payloadHash: 'h', lesson })).toBe(false);
+    expect(parse({ candidateId: 'c', revision: 1, lesson })).toBe(false);
+    expect(parse({ candidateId: 'c', revision: 1, payloadHash: 'h', lesson: { ...lesson, steps: [] } })).toBe(false);
   });
 
   it('rejects start from non-agent role', () => {
@@ -245,5 +377,79 @@ describe('createEnvelope', () => {
 
   it('validates role/event compatibility', () => {
     expect(() => createEnvelope('user', { t: 'service', text: 'internal event' })).toThrow();
+  });
+});
+
+
+it('accepts bounded channel-ready identity and refuses extra authority fields', () => {
+  const event = { t: 'channel-ready', requestId: 'r1', runtimeId: 'runtime-1', nonce: '00000000-0000-4000-8000-000000000001' };
+  expect(sessionEventSchema.safeParse(event).success).toBe(true);
+  expect(sessionEventSchema.safeParse({ ...event, permissionMode: 'yolo' }).success).toBe(false);
+  expect(sessionEventSchema.safeParse({ ...event, nonce: 'r1' }).success).toBe(false);
+});
+
+describe('difficultyRouting previousApplied contract', () => {
+  function resultWith(extra: Record<string, unknown>) {
+    return {
+      version: 1,
+      clientRequestId: 'client-1',
+      mode: 'auto',
+      policyVersion: 'org-shared-difficulty-routing.v1',
+      policyRevision: null,
+      model: 'claude-opus-5',
+      effort: 'high',
+      difficulty: 'hard',
+      classifierSource: 'p1-local',
+      ...extra,
+    };
+  }
+  const parse = (extra: Record<string, unknown>) => sessionEnvelopeSchema.safeParse({
+    id: 'e', time: 1, role: 'session',
+    ev: { t: 'difficulty-routing', result: resultWith(extra) },
+  });
+
+  it('accepts a previous applied route for every producing kind', () => {
+    for (const kind of ['auto', 'local-auto-bootstrap', 'manual']) {
+      const parsed = parse({
+        previousApplied: { model: 'claude-fable-5-1', effort: 'high', difficulty: 'escalated', kind },
+      });
+      expect(parsed.success, kind).toBe(true);
+    }
+  });
+
+  it('accepts a null effort, which is a real value for some models', () => {
+    expect(parse({
+      previousApplied: { model: 'claude-haiku-4-5', effort: null, difficulty: 'trivial', kind: 'auto' },
+    }).success).toBe(true);
+  });
+
+  it('treats the field as optional so a producer that never recorded one still validates', () => {
+    const parsed = parse({});
+    expect(parsed.success).toBe(true);
+    // Absent must stay absent — a reader must not receive a fabricated default.
+    expect((parsed as { data: { ev: { result: Record<string, unknown> } } }).data.ev.result.previousApplied)
+      .toBeUndefined();
+  });
+
+  it('rejects a partial previous applied route rather than passing it through', () => {
+    // A half-populated snapshot would be read as authoritative.
+    expect(parse({ previousApplied: { model: 'claude-opus-5' } }).success).toBe(false);
+    expect(parse({ previousApplied: { model: 'claude-opus-5', effort: 'high', difficulty: 'hard' } }).success)
+      .toBe(false);
+  });
+
+  it('rejects a kind or difficulty outside the known sets', () => {
+    expect(parse({
+      previousApplied: { model: 'm', effort: 'high', difficulty: 'hard', kind: 'provider-confirmed' },
+    }).success).toBe(false);
+    expect(parse({
+      previousApplied: { model: 'm', effort: 'high', difficulty: 'catastrophic', kind: 'auto' },
+    }).success).toBe(false);
+  });
+
+  it('rejects an empty model, which would read as a known-but-nameless route', () => {
+    expect(parse({
+      previousApplied: { model: '', effort: 'high', difficulty: 'hard', kind: 'auto' },
+    }).success).toBe(false);
   });
 });

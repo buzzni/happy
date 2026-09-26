@@ -185,3 +185,37 @@ describe('BYOS behaviour is unchanged', () => {
         expect(await call(manager, 'nope', {})).toEqual({ error: 'Method not found' });
     });
 });
+
+describe('native probe RPC diagnostics', () => {
+    const rpcLatency = { version: 1 as const, id: '11111111-1111-4111-8111-111111111111' };
+    it.each(['legacy', 'dataKey'] as const)('preserves %s encrypted results while returning bounded timing', async (variant) => {
+        const manager = new RpcHandlerManager({ scopePrefix: 'machine-1', encryptionKey: KEY, encryptionVariant: variant, logger: () => {} });
+        let calls = 0;
+        manager.registerHandler('daemon-session-state', async () => { calls++; return { version: 1, state: 'present' }; });
+        const response = await manager.handleRequest({ method: 'machine-1:daemon-session-state', params: encodeBase64(encrypt(KEY, variant, { sessionId: 'private-session' })), rpcLatency });
+        expect(calls).toBe(1);
+        expect(decrypt(KEY, variant, decodeBase64(response.result))).toEqual({ version: 1, state: 'present' });
+        expect(response.rpcLatency.id).toBe(rpcLatency.id);
+        expect(response.rpcLatency.spans.map((s: any) => s.stage)).toEqual(['daemon-total', 'daemon-decrypt', 'daemon-handler', 'daemon-encrypt']);
+        expect(JSON.stringify(response.rpcLatency)).not.toMatch(/private-session|machine-1|params|result/);
+    });
+    it('does not wrap other RPC methods and preserves managed refusal without dispatch', async () => {
+        const manager = makeManager();
+        manager.registerHandler('echo', async () => 'ok');
+        const params = encodeBase64(encrypt(KEY, 'legacy', {}));
+        expect(typeof await manager.handleRequest({ method: 'machine-1:echo', params, rpcLatency })).toBe('string');
+        let called = false;
+        manager.registerHandler('daemon-session-state', async () => { called = true; });
+        manager.setManagedAllowlist(['spawn']);
+        const response = await manager.handleRequest({ method: 'machine-1:daemon-session-state', params, rpcLatency });
+        expect(called).toBe(false);
+        expect(decrypt(KEY, 'legacy', decodeBase64(response.result))).toMatchObject({ code: 'MANAGED_CAPABILITY_REQUIRED' });
+        expect(response.rpcLatency.spans.map((s: any) => s.stage)).toEqual(['daemon-total']);
+    });
+});
+
+it('preserves the encrypted error response for a malformed untraced request', async () => {
+    const manager = makeManager();
+    const response = await manager.handleRequest(null as never);
+    expect(decrypt(KEY, 'legacy', decodeBase64(response))).toHaveProperty('error');
+});

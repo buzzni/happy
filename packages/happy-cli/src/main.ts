@@ -43,6 +43,7 @@ import { runPreToolUseCli } from './hooks/runPreToolUseCli'
 import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
 import { readManagedStartup } from '@/managed/managedStartup';
+import { resolveDaemonMcpConfigEnvironment } from './daemon/daemonMcpConfig'
 
 
 (async () => {
@@ -601,6 +602,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         }
         daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: presetUrl }
       }
+      daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
 
       // Spawn detached daemon process.
       // stdio is captured, never ignored: if start-sync dies before its logger
@@ -636,6 +638,10 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       await preflightDaemonControlServer()
       process.exit(0)
     } else if (daemonSubcommand === 'start-sync') {
+      const daemonEnv = await resolveDaemonMcpConfigEnvironment(process.env, { persistExplicit: true })
+      if (daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL) {
+        process.env.HAPPY_APLUS_MCP_CONFIG_URL = daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL
+      }
       await startDaemon()
       process.exit(0)
     } else if (daemonSubcommand === 'stop') {

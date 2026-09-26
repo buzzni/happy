@@ -30,6 +30,11 @@ import {
     type ManagedAiAuthProvider,
 } from '@/managed/managedAiAuth';
 import { parseManagedAiAuthMarker, readManagedAiAuthApiKey } from '@/managed/managedAiAuthStore';
+import {
+    aiAuthSourceForManagedKind,
+    HAPPY_AI_AUTH_CONNECTION_VERSION_ENV,
+    HAPPY_AI_AUTH_SOURCE_ENV,
+} from '@/usage/aiAuthSource';
 import { buildZaiClaudeEnvironment } from '@/managed/zaiClaudeEnvironment';
 import { attachManagedSession, ManagedAttachError, type ManagedAttachment } from '@/managed/managedSessionAttach';
 import {
@@ -210,6 +215,17 @@ const PROVIDER_CREDENTIAL_ENV = [
 const PROVIDER_AUTH_HOME_ENV = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'];
 
 /**
+ * What this run tells the usage ledger it spent.
+ *
+ * A prefix rather than the two keys, for the reason the lineage list gives:
+ * the family is added to over time and a list is a list that will be short by
+ * one. A caller that sets any of it is a caller choosing which account the run
+ * is metered against — the envelope decided that, and an override applied
+ * after startup would replace it.
+ */
+const AI_AUTH_REPORTING_ENV_PREFIX = 'HAPPY_AI_AUTH_';
+
+/**
  * Drops provider credentials from a caller-supplied environment overlay.
  *
  * `--claude-env` values are written into `process.env` after startup
@@ -223,10 +239,14 @@ export function stripProviderCredentialOverrides(
     if (!overrides) return overrides;
     const kept: Record<string, string> = {};
     for (const [key, value] of Object.entries(overrides)) {
-        if (PROVIDER_CREDENTIAL_ENV.includes(key)) continue;
+        const canonicalKey = key.toUpperCase();
+        if (PROVIDER_CREDENTIAL_ENV.includes(canonicalKey)) continue;
         // An override naming an auth home is the same substitution by another
         // route: it would point this run at a login it was not admitted on.
-        if (PROVIDER_AUTH_HOME_ENV.includes(key)) continue;
+        if (PROVIDER_AUTH_HOME_ENV.includes(canonicalKey)) continue;
+        // Not a credential, but the same substitution one layer over: it names
+        // whose credential this run is billed to.
+        if (canonicalKey.startsWith(AI_AUTH_REPORTING_ENV_PREFIX)) continue;
         kept[key] = value;
     }
     return kept;
@@ -309,6 +329,7 @@ export function applyManagedGatewayEnvironment(
 ): void {
     for (const key of PROVIDER_CREDENTIAL_ENV) delete env[key];
     for (const key of PROVIDER_AUTH_HOME_ENV) delete env[key];
+    applyManagedAiAuthReporting(env, envelope.aiAuth);
     if (envelope.aiAuth.kind === 'personal-subscription') {
         assertAdmittedConnection(envelope.aiAuth, readFile);
         /*
@@ -340,6 +361,38 @@ export function applyManagedGatewayEnvironment(
     }
     env.OPENAI_BASE_URL = base;
     env.OPENAI_API_KEY = gateway.capability;
+}
+
+/**
+ * Records which credential this run is actually spending.
+ *
+ * Written here, beside the branch that builds the credential environment,
+ * because this is the only place that holds both the envelope and the
+ * environment the agent inherits — and `applyManagedGatewayEnvironment` is
+ * what both runners call. Deriving it at the two call sites instead would put
+ * the same mapping in two files and leave it to drift from the branches below.
+ *
+ * `aiAuth.kind` is the authority. Nothing in the environment may overturn it:
+ * the gateway base URL differs per envelope, and an organisation bundle and a
+ * person's own key are the same variable. Written unconditionally, so an
+ * inherited value from an earlier launch on a reused runtime is replaced
+ * rather than believed.
+ *
+ * The connection version is written only when the envelope carries one —
+ * `ManagedAiAuthSelection` has it on the personal kinds alone. A platform kind
+ * has no connection, and a made-up version reports an admission that never
+ * happened. Deleted otherwise, for the same reason the source is overwritten.
+ */
+function applyManagedAiAuthReporting(
+    env: NodeJS.ProcessEnv,
+    aiAuth: ManagedSpawnEnvelope['aiAuth'],
+): void {
+    env[HAPPY_AI_AUTH_SOURCE_ENV] = aiAuthSourceForManagedKind(aiAuth.kind);
+    if (isPersonalAiAuth(aiAuth)) {
+        env[HAPPY_AI_AUTH_CONNECTION_VERSION_ENV] = String(aiAuth.connectionVersion);
+        return;
+    }
+    delete env[HAPPY_AI_AUTH_CONNECTION_VERSION_ENV];
 }
 
 /**

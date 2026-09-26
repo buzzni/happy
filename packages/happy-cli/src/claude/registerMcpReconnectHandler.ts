@@ -8,7 +8,14 @@ export function registerMcpReconnectHandler(
     rpcHandlerManager: RpcHandlerManager,
     sessionId: string,
     getController: () => McpReconnectController | null,
+    getStatusReader?: () => Pick<McpRuntimeRecovery, 'readStatuses'> | null,
 ): void {
+    rpcHandlerManager.registerHandler('mcp-status', async (params: { sessionId?: string }) => {
+        if (params.sessionId !== sessionId) throw new Error('Session mismatch');
+        const reader = getStatusReader?.();
+        if (!reader) throw new Error('MCP status is not initialized');
+        return { statuses: await reader.readStatuses() };
+    });
     rpcHandlerManager.registerHandler<unknown, McpReconnectResult>('mcp-reconnect', async (params) => {
         const parsed = McpReconnectRequestSchema.safeParse(params);
         if (!parsed.success) {

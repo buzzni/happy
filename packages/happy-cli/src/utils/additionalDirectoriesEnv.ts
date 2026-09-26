@@ -36,3 +36,33 @@ export function mergeAdditionalDirectoriesIntoSandboxEnvironment(
   config.extraWritePaths = [...new Set([...existing, ...directories])]
   env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify(config)
 }
+
+/**
+ * Swaps the roots a session was granted for `next` — used when a session is
+ * resumed, so roots registered (or removed) while it was stopped take effect.
+ * Only roots recorded in HAPPY_ADDITIONAL_DIRECTORIES are withdrawn; a session
+ * spawned before that record existed keeps its merged roots, because they are
+ * indistinguishable from project policy.
+ */
+export function replaceAdditionalDirectoriesInEnvironment(
+  env: Record<string, string>,
+  next: readonly string[],
+): void {
+  const previous = env[ADDITIONAL_DIRECTORIES_ENV] === undefined
+    ? []
+    : readAdditionalDirectoriesEnvironment(env)
+  if (previous.length > 0 && env.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined) {
+    const config = JSON.parse(env.HAPPY_PROJECT_SANDBOX_CONFIG) as Record<string, unknown>
+    if (Array.isArray(config.extraWritePaths)) {
+      const withdrawn = new Set(previous)
+      config.extraWritePaths = config.extraWritePaths.filter((path) => !withdrawn.has(path as string))
+      env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify(config)
+    }
+  }
+  if (next.length === 0) {
+    delete env[ADDITIONAL_DIRECTORIES_ENV]
+    return
+  }
+  env[ADDITIONAL_DIRECTORIES_ENV] = JSON.stringify(next)
+  mergeAdditionalDirectoriesIntoSandboxEnvironment(env, next)
+}

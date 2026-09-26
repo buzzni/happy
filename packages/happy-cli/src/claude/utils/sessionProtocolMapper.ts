@@ -14,12 +14,35 @@ import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGat
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
+    /**
+     * Set just before a turn that answers an external messenger request, and consumed by the
+     * `turn-start` it stamps (Saycode specs/desktop-messenger-channels). Held separately from
+     * `currentRequestId` so an id waiting for a turn that never opens cannot be inherited by a
+     * later, unrelated one.
+     */
+    pendingRequestId?: string | null;
+    /** The request the currently open turn answers; re-stamped on its `turn-end`. */
+    currentRequestId?: string | null;
     uuidToProviderSubagent?: Map<string, string>;
     taskPromptToSubagents?: Map<string, string[]>;
     providerSubagentToSessionSubagent?: Map<string, string>;
     subagentTitles?: Map<string, string>;
     bufferedSubagentMessages?: Map<string, RawJSONLines[]>;
     hiddenParentToolCalls?: Set<string>;
+    /**
+     * tool-call id → the turn and external request its `tool-call-start` was stamped with
+     * (Saycode specs/desktop-messenger-channels — R9).
+     *
+     * Recorded because "which turn is current" is not the same question as "which turn contains
+     * this tool call". The permission callback for a tool call is dispatched by the SDK on a
+     * different path from the assistant message that carries the block
+     * (`handleControlRequest` is not awaited and the message goes to a separate input stream), so
+     * either can be observed first. Membership is the only order-independent answer.
+     *
+     * Entries live only as long as their turn: `closeTurn` drops them, so a tool-use id reused on
+     * a later turn cannot be answered from the previous one.
+     */
+    toolCallTurns?: Map<string, { turnId: string; requestId: string | null }>;
     startedSubagents?: Set<string>;
     activeSubagents?: Set<string>;
 };
@@ -108,6 +131,57 @@ function pickProviderSubagent(message: RawJSONLines): string | undefined {
         return raw.parentToolUseId;
     }
     return undefined;
+}
+
+/**
+ * A cap for one turn's tool calls, not a history. Entries are dropped when their turn closes, so
+ * this only bounds a single pathological turn.
+ */
+const TOOL_CALL_TURN_MEMORY = 200;
+
+function rememberToolCallTurn(
+    state: ClaudeSessionProtocolState,
+    call: string,
+    turnId: string | undefined,
+): void {
+    if (!call || !turnId) return;
+    const turns = state.toolCallTurns ?? new Map<string, { turnId: string; requestId: string | null }>();
+    state.toolCallTurns = turns;
+    turns.set(call, { turnId, requestId: state.currentRequestId ?? null });
+    while (turns.size > TOOL_CALL_TURN_MEMORY) {
+        const oldest = turns.keys().next();
+        if (oldest.done) break;
+        turns.delete(oldest.value);
+    }
+}
+
+/** Every entry for a turn that has ended. Kept, they would answer for a later reused tool id. */
+function forgetToolCallTurns(state: ClaudeSessionProtocolState, turnId: string): void {
+    const turns = state.toolCallTurns;
+    if (!turns) return;
+    for (const [call, membership] of turns) {
+        if (membership.turnId === turnId) turns.delete(call);
+    }
+}
+
+/**
+ * The turn a tool call belongs to, **while that turn is still open**, or null.
+ *
+ * Both halves matter. Membership alone is not enough: a tool-use id can repeat on a later turn,
+ * and a retained entry would hand the new prompt the old turn and the old external request —
+ * `instanceSeq` does not catch that, because the *new* instance would be binding to stale
+ * membership rather than a stale item rebinding. And the current turn alone is never used: a
+ * closed entry returns null so the caller waits for the tool call's own fresh `tool-call-start`,
+ * rather than inheriting whatever is open now.
+ */
+export function toolCallTurnFor(
+    state: ClaudeSessionProtocolState,
+    call: string,
+): { turnId: string; requestId: string | null } | null {
+    const membership = state.toolCallTurns?.get(call);
+    if (!membership) return null;
+    if (state.currentTurnId !== membership.turnId) return null;
+    return membership;
 }
 
 function getUuidToProviderSubagent(state: ClaudeSessionProtocolState): Map<string, string> {
@@ -449,8 +523,13 @@ function ensureTurn(state: ClaudeSessionProtocolState, envelopes: SessionEnvelop
     }
 
     const turnId = createId();
-    envelopes.push(createEnvelope('agent', { t: 'turn-start' }, { turn: turnId }));
+    // Stamped on the boundary the request is actually answered by. The id is consumed here and
+    // held for the matching `turn-end`, so a later unrelated turn cannot inherit it.
+    const requestId = state.pendingRequestId ?? undefined;
+    envelopes.push(createEnvelope('agent', { t: 'turn-start', ...(requestId ? { requestId } : {}) }, { turn: turnId }));
     state.currentTurnId = turnId;
+    state.currentRequestId = requestId ?? null;
+    state.pendingRequestId = null;
     return turnId;
 }
 
@@ -460,11 +539,26 @@ function closeTurn(
     envelopes: SessionEnvelope[],
 ): void {
     if (!state.currentTurnId) {
-        return;
+        // A turn only opens on mapped activity, so a run that produced no assistant text — an
+        // immediate failure, an empty completion — reaches its terminal result with nothing open.
+        // A channel request waiting on that run must still get a correlated answer: without this
+        // the id is stranded, the caller never learns the outcome, and the id would be inherited
+        // by whatever turn opens next.
+        if (!state.pendingRequestId) return;
+        ensureTurn(state, envelopes);
     }
+    const turnId = state.currentTurnId;
+    if (!turnId) return;
 
-    envelopes.push(createEnvelope('agent', { t: 'turn-end', status }, { turn: state.currentTurnId }));
+    const requestId = state.currentRequestId ?? undefined;
+    envelopes.push(createEnvelope(
+        'agent',
+        { t: 'turn-end', status, ...(requestId ? { requestId } : {}) },
+        { turn: turnId },
+    ));
+    forgetToolCallTurns(state, turnId);
     state.currentTurnId = null;
+    state.currentRequestId = null;
     clearSubagentTracking(state);
 }
 
@@ -486,6 +580,20 @@ function toToolArgs(input: unknown): Record<string, unknown> {
         return {};
     }
     return { input };
+}
+
+/** An authoritative result may be the first activity of a channel turn. */
+export function mapClaudeChannelFinalAnswer(
+    state: ClaudeSessionProtocolState,
+    text: string,
+): ClaudeMapperResult {
+    const envelopes: SessionEnvelope[] = [];
+    const requestId = state.currentTurnId ? state.currentRequestId : state.pendingRequestId;
+    if (requestId && typeof text === 'string' && text.trim().length > 0) {
+        const turn = ensureTurn(state, envelopes);
+        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, requestId }, { turn }));
+    }
+    return { currentTurnId: state.currentTurnId, envelopes };
 }
 
 export function closeClaudeTurnWithStatus(
@@ -606,6 +714,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 // chat-tool-output-streaming Phase 3 — track the live
                 // call id so the in-process bash_stream MCP handler can
                 // address its progress envelopes to it.
+                rememberToolCallTurn(state, call, turnId);
                 if (name === BASH_STREAM_AGENT_TOOL_NAME) {
                     setActiveBashStreamCall(call);
                 }

@@ -2,6 +2,9 @@ import { logger } from "@/ui/logger";
 
 export type PendingAttachment = { data: Uint8Array; mimeType: string; name: string };
 
+/** An opt-in, daemon-local marker for one browser chat input. It never holds text or a session id. */
+export type QueueLatencyTrace = { id: string; receivedAt: number };
+
 interface QueueItem<T> {
     message: string;
     mode: T;
@@ -9,6 +12,43 @@ interface QueueItem<T> {
     isolate?: boolean; // If true, this message must be processed alone
     /** Decoded image attachments owned by *this* message (per-message ownership). */
     attachments?: PendingAttachment[];
+    latencyTrace?: QueueLatencyTrace;
+    /**
+     * Identifiers for whatever produced this message (auto-routing client request
+     * ids today). They ride *beside* the mode rather than inside it: the mode is
+     * hashed to decide batching, so putting per-message ids there would give every
+     * message a unique hash and destroy the batching itself.
+     */
+    requestIds?: string[];
+    /**
+     * Core-minted handle for a turn that answers an external messenger request
+     * (Saycode specs/desktop-messenger-channels). Kept apart from `requestIds`: those are
+     * auto-routing ids that ordinary Desktop input carries too, and anything that reads "has an
+     * id" as "came from a channel" would then put every routed Desktop message behind channel
+     * execution approval and switch off its slash commands.
+     */
+    channelRequestId?: string;
+}
+
+export type CollectedBatch<T> = {
+    message: string;
+    mode: T;
+    hash: string;
+    isolate: boolean;
+    attachments?: PendingAttachment[];
+    /**
+     * Every merged message's request ids, in batch order. A consumer that commits
+     * per-execution state needs all of them: attributing a merged batch to its
+     * first input alone loses the rest.
+     */
+    requestIds?: string[];
+    inputCount: number;
+    latencyTraces: QueueLatencyTrace[];
+    /**
+     * The channel request this batch answers. Channel turns are always pushed isolated, so a
+     * batch carries at most one — and a batch with one carries nothing else.
+     */
+    channelRequestId?: string;
 }
 
 /**
@@ -38,11 +78,18 @@ export class MessageQueue2<T> {
         this.onMessageHandler = handler;
     }
 
+    /** Remove only a tagged channel request; ordinary Desktop input is never selected. */
+    removeByRequestId(requestId: string): number {
+        const before = this.queue.length;
+        this.queue = this.queue.filter(item => item.channelRequestId !== requestId);
+        return before - this.queue.length;
+    }
+
     /**
      * Push a message to the queue with a mode and an optional list of
      * attachments that travel with this message.
      */
-    push(message: string, mode: T, attachments?: PendingAttachment[]): void {
+    push(message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace): void {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -56,6 +103,8 @@ export class MessageQueue2<T> {
             modeHash,
             isolate: false,
             attachments,
+            requestIds,
+            latencyTrace,
         });
 
         // Trigger message handler if set
@@ -78,7 +127,7 @@ export class MessageQueue2<T> {
      * Push a message immediately without batching delay.
      * Does not clear the queue or enforce isolation.
      */
-    pushImmediate(message: string, mode: T): void {
+    pushImmediate(message: string, mode: T, latencyTrace?: QueueLatencyTrace): void {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -90,7 +139,8 @@ export class MessageQueue2<T> {
             message,
             mode,
             modeHash,
-            isolate: false
+            isolate: false,
+            latencyTrace,
         });
 
         // Trigger message handler if set
@@ -114,7 +164,13 @@ export class MessageQueue2<T> {
      * Clears any pending messages and ensures this message is never batched with others.
      * Used for special commands that require dedicated processing.
      */
-    pushIsolateAndClear(message: string, mode: T, attachments?: PendingAttachment[]): void {
+    /**
+     * Returns the request ids of the messages this call discarded. They were
+     * accepted but will never execute, so a consumer holding per-request state
+     * needs to know they are dead — otherwise their decisions sit in the state
+     * forever, indistinguishable from work still in flight.
+     */
+    pushIsolateAndClear(message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace): string[] {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -123,6 +179,7 @@ export class MessageQueue2<T> {
         logger.debug(`[MessageQueue2] pushIsolateAndClear() called with mode hash: ${modeHash} - clearing ${this.queue.length} pending messages`);
 
         // Clear any pending messages to ensure this message is processed in complete isolation
+        const discarded = this.queue.flatMap((item) => item.requestIds ?? []);
         this.queue = [];
 
         this.queue.push({
@@ -131,6 +188,7 @@ export class MessageQueue2<T> {
             modeHash,
             isolate: true,
             attachments,
+            latencyTrace,
         });
 
         // Trigger message handler if set
@@ -147,13 +205,21 @@ export class MessageQueue2<T> {
         }
 
         logger.debug(`[MessageQueue2] pushIsolateAndClear() completed. Queue size: ${this.queue.length}`);
+        return discarded;
     }
 
     /**
      * Push a message that must be processed alone without discarding
      * already-queued user prompts.
      */
-    pushIsolated(message: string, mode: T, attachments?: PendingAttachment[]): void {
+    pushIsolated(
+        message: string,
+        mode: T,
+        attachments?: PendingAttachment[],
+        requestIds?: string[],
+        channelRequestId?: string,
+        latencyTrace?: QueueLatencyTrace,
+    ): void {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -167,6 +233,9 @@ export class MessageQueue2<T> {
             modeHash,
             isolate: true,
             attachments,
+            requestIds,
+            latencyTrace,
+            channelRequestId,
         });
 
         // Trigger message handler if set
@@ -190,13 +259,13 @@ export class MessageQueue2<T> {
      * that were already queued. Used for an automation turn that wakes an
      * existing session while preserving subsequent user input.
      */
-    unshiftIsolated(message: string, mode: T): void {
+    unshiftIsolated(message: string, mode: T, latencyTrace?: QueueLatencyTrace): void {
         if (this.closed) {
             throw new Error('Cannot unshift to closed queue');
         }
 
         const modeHash = this.modeHasher(mode);
-        this.queue.unshift({ message, mode, modeHash, isolate: true });
+        this.queue.unshift({ message, mode, modeHash, isolate: true, latencyTrace });
         if (this.onMessageHandler) {
             this.onMessageHandler(message, mode);
         }
@@ -210,7 +279,7 @@ export class MessageQueue2<T> {
     /**
      * Push a message to the beginning of the queue with a mode.
      */
-    unshift(message: string, mode: T): void {
+    unshift(message: string, mode: T, latencyTrace?: QueueLatencyTrace): void {
         if (this.closed) {
             throw new Error('Cannot unshift to closed queue');
         }
@@ -222,7 +291,8 @@ export class MessageQueue2<T> {
             message,
             mode,
             modeHash,
-            isolate: false
+            isolate: false,
+            latencyTrace,
         });
 
         // Trigger message handler if set
@@ -286,7 +356,7 @@ export class MessageQueue2<T> {
      * Wait for messages and return all messages with the same mode as a single string
      * Returns { message: string, mode: T } or null if aborted/closed
      */
-    async waitForMessagesAndGetAsString(abortSignal?: AbortSignal): Promise<{ message: string, mode: T, isolate: boolean, hash: string, attachments?: PendingAttachment[] } | null> {
+    async waitForMessagesAndGetAsString(abortSignal?: AbortSignal): Promise<CollectedBatch<T> | null> {
         // If we have messages, return them immediately
         if (this.queue.length > 0) {
             return this.collectBatch();
@@ -310,7 +380,7 @@ export class MessageQueue2<T> {
     /**
      * Collect a batch of messages with the same mode, respecting isolation requirements
      */
-    private collectBatch(): { message: string, mode: T, hash: string, isolate: boolean, attachments?: PendingAttachment[] } | null {
+    private collectBatch(): CollectedBatch<T> | null {
         if (this.queue.length === 0) {
             return null;
         }
@@ -318,6 +388,9 @@ export class MessageQueue2<T> {
         const firstItem = this.queue[0];
         const sameModeMessages: string[] = [];
         const collectedAttachments: PendingAttachment[] = [];
+        const collectedRequestIds: string[] = [];
+        const latencyTraces: QueueLatencyTrace[] = [];
+        let channelRequestId: string | undefined;
         let mode = firstItem.mode;
         let isolate = firstItem.isolate ?? false;
         const targetModeHash = firstItem.modeHash;
@@ -327,6 +400,9 @@ export class MessageQueue2<T> {
             const item = this.queue.shift()!;
             sameModeMessages.push(item.message);
             if (item.attachments) collectedAttachments.push(...item.attachments);
+            if (item.requestIds) collectedRequestIds.push(...item.requestIds);
+            if (item.latencyTrace) latencyTraces.push(item.latencyTrace);
+            channelRequestId = item.channelRequestId;
             logger.debug(`[MessageQueue2] Collected isolated message with mode hash: ${targetModeHash}`);
         } else {
             // Collect all messages with the same mode until we hit an isolated message
@@ -336,6 +412,8 @@ export class MessageQueue2<T> {
                 const item = this.queue.shift()!;
                 sameModeMessages.push(item.message);
                 if (item.attachments) collectedAttachments.push(...item.attachments);
+                if (item.requestIds) collectedRequestIds.push(...item.requestIds);
+                if (item.latencyTrace) latencyTraces.push(item.latencyTrace);
             }
             logger.debug(`[MessageQueue2] Collected batch of ${sameModeMessages.length} messages with mode hash: ${targetModeHash}`);
         }
@@ -348,7 +426,11 @@ export class MessageQueue2<T> {
             mode,
             hash: targetModeHash,
             isolate,
+            inputCount: sameModeMessages.length,
+            latencyTraces,
             attachments: collectedAttachments.length > 0 ? collectedAttachments : undefined,
+            requestIds: collectedRequestIds.length > 0 ? collectedRequestIds : undefined,
+            ...(channelRequestId !== undefined ? { channelRequestId } : {}),
         };
     }
 

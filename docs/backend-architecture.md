@@ -329,6 +329,13 @@ flowchart TD
 
 This pattern is used for multi-write operations like batch KV mutation and session deletion.
 
+자동화의 `GET /v1/projects/:projectId/automations`, `/automation-runs`, `/automation-target`는
+권한 확인 후 일반 DB 클라이언트로 조회한다. 읽기 전용 화면 조회에 interactive transaction을
+사용하면 DB 지연 때 불필요한 10초 트랜잭션 만료(P2028)가 발생하기 때문이다. 각 쿼리는
+독립된 최신 상태를 읽으며 응답 전체의 단일 스냅샷은 보장하지 않는다. 생성·수정·키 교체 등
+쓰기 경로는 계속 Serializable 트랜잭션 안에서 권한과 revision/key version을 검증한다.
+조회 응답에 원자적인 스냅샷이 필요한 요구사항이 생기면 이 경계를 재검토한다.
+
 ### Blob storage (S3/MinIO)
 The server uses S3-compatible storage for user assets (e.g., avatars):
 - `storage/files.ts` configures the S3 client.

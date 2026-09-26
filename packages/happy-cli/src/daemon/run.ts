@@ -1,4 +1,5 @@
 import { DIFFICULTY_CLASSIFIER_REVISION } from './difficultyRoutingArtifacts';
+import { healInstallArtifacts } from './installArtifactsHeal';
 import fs from 'fs/promises';
 import os from 'os';
 import * as tmp from 'tmp';
@@ -63,15 +64,20 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  AI_AUTH_SELECTION_CAPABILITY,
+  applyAppliedAiAuthSourceEnv,
   applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
   buildSpawnRequestEnvironment,
   captureSaycodeAgentEnvironment,
+  honorsManagedAiCredentials,
   overlayManagedCredentialEnvironment,
   SESSION_LINEAGE_ENV_PREFIXES,
   stripManagedCredentialConflicts,
+  verifyAiAuthSelection,
 } from './sessionEnv';
+import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -149,6 +155,7 @@ import {
   mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
 import { resolveManagedRuntimeIdentity, managedProvisioningPath } from './managedRuntimeIdentity';
+import { createDaemonSessionStateHandler } from './daemonSessionState';
 import { acquireManagedWriterLock } from './managedWriterLock';
 import {
     inspectManagedDaemonStateLayout,
@@ -170,6 +177,15 @@ import { teardownManagedRuntime as runManagedTeardown } from './managedTeardown'
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
+import { createLessonHostSupervisor } from '@/memory/lessonHostSupervisor';
+import { applyLessonLaunchEnvironment } from '@/memory/lessonLaunchEnvironment';
+import {
+  createLessonReviewOutcomeStore,
+  lessonReviewOutcomePath,
+  lessonSettingsPath,
+} from '@/memory/lessonSettingsStore';
+import { createLessonGrantVerifier, lessonGrantAudience, type LessonGrantVerifier } from '@/memory/lessonGrantVerifier';
+import { fetchLessonGrantPublicKey, requestLessonSnapshotGrant } from '@/memory/lessonHostRuntime';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import {
   decideAutomationAwareHandoff,
@@ -202,6 +218,7 @@ import {
   decryptServerAutomationPayload,
 } from './automations/serverAutomationCache';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
+import { fetchAutomationProjectEnvironment } from './automations/automationProjectEnvironment';
 import {
   runServerAutomationTick,
   type ServerAutomationExecutorInput,
@@ -241,6 +258,7 @@ import {
 import {
   ADDITIONAL_DIRECTORIES_CAPABILITY,
   prepareAdditionalDirectories,
+  reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories';
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
 import {
@@ -313,9 +331,48 @@ export const initialMachineMetadata: MachineMetadata = {
     protocolVersion: AUTOMATION_PROTOCOL_VERSION,
   },
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
+  /*
+   * Only engines that can do *both* halves: register the channel RPCs, and produce an
+   * authoritative final answer the channel may relay.
+   *
+   * `grok` (and every other ACP agent) registers the RPCs but is deliberately absent. ACP's
+   * `AgentMessage` model output carries only `textDelta`/`fullText` — no phase, no final marker —
+   * and `AcpBackend.sendPrompt` discards the `PromptResponse` whose `stopReason` is the one
+   * authoritative terminal it does receive. Without a per-segment final marker there is no way to
+   * tell an answer from commentary, and R14 does not allow guessing, so ACP is unsupported rather
+   * than approximately supported. See the spec notes for the concrete work that would change it.
+   */
+  /*
+   * Two different questions, and only one of them has its own list.
+   *
+   * `engines` is who can execute an external channel turn — and, because a runtime that executes
+   * one also publishes its approval waits, it is equally the set that emits `channel-permission`
+   * with `kind: 'desktop-only'` (R8/R9). Both Claude and Codex do; Gemini and the ACP handler do
+   * neither, which is why they are absent.
+   *
+   * `approvals.engines` is the narrower question: who can have a prompt *answered* from a
+   * messenger. Only Claude. The prompt→turn binding, the one-shot consume and the dedicated
+   * `channel-permission` RPC live in the Claude launcher's ordered queue
+   * (`claude/claudeRemoteLauncher.ts` + `channel/channelPermissionWiring.ts`). Codex reaches its
+   * approvals through `codexAppServerClient`'s own request/response methods, registers no
+   * dedicated RPC, and binds every observed prompt as unanswerable — so listing it here would
+   * advertise a button whose answers have no route.
+   */
+  channelSupport: {
+    protocolVersion: 1,
+    engines: ['claude', 'codex'],
+    approvals: { protocolVersion: 1, engines: ['claude'] },
+  },
+  aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
 };
 
-async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest): Promise<boolean> {
+/**
+ * The host owns this call's deadline and passes its own signal: recomputing one here from
+ * `request.deadlineAt` would read an absolute instant produced on another machine, and a v2
+ * request has no such field at all. The body echoes the negotiated contract so the server can
+ * refuse a signed v2 grant presented as v1.
+ */
+async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelayRequest, signal: AbortSignal): Promise<boolean> {
   try {
     const response = await fetch(`${resolveAplusDifficultyRoutingOrigin()}/api/me/difficulty-routing/validate-grant`, {
       method: 'POST',
@@ -330,8 +387,9 @@ async function authorizeDifficultyRoutingRequest(request: DifficultyRoutingRelay
         hostMachineId: request.hostMachineId,
         hostProcessKeyId: request.hostProcessKeyId,
         policyRevision: request.policyRevision,
+        ...(request.timingVersion === 2 ? { timingVersion: 2 as const, remainingMs: request.remainingMs } : {}),
       }),
-      signal: AbortSignal.timeout(Math.max(1, Math.min(250, request.deadlineAt - Date.now()))),
+      signal,
     });
     if (!response.ok) return false;
     const body = await response.json().catch(() => null) as { ok?: unknown } | null;
@@ -650,6 +708,11 @@ export async function startDaemon(): Promise<void> {
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   try {
+    // npm 12 blocks install scripts it was not told to allow, so a plain
+    // `npm i -g` can leave the postinstall artifacts behind. Restore them before
+    // any RPC (ripgrep, terminal) can need them. Never throws.
+    await healInstallArtifacts();
+
     // Start caffeinate
     const caffeinateStarted = startCaffeinate();
     if (caffeinateStarted) {
@@ -918,6 +981,11 @@ export async function startDaemon(): Promise<void> {
         protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
         hostProcessKeyId: difficultyRoutingHostKey.id,
         hostProcessPublicKey: encodeBase64(difficultyRoutingHostKey.publicKey),
+        // Advertised from the base metadata, not only from `host.capability()`: the readiness
+        // refresh rebuilds `difficultyRouting` from this object, so anything missing here is
+        // dropped the first time readiness changes.
+        timingVersions: [1, 2],
+        maxRelayTtlMs: 3000,
         classifier: {
           kind: 'transformers-binary',
           modelMaxInputTokens: DIFFICULTY_ROUTING_MAX_INPUT_TOKENS,
@@ -1587,7 +1655,8 @@ export async function startDaemon(): Promise<void> {
         + ` callerGrant=${trustedMcpContext ? 'automation' : options.mcpCallerGrantEnvelope ? 'envelope' : 'absent'}`,
       );
 
-      const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
+      // Lesson eligibility uses the registered daemon machine, not an optional RPC field.
+      const { directory, sessionId, approvedNewDirectoryCreation = true } = options;
       let directoryCreated = false;
 
       try {
@@ -1647,15 +1716,22 @@ export async function startDaemon(): Promise<void> {
           primaryDirectory: directory,
           allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
         });
-        const finishSpawn = async (spawn: Promise<SpawnSessionResult>): Promise<SpawnSessionResult> => {
+        const finishSpawn = async (
+          spawn: Promise<SpawnSessionResult>,
+          appliedAiAuthSource?: AiAuthSource,
+        ): Promise<SpawnSessionResult> => {
           try {
             const result = await spawn;
             if (result.type !== 'success') {
               cleanupStagedDeferredContinuationContext();
             }
-            if (result.type !== 'success' || options.additionalDirectories === undefined) return result;
+            if (result.type !== 'success') return result;
+            const reported: SpawnSessionResult = appliedAiAuthSource === undefined
+              ? result
+              : { ...result, appliedAiAuthSource };
+            if (options.additionalDirectories === undefined) return reported;
             return {
-              ...result,
+              ...reported,
               additionalDirectories: {
                 version: 1,
                 accepted: additionalDirectoryResult.accepted,
@@ -1740,7 +1816,12 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
-        const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(options.agent);
+        // `machine-personal` 은 이 머신의 자기 로그인을 고른 것이다. 관리 자격을
+        // 해석해 두면 overlayManagedCredentialEnvironment 가 마지막에 덮어 항상
+        // 이긴다 — 그래서 해석 자체를 하지 않는다.
+        const managedAiCredentialEnvironment = honorsManagedAiCredentials(options.aiAuthSelection)
+          ? await resolveManagedAiCredentialEnvironment(options.agent)
+          : {};
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables),
@@ -1815,6 +1896,47 @@ export async function startDaemon(): Promise<void> {
             errorMessage
           };
         }
+        /*
+         * The state root and who injects lessons, in one place shared with the
+         * resume path so the two cannot drift.
+         *
+         * Settings, the spending ledger and the review outcome live under the
+         * daemon's home, so a session whose own `HAPPY_HOME_DIR` was relocated
+         * for another user's credentials must still read them there.
+         *
+         * Ownership is decided now and fixed for the child's lifetime: the
+         * host boots lazily, so "ready" moves during a session, and a marker
+         * that followed it would either silence CML's native hook halfway
+         * through or let both inject across the switch.
+         */
+        const lessonLaunch = await applyLessonLaunchEnvironment({
+          environment: extraEnv,
+          // The credential the child will actually authenticate with.
+          callerToken: options.happyToken,
+          daemonToken: credentials.token,
+          daemonHomeDir: configuration.happyHomeDir,
+          projectId: hasAuthoritativeProjectBinding ? mcpConfigProjectId : null,
+          hasSessionAuthority: hasAuthoritativeProjectBinding && Boolean(mcpCallerGrant),
+          eligible: Boolean(
+            // A managed runtime loads no settings sources, so there is no
+            // native hook to stand down and no account credential to be a
+            // host with.
+            managedIdentity.status !== 'active'
+            && lessonStudioOrigin
+            && machineId,
+          ),
+          /*
+           * Proof, not a prediction: the supervisor opens the project through
+           * the same signed grant a turn would. A `null` here means the studio
+           * refused, the key is missing or the store will not open — all of
+           * which keep supported launches behind the host policy gate.
+           */
+          hostIsReady: async () => Boolean(
+            mcpConfigProjectId && await lessonHosts.ensureOpen(mcpConfigProjectId),
+          ),
+        });
+        logger.debug(`[lesson-host] owner=${lessonLaunch.decision.owner} (${lessonLaunch.decision.reason})`);
+        extraEnv = lessonLaunch.environment;
         extraEnv = injectCheckpointSpawnContext(extraEnv, mcpConfigProjectId && hasAuthoritativeProjectBinding
           ? {
             projectId: mcpConfigProjectId,
@@ -1822,7 +1944,6 @@ export async function startDaemon(): Promise<void> {
             checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
           }
           : undefined);
-
         // Managed credentials are already validated by the credential runtime.
         // Overlay them only after caller variable expansion so secret text such
         // as `${...}` is never interpreted as a daemon environment reference.
@@ -1960,14 +2081,22 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const tmuxEnv = applyConfirmedPromptDeliveryFlag(
+          const tmuxEnv = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
             buildManagedSessionSpawnEnvironment(
               inheritedSpawnEnvironment,
               extraEnv,
               managedAiCredentialEnvironment,
             ),
             requireInitialPromptAck,
-          );
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
+          // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
+          const tmuxSelection = verifyAiAuthSelection(options.aiAuthSelection, tmuxEnv);
+          if (tmuxSelection.rejection) {
+            return finishSpawn(Promise.resolve({
+              type: 'error',
+              errorMessage: tmuxSelection.rejection,
+            }));
+          }
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -2011,7 +2140,7 @@ export async function startDaemon(): Promise<void> {
               pidToAwaiter,
               label: '(tmux)',
               logger,
-            }));
+            }), tmuxSelection.appliedSource);
           } else {
             logger.debug(`[DAEMON RUN] Failed to spawn in tmux: ${tmuxResult.error}, falling back to regular spawning`);
             useTmux = false;
@@ -2052,24 +2181,34 @@ export async function startDaemon(): Promise<void> {
 
           // TODO: In future, sessionId could be used with --resume to continue existing sessions
           // For now, we ignore it - each spawn creates a new session
+          // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
+          // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
+          // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
+          const spawnEnvironment = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
+            buildManagedSessionSpawnEnvironment(
+              inheritedSpawnEnvironment,
+              extraEnv,
+              managedAiCredentialEnvironment,
+            ),
+            requireInitialPromptAck,
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
+          // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
+          const spawnSelection = verifyAiAuthSelection(options.aiAuthSelection, spawnEnvironment);
+          if (spawnSelection.rejection) {
+            return finishSpawn(Promise.resolve({
+              type: 'error',
+              errorMessage: spawnSelection.rejection,
+            }));
+          }
+
           return finishSpawn(spawnTrackedHappyProcess({
             args,
             cwd: directory,
-            // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
-            // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
-            // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: applyConfirmedPromptDeliveryFlag(
-              buildManagedSessionSpawnEnvironment(
-                inheritedSpawnEnvironment,
-                extraEnv,
-                managedAiCredentialEnvironment,
-              ),
-              requireInitialPromptAck,
-            ),
+            env: spawnEnvironment,
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
             userHomeDir: stagedUserHomeDir,
-          }));
+          }), spawnSelection.appliedSource);
         }
 
         // This should never be reached, but TypeScript requires a return statement
@@ -2291,6 +2430,8 @@ export async function startDaemon(): Promise<void> {
       mcpCallerGrantEnvelope?: string;
       mcpConfigProjectId?: string;
       expectedConnectors?: string[];
+      /** Present = replace the roots granted at spawn (a live child is left untouched). */
+      additionalDirectories?: string[];
       checkpointRestart?: true;
       automation?: {
         directory: string;
@@ -2530,8 +2671,35 @@ export async function startDaemon(): Promise<void> {
         }
         const authoritativeCheckpointProjectId = priorCheckpointContext?.projectId
           ?? (options?.mcpCallerGrantEnvelope ? checkpointProjectId : undefined);
-        const resumedEnvironment = injectCheckpointSpawnContext(
-          mcpEnvironment.environmentVariables,
+        /*
+         * Lesson wiring, re-established for the resumed child.
+         *
+         * `prepareMcpChildEnvironment` above strips every `HAPPY_LESSON_` and
+         * `CLAUDE_MEMORY_` key, because a caller must not be able to forge
+         * them — and that strip takes the daemon's own two with it. Without
+         * this the first resume of any session lost its state root and its
+         * owner marker, so the host went quiet and an inherited marker decided
+         * who injects. Same helper as the fresh spawn, so the two agree.
+         */
+        const resumeLessonLaunch = await applyLessonLaunchEnvironment({
+          environment: mcpEnvironment.environmentVariables,
+          // What the resumed child will actually authenticate with, which the
+          // credential decision above already resolved and verified.
+          callerToken: credentialDecision.token,
+          daemonToken: credentials.token,
+          daemonHomeDir: configuration.happyHomeDir,
+          projectId: authoritativeCheckpointProjectId ?? null,
+          hasSessionAuthority: Boolean(authoritativeCheckpointProjectId
+            && mcpEnvironment.environmentVariables.HAPPY_APLUS_MCP_CALLER_GRANT),
+          eligible: Boolean(process.env.HAPPY_APLUS_MCP_CONFIG_URL && machineId),
+          hostIsReady: async () => Boolean(
+            authoritativeCheckpointProjectId
+            && await lessonHosts.ensureOpen(authoritativeCheckpointProjectId),
+          ),
+        });
+        logger.debug(`[lesson-host] resume owner=${resumeLessonLaunch.decision.owner} (${resumeLessonLaunch.decision.reason})`);
+        const resumedEnvironment = applyAppliedAiAuthSourceEnv(injectCheckpointSpawnContext(
+          resumeLessonLaunch.environment,
           authoritativeCheckpointProjectId
             ? {
               projectId: authoritativeCheckpointProjectId,
@@ -2539,7 +2707,19 @@ export async function startDaemon(): Promise<void> {
               checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
             }
             : undefined,
-        );
+        ), Object.keys(managedAiCredentialEnvironment).length > 0);
+        if (options?.additionalDirectories !== undefined) {
+          // Roots registered while the session was stopped only reach the sandbox here:
+          // the OS sandbox profile is fixed for the life of the child process.
+          const reapplied = await reapplyAdditionalDirectoriesOnResume(resumedEnvironment, {
+            requested: options.additionalDirectories,
+            primaryDirectory: launch.cwd,
+            allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+          });
+          if (!reapplied.applied) {
+            logger.debug(`[DAEMON RUN] Kept the granted additional directories for ${happySessionId}: the requested list was rejected`);
+          }
+        }
 
         const result = await spawnTrackedHappyProcess({
           args: launch.args,
@@ -3822,6 +4002,79 @@ export async function startDaemon(): Promise<void> {
         keyVersion,
       );
     }, scriptWorker ? SCRIPT_AUTOMATION_PROTOCOL_VERSION : AUTOMATION_PROTOCOL_VERSION);
+    /*
+     * The lesson host. The studio origin is the daemon's own configured value
+     * — the same one the MCP config uses — never anything from a request, and
+     * the bearer is this daemon's account credential. Absent either, the
+     * supervisor still answers, and it answers `disabled`.
+     */
+    /*
+     * One verifier for routing, built from the studio key this daemon fetched.
+     * Null until that key is available, and a null verifier refuses every
+     * lesson request rather than routing it on an unverified body.
+     */
+    let lessonRouteVerifier: LessonGrantVerifier | null = null;
+    const lessonStudioOrigin = (() => {
+      const configured = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+      if (!configured) return null;
+      try { return new URL(configured).origin; } catch { return null; }
+    })();
+    if (lessonStudioOrigin && machineId) {
+      const lessonPublicKey = await fetchLessonGrantPublicKey({
+        studioBaseUrl: lessonStudioOrigin,
+        token: credentials.token,
+        machineId,
+      });
+      if (lessonPublicKey) {
+        try {
+          lessonRouteVerifier = createLessonGrantVerifier({
+            publicKeyBase64: lessonPublicKey,
+            machineId,
+            audience: lessonGrantAudience(lessonStudioOrigin),
+          });
+        } catch (error) {
+          logger.debug(`[lesson-host] routing key unusable: ${(error as Error).message}`);
+        }
+      }
+    }
+    const lessonHosts = createLessonHostSupervisor({
+      /*
+       * Routing reads the signed `workspaceDir` out of the envelope. The
+       * daemon deliberately does *not* supply a directory of its own: the MCP
+       * caller grant it consumes at spawn signs a project and a machine but
+       * never a path, so deriving the workspace from a spawn would let a valid
+       * grant for one project open another project's store.
+       */
+      routeVerifier: () => lessonRouteVerifier,
+      loadRouteVerifier: async () => {
+        if (!lessonStudioOrigin || !machineId) return null;
+        const key = await fetchLessonGrantPublicKey({
+          studioBaseUrl: lessonStudioOrigin, token: credentials.token, machineId,
+        });
+        if (!key) return null;
+        lessonRouteVerifier = createLessonGrantVerifier({
+          publicKeyBase64: key, machineId, audience: lessonGrantAudience(lessonStudioOrigin),
+        });
+        return lessonRouteVerifier;
+      },
+      // Lets a turn or a review open a project nobody has clicked into yet.
+      // The studio still decides, and still signs the path.
+      requestSnapshotGrant: (projectId) => (lessonStudioOrigin && machineId
+        ? requestLessonSnapshotGrant({
+          studioBaseUrl: lessonStudioOrigin, token: credentials.token, machineId, projectId,
+        })
+        : Promise.resolve(null)),
+      machineId: () => machineId,
+      studioBaseUrl: () => lessonStudioOrigin,
+      studioToken: () => credentials.token,
+      // The shared helper, so the daemon and every session name the same file.
+      settingsPathFor: (projectId) => lessonSettingsPath(configuration.happyHomeDir, projectId),
+      // The worker writes this from the provider process; the UI reads it here.
+      reviewOutcomeFor: (projectId) => createLessonReviewOutcomeStore(
+        lessonReviewOutcomePath(configuration.happyHomeDir, projectId),
+      ).read(),
+    });
+    await apiMachine.setLessonHosts(lessonHosts);
     apiMachine.setServerAutomationCache(serverAutomationCache);
     const serverAutomationTickRunner = createAutomationTickRunner({
       runTick: () => runServerAutomationTick({
@@ -3880,6 +4133,13 @@ export async function startDaemon(): Promise<void> {
             },
           });
         },
+        resolveProjectEnvironment: ({ runId, claimToken }) => fetchAutomationProjectEnvironment({
+          configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
+          machineToken: credentials.token,
+          machineId,
+          runId,
+          claimToken,
+        }),
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,
@@ -4069,6 +4329,7 @@ export async function startDaemon(): Promise<void> {
 
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
       spawnSession,
@@ -4453,6 +4714,11 @@ export async function startDaemon(): Promise<void> {
       claudeSwapSupervisor.shutdown();
       scriptAutomationTickRunner.pause();
       await stopScriptWorker();
+      // Closes every open project store. Flips its own closed flag first, so a
+      // binding in flight stops resolving before the database goes away.
+      await lessonHosts.close().catch((error) => logger.debug(
+        `[lesson-host] shutdown: ${(error as Error).message}`,
+      ));
 
       // Update daemon state before shutting down
       await apiMachine.updateDaemonState((state: DaemonState | null) => ({
