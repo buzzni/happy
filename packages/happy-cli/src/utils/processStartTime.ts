@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 /**
  * Wall-clock time a process started, in epoch milliseconds.
@@ -36,20 +36,18 @@ export function getProcessStartedAt(pid: number): number | undefined {
 /**
  * Windows counterpart of {@link getProcessStartedAt}: `ps` does not exist there.
  * CIM reports the creation time of any process, including ones the caller may
- * not open. It costs a PowerShell start, so call it only for a live pid that
- * actually needs checking. Undefined means "cannot verify", as above.
+ * not open. It costs a PowerShell start, so it runs asynchronously and only for
+ * a live pid that actually needs checking. Undefined means "cannot verify".
  */
-export function getWindowsProcessStartedAt(pid: number): number | undefined {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-  try {
-    const output = execFileSync('powershell.exe', [
+export function getWindowsProcessStartedAt(pid: number): Promise<number | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve(undefined);
+  return new Promise(resolve => {
+    execFile('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command',
       `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o') }`,
-    ], { encoding: 'utf-8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
-    if (!output) return undefined;
-    const parsed = Date.parse(output);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+    ], { encoding: 'utf-8', timeout: 5_000, windowsHide: true }, (error, stdout) => {
+      const parsed = error ? NaN : Date.parse(String(stdout).trim());
+      resolve(Number.isFinite(parsed) ? parsed : undefined);
+    });
+  });
 }

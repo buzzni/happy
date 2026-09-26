@@ -70,3 +70,63 @@ describe('acquireDaemonLock with a lock left by a dead daemon', () => {
     rmSync(lockFile, { force: true })
   })
 })
+
+describe('acquireDaemonLock reclaim safety', () => {
+  const lockFile = join(home, 'daemon.state.json.lock')
+  const staleLock = (pid: number, writtenAt: number) => {
+    writeFileSync(lockFile, String(pid))
+    utimesSync(lockFile, writtenAt / 1000, writtenAt / 1000)
+  }
+
+  it('lets only one of two concurrent starters reclaim the same stale lock', async () => {
+    // The live pid (this runner) started 10 min ago; the stale lock is an hour old,
+    // and whichever starter wins writes a fresh lock that the other must keep.
+    const startedAt = Date.now() - 10 * 60_000
+    staleLock(process.pid, Date.now() - 60 * 60_000)
+    let arrived = 0
+    let release!: () => void
+    const bothLooking = new Promise<void>(resolve => { release = resolve })
+    const deps = {
+      getProcessStartedAt: async () => { if (++arrived === 2) release(); await bothLooking; return startedAt },
+      answersAsDaemon: async () => false,
+    }
+    const handles = await Promise.all([acquireDaemonLock(3, 0, deps), acquireDaemonLock(3, 0, deps)])
+    expect(handles.filter(Boolean)).toHaveLength(1)
+    await releaseDaemonLock(handles.find(Boolean)!)
+  })
+
+  it('keeps a lock whose holder still answers as the daemon even if its start looks later', async () => {
+    staleLock(process.pid, Date.now() - 60 * 60_000)
+    const handle = await acquireDaemonLock(2, 0, { getProcessStartedAt: () => Date.now(), answersAsDaemon: async () => true })
+    expect(handle).toBeNull()
+    rmSync(lockFile, { force: true })
+  })
+
+  it('asks for the start time once per lock it sees, not once per retry', async () => {
+    const writtenAt = Date.now() - 60_000
+    staleLock(process.pid, writtenAt)
+    let lookups = 0
+    const handle = await acquireDaemonLock(4, 0, { getProcessStartedAt: () => { lookups++; return writtenAt - 5_000 } })
+    expect(handle).toBeNull()
+    expect(lookups).toBe(1)
+    rmSync(lockFile, { force: true })
+  })
+
+  it('does not treat a holder it may not signal as dead', async () => {
+    // pid 1 belongs to root: signalling it fails with EPERM for a normal user.
+    const writtenAt = Date.now() - 60_000
+    staleLock(1, writtenAt)
+    const handle = await acquireDaemonLock(2, 0, { getProcessStartedAt: () => writtenAt - 5_000 })
+    expect(handle).toBeNull()
+    rmSync(lockFile, { force: true })
+  })
+
+  it('releases only the lock it still owns', async () => {
+    const handle = await acquireDaemonLock(1, 0)
+    expect(handle).not.toBeNull()
+    writeFileSync(lockFile, '999999') // someone else's lock replaced ours
+    await releaseDaemonLock(handle!)
+    expect(readFileSync(lockFile, 'utf-8')).toBe('999999')
+    rmSync(lockFile, { force: true })
+  })
+})
