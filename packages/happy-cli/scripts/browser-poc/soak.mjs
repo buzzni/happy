@@ -12,6 +12,9 @@ const minutes = Number(arg('--minutes', '30'));
 const warmup = Number(arg('--warmup-minutes', '5'));
 // Pages opened concurrently every minute (default = the agent window cap), so windows are really created and destroyed.
 const perMinute = Number(arg('--pages-per-minute', '4'));
+// Release acceptance (D5/GD5) needs at least 30 measured minutes; shorter runs are diagnostics and never pass.
+const ACCEPTANCE_MINUTES = 30;
+const diagnostic = process.argv.includes('--diagnostic');
 if (!(minutes > 0 && warmup >= 0 && Number.isInteger(perMinute) && perMinute >= 1)) throw Error('invalid duration or --pages-per-minute');
 const env = JSON.parse(readFileSync(join(root, '.abp', run, 'env.json')));
 const keys = JSON.parse(readFileSync(join(root, '.abp', run, 'keys.json')));
@@ -72,5 +75,6 @@ const measuredSpanMs = measured.length ? measured.at(-1).atMs - measured[0].atMs
 const coverage = { samples: measured.length, requiredSamples: minutes, spanMs: measuredSpanMs, requiredSpanMs: Math.max(0, (minutes - 1) * 60_000 * 0.95), validSamples,
   pass: measured.length === minutes && measuredSpanMs >= Math.max(0, (minutes - 1) * 60_000 * 0.95) && validSamples };
 const registryStable = measured.every(s => Object.values(s.driver).every(d => d.counts.tabs === 0 && d.counts.sessions === 0)) && measured.every(s => s.browserPageTargets.a === measured[0].browserPageTargets.a && s.browserPageTargets.b === measured[0].browserPageTargets.b);
-const summary = { run, minutes, warmup, perMinute, completed, crashes, taskLoss, registryStable, coverage, result, processRss, maxPageTargets, pass: coverage.pass && crashes===0 && taskLoss===0 && registryStable && Object.values(result).every(v=>v.pass) && Object.values(processRss).every(v=>v.pass) };
+const acceptanceEligible = minutes >= ACCEPTANCE_MINUTES;
+const summary = { run, minutes, warmup, perMinute, diagnostic, acceptanceEligible, completed, crashes, taskLoss, registryStable, coverage, result, processRss, maxPageTargets, pass: coverage.pass && (acceptanceEligible || diagnostic) && crashes===0 && taskLoss===0 && registryStable && Object.values(result).every(v=>v.pass) && Object.values(processRss).every(v=>v.pass) };
 writeFileSync(join(root,'.abp',run,'soak-summary.json'), JSON.stringify(summary,null,2)); console.log(JSON.stringify(summary)); if (!summary.pass) process.exitCode=1;
