@@ -136,7 +136,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { createBrowserTaskSessionBroker, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { createBrowserTaskSessionBroker, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import { findBrowserAttentionSession, startBrowserAttentionWatcher } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -1654,6 +1654,7 @@ export async function startDaemon(): Promise<void> {
     } catch (error) {
       logger.warn(`[DAEMON RUN] Browser task broker disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
+    const stopBrowserTaskReconciliation = startBrowserTaskReconciliation(browserTaskBroker);
     const reportBrowserTaskRevokeFailure = (error: unknown): void => {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
@@ -1748,8 +1749,10 @@ export async function startDaemon(): Promise<void> {
               cleanupStagedDeferredContinuationContext();
             }
             // The Happy session id exists only now; an unbound registration never issues a grant.
+            // Attribute the registration to the session's host pid, never to this restartable daemon.
             if (browserTaskRegistration && !(result.type === 'success'
-              && await browserTaskBroker?.bind(browserTaskRegistration.registrationId, result.sessionId))) {
+              && await browserTaskBroker?.bind(browserTaskRegistration.registrationId, result.sessionId,
+                Array.from(pidToTrackedSession.values()).find((session) => session.happySessionId === result.sessionId)?.pid))) {
               await releaseBrowserTaskRegistration();
             }
             if (result.type !== 'success') return result;
@@ -4727,6 +4730,7 @@ export async function startDaemon(): Promise<void> {
     const cleanupAndShutdown = async (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string) => {
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
 
+      stopBrowserTaskReconciliation();
       await stopBrowserAttention();
 
       // Clear health check interval

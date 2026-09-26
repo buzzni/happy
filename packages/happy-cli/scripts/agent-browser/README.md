@@ -266,6 +266,7 @@ same tasks, profiles and secrets. Accounts and homes (Happy and Claude logins) a
 | first Desktop chat after a daemon restart: `MCP caller grant rejected (invalid-envelope)` | the server has not refreshed the daemon key yet; retry after ~1 minute |
 | `upgrade aborted: …` | fence not verifiable (`abp-firewall check`, then `systemctl restart abp-firewall`), admin metrics down (`docker logs abp-runtime`), or batches still running after 60 s (retry later); nothing was changed |
 | proxy 502 / resolution fails | `sudo -u abp-proxy getent hosts api.anthropic.com`; nsswitch `resolve`, systemd-resolved active |
+| `QUOTA_EXCEEDED` after a crash/reboot | registrations with a known Linux session owner self-heal at daemon startup and every 60 s: dead owners are revoked, paused tasks cancelled and spaces reclaimed. Surviving sessions and legacy registrations without an owner are kept. The admin `POST /admin/close-space` route remains the manual cleanup path. |
 | broker 401 from the daemon | token and hash out of step (interrupted rotation) → `abp-stack rotate-keys --daemon-token` |
 | browsers cannot load a site | `abp-firewall check-egress`; a site on a private or `--deny-cidr` address is blocked by design; DNS: `--browser-dns` must list the resolvers Docker forwards to |
 | `another abp-stack operation (or abp-install) is running` | one mutating operation at a time (`/run/abp-stack-ops.lock`); wait for it |

@@ -77,6 +77,22 @@ describe('space quota', () => {
 })
 
 describe('session-end reclamation', () => {
+    it.each(['grant-expired', 'approval-expired', 'browser-replaced'] as const)('frees the quota when a dead session ends with a task paused for %s', async (pauseReason) => {
+        const h = await start(await tempDir(), undefined, { maxSpacesPerProfile: 1 })
+        const dead = await h.openSpace('dead-session')
+        await h.store.commit(dead.taskId, { status: 'paused', pauseReason },
+            { type: 'state-changed', atMs: h.clock.now(), leaseEpoch: 0, data: {} })
+        await expect(h.runtime.createSpace(h.agent('new-session'), { profileId, requestId: rid('space') })).rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+        // The broker's durable revoke invokes endSession after revoking grants.
+        await h.runtime.endSession('dead-session')
+        expect(h.store.getTask(dead.taskId)).toMatchObject({ status: 'cancelled', cancelRequested: true })
+        // Reclamation releases the quota before physical tab cleanup runs.
+        await h.runtime.createSpace(h.agent('new-session'), { profileId, requestId: rid('space') })
+        await h.runtime.reclaimSpaces()
+        expect(h.store.getSpace(dead.taskSpaceId)?.closed).toBe(true)
+        await h.store.close()
+    })
+
     it('cancels the ended session\'s tasks and closes its tabs and space, leaving other sessions alone', async () => {
         const h = await start(await tempDir(), undefined, { maxSpacesPerProfile: 2 })
         const ended = await h.openSpace('session-a')

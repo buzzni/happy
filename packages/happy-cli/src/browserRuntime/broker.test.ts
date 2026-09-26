@@ -1,3 +1,4 @@
+/** Broker authentication, durable registrations, grants and revocation recovery. */
 import { createHash } from 'node:crypto'
 import { chmod, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { request } from 'node:http'
@@ -66,6 +67,34 @@ async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId)
 }
 
 describe('broker socket', () => {
+    it('lists only public registration metadata with daemon auth, preserving owners across restart', async () => {
+        const h = await harness()
+        const owner = { bootId: 'boot-a', pid: 123, pidStartTime: '98765' }
+        const unbound = await call(h.socketPath, 'POST', '/v1/sessions/register', h.daemon, { schemaVersion: 1, owner })
+        const bound = await h.register()
+        await h.grant(bound.sessionSecret)
+        // Binding can attach ownership after spawn, including an idempotent bind retry.
+        expect((await call(h.socketPath, 'POST', '/v1/sessions/bind', h.daemon, {
+            schemaVersion: 1, registrationId: bound.registrationId, agentSessionId: 'session-1', owner,
+        })).status).toBe(200)
+        const legacy = await h.register('legacy')
+        const unauthorizedHeaders: Record<string, string>[] = [{}, { 'x-abp-daemon-token': 'wrong' }, { 'x-abp-session-secret': bound.sessionSecret }]
+        for (const headers of unauthorizedHeaders) {
+            expect((await call(h.socketPath, 'GET', '/v1/sessions', headers)).status).toBe(401)
+        }
+        const expected = [
+            { registrationId: unbound.body.result.registrationId, owner, createdAtMs: 1_000_000, revoking: false },
+            { registrationId: bound.registrationId, agentSessionId: 'session-1', owner, createdAtMs: 1_000_000, revoking: false },
+            { registrationId: legacy.registrationId, agentSessionId: 'legacy', createdAtMs: 1_000_000, revoking: false },
+        ]
+        // Exact equality excludes secrets, hashes and grant ids.
+        expect((await call(h.socketPath, 'GET', '/v1/sessions', h.daemon)).body.result).toEqual(expected)
+        await h.close()
+        cleanups.splice(cleanups.indexOf(h.close), 1)
+        const restarted = await harness({ dir: h.dir })
+        expect((await call(restarted.socketPath, 'GET', '/v1/sessions', restarted.daemon)).body.result).toEqual(expected)
+    })
+
     it('requires the daemon token to register a session', async () => {
         const h = await harness()
         expect((await call(h.socketPath, 'POST', '/v1/sessions/register', {}, { schemaVersion: 1 })).status).toBe(401)
@@ -158,6 +187,9 @@ describe('broker socket', () => {
         const failed = await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })
         expect(failed.status).toBe(503)
         expect(failed.body.error.retryable).toBe(true)
+        expect((await call(h.socketPath, 'GET', '/v1/sessions', h.daemon)).body.result).toEqual([
+            { registrationId: expect.any(String), agentSessionId: 'session-1', createdAtMs: 1_000_000, revoking: true },
+        ])
         const onDisk = JSON.parse(await readFile(join(h.dir, 'broker-sessions.json'), 'utf8'))
         expect(Object.values(onDisk.registrations)).toEqual([expect.objectContaining({ agentSessionId: 'session-1', revoking: true, grantIds: [issued] })])
         expect((await h.grant(sessionSecret)).status).toBe(401)

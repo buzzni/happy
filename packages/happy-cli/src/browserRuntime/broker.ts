@@ -5,8 +5,9 @@
  * Happy daemon and its session processes (user `agent`, outside the claude
  * sandbox) can connect. The agent HMAC key never leaves the Runtime.
  *
- *   POST /v1/sessions/register  daemon token   → { registrationId, sessionSecret }
- *   POST /v1/sessions/bind      daemon token   { registrationId, agentSessionId }
+ *   GET  /v1/sessions           daemon token   → [{ registrationId, agentSessionId?, owner?, createdAtMs, revoking }]
+ *   POST /v1/sessions/register  daemon token   { owner? } → { registrationId, sessionSecret }
+ *   POST /v1/sessions/bind      daemon token   { registrationId, agentSessionId, owner? }
  *   POST /v1/sessions/revoke    daemon token   { agentSessionId } | { registrationId }
  *   POST /v1/agent-grants       session secret { agentSessionId, profileId } → { token, grantId, expiresAtMs }
  *   GET  /v1/attention?afterSeq=&waitMs=  daemon token → AttentionFeed
@@ -30,6 +31,7 @@ import { mintAgentGrant } from './auth'
 import type { AttentionOutbox } from './attention'
 import { AGENT_OPERATIONS, BrowserRuntimeError, type AgentSessionId, type GrantId, type MachineId, type PrincipalId, type ProfileId, type WorkspaceId } from './contracts'
 import { MAX_SUBSCRIBE_WAIT_MS, httpStatusFor } from './server'
+import { sessionOwnerSchema, type SessionOwner } from './sessionRegistration'
 
 /** Session processes renew 5 minutes before expiry. */
 export const BROKER_GRANT_TTL_MS = 55 * 60_000
@@ -38,6 +40,7 @@ const MAX_BODY_BYTES = 16 * 1024
 
 interface Registration {
     secretSha256: string
+    owner?: SessionOwner
     agentSessionId?: string
     createdAtMs: number
     grantIds: string[]
@@ -89,8 +92,8 @@ export function withRevokingGrants(revoked: ReadonlySet<string>, broker?: Pick<B
 
 const id = z.string().min(1).max(256)
 const schemas = {
-    register: z.object({ schemaVersion: z.literal(1) }).strict(),
-    bind: z.object({ schemaVersion: z.literal(1), registrationId: id, agentSessionId: id }).strict(),
+    register: z.object({ schemaVersion: z.literal(1), owner: sessionOwnerSchema.optional() }).strict(),
+    bind: z.object({ schemaVersion: z.literal(1), registrationId: id, agentSessionId: id, owner: sessionOwnerSchema.optional() }).strict(),
     revoke: z.union([
         z.object({ schemaVersion: z.literal(1), agentSessionId: id }).strict(),
         z.object({ schemaVersion: z.literal(1), registrationId: id }).strict(),
@@ -196,13 +199,20 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
     }
 
     const routes: Record<string, (req: IncomingMessage, url: URL) => Promise<unknown>> = {
+        'GET /v1/sessions': async (req) => {
+            assertDaemon(req)
+            return exclusive(async () => Object.entries(registry.registrations).map(([registrationId, registration]) => ({
+                registrationId, agentSessionId: registration.agentSessionId, owner: registration.owner,
+                createdAtMs: registration.createdAtMs, revoking: registration.revoking === true,
+            })))
+        },
         'POST /v1/sessions/register': async (req) => {
             assertDaemon(req)
-            parse(schemas.register, await readJson(req))
+            const body = parse(schemas.register, await readJson(req))
             return exclusive(async () => {
                 const registrationId = `reg-${randomUUID()}`
                 const sessionSecret = randomBytes(32).toString('base64url')
-                registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [] }
+                registry.registrations[registrationId] = { secretSha256: sha256(sessionSecret).toString('hex'), createdAtMs: now(), grantIds: [], ...(body.owner ? { owner: body.owner } : {}) }
                 await persist()
                 return { registrationId, sessionSecret }
             })
@@ -213,10 +223,11 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             return exclusive(async () => {
                 const registration = registry.registrations[body.registrationId]
                 if (!registration || registration.revoking) throw new BrowserRuntimeError('SCOPE_DENIED', 'unknown registration')
-                if (registration.agentSessionId === body.agentSessionId) return { bound: true }
                 const other = findByAgentSession(body.agentSessionId)
-                if (registration.agentSessionId || other) throw new BrowserRuntimeError('CONFLICT', 'registration or session is already bound')
+                if ((registration.agentSessionId && registration.agentSessionId !== body.agentSessionId)
+                    || (other && other[0] !== body.registrationId)) throw new BrowserRuntimeError('CONFLICT', 'registration or session is already bound')
                 registration.agentSessionId = body.agentSessionId
+                if (body.owner) registration.owner = body.owner
                 await persist()
                 return { bound: true }
             })

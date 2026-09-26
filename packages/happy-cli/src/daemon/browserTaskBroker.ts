@@ -6,8 +6,9 @@
  * daemon registers each spawned session with the Runtime broker, hands the
  * session process its per-session secret through the spawn environment,
  * binds the registration once the session reports its Happy session id, and
- * revokes it when the session ends. A failed registration only means the
- * session has no browser grant; it never blocks the spawn.
+ * revokes it when the session ends. Startup and periodic reconciliation also
+ * revoke registrations whose Linux owner process is provably dead. A failed
+ * registration only means the session has no browser grant; it never blocks the spawn.
  *
  * A revocation the Runtime has not confirmed is kept in a file and retried
  * with exponential backoff (at most 5 minutes apart), across daemon restarts,
@@ -23,6 +24,8 @@ import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, write
 import { basename, dirname, join } from 'node:path'
 import { brokerRequest } from '@/browserRuntime/brokerGrantSource'
 import { logger } from '@/ui/logger'
+import { sessionRegistrationsSchema, type SessionOwner } from '@/browserRuntime/sessionRegistration'
+import { readBrowserTaskBootId, readBrowserTaskPidStartTime, readBrowserTaskSessionOwner } from './browserTaskSessionOwner'
 
 const DEFAULT_DAEMON_TOKEN_FILE = '/var/lib/abp/daemon-token'
 const MAX_RETRY_DELAY_MS = 5 * 60_000
@@ -31,7 +34,9 @@ type RevokeTarget = { registrationId: string } | { agentSessionId: string }
 
 export interface BrowserTaskSessionBroker {
     register(): Promise<{ registrationId: string; sessionSecret: string } | undefined>
-    bind(registrationId: string, agentSessionId: string): Promise<boolean>
+    bind(registrationId: string, agentSessionId: string, pid?: number): Promise<boolean>
+    /** Revoke only registrations with a provably dead Linux host process owner. */
+    reconcile(): Promise<void>
     /** Tries once now; an unconfirmed revocation stays pending and is retried. */
     revoke(target: RevokeTarget): Promise<void>
     /** Retries every pending revocation once; resolves to how many remain. */
@@ -39,6 +44,8 @@ export interface BrowserTaskSessionBroker {
 }
 
 export interface BrowserTaskSessionBrokerOptions {
+    /** Linux procfs on the execution host; overridable for filesystem fixtures. */
+    procRoot?: string
     /** Pending revocations survive daemon restarts here (the daemon's home dir). */
     pendingRevocationsFile?: string
     /** First retry delay; doubles per failed round up to 5 minutes. */
@@ -186,15 +193,48 @@ export function createBrowserTaskSessionBroker(
     }
     scheduleRetry()
 
-    return {
+    const broker: BrowserTaskSessionBroker = {
         async register() {
             const result = await call('/v1/sessions/register', {})
             return typeof result?.registrationId === 'string' && typeof result.sessionSecret === 'string'
                 ? { registrationId: result.registrationId, sessionSecret: result.sessionSecret }
                 : undefined
         },
-        async bind(registrationId, agentSessionId) {
-            return Boolean(await call('/v1/sessions/bind', { registrationId, agentSessionId }))
+        async bind(registrationId, agentSessionId, pid) {
+            let owner: SessionOwner | undefined
+            if (pid !== undefined) {
+                try {
+                    owner = await readBrowserTaskSessionOwner(pid, options.procRoot)
+                } catch (error) {
+                    logger.debug(`[DAEMON RUN] Browser task session owner unavailable: ${error instanceof Error ? error.message : 'unknown'}`)
+                }
+            }
+            return Boolean(await call('/v1/sessions/bind', { registrationId, agentSessionId, ...(owner ? { owner } : {}) }))
+        },
+        async reconcile() {
+            try {
+                const reply = await request(socketPath, 'GET', '/v1/sessions', headers)
+                if (reply.status !== 200 || !reply.body.ok) {
+                    logger.debug(`[DAEMON RUN] Browser task reconciliation list failed status=${reply.status}; retrying next tick`)
+                    return
+                }
+                const registrations = sessionRegistrationsSchema.parse(reply.body.result)
+                if (!registrations.some((registration) => registration.owner)) return
+                const bootId = await readBrowserTaskBootId(options.procRoot)
+                for (const registration of registrations) {
+                    const { owner } = registration
+                    if (!owner) continue
+                    try {
+                        if (owner.bootId !== bootId || await readBrowserTaskPidStartTime(owner.pid, options.procRoot) !== owner.pidStartTime) {
+                            await broker.revoke({ registrationId: registration.registrationId })
+                        }
+                    } catch (error) {
+                        logger.debug(`[DAEMON RUN] Browser task reconciliation failed registration=${registration.registrationId}: ${error instanceof Error ? error.message : 'unknown'}; retrying next tick`)
+                    }
+                }
+            } catch (error) {
+                logger.debug(`[DAEMON RUN] Browser task reconciliation unavailable: ${error instanceof Error ? error.message : 'unknown'}; retrying next tick`)
+            }
         },
         async revoke(target) {
             let saved = !queueDirty
@@ -210,4 +250,26 @@ export function createBrowserTaskSessionBroker(
         },
         retryPendingRevocations,
     }
+    return broker
+}
+
+/** Start immediately and avoid overlapping sweeps; stopping never revokes surviving sessions. */
+export function startBrowserTaskReconciliation(broker: BrowserTaskSessionBroker | undefined, intervalMs = 60_000): () => void {
+    if (!broker) return () => {}
+    let running = false
+    const tick = async (): Promise<void> => {
+        if (running) return
+        running = true
+        try {
+            await broker.reconcile()
+        } catch (error) {
+            logger.debug(`[DAEMON RUN] Browser task reconciliation failed: ${error instanceof Error ? error.message : 'unknown'}`)
+        } finally {
+            running = false
+        }
+    }
+    void tick()
+    const timer = setInterval(() => void tick(), intervalMs)
+    timer.unref()
+    return () => clearInterval(timer)
 }
