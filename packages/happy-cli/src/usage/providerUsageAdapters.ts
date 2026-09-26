@@ -3,7 +3,11 @@ import {
     type AiAuthReportV1,
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
-import { readAiAuthConnectionVersion, resolveAppliedAiAuthSource } from './aiAuthSource';
+import {
+    HAPPY_AI_AUTH_OBSERVED_SOURCE_ENV,
+    readAiAuthConnectionVersion,
+    resolveAppliedAiAuthSource,
+} from './aiAuthSource';
 
 type ClaudeUsage = {
     input_tokens: number;
@@ -44,6 +48,13 @@ type UsageEventEnvironment = Record<string, string | undefined>;
  */
 function aiAuthReport(env: UsageEventEnvironment): AiAuthReportV1 | undefined {
     const appliedSource = resolveAppliedAiAuthSource({ env });
+    // A confirmed source always wins. Only when the daemon confirmed nothing does
+    // the spawn-time observation speak, and it only ever says org-bundle — any
+    // other value on that channel is a leftover or a forgery, not an answer.
+    // An observation never carries a connection version.
+    if (appliedSource === 'unknown' && env[HAPPY_AI_AUTH_OBSERVED_SOURCE_ENV] === 'org-bundle') {
+        return { appliedSource: 'org-bundle', connectionVersion: null };
+    }
     const connectionVersion = readAiAuthConnectionVersion(env);
     if (appliedSource === 'unknown' && connectionVersion === null) return undefined;
     return { appliedSource, connectionVersion };

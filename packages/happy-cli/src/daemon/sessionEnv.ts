@@ -29,11 +29,13 @@ import {
 } from '@/checkpoint/checkpointSpawnContext'
 import {
     HAPPY_AI_AUTH_CONNECTION_VERSION_ENV,
+    HAPPY_AI_AUTH_OBSERVED_SOURCE_ENV,
     HAPPY_AI_AUTH_SOURCE_ENV,
     normalizeAiAuthSource,
     resolveAppliedAiAuthSource,
     type AiAuthSource,
 } from '@/usage/aiAuthSource'
+import type { ObservedAiAuthSource } from './aiAuthObservation'
 import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
@@ -251,6 +253,11 @@ export function applyAppliedAiAuthSourceEnv(
      * same Z.AI variables, so the environment alone never proves ownership.
      */
     platformLeaseApplied = false,
+    /**
+     * The spawn-time observation (aiAuthObservation.ts). Written to its own key
+     * so the selection check, which reads HAPPY_AI_AUTH_SOURCE, never sees it.
+     */
+    observedSource: ObservedAiAuthSource = 'unknown',
 ): Record<string, string> {
     /*
      * The version is **written empty, not omitted**.
@@ -268,6 +275,8 @@ export function applyAppliedAiAuthSourceEnv(
         ...env,
         [HAPPY_AI_AUTH_SOURCE_ENV]: resolveAppliedAiAuthSource({ env, platformLeaseApplied }),
         [HAPPY_AI_AUTH_CONNECTION_VERSION_ENV]: '',
+        // Empty, never omitted — same reason as the connection version above.
+        [HAPPY_AI_AUTH_OBSERVED_SOURCE_ENV]: observedSource === 'org-bundle' ? 'org-bundle' : '',
     }
 }
 
