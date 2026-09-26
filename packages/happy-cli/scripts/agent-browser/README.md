@@ -190,8 +190,10 @@ batch or request on a kept-alive connection gets in) and **verify** it: the rule
 must answer and reach 0 `running`/`recovering` tasks within 60 s. A fence that cannot be
 verified, metrics that do not answer, or a drain timeout **abort** the operation: the fence is
 lifted, nothing is stopped or changed, history records `aborted` with the reason (retry later,
-or use `emergency-stop`). A Runtime that is not running is recorded as `runtime-not-running`
-and needs no fence. Then, on a running stack, **only the containers whose image digest changes
+or use `emergency-stop`). A Runtime that is not running (Docker reports it stopped, or "no such
+object") is recorded as `runtime-not-running` and needs no fence; a state Docker cannot report
+(daemon unreachable, permission, unexpected output) aborts the operation, and after a stop such
+a container is not counted as stopped. Then, on a running stack, **only the containers whose image digest changes
 are replaced** (a time-limited `/run/abp-stack-maintenance` flag keeps the supervisor from
 restarting them meanwhile):
 
