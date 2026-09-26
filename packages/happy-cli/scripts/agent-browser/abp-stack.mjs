@@ -280,6 +280,17 @@ export function createStack(deps) {
     if (!ready.ok) throw new Error("the restarted Runtime is not ready (abp-stack status)");
   }
 
+  function createAndStartBrowser(plan, browser, image) {
+    docker(browserCreateArgs(plan, browser, image));
+    docker(["start", browser.container]);
+  }
+
+  function createAndStartRuntime(plan, image) {
+    docker(runtimeCreateArgs(plan, image));
+    for (const { network, ip } of plan.runtime.attach) docker(["network", "connect", `--alias=${plan.runtime.alias}`, `--ip=${ip}`, network, plan.runtime.container]);
+    docker(["start", plan.runtime.container]);
+  }
+
   /** Stops the stack (the service fences, drains and stops), verifies it, switches digests, starts, waits for /v1/ready. */
   async function switchTo(target, previous, action, readyTimeoutMs, quiesced) {
     const before = readState();
@@ -317,13 +328,8 @@ export function createStack(deps) {
       for (const volume of plan.volumes) {
         if (docker(["volume", "inspect", volume], { allowFail: true }).status !== 0) docker(["volume", "create", `--label=${STACK_LABEL}`, volume]);
       }
-      for (const browser of plan.browsers) {
-        docker(browserCreateArgs(plan, browser, state.current.browser));
-        docker(["start", browser.container]);
-      }
-      docker(runtimeCreateArgs(plan, state.current.runtime));
-      for (const { network, ip } of plan.runtime.attach) docker(["network", "connect", `--alias=${plan.runtime.alias}`, `--ip=${ip}`, network, plan.runtime.container]);
-      docker(["start", plan.runtime.container]);
+      for (const browser of plan.browsers) createAndStartBrowser(plan, browser, state.current.browser);
+      createAndStartRuntime(plan, state.current.runtime);
       unfence();
       lastEgressCheckMs = deps.now();
       deps.log(`started runtime=${state.current.runtime} browser=${state.current.browser} profiles=${plan.browsers.length}`);
