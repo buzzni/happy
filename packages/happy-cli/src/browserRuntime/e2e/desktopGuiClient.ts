@@ -37,7 +37,7 @@ export class DesktopGui {
     static async connect(timeoutMs = 180_000): Promise<DesktopGui> {
         for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(1_000)) {
             const targets = await fetch(`http://127.0.0.1:${cdpPort()}/json/list`).then((r) => r.json() as Promise<Array<{ type: string; url: string; webSocketDebuggerUrl: string }>>).catch(() => [])
-            const page = targets.find((target) => target.type === 'page' && target.url.startsWith('http://localhost:'))
+            const page = targets.find((target) => target.type === 'page' && /^http:\/\/(localhost|127\.0\.0\.1):/.test(target.url))
             if (!page) continue
             const ws = new WebSocket(page.webSocketDebuggerUrl)
             await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject })
@@ -207,6 +207,9 @@ export function launchDesktop(logFile: string, options: { proxyPort?: number } =
     for (const key of ['SAYCODE_AGENT_ENV', 'SAYCODE_AGENT_ROOT', 'HAPPY_HOME_DIR', 'ELECTRON_RUN_AS_NODE']) delete env[key]
     if (process.env.ABP_DESKTOP_USER_DATA_DIR) env.APLUS_DESKTOP_USER_DATA_DIR = process.env.ABP_DESKTOP_USER_DATA_DIR
     const extra = options.proxyPort ? ['--', `--proxy-server=http://127.0.0.1:${options.proxyPort}`] : []
-    const child = spawn('npx', ['electron-vite', 'dev', '--remoteDebuggingPort', String(cdpPort()), ...extra], { cwd: desktopDir(), env, detached: true, stdio: ['ignore', out, out] })
+    // ABP_DESKTOP_VITE_CONFIG pins the renderer dev server (another project's dev server on the same
+    // default port would otherwise be loaded into this window).
+    const config = process.env.ABP_DESKTOP_VITE_CONFIG ? ['-c', process.env.ABP_DESKTOP_VITE_CONFIG] : []
+    const child = spawn('npx', ['electron-vite', 'dev', ...config, '--remoteDebuggingPort', String(cdpPort()), ...extra], { cwd: desktopDir(), env, detached: true, stdio: ['ignore', out, out] })
     child.unref()
 }
