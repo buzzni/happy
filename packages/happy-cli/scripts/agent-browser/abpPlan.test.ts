@@ -236,6 +236,9 @@ describe('browser networks and egress firewall', () => {
         const deny = chain.findIndex((rule: string) => rule.includes('--match-set abp-deny4 dst -j REJECT'))
         expect(allow).toBeGreaterThanOrEqual(0)
         expect(allow).toBeLessThan(deny)
+        // The fixture's replies to the browser come back through the same bridge chain.
+        const browser = stackLayout(withTest).browsers[0].browserIp
+        expect(chain).toContain(`-s 10.20.30.40/32 -d ${browser}/32 -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j RETURN`)
         expect(() => mergeInstallOptions(base(), { testAllowCidrs: ['0.0.0.0/0'] })).toThrow(/testAllowCidrs/)
     })
 
