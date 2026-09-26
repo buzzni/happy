@@ -57,6 +57,8 @@ export interface CdpDriverOptions {
         discardCloseFails?: () => boolean
         /** Fault injection: make a guard command (Fetch.enable, Target.setAutoAttach) fail for a descendant. depth: popup generation */
         guardFailure?: (kind: GuardedKind, method: string, depth: number) => boolean
+        /** Simulates a page guard whose verdicts never arrive. */
+        dropGuardReports?: () => boolean
     }
 }
 
@@ -101,7 +103,7 @@ const FETCH_PATTERNS = ['Document', 'XHR', 'Fetch', 'Ping', 'EventSource', 'Othe
     .map((resourceType) => ({ urlPattern: '*', resourceType, requestStage: 'Request' }))
 /** How long a click's submission guard stays armed. */
 const SUBMIT_GUARD_MS = 10_000
-/** A document request waits this long for the guard's verdict when it has not arrived yet. */
+/** Once a submission is under way, how long the click waits for the request check's verdict. */
 const GUARD_VERDICT_MS = 1_500
 const GUARD_BINDING = '__abpGuardReport'
 /** After the click, how long to wait for a verdict of a submission the click may have started. */
@@ -882,7 +884,12 @@ export class CdpDriver implements BrowserDriver {
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
             // A submission's verdict: the page's (at submit/formdata) and then the request check's.
             const guard = live?.form ? tab.submitGuard : undefined
-            if (guard && await this.submitGuardStatus(guard, GUARD_SETTLE_MS) !== 'blocked') await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['submitted', 'submitting'])
+            if (guard) {
+                // Any sign of a submission (a page report, or the request itself), then — if one is
+                // under way — the request check's verdict. Page reports may be suppressed or lost.
+                await this.submitGuardStatus(guard, GUARD_SETTLE_MS, ['armed'])
+                await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['submitted', 'submitting'])
+            }
             if (guard?.lastStatus === 'blocked') {
                 throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
             }
@@ -1260,14 +1267,18 @@ export class CdpDriver implements BrowserDriver {
             // A popup closed over the cap may still have its first request paused in the opener's session.
             const closedPopup = this.popups.get(params.frameId)?.closed === true
             if (tab && !closedPopup && this.destinationAllowed(params.request.url, tab.allowedOrigins)) {
-                void this.submissionAllowed(tab, params).catch(() => false).then((allowed) => {
-                    if (allowed) {
-                        conn.send('Fetch.continueRequest', { requestId: params.requestId }, sessionId).catch(() => undefined)
-                        return
-                    }
-                    conn.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => undefined)
-                    this.onBlocked(conn, tab, sessionId, params)
-                })
+                let allowed = false
+                try {
+                    allowed = this.submissionAllowed(tab, params)
+                } catch {
+                    allowed = false
+                }
+                if (allowed) {
+                    conn.send('Fetch.continueRequest', { requestId: params.requestId }, sessionId).catch(() => undefined)
+                    return
+                }
+                conn.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => undefined)
+                this.onBlocked(conn, tab, sessionId, params)
                 return
             }
             conn.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => undefined)
@@ -1635,32 +1646,31 @@ export class CdpDriver implements BrowserDriver {
     }
 
     private onGuardReport(sessionId: string, status: string): void {
+        if (this.options.testHooks?.dropGuardReports?.()) return
         const tab = this.sessions.get(sessionId)?.tab
         const guard = tab?.submitGuard
-        if (!guard || guard.sessionId !== sessionId || guard.lastStatus === 'blocked') return
+        // The request check's verdict is final; late page reports cannot undo it.
+        if (!guard || guard.sessionId !== sessionId || ['blocked', 'sent'].includes(guard.lastStatus)) return
         this.settleGuard(guard, status)
     }
 
     /**
-     * While a submission guard is armed, a document request of the tab is checked before
-     * it is sent: refused when the guard blocked. A request of the guarded form's frame (or
-     * the new browsing context it targets) that follows the form's formdata event is the
-     * submission itself: its final method, URL with query and body must be exactly the
-     * approved submission (every page handler has run by now), else it is not sent.
+     * While a submission guard is armed (after a dispatch on a form element), the
+     * submission candidate — the next document request of the form's frame, or of any
+     * frame/popup of the tab when the form targets another browsing context — is judged
+     * on the request itself: its method, URL with query and body must be exactly the
+     * approved submission. The page's own events only ever tighten this (a 'blocked'
+     * report rejects); a page that suppresses them, or reports that never arrive,
+     * change nothing. Anything else — including a navigation the page substitutes, or a
+     * request that cannot be verified — is not sent.
      */
-    private async submissionAllowed(tab: TabState, params: any): Promise<boolean> {
+    private submissionAllowed(tab: TabState, params: any): boolean {
         const guard = tab.submitGuard
         if (!guard || params.resourceType !== 'Document' || Date.now() > guard.untilMs) return true
-        const newContext = !['', '_self'].includes(guard.expected.target)
-        const fromForm = params.frameId === guard.frameId || (newContext && this.popupTabs.has(params.frameId))
-        if (!fromForm) return guard.lastStatus !== 'blocked'
-        // The page's formdata report precedes the request, but not necessarily in CDP event order.
-        const status = await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['armed', 'submitted'])
-        if (status === 'blocked') return false
-        // No formdata event: not this form's submission (e.g. the page cancelled it and navigated itself).
-        if (status !== 'submitting') return true
+        const selfTarget = ['', '_self'].includes(guard.expected.target)
+        if (selfTarget && params.frameId !== guard.frameId) return guard.lastStatus !== 'blocked'
         tab.submitGuard = undefined
-        const verdict = verifySubmissionRequest(guard.expected, params.request)
+        const verdict = guard.lastStatus === 'blocked' ? 'mismatch' : verifySubmissionRequest(guard.expected, params.request)
         this.settleGuard(guard, verdict === 'match' ? 'sent' : 'blocked')
         return verdict === 'match'
     }

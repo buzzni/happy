@@ -257,17 +257,19 @@ still allowed). Fault-injection hook: `testHooks.guardFailure`.
   which re-checks it after the hover and arms a one-shot in-page guard: a capturing `submit`
   listener recomputes the submission and cancels a changed one; a `formdata` listener compares the
   final entries and destination. Verdicts reach the driver through an isolated-world binding
-  (Runtime domain on only while armed). The request the form produces is then verified at
-  interception time, after every page handler ran (integration review P0-1): method, URL with query
-  and body (urlencoded, multipart, text/plain) must equal the approved submission
-  (`drivers/submissionCheck.ts`), else it is not sent; what cannot be verified is not sent either.
+  (Runtime domain on only while armed). Independently of those page events (which a page can
+  suppress), the submission candidate — the next document request of the form's frame, or of any
+  frame/popup of the tab when the form targets another context — is verified at interception time,
+  after every page handler ran (reviews P0-1, A1): method, URL with query and body (urlencoded,
+  multipart, text/plain) must equal the approved submission (`drivers/submissionCheck.ts`), else it
+  is not sent; a substituted navigation or an unverifiable request is not sent either.
 - Driver checks right before input: same-node relabel → `STALE_REF`; for elements in iframes
   every ancestor document must hit the iframe element at the click point. A transformed or
   zoomed iframe (or ancestor) is not guessed: handed to the user (review P0-7).
 - Limits: purely visual relabels (CSS `content`, images, canvas); JS that sends data itself
-  (e.g. `fetch` in a click handler) to an allowed origin; a submission the page cancels and
-  replaces with its own navigation is only destination-checked; step payload hashes in the journal
-  are unkeyed.
+  (e.g. `fetch` in a click handler) to an allowed origin; a JS navigation of the form's frame right
+  after a click on a form element is refused as a non-matching submission (conservative); step
+  payload hashes in the journal are unkeyed.
 
 ### Site policy (D7)
 
