@@ -293,7 +293,9 @@ export function egressRules(layout, install) {
     for (const dns of install.browserDns) {
       chain.push(`-s ${b} -d ${dns}/32 -p udp -m udp --dport 53 -j RETURN`, `-s ${b} -d ${dns}/32 -p tcp -m tcp --dport 53 -j RETURN`);
     }
-    for (const cidr of install.testAllowCidrs ?? []) chain.push(`-s ${b} -d ${cidr} -j RETURN`);
+    for (const cidr of install.testAllowCidrs ?? []) {
+      chain.push(`-s ${b} -d ${cidr} -j RETURN`, `-s ${cidr} -d ${b} -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j RETURN`);
+    }
     chain.push(`-s ${b} -m set --match-set abp-deny4 dst -j REJECT`, `-s ${b} -j RETURN`);
   }
   chain.push("-j REJECT");

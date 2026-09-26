@@ -40,7 +40,12 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 ops.push({ op: m[1], bearer: String(req.headers.authorization ?? '').replace(/^Bearer /, ''), body: JSON.parse(raw || '{}') })
                 const result = m[1] === 'listTasks'
                     ? { tasks: [{ taskId: 'task-1', status: 'paused', pauseReason: 'awaiting-user', tabs: ['tab-1'], updatedAtMs: Date.now() }] }
-                    : {}
+                    : m[1] === 'getTask'
+                        ? { taskId: 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
+                            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'none' } }, { tabId: 'tab-2', leaseEpoch: 2, owner: { kind: 'none' } }] }
+                        : m[1] === 'subscribe'
+                            ? { kind: 'events', events: [{ seq: 1, type: 'state-changed', leaseEpoch: 11, data: {} }] }
+                            : m[1] === 'viewerTicket' ? { ticket: `ticket-${ops.filter((entry) => entry.op === 'viewerTicket').length}`, expiresAtMs: Date.now() + 30_000 } : {}
                 res.writeHead(200, { 'content-type': 'application/json' })
                 res.end(JSON.stringify({ ok: true, result }))
             })
@@ -92,6 +97,44 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         expect((await eventually(() => ops.find((entry) => entry.op === 'listTasks'), Boolean, 5_000))?.bearer).toBe(renewed)
         await harness.closeTarget(target)
     }, 40_000)
+
+    it('asks its host for a capability right away when loaded without one (reload, restore)', async () => {
+        ops.length = 0
+        const target = await harness.openFrontTab(`${origin}/console`)
+        await harness.evaluate(target, `window.__requests = 0; window.addEventListener('message', (e) => { if (e.data && e.data.type === 'abp-capability-request') window.__requests++ })`)
+        expect(await eventually(() => harness.evaluate(target, 'window.__requests'), (count) => count >= 1, 15_000)).toBeGreaterThanOrEqual(1)
+        const cap = token('boot', Date.now() + 600_000)
+        await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(cap)}, expiresAtMs: Date.now() + 600_000 }, location.origin)`)
+        expect((await eventually(() => ops.find((entry) => entry.op === 'listTasks'), Boolean, 5_000))?.bearer).toBe(cap)
+        await harness.closeTarget(target)
+    }, 30_000)
+
+    it("takes over with the selected tab's own lease epoch", async () => {
+        ops.length = 0
+        const cap = token('epoch', Date.now() + 600_000)
+        const target = await harness.openFrontTab(`${origin}/console#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+        await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+        await harness.evaluate(target, `document.getElementById('taskId').value = 'task-1'; document.getElementById('connect').click()`)
+        await eventually(() => ops.some((entry) => entry.op === 'subscribe'), Boolean, 5_000)
+        await harness.evaluate(target, `document.getElementById('tabId').value = 'tab-2'; document.getElementById('takeOver').click()`)
+        expect((await eventually(() => ops.find((entry) => entry.op === 'takeOver'), Boolean, 5_000))?.body).toMatchObject({ tabId: 'tab-2', expectedEpoch: 2 })
+        await harness.closeTarget(target)
+    }, 30_000)
+
+    it('reconnects an open screen with a fresh ticket when the capability is renewed', async () => {
+        ops.length = 0
+        const cap = token('screen-renew', Date.now() + 600_000)
+        const target = await harness.openFrontTab(`${origin}/console#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+        await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+        await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+        await eventually(() => ops.filter((entry) => entry.op === 'viewerTicket').length === 1, Boolean, 5_000)
+        const renewed = token('screen-renew-2', Date.now() + 900_000)
+        await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(renewed)}, expiresAtMs: Date.now() + 900_000 }, location.origin)`)
+        const second = await eventually(() => ops.filter((entry) => entry.op === 'viewerTicket')[1], Boolean, 5_000)
+        expect(second?.bearer).toBe(renewed)
+        expect(await harness.evaluate(target, `document.getElementById('screen').src`)).toContain(encodeURIComponent('ticket=ticket-2'))
+        await harness.closeTarget(target)
+    }, 30_000)
 
     it('opens the screen through a one-time viewer ticket for the capability profile', async () => {
         ops.length = 0

@@ -11,8 +11,12 @@
  * until answered) and accepts `{ type: 'abp-capability', token, expiresAtMs }`
  * only from `window.parent` on its own origin. Desktop hosts the page in a
  * `<webview>` without preload, so `window.parent === window` and the answer is
- * posted into the page by the host. Without a fragment (harness) the token can be
- * pasted, still kept in memory only.
+ * posted into the page by the host. A load without a fragment (reload, back
+ * navigation, restored panel) asks the host at once and every 10 s until answered;
+ * in the harness the token can also be pasted, still kept in memory only. An open
+ * screen is reconnected with a fresh ticket after each renewal (a viewer connection
+ * ends with the capability it was ticketed with). Take over/release use the selected
+ * tab's own lease epoch from getTask().tabLeases.
  */
 export function renderConsolePage(): string {
     return `<!doctype html>
@@ -45,23 +49,24 @@ section{border:1px solid var(--line);padding:10px;margin:10px 0}pre{white-space:
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
-var S={cursor:0,seen:{},task:null,leaseEpoch:0,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0};
+var S={cursor:0,seen:{},task:null,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false};
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000;
 function rid(){return (crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random())}
 function decodePart(p){try{return JSON.parse(atob(p.replace(/-/g,'+').replace(/_/g,'/')))}catch(e){return null}}
-function setCapability(token,expiresAtMs){
+function askHost(){clearTimeout(S.renewTimer);window.parent.postMessage({type:'abp-capability-request'},location.origin);S.renewTimer=setTimeout(askHost,RENEW_RETRY_MS)}
+function setCapability(token,expiresAtMs){var renewal=!!S.token;
  var parts=String(token||'').split('.');var payload=parts.length>=3?decodePart(parts[parts.length===4?2:1]):null;
  if(!payload||typeof payload.profileId!=='string'){$('capState').textContent='capability is not readable';return false}
  S.token=token;S.profileId=payload.profileId;S.expiresAtMs=Number(expiresAtMs)||Number(payload.expiresAtMs)||0;
  $('capState').textContent='profile '+S.profileId+(S.expiresAtMs?' · expires '+new Date(S.expiresAtMs).toLocaleTimeString():'');
- scheduleRenewal();return true}
+ scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
 function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
  var wait=Math.max(0,S.expiresAtMs-RENEW_BEFORE_MS-Date.now());
- S.renewTimer=setTimeout(function ask(){window.parent.postMessage({type:'abp-capability-request'},location.origin);S.renewTimer=setTimeout(ask,RENEW_RETRY_MS)},wait)}
+ S.renewTimer=setTimeout(askHost,wait)}
 window.addEventListener('message',function(event){
  if(event.source!==window.parent||event.origin!==location.origin)return;
  var d=event.data;if(!d||d.type!=='abp-capability'||typeof d.token!=='string'||typeof d.expiresAtMs!=='number')return;
- setCapability(d.token,d.expiresAtMs)});
+ var first=!S.token;if(setCapability(d.token,d.expiresAtMs)&&first)listTasks()});
 (function readFragment(){var h=location.hash.replace(/^#/,'');if(!h)return;var q=new URLSearchParams(h);
  var token=q.get('abp-cap');if(token)setCapability(token,Number(q.get('abp-exp')));
  history.replaceState(null,'',location.pathname+location.search)})();
@@ -77,7 +82,9 @@ function listTasks(){if(!S.token)return;$('tasks').textContent='loading';
    b.textContent=t.taskId+' · '+t.status+(t.pauseReason?'/'+t.pauseReason:'')+(t.pendingApproval?' · approval':'')+' · '+new Date(t.updatedAtMs).toLocaleTimeString();
    b.onclick=function(){$('taskId').value=t.taskId;$('tabId').value=(t.tabs&&t.tabs[0])||'';watch()};box.appendChild(b)})
  },function(e){$('tasks').textContent=e.message;$('tasks').className='warn'})}
-function addEvent(e){if(S.seen[e.seq])return;S.seen[e.seq]=1;if(e.seq>S.cursor)S.cursor=e.seq;if(typeof e.leaseEpoch==='number')S.leaseEpoch=Math.max(S.leaseEpoch,e.leaseEpoch);
+/** The Runtime checks the selected tab's own lease epoch, not a global maximum. */
+function tabEpoch(){var tab=$('tabId').value.trim();var leases=(S.task&&S.task.tabLeases)||[];for(var i=0;i<leases.length;i++)if(leases[i].tabId===tab)return leases[i].leaseEpoch;return 0}
+function addEvent(e){if(S.seen[e.seq])return;S.seen[e.seq]=1;if(e.seq>S.cursor)S.cursor=e.seq;
  var line=document.createElement('div');line.textContent='#'+e.seq+' '+e.type+' '+JSON.stringify(e.data);$('events').prepend(line)}
 function refresh(){return op('getTask',{taskId:$('taskId').value.trim()}).then(showTask)}
 function loop(gen){if(gen!==S.gen)return;
@@ -89,18 +96,21 @@ function loop(gen){if(gen!==S.gen)return;
 function watch(){S.cursor=0;S.seen={};$('events').textContent='';var gen=++S.gen;refresh().then(function(){loop(gen)},function(e){$('conn').textContent=' '+e.message})}
 $('useToken').onclick=function(){if(setCapability($('token').value.trim()))listTasks();$('token').value=''};
 $('refreshTasks').onclick=listTasks;$('connect').onclick=watch;
-function act(p){$('actionResult').textContent='...';p.then(function(r){$('actionResult').textContent=JSON.stringify(r.status||r.outcome||r.owner||r,null,0);if(r.task)showTask(r.task);if(typeof r.leaseEpoch==='number')S.leaseEpoch=r.leaseEpoch;return refresh()})
- .catch(function(e){$('actionResult').textContent=e.message})}
+function act(p){$('actionResult').textContent='...';p.then(function(r){$('actionResult').textContent=JSON.stringify(r.status||r.outcome||r.owner||r,null,0);if(r.task)showTask(r.task);return refresh()})
+ .catch(function(e){$('actionResult').textContent=e.message;if(e.body&&e.body.code==='STALE_LEASE')refresh()})}
 function decide(d){var a=S.task&&S.task.pendingApproval;if(!a)return;act(op('approve',{taskId:S.task.taskId,approvalId:a.approvalId,bindingHash:a.bindingHash,requestId:rid(),decision:d}))}
 $('approve').onclick=function(){decide('approve')};$('reject').onclick=function(){decide('reject')};
-$('takeOver').onclick=function(){act(op('takeOver',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:S.leaseEpoch,requestId:rid()}))};
-$('release').onclick=function(){act(op('releaseControl',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:S.leaseEpoch,requestId:rid()}))};
+$('takeOver').onclick=function(){act(op('takeOver',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()}))};
+$('release').onclick=function(){act(op('releaseControl',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()}))};
 $('resume').onclick=function(){if(S.task)act(op('resume',{taskId:S.task.taskId,expectedVersion:S.task.stateVersion,requestId:rid()}))};
 $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),requestId:rid()}))};
-$('openScreen').onclick=function(){op('viewerTicket',{profileId:S.profileId}).then(function(r){
+/** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
+function openScreen(){op('viewerTicket',{profileId:S.profileId}).then(function(r){S.screenOpen=true;
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent('v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket));$('screenBox').hidden=false
-},function(e){$('actionResult').textContent=e.message})};
-if(S.token)listTasks();
+},function(e){$('actionResult').textContent=e.message})}
+$('openScreen').onclick=openScreen;
+// Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
+if(S.token)listTasks();else askHost();
 })();
 </script></body></html>`
 }
