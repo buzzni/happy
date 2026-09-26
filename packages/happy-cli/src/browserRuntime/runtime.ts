@@ -313,12 +313,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (this.controllers.get(task.taskId) === controller)
             this.controllers.delete(task.taskId)
-        const space = this.requireSpace(task.taskSpaceId)
-        await this.options.store.updateSpace(task.taskSpaceId, {
+        // Derived from the space as it is inside the store queue: concurrent opens in one space must not drop each other's tabs.
+        await this.options.store.mutateSpace(task.taskSpaceId, (space) => ({
             tabs: [...space.tabs, handle.tabId],
             tabTargets: { ...space.tabTargets, [handle.tabId]: handle.targetId },
             tabLeaseEpochs: { ...space.tabLeaseEpochs, [handle.tabId]: tabEpoch },
-        })
+        }))
         const result = { tabId: handle.tabId, actionId, url: redact(req.url), task: this.view(after) }
         await this.saveTaskRequest(after, auth, req.requestId, { operation: 'openPage', ...req }, result)
         const releasedEpoch = this.leases.release(handle.tabId, task.profileId)
@@ -345,9 +345,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             }
         if (!space.tabs.includes(req.tabId) && space.goneTabs?.includes(req.tabId)) {
             const response = { closed: false }
-            await this.options.store.updateSpace(req.taskSpaceId, {
-                dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closePage', ...req }, response),
-            })
+            await this.options.store.mutateSpace(req.taskSpaceId, (current) => ({
+                dedupe: this.spaceDedupe(current, auth, req.requestId, { operation: 'closePage', ...req }, response),
+            }))
             return response
         }
         if (!space.tabs.includes(req.tabId))
@@ -365,13 +365,16 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (!result.closed)
             return { closed: false }
         const response = { closed: result.closed }
-        const { [req.tabId]: _target, ...tabTargets } = space.tabTargets ?? {}
-        const { [req.tabId]: _epoch, ...tabLeaseEpochs } = space.tabLeaseEpochs ?? {}
-        await this.options.store.updateSpace(req.taskSpaceId, {
-            tabs: space.tabs.filter((tab) => tab !== req.tabId),
-            goneTabs: [...new Set([...(space.goneTabs ?? []), req.tabId])],
-            tabTargets, tabLeaseEpochs,
-            dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closePage', ...req }, response) })
+        await this.options.store.mutateSpace(req.taskSpaceId, (current) => {
+            const { [req.tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [req.tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            return {
+                tabs: current.tabs.filter((tab) => tab !== req.tabId),
+                goneTabs: [...new Set([...(current.goneTabs ?? []), req.tabId])],
+                tabTargets, tabLeaseEpochs,
+                dedupe: this.spaceDedupe(current, auth, req.requestId, { operation: 'closePage', ...req }, response),
+            }
+        })
         return response
     }
     async observe(auth: AuthContext, req: {
@@ -663,8 +666,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (replaced) {
                 const approvals = Object.fromEntries(Object.entries(task.approvals).map(([id, approval]) => [id, { ...approval,
                     state: approval.state === 'pending' ? 'expired' : approval.state }]))
-                const space = this.requireSpace(task.taskSpaceId)
-                await this.options.store.updateSpace(task.taskSpaceId, { tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)) })
+                await this.options.store.mutateSpace(task.taskSpaceId, (space) => ({ tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)) }))
                 await this.commit(task, { status: 'paused', pauseReason: 'browser-replaced', tabs: [], pendingApproval: undefined,
                     approvals, browserInstanceId: currentInstance }, 'recovered', { driver: 'reconnected', browserReplaced: true,
                         attention: 'recovered' })
@@ -1252,14 +1254,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (result.beforeUnloadBlocked || !result.closed)
                 throw new BrowserRuntimeError('CONFLICT', 'A task space tab could not be closed')
             closedTabs.push(tab as TabId)
-            const current = this.requireSpace(req.taskSpaceId)
-            const { [tab]: _target, ...tabTargets } = current.tabTargets ?? {}
-            const { [tab]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
-            await this.options.store.updateSpace(req.taskSpaceId, {
-                tabs: current.tabs.filter((item) => item !== tab),
-                goneTabs: [...new Set([...(current.goneTabs ?? []), tab as TabId])],
-                tabTargets,
-                tabLeaseEpochs,
+            await this.options.store.mutateSpace(req.taskSpaceId, (current) => {
+                const { [tab]: _target, ...tabTargets } = current.tabTargets ?? {}
+                const { [tab]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+                return {
+                    tabs: current.tabs.filter((item) => item !== tab),
+                    goneTabs: [...new Set([...(current.goneTabs ?? []), tab as TabId])],
+                    tabTargets,
+                    tabLeaseEpochs,
+                }
             })
         }
         const response = { closedTabs }
