@@ -54,6 +54,27 @@ describe('admin server', () => {
         expect(log).toEqual(['capability:cap-1', 'grant:g-1'])
     })
 
+    it('lists spaces and closes one for the operator (abp-stack spaces list|close)', async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'abp-admin-')); cleanups.push(() => rm(dir, { recursive: true, force: true }))
+        const closes: string[] = []
+        const socketPath = join(dir, 'admin.sock')
+        const server = await startAdminServer({
+            runtime: { ...fakeRuntime([]),
+                spaceReport: () => [{ taskSpaceId: 'space-1', agentSessionId: 'session-a', tasks: [], tabs: ['tab-1'] }] as never,
+                closeSpaceAsOperator: async (taskSpaceId: string, options?: { force?: boolean }) => {
+                    closes.push(`${taskSpaceId}:${options?.force === true}`)
+                    return { taskSpaceId, reason: 'operator', closed: true, closedTabs: ['tab-1'] } as never
+                } },
+            drivers: new Map(), listen: { socketPath }, metrics: async () => ({}), revokeCapability: async () => undefined,
+        })
+        cleanups.push(() => server.close())
+        expect((await call({ socketPath }, 'GET', '/admin/spaces')).body).toEqual({ ok: true, result: { spaces: [{ taskSpaceId: 'space-1', agentSessionId: 'session-a', tasks: [], tabs: ['tab-1'] }] } })
+        expect((await call({ socketPath }, 'POST', '/admin/close-space', {}, { taskSpaceId: 'space-1' })).body.result).toMatchObject({ closed: true, closedTabs: ['tab-1'] })
+        expect((await call({ socketPath }, 'POST', '/admin/close-space', {}, { taskSpaceId: 'space-1', force: true })).status).toBe(200)
+        expect((await call({ socketPath }, 'POST', '/admin/close-space', {}, {})).status).toBe(500)
+        expect(closes).toEqual(['space-1:false', 'space-1:true'])
+    })
+
     it('keeps the bearer token on the harness TCP listener', async () => {
         const log: string[] = []
         const server = await startAdminServer({

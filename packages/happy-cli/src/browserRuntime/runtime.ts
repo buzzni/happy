@@ -11,7 +11,7 @@ import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
 import { approvalBinding, assertAllowedOrigin, assertSiteAllowed, classifySiteAction, classifyUserWait, loginCompleted, payloadHash, redact, type SitePolicy } from './policy'
-import { TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
+import { RECLAIMING_SPACE_RESERVE, TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
 export interface BrowserRuntimeOptions {
@@ -20,6 +20,40 @@ export interface BrowserRuntimeOptions {
     clock?: RuntimeClock
     /** Site allowlist and action policy (D7). Origins outside it cannot be opened, whatever a grant allows. */
     sites: SitePolicy[]
+    /** Open spaces per profile (runtime.json; the PoC limit without configuration). */
+    maxSpacesPerProfile?: number
+    /** Close spaces whose tasks are all finished after this long without activity; off when absent. */
+    spaceIdleReclaimMs?: number
+}
+/** What one reclamation pass did (or could not do) for a space. */
+export interface SpaceReclaimReport {
+    taskSpaceId: TaskSpaceId
+    reason: NonNullable<SpaceRecord['reclaimReason']>
+    closed: boolean
+    closedTabs: TabId[]
+    /** beforeunload kept these open; retried on the next pass. */
+    blockedTabs?: TabId[]
+    /** A user holds these, or the browser could not close them; retried. */
+    failedTabs?: TabId[]
+    /** Tasks with an unknown write outcome, kept (paused) for the user. */
+    retained?: TaskId[]
+    /** Cancelled tasks whose batch has not stopped yet. */
+    waiting?: TaskId[]
+}
+/** One space as the operator sees it (admin socket). */
+export interface SpaceSummary {
+    taskSpaceId: TaskSpaceId
+    profileId: ProfileId
+    agentSessionId?: string
+    createdAtMs: number
+    ageMs: number
+    closed: boolean
+    /** Counts against maxSpacesPerProfile (see RECLAIMING_SPACE_RESERVE for reclaiming ones). */
+    counted: boolean
+    reclaimReason?: SpaceRecord['reclaimReason']
+    reclaimBlockedTabs?: TabId[]
+    tabs: TabId[]
+    tasks: Array<{ taskId: TaskId; agentSessionId: string; status: TaskView['status']; pauseReason?: string; uncertainActions: number; updatedAtMs: number }>
 }
 type DriverWithAction = BrowserDriver & {
     armAction?: (actionId: string) => void
@@ -109,7 +143,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.options.store.createSpace({ taskSpaceId, profileId: req.profileId, createdAtMs: this.clock.now(), tabs: [],
             tabTargets: {}, tabLeaseEpochs: {},
             owner: identity(auth), requestKey: requestKeyValue, requestHash: payloadHash({ operation: 'createSpace', ...req }),
-                dedupe: {} })
+                dedupe: {}, ...(auth.credential.kind === 'agent-grant' ? { agentSessionId: auth.credential.agentSessionId } : {}) },
+            this.options.maxSpacesPerProfile)
         return { taskSpaceId }
     }
     private async createTaskImpl(auth: AuthContext, req: {
@@ -126,6 +161,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 throw new BrowserRuntimeError('CONFLICT', 'requestId payload differs')
             return this.view(duplicate.result as StoredTask)
         }
+        this.assertSpaceOpen(space)
         const now = this.clock.now()
         const taskId = `task-${randomUUID()}` as TaskId
         const credential = auth.credential as AgentGrant
@@ -160,6 +196,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 url: string
                 task: TaskView
             }
+        this.assertSpaceOpen(this.requireSpace(task.taskSpaceId))
         this.assertCanStart(task)
         if (this.clock.now() - task.createdAtMs >= POC_LIMITS.taskTimeLimitMs) {
             await this.commit(task, { status: 'paused', pauseReason: 'task-time-limit' }, 'state-changed',
@@ -711,30 +748,203 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     /**
      * Retention (retentionDays): deletes terminal tasks whose last change is older than
-     * `retentionMs` (TaskStore.purgeExpiredTasks) and what the Runtime keeps in memory for them.
+     * `retentionMs` and what the Runtime keeps in memory for them. Their still-open browser
+     * tabs are closed first and only then dropped from the space; a task whose tab cannot be
+     * closed (browser unreachable, beforeunload, user holding it) keeps all its state and is
+     * retried on the next run, also after a restart.
      */
     async purgeExpiredTasks(retentionMs: number): Promise<TaskId[]> {
         await this.recovery
-        const known = new Map(this.options.store.listTasks().map((task) => [task.taskId, task]))
-        const purged = await this.options.store.purgeExpiredTasks(this.clock.now(), retentionMs)
-        for (const taskId of purged) {
-            const task = known.get(taskId)
-            this.controllers.delete(taskId)
-            this.workers.delete(taskId)
-            this.inFlightDriverCalls.delete(taskId)
-            this.commitTails.delete(taskId)
-            for (const wake of this.eventWaiters.get(taskId) ?? [])
+        await this.options.store.resumePurges()
+        const purged: TaskId[] = []
+        for (const task of this.options.store.expiredTasks(this.clock.now(), retentionMs)) {
+            if (!(await this.closeRetainedTabs(task).catch(() => false)) || !(await this.options.store.purgeTask(task.taskId)))
+                continue
+            purged.push(task.taskId)
+            this.controllers.delete(task.taskId)
+            this.workers.delete(task.taskId)
+            this.inFlightDriverCalls.delete(task.taskId)
+            this.commitTails.delete(task.taskId)
+            for (const wake of this.eventWaiters.get(task.taskId) ?? [])
                 wake()
-            this.eventWaiters.delete(taskId)
-            this.leases.revokeTask(taskId)
-            for (const batchId of Object.keys(task?.batches ?? {}))
+            this.eventWaiters.delete(task.taskId)
+            this.leases.revokeTask(task.taskId)
+            for (const batchId of Object.keys(task.batches))
                 this.liveBatchSteps.delete(batchId as BatchId)
-            for (const tabId of task?.tabs ?? []) {
+            for (const tabId of task.tabs) {
                 this.latestAgentSnapshots.delete(tabId)
                 this.latestAgentUrls.delete(tabId)
             }
         }
         return purged
+    }
+    /** Closes an expired task's open tabs, removing each from its space once closed; false if any stays open. */
+    private async closeRetainedTabs(task: StoredTask): Promise<boolean> {
+        let closedAll = true
+        for (const tabId of this.options.store.openTabsOf(task)) {
+            if (await this.closeSpaceTab(task.profileId, task.taskSpaceId, tabId) !== 'closed')
+                closedAll = false
+        }
+        return closedAll
+    }
+    /**
+     * Closes one space tab in the browser and only then drops it from the space. A target
+     * that is already gone (closed just before a crash) counts as closed; a tab a user holds
+     * is not touched.
+     */
+    private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId): Promise<'closed' | 'held' | 'blocked' | 'failed'> {
+        if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
+            return 'held'
+        const driver = this.driver(profileId)
+        const result = await driver.closeTab(tabId, { timeoutMs: 5000 }).catch(() => undefined)
+        if (result?.beforeUnloadBlocked)
+            return 'blocked'
+        if (!result?.closed && !(result && !driver.hasTab(tabId)))
+            return 'failed'
+        await this.options.store.mutateSpace(taskSpaceId, (current) => {
+            const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
+                tabTargets, tabLeaseEpochs }
+        })
+        return 'closed'
+    }
+    /**
+     * The agent session ended (broker revocation at session exit): its spaces are marked
+     * for reclamation (durably, so a restart finishes it) and its unfinished tasks go
+     * through the cancel fence. reclaimSpaces closes them once their tasks allow.
+     * Idempotent.
+     */
+    async endSession(agentSessionId: string): Promise<void> {
+        await this.recovery
+        const tasks = this.options.store.listTasks().filter((task) => task.agentSessionId === agentSessionId)
+        const spaceIds = new Set([...this.options.store.listSpaces().filter((space) => space.agentSessionId === agentSessionId).map((space) => space.taskSpaceId),
+            ...tasks.map((task) => task.taskSpaceId)])
+        for (const taskSpaceId of spaceIds)
+            await this.markReclaiming(taskSpaceId, 'session-ended')
+        for (const task of tasks) {
+            if (!FINISHED_STATUSES.has(task.status))
+                await this.cancelTask(this.requireTask(task.taskId))
+        }
+    }
+    /**
+     * One reclamation pass: spaces marked for reclamation, and (with spaceIdleReclaimMs)
+     * spaces whose tasks are all finished and that saw no activity for that long, are
+     * closed tab by tab. A task with an unknown write outcome keeps its space for the user;
+     * a tab blocking unload stays open and is reported. Passes are serialized.
+     */
+    reclaimSpaces(): Promise<SpaceReclaimReport[]> {
+        const run = this.reclaimTail.then(() => this.reclaimPass(), () => this.reclaimPass())
+        this.reclaimTail = run.catch(() => undefined)
+        return run
+    }
+    private reclaimTail: Promise<unknown> = Promise.resolve()
+    private async reclaimPass(): Promise<SpaceReclaimReport[]> {
+        await this.recovery
+        const reports: SpaceReclaimReport[] = []
+        const idleMs = this.options.spaceIdleReclaimMs
+        for (const space of this.options.store.listSpaces()) {
+            if (space.closed)
+                continue
+            if (space.reclaimingSinceMs === undefined) {
+                const tasks = this.spaceTasks(space.taskSpaceId)
+                const lastActivityMs = Math.max(space.createdAtMs, ...tasks.map((task) => Number(task.updatedAtMs)))
+                if (idleMs === undefined || tasks.some((task) => !FINISHED_STATUSES.has(task.status) || this.workers.has(task.taskId))
+                    || this.clock.now() - lastActivityMs < idleMs)
+                    continue
+                await this.markReclaiming(space.taskSpaceId, 'idle')
+            }
+            reports.push(await this.reclaimSpace(space.taskSpaceId))
+        }
+        return reports
+    }
+    /** Operator view of every space (admin socket). */
+    spaceReport(): SpaceSummary[] {
+        const now = this.clock.now()
+        const spaces = this.options.store.listSpaces()
+        const reclaimingByProfile = new Map<ProfileId, number>()
+        return spaces.map((space) => {
+            let counted = !space.closed
+            if (counted && space.reclaimingSinceMs !== undefined) {
+                const seen = (reclaimingByProfile.get(space.profileId) ?? 0) + 1
+                reclaimingByProfile.set(space.profileId, seen)
+                counted = seen > RECLAIMING_SPACE_RESERVE
+            }
+            const tasks = this.spaceTasks(space.taskSpaceId)
+            return {
+                taskSpaceId: space.taskSpaceId, profileId: space.profileId,
+                agentSessionId: space.agentSessionId ?? tasks[0]?.agentSessionId,
+                createdAtMs: space.createdAtMs, ageMs: now - space.createdAtMs, closed: Boolean(space.closed), counted,
+                ...(space.reclaimReason ? { reclaimReason: space.reclaimReason } : {}),
+                ...(space.reclaimBlockedTabs?.length ? { reclaimBlockedTabs: space.reclaimBlockedTabs } : {}),
+                tabs: [...space.tabs],
+                tasks: tasks.map((task) => ({ taskId: task.taskId, agentSessionId: task.agentSessionId, status: task.status,
+                    ...(task.pauseReason ? { pauseReason: task.pauseReason } : {}), uncertainActions: task.uncertainActions.length,
+                    updatedAtMs: Number(task.updatedAtMs) })),
+            }
+        })
+    }
+    /**
+     * Operator close (admin socket): cancels the space's tasks and closes it. A task with an
+     * unknown write outcome keeps the space unless `force` (its record stays for reconcile).
+     */
+    async closeSpaceAsOperator(taskSpaceId: TaskSpaceId, options: { force?: boolean } = {}): Promise<SpaceReclaimReport> {
+        await this.recovery
+        const space = this.requireSpace(taskSpaceId)
+        if (space.closed)
+            return { taskSpaceId, reason: space.reclaimReason ?? 'operator', closed: true, closedTabs: [] }
+        await this.markReclaiming(taskSpaceId, 'operator')
+        for (const task of this.spaceTasks(taskSpaceId)) {
+            if (!FINISHED_STATUSES.has(task.status))
+                await this.cancelTask(this.requireTask(task.taskId))
+        }
+        await Promise.all(this.spaceTasks(taskSpaceId).map((task) => this.workers.get(task.taskId)?.catch(() => undefined)))
+        return this.reclaimSpace(taskSpaceId, options.force)
+    }
+    private spaceTasks(taskSpaceId: TaskSpaceId): StoredTask[] {
+        return this.options.store.listTasks().filter((task) => task.taskSpaceId === taskSpaceId)
+    }
+    private async markReclaiming(taskSpaceId: TaskSpaceId, reason: NonNullable<SpaceRecord['reclaimReason']>): Promise<void> {
+        await this.options.store.mutateSpace(taskSpaceId, (current) => current.closed || current.reclaimingSinceMs !== undefined ? null
+            : { reclaimingSinceMs: this.clock.now(), reclaimReason: reason })
+    }
+    private async reclaimSpace(taskSpaceId: TaskSpaceId, force = false): Promise<SpaceReclaimReport> {
+        const space = this.requireSpace(taskSpaceId)
+        const report: SpaceReclaimReport = { taskSpaceId, reason: space.reclaimReason ?? 'operator', closed: false, closedTabs: [] }
+        const tasks = this.spaceTasks(taskSpaceId)
+        // A crash between marking and cancelling is finished here.
+        for (const task of tasks) {
+            if (report.reason !== 'idle' && !FINISHED_STATUSES.has(task.status) && !task.cancelRequested)
+                await this.cancelTask(this.requireTask(task.taskId))
+        }
+        const current = this.spaceTasks(taskSpaceId)
+        const retained = current.filter((task) => !FINISHED_STATUSES.has(task.status) && task.uncertainActions.length && !this.workers.has(task.taskId))
+            .map((task) => task.taskId)
+        const waiting = current.filter((task) => this.workers.has(task.taskId)
+            || (!FINISHED_STATUSES.has(task.status) && !task.uncertainActions.length)).map((task) => task.taskId)
+        if (waiting.length)
+            return { ...report, waiting }
+        if (retained.length && !force)
+            return { ...report, retained }
+        const blockedTabs: TabId[] = []
+        const failedTabs: TabId[] = []
+        for (const tabId of space.tabs) {
+            const outcome = await this.closeSpaceTab(space.profileId, taskSpaceId, tabId)
+            if (outcome === 'closed')
+                report.closedTabs.push(tabId)
+            else if (outcome === 'blocked')
+                blockedTabs.push(tabId)
+            else
+                failedTabs.push(tabId)
+        }
+        await this.options.store.mutateSpace(taskSpaceId, (latest) => blockedTabs.length || failedTabs.length
+            ? { reclaimBlockedTabs: blockedTabs }
+            : { tabs: [], tabTargets: {}, tabLeaseEpochs: {}, profileUserOwner: null, closed: true, reclaimBlockedTabs: undefined,
+                goneTabs: [...new Set([...(latest.goneTabs ?? []), ...latest.tabs])] })
+        if (blockedTabs.length || failedTabs.length)
+            return { ...report, ...(blockedTabs.length ? { blockedTabs } : {}), ...(failedTabs.length ? { failedTabs } : {}),
+                ...(retained.length ? { retained } : {}) }
+        return { ...report, closed: true, ...(retained.length ? { retained } : {}) }
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
         let failure: unknown
@@ -1253,6 +1463,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.authorizeTask(auth, 'cancel', task)
         if (['succeeded', 'failed', 'cancelled'].includes(task.status))
             return { status: 'cancel-accepted', task: this.view(task), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        const latest = await this.cancelTask(task)
+        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
+    }
+    /**
+     * The cancel fence: revokes the task's input leases, aborts its worker and durably
+     * records the cancel; writes whose outcome is unknown leave it paused
+     * (`cancelled-with-unknown-effect`) instead of cancelled.
+     */
+    private async cancelTask(task: StoredTask): Promise<StoredTask> {
         const revokedLeases = this.leases.revokeTask(task.taskId)
         for (const lease of revokedLeases)
             await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
@@ -1271,8 +1490,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     current.stateVersion + 1),
             }
         })
-        const latest = next ?? this.requireTask(task.taskId)
-        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        return next ?? this.requireTask(task.taskId)
     }
     private async closeSpaceImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
@@ -2320,6 +2538,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const space = this.options.store.getSpace(id)
         if (!space)
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist'); return space; }
+    /** A closed or reclaiming space takes no new work; the agent creates a new space. */
+    private assertSpaceOpen(space: SpaceRecord): void {
+        if (space.closed || space.reclaimingSinceMs !== undefined)
+            throw new BrowserRuntimeError('CONFLICT', 'Task space was closed; create a new task space')
+    }
     private assertTaskTab(task: StoredTask, tab: TabId): void { if (!task.tabs.includes(tab))
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Tab is not owned by task'); }
     /**

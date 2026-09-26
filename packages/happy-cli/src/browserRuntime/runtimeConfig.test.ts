@@ -23,6 +23,14 @@ describe('parseRuntimeConfig', () => {
         expect(config.profilePrincipals.get('profile-a' as never)).toBe('user-1')
     })
 
+    it('defaults the space quota to 4 (never above maxAgentWindows) and idle reclamation to 15 minutes', () => {
+        expect(parseRuntimeConfig(valid())).toMatchObject({ maxSpacesPerProfile: 4, spaceIdleReclaimMs: 900_000 })
+        expect(parseRuntimeConfig({ ...valid(), maxAgentWindows: 2 }).maxSpacesPerProfile).toBe(2)
+        expect(parseRuntimeConfig({ ...valid(), maxAgentWindows: 6, maxSpacesPerProfile: 6 }).maxSpacesPerProfile).toBe(6)
+        expect(() => parseRuntimeConfig({ ...valid(), maxAgentWindows: 3, maxSpacesPerProfile: 4 })).toThrow(/maxSpacesPerProfile/)
+        expect(() => parseRuntimeConfig({ ...valid(), spaceIdleReclaimMs: 1_000 })).toThrow(/spaceIdleReclaimMs/)
+    })
+
     it('rejects unknown keys and duplicate profiles', () => {
         expect(() => parseRuntimeConfig({ ...valid(), adminToken: 'x' })).toThrow(/runtime config/)
         expect(() => parseRuntimeConfig({ ...valid(), profiles: [valid().profiles[0], valid().profiles[0]] })).toThrow(/duplicate profileId/)

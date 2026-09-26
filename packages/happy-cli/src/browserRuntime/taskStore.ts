@@ -104,7 +104,20 @@ export interface SpaceRecord {
         hash: string
         result: unknown
     }>
+    /** Agent session that created the space; its end reclaims the space. */
+    agentSessionId?: string
+    /** Reclamation started (owning session ended, idle, operator): no new work, closed once its tasks allow. */
+    reclaimingSinceMs?: number
+    reclaimReason?: 'session-ended' | 'idle' | 'operator'
+    /** Tabs a reclamation could not close (beforeunload); reported, retried. */
+    reclaimBlockedTabs?: TabId[]
 }
+/**
+ * Spaces being reclaimed do not count against maxSpacesPerProfile, except those beyond
+ * this reserve per profile: retained spaces (a task with an unknown write outcome left for
+ * the user) cannot pile up unnoticed.
+ */
+export const RECLAIMING_SPACE_RESERVE = 2
 export interface TaskMutation {
     patch: Partial<StoredTask>
     event: StoreEventInput
@@ -171,11 +184,12 @@ export class TaskStore {
             heartbeatAtMs: this.now(),
         }, 'metadata')
     }
-    async createSpace(record: SpaceRecord): Promise<void> {
+    async createSpace(record: SpaceRecord, maxSpacesPerProfile: number = POC_LIMITS.maxSpacesPerProfile): Promise<void> {
         await this.withMetadataQueue(async () => {
             await this.assertWriter()
-            const perProfile = [...this.spaces.values()].filter((space) => space.profileId === record.profileId && !space.closed)
-            if (perProfile.length >= POC_LIMITS.maxSpacesPerProfile)
+            const open = [...this.spaces.values()].filter((space) => space.profileId === record.profileId && !space.closed)
+            const reclaiming = open.filter((space) => space.reclaimingSinceMs !== undefined).length
+            if (open.length - reclaiming + Math.max(0, reclaiming - RECLAIMING_SPACE_RESERVE) >= maxSpacesPerProfile)
                 throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
             this.spaces.set(record.taskSpaceId, structuredClone(record))
             try {
@@ -257,32 +271,50 @@ export class TaskStore {
      */
     async purgeExpiredTasks(nowMs: number, retentionMs: number): Promise<TaskId[]> {
         await this.resumePurges()
-        const expired = [...this.tasks.values()].filter((task) => (TERMINAL_STATUSES as readonly string[]).includes(task.status)
-            && !task.uncertainActions.length && nowMs - Number(task.updatedAtMs) > retentionMs).map((task) => task.taskId)
         const purged: TaskId[] = []
-        for (const id of expired) {
-            await this.withTaskQueue(id, async () => {
-                await this.assertWriter()
-                const task = this.tasks.get(id)
-                if (!task)
-                    return
-                await this.faultInjector?.('purge-move')
-                const purgedRoot = join(this.stateDir, PURGED_DIR)
-                await mkdir(purgedRoot, { recursive: true })
-                await rename(join(this.stateDir, 'tasks', id), join(purgedRoot, id))
-                await this.syncDirectory(join(this.stateDir, 'tasks'))
-                await this.syncDirectory(purgedRoot)
-                this.tasks.delete(id)
-                purged.push(id)
-                for (const listener of this.purgeListeners) {
-                    try { listener(id) } catch { /* observers never fail a purge */ }
-                }
-                await this.finishPurge(id, task)
-            })
+        for (const task of this.expiredTasks(nowMs, retentionMs)) {
+            if (await this.purgeTask(task.taskId))
+                purged.push(task.taskId)
         }
         return purged
     }
-    private async resumePurges(): Promise<void> {
+    /** Terminal tasks without uncertain actions whose last change is older than `retentionMs`. */
+    expiredTasks(nowMs: number, retentionMs: number): StoredTask[] {
+        return [...this.tasks.values()].filter((task) => (TERMINAL_STATUSES as readonly string[]).includes(task.status)
+            && !task.uncertainActions.length && nowMs - Number(task.updatedAtMs) > retentionMs).map((task) => structuredClone(task))
+    }
+    /**
+     * Tabs of `task` still open in its space that no other task uses. Retention must close
+     * them in the browser first: deleting their references would orphan the windows.
+     */
+    openTabsOf(task: Pick<StoredTask, 'taskId' | 'taskSpaceId' | 'tabs'>): TabId[] {
+        const usedElsewhere = new Set([...this.tasks.values()].filter((other) => other.taskId !== task.taskId).flatMap((other) => other.tabs.map(String)))
+        const open = new Set((this.spaces.get(task.taskSpaceId)?.tabs ?? []).map(String))
+        return task.tabs.filter((tabId) => open.has(String(tabId)) && !usedElsewhere.has(String(tabId)))
+    }
+    /** Deletes one task as described for purgeExpiredTasks; false when it no longer exists or a tab of it is still open. */
+    async purgeTask(id: TaskId): Promise<boolean> {
+        return this.withTaskQueue(id, async () => {
+            await this.assertWriter()
+            const task = this.tasks.get(id)
+            if (!task || this.openTabsOf(task).length)
+                return false
+            await this.faultInjector?.('purge-move')
+            const purgedRoot = join(this.stateDir, PURGED_DIR)
+            await mkdir(purgedRoot, { recursive: true })
+            await rename(join(this.stateDir, 'tasks', id), join(purgedRoot, id))
+            await this.syncDirectory(join(this.stateDir, 'tasks'))
+            await this.syncDirectory(purgedRoot)
+            this.tasks.delete(id)
+            for (const listener of this.purgeListeners) {
+                try { listener(id) } catch { /* observers never fail a purge */ }
+            }
+            await this.finishPurge(id, task)
+            return true
+        })
+    }
+    /** Finishes deletions a crash interrupted (tasks-purged/). */
+    async resumePurges(): Promise<void> {
         const purgedRoot = join(this.stateDir, PURGED_DIR)
         let ids: string[]
         try {

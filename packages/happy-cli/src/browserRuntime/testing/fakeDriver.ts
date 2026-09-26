@@ -33,6 +33,7 @@ export class FakeBrowserDriver implements BrowserDriver {
     readonly clickExpectations: Array<DriverOptions['expect']> = []
     observeCount = 0
     delays = new Map<Operation, number>()
+    private readonly unloadBlocked = new Set<TabId>()
     private readonly failures = new Map<Operation, Error[]>()
     private waitRelease?: () => void
     private ignoreWaitAbort = false
@@ -76,8 +77,11 @@ export class FakeBrowserDriver implements BrowserDriver {
         this.record(tabId, targetId, 'openTab')
         return { tabId, targetId }
     }
+    /** Make closeTab report a beforeunload prompt for `tabId` (the page stays open). */
+    blockUnload(tabId: TabId, blocked: boolean): void { if (blocked) this.unloadBlocked.add(tabId); else this.unloadBlocked.delete(tabId) }
     async closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }> {
         await this.delay('closeTab', opts); this.throwNextFailure('closeTab'); const page = this.pages.get(tabId); if (!page) return { closed: false }
+        if (this.unloadBlocked.has(tabId)) return { closed: false, beforeUnloadBlocked: true }
         this.pages.delete(tabId); this.record(tabId, `target-${tabId}`, 'closeTab'); return { closed: true }
     }
     hasTab(tabId: TabId): boolean { return this.pages.has(tabId) }

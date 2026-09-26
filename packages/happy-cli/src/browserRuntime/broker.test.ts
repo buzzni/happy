@@ -28,13 +28,14 @@ function call(socketPath: string, method: string, path: string, headers: Record<
     })
 }
 
-async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId) => Promise<void>; recoveryRetryMs?: number } = {}) {
+async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId) => Promise<void>; recoveryRetryMs?: number; endSession?: (agentSessionId: string) => Promise<void> } = {}) {
     const dir = options.dir ?? await mkdtemp(join(tmpdir(), 'abp-broker-'))
     if (!options.dir) cleanups.push(() => rm(dir, { recursive: true, force: true }))
     const store = await TaskStore.open(dir)
     const attention = await AttentionOutbox.open(dir)
     attention.attach(store)
     const revoked: GrantId[] = []
+    const endedSessions: string[] = []
     const socketPath = join(dir, 'broker.sock')
     let now = 1_000_000
     const broker: Broker = await startBroker({
@@ -47,6 +48,7 @@ async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId)
         revokeGrant: async (grantId) => { await options.revokeGrant?.(grantId); await store.revoke(grantId); revoked.push(grantId) },
         now: () => now,
         recoveryRetryMs: options.recoveryRetryMs ?? 3_600_000,
+        endSession: async (agentSessionId) => { await options.endSession?.(agentSessionId); endedSessions.push(agentSessionId) },
     })
     const close = async () => { await broker.close(); await store.close() }
     cleanups.push(close)
@@ -60,7 +62,7 @@ async function harness(options: { dir?: string; revokeGrant?: (grantId: GrantId)
     }
     const grant = (secret: string, body: Record<string, unknown> = {}) => call(socketPath, 'POST', '/v1/agent-grants', { 'x-abp-session-secret': secret },
         { schemaVersion: 1, agentSessionId: 'session-1', profileId: 'profile-a', ...body })
-    return { dir, store, attention, socketPath, revoked, daemon, register, grant, close, broker, setNow: (value: number) => { now = value } }
+    return { dir, store, attention, socketPath, revoked, endedSessions, daemon, register, grant, close, broker, setNow: (value: number) => { now = value } }
 }
 
 describe('broker socket', () => {
@@ -259,6 +261,22 @@ describe('broker socket', () => {
         failing = false
         await vi.waitFor(() => expect(restarted.broker.pendingRevocations()).toBe(0))
         expect(restarted.revoked).toEqual([interrupted.grantId])
+    })
+
+    it('ends the bound session (task and space reclamation) before it forgets the registration, and retries a failed end', async () => {
+        let failing = true
+        const h = await harness({ endSession: async () => { if (failing) throw new Error('journal down') } })
+        await h.register('session-1')
+        const unbound = await call(h.socketPath, 'POST', '/v1/sessions/register', h.daemon, { schemaVersion: 1 })
+        const failed = await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })
+        expect([failed.status, failed.body.error.retryable]).toEqual([503, true])
+        expect(h.broker.pendingRevocations()).toBe(1)
+        failing = false
+        expect((await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, agentSessionId: 'session-1' })).body.result).toEqual({ revoked: true, grants: 0 })
+        expect(h.endedSessions).toEqual(['session-1'])
+        // A registration never bound to a session has no session to end.
+        await call(h.socketPath, 'POST', '/v1/sessions/revoke', h.daemon, { schemaVersion: 1, registrationId: unbound.body.result.registrationId })
+        expect(h.endedSessions).toEqual(['session-1'])
     })
 
     it('keeps registrations across a Runtime restart', async () => {

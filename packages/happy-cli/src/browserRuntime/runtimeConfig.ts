@@ -48,6 +48,10 @@ const schema = z.object({
     /** Origins the viewer WebSocket accepts besides loopback ones. Defense in depth only: the one-time viewer ticket is the boundary. */
     viewerOrigins: z.array(origin).default([]),
     maxAgentWindows: z.number().int().min(1).max(16).default(4),
+    /** Open task spaces per profile; default min(4, maxAgentWindows), never above maxAgentWindows. */
+    maxSpacesPerProfile: z.number().int().min(1).max(16).optional(),
+    /** Spaces whose tasks are all finished are closed after this long without activity. */
+    spaceIdleReclaimMs: z.number().int().min(60_000).max(24 * 60 * 60_000).default(15 * 60_000),
     retentionDays: z.number().int().min(1).max(365).default(7),
 }).strict().superRefine((config, ctx) => {
     const seen = new Set<string>()
@@ -60,13 +64,16 @@ const schema = z.object({
         try { type = createPublicKey(issuer.publicKeyPem).asymmetricKeyType } catch { type = undefined }
         if (type !== 'ed25519') ctx.addIssue({ code: 'custom', path: ['trustedIssuers', index, 'publicKeyPem'], message: 'must be an Ed25519 public key (PEM)' })
     }
+    if (config.maxSpacesPerProfile !== undefined && config.maxSpacesPerProfile > config.maxAgentWindows)
+        ctx.addIssue({ code: 'custom', path: ['maxSpacesPerProfile'], message: 'must not exceed maxAgentWindows' })
     if (config.authMode === 'production') {
         if (config.trustedIssuers.length === 0) ctx.addIssue({ code: 'custom', path: ['trustedIssuers'], message: 'production needs at least one trusted issuer' })
         if (!config.daemonTokenSha256) ctx.addIssue({ code: 'custom', path: ['daemonTokenSha256'], message: 'production needs the daemon token hash' })
     }
 })
 
-export interface RuntimeConfig extends Omit<z.infer<typeof schema>, 'authMode' | 'machineId' | 'workspaceId' | 'trustedIssuers'> {
+export interface RuntimeConfig extends Omit<z.infer<typeof schema>, 'authMode' | 'machineId' | 'workspaceId' | 'trustedIssuers' | 'maxSpacesPerProfile'> {
+    maxSpacesPerProfile: number
     authMode: AuthMode
     machineId: MachineId
     workspaceId: WorkspaceId
@@ -84,6 +91,7 @@ export function parseRuntimeConfig(value: unknown): RuntimeConfig {
     const config = parsed.data
     return {
         ...config,
+        maxSpacesPerProfile: config.maxSpacesPerProfile ?? Math.min(4, config.maxAgentWindows),
         machineId: config.machineId as MachineId,
         workspaceId: config.workspaceId as WorkspaceId,
         profilePrincipals: new Map(config.profiles.map((profile) => [profile.profileId as ProfileId, profile.principalId as PrincipalId])),
