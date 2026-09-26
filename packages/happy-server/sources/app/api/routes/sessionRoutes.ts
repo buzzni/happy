@@ -178,6 +178,15 @@ export function sessionRoutes(app: Fastify) {
         const viewerEnvelope = grantViewer
             ? { sessionId: grantViewer.sessionId, key: grantViewer.viewerDataEncryptionKey ?? null }
             : null;
+        const servedDataEncryptionKey = (v: { id: string; dataEncryptionKey: Uint8Array | null }) => (
+            viewerEnvelope && viewerEnvelope.sessionId === v.id
+                ? (viewerEnvelope.key
+                    ? Buffer.from(viewerEnvelope.key).toString('base64')
+                    : null)
+                : (v.dataEncryptionKey
+                    ? Buffer.from(v.dataEncryptionKey).toString('base64')
+                    : null)
+        );
         const sessions = await db.session.findMany({
             where: {
                 accountId: userId,
@@ -211,13 +220,7 @@ export function sessionRoutes(app: Fastify) {
                     metadataVersion: v.metadataVersion,
                     agentState: v.agentState,
                     agentStateVersion: v.agentStateVersion,
-                    dataEncryptionKey: viewerEnvelope && viewerEnvelope.sessionId === v.id
-                        ? (viewerEnvelope.key
-                            ? Buffer.from(viewerEnvelope.key).toString('base64')
-                            : null)
-                        : (v.dataEncryptionKey
-                            ? Buffer.from(v.dataEncryptionKey).toString('base64')
-                            : null),
+                    dataEncryptionKey: servedDataEncryptionKey(v),
                 }))
         });
     });
