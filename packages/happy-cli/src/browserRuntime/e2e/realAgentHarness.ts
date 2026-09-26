@@ -292,7 +292,12 @@ export async function fixtureControl(ctx: RunContext, method: string, path: stri
     if (fixtureOnExec && execMachine) {
         const config = [`url = "${fixtureOnExec}${path}"`, `request = "${method}"`, `header = "x-harness-token: ${ctx.env.harnessToken}"`,
             'header = "content-type: application/json"', ...body ? [`data-binary = ${JSON.stringify(JSON.stringify(body))}`] : [], 'silent', 'max-time = 30'].join('\n')
-        return JSON.parse(await onExecMachine('curl -K -', config)) as Record<string, unknown>
+        // A rare empty reply from the orb exec relay is retried for reads; a real error body still parses.
+        for (let attempt = 1; ; attempt++) {
+            const out = await onExecMachine('curl -K -', config)
+            if (out.trim() || method !== 'GET' || attempt === 3) return JSON.parse(out) as Record<string, unknown>
+            await sleep(500)
+        }
     }
     const response = await harnessFetch(`http://${execHost()}:${ctx.env.ports.control}${path}`, {
         method,
