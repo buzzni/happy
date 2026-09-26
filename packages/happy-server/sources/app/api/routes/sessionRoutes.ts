@@ -189,9 +189,10 @@ export function sessionRoutes(app: Fastify) {
         );
         /*
          * The runtime poll asks for this on every tick and fetches the full row
-         * only when a version or the key envelope moved: encrypted bodies change
-         * only through the version-CAS socket handlers, and a rewrap fills the
-         * envelope without bumping either version.
+         * only when a version or key presence moved: encrypted bodies change
+         * through the version-CAS socket handlers (versions bump) or a rewrap,
+         * which re-encrypts them without a bump but only while filling a
+         * missing envelope — key presence changes with it.
          */
         if (request.body.projection === 'version') {
             const rows = await db.session.findMany({
