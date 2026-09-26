@@ -25,7 +25,11 @@ interface HostOptions {
     profiles?: Array<{ profileId: string; principalId: string }>
 }
 
-/** Records every command; files live in a map; the Runtime's image label follows the state file (as abp-stack run would). */
+/**
+ * Records every command; files live in a map. Docker is modelled per container (running, image label):
+ * create/start/stop/kill/rm act on it, and the abp-stack.service start/stop recreate or stop the whole
+ * stack from the state file, as abp-stack run would. Side effects apply only to commands that succeed.
+ */
 function fakeHost(options: HostOptions = {}) {
     const calls: string[] = []
     const logs: string[] = []
@@ -44,7 +48,14 @@ function fakeHost(options: HostOptions = {}) {
     files.set(PATHS.stackState, { data: JSON.stringify({ schemaVersion: 1, current: options.current === undefined ? { runtime: RUNTIME_OLD, browser: BROWSER_OLD } : options.current, previous: options.previous ?? null, history: [] }), mode: 0o600, owner: 'root', group: 'root' })
     const state = () => JSON.parse(files.get(PATHS.stackState)!.data)
     const running = [...(options.running ?? [])]
-    let runtimeRunning = options.runtimeRunning ?? true
+    const names = ['abp-runtime', ...install.profiles.map((profile: { profileId: string }) => `abp-browser-${profile.profileId}`)]
+    const containers = new Map<string, { running: boolean; image: string }>()
+    const recreateAll = (up: boolean) => {
+        const current = state().current ?? { runtime: '', browser: '' }
+        for (const name of names) containers.set(name, { running: up, image: name === 'abp-runtime' ? current.runtime : current.browser })
+    }
+    recreateAll(true)
+    containers.get('abp-runtime')!.running = options.runtimeRunning ?? true
     let lockHeld = false
     // The fence resets host packets to the API port: while it is up, the Runtime does not answer.
     let fenced = false
@@ -53,26 +64,35 @@ function fakeHost(options: HostOptions = {}) {
         run(cmd: string, args: string[], opts: { allowFail?: boolean } = {}): Result {
             const line = [cmd, ...args].join(' ')
             calls.push(line)
-            if (line === FENCE) fenced = true
-            if (line === UNFENCE) fenced = false
-            // abp-stack.service: its stop takes the Runtime down; its start recreates it and lifts the fence.
-            if (line === 'systemctl stop abp-stack.service') runtimeRunning = false
-            if (line === 'systemctl start abp-stack.service') { runtimeRunning = true; fenced = false }
             const handlers: Array<[RegExp, Handler]> = [
                 ...options.handlers ?? [],
                 [/^docker image inspect/, (a) => ({ stdout: a.at(-1) })],
-                // Controlled operations ask whether the Runtime runs before fencing it.
-                [/^docker inspect -f \{\{\.State\.Running\}\} abp-runtime$/, () => ({ stdout: runtimeRunning ? 'true' : 'false' })],
-                [new RegExp(`^${LABEL.replace(/[{}.]/g, '\\$&')}$`), () => ({ stdout: state().current?.runtime })],
+                [/^docker inspect -f \{\{\.State\.Running\}\} (\S+)$/, (a) => ({ stdout: String(containers.get(a.at(-1)!)?.running ?? false) })],
+                [/^docker inspect -f \{\{\.State\.Running\}\} \{\{index \.Config\.Labels "ai\.saycode\.abp\.image"\}\} (\S+)$/, (a) => {
+                    const container = containers.get(a.at(-1)!)
+                    return container ? { stdout: `${container.running} ${container.image}` } : { status: 1 }
+                }],
+                [new RegExp(`^${LABEL.replace(/[{}.]/g, '\\$&')}$`), () => ({ stdout: containers.get('abp-runtime')?.image ?? '' })],
             ]
+            let result: Result = { status: 0, stdout: '', stderr: '' }
             for (const [pattern, handler] of handlers) {
-                if (pattern.test(line)) {
-                    const result = { status: 0, stdout: '', stderr: '', ...handler(args) }
-                    if (result.status !== 0 && !opts.allowFail) throw new Error(`${cmd} ${args[0]} failed`)
-                    return result
-                }
+                if (pattern.test(line)) { result = { status: 0, stdout: '', stderr: '', ...handler(args) }; break }
             }
-            return { status: 0, stdout: '', stderr: '' }
+            if (result.status === 0) {
+                if (line === FENCE) fenced = true
+                if (line === UNFENCE) fenced = false
+                // abp-stack.service: its stop takes the stack down; its start recreates it and lifts the fence.
+                if (line === 'systemctl stop abp-stack.service') for (const container of containers.values()) container.running = false
+                if (line === 'systemctl start abp-stack.service') { recreateAll(true); fenced = false }
+                const name = args.at(-1)!
+                if (cmd === 'docker' && args[0] === 'create') containers.set(args[1].replace('--name=', ''), { running: false, image: name })
+                if (cmd === 'docker' && args[0] === 'start' && containers.has(name)) containers.get(name)!.running = true
+                if (cmd === 'docker' && ['stop', 'kill'].includes(args[0]) && containers.has(name)) containers.get(name)!.running = false
+                if (cmd === 'docker' && args[0] === 'restart' && containers.has(name)) containers.get(name)!.running = true
+                if (cmd === 'docker' && args[0] === 'rm') for (const id of args.slice(2)) containers.delete(id)
+            }
+            if (result.status !== 0 && !opts.allowFail) throw new Error(`${cmd} ${args[0]} failed`)
+            return result
         },
         readFile(path: string) {
             const file = files.get(path)
@@ -98,7 +118,7 @@ function fakeHost(options: HostOptions = {}) {
             return () => { lockHeld = false }
         },
     }
-    return { deps, calls, logs, files, state, setRuntimeRunning: (value: boolean) => { runtimeRunning = value } }
+    return { deps, calls, logs, files, state, containers }
 }
 
 const indexOf = (calls: string[], pattern: RegExp | string) => calls.findIndex((line) => (typeof pattern === 'string' ? line === pattern : pattern.test(line)))
