@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import type { TaskEvent, TaskId } from '../contracts'
 import {
     clientProcessCount, evidenceFile, ledger, loadRun, now, parseArgs, sessionClient, sleep, spawnAgentSession,
-    userClient, waitForTranscript, prodIdentity,
+    userClient, userTexts, waitForTranscript, prodIdentity,
 } from './realAgentHarness'
 
 const PROMPT_TEMPLATE = readFileSync(join(import.meta.dirname, 'realAgentA08.prompt.txt'), 'utf8')
@@ -54,7 +54,8 @@ async function main(): Promise<void> {
     await waitForTranscript(sessionId, (list) => list.some((row) => row.t === 'turn-end' && row.time >= (waiting?.time ?? 0)), 60_000)
 
     // 2. While nobody is connected: the approval is durable and nothing was sent.
-    const user = userClient(ctx, `viewer-a08-${iteration}`)
+    // A fresh capability per call: server capabilities live 5 minutes and this run can outlast one.
+    const user = new Proxy({} as ReturnType<typeof userClient>, { get: (_target, key) => { const client = userClient(ctx, `viewer-a08-${iteration}`) as never; const value = (client as Record<string | symbol, unknown>)[key]; return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(client) : value } })
     const pending = await user.getTask({ taskId })
     evidence.beforeApproval = { status: pending.status, waitReason: pending.waitReason, hasPendingApproval: Boolean(pending.pendingApproval), riskyWrites: (await riskyCount(ctx)) - riskyBefore }
     save()
@@ -85,8 +86,10 @@ async function main(): Promise<void> {
     if (prodIdentity) {
         evidence.wakeBy = 'daemon-attention-watcher'
         evidence.clientProcessesAtWake = await clientProcessCount()
-        const woke = await waitForTranscript(sessionId, (list2) => list2.some((row) => row.t === 'text' && row.time > approvedAt && /\[agent-browser\]/.test(row.text ?? '')), 300_000)
-        evidence.daemonWakeSeen = woke.some((row) => row.time > approvedAt && /\[agent-browser\]/.test(row.text ?? ''))
+        const wakeText = `[agent-browser] task ${taskId}`
+        let woke = false
+        for (const deadline = now() + 300_000; !woke && now() < deadline; await sleep(2_000)) woke = (await userTexts(sessionId)).some((text) => text.startsWith(wakeText))
+        evidence.daemonWakeSeen = woke
     } else {
         await sessionClient('send', sessionId, followUp(taskId, `${afterApproval.status}:${afterApproval.pauseReason ?? ''}`, attention.seq))
     }

@@ -249,6 +249,13 @@ export async function clientProcessCount(): Promise<number> {
     return stdout.trim() ? stdout.trim().split('\n').length : 0
 }
 
+/** User-role text messages of a session (e.g. a re-invocation delivered by H's daemon), oldest first. */
+export async function userTexts(sessionId: string): Promise<string[]> {
+    const raw = await sessionClient('read', sessionId, '200')
+    const messages = JSON.parse(raw.trim().split('\n').at(-1)!.replace(/[\u0000-\u001f]/g, ' ')) as Array<{ content: { role?: string; content?: { type?: string; text?: string } } }>
+    return messages.filter((message) => message.content?.role === 'user' && typeof message.content.content?.text === 'string').map((message) => message.content.content!.text!)
+}
+
 export async function transcript(sessionId: string): Promise<TranscriptRow[]> {
     const raw = await sessionClient('read', sessionId, '200')
     const messages = JSON.parse(raw.trim().split('\n').at(-1)!.replace(/[\u0000-\u001f]/g, ' ')) as Array<{
