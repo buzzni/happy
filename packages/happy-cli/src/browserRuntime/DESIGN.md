@@ -233,7 +233,12 @@ are failed unsent (redirect hops included); subresources (script, style, image, 
 not checked. A popup whose document is stopped is closed. `blockedReports()` keeps origins only.
 Not covered: WebSocket/WebTransport/WebRTC, service-worker-initiated fetches, subresource GETs.
 A paused target answers only Fetch/auto-attach until resumed, and a same-site popup shares its
-opener's renderer (it must be resumed — with its requests failed — never left paused).
+opener's renderer (over the cap it is resumed with its requests failed). Fail closed (integration
+review P0-3): if interception (`Fetch.enable`) or recursive auto-attach cannot be established for a
+popup or frame — or auto-attach for a worker, whose requests pause in its parent's session (workers
+have no Fetch domain) — the target is never resumed: a popup is closed while paused, a frame or
+worker stays paused, and the owning tab refuses further work (`RUNTIME_UNAVAILABLE`, `closeTab`
+still allowed). Fault-injection hook: `testHooks.guardFailure`.
 
 ### Approval binding (D6)
 
@@ -252,14 +257,17 @@ opener's renderer (it must be resumed — with its requests failed — never lef
   which re-checks it after the hover and arms a one-shot in-page guard: a capturing `submit`
   listener recomputes the submission and cancels a changed one; a `formdata` listener compares the
   final entries and destination. Verdicts reach the driver through an isolated-world binding
-  (Runtime domain on only while armed); document requests of the tab wait for the verdict and are
-  failed when blocked or when method/destination differ (review P0-4).
+  (Runtime domain on only while armed). The request the form produces is then verified at
+  interception time, after every page handler ran (integration review P0-1): method, URL with query
+  and body (urlencoded, multipart, text/plain) must equal the approved submission
+  (`drivers/submissionCheck.ts`), else it is not sent; what cannot be verified is not sent either.
 - Driver checks right before input: same-node relabel → `STALE_REF`; for elements in iframes
   every ancestor document must hit the iframe element at the click point. A transformed or
   zoomed iframe (or ancestor) is not guessed: handed to the user (review P0-7).
-- Limits: purely visual relabels (CSS `content`, images, canvas); submit/formdata listeners the
-  page adds after the guard (and JS that sends the data itself, e.g. `fetch` in a click handler,
-  to an allowed origin); step payload hashes in the journal are unkeyed.
+- Limits: purely visual relabels (CSS `content`, images, canvas); JS that sends data itself
+  (e.g. `fetch` in a click handler) to an allowed origin; a submission the page cancels and
+  replaces with its own navigation is only destination-checked; step payload hashes in the journal
+  are unkeyed.
 
 ### Site policy (D7)
 

@@ -477,7 +477,8 @@ ${FORM_SUBMISSION}
             && (expected.fields[i][1] === 'centre' || canonical(value) === canonical(expectedEntry(expected.fields[i][1]))))
         const head = submissionOf(form, expected.submitter ? element : null)
         const sameHead = head.action === expected.action && head.method === expected.method && head.enctype === expected.enctype && head.target === expected.target
-        if (!sameFields || !sameHead) report('blocked')
+        // The browser builds the request after this: the driver verifies that request itself.
+        report(!sameFields || !sameHead ? 'blocked' : 'submitting')
     }
     win.addEventListener('submit', onSubmit, true)
     form.addEventListener('formdata', onFormData)
