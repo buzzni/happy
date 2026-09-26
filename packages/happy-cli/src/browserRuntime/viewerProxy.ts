@@ -11,6 +11,15 @@
  * display messages pass, input passes only under control. Server messages are
  * framed and length-checked by rfb.ts before they reach the viewer.
  *
+ * Authorization boundary: the one-time ticket. It is issued only against a
+ * live interactive capability (server-signed in production) for its profile,
+ * is 256-bit random, valid for 30 s (never past the capability) and spent on
+ * first use, and the connection stays bound to that capability (expiry and
+ * revocation close it; input also needs its viewer to own the takeover lease).
+ * The Origin check is defense in depth only: the Saycode machine tunnel's
+ * relay rewrites Origin to a loopback origin, so behind the tunnel it says
+ * nothing about the viewer's real page.
+ *
  * Input authorization (review P0-1..3): every input message is bound to this
  * viewer's authorization epoch at its first byte, checked again when it is
  * complete and once more right before it is written upstream. Releases are
@@ -114,7 +123,7 @@ export interface ViewerProxyOptions {
     vncPassword: string
     /** Expiry and revocation, checked again on every input and every second. */
     isCapabilityLive(capability: InteractiveCapability): boolean
-    /** Tunnel origins allowed besides the Runtime's own loopback origin. */
+    /** Tunnel origins allowed besides loopback origins (defense in depth; the ticket is the boundary). */
     allowedOrigins: readonly string[]
     now?: () => number
     log?: (line: string) => void
@@ -173,10 +182,13 @@ export class ViewerProxy {
     }
 
     /**
-     * The tunnel origins from the configuration, or any http loopback origin when
-     * the Runtime itself is reached on a loopback Host: Desktop's local tunnel picks
-     * its port at runtime, while a DNS-rebound name (non-loopback Host) never passes.
-     * The one-time ticket stays the authorization; this only narrows who may try.
+     * Defense in depth, not an authorization boundary (the ticket is). Accepts
+     * the configured tunnel origins, or any http loopback origin when the
+     * Runtime itself is reached on a loopback Host (Desktop's local tunnel picks
+     * its port at runtime). It refuses browser pages of other sites that reach
+     * the Runtime port directly and DNS-rebound names (non-loopback Host). It
+     * cannot tell pages apart behind the Saycode tunnel: the relay rewrites
+     * Origin to loopback there, so every relayed viewer passes this check.
      */
     private originAllowed(req: IncomingMessage): boolean {
         const origin = req.headers.origin

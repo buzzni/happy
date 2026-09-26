@@ -131,8 +131,17 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
 
 - `POST /v1/ops/viewerTicket` (interactive operation) → one-time ticket, 30 s or the capability's expiry,
   bound to the capability and profile. `GET /v1/viewer/websockify?ticket=` spends the ticket even when
-  refused; `Origin` must be a configured tunnel origin (`viewerOrigins`) or `http://<Host>` for a
-  loopback Host literal (a DNS-rebound name never matches).
+  refused.
+- **Authorization boundary = the ticket.** It is obtainable only with a live interactive capability
+  (server-signed abp2 in production) for that profile, 256-bit random, single use, ≤ 30 s, and the
+  connection stays bound to the capability (expiry/revocation close it; input additionally needs the
+  capability's viewer to own the takeover lease).
+- `Origin` is defense in depth, not a boundary. Accepted: a configured `viewerOrigins` entry, or any
+  http loopback origin when the Host is a loopback literal. That refuses other sites' pages reaching the
+  Runtime port directly and DNS-rebound names, but behind the Saycode machine tunnel it proves nothing:
+  the happy-server preview relay rewrites Origin to loopback, so every relayed viewer passes it. The
+  contract line "Origin은 Runtime 자기 origin 또는 설정된 터널 origin만" is therefore not an effective
+  control through the tunnel; checking the viewer page's real origin would have to happen at the relay.
 - Two independent RFB sessions per connection: RFB 3.8 server to the viewer (security None — the ticket
   authenticated it; desktop name replaced), RFB client of x11vnc (VNC authentication with the per-run
   password, shared). x11vnc listens on the profile network (no `-localhost`), is never published.
@@ -147,12 +156,15 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
 - Control loss: queued input is dropped. With no input ever written the connection stays view-only.
   Otherwise bytes may already be in flight, so the proxy writes key-up / button release for what was
   actually written (not queued intent), sends EOF, closes the viewer (4002 = reconnect with a new
-  ticket; 4001 on capability expiry/revocation) and fences the profile for agents
-  (`InputLeaseManager.fenceProfile`) until x11vnc closes its side. x11vnc processes messages in order and
+  ticket; 4001 on capability expiry/revocation) and fences the profile (`InputLeaseManager.fenceProfile`)
+  until x11vnc closes its side. The fence blocks every new input owner: agent acquire and user
+  takeOver get STALE_LEASE, and `userControl` reports settling, so a replacement viewer (even one of the
+  same viewer session that still owns the lease) gets no input through until the drain completes.
+  Setting and lifting a fence notify viewers. x11vnc processes messages in order and
   closes only after reading EOF, so its close proves the input and releases were consumed; a
   FramebufferUpdateRequest round-trip cannot (libvncserver merges requests and may answer an older one).
-  A hung x11vnc keeps the fence (fail closed, logged after 10 s). An agent step during the fence gets
-  STALE_LEASE before any intent is written.
+  A hung x11vnc keeps the fence (fail closed, logged after 10 s). An agent step or a takeover during the
+  fence gets STALE_LEASE before any intent or lease change is written.
 - Upstream→viewer: framed, not byte-passthrough. The server stream's lengths follow from headers only
   for the filtered encodings, so the proxy validates every header (message type, rectangle inside the
   framebuffer, encoding actually requested, ZRLE/cut-text length bounds) before forwarding and streams

@@ -45,7 +45,7 @@ const schema = z.object({
     brokerSocketGid: z.number().int().nonnegative().optional(),
     /** SHA-256 (hex) of the daemon token installed at /var/lib/abp/daemon-token. */
     daemonTokenSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
-    /** Machine tunnel origins the viewer WebSocket accepts besides the Runtime's own loopback origin. */
+    /** Origins the viewer WebSocket accepts besides loopback ones. Defense in depth only: the one-time viewer ticket is the boundary. */
     viewerOrigins: z.array(origin).default([]),
     maxAgentWindows: z.number().int().min(1).max(16).default(4),
     retentionDays: z.number().int().min(1).max(365).default(7),
