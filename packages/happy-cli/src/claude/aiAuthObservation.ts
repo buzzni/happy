@@ -23,6 +23,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { readActiveClaudeProvenance, type ActiveClaudeProvenance } from '@/daemon/aiCredentialProvenance'
+import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 
 export const ORG_BUNDLE_OBSERVED = 'org-bundle-observed'
 export type ObservedAiAuthSource = typeof ORG_BUNDLE_OBSERVED
@@ -77,6 +78,10 @@ function isMissing(error: unknown): boolean {
  * file exists, otherwise `.claude.json` beside the config root. An empty or
  * relative `CLAUDE_CONFIG_DIR` is resolved by Claude against a cwd this cannot
  * be sure of, so it is not guessed.
+ *
+ * An env that authenticates or routes Claude on its own (`ANTHROPIC_BASE_URL`,
+ * `ANTHROPIC_CUSTOM_HEADERS`, …) has no such login to report: `accountInfo()`
+ * still names the stored account, but the requests go wherever the env says.
  */
 export async function readLiveOauthAccount(input: {
     env: Record<string, string | undefined>
@@ -84,6 +89,7 @@ export async function readLiveOauthAccount(input: {
     readFile: (path: string) => Promise<string>
 }): Promise<LiveOauthAccount | null> {
     try {
+        if (CLAUDE_AUTH_OVERRIDE_ENV_KEYS.some((key) => input.env[key])) return null
         const configDir = input.env.CLAUDE_CONFIG_DIR
         if (configDir !== undefined && (configDir === '' || !isAbsolute(configDir))) return null
         const legacy = join(configDir ?? join(input.homeDir, '.claude'), '.config.json')

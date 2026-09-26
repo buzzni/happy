@@ -1,9 +1,18 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AccountInfo } from '@anthropic-ai/claude-agent-sdk'
-import type { ActiveClaudeProvenance } from '@/daemon/aiCredentialProvenance'
+import {
+    AI_CREDENTIAL_PROVENANCE_PATH,
+    serializeAppliedClaudeProvenance,
+    type ActiveClaudeProvenance,
+} from '@/daemon/aiCredentialProvenance'
+import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import {
     ORG_BUNDLE_OBSERVED,
     classifyObservedLogin,
+    observeClaudeQueryAuth,
     readLiveOauthAccount,
     startClaudeAuthObservation,
     type LiveOauthAccount,
@@ -157,6 +166,15 @@ describe('readLiveOauthAccount — where Claude Code keeps the login', () => {
             env: { CLAUDE_CONFIG_DIR: dir },
             homeDir: '/home/u',
             readFile: async () => oauthAccount,
+        })).resolves.toBeNull()
+    })
+
+    it.each(CLAUDE_AUTH_OVERRIDE_ENV_KEYS)('returns null when %s authenticates or routes Claude on its own', async (key) => {
+        // accountInfo() still names the stored login; the requests go elsewhere.
+        await expect(readLiveOauthAccount({
+            env: { [key]: 'set' },
+            homeDir: '/home/u',
+            readFile: files({ '/home/u/.claude.json': oauthAccount }),
         })).resolves.toBeNull()
     })
 
@@ -357,5 +375,57 @@ describe('startClaudeAuthObservation — one per provider run', () => {
             await flush()
             expect(observation.current()).toBeUndefined()
         })
+    })
+})
+
+describe('observeClaudeQueryAuth — this process, as the query child sees it', () => {
+    let home: string | undefined
+
+    afterEach(async () => {
+        vi.unstubAllEnvs()
+        if (home) await rm(home, { recursive: true, force: true })
+        home = undefined
+    })
+
+    // A machine right after an org bundle apply: the login, its fenced record.
+    async function machineWithAppliedBundle() {
+        home = await mkdtemp(join(tmpdir(), 'ai-auth-observation-'))
+        const configDir = join(home, 'claude-config')
+        await mkdir(configDir, { recursive: true })
+        await mkdir(join(home, '.happy'), { recursive: true })
+        await writeFile(join(configDir, '.claude.json'), oauthAccount)
+        await writeFile(join(home, AI_CREDENTIAL_PROVENANCE_PATH), serializeAppliedClaudeProvenance({
+            ...provenance,
+            identities: provenance.identities,
+        }))
+        await writeFile(
+            join(home, '.happy', 'ai-credential-apply-generations.json'),
+            JSON.stringify({ version: 1, generations: { claude: provenance.generation } }),
+        )
+        vi.stubEnv('HOME', home)
+        vi.stubEnv('CLAUDE_CONFIG_DIR', configDir)
+        for (const key of CLAUDE_AUTH_OVERRIDE_ENV_KEYS) vi.stubEnv(key, '')
+    }
+
+    const query = { accountInfo: async () => subscriber }
+    const settle = () => new Promise((r) => setTimeout(r, 50))
+
+    it('observes the deployed login', async () => {
+        await machineWithAppliedBundle()
+        const observation = observeClaudeQueryAuth(query)
+        await settle()
+        expect(observation.current()).toBe(ORG_BUNDLE_OBSERVED)
+    })
+
+    it.each([
+        ['ANTHROPIC_BASE_URL', 'http://127.0.0.1:9/proxy'],
+        ['ANTHROPIC_CUSTOM_HEADERS', 'x-api-key: proxy-key'],
+    ])('observes nothing when %s routes the requests elsewhere', async (key, value) => {
+        await machineWithAppliedBundle()
+        // How claudeRemote applies claudeEnvVars before starting the query.
+        vi.stubEnv(key, value)
+        const observation = observeClaudeQueryAuth(query)
+        await settle()
+        expect(observation.current()).toBeUndefined()
     })
 })
