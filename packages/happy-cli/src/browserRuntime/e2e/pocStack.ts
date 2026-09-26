@@ -199,7 +199,9 @@ export async function startPocStack(options: { run?: string; bundle?: string; vi
         async admin(path, body = {}) {
             const response = await fetch(`http://127.0.0.1:${env.ports.admin}${path}`, {
                 method: path === '/admin/debug' ? 'GET' : 'POST',
-                headers: { authorization: `Bearer ${keys.adminToken}`, 'content-type': 'application/json' },
+                // Harness plumbing, not a client under test: no pooled socket left behind (the Runtime keeps idle
+                // connections 65 s, and A01 waits until no client connection remains).
+                headers: { authorization: `Bearer ${keys.adminToken}`, 'content-type': 'application/json', connection: 'close' },
                 ...(path === '/admin/debug' ? {} : { body: JSON.stringify(body) }),
             })
             const parsed = await response.json() as { ok: boolean; result?: unknown; error?: unknown }
@@ -237,7 +239,7 @@ export async function startPocStack(options: { run?: string; bundle?: string; vi
             const deadline = Date.now() + timeoutMs
             while (Date.now() < deadline) {
                 try {
-                    const response = await fetch(`${stack.runtimeUrl}/v1/health`)
+                    const response = await fetch(`${stack.runtimeUrl}/v1/health`, { headers: { connection: 'close' } })
                     if (response.ok) {
                         const health = await response.json() as { profiles?: Array<{ connected: boolean }> }
                         if (health.profiles?.every((profile) => profile.connected)) return
