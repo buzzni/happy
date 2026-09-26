@@ -15,7 +15,7 @@
 #   --install-packages        apt-get the host prerequisites (bubblewrap sudo iptables ipset gcc libc6-dev systemd-resolved libnss-resolve)
 #   --no-start                write everything, start nothing
 # Machine options (saved in /etc/abp/install.json; see abp-plan.mjs parseOptionFlags):
-#   --machine-id <id|auto> --workspace-id <id> --profile <id>=<principalId>... --agent-profile <id>
+#   --machine-id <id|auto> --workspace-id <id> --profile main=<principalId> (release 1: exactly main)
 #   --issuer <kid>=<public-key.pem>... --sites <policy.json> --runtime-port <n> --max-agent-windows <n>
 #   --retention-days <n> --viewer-origin <origin>... --egress-domain <domain>... --happy-prefix <dir>
 #   --browser-subnet-pool <private /20> --deny-cidr <cidr>... --browser-dns <ipv4>...
