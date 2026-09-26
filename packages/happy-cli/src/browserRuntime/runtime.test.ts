@@ -2,7 +2,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BrowserRuntimeError, type AgentGrant, type FormSubmission, type InteractiveCapability, type ProfileId, type RequestId } from './contracts'
+import { BrowserRuntimeError, type AgentGrant, type FormSubmission, type InteractiveCapability, type ProfileId, type RequestId, type TabId } from './contracts'
 import type { FakePage } from './testing/fakeDriver'
 import { fixtureSitePolicies } from './testing/fixtureSitePolicy'
 import { formDigest, type SitePolicy } from './policy'
@@ -1845,6 +1845,48 @@ describe('site policy at the runtime (D7)', () => {
         expect(result.outcome).toBe('failed')
         expect(result.steps[0].error?.code).toBe('STALE_REF')
         expect(h.driver.dispatchCounts.get('d7-relabel') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    /** The user's own resume (interactive credential) after a takeover; returns the task view. */
+    const userResumeAfterTurn = async (h: Awaited<ReturnType<typeof createHarness>>, tabId: TabId, id: string, page?: FakePage) => {
+        const leases = (h.runtime as unknown as { leases: { owner(tabId: string, profileId: ProfileId): { leaseEpoch: number } } }).leases
+        const control = ui(h, ['takeOver', 'releaseControl', 'resume'])
+        const taken = await h.runtime.takeOver(control, { taskId: h.task.taskId, tabId, expectedEpoch: leases.owner(tabId, h.profileId).leaseEpoch, requestId: `${id}-take` as RequestId })
+        if (page) h.driver.seedTab(tabId, page)
+        const released = await h.runtime.releaseControl(control, { taskId: h.task.taskId, tabId, expectedEpoch: taken.leaseEpoch, requestId: `${id}-release` as RequestId })
+        return h.runtime.resume(control, { taskId: h.task.taskId, expectedVersion: released.task.stateVersion, requestId: `${id}-resume` as RequestId })
+    }
+    const lastAttention = (h: Awaited<ReturnType<typeof createHarness>>) =>
+        h.store.events(h.task.taskId, 0).filter((event) => event.data.attention).at(-1)?.data
+
+    it('lets the user hand a handed-off action back to the agent with their own resume, and records it for the agent', async () => {
+        const permissive: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }] }]
+        const h = await createHarness('abp-d8-handoff-', undefined, permissive)
+        h.driver.seedTab(h.opened.tabId, { url: `${origin}/login`, form: { action: `${origin}/session`, method: 'post', enctype: 'application/x-www-form-urlencoded',
+            target: '', fields: [['user', 'a']], submitter: null, opaque: true },
+            elements: [{ ref: '@go' as never, role: 'button', name: 'Sign in', visible: true, frameOrigin: origin }] })
+        await observeHarnessTab(h)
+        expect(await runStep(h, 'd8-handoff', { kind: 'click', ref: '@go' })).toMatchObject({ outcome: 'awaiting-user', waitReason: 'handoff' })
+        const resumed = await userResumeAfterTurn(h, h.opened.tabId, 'd8-handoff')
+        expect(resumed).toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
+        expect(resumed.waitReason).toBeUndefined()
+        expect(lastAttention(h)).toMatchObject({ attention: 'user-resumed', waitCompleted: 'handoff' })
+        expect(h.driver.dispatchCounts.get('d8-handoff') ?? 0).toBe(0)
+        await h.store.close()
+    })
+
+    it('applies the site loginCompleteWhen to the user\'s own resume too, and records the completed login for the agent', async () => {
+        const sites: SitePolicy[] = [{ origin, actions: [{ match: {}, risk: 'auto' }], loginCompleteWhen: { urlPrefix: `${origin}/account`, text: 'Signed in' } }]
+        const h = await createHarness('abp-d8-login-', undefined, sites)
+        const login = await h.runtime.openPage(h.auth, { taskId: h.task.taskId, url: `${origin}/login`, requestId: 'd8-login' as RequestId })
+        expect(await userResumeAfterTurn(h, login.tabId, 'd8-error', { url: `${origin}/error`, text: 'Something failed', elements: [] }))
+            .toMatchObject({ status: 'awaiting-user', waitReason: 'login' })
+        expect(await userResumeAfterTurn(h, login.tabId, 'd8-partial', { url: `${origin}/account`, text: 'Welcome', elements: [] }))
+            .toMatchObject({ status: 'awaiting-user', waitReason: 'login' })
+        expect(await userResumeAfterTurn(h, login.tabId, 'd8-done', { url: `${origin}/account`, text: 'Welcome. Signed in', elements: [] }))
+            .toMatchObject({ status: 'paused', pauseReason: 'awaiting-agent' })
+        expect(lastAttention(h)).toMatchObject({ attention: 'user-resumed', waitCompleted: 'login' })
         await h.store.close()
     })
 

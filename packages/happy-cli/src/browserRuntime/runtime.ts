@@ -1165,22 +1165,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 || this.options.store.isRevoked(currentGrant.grantId))
                 throw new BrowserRuntimeError('SCOPE_DENIED', 'Task execution grant is expired or revoked')
         }
-        const wait = task.waitCompletion as {
-            batchId?: string
-            nextStep?: number
-            tabId: TabId
-            predicate?: BatchStep['until']
-            notPathPrefix?: string
-        } | undefined
-        if (task.waitReason && wait) {
+        const wait = task.waitCompletion as UserWaitCompletion | undefined
+        // Same completion rules as the agent's resume (handoff, site login condition, predicate).
+        if (task.waitReason) {
             if (Number(task.waitExpiresAtMs ?? 0) > 0 && this.clock.now() > Number(task.waitExpiresAtMs))
                 return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
                     { pauseReason: 'user-wait-expired', waitReason: task.waitReason }))
-            const observation = await this.driver(task.profileId).observe(wait.tabId, grant.allowedOrigins, { timeoutMs: 10000 })
-            const waitCompleted = wait.notPathPrefix
-                ? !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
-                : Boolean(wait.predicate && matchesWait(wait.predicate, observation))
-            if (!waitCompleted)
+            if (!(await this.userWaitCompleted(task, wait, grant.allowedOrigins)))
                 return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
                     waitReason: task.waitReason }, 0, false, unchanged))
         }
