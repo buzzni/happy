@@ -61,6 +61,19 @@ quote() {
 run() { if [ "$DRY_RUN" = 1 ]; then printf '+ %s\n' "$(quote "$@")"; else "$@"; fi; }
 plan() { "$NODE" "$here/abp-plan.mjs" "$@"; }
 changed() { case "$CHANGED" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+# restart_or_start <unit> <input paths...>: restart the unit if write_file changed any input, else start it.
+restart_or_start() {
+    local unit=$1 input
+    shift
+    for input in "$@"; do
+        if changed "$input"; then
+            say "restarting ${unit%.service} (inputs changed)"
+            run systemctl restart "$unit"
+            return 0
+        fi
+    done
+    run systemctl start "$unit"
+}
 cleanup() { if [ -n "$WORK" ]; then rm -rf "$WORK"; fi; }
 trap cleanup EXIT
 
@@ -543,20 +556,10 @@ main_install() {
     run systemctl restart abp-egress.service
     run systemctl restart abp-egress-proxy.service
     if [ -n "$machine_id" ] && { [ "$DRY_RUN" = 1 ] || [ -s "$VARLIB/stack-state.json" ]; }; then
-        # A restart fences, drains and pauses running tasks; only do it when the stack's inputs changed.
-        if changed "$RUNTIME_JSON" || changed "$VARLIB/secrets/runtime/vnc-password" || changed /etc/systemd/system/abp-stack.service \
-            || changed "$ETC/egress.rules4" || changed "$ETC/seccomp-chromium.json"; then
-            say "restarting abp-stack (inputs changed)"
-            run systemctl restart abp-stack.service
-        else
-            run systemctl start abp-stack.service
-        fi
-        if changed "$ETC/happy-daemon.env" || changed /etc/systemd/system/abp-happy-daemon.service || changed "$DAEMON_TOKEN"; then
-            say "restarting abp-happy-daemon (inputs changed)"
-            run systemctl restart abp-happy-daemon.service
-        else
-            run systemctl start abp-happy-daemon.service
-        fi
+        # A stack restart fences, drains and pauses running tasks; only do it when the stack's inputs changed.
+        restart_or_start abp-stack.service "$RUNTIME_JSON" "$VARLIB/secrets/runtime/vnc-password" /etc/systemd/system/abp-stack.service \
+            "$ETC/egress.rules4" "$ETC/seccomp-chromium.json"
+        restart_or_start abp-happy-daemon.service "$ETC/happy-daemon.env" /etc/systemd/system/abp-happy-daemon.service "$DAEMON_TOKEN"
     fi
     say "done. Next: see README (Claude login for agent-sbx), then: abp-install check"
 }
