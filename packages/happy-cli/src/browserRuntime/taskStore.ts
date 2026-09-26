@@ -269,12 +269,21 @@ export class TaskStore {
         return [...this.tasks.values()].filter((task) => (TERMINAL_STATUSES as readonly string[]).includes(task.status)
             && !task.uncertainActions.length && nowMs - Number(task.updatedAtMs) > retentionMs).map((task) => structuredClone(task))
     }
-    /** Deletes one task as described for purgeExpiredTasks; false when it no longer exists. */
+    /**
+     * Tabs of `task` still open in its space that no other task uses. Retention must close
+     * them in the browser first: deleting their references would orphan the windows.
+     */
+    openTabsOf(task: Pick<StoredTask, 'taskId' | 'taskSpaceId' | 'tabs'>): TabId[] {
+        const usedElsewhere = new Set([...this.tasks.values()].filter((other) => other.taskId !== task.taskId).flatMap((other) => other.tabs.map(String)))
+        const open = new Set((this.spaces.get(task.taskSpaceId)?.tabs ?? []).map(String))
+        return task.tabs.filter((tabId) => open.has(String(tabId)) && !usedElsewhere.has(String(tabId)))
+    }
+    /** Deletes one task as described for purgeExpiredTasks; false when it no longer exists or a tab of it is still open. */
     async purgeTask(id: TaskId): Promise<boolean> {
         return this.withTaskQueue(id, async () => {
             await this.assertWriter()
             const task = this.tasks.get(id)
-            if (!task)
+            if (!task || this.openTabsOf(task).length)
                 return false
             await this.faultInjector?.('purge-move')
             const purgedRoot = join(this.stateDir, PURGED_DIR)

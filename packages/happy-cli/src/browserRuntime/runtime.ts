@@ -711,30 +711,60 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     /**
      * Retention (retentionDays): deletes terminal tasks whose last change is older than
-     * `retentionMs` (TaskStore.purgeExpiredTasks) and what the Runtime keeps in memory for them.
+     * `retentionMs` and what the Runtime keeps in memory for them. Their still-open browser
+     * tabs are closed first and only then dropped from the space; a task whose tab cannot be
+     * closed (browser unreachable, beforeunload, user holding it) keeps all its state and is
+     * retried on the next run, also after a restart.
      */
     async purgeExpiredTasks(retentionMs: number): Promise<TaskId[]> {
         await this.recovery
-        const known = new Map(this.options.store.listTasks().map((task) => [task.taskId, task]))
-        const purged = await this.options.store.purgeExpiredTasks(this.clock.now(), retentionMs)
-        for (const taskId of purged) {
-            const task = known.get(taskId)
-            this.controllers.delete(taskId)
-            this.workers.delete(taskId)
-            this.inFlightDriverCalls.delete(taskId)
-            this.commitTails.delete(taskId)
-            for (const wake of this.eventWaiters.get(taskId) ?? [])
+        await this.options.store.resumePurges()
+        const purged: TaskId[] = []
+        for (const task of this.options.store.expiredTasks(this.clock.now(), retentionMs)) {
+            if (!(await this.closeRetainedTabs(task).catch(() => false)) || !(await this.options.store.purgeTask(task.taskId)))
+                continue
+            purged.push(task.taskId)
+            this.controllers.delete(task.taskId)
+            this.workers.delete(task.taskId)
+            this.inFlightDriverCalls.delete(task.taskId)
+            this.commitTails.delete(task.taskId)
+            for (const wake of this.eventWaiters.get(task.taskId) ?? [])
                 wake()
-            this.eventWaiters.delete(taskId)
-            this.leases.revokeTask(taskId)
-            for (const batchId of Object.keys(task?.batches ?? {}))
+            this.eventWaiters.delete(task.taskId)
+            this.leases.revokeTask(task.taskId)
+            for (const batchId of Object.keys(task.batches))
                 this.liveBatchSteps.delete(batchId as BatchId)
-            for (const tabId of task?.tabs ?? []) {
+            for (const tabId of task.tabs) {
                 this.latestAgentSnapshots.delete(tabId)
                 this.latestAgentUrls.delete(tabId)
             }
         }
         return purged
+    }
+    /** Closes an expired task's open tabs, removing each from its space once closed; false if any stays open. */
+    private async closeRetainedTabs(task: StoredTask): Promise<boolean> {
+        let closedAll = true
+        for (const tabId of this.options.store.openTabsOf(task)) {
+            if (this.leases.owner(tabId, task.profileId).owner.kind !== 'none') {
+                closedAll = false
+                continue
+            }
+            const driver = this.driver(task.profileId)
+            const result = await driver.closeTab(tabId, { timeoutMs: 5000 }).catch(() => undefined)
+            // A target that is already gone (closed just before a crash) counts as closed.
+            const closed = Boolean(result?.closed || (result && !result.beforeUnloadBlocked && !driver.hasTab(tabId)))
+            if (!closed) {
+                closedAll = false
+                continue
+            }
+            await this.options.store.mutateSpace(task.taskSpaceId, (current) => {
+                const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+                const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+                return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
+                    tabTargets, tabLeaseEpochs }
+            })
+        }
+        return closedAll
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
         let failure: unknown

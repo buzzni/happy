@@ -30,9 +30,11 @@ function storedTask(taskId: string): StoredTask {
 }
 
 /** Tasks ending at the given times, and a space whose tabs and request records refer to them. */
-async function seed(store: TaskStore, tasks: Array<{ id: string; status: TaskStatus; endedAtMs: number; uncertain?: boolean }>) {
+async function seed(store: TaskStore, tasks: Array<{ id: string; status: TaskStatus; endedAtMs: number; uncertain?: boolean; open?: boolean }>) {
     const tabIds = tasks.map((task) => `tab-${task.id}`)
-    await store.createSpace({ taskSpaceId: 's1' as TaskSpaceId, profileId: 'p1' as ProfileId, createdAtMs: 1, tabs: tabIds as never,
+    await store.createSpace({ taskSpaceId: 's1' as TaskSpaceId, profileId: 'p1' as ProfileId, createdAtMs: 1,
+        tabs: tasks.filter((task) => task.open).map((task) => `tab-${task.id}`) as never,
+        goneTabs: tasks.filter((task) => !task.open).map((task) => `tab-${task.id}`) as never,
         tabTargets: Object.fromEntries(tabIds.map((tabId) => [tabId, `target-${tabId}`])), tabLeaseEpochs: Object.fromEntries(tabIds.map((tabId) => [tabId, 1])),
         dedupe: Object.fromEntries(tasks.map((task) => [`request-${task.id}`, { hash: 'h', result: { task: { taskId: task.id } } }])) })
     for (const task of tasks) {
@@ -45,9 +47,12 @@ async function seed(store: TaskStore, tasks: Array<{ id: string; status: TaskSta
 const standardTasks = [
     { id: 'expired', status: 'succeeded' as const, endedAtMs: NOW - RETENTION - 1 },
     { id: 'boundary', status: 'failed' as const, endedAtMs: NOW - RETENTION },
-    { id: 'paused-old', status: 'paused' as const, endedAtMs: 1 },
-    { id: 'uncertain-old', status: 'cancelled' as const, endedAtMs: 1, uncertain: true },
+    { id: 'paused-old', status: 'paused' as const, endedAtMs: 1, open: true },
+    { id: 'uncertain-old', status: 'cancelled' as const, endedAtMs: 1, uncertain: true, open: true },
+    // Its browser tab is still open: only the Runtime (which closes it first) may delete it.
+    { id: 'expired-open', status: 'succeeded' as const, endedAtMs: 1, open: true },
 ]
+const KEPT = ['boundary', 'expired-open', 'paused-old', 'uncertain-old']
 
 async function expectPurged(dir: string, store: TaskStore, taskId: string) {
     expect(store.getTask(taskId as TaskId)).toBeUndefined()
@@ -57,22 +62,23 @@ async function expectPurged(dir: string, store: TaskStore, taskId: string) {
     expect(space.tabs).not.toContain(`tab-${taskId}`)
     expect(Object.keys(space.tabTargets ?? {})).not.toContain(`tab-${taskId}`)
     expect(Object.keys(space.tabLeaseEpochs ?? {})).not.toContain(`tab-${taskId}`)
+    expect(space.goneTabs ?? []).not.toContain(`tab-${taskId}`)
     expect(Object.keys(space.dedupe ?? {})).not.toContain(`request-${taskId}`)
 }
 
 describe('TaskStore retention', () => {
-    it('deletes only terminal tasks without uncertain actions whose last change is older than the retention', async () => {
+    it('deletes only terminal tasks without uncertain actions or open tabs whose last change is older than the retention', async () => {
         const dir = await tempDir()
         const store = await TaskStore.open(dir)
         await seed(store, standardTasks)
         expect(await store.purgeExpiredTasks(NOW, RETENTION)).toEqual(['expired'])
         await expectPurged(dir, store, 'expired')
-        expect(store.getSpace('s1' as TaskSpaceId)!.tabs).toEqual(['tab-boundary', 'tab-paused-old', 'tab-uncertain-old'])
-        expect(Object.keys(store.getSpace('s1' as TaskSpaceId)!.dedupe ?? {}).sort()).toEqual(['request-boundary', 'request-paused-old', 'request-uncertain-old'])
+        expect(store.getSpace('s1' as TaskSpaceId)!.tabs).toEqual(['tab-paused-old', 'tab-uncertain-old', 'tab-expired-open'])
+        expect(Object.keys(store.getSpace('s1' as TaskSpaceId)!.dedupe ?? {}).sort()).toEqual(KEPT.map((id) => `request-${id}`))
         await store.close()
 
         const reopened = await TaskStore.open(dir)
-        expect(reopened.listTasks().map((task) => task.taskId).sort()).toEqual(['boundary', 'paused-old', 'uncertain-old'])
+        expect(reopened.listTasks().map((task) => task.taskId).sort()).toEqual(KEPT)
         expect(await reopened.purgeExpiredTasks(NOW + 1, RETENTION)).toEqual(['boundary'])
         await reopened.close()
     })
@@ -90,7 +96,7 @@ describe('TaskStore retention', () => {
 
         const reopened = await TaskStore.open(dir)
         await expectPurged(dir, reopened, 'expired')
-        expect(reopened.listTasks().map((task) => task.taskId).sort()).toEqual(['boundary', 'paused-old', 'uncertain-old'])
+        expect(reopened.listTasks().map((task) => task.taskId).sort()).toEqual(KEPT)
         await reopened.close()
     })
 
@@ -152,6 +158,95 @@ describe('attention outbox and Runtime on retention', () => {
         const state = await attentionState(dir)
         expect([Object.keys(state.taskCursors), Object.keys(state.unresolved)]).toEqual([[], []])
         await reopened.close()
+    })
+
+    const profileId = 'profile-1' as ProfileId
+    async function runtimeWithFinishedTask(dir: string, driver: FakeBrowserDriver) {
+        const { store, runtime, clock } = await startRuntime(dir, driver)
+        const auth = agent(clock)
+        const space = await runtime.createSpace(auth, { profileId, requestId: 'space' as never })
+        const task = await runtime.createTask(auth, { taskSpaceId: space.taskSpaceId, requestId: 'task' as never })
+        const opened = await runtime.openPage(auth, { taskId: task.taskId, url: 'https://fixture.test/start', requestId: 'open' as never })
+        await store.commit(task.taskId, { status: 'succeeded' }, { type: 'state-changed', atMs: 2, leaseEpoch: 0, data: {} })
+        clock.set(3 + RETENTION)
+        return { store, runtime, clock, taskId: task.taskId, taskSpaceId: space.taskSpaceId, tabId: opened.tabId }
+    }
+    async function startRuntime(dir: string, driver: FakeBrowserDriver) {
+        const store = await TaskStore.open(dir)
+        const clock = new FakeClock(3 + RETENTION)
+        const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock, sites: [{ origin: 'https://fixture.test', actions: [] }] })
+        return { store, clock, runtime }
+    }
+    const agent = (clock: FakeClock) => ({ verifiedAtMs: clock.now(), credential: { kind: 'agent-grant', grantId: 'g', principalId: 'p', workspaceId: 'w', machineId: 'm',
+        agentSessionId: 'a', profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'getTask'], taskSpaceIds: [],
+        issuedAtMs: 0, expiresAtMs: 100 * DAY } as unknown as AgentGrant })
+    const spaceTabs = (store: TaskStore, taskSpaceId: TaskSpaceId) => {
+        const space = store.getSpace(taskSpaceId)!
+        return { tabs: space.tabs, targets: Object.keys(space.tabTargets ?? {}) }
+    }
+
+    it('closes an expired task\'s open browser tab before deleting the task', async () => {
+        const driver = new FakeBrowserDriver()
+        const h = await runtimeWithFinishedTask(await tempDir(), driver)
+        expect(driver.hasTab(h.tabId)).toBe(true)
+        expect(await h.runtime.purgeExpiredTasks(RETENTION)).toEqual([h.taskId])
+        expect(driver.hasTab(h.tabId)).toBe(false)
+        expect(h.store.getTask(h.taskId)).toBeUndefined()
+        expect(spaceTabs(h.store, h.taskSpaceId)).toEqual({ tabs: [], targets: [] })
+        await h.store.close()
+    })
+
+    it('keeps the task and its tab references when the tab cannot be closed, and retries on the next run', async () => {
+        const driver = new FakeBrowserDriver()
+        const h = await runtimeWithFinishedTask(await tempDir(), driver)
+        driver.failNext('closeTab', new Error('browser unreachable'))
+        expect(await h.runtime.purgeExpiredTasks(RETENTION)).toEqual([])
+        expect(h.store.getTask(h.taskId)).toBeDefined()
+        expect(spaceTabs(h.store, h.taskSpaceId)).toEqual({ tabs: [h.tabId], targets: [h.tabId] })
+        expect(driver.hasTab(h.tabId)).toBe(true)
+        expect(await h.runtime.purgeExpiredTasks(RETENTION)).toEqual([h.taskId])
+        expect(driver.hasTab(h.tabId)).toBe(false)
+        await h.store.close()
+    })
+
+    it('retries after a restart when closing failed before the Runtime stopped', async () => {
+        const dir = await tempDir()
+        const driver = new FakeBrowserDriver()
+        const h = await runtimeWithFinishedTask(dir, driver)
+        driver.failNext('closeTab', new Error('browser unreachable'))
+        expect(await h.runtime.purgeExpiredTasks(RETENTION)).toEqual([])
+        await h.store.close()
+
+        const restarted = await startRuntime(dir, driver)
+        expect(await restarted.runtime.purgeExpiredTasks(RETENTION)).toEqual([h.taskId])
+        expect(driver.hasTab(h.tabId)).toBe(false)
+        expect(spaceTabs(restarted.store, h.taskSpaceId)).toEqual({ tabs: [], targets: [] })
+        await restarted.store.close()
+    })
+
+    it('counts a tab the browser already closed as closed, and drops its references', async () => {
+        const driver = new FakeBrowserDriver()
+        const h = await runtimeWithFinishedTask(await tempDir(), driver)
+        await driver.closeTab(h.tabId, { timeoutMs: 1000 })
+        expect(await h.runtime.purgeExpiredTasks(RETENTION)).toEqual([h.taskId])
+        expect(spaceTabs(h.store, h.taskSpaceId)).toEqual({ tabs: [], targets: [] })
+        await h.store.close()
+    })
+
+    it('leaves no orphaned reference after a crash between closing the tab and removing it, and still deletes the task', async () => {
+        const dir = await tempDir()
+        const driver = new FakeBrowserDriver()
+        const h = await runtimeWithFinishedTask(dir, driver)
+        await driver.closeTab(h.tabId, { timeoutMs: 1000 })
+        await h.store.close()
+
+        const restarted = await startRuntime(dir, driver)
+        await restarted.runtime.purgeExpiredTasks(RETENTION)
+        // Start-up recovery already moved the vanished tab out of the space; its commit restarts the task's age.
+        expect(spaceTabs(restarted.store, h.taskSpaceId)).toEqual({ tabs: [], targets: [] })
+        restarted.clock.set(restarted.clock.now() + RETENTION + 1)
+        expect(await restarted.runtime.purgeExpiredTasks(RETENTION)).toEqual([h.taskId])
+        await restarted.store.close()
     })
 
     it('forgets a purged task in the Runtime: it is no longer found and its approvals are gone', async () => {
