@@ -17,6 +17,13 @@ const provenance: ActiveClaudeProvenance = {
     identities: new Set([JSON.stringify(['a@corp.com', 'org-a', 'Corp Inc'])]),
 }
 
+function withIdentities(...extra: Array<[string, string, string]>): ActiveClaudeProvenance {
+    return {
+        ...provenance,
+        identities: new Set([...provenance.identities, ...extra.map((identity) => JSON.stringify(identity))]),
+    }
+}
+
 // What Claude Code reports for a claude.ai subscription login: no tokenSource,
 // no apiKeySource, the account's email and organization name.
 const subscriber: AccountInfo = { email: 'a@corp.com', organization: 'Corp Inc', subscriptionType: 'max' }
@@ -71,10 +78,27 @@ describe('classifyObservedLogin', () => {
     })
 
     it('rejects when the login metadata names another account than Claude Code reported', () => {
+        // Both accounts are in the bundle, so only the agreement check can reject.
         expect(classifyObservedLogin({
             account: subscriber,
             live: { ...live, email: 'b@corp.com' },
-            provenance,
+            provenance: withIdentities(['b@corp.com', 'org-a', 'Corp Inc']),
+        })).toBe(false)
+    })
+
+    it('rejects when the login metadata names another organization than Claude Code reported', () => {
+        expect(classifyObservedLogin({
+            account: subscriber,
+            live: { ...live, organizationName: 'Renamed Org' },
+            provenance: withIdentities(['a@corp.com', 'org-a', 'Renamed Org']),
+        })).toBe(false)
+    })
+
+    it('rejects an empty email even if a record carried one', () => {
+        expect(classifyObservedLogin({
+            account: { ...subscriber, email: '' },
+            live: { ...live, email: '' },
+            provenance: withIdentities(['', 'org-a', 'Corp Inc']),
         })).toBe(false)
     })
 
@@ -127,10 +151,12 @@ describe('readLiveOauthAccount — where Claude Code keeps the login', () => {
     })
 
     it.each(['', 'relative/dir'])('gives up on CLAUDE_CONFIG_DIR=%j rather than guess what Claude resolved', async (dir) => {
+        // Every place a naive join could land holds a valid login, so only the
+        // guard can make this null.
         await expect(readLiveOauthAccount({
             env: { CLAUDE_CONFIG_DIR: dir },
             homeDir: '/home/u',
-            readFile: files({ '/home/u/.claude.json': oauthAccount }),
+            readFile: async () => oauthAccount,
         })).resolves.toBeNull()
     })
 
@@ -270,6 +296,46 @@ describe('startClaudeAuthObservation — one per provider run', () => {
             observation.noteTurnApiKeySource('/login managed key')
             await flush()
             expect(observation.current()).toBe(ORG_BUNDLE_OBSERVED)
+        })
+
+        it('reports nothing while a turn is still rechecking the deployment', async () => {
+            const recheck = deferred<ActiveClaudeProvenance | null>()
+            let reads = 0
+            const observation = startClaudeAuthObservation(observationDeps({
+                readProvenance: () => (++reads <= 2 ? Promise.resolve(provenance) : recheck.promise),
+            }))
+            await flush()
+            observation.noteTurnApiKeySource('none')
+            expect(observation.current()).toBeUndefined()
+            recheck.resolve(provenance)
+            await flush()
+            expect(observation.current()).toBe(ORG_BUNDLE_OBSERVED)
+        })
+
+        it('stops for good when a recheck does not answer in time', async () => {
+            let reads = 0
+            const observation = startClaudeAuthObservation(observationDeps({
+                readProvenance: () => (++reads <= 2 ? Promise.resolve(provenance) : new Promise(() => {})),
+                timeoutMs: 5,
+            }))
+            await flush()
+            observation.noteTurnApiKeySource('none')
+            await new Promise((r) => setTimeout(r, 20))
+            expect(observation.current()).toBeUndefined()
+        })
+
+        it('never throws from a turn, even when the recheck throws synchronously', async () => {
+            let reads = 0
+            const observation = startClaudeAuthObservation(observationDeps({
+                readProvenance: () => {
+                    if (++reads <= 2) return Promise.resolve(provenance)
+                    throw new Error('EACCES')
+                },
+            }))
+            await flush()
+            expect(() => observation.noteTurnApiKeySource('none')).not.toThrow()
+            await flush()
+            expect(observation.current()).toBeUndefined()
         })
 
         it('stops for good when a later turn finds the deployment replaced', async () => {

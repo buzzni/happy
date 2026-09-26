@@ -129,10 +129,13 @@ export function startClaudeAuthObservation(deps: {
     readLiveAccount: () => Promise<LiveOauthAccount | null>
     timeoutMs?: number
 }): ClaudeAuthObservation {
+    const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
     let disposed = false
     // Once anything contradicts the observation it stays off for this run.
     let contradicted = false
     let observed: { turnApiKeySource: string; generation: number } | null = null
+    // A turn's deployment recheck in flight: nothing is reported until it answers.
+    let pendingRechecks = 0
     const turnApiKeySources: unknown[] = []
 
     const contradict = () => {
@@ -152,10 +155,10 @@ export function startClaudeAuthObservation(deps: {
         return { turnApiKeySource: account?.apiKeySource ?? 'none', generation: after.generation }
     }
 
-    void withDeadline(observe(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+    void withDeadline(observe(), timeoutMs)
         .catch(() => null)
         .then((result) => {
-            if (disposed || contradicted || !result) return
+            if (contradicted || !result) return
             if (turnApiKeySources.some((source) => source !== result.turnApiKeySource)) {
                 contradict()
                 return
@@ -164,9 +167,9 @@ export function startClaudeAuthObservation(deps: {
         })
 
     return {
-        current: () => (!disposed && observed ? ORG_BUNDLE_OBSERVED : undefined),
+        current: () => (!disposed && observed && pendingRechecks === 0 ? ORG_BUNDLE_OBSERVED : undefined),
         noteTurnApiKeySource(apiKeySource) {
-            if (disposed || contradicted) return
+            if (disposed) return
             if (!observed) {
                 turnApiKeySources.push(apiKeySource)
                 return
@@ -176,15 +179,16 @@ export function startClaudeAuthObservation(deps: {
                 return
             }
             const generation = observed.generation
-            void deps.readProvenance()
-                .catch(() => null)
+            pendingRechecks += 1
+            void withDeadline(Promise.resolve().then(() => deps.readProvenance()), timeoutMs)
+                .catch(() => undefined)
                 .then((provenance) => {
-                    if (!disposed && provenance?.generation !== generation) contradict()
+                    pendingRechecks -= 1
+                    if (provenance?.generation !== generation) contradict()
                 })
         },
         dispose() {
             disposed = true
-            observed = null
         },
     }
 }
