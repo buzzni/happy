@@ -80,7 +80,6 @@ import {
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
-import { observeClaudeAiAuthSource } from './aiAuthObservation';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import {
@@ -2185,29 +2184,14 @@ export async function startDaemon(): Promise<void> {
           // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
           // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
           // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-          const finalSpawnEnvironment = applyConfirmedPromptDeliveryFlag(
+          const spawnEnvironment = applyAppliedAiAuthSourceEnv(applyConfirmedPromptDeliveryFlag(
             buildManagedSessionSpawnEnvironment(
               inheritedSpawnEnvironment,
               extraEnv,
               managedAiCredentialEnvironment,
             ),
             requireInitialPromptAck,
-          );
-          // Observed against the environment the child will actually get. Never
-          // throws, and lands on its own key — it cannot approve a selection.
-          const observedAiAuthSource = await observeClaudeAiAuthSource({
-            agent: agentCommand,
-            spawnPath: 'spawn',
-            env: finalSpawnEnvironment,
-            cwd: directory,
-            homeDir: os.homedir(),
-            readFile: (path) => fs.readFile(path, 'utf8'),
-          });
-          const spawnEnvironment = applyAppliedAiAuthSourceEnv(
-            finalSpawnEnvironment,
-            Object.keys(managedAiCredentialEnvironment).length > 0,
-            observedAiAuthSource,
-          );
+          ), Object.keys(managedAiCredentialEnvironment).length > 0);
           // 최종 env 를 만든 **뒤** 선택과 대조한다. 어긋나면 대체하지 않고 멈춘다.
           const spawnSelection = verifyAiAuthSelection(options.aiAuthSelection, spawnEnvironment);
           if (spawnSelection.rejection) {
@@ -2714,7 +2698,7 @@ export async function startDaemon(): Promise<void> {
           ),
         });
         logger.debug(`[lesson-host] resume owner=${resumeLessonLaunch.decision.owner} (${resumeLessonLaunch.decision.reason})`);
-        const finalResumedEnvironment = injectCheckpointSpawnContext(
+        const resumedEnvironment = applyAppliedAiAuthSourceEnv(injectCheckpointSpawnContext(
           resumeLessonLaunch.environment,
           authoritativeCheckpointProjectId
             ? {
@@ -2723,20 +2707,7 @@ export async function startDaemon(): Promise<void> {
               checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
             }
             : undefined,
-        );
-        const observedAiAuthSource = await observeClaudeAiAuthSource({
-          agent: launch.args[0] ?? '',
-          spawnPath: 'resume',
-          env: finalResumedEnvironment,
-          cwd: launch.cwd,
-          homeDir: os.homedir(),
-          readFile: (path) => fs.readFile(path, 'utf8'),
-        });
-        const resumedEnvironment = applyAppliedAiAuthSourceEnv(
-          finalResumedEnvironment,
-          Object.keys(managedAiCredentialEnvironment).length > 0,
-          observedAiAuthSource,
-        );
+        ), Object.keys(managedAiCredentialEnvironment).length > 0);
         if (options?.additionalDirectories !== undefined) {
           // Roots registered while the session was stopped only reach the sandbox here:
           // the OS sandbox profile is fixed for the life of the child process.

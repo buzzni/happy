@@ -649,30 +649,3 @@ describe('리뷰 수정: 확인할 수 없는 선택은 통과시키지 않는�
             .toBeUndefined()
     })
 })
-
-describe('observed source channel (specs/agent-ai-source-routing observation increment)', () => {
-    it('carries an observation on its own key and leaves the confirmed source alone', () => {
-        const child = applyAppliedAiAuthSourceEnv({ PATH: '/usr/bin' }, false, 'org-bundle')
-        expect(child.HAPPY_AI_AUTH_OBSERVED_SOURCE).toBe('org-bundle')
-        expect(child.HAPPY_AI_AUTH_SOURCE).toBe('unknown')
-    })
-
-    it('writes the key empty rather than omitting it — tmux keeps omitted keys', () => {
-        const child = applyAppliedAiAuthSourceEnv({ PATH: '/usr/bin' }, false)
-        expect(Object.prototype.hasOwnProperty.call(child, 'HAPPY_AI_AUTH_OBSERVED_SOURCE')).toBe(true)
-        expect(child.HAPPY_AI_AUTH_OBSERVED_SOURCE).toBe('')
-    })
-
-    it('clears an observation inherited from an earlier session', () => {
-        const child = applyAppliedAiAuthSourceEnv({ HAPPY_AI_AUTH_OBSERVED_SOURCE: 'org-bundle' }, false, 'unknown')
-        expect(child.HAPPY_AI_AUTH_OBSERVED_SOURCE).toBe('')
-    })
-
-    it('does not let an observation approve an explicit selection', () => {
-        // The selection check reads HAPPY_AI_AUTH_SOURCE only. Were the observation
-        // written there, an org-bundle selection would pass on circumstantial
-        // evidence — the substitution this feature exists to prevent.
-        const child = applyAppliedAiAuthSourceEnv({ PATH: '/usr/bin' }, false, 'org-bundle')
-        expect(verifyAiAuthSelection({ kind: 'org-bundle' }, child).rejection).toBeDefined()
-    })
-})

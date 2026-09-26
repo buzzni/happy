@@ -67,14 +67,6 @@ export const HAPPY_AI_AUTH_SOURCE_ENV = 'HAPPY_AI_AUTH_SOURCE'
 /** The connection version the source was resolved from, when there is one. */
 export const HAPPY_AI_AUTH_CONNECTION_VERSION_ENV = 'HAPPY_AI_AUTH_CONNECTION_VERSION'
 
-/**
- * What the daemon *observed* at spawn (specs/agent-ai-source-routing
- * observation increment) — kept apart from HAPPY_AI_AUTH_SOURCE because an
- * explicit credential selection is verified against that one, and an
- * observation must never approve a selection.
- */
-export const HAPPY_AI_AUTH_OBSERVED_SOURCE_ENV = 'HAPPY_AI_AUTH_OBSERVED_SOURCE'
-
 /** Exact tokens only — a cased variant is a token this build does not know. */
 export function normalizeAiAuthSource(value: unknown): AiAuthSource {
     if (typeof value !== 'string') return 'unknown'

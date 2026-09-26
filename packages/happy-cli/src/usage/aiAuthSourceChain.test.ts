@@ -82,33 +82,15 @@ describe('배선 가드: daemon 이 실제로 원천을 심는가', () => {
     const text = await source('../daemon/run.ts')
     // 호출 횟수만 세면 헬퍼를 overlay 앞으로 옮겨도 3 회 그대로라 통과한다.
     // 각 호출의 인자가 최종 env 를 만드는 함수인지 본다.
-    // 첫 인자는 최종 env 를 만드는 호출이거나, 그런 호출의 결과를 담은 변수다.
-    // 변수는 관측 판정에 **같은** 최종 env 를 넘기려고 뺀 것이다.
-    const finalEnvBuilders = ['applyConfirmedPromptDeliveryFlag', 'injectCheckpointSpawnContext']
-    const firstArgs = [...text.matchAll(/applyAppliedAiAuthSourceEnv\(\s*([A-Za-z]+)(\()?/g)]
-    expect(firstArgs).toHaveLength(3)
-    for (const [, name, isCall] of firstArgs) {
-      const builder = isCall
-        ? name
-        : text.match(new RegExp(`const ${name} = ([A-Za-z]+)\\(`))?.[1]
-      expect(finalEnvBuilders).toContain(builder)
+    const wrapped = [...text.matchAll(/applyAppliedAiAuthSourceEnv\(\s*([A-Za-z]+)\(/g)]
+      .map((match) => match[1])
+    expect(wrapped).toHaveLength(3)
+    for (const inner of wrapped) {
+      expect([
+        'applyConfirmedPromptDeliveryFlag',
+        'injectCheckpointSpawnContext',
+      ]).toContain(inner)
     }
-  })
-
-  it('관측 판정은 일반 spawn·resume 에서 **최종 env** 로 불리고, tmux 에선 불리지 않는다', async () => {
-    // specs/agent-ai-source-routing/observation-increment.md §2.3·§2.4. tmux 는
-    // 서버에 남은 env 를 볼 수 없어 판정하지 않는다. 판정기가 최종 env 가 아닌
-    // 중간 env 를 보면 관리 자격 덮어쓰기 이후의 우회를 놓친다.
-    const text = await source('../daemon/run.ts')
-    const observations = [...text.matchAll(
-      /observeClaudeAiAuthSource\(\{[\s\S]*?spawnPath: '([a-z]+)',[\s\S]*?env: ([A-Za-z]+),[\s\S]*?\}\);\s*const [A-Za-z]+ = applyAppliedAiAuthSourceEnv\(\s*([A-Za-z]+),[\s\S]*?,\s*([A-Za-z]+),?\s*\)/g,
-    )]
-    expect(observations.map(([, path]) => path).sort()).toEqual(['resume', 'spawn'])
-    for (const [, , observedEnv, passedEnv, passedObservation] of observations) {
-      expect(passedEnv).toBe(observedEnv)
-      expect(passedObservation).toBe('observedAiAuthSource')
-    }
-    expect(text).not.toContain("spawnPath: 'tmux'")
   })
 
   it('각 호출이 체험 임대 적용 여부를 넘긴다 — 안 넘기면 개인 GLM 키가 플랫폼으로 잡힌다', async () => {
