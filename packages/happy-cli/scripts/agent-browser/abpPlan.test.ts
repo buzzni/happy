@@ -64,6 +64,11 @@ describe('install options', () => {
         expect(() => mergeInstallOptions(undefined, { workspaceId: 'w', profiles: [{ profileId: 'a', principalId: 'u' }], issuers: [{ kid: 'k', publicKeyPem: pem() }] }), 'missing machineId').toThrow(/machineId/)
     })
 
+    it('allows exactly one profile named main in release 1 (the Desktop requests profile main)', () => {
+        expect(() => mergeInstallOptions(base(), { profiles: [{ profileId: 'ops', principalId: 'u' }] })).toThrow(/exactly one profile named main/)
+        expect(() => mergeInstallOptions(base(), { profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }] })).toThrow(/exactly one profile named main/)
+        expect(mergeInstallOptions(base(), { profiles: [{ profileId: 'main', principalId: 'u9' }] }).profiles).toEqual([{ profileId: 'main', principalId: 'u9' }])
+    })
 
     it('refuses a private key given as the issuer key and never echoes it', () => {
         const privatePem = generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()

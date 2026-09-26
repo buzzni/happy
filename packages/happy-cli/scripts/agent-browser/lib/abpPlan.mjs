@@ -45,6 +45,8 @@ export const PATHS = {
   opsLock: "/run/abp-stack-ops.lock",
 };
 export const DEFAULT_BROWSER_SUBNET_POOL = "10.249.240.0/20";
+/** The only profile release 1 installs (the Desktop requests it). */
+export const RELEASE_PROFILE = "main";
 const MAX_PROFILES = 16;
 /** Container-side paths (fixed by the images). */
 const IN_CONTAINER = { secrets: "/run/secrets/abp", vncPassword: "/run/secrets/abp/vnc-password", state: "/var/lib/abp", stateDir: "/var/lib/abp/state", profile: "/home/browser/profile" };
@@ -133,6 +135,9 @@ export function mergeInstallOptions(saved, flags) {
     seen.add(profile.profileId);
   }
   merged.profiles = merged.profiles.map(({ profileId, principalId }) => ({ profileId, principalId }));
+  // Release 1: one dedicated user per machine and the Desktop asks for profile "main". The generators
+  // below support several profiles; lift this check together with the Desktop when that ships.
+  if (merged.profiles.length !== 1 || merged.profiles[0].profileId !== RELEASE_PROFILE) fail("profiles", `release 1 installs exactly one profile named ${RELEASE_PROFILE} (--profile ${RELEASE_PROFILE}=<studio userId>)`);
   if (!seen.has(merged.agentProfileId)) fail("agentProfileId", "must be one of the configured profiles");
   if (!Array.isArray(merged.trustedIssuers) || merged.trustedIssuers.length === 0) fail("trustedIssuers", "at least one --issuer <kid>=<public-key.pem> is required");
   merged.trustedIssuers = merged.trustedIssuers.map((issuer, index) => {

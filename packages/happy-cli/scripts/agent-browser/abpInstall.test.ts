@@ -117,6 +117,10 @@ describe('abp-install --dry-run', () => {
         expect(result.status).not.toBe(0)
         expect(result.stderr).toMatch(/profileId/)
         expect(result.stdout).not.toMatch(/useradd/)
+        const other = bash('abp-install', ['--dry-run', 'install', '--machine-id', 'm', '--workspace-id', 'w', '--profile', 'ops=u', '--issuer', `k1=${pemFile}`])
+        expect(other.status).not.toBe(0)
+        expect(other.stderr).toMatch(/exactly one profile named main/)
+        expect(other.stdout).not.toMatch(/useradd/)
     })
 })
 
