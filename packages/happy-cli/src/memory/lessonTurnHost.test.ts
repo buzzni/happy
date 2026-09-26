@@ -9,7 +9,10 @@ const settings = { revision: 1, recallEnabled: true, reviewEnabled: false, daily
 
 function fixture() {
     const deps = {
-        host: { projectHash: verified.projectHash, close: vi.fn(), hashCandidatePayload: vi.fn(), service: {
+        // openLessonHost always sets the workspace path, and it is quoted once
+        // per shortened block, so budget tests must measure a production-length one.
+        host: { projectHash: verified.projectHash, projectPath: '/home/user/.happy/automation-worktrees/0123456789abcdef01234567',
+            close: vi.fn(), hashCandidatePayload: vi.fn(), service: {
             recall: vi.fn().mockResolvedValue({ outcome: 'selected', traceId: 'trace', lessonIds: ['l'], lessons: [lesson] }),
             ackDelivery: vi.fn().mockResolvedValue({ outcome: 'delivered', traceId: 'trace' }),
         } },
@@ -242,6 +245,18 @@ describe('lesson previews when full bodies do not fit', () => {
         expect(result.block).toContain('reference only');
         expect(Buffer.byteLength(result.block)).toBeLessThanOrEqual(1500);
     });
+
+    it('still delivers references for 240-byte names, as the bare-reference form did', async () => {
+        const longName = (n: number) => ({ ...realistic(n, koreanTrigger), name: `${'n'.repeat(238)}-${n}` });
+        const result = await recallWith([longName(1), longName(2), longName(3)]);
+        if (result.outcome !== 'selected') throw new Error(`expected selected, got ${result.outcome}`);
+        expect(result.block).toContain('projectPath="/home/user/.happy/automation-worktrees/0123456789abcdef01234567"');
+        for (const n of [1, 2, 3]) {
+            expect(result.block).toContain(`[lesson:${uuid(n)}]`);
+            expect(result.block).toContain('(reference only, delivered revision 2)');
+        }
+        expect(Buffer.byteLength(result.block)).toBeLessThanOrEqual(1500);
+    });
 });
 
 describe('lesson preview review follow-ups', () => {
@@ -258,7 +273,7 @@ describe('lesson preview review follow-ups', () => {
     }
 
     it('keeps a preview whose triggers are shorter than the per-trigger floor', async () => {
-        const result = await recallWith([1, 2, 3].map(n => base(n, { name: `${'이름'.repeat(34)}-${n}`, trigger: 'CI' })));
+        const result = await recallWith([1, 2, 3].map(n => base(n, { name: `${'이름'.repeat(31)}-${n}`, trigger: 'CI' })));
         if (result.outcome !== 'selected') throw new Error(`expected selected, got ${result.outcome}`);
         expect(result.block.split('\n').filter(line => line === '  when: CI')).toHaveLength(3);
         expect(Buffer.byteLength(result.block)).toBeLessThanOrEqual(1500);
