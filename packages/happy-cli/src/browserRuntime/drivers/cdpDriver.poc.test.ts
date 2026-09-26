@@ -178,7 +178,17 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             // After every guard listener: an ancestor seeing the bubbling formdata event, and a form listener added mid-click.
             a.route(`/late-bubble-${key}`, form(`late-bubble-${key}`, `document.addEventListener('formdata', (e) => e.formData.set('amount', '999'))`))
             a.route(`/late-form-${key}`, form(`late-form-${key}`, '', `onmousedown="f.addEventListener('formdata', (e) => e.formData.append('extra', '1'))"`))
+            // Registered before the guard, in the capture phase: the guard's listeners never see the events.
+            const swallow = (type: string, mutate = '') => `window.addEventListener('${type}', (e) => { ${mutate} e.stopImmediatePropagation() }, true)`
+            a.route(`/suppress-formdata-${key}`, form(`suppress-formdata-${key}`, swallow('formdata', `e.formData.set('amount', '999');`)))
+            a.route(`/suppress-both-${key}`, form(`suppress-both-${key}`, `${swallow('submit')}; ${swallow('formdata', `e.formData.set('amount', '999');`)}`))
+            a.route(`/suppress-clean-${key}`, form(`suppress-clean-${key}`, `${swallow('submit')}; ${swallow('formdata')}`))
         }
+        a.route('/suppress-file', () => `${HIT_SCRIPT}<body><form id="f" action="/hit/suppress-file" method="post" enctype="multipart/form-data">
+            <input name="amount" value="10"><input type="file" name="doc">
+            <button id="pay" name="op" value="pay" style="width:120px;height:40px"
+                onmousedown="const d = new DataTransfer(); d.items.add(new File(['synthetic'], 'a.txt')); document.querySelector('[name=doc]').files = d.files">Pay</button></form>
+            <script>for (const type of ['submit', 'formdata']) window.addEventListener(type, (e) => e.stopImmediatePropagation(), true)</script></body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -379,7 +389,8 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 const child = await eventually(() => own.targets(), (t) => t.some((x) => x.url.endsWith('/popup-opener')))
                 const { sessionId } = await own.conn.send('Target.attachToTarget', { targetId: child.find((x) => x.url.endsWith('/popup-opener'))!.targetId, flatten: true })
                 void own.conn.send('Runtime.evaluate', { expression: `window.open('${a.url('/hit/grandchild-ran')}'); 1`, userGesture: true }, sessionId).catch(() => undefined)
-                expect(await eventually(() => a.hits('popup-ran') + a.hits('worker-ran') + b.hits('frame-ran') + a.hits('grandchild-ran'), (n) => n === 4, 5_000)).toBe(4)
+                const ran = () => ({ popup: a.hits('popup-ran'), worker: a.hits('worker-ran'), frame: b.hits('frame-ran'), grandchild: a.hits('grandchild-ran') })
+                expect(await eventually(ran, (r) => Object.values(r).every((n) => n === 1), 15_000)).toEqual({ popup: 1, worker: 1, frame: 1, grandchild: 1 })
                 for (const site of [a, b]) site.resetHits()
             })
         })
@@ -762,6 +773,45 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 expect(a.hits(`late-bubble-${key}`) + a.hits(`late-form-${key}`)).toBe(0)
             })
         }
+
+        for (const key of ['get', 'post', 'multipart', 'text']) {
+            it(`verifies the final ${key} request even when the page suppresses the guard's events (capture + stopImmediatePropagation)`, async () => {
+                for (const path of [`suppress-formdata-${key}`, `suppress-both-${key}`]) {
+                    const error = await expectCode(clickExpecting(`/${path}`), 'APPROVAL_EXPIRED')
+                    expect(error.mayHaveSideEffects, path).toBe(true)
+                }
+                // Nothing changed: the request itself is the verdict, and it matches.
+                await clickExpecting(`/suppress-clean-${key}`)
+                expect(await eventually(() => a.hits(`suppress-clean-${key}`), (n) => n === 1)).toBe(1)
+                await delay(800)
+                expect(a.hits(`suppress-formdata-${key}`) + a.hits(`suppress-both-${key}`)).toBe(0)
+            })
+        }
+
+        it('rejects a changed submission when the guard gives no verdict at all (reports lost)', async () => {
+            const silent = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, testHooks: { dropGuardReports: () => true } })
+            await silent.connect()
+            try {
+                for (const path of ['/late-bubble-post', '/late-bubble-get']) {
+                    const tab = await silent.openTab(a.url(path), [a.origin], OPTS)
+                    const obs = await silent.observe(tab.tabId, [a.origin], OPTS)
+                    const ref = obs.elements.find((e) => e.name === 'Pay')!.ref
+                    const expectation = expectationOf(await silent.describeRef(tab.tabId, ref, obs.snapshotId, OPTS))
+                    await expectCode(silent.click(tab.tabId, ref, obs.snapshotId, { ...OPTS, expect: expectation }), 'APPROVAL_EXPIRED')
+                }
+                await delay(800)
+                expect(a.hits('late-bubble-post') + a.hits('late-bubble-get')).toBe(0)
+            } finally {
+                await silent.close()
+            }
+        })
+
+        it('does not send a submission it cannot verify (a file added mid-click while the guard is blinded)', async () => {
+            const error = await expectCode(clickExpecting('/suppress-file'), 'APPROVAL_EXPIRED')
+            expect(error.mayHaveSideEffects).toBe(true)
+            await delay(800)
+            expect(a.hits('suppress-file')).toBe(0)
+        })
 
         it('stops the submission when mousedown, click or later submit/formdata handlers changed it', async () => {
             for (const path of ['/guard-down', '/guard-click', '/guard-submit-late', '/guard-formdata']) {
