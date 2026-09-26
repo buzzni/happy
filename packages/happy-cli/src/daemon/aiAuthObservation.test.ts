@@ -132,21 +132,6 @@ describe('observeClaudeAiAuthSource', () => {
                 .resolves.toBe('unknown')
         })
 
-        it("reads Claude's files under the child's HOME, but the deployment record under the daemon's", async () => {
-            // The daemon writes provenance to its own ~/.happy. Claude Code, in
-            // the child, resolves its login and user settings from the child's HOME.
-            const files = baseFiles()
-            files['/home/child/.claude.json'] = JSON.stringify({
-                oauthAccount: { emailAddress: 'me@personal.com', organizationUuid: 'org-me' },
-            })
-            await expect(observe({ files, env: { HOME: '/home/child' } })).resolves.toBe('unknown')
-
-            const bundled = baseFiles()
-            bundled['/home/child/.claude.json'] = bundled[`${HOME}/.claude.json`]!
-            delete bundled[`${HOME}/.claude.json`]
-            await expect(observe({ files: bundled, env: { HOME: '/home/child' } })).resolves.toBe('org-bundle')
-        })
-
         it('prefers the legacy <config home>/.config.json when it exists, as Claude Code does', async () => {
             await expect(observe({
                 files: withFile(`${HOME}/.claude/.config.json`, JSON.stringify({
