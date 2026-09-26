@@ -26,11 +26,16 @@ it.each(['/usr/bin/sudo', FIREWALL_READER])('refuses failed live check %s', path
     mocks.exec.mockImplementation((p, args) => { if (p === path) throw new Error('denied'); return original(p, args); });
     expect(() => checkSandboxPrerequisites()).toThrow();
 });
-it('refuses broker group membership and world-readable agent home', () => {
+it('refuses broker group membership', () => {
     const original = mocks.exec.getMockImplementation()!;
     mocks.exec.mockImplementation((p, args) => args[0] === '-Gn' ? 'agent-sbx abp-session' : original(p, args));
-    expect(() => checkSandboxPrerequisites()).toThrow();
-    mocks.exec.mockImplementation(original);
-    mocks.stat.mockReturnValue({ uid: 0, mode: 0o777, isSymbolicLink: () => false });
-    expect(() => checkSandboxPrerequisites()).toThrow();
+    expect(() => checkSandboxPrerequisites()).toThrow(/sandbox identity, permissions/);
+});
+it('refuses a world-readable agent home while every installation path is trusted', () => {
+    // Only the home changes (0755): the installation paths stay root-owned 0755, so a failure here can only
+    // come from the home check, never from the earlier installation check.
+    const original = mocks.stat.getMockImplementation()!;
+    mocks.stat.mockImplementation((p: string) => p === '/home/agent' ? { ...original(p), mode: 0o755 } : original(p));
+    expect(() => checkSandboxPrerequisites()).toThrow(/sandbox identity, permissions/);
+    expect(() => checkSandboxPrerequisites()).not.toThrow(/untrusted sandbox installation/);
 });
