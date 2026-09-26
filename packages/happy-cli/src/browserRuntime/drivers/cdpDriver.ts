@@ -40,6 +40,7 @@ import {
 } from '../contracts'
 import { formDigest } from '../policy'
 import { CdpConnection, CdpProtocolError, connectionClosedError } from './cdpConnection'
+import { verifySubmissionRequest } from './submissionCheck'
 import { CHECK_ELEMENT, CLIMB_FRAMES, COLLECT_FRAME, DESCRIBE_ELEMENT, FRAME_HAS_TEXT, HIT_TEST, IN_THIS_DOCUMENT, LABEL_OF, SELECT_CONTENT, SUBMIT_GUARD, type CollectedFrame, type ElementState } from './pageScripts'
 
 export interface CdpDriverOptions {
@@ -179,7 +180,10 @@ interface SubmitGuard {
     frameId: string
     expected: FormSubmission
     untilMs: number
-    /** last verdict reported by the page: armed | submitted | blocked | expired */
+    /**
+     * armed → submitted (submit event) → submitting (form's formdata matched) → sent (the
+     * request matched) | blocked (any mismatch, or the request did not match) | expired
+     */
     lastStatus: string
     waiters: Set<() => void>
 }
@@ -876,7 +880,10 @@ export class CdpDriver implements BrowserDriver {
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, binding.sessionId)
-            if (live?.form && tab.submitGuard && await this.submitGuardStatus(tab.submitGuard, GUARD_SETTLE_MS) === 'blocked') {
+            // A submission's verdict: the page's (at submit/formdata) and then the request check's.
+            const guard = live?.form ? tab.submitGuard : undefined
+            if (guard && await this.submitGuardStatus(guard, GUARD_SETTLE_MS) !== 'blocked') await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['submitted', 'submitting'])
+            if (guard?.lastStatus === 'blocked') {
                 throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
             }
             this.assertEnforced(tab)
@@ -1258,7 +1265,6 @@ export class CdpDriver implements BrowserDriver {
                         conn.send('Fetch.continueRequest', { requestId: params.requestId }, sessionId).catch(() => undefined)
                         return
                     }
-                    if (tab.submitGuard) tab.submitGuard.lastStatus = 'blocked'
                     conn.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => undefined)
                     this.onBlocked(conn, tab, sessionId, params)
                 })
@@ -1607,46 +1613,56 @@ export class CdpDriver implements BrowserDriver {
      * that arrives first waits briefly (the page cannot be queried while its navigation
      * request is paused).
      */
-    private async submitGuardStatus(guard: SubmitGuard, waitMs = 0): Promise<string> {
-        if (guard.lastStatus === 'armed' && waitMs > 0) {
+    private async submitGuardStatus(guard: SubmitGuard, waitMs = 0, waitWhile: string[] = ['armed']): Promise<string> {
+        const deadline = Date.now() + waitMs
+        while (waitWhile.includes(guard.lastStatus) && Date.now() < deadline) {
             await new Promise<void>((resolve) => {
                 const done = () => {
                     clearTimeout(timer)
                     guard.waiters.delete(done)
                     resolve()
                 }
-                const timer = setTimeout(done, waitMs)
+                const timer = setTimeout(done, Math.max(0, deadline - Date.now()))
                 guard.waiters.add(done)
             })
         }
         return guard.lastStatus
     }
 
-    private onGuardReport(sessionId: string, status: string): void {
-        const tab = this.sessions.get(sessionId)?.tab
-        const guard = tab?.submitGuard
-        if (!guard || guard.sessionId !== sessionId || guard.lastStatus === 'blocked') return
+    private settleGuard(guard: SubmitGuard, status: string): void {
         guard.lastStatus = status
         for (const done of [...guard.waiters]) done()
     }
 
+    private onGuardReport(sessionId: string, status: string): void {
+        const tab = this.sessions.get(sessionId)?.tab
+        const guard = tab?.submitGuard
+        if (!guard || guard.sessionId !== sessionId || guard.lastStatus === 'blocked') return
+        this.settleGuard(guard, status)
+    }
+
     /**
-     * While a submission guard is armed, a document request of the tab waits for its
-     * verdict: stopped when the guard blocked, or when the guarded form's frame (or a
-     * new browsing context it targets) navigates with another method or destination.
+     * While a submission guard is armed, a document request of the tab is checked before
+     * it is sent: refused when the guard blocked. A request of the guarded form's frame (or
+     * the new browsing context it targets) that follows the form's formdata event is the
+     * submission itself: its final method, URL with query and body must be exactly the
+     * approved submission (every page handler has run by now), else it is not sent.
      */
     private async submissionAllowed(tab: TabState, params: any): Promise<boolean> {
         const guard = tab.submitGuard
         if (!guard || params.resourceType !== 'Document' || Date.now() > guard.untilMs) return true
-        const status = await this.submitGuardStatus(guard, GUARD_VERDICT_MS)
-        if (status === 'blocked') return false
-        if (status !== 'submitted') return true
         const newContext = !['', '_self'].includes(guard.expected.target)
-        if (params.frameId !== guard.frameId && !(newContext && this.popupTabs.has(params.frameId))) return true
+        const fromForm = params.frameId === guard.frameId || (newContext && this.popupTabs.has(params.frameId))
+        if (!fromForm) return guard.lastStatus !== 'blocked'
+        // The page's formdata report precedes the request, but not necessarily in CDP event order.
+        const status = await this.submitGuardStatus(guard, GUARD_VERDICT_MS, ['armed', 'submitted'])
+        if (status === 'blocked') return false
+        // No formdata event: not this form's submission (e.g. the page cancelled it and navigated itself).
+        if (status !== 'submitting') return true
         tab.submitGuard = undefined
-        const withoutQuery = (url: string) => url.split('#')[0].split('?')[0]
-        const method = String(params.request.method).toLowerCase()
-        return method === guard.expected.method && withoutQuery(params.request.url) === withoutQuery(guard.expected.action)
+        const verdict = verifySubmissionRequest(guard.expected, params.request)
+        this.settleGuard(guard, verdict === 'match' ? 'sent' : 'blocked')
+        return verdict === 'match'
     }
 
     /**

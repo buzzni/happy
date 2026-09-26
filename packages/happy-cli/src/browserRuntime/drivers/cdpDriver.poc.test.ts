@@ -167,6 +167,18 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             <button onclick="const f = document.createElement('iframe'); f.src = '${b.url('/frame-runs')}'; document.body.append(f)">Add frame</button></body>`)
         a.route('/popup-opener', () => `<body>popup</body>`)
         b.route('/frame-runs', () => `<body><script>fetch('/hit/frame-ran', { method: 'POST' })</script>frame</body>`)
+        const encodings = { get: ['get', 'application/x-www-form-urlencoded'], post: ['post', 'application/x-www-form-urlencoded'],
+            multipart: ['post', 'multipart/form-data'], text: ['post', 'text/plain'] } as const
+        for (const [key, [method, enctype]] of Object.entries(encodings)) {
+            const form = (hit: string, script: string, buttonAttrs = '') => () => `${HIT_SCRIPT}<body><form id="f" action="/hit/${hit}?src=cart" method="${method}" enctype="${enctype}">
+                <input type="hidden" name="token" value="t1"><input name="amount" value="10"><textarea name="note">a\nb</textarea>
+                <button id="pay" name="op" value="pay" style="width:120px;height:40px" ${buttonAttrs}>Pay</button></form>
+                <script>const f = document.getElementById('f'), pay = document.getElementById('pay'); ${script}</script></body>`
+            a.route(`/sub-${key}`, form(`sub-${key}`, ''))
+            // After every guard listener: an ancestor seeing the bubbling formdata event, and a form listener added mid-click.
+            a.route(`/late-bubble-${key}`, form(`late-bubble-${key}`, `document.addEventListener('formdata', (e) => e.formData.set('amount', '999'))`))
+            a.route(`/late-form-${key}`, form(`late-form-${key}`, '', `onmousedown="f.addEventListener('formdata', (e) => e.formData.append('extra', '1'))"`))
+        }
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -737,6 +749,19 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             await delay(500)
             expect(a.hits('g-post') + a.hits('g-other')).toBe(0)
         })
+
+        for (const key of ['get', 'post', 'multipart', 'text']) {
+            it(`checks the final ${key} request: an unchanged one is sent once, one changed by a late formdata listener is not sent`, async () => {
+                await clickExpecting(`/sub-${key}`)
+                expect(await eventually(() => a.hits(`sub-${key}`), (n) => n === 1)).toBe(1)
+                for (const late of [`late-bubble-${key}`, `late-form-${key}`]) {
+                    const error = await expectCode(clickExpecting(`/${late}`), 'APPROVAL_EXPIRED')
+                    expect(error.mayHaveSideEffects, late).toBe(true)
+                }
+                await delay(800)
+                expect(a.hits(`late-bubble-${key}`) + a.hits(`late-form-${key}`)).toBe(0)
+            })
+        }
 
         it('stops the submission when mousedown, click or later submit/formdata handlers changed it', async () => {
             for (const path of ['/guard-down', '/guard-click', '/guard-submit-late', '/guard-formdata']) {
