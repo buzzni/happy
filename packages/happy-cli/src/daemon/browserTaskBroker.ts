@@ -259,6 +259,35 @@ export function createBrowserTaskSessionBroker(
     return broker
 }
 
+/**
+ * Resumed session processes need their own registration: the previous process's one was revoked at its exit.
+ * Registers, hands the secret to the spawn, binds the known session id, and revokes it if the spawn does not succeed.
+ */
+export async function spawnResumedWithBrowserTaskRegistration<R extends { type: string }>(input: {
+    broker: BrowserTaskSessionBroker | undefined
+    agentSessionId: string
+    env: Record<string, string>
+    spawn: (env: Record<string, string>) => Promise<R>
+    ownerPid: () => number | undefined
+    onRevokeFailure: (error: unknown) => void
+}): Promise<R> {
+    const { broker, agentSessionId } = input
+    const registration = await broker?.register()
+    if (!broker || !registration) return input.spawn(input.env)
+    const release = () => broker.revoke({ registrationId: registration.registrationId }).catch(input.onRevokeFailure)
+    let result: R
+    try {
+        result = await input.spawn({ ...input.env, HAPPY_BROWSER_TASK_SESSION_SECRET: registration.sessionSecret })
+    } catch (error) {
+        await release()
+        throw error
+    }
+    if (!(result.type === 'success' && await broker.bind(registration.registrationId, agentSessionId, input.ownerPid()))) {
+        await release()
+    }
+    return result
+}
+
 /** Start immediately and avoid overlapping sweeps; stopping never revokes surviving sessions. */
 export function startBrowserTaskReconciliation(broker: BrowserTaskSessionBroker | undefined, intervalMs = 60_000): () => void {
     if (!broker) return () => {}

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { PendingRevocationQueueError, createBrowserTaskSessionBroker } from './browserTaskBroker'
+import { PendingRevocationQueueError, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration } from './browserTaskBroker'
 
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
@@ -143,5 +143,59 @@ describe('daemon pending revocation queue', () => {
         expect(JSON.parse(readFileSync(file, 'utf8')).pending).toEqual([{ registrationId: 'reg-1' }, { agentSessionId: 'session-2' }])
         expect(readFileSync(leftover, 'utf8')).toBe('half-written')
         expect(readdirSync(dir).filter((name) => name.endsWith('.tmp'))).toEqual(['.pending.json.crashed.tmp'])
+    })
+})
+
+describe('resumed session browser task registration', () => {
+    const replies = {
+        '/v1/sessions/register': { status: 200, body: { ok: true, result: { registrationId: 'reg-2', sessionSecret: 'secret-2' } } },
+        '/v1/sessions/bind': { status: 200, body: { ok: true, result: { bound: true } } },
+        '/v1/sessions/revoke': { status: 200, body: { ok: true, result: { revoked: true, grants: 0 } } },
+    }
+    async function resumeBroker() {
+        const { calls, request } = recorder(replies)
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }, request)!
+        return { broker, paths: () => calls.map((call) => [call.path, (call.body as Record<string, unknown>).registrationId, (call.body as Record<string, unknown>).agentSessionId]) }
+    }
+
+    it('gives the resumed session process a fresh secret and binds it to the resumed session id', async () => {
+        const { broker, paths } = await resumeBroker()
+        const spawned: Record<string, string>[] = []
+        const result = await spawnResumedWithBrowserTaskRegistration({
+            broker, agentSessionId: 'session-1', env: { APLUS_SESSION_ID: 'session-1' },
+            spawn: async (env) => { spawned.push(env); return { type: 'success', sessionId: 'session-1' } },
+            ownerPid: () => undefined, onRevokeFailure: () => {},
+        })
+        expect(result).toEqual({ type: 'success', sessionId: 'session-1' })
+        expect(spawned).toEqual([{ APLUS_SESSION_ID: 'session-1', HAPPY_BROWSER_TASK_SESSION_SECRET: 'secret-2' }])
+        expect(paths()).toEqual([['/v1/sessions/register', undefined, undefined], ['/v1/sessions/bind', 'reg-2', 'session-1']])
+    })
+
+    it('revokes the registration when the resume spawn fails or throws', async () => {
+        const failed = await resumeBroker()
+        await spawnResumedWithBrowserTaskRegistration({
+            broker: failed.broker, agentSessionId: 'session-1', env: {},
+            spawn: async () => ({ type: 'error', errorMessage: 'no pid' }),
+            ownerPid: () => undefined, onRevokeFailure: () => {},
+        })
+        expect(failed.paths()).toEqual([['/v1/sessions/register', undefined, undefined], ['/v1/sessions/revoke', 'reg-2', undefined]])
+
+        const thrown = await resumeBroker()
+        await expect(spawnResumedWithBrowserTaskRegistration({
+            broker: thrown.broker, agentSessionId: 'session-1', env: {},
+            spawn: async () => { throw new Error('spawn failed') },
+            ownerPid: () => undefined, onRevokeFailure: () => {},
+        })).rejects.toThrow('spawn failed')
+        expect(thrown.paths()).toEqual([['/v1/sessions/register', undefined, undefined], ['/v1/sessions/revoke', 'reg-2', undefined]])
+    })
+
+    it('resumes without a secret when the machine has no broker', async () => {
+        const spawned: Record<string, string>[] = []
+        await spawnResumedWithBrowserTaskRegistration({
+            broker: undefined, agentSessionId: 'session-1', env: { APLUS_SESSION_ID: 'session-1' },
+            spawn: async (env) => { spawned.push(env); return { type: 'success', sessionId: 'session-1' } },
+            ownerPid: () => undefined, onRevokeFailure: () => {},
+        })
+        expect(spawned).toEqual([{ APLUS_SESSION_ID: 'session-1' }])
     })
 })

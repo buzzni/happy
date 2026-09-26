@@ -136,7 +136,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { createBrowserTaskSessionBroker, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import { findBrowserAttentionSession, startBrowserAttentionWatcher } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -2744,14 +2744,21 @@ export async function startDaemon(): Promise<void> {
             : undefined,
         ), Object.keys(managedAiCredentialEnvironment).length > 0);
 
-        const result = await spawnTrackedHappyProcess({
-          args: launch.args,
-          cwd: launch.cwd,
-          // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
-          // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
+        const result = await spawnResumedWithBrowserTaskRegistration({
+          broker: browserTaskBroker,
+          agentSessionId: happySessionId,
           env: resumedEnvironment,
-          userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
-          resumeTargetSessionId: happySessionId,
+          spawn: (env) => spawnTrackedHappyProcess({
+            args: launch.args,
+            cwd: launch.cwd,
+            // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
+            // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
+            env,
+            userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
+            resumeTargetSessionId: happySessionId,
+          }),
+          ownerPid: () => Array.from(pidToTrackedSession.values()).find((session) => session.happySessionId === happySessionId)?.pid,
+          onRevokeFailure: reportBrowserTaskRevokeFailure,
         });
         return result.type === 'error'
           ? { ...result, code: 'SESSION_RESUME_FAILED' }
