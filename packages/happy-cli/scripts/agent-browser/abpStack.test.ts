@@ -22,6 +22,7 @@ interface HostOptions {
     running?: Array<number | undefined>
     /** whether `docker inspect` reports the Runtime running (controlled operations) */
     runtimeRunning?: boolean
+    profiles?: Array<{ profileId: string; principalId: string }>
 }
 
 /** Records every command; files live in a map; the Runtime's image label follows the state file (as abp-stack run would). */
@@ -29,11 +30,15 @@ function fakeHost(options: HostOptions = {}) {
     const calls: string[] = []
     const logs: string[] = []
     const files = new Map<string, { data: string; mode: number; owner: string; group: string }>()
-    const install = mergeInstallOptions(undefined, {
-        machineId: 'machine-1', workspaceId: 'ws-1',
-        profiles: [{ profileId: 'main', principalId: 'user-1' }, { profileId: 'ops', principalId: 'user-2' }],
-        issuers: [{ kid: 'k1', publicKeyPem: generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString() }],
-    })
+    const install = {
+        ...mergeInstallOptions(undefined, {
+            machineId: 'machine-1', workspaceId: 'ws-1',
+            profiles: [{ profileId: 'main', principalId: 'user-1' }],
+            issuers: [{ kid: 'k1', publicKeyPem: generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString() }],
+        }),
+        // Two profiles exercise the per-profile loops; release 1 installs only main (see the set-principal test).
+        profiles: options.profiles ?? [{ profileId: 'main', principalId: 'user-1' }, { profileId: 'ops', principalId: 'user-2' }],
+    }
     files.set(PATHS.installConfig, { data: JSON.stringify(install), mode: 0o600, owner: 'root', group: 'root' })
     files.set(PATHS.runtimeConfig, { data: JSON.stringify({ daemonTokenSha256: 'e'.repeat(64) }), mode: 0o600, owner: 'root', group: 'root' })
     files.set(PATHS.stackState, { data: JSON.stringify({ schemaVersion: 1, current: options.current === undefined ? { runtime: RUNTIME_OLD, browser: BROWSER_OLD } : options.current, previous: options.previous ?? null, history: [] }), mode: 0o600, owner: 'root', group: 'root' })
@@ -334,7 +339,7 @@ describe('abp-stack upgrade / rollback', () => {
         const release = await host.deps.opLock()
         await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 1 })).rejects.toThrow(/another abp-stack operation/)
         await expect(createStack(host.deps).rotateKeys()).rejects.toThrow(/another abp-stack operation/)
-        await expect(createStack(host.deps).setPrincipal('ops', 'x')).rejects.toThrow(/another abp-stack operation/)
+        await expect(createStack(host.deps).setPrincipal('main', 'x')).rejects.toThrow(/another abp-stack operation/)
         expect(host.calls).toEqual([])
         release()
         await createStack(host.deps).rotateKeys({ daemonToken: false, vncPassword: true })
@@ -419,11 +424,11 @@ describe('abp-stack rotate-keys', () => {
 
 describe('abp-stack set-principal', () => {
     it('reassigns a profile owner in both config files and restarts the Runtime behind the fence', async () => {
-        const host = fakeHost()
-        await createStack(host.deps).setPrincipal('ops', 'user-9')
-        expect(JSON.parse(host.files.get(PATHS.installConfig)!.data).profiles).toContainEqual({ profileId: 'ops', principalId: 'user-9' })
+        const host = fakeHost({ profiles: [{ profileId: 'main', principalId: 'user-1' }] })
+        await createStack(host.deps).setPrincipal('main', 'user-9')
+        expect(JSON.parse(host.files.get(PATHS.installConfig)!.data).profiles).toEqual([{ profileId: 'main', principalId: 'user-9' }])
         const config = JSON.parse(host.files.get(PATHS.runtimeConfig)!.data)
-        expect(config.profiles).toContainEqual({ profileId: 'ops', principalId: 'user-9' })
+        expect(config.profiles).toEqual([{ profileId: 'main', principalId: 'user-9' }])
         expect(config.daemonTokenSha256).toBe('e'.repeat(64))
         expect(host.calls.indexOf('docker restart -t 30 abp-runtime')).toBeGreaterThan(host.calls.indexOf(FENCE))
         expect(() => createStack(host.deps).setPrincipal('nope', 'user-9')).toThrow(/unknown profile/)
