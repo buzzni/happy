@@ -353,14 +353,19 @@ ensure_accounts() {
 }
 
 HAPPY_PREFIX_MARKER=.abp-happy-prefix
+# The installer's own default Happy prefix (abp-plan.mjs happyPrefix default).
+DEFAULT_HAPPY_PREFIX=/opt/abp/happy
 
-# happy_prefix_is_dedicated <prefix>: absent, empty, marked by this installer, or an earlier install that
-# holds only a Happy package. Anything else may be shared with other software and is never replaced.
+# happy_prefix_is_dedicated <prefix>: absent, empty, or marked by this installer. An unmarked earlier install
+# is trusted only at the installer's own default prefix and only if it holds a Happy package at the top
+# level: elsewhere, lib/node_modules may be shared with other packages, so it is never replaced.
 happy_prefix_is_dedicated() {
     local prefix=$1 entry
     [ -e "$prefix" ] || return 0
     [ -e "$prefix/$HAPPY_PREFIX_MARKER" ] && return 0
-    [ -d "$prefix/lib/node_modules/@buzzni/happy-cli" ] || [ -z "$(ls -A "$prefix")" ] || return 1
+    [ -z "$(ls -A "$prefix")" ] && return 0
+    [ "$prefix" = "$DEFAULT_HAPPY_PREFIX" ] || return 1
+    [ -d "$prefix/lib/node_modules/@buzzni/happy-cli" ] || return 1
     for entry in "$prefix"/* "$prefix"/.[!.]*; do
         [ -e "$entry" ] || continue
         case "${entry##*/}" in bin | lib | share | etc) ;; *) return 1 ;; esac
@@ -742,7 +747,7 @@ IMAGES_DIR=""
 BUILD_FROM=""
 INSTALL_PACKAGES=0
 NO_START=0
-HAPPY_PREFIX=/opt/abp/happy
+HAPPY_PREFIX=$DEFAULT_HAPPY_PREFIX
 if [ "${1:-}" = --dry-run ]; then DRY_RUN=1; shift; fi
 command=install
 case "${1:-}" in install | check | claude-login) command=$1; shift ;; esac
