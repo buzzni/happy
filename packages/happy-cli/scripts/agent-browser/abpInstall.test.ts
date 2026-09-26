@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir, userInfo } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -120,7 +120,31 @@ describe('abp-install --dry-run', () => {
     })
 })
 
-describe('abp-install internals (sourced)', () => {
+/**
+ * safe_path refuses paths below directories that others may write (e.g. /tmp, 1777), so its
+ * fixtures must live below a directory whose whole ancestor chain passes the same rule: owned by
+ * root or this user, not group/other-writable, no symlinks. The first such candidate is used.
+ */
+function trustedBase(): string | undefined {
+    const uid = userInfo().uid
+    const passes = (dir: string): boolean => {
+        for (let current = dir; ; current = dirname(current)) {
+            const stat = lstatSync(current)
+            if (stat.isSymbolicLink() || (stat.uid !== 0 && stat.uid !== uid) || (stat.mode & 0o022)) return false
+            if (current === '/') return true
+        }
+    }
+    for (const candidate of [tmpdir(), homedir(), here]) {
+        try {
+            const real = realpathSync(candidate)
+            if (passes(real)) return real
+        } catch { /* try the next one */ }
+    }
+    return undefined
+}
+const fixtureBase = trustedBase()
+
+describe.skipIf(!fixtureBase)('abp-install internals (sourced; needs a directory with a trusted ancestor chain)', () => {
     /** Runs a snippet with abp-install's functions loaded (main does not run when sourced). */
     const sourced = (snippet: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0; ${snippet}`, 'test', join(here, 'abp-install')], {
         encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, ABP_NODE: process.execPath },
@@ -134,7 +158,7 @@ describe('abp-install internals (sourced)', () => {
     })
 
     it('records a changed file in the parent shell and not an unchanged one, so restarts follow real changes', () => {
-        const root = realpathSync(mkdtempSync(join(tmpdir(), 'abp-emit-')))
+        const root = mkdtempSync(join(fixtureBase!, '.abp-emit-'))
         chmodSync(root, 0o755)
         const target = join(root, 'config.json')
         const result = sourced(`
@@ -150,7 +174,7 @@ describe('abp-install internals (sourced)', () => {
     })
 
     it('refuses to write through a symlink, under a symlinked or group-writable directory', () => {
-        const root = realpathSync(mkdtempSync(join(tmpdir(), 'abp-path-')))
+        const root = mkdtempSync(join(fixtureBase!, '.abp-path-'))
         chmodSync(root, 0o755)
         mkdirSync(join(root, 'real'), { mode: 0o755 })
         writeFileSync(join(root, 'elsewhere'), 'x')
