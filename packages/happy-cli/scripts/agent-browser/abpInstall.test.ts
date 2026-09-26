@@ -176,7 +176,10 @@ describe('abp-install --dry-run', () => {
 /**
  * safe_path refuses paths below directories that others may write (e.g. /tmp, 1777), so its
  * fixtures must live below a directory whose whole ancestor chain passes the same rule: owned by
- * root or this user, not group/other-writable, no symlinks. The first such candidate is used.
+ * root or this user, not group/other-writable, no symlinks. The candidate must also be writable
+ * (proved by creating and removing a directory: a sandboxed or read-only home can pass the ownership
+ * rule and still refuse writes). Candidates are tried in a fixed order; the first one that qualifies
+ * is used, and without one these suites are skipped.
  */
 function trustedBase(): string | undefined {
     const uid = userInfo().uid
@@ -187,10 +190,18 @@ function trustedBase(): string | undefined {
             if (current === '/') return true
         }
     }
-    for (const candidate of [tmpdir(), homedir(), here]) {
+    const writable = (dir: string): boolean => {
+        try {
+            rmSync(mkdtempSync(join(dir, '.abp-probe-')), { recursive: true, force: true })
+            return true
+        } catch {
+            return false
+        }
+    }
+    for (const candidate of [tmpdir(), homedir(), join(here, '..', '..'), here, process.cwd()]) {
         try {
             const real = realpathSync(candidate)
-            if (passes(real)) return real
+            if (passes(real) && writable(real)) return real
         } catch { /* try the next one */ }
     }
     return undefined
