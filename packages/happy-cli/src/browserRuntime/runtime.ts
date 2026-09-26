@@ -745,26 +745,32 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private async closeRetainedTabs(task: StoredTask): Promise<boolean> {
         let closedAll = true
         for (const tabId of this.options.store.openTabsOf(task)) {
-            if (this.leases.owner(tabId, task.profileId).owner.kind !== 'none') {
+            if (await this.closeSpaceTab(task.profileId, task.taskSpaceId, tabId) !== 'closed')
                 closedAll = false
-                continue
-            }
-            const driver = this.driver(task.profileId)
-            const result = await driver.closeTab(tabId, { timeoutMs: 5000 }).catch(() => undefined)
-            // A target that is already gone (closed just before a crash) counts as closed.
-            const closed = Boolean(result?.closed || (result && !result.beforeUnloadBlocked && !driver.hasTab(tabId)))
-            if (!closed) {
-                closedAll = false
-                continue
-            }
-            await this.options.store.mutateSpace(task.taskSpaceId, (current) => {
-                const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
-                const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
-                return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
-                    tabTargets, tabLeaseEpochs }
-            })
         }
         return closedAll
+    }
+    /**
+     * Closes one space tab in the browser and only then drops it from the space. A target
+     * that is already gone (closed just before a crash) counts as closed; a tab a user holds
+     * is not touched.
+     */
+    private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId): Promise<'closed' | 'held' | 'blocked' | 'failed'> {
+        if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
+            return 'held'
+        const driver = this.driver(profileId)
+        const result = await driver.closeTab(tabId, { timeoutMs: 5000 }).catch(() => undefined)
+        if (result?.beforeUnloadBlocked)
+            return 'blocked'
+        if (!result?.closed && !(result && !driver.hasTab(tabId)))
+            return 'failed'
+        await this.options.store.mutateSpace(taskSpaceId, (current) => {
+            const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
+                tabTargets, tabLeaseEpochs }
+        })
+        return 'closed'
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
         let failure: unknown
@@ -1283,6 +1289,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.authorizeTask(auth, 'cancel', task)
         if (['succeeded', 'failed', 'cancelled'].includes(task.status))
             return { status: 'cancel-accepted', task: this.view(task), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        const latest = await this.cancelTask(task)
+        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
+    }
+    /**
+     * The cancel fence: revokes the task's input leases, aborts its worker and durably
+     * records the cancel; writes whose outcome is unknown leave it paused
+     * (`cancelled-with-unknown-effect`) instead of cancelled.
+     */
+    private async cancelTask(task: StoredTask): Promise<StoredTask> {
         const revokedLeases = this.leases.revokeTask(task.taskId)
         for (const lease of revokedLeases)
             await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
@@ -1301,8 +1316,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     current.stateVersion + 1),
             }
         })
-        const latest = next ?? this.requireTask(task.taskId)
-        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        return next ?? this.requireTask(task.taskId)
     }
     private async closeSpaceImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
