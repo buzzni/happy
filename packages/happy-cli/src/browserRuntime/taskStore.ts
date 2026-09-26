@@ -257,32 +257,41 @@ export class TaskStore {
      */
     async purgeExpiredTasks(nowMs: number, retentionMs: number): Promise<TaskId[]> {
         await this.resumePurges()
-        const expired = [...this.tasks.values()].filter((task) => (TERMINAL_STATUSES as readonly string[]).includes(task.status)
-            && !task.uncertainActions.length && nowMs - Number(task.updatedAtMs) > retentionMs).map((task) => task.taskId)
         const purged: TaskId[] = []
-        for (const id of expired) {
-            await this.withTaskQueue(id, async () => {
-                await this.assertWriter()
-                const task = this.tasks.get(id)
-                if (!task)
-                    return
-                await this.faultInjector?.('purge-move')
-                const purgedRoot = join(this.stateDir, PURGED_DIR)
-                await mkdir(purgedRoot, { recursive: true })
-                await rename(join(this.stateDir, 'tasks', id), join(purgedRoot, id))
-                await this.syncDirectory(join(this.stateDir, 'tasks'))
-                await this.syncDirectory(purgedRoot)
-                this.tasks.delete(id)
-                purged.push(id)
-                for (const listener of this.purgeListeners) {
-                    try { listener(id) } catch { /* observers never fail a purge */ }
-                }
-                await this.finishPurge(id, task)
-            })
+        for (const task of this.expiredTasks(nowMs, retentionMs)) {
+            if (await this.purgeTask(task.taskId))
+                purged.push(task.taskId)
         }
         return purged
     }
-    private async resumePurges(): Promise<void> {
+    /** Terminal tasks without uncertain actions whose last change is older than `retentionMs`. */
+    expiredTasks(nowMs: number, retentionMs: number): StoredTask[] {
+        return [...this.tasks.values()].filter((task) => (TERMINAL_STATUSES as readonly string[]).includes(task.status)
+            && !task.uncertainActions.length && nowMs - Number(task.updatedAtMs) > retentionMs).map((task) => structuredClone(task))
+    }
+    /** Deletes one task as described for purgeExpiredTasks; false when it no longer exists. */
+    async purgeTask(id: TaskId): Promise<boolean> {
+        return this.withTaskQueue(id, async () => {
+            await this.assertWriter()
+            const task = this.tasks.get(id)
+            if (!task)
+                return false
+            await this.faultInjector?.('purge-move')
+            const purgedRoot = join(this.stateDir, PURGED_DIR)
+            await mkdir(purgedRoot, { recursive: true })
+            await rename(join(this.stateDir, 'tasks', id), join(purgedRoot, id))
+            await this.syncDirectory(join(this.stateDir, 'tasks'))
+            await this.syncDirectory(purgedRoot)
+            this.tasks.delete(id)
+            for (const listener of this.purgeListeners) {
+                try { listener(id) } catch { /* observers never fail a purge */ }
+            }
+            await this.finishPurge(id, task)
+            return true
+        })
+    }
+    /** Finishes deletions a crash interrupted (tasks-purged/). */
+    async resumePurges(): Promise<void> {
         const purgedRoot = join(this.stateDir, PURGED_DIR)
         let ids: string[]
         try {
