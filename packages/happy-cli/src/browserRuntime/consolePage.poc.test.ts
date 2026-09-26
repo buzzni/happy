@@ -132,7 +132,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(renewed)}, expiresAtMs: Date.now() + 900_000 }, location.origin)`)
         const second = await eventually(() => ops.filter((entry) => entry.op === 'viewerTicket')[1], Boolean, 5_000)
         expect(second?.bearer).toBe(renewed)
-        expect(await harness.evaluate(target, `document.getElementById('screen').src`)).toContain(encodeURIComponent('ticket=ticket-2'))
+        // The fake server records the request before the page has applied its reply to the iframe.
+        expect(await eventually(() => harness.evaluate(target, `document.getElementById('screen').src`), (src) => String(src).includes(encodeURIComponent('ticket=ticket-2')), 5_000))
+            .toContain(encodeURIComponent('ticket=ticket-2'))
         await harness.closeTarget(target)
     }, 30_000)
 
