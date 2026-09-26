@@ -61,6 +61,8 @@ describe('install options', () => {
             ['public browser subnet pool', { browserSubnetPool: '8.8.0.0/20' }],
             ['browser subnet pool not a /20', { browserSubnetPool: '10.249.0.0/16' }],
             ['deny CIDR not a network', { denyCidrs: ['10.0.0.1/33'] }],
+            // ipset hash:net refuses prefix 0, so abp-firewall apply-egress would fail on every start.
+            ['deny CIDR of everything', { denyCidrs: ['0.0.0.0/0'] }],
             ['browser DNS not an IPv4 address', { browserDns: ['dns.example'] }],
             ['more than 16 profiles', { profiles: Array.from({ length: 17 }, (_, i) => ({ profileId: `p${i}`, principalId: 'u' })) }],
         ]
@@ -299,6 +301,13 @@ describe('browser networks and egress firewall', () => {
         expect(chain.at(-1)).toBe('-j REJECT')
         expect(chain).not.toContain(`-s ${main.runtimeIp}/32 -j RETURN`)
         expect(rules[4].chains['ABP-INPUT']).toEqual(['-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN', '-j REJECT'])
+    })
+
+    it('writes a /32 deny entry as the bare host, the form ipset save reports (check-egress compares them)', () => {
+        const hosts = stackLayout({ ...install, denyCidrs: ['203.0.114.7/32'] })
+        const deny = egressRules(hosts, { ...install, denyCidrs: ['203.0.114.7/32'] })[4].sets['abp-deny4']
+        expect(deny).toContain('203.0.114.7')
+        expect(deny).not.toContain('203.0.114.7/32')
     })
 
     it('rejects all IPv6 from browser bridges (they have no IPv6 addresses to use)', () => {
