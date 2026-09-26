@@ -29,6 +29,7 @@
  *   ABP_WRITER_FLOCK         lock file the entrypoint holds with flock -F (set by the entrypoint)
  *   ABP_RUNTIME_UID/GID      identity to drop to when started as root (set by the image)
  *   ABP_MAX_AGENT_WINDOWS    agent windows per profile (harness; config: maxAgentWindows; default 4, at most the tab quota)
+ *   ABP_SPACE_IDLE_RECLAIM_MS  close idle finished task spaces after this long (harness; config: spaceIdleReclaimMs; off in harness by default)
  *   ABP_SITE_POLICY          JSON sites[] (policy.parseSitePolicies), harness mode; config mode uses runtime.json sites[]
  *   ABP_VNC_PASSWORD_FILE    per-run x11vnc password (or ABP_VNC_PASSWORD); enables the viewer (D2). Read before dropping root.
  *   ABP_VIEWER_ORIGINS       comma-separated tunnel origins for the viewer (harness; config: viewerOrigins)
@@ -69,6 +70,7 @@ interface KeysFile extends AuthKeys {
 const RECONNECT_BACKOFF_MS = [250, 500, 1_000, 2_000, 5_000]
 const SWEEP_INTERVAL_MS = 1_000
 const RETENTION_INTERVAL_MS = 60 * 60_000
+const SPACE_RECLAIM_INTERVAL_MS = 30_000
 const DAY_MS = 24 * 60 * 60_000
 const LOCK_HEARTBEAT_MS = 5_000
 
@@ -305,7 +307,11 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     // Connect before recovery so it can compare browser instance ids.
     await Promise.all(profiles.map((profile) => connectWithRetry(drivers.get(profile.profileId)!, profile, log)))
 
-    const runtime = new BrowserRuntime({ store, drivers, sites })
+    // Harness keeps the PoC space quota and no idle reclamation unless asked.
+    const harnessIdleMs = process.env.ABP_SPACE_IDLE_RECLAIM_MS ? Number(process.env.ABP_SPACE_IDLE_RECLAIM_MS) : undefined
+    const runtime = new BrowserRuntime({ store, drivers, sites,
+        maxSpacesPerProfile: config?.maxSpacesPerProfile,
+        spaceIdleReclaimMs: config?.spaceIdleReclaimMs ?? (Number.isFinite(harnessIdleMs) ? harnessIdleMs : undefined) })
 
     for (const profile of profiles) {
         const driver = drivers.get(profile.profileId)!
@@ -369,6 +375,27 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
         retention.unref()
     }
 
+    // Task spaces of ended sessions (broker) and idle finished ones are closed; a pass is
+    // also started right after a session ends. Blocked tabs are reported and retried.
+    let reclaiming = false
+    const reclaim = () => {
+        if (reclaiming) return
+        reclaiming = true
+        void runtime.reclaimSpaces()
+            .then((reports) => {
+                for (const report of reports) {
+                    if (report.closed || report.blockedTabs || report.failedTabs || report.retained)
+                        log(`space reclaim space=${report.taskSpaceId} reason=${report.reason} closed=${report.closed} tabs=${report.closedTabs.length}`
+                            + ` blocked=${report.blockedTabs?.length ?? 0} failed=${report.failedTabs?.length ?? 0} retained=${report.retained?.length ?? 0}`)
+                }
+            })
+            .catch((error) => log(`space reclaim failed code=${(error as BrowserRuntimeError).code ?? 'ERROR'}`))
+            .finally(() => { reclaiming = false })
+    }
+    reclaim()
+    const reclaimTimer = setInterval(reclaim, SPACE_RECLAIM_INTERVAL_MS)
+    reclaimTimer.unref()
+
     const fenceAcksMs: number[] = []
     // Records cancel fence ACK latency for metrics; every other operation goes straight to the Runtime.
     const api = new Proxy(runtime, {
@@ -398,6 +425,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
             allowedOrigins: config.sites.map((site) => site.origin),
             agentKey: keys.agentKey,
             revokeGrant: (grantId) => runtime.revokeGrant(grantId),
+            endSession: async (agentSessionId) => { await runtime.endSession(agentSessionId); reclaim() },
             attention,
             log,
         })
@@ -455,6 +483,7 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
     const shutdown = async () => {
         clearInterval(sweep)
         clearInterval(retention)
+        clearInterval(reclaimTimer)
         clearInterval(heartbeat)
         await server.close()
         await admin.close()
