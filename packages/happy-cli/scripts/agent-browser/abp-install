@@ -6,6 +6,7 @@
 #
 #   abp-install [--dry-run] [install] [options]   install or update (root; --dry-run prints every action)
 #   abp-install check                             verify the installed machine (root)
+#   abp-install claude-login                      log agent-sbx in to Claude (interactive, through the proxy)
 #
 # Installer options:
 #   --happy-tarball <tgz>     install this Happy package (npm pack) under the Happy prefix
@@ -455,6 +456,35 @@ main_install() {
     say "done. Next: see README (Claude login for agent-sbx), then: abp-install check"
 }
 
+# ---- claude-login --------------------------------------------------------------------------------
+# claude_binary <happy prefix> <uname -m>: the Claude Agent SDK's native binary shipped in the Happy package.
+claude_binary() {
+    local arch
+    case "$2" in
+        x86_64 | amd64) arch=x64 ;;
+        aarch64 | arm64) arch=arm64 ;;
+        *) die "unsupported architecture $2 (the Claude Agent SDK ships linux-x64 and linux-arm64)" ;;
+    esac
+    printf '%s/lib/node_modules/@buzzni/happy-cli/node_modules/@anthropic-ai/claude-agent-sdk-linux-%s/claude\n' "$1" "$arch"
+}
+
+# Claude keeps its login in /home/agent-sbx/.claude (the sandbox's only writable home). The owner
+# firewall lets agent-sbx reach only the loopback CONNECT proxy, so the login goes through it too.
+main_claude_login() {
+    local prefix=$HAPPY_PREFIX binary
+    if [ -r "$INSTALL_JSON" ]; then
+        prefix=$("$NODE" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).happyPrefix || "")' "$INSTALL_JSON")
+        [ -n "$prefix" ] || prefix=$HAPPY_PREFIX
+    fi
+    binary=$(claude_binary "$prefix" "$(uname -m)")
+    if [ "$DRY_RUN" = 0 ]; then
+        [ "$(id -u)" = 0 ] || die "run as root"
+        [ -x "$binary" ] || die "Claude binary not found at $binary (install the Happy package first)"
+    fi
+    say "starting Claude as agent-sbx; type /login and follow the prompts, then /exit"
+    run sudo -u agent-sbx env HOME=/home/agent-sbx CLAUDE_CONFIG_DIR=/home/agent-sbx/.claude HTTPS_PROXY=http://127.0.0.1:3128 "$binary"
+}
+
 # ---- check ---------------------------------------------------------------------------------------
 FAILS=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -528,5 +558,9 @@ NO_START=0
 HAPPY_PREFIX=/opt/abp/happy
 if [ "${1:-}" = --dry-run ]; then DRY_RUN=1; shift; fi
 command=install
-case "${1:-}" in install | check) command=$1; shift ;; esac
-if [ "$command" = check ]; then main_check; else main_install "$@"; fi
+case "${1:-}" in install | check | claude-login) command=$1; shift ;; esac
+case "$command" in
+    check) main_check ;;
+    claude-login) main_claude_login ;;
+    *) main_install "$@" ;;
+esac

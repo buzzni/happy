@@ -195,6 +195,26 @@ describe.skipIf(!fixtureBase)('abp-install internals (sourced; needs a directory
     })
 })
 
+describe('abp-install claude-login', () => {
+    const sourced = (snippet: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; ${snippet}`, 'test', join(here, 'abp-install')], { encoding: 'utf8' })
+    const sdk = '/opt/abp/happy/lib/node_modules/@buzzni/happy-cli/node_modules/@anthropic-ai'
+
+    it('resolves the Claude Agent SDK native binary for the machine architecture', () => {
+        expect(sourced('claude_binary /opt/abp/happy x86_64').stdout.trim()).toBe(`${sdk}/claude-agent-sdk-linux-x64/claude`)
+        expect(sourced('claude_binary /opt/abp/happy aarch64').stdout.trim()).toBe(`${sdk}/claude-agent-sdk-linux-arm64/claude`)
+        const other = sourced('claude_binary /opt/abp/happy mips')
+        expect(other.status).not.toBe(0)
+        expect(other.stderr).toMatch(/unsupported architecture mips/)
+    })
+
+    it('runs it as agent-sbx with its own home and config, through the egress proxy', () => {
+        const result = bash('abp-install', ['--dry-run', 'claude-login'])
+        expect(result.status).toBe(0)
+        expect(result.stdout).toMatch(new RegExp(`^\\+ sudo -u agent-sbx env HOME=/home/agent-sbx CLAUDE_CONFIG_DIR=/home/agent-sbx/\\.claude HTTPS_PROXY=http://127\\.0\\.0\\.1:3128 ${sdk.replace(/[.]/g, '\\.')}/claude-agent-sdk-linux-(x64|arm64)/claude$`, 'm'))
+        expect(result.stdout).toMatch(/\/login/)
+    })
+})
+
 describe('abp-uninstall', () => {
     it('keeps profile and journal volumes, configuration and secrets unless --purge', () => {
         const kept = bash('abp-uninstall', ['--dry-run'])
