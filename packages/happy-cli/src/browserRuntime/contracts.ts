@@ -92,7 +92,7 @@ export class BrowserRuntimeError extends Error {
 export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
-    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace'
+    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
@@ -100,7 +100,7 @@ export const AGENT_OPERATIONS: readonly Operation[] = [
     'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace',
 ]
 /** Operations that require an interactive (human UI) capability. */
-export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl']
+export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket']
 
 export interface AgentGrant {
     kind: 'agent-grant'
@@ -130,7 +130,21 @@ export interface InteractiveCapability {
     operations: Operation[]
     issuedAtMs: number
     expiresAtMs: number
+    /** abp2 only: the Happy machineId the capability is for (must equal the Runtime's configured machineId). */
+    aud?: string
+    /** abp2 only: always INTERACTIVE_CAPABILITY_ISSUER. */
+    iss?: string
 }
+
+/** `iss` of every server-signed (abp2) interactive capability. */
+export const INTERACTIVE_CAPABILITY_ISSUER = 'saycode-server'
+
+/**
+ * Runtime auth mode. `harness` keeps the PoC behaviour (abp1 HMAC interactive
+ * capabilities minted by the E2E harness). `production` accepts interactive
+ * capabilities only as abp2 (Ed25519, signed by the Saycode server).
+ */
+export type AuthMode = 'harness' | 'production'
 
 /** Client (UI) read access: getTask/subscribe for the principal's tasks. */
 export type Credential = AgentGrant | InteractiveCapability
@@ -172,7 +186,8 @@ export const PAUSE_REASONS = [
 ] as const
 export type PauseReason = (typeof PAUSE_REASONS)[number]
 
-export type WaitReason = 'approval' | 'login' | 'captcha'
+/** handoff: the user performs an action the agent may not (it cannot be bound for approval or verified) */
+export type WaitReason = 'approval' | 'login' | 'captcha' | 'handoff'
 
 export type ActionState = 'planned' | 'intent-committed' | 'dispatched' | 'confirmed' | 'uncertain' | 'failed' | 'skipped'
 
@@ -297,6 +312,30 @@ export interface ObservedElement {
     formAction?: string
 }
 
+/**
+ * A form field value as it would be submitted. Password values are never read
+ * out (only their length is bound) and files are bound by name/size/type.
+ */
+export type FormFieldValue = string | { password: number } | { file: string; size: number; type: string }
+
+/** What activating an element would submit, after submitter overrides (HTML form submission). */
+export interface FormSubmission {
+    /** Absolute action URL */
+    action: string
+    method: string
+    enctype: string
+    target: string
+    /** The complete entry list in submission (tree) order; duplicates kept */
+    fields: Array<[string, FormFieldValue]>
+    /** The activated submit button, or null when the element does not submit the form itself */
+    submitter: { name: string; value: string; formaction: string | null; formmethod: string | null; formenctype: string | null } | null
+    /**
+     * The digest cannot cover everything that would be sent: a form-associated custom
+     * element (unreadable value), a non-empty password or a chosen file (content not bound).
+     */
+    opaque: boolean
+}
+
 export interface ElementDescription {
     ref: ElementRef
     role: string
@@ -316,6 +355,18 @@ export interface ElementDescription {
     documentGeneration: number
     /** Opaque, non-secret element identity that restoreRef can re-bind after a Runtime-only restart. */
     identity: string
+    /** Role/name computed now; `role`/`name` above are the snapshot's ('' for a restored ref). */
+    currentRole?: string
+    currentName?: string
+    tag?: string
+    /** Absolute href when the element is (inside) a link */
+    linkUrl?: string
+    /** The link's effective browsing-context target (its own, else <base target>, else '') */
+    linkTarget?: string
+    /** The enclosing form's submission and its SHA-256 digest (policy.formDigest) */
+    form?: FormSubmission & { digest: string }
+    /** True when activating the element submits `form` (submit button / image input) */
+    submitsForm?: boolean
 }
 
 export interface ObservedFrame {
@@ -361,9 +412,25 @@ export interface DriverTabHandle {
     targetId: string
 }
 
+/**
+ * The element as the runtime classified (or the user approved) it. The driver
+ * re-checks it after pointer preparation and guards the submission the click
+ * makes; a mismatch is refused (before input) or stopped (after it).
+ */
+export interface DispatchExpectation {
+    role: string
+    name: string
+    linkUrl?: string
+    linkTarget?: string
+    /** formDigest of the submission the element would make */
+    formDigest?: string
+}
+
 export interface DriverOptions {
     signal?: AbortSignal
     timeoutMs: number
+    /** click only */
+    expect?: DispatchExpectation
 }
 
 export interface BrowserDriver {
@@ -418,6 +485,9 @@ export interface ScreenshotRequest { taskId: TaskId; tabId: TabId }
 export interface SubmitBatchRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId; steps: BatchStep[] }
 export interface FinishTaskRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
 export interface GetTaskRequest { taskId: TaskId }
+/** Interactive: the principal's unfinished tasks on one profile (console task discovery, D12). */
+export interface ListTasksRequest { profileId: ProfileId }
+export interface ListTasksResult { tasks: TaskView[] }
 export interface SubscribeRequest { taskId: TaskId; afterSeq: number }
 export interface ApproveRequest { taskId: TaskId; approvalId: ApprovalId; bindingHash: string; requestId: RequestId; decision: 'approve' | 'reject' }
 export interface TakeOverRequest { taskId: TaskId; tabId: TabId; expectedEpoch: number; requestId: RequestId }
@@ -425,6 +495,10 @@ export interface ReleaseControlRequest { taskId: TaskId; tabId: TabId; expectedE
 export interface ResumeRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
 export interface CancelRequest { taskId: TaskId; requestId: RequestId }
 export interface CloseSpaceRequest { taskSpaceId: TaskSpaceId; requestId: RequestId }
+/** Served by the viewer proxy (viewerProxy.ts), not by BrowserRuntimeApi. */
+export interface ViewerTicketRequest { profileId: ProfileId }
+/** One-time WebSocket ticket for `GET /v1/viewer/websockify?ticket=`, bound to the capability and profile. */
+export interface ViewerTicket { ticket: string; expiresAtMs: number }
 
 export type SubscribeResult =
     | { kind: 'events'; events: TaskEvent[]; highWatermarkSeq: number }
@@ -461,6 +535,7 @@ export interface BrowserRuntimeApi {
     submitBatch(auth: AuthContext, req: SubmitBatchRequest, opts?: { waitMs?: number }): Promise<{ batchId: BatchId; accepted: true; task: TaskView; result?: BatchResult }>
     finishTask(auth: AuthContext, req: FinishTaskRequest): Promise<TaskView>
     getTask(auth: AuthContext, req: GetTaskRequest): Promise<TaskView>
+    listTasks(auth: AuthContext, req: ListTasksRequest): Promise<ListTasksResult>
     subscribe(auth: AuthContext, req: SubscribeRequest): Promise<SubscribeResult>
     approve(auth: AuthContext, req: ApproveRequest): Promise<ApproveResult>
     takeOver(auth: AuthContext, req: TakeOverRequest): Promise<ControlResult>
@@ -478,6 +553,36 @@ export interface BrowserRuntimeApi {
 }
 
 // ---------------------------------------------------------------------------
+// Attention feed (D10): external transitions after which the owning agent
+// session must look at its task again. Served on the broker socket to the daemon.
+// ---------------------------------------------------------------------------
+
+export const ATTENTION_REASONS = ['approval-approved', 'approval-rejected', 'takeover-released', 'user-resumed', 'recovered'] as const
+export type AttentionReason = (typeof ATTENTION_REASONS)[number]
+
+export interface AttentionEvent {
+    /** Outbox sequence (persistent, strictly increasing). */
+    seq: number
+    taskId: TaskId
+    agentSessionId: AgentSessionId
+    /** Task status right after the transition. */
+    status: TaskStatus
+    /** Task event seq of the transition; the daemon's message localId is `abp-<taskId>-<eventSeq>`. */
+    eventSeq: number
+    reason: AttentionReason
+}
+
+/**
+ * `nextSeq` is the cursor to pass as the next `afterSeq` (the last seq returned).
+ * CURSOR_EXPIRED: the cursor is older than the retained window (or ahead of the
+ * outbox); `snapshot` holds each task's latest attention entry that no agent
+ * batch has followed yet. Delivery stays idempotent through the eventSeq localId.
+ */
+export type AttentionFeed =
+    | { events: AttentionEvent[]; nextSeq: number; oldestSeq: number }
+    | { code: 'CURSOR_EXPIRED'; events: []; snapshot: AttentionEvent[]; nextSeq: number; oldestSeq: number }
+
+// ---------------------------------------------------------------------------
 // PoC defaults (contracts.md "자원·권한 기본값")
 // ---------------------------------------------------------------------------
 
@@ -489,6 +594,8 @@ export const POC_LIMITS = {
     maxWaitForTimeoutMs: 120_000,
     taskTimeLimitMs: 60 * 60_000,
     maxGrantLifetimeMs: 60 * 60_000,
+    /** Server-signed (abp2) interactive capabilities; clients re-issue 1 minute before expiry. */
+    maxInteractiveLifetimeMs: 5 * 60_000,
     workerHeartbeatMs: 10_000,
     workerStaleMs: 60_000,
     userWaitMs: 10 * 60_000,
@@ -500,4 +607,12 @@ export const POC_LIMITS = {
     journalControlReserveEvents: 100,
     terminalBrowserIdleMs: 5 * 60_000,
     eventRetentionMs: 7 * 24 * 60 * 60_000,
+} as const
+
+/** Viewer proxy (D2) limits. */
+export const VIEWER_LIMITS = {
+    ticketTtlMs: 30_000,
+    maxOutstandingTickets: 256,
+    maxSetEncodings: 64,
+    maxClientCutTextBytes: 64 * 1024,
 } as const

@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import type { TaskEvent, TaskId } from '../contracts'
 import {
     clientProcessCount, evidenceFile, fixtureControl, ledger, loadRun, now, parseArgs, sessionClient, spawnAgentSession,
-    userClient, waitForTranscript,
+    userClient, waitForTranscript, prodIdentity,
 } from './realAgentHarness'
 
 /** The waitFor step the agent submits may block at most this long (contracts). */
@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     // 3. The client sends the fixed prompt and exits.
     evidence.promptTemplateSha256 = createHash('sha256').update(PROMPT_TEMPLATE).digest('hex')
     evidence.clientSendStartedAtMs = now()
-    await sessionClient('send', sessionId, PROMPT_TEMPLATE.replace('__RUN__', ctx.run).replace('__KEY__', barrierKey))
+    await sessionClient('send', sessionId, PROMPT_TEMPLATE.replace('__PROFILE__', prodIdentity?.profileId ?? 'profile-a').replace('__RUN__', ctx.run).replace('__KEY__', barrierKey))
     evidence.clientExitedAtMs = now()
     evidence.clientProcessesAfterExit = await clientProcessCount()
     save()

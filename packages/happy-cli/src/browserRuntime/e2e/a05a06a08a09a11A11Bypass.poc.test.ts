@@ -192,7 +192,11 @@ describe('A11 bypass, origin and secrets', () => {
             const serialized = JSON.stringify([obs, batch, denied.message])
             evidence('A11', { path: 'canary-frame', i, frames: obs.frames.map((f) => `${f.origin}:${f.allowed}`), cElements: obs.elements.filter((e) => e.frameOrigin === SITE_C).length, screenshot: denied.code, batchOutcome: batch.result?.outcome, controlImage: [png.width, png.height], canaryInResponses: serialized.includes('ABP-CANARY') })
             expect(serialized.includes('ABP-CANARY')).toBe(false)
-            expect(obs.frames.find((f) => f.origin === SITE_C)?.allowed).toBe(false)
+            // Request-time enforcement blocks the C document itself, so the frame reports C or an undeterminable
+            // origin; either way it is listed as not allowed and contributes nothing.
+            const foreign = obs.frames.filter((f) => f.origin !== SITE_A)
+            expect(foreign.length).toBeGreaterThan(0)
+            expect(foreign.every((f) => f.allowed === false)).toBe(true)
             expect(obs.elements.filter((e) => e.frameOrigin === SITE_C)).toHaveLength(0)
             expect(batch.result?.outcome, 'screenshot step inside a batch must also be refused').not.toBe('succeeded')
             expect(png.width).toBeGreaterThan(0)
@@ -246,7 +250,7 @@ describe('A11 bypass, origin and secrets', () => {
         const cdpExposed = Object.entries(ports).filter(([, v]) => /(^|\D)(9222|9223|9224)\/tcp/.test(v))
         const evaluateOp = await rawOp(stack, 'evaluate', { expression: '1' }, { authorization: `Bearer ${mintAgent(stack).token}` })
         const agentOps = await rawOp(stack, 'submitBatch', { taskId: 'task-x', expectedVersion: 0, requestId: rid(), steps: [{ stepId: 's', actionId: 'a', tabId: 't', kind: 'evaluate', timeoutMs: 1000 }] }, { authorization: `Bearer ${mintAgent(stack).token}` })
-        const security = await vncSecurityTypes(stack.env.ports.novncA).catch((e: Error) => [`error:${e.message}`] as unknown as number[])
+        const security = await vncSecurityTypes(stack.env.ports.novncA!).catch((e: Error) => [`error:${e.message}`] as unknown as number[])
         evidence('A11', { path: 'raw-surfaces', i, ports, cdpExposed: cdpExposed.length, evaluateOp: `${evaluateOp.status}:${evaluateOp.json.error?.code}`, evaluateStep: `${agentOps.status}:${agentOps.json.error?.code}`, vncSecurityTypes: security })
         expect(cdpExposed, 'no CDP / instance port may be published to the host').toEqual([])
         expect(evaluateOp.status).toBe(404)

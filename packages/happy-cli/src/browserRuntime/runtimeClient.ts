@@ -3,10 +3,12 @@
  * connection errors; mutations never auto-retry (callers reuse requestId).
  */
 import {
-    BrowserRuntimeError, ERROR_CODES, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody,
+    BrowserRuntimeError, ERROR_CODES, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody, type ViewerTicket,
+    type ViewerTicketRequest,
 } from './contracts'
 
-type Api = BrowserRuntimeApi
+/** viewerTicket is served by the viewer proxy, not by BrowserRuntimeApi. */
+type Api = BrowserRuntimeApi & { viewerTicket(auth: unknown, req: ViewerTicketRequest): Promise<ViewerTicket> }
 type Req<K extends keyof Api> = Parameters<Api[K]>[1]
 type Res<K extends keyof Api> = Awaited<ReturnType<Api[K]>>
 
@@ -38,6 +40,7 @@ export class RuntimeClient {
     }
     finishTask(req: Req<'finishTask'>) { return this.call('finishTask', req) }
     getTask(req: Req<'getTask'>) { return this.call('getTask', req) }
+    listTasks(req: Req<'listTasks'>) { return this.call('listTasks', req) }
     subscribe(req: Req<'subscribe'>, opts?: { waitMs?: number }) {
         return this.call('subscribe', { ...req, ...(opts?.waitMs !== undefined ? { waitMs: opts.waitMs } : {}) })
     }
@@ -47,6 +50,7 @@ export class RuntimeClient {
     resume(req: Req<'resume'>) { return this.call('resume', req) }
     cancel(req: Req<'cancel'>) { return this.call('cancel', req) }
     closeSpace(req: Req<'closeSpace'>) { return this.call('closeSpace', req) }
+    viewerTicket(req: Req<'viewerTicket'>) { return this.call('viewerTicket', req) }
 
     private async call<K extends Operation>(op: K, body: unknown): Promise<Res<K>> {
         const attempts = READ_OPS.has(op) ? READ_RETRIES + 1 : 1

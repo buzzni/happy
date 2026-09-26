@@ -27,6 +27,7 @@ import {
     type WorkspaceId,
 } from '../contracts'
 import { RuntimeClient } from '../runtimeClient'
+import { fixtureSitePolicies } from '../testing/fixtureSitePolicy'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const ISSUE_BACKDATE_MS = 5_000
@@ -51,7 +52,8 @@ export interface LedgerEntry {
 }
 
 interface PocEnvJson {
-    ports: { control: number; runtime: number; admin: number; novncA: number; novncB: number }
+    /** noVNC ports exist only in the harness viewer layout (`viewer: 'harness'`). */
+    ports: { control: number; runtime: number; admin: number; novncA?: number; novncB?: number }
     harnessToken: string
     containers: Record<string, string>
 }
@@ -71,7 +73,7 @@ export interface PocStack {
     run: string
     runtimeUrl: string
     env: PocEnvJson
-    keys: AuthKeys & { adminToken: string }
+    keys: Required<AuthKeys> & { adminToken: string }
     mintAgent(options?: GrantOptions): { token: string; grantId: GrantId }
     mintInteractive(options?: { principalId?: PrincipalId; profileId?: ProfileId; ttlMs?: number; viewerSessionId?: string }): string
     client(token: string): RuntimeClient
@@ -96,7 +98,12 @@ export function buildRuntimeBundle(): string {
     return out
 }
 
-export async function startPocStack(options: { run?: string; bundle?: string } = {}): Promise<PocStack> {
+/**
+ * `viewer: 'runtime'` is the production viewer layout (D2): no noVNC is started or published and
+ * the display is reachable only through the Runtime's viewer proxy. The default keeps the harness
+ * noVNC for the PoC suites that probe it directly (A11).
+ */
+export async function startPocStack(options: { run?: string; bundle?: string; viewer?: 'harness' | 'runtime' } = {}): Promise<PocStack> {
     const run = options.run ?? `t${Date.now().toString(36)}${randomBytes(2).toString('hex')}`
     const runDir = join(pocDir, '.abp', run)
     mkdirSync(runDir, { recursive: true, mode: 0o700 })
@@ -113,12 +120,14 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
         ABP_STATE_DIR: '/var/lib/abp',
         ABP_KEYS_FILE: '/app/keys.json',
         ABP_PROFILES: JSON.stringify([
-            { profileId: PROFILE_A, cdpHttpUrl: 'http://browser-a:9223', instanceUrl: 'http://browser-a:9224/instance' },
-            { profileId: PROFILE_B, cdpHttpUrl: 'http://browser-b:9223', instanceUrl: 'http://browser-b:9224/instance' },
+            { profileId: PROFILE_A, cdpHttpUrl: 'http://browser-a:9223', instanceUrl: 'http://browser-a:9224/instance', vncAddress: 'browser-a:5900' },
+            { profileId: PROFILE_B, cdpHttpUrl: 'http://browser-b:9223', instanceUrl: 'http://browser-b:9224/instance', vncAddress: 'browser-b:5900' },
         ]),
+        // Harness mode: the synthetic fixture's explicit site policy (PoC classifier parity).
+        ABP_SITE_POLICY: JSON.stringify(fixtureSitePolicies([SITE_A, SITE_B, SITE_C])),
     }), { mode: 0o600 })
     const bundle = options.bundle ?? buildRuntimeBundle()
-    poc(['up', '--run', run, '--runtime-bundle', bundle, '--runtime-env', runtimeEnvFile, '--runtime-keys', keysFile])
+    poc(['up', '--run', run, '--runtime-bundle', bundle, '--runtime-env', runtimeEnvFile, '--runtime-keys', keysFile, '--viewer', options.viewer ?? 'harness'])
     const env = JSON.parse(readFileSync(join(runDir, 'env.json'), 'utf8')) as PocEnvJson
     const runtimeUrl = `http://127.0.0.1:${env.ports.runtime}`
     const controlUrl = `http://127.0.0.1:${env.ports.control}`
@@ -190,7 +199,9 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
         async admin(path, body = {}) {
             const response = await fetch(`http://127.0.0.1:${env.ports.admin}${path}`, {
                 method: path === '/admin/debug' ? 'GET' : 'POST',
-                headers: { authorization: `Bearer ${keys.adminToken}`, 'content-type': 'application/json' },
+                // Harness plumbing, not a client under test: no pooled socket left behind (the Runtime keeps idle
+                // connections 65 s, and A01 waits until no client connection remains).
+                headers: { authorization: `Bearer ${keys.adminToken}`, 'content-type': 'application/json', connection: 'close' },
                 ...(path === '/admin/debug' ? {} : { body: JSON.stringify(body) }),
             })
             const parsed = await response.json() as { ok: boolean; result?: unknown; error?: unknown }
@@ -228,7 +239,7 @@ export async function startPocStack(options: { run?: string; bundle?: string } =
             const deadline = Date.now() + timeoutMs
             while (Date.now() < deadline) {
                 try {
-                    const response = await fetch(`${stack.runtimeUrl}/v1/health`)
+                    const response = await fetch(`${stack.runtimeUrl}/v1/health`, { headers: { connection: 'close' } })
                     if (response.ok) {
                         const health = await response.json() as { profiles?: Array<{ connected: boolean }> }
                         if (health.profiles?.every((profile) => profile.connected)) return

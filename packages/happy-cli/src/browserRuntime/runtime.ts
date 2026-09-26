@@ -1,28 +1,80 @@
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, type ActionId, type AgentGrant, type AuthContext, type BatchId,
+import { BrowserRuntimeError, POC_LIMITS, SCHEMA_VERSION, TERMINAL_STATUSES, type ActionId, type AgentGrant, type AuthContext, type BatchId,
     type BatchResult, type BatchStep, type BrowserDriver, type BrowserInstanceId, type BrowserRuntimeApi, type GrantId,
         type ApproveResult, type ControlResult, type RuntimeErrorBody, type SnapshotId, type InputOwner, type Operation,
             type ProfileId, type RequestId, type TaskEvent, type TaskId, type TaskSpaceId, type TaskView, type TaskStatus,
                 type TabId, type ApprovalId,
-                type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
+                type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type ScreenshotResult, type SubscribeResult } from './contracts'
 import { assertOperation } from './auth'
-import { createApproval } from './approvals'
+import { approvalPayloadHash, createApproval } from './approvals'
 import { dispatchStep } from './batchWorker'
 import { systemClock, type RuntimeClock } from './clock'
 import { InputLeaseManager } from './inputLease'
-import { approvalBinding, assertAllowedOrigin, classifyAction, classifyUserWait, payloadHash, redact } from './policy'
-import { TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
+import { approvalBinding, assertAllowedOrigin, assertSiteAllowed, classifySiteAction, classifyUserWait, loginCompleted, payloadHash, redact, type SitePolicy } from './policy'
+import { RECLAIMING_SPACE_RESERVE, TaskStore, type SpaceRecord, type StoredTask, type StoreEventInput } from './taskStore'
 import { browserInstanceMatches, inFlightWriteActions } from './recovery'
 import { transitionTask } from './stateMachine'
 export interface BrowserRuntimeOptions {
     store: TaskStore
     drivers: Map<ProfileId, BrowserDriver> | Record<string, BrowserDriver>
     clock?: RuntimeClock
+    /** Site allowlist and action policy (D7). Origins outside it cannot be opened, whatever a grant allows. */
+    sites: SitePolicy[]
+    /** Open spaces per profile (runtime.json; the PoC limit without configuration). */
+    maxSpacesPerProfile?: number
+    /** Close spaces whose tasks are all finished after this long without activity; off when absent. */
+    spaceIdleReclaimMs?: number
+}
+/** What one reclamation pass did (or could not do) for a space. */
+export interface SpaceReclaimReport {
+    taskSpaceId: TaskSpaceId
+    reason: NonNullable<SpaceRecord['reclaimReason']>
+    closed: boolean
+    closedTabs: TabId[]
+    /** beforeunload kept these open; retried on the next pass. */
+    blockedTabs?: TabId[]
+    /** A user holds these, or the browser could not close them; retried. */
+    failedTabs?: TabId[]
+    /** Tasks with an unknown write outcome, kept (paused) for the user. */
+    retained?: TaskId[]
+    /** Cancelled tasks whose batch has not stopped yet. */
+    waiting?: TaskId[]
+}
+/** One space as the operator sees it (admin socket). */
+export interface SpaceSummary {
+    taskSpaceId: TaskSpaceId
+    profileId: ProfileId
+    agentSessionId?: string
+    createdAtMs: number
+    ageMs: number
+    closed: boolean
+    /** Counts against maxSpacesPerProfile (see RECLAIMING_SPACE_RESERVE for reclaiming ones). */
+    counted: boolean
+    reclaimReason?: SpaceRecord['reclaimReason']
+    reclaimBlockedTabs?: TabId[]
+    tabs: TabId[]
+    tasks: Array<{ taskId: TaskId; agentSessionId: string; status: TaskView['status']; pauseReason?: string; uncertainActions: number; updatedAtMs: number }>
 }
 type DriverWithAction = BrowserDriver & {
     armAction?: (actionId: string) => void
 }
+/** How a user wait is recognised as done (`task.waitCompletion`). */
+type UserWaitCompletion = {
+    batchId?: string
+    nextStep?: number
+    tabId: TabId
+    predicate?: BatchStep['until']
+    notPathPrefix?: string
+    /** The site whose loginCompleteWhen decides a login wait. */
+    protectedOrigin?: string
+    handoff?: true
+}
 /** Durable, scoped task runtime. Driver awaits never hold the task commit queue. */
+/** Finished tasks are not offered to the console; the listing is bounded (D12). */
+const FINISHED_STATUSES: ReadonlySet<TaskStatus> = new Set(TERMINAL_STATUSES)
+const LIST_TASKS_LIMIT = 50
+
+
 export class BrowserRuntime implements BrowserRuntimeApi {
     readonly leases = new InputLeaseManager()
     private readonly drivers: Map<ProfileId, BrowserDriver>
@@ -32,6 +84,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly inFlightDriverCalls = new Set<TaskId>()
     private readonly latestAgentSnapshots = new Map<TabId, SnapshotId>()
     private readonly liveBatchSteps = new Map<BatchId, BatchStep[]>()
+    /** Profiles between a driver disconnect and the end of its reconnect handling (which alone judges browser identity) */
+    private readonly reconnecting = new Set<ProfileId>()
     private readonly latestAgentUrls = new Map<TabId, string>()
     private readonly commitTails = new Map<TaskId, Promise<unknown>>()
     private readonly eventWaiters = new Map<TaskId, Set<() => void>>()
@@ -89,7 +143,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.options.store.createSpace({ taskSpaceId, profileId: req.profileId, createdAtMs: this.clock.now(), tabs: [],
             tabTargets: {}, tabLeaseEpochs: {},
             owner: identity(auth), requestKey: requestKeyValue, requestHash: payloadHash({ operation: 'createSpace', ...req }),
-                dedupe: {} })
+                dedupe: {}, ...(auth.credential.kind === 'agent-grant' ? { agentSessionId: auth.credential.agentSessionId } : {}) },
+            this.options.maxSpacesPerProfile)
         return { taskSpaceId }
     }
     private async createTaskImpl(auth: AuthContext, req: {
@@ -106,6 +161,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 throw new BrowserRuntimeError('CONFLICT', 'requestId payload differs')
             return this.view(duplicate.result as StoredTask)
         }
+        this.assertSpaceOpen(space)
         const now = this.clock.now()
         const taskId = `task-${randomUUID()}` as TaskId
         const credential = auth.credential as AgentGrant
@@ -140,12 +196,20 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 url: string
                 task: TaskView
             }
+        this.assertSpaceOpen(this.requireSpace(task.taskSpaceId))
         this.assertCanStart(task)
         if (this.clock.now() - task.createdAtMs >= POC_LIMITS.taskTimeLimitMs) {
             await this.commit(task, { status: 'paused', pauseReason: 'task-time-limit' }, 'state-changed',
                 { pauseReason: 'task-time-limit' })
             throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Task time limit reached')
         }
+        assertSiteAllowed(this.options.sites, req.url)
+        // The same navigation policy as a navigate step; a held page is not opened (there is no tab to hand over yet).
+        const navigation = classifySiteAction(this.options.sites, { kind: 'navigate', url: req.url } as BatchStep)
+        if (navigation === 'deny')
+            throw new BrowserRuntimeError('ORIGIN_DENIED', 'Site policy refuses this destination')
+        if (navigation !== 'auto')
+            throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Site policy requires the user for this page; it was not opened', false, false)
         const grant = this.agentGrant(auth)
         const origin = assertAllowedOrigin(req.url, grant)
         const driver = this.driver(task.profileId)
@@ -215,6 +279,16 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 && !error.mayHaveSideEffects) {
                 await this.commit(current, {
                     status: 'failed',
+                    actions: { ...current.actions, [actionId]: { ...current.actions[actionId], state: 'failed' } },
+                }, 'action-failed', { actionId, error: safeError(error) }, epoch)
+                throw error
+            }
+            // The driver refuses before creating any target when its agent windows are all in use:
+            // nothing happened, so the agent may close a page and open again.
+            if (error instanceof BrowserRuntimeError && error.code === 'QUOTA_EXCEEDED' && !error.mayHaveSideEffects) {
+                await this.commit(current, {
+                    status: 'paused',
+                    pauseReason: 'awaiting-agent',
                     actions: { ...current.actions, [actionId]: { ...current.actions[actionId], state: 'failed' } },
                 }, 'action-failed', { actionId, error: safeError(error) }, epoch)
                 throw error
@@ -289,12 +363,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (this.controllers.get(task.taskId) === controller)
             this.controllers.delete(task.taskId)
-        const space = this.requireSpace(task.taskSpaceId)
-        await this.options.store.updateSpace(task.taskSpaceId, {
+        // Derived from the space as it is inside the store queue: concurrent opens in one space must not drop each other's tabs.
+        await this.options.store.mutateSpace(task.taskSpaceId, (space) => ({
             tabs: [...space.tabs, handle.tabId],
             tabTargets: { ...space.tabTargets, [handle.tabId]: handle.targetId },
             tabLeaseEpochs: { ...space.tabLeaseEpochs, [handle.tabId]: tabEpoch },
-        })
+        }))
         const result = { tabId: handle.tabId, actionId, url: redact(req.url), task: this.view(after) }
         await this.saveTaskRequest(after, auth, req.requestId, { operation: 'openPage', ...req }, result)
         const releasedEpoch = this.leases.release(handle.tabId, task.profileId)
@@ -321,9 +395,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             }
         if (!space.tabs.includes(req.tabId) && space.goneTabs?.includes(req.tabId)) {
             const response = { closed: false }
-            await this.options.store.updateSpace(req.taskSpaceId, {
-                dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closePage', ...req }, response),
-            })
+            await this.options.store.mutateSpace(req.taskSpaceId, (current) => ({
+                dedupe: this.spaceDedupe(current, auth, req.requestId, { operation: 'closePage', ...req }, response),
+            }))
             return response
         }
         if (!space.tabs.includes(req.tabId))
@@ -341,13 +415,16 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (!result.closed)
             return { closed: false }
         const response = { closed: result.closed }
-        const { [req.tabId]: _target, ...tabTargets } = space.tabTargets ?? {}
-        const { [req.tabId]: _epoch, ...tabLeaseEpochs } = space.tabLeaseEpochs ?? {}
-        await this.options.store.updateSpace(req.taskSpaceId, {
-            tabs: space.tabs.filter((tab) => tab !== req.tabId),
-            goneTabs: [...new Set([...(space.goneTabs ?? []), req.tabId])],
-            tabTargets, tabLeaseEpochs,
-            dedupe: this.spaceDedupe(space, auth, req.requestId, { operation: 'closePage', ...req }, response) })
+        await this.options.store.mutateSpace(req.taskSpaceId, (current) => {
+            const { [req.tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [req.tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            return {
+                tabs: current.tabs.filter((tab) => tab !== req.tabId),
+                goneTabs: [...new Set([...(current.goneTabs ?? []), req.tabId])],
+                tabTargets, tabLeaseEpochs,
+                dedupe: this.spaceDedupe(current, auth, req.requestId, { operation: 'closePage', ...req }, response),
+            }
+        })
         return response
     }
     async observe(auth: AuthContext, req: {
@@ -545,6 +622,19 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         taskId: TaskId
     }): Promise<TaskView> { await this.recovery; const task = this.requireTask(req.taskId); this.authorizeTask(auth, 'getTask',
         task); return this.view(task); }
+    /** Interactive only (assertOperation refuses agent grants): unfinished tasks of the credential's owner on its profile. */
+    async listTasks(auth: AuthContext, req: { profileId: ProfileId }): Promise<{ tasks: TaskView[] }> {
+        await this.recovery
+        if (auth.credential.kind !== 'interactive') throw new BrowserRuntimeError('SCOPE_DENIED', 'Task listing needs an interactive capability')
+        this.checkCredential(auth, 'listTasks', req.profileId)
+        const { principalId, workspaceId, machineId } = auth.credential
+        const tasks = this.options.store.listTasks()
+            .filter((task) => task.profileId === req.profileId && task.owner.principalId === principalId
+                && task.owner.workspaceId === workspaceId && task.owner.machineId === machineId && !FINISHED_STATUSES.has(task.status))
+            .sort((a, b) => b.createdAtMs - a.createdAtMs || (a.taskId < b.taskId ? -1 : 1))
+            .slice(0, LIST_TASKS_LIMIT)
+        return { tasks: tasks.map((task) => this.view(task)) }
+    }
     async subscribe(auth: AuthContext, req: {
         taskId: TaskId
         afterSeq: number
@@ -588,6 +678,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return read()
     }
     async onDriverDisconnected(profileId: ProfileId): Promise<void> {
+        this.reconnecting.add(profileId)
         await this.recovery
         for (const task of this.options.store.listTasks()) {
             if (task.profileId !== profileId || ['succeeded', 'failed', 'cancelled'].includes(task.status))
@@ -609,6 +700,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     async onDriverReconnected(profileId: ProfileId): Promise<void> {
+        try {
+            await this.handleDriverReconnected(profileId)
+        } finally {
+            this.reconnecting.delete(profileId)
+        }
+    }
+    private async handleDriverReconnected(profileId: ProfileId): Promise<void> {
         await this.recovery
         await this.restorePersistedTabs(profileId)
         const driver = this.drivers.get(profileId)
@@ -626,10 +724,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (replaced) {
                 const approvals = Object.fromEntries(Object.entries(task.approvals).map(([id, approval]) => [id, { ...approval,
                     state: approval.state === 'pending' ? 'expired' : approval.state }]))
-                const space = this.requireSpace(task.taskSpaceId)
-                await this.options.store.updateSpace(task.taskSpaceId, { tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)) })
+                await this.options.store.mutateSpace(task.taskSpaceId, (space) => ({ tabs: space.tabs.filter((tab) => !task.tabs.includes(tab)) }))
                 await this.commit(task, { status: 'paused', pauseReason: 'browser-replaced', tabs: [], pendingApproval: undefined,
-                    approvals, browserInstanceId: currentInstance }, 'recovered', { driver: 'reconnected', browserReplaced: true })
+                    approvals, browserInstanceId: currentInstance }, 'recovered', { driver: 'reconnected', browserReplaced: true,
+                        attention: 'recovered' })
                 continue
             }
             const previousStatus = task.previousDriverStatus as TaskStatus | undefined
@@ -643,9 +741,210 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 ? { status: previous, pauseReason: pauseReason ?? 'awaiting-agent' as const,
                     ...(writes.length ? { uncertainActions: [...new Set([...task.uncertainActions, ...writes])] } : {}) }
                 : { status: previous, pauseReason: undefined }
+            // A batch the agent was waiting on ended with the disconnect: the agent must re-plan.
             await this.commit(task, { ...patch, previousDriverStatus: undefined }, 'recovered', { driver: 'reconnected',
-                browserReplaced: false })
+                browserReplaced: false, ...(previousStatus === 'running' && patch.status === 'paused' ? { attention: 'recovered' } : {}) })
         }
+    }
+    /**
+     * Retention (retentionDays): deletes terminal tasks whose last change is older than
+     * `retentionMs` and what the Runtime keeps in memory for them. Their still-open browser
+     * tabs are closed first and only then dropped from the space; a task whose tab cannot be
+     * closed (browser unreachable, beforeunload, user holding it) keeps all its state and is
+     * retried on the next run, also after a restart.
+     */
+    async purgeExpiredTasks(retentionMs: number): Promise<TaskId[]> {
+        await this.recovery
+        await this.options.store.resumePurges()
+        const purged: TaskId[] = []
+        for (const task of this.options.store.expiredTasks(this.clock.now(), retentionMs)) {
+            if (!(await this.closeRetainedTabs(task).catch(() => false)) || !(await this.options.store.purgeTask(task.taskId)))
+                continue
+            purged.push(task.taskId)
+            this.controllers.delete(task.taskId)
+            this.workers.delete(task.taskId)
+            this.inFlightDriverCalls.delete(task.taskId)
+            this.commitTails.delete(task.taskId)
+            for (const wake of this.eventWaiters.get(task.taskId) ?? [])
+                wake()
+            this.eventWaiters.delete(task.taskId)
+            this.leases.revokeTask(task.taskId)
+            for (const batchId of Object.keys(task.batches))
+                this.liveBatchSteps.delete(batchId as BatchId)
+            for (const tabId of task.tabs) {
+                this.latestAgentSnapshots.delete(tabId)
+                this.latestAgentUrls.delete(tabId)
+            }
+        }
+        return purged
+    }
+    /** Closes an expired task's open tabs, removing each from its space once closed; false if any stays open. */
+    private async closeRetainedTabs(task: StoredTask): Promise<boolean> {
+        let closedAll = true
+        for (const tabId of this.options.store.openTabsOf(task)) {
+            if (await this.closeSpaceTab(task.profileId, task.taskSpaceId, tabId) !== 'closed')
+                closedAll = false
+        }
+        return closedAll
+    }
+    /**
+     * Closes one space tab in the browser and only then drops it from the space. A target
+     * that is already gone (closed just before a crash) counts as closed; a tab a user holds
+     * is not touched.
+     */
+    private async closeSpaceTab(profileId: ProfileId, taskSpaceId: TaskSpaceId, tabId: TabId): Promise<'closed' | 'held' | 'blocked' | 'failed'> {
+        if (this.leases.owner(tabId, profileId).owner.kind !== 'none')
+            return 'held'
+        const driver = this.driver(profileId)
+        const result = await driver.closeTab(tabId, { timeoutMs: 5000 }).catch(() => undefined)
+        if (result?.beforeUnloadBlocked)
+            return 'blocked'
+        if (!result?.closed && !(result && !driver.hasTab(tabId)))
+            return 'failed'
+        await this.options.store.mutateSpace(taskSpaceId, (current) => {
+            const { [tabId]: _target, ...tabTargets } = current.tabTargets ?? {}
+            const { [tabId]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+            return { tabs: current.tabs.filter((tab) => tab !== tabId), goneTabs: [...new Set([...(current.goneTabs ?? []), tabId])],
+                tabTargets, tabLeaseEpochs }
+        })
+        return 'closed'
+    }
+    /**
+     * The agent session ended (broker revocation at session exit): its spaces are marked
+     * for reclamation (durably, so a restart finishes it) and its unfinished tasks go
+     * through the cancel fence. reclaimSpaces closes them once their tasks allow.
+     * Idempotent.
+     */
+    async endSession(agentSessionId: string): Promise<void> {
+        await this.recovery
+        const tasks = this.options.store.listTasks().filter((task) => task.agentSessionId === agentSessionId)
+        const spaceIds = new Set([...this.options.store.listSpaces().filter((space) => space.agentSessionId === agentSessionId).map((space) => space.taskSpaceId),
+            ...tasks.map((task) => task.taskSpaceId)])
+        for (const taskSpaceId of spaceIds)
+            await this.markReclaiming(taskSpaceId, 'session-ended')
+        for (const task of tasks) {
+            if (!FINISHED_STATUSES.has(task.status))
+                await this.cancelTask(this.requireTask(task.taskId))
+        }
+    }
+    /**
+     * One reclamation pass: spaces marked for reclamation, and (with spaceIdleReclaimMs)
+     * spaces whose tasks are all finished and that saw no activity for that long, are
+     * closed tab by tab. A task with an unknown write outcome keeps its space for the user;
+     * a tab blocking unload stays open and is reported. Passes are serialized.
+     */
+    reclaimSpaces(): Promise<SpaceReclaimReport[]> {
+        const run = this.reclaimTail.then(() => this.reclaimPass(), () => this.reclaimPass())
+        this.reclaimTail = run.catch(() => undefined)
+        return run
+    }
+    private reclaimTail: Promise<unknown> = Promise.resolve()
+    private async reclaimPass(): Promise<SpaceReclaimReport[]> {
+        await this.recovery
+        const reports: SpaceReclaimReport[] = []
+        const idleMs = this.options.spaceIdleReclaimMs
+        for (const space of this.options.store.listSpaces()) {
+            if (space.closed)
+                continue
+            if (space.reclaimingSinceMs === undefined) {
+                const tasks = this.spaceTasks(space.taskSpaceId)
+                const lastActivityMs = Math.max(space.createdAtMs, ...tasks.map((task) => Number(task.updatedAtMs)))
+                if (idleMs === undefined || tasks.some((task) => !FINISHED_STATUSES.has(task.status) || this.workers.has(task.taskId))
+                    || this.clock.now() - lastActivityMs < idleMs)
+                    continue
+                await this.markReclaiming(space.taskSpaceId, 'idle')
+            }
+            reports.push(await this.reclaimSpace(space.taskSpaceId))
+        }
+        return reports
+    }
+    /** Operator view of every space (admin socket). */
+    spaceReport(): SpaceSummary[] {
+        const now = this.clock.now()
+        const spaces = this.options.store.listSpaces()
+        const reclaimingByProfile = new Map<ProfileId, number>()
+        return spaces.map((space) => {
+            let counted = !space.closed
+            if (counted && space.reclaimingSinceMs !== undefined) {
+                const seen = (reclaimingByProfile.get(space.profileId) ?? 0) + 1
+                reclaimingByProfile.set(space.profileId, seen)
+                counted = seen > RECLAIMING_SPACE_RESERVE
+            }
+            const tasks = this.spaceTasks(space.taskSpaceId)
+            return {
+                taskSpaceId: space.taskSpaceId, profileId: space.profileId,
+                agentSessionId: space.agentSessionId ?? tasks[0]?.agentSessionId,
+                createdAtMs: space.createdAtMs, ageMs: now - space.createdAtMs, closed: Boolean(space.closed), counted,
+                ...(space.reclaimReason ? { reclaimReason: space.reclaimReason } : {}),
+                ...(space.reclaimBlockedTabs?.length ? { reclaimBlockedTabs: space.reclaimBlockedTabs } : {}),
+                tabs: [...space.tabs],
+                tasks: tasks.map((task) => ({ taskId: task.taskId, agentSessionId: task.agentSessionId, status: task.status,
+                    ...(task.pauseReason ? { pauseReason: task.pauseReason } : {}), uncertainActions: task.uncertainActions.length,
+                    updatedAtMs: Number(task.updatedAtMs) })),
+            }
+        })
+    }
+    /**
+     * Operator close (admin socket): cancels the space's tasks and closes it. A task with an
+     * unknown write outcome keeps the space unless `force` (its record stays for reconcile).
+     */
+    async closeSpaceAsOperator(taskSpaceId: TaskSpaceId, options: { force?: boolean } = {}): Promise<SpaceReclaimReport> {
+        await this.recovery
+        const space = this.requireSpace(taskSpaceId)
+        if (space.closed)
+            return { taskSpaceId, reason: space.reclaimReason ?? 'operator', closed: true, closedTabs: [] }
+        await this.markReclaiming(taskSpaceId, 'operator')
+        for (const task of this.spaceTasks(taskSpaceId)) {
+            if (!FINISHED_STATUSES.has(task.status))
+                await this.cancelTask(this.requireTask(task.taskId))
+        }
+        await Promise.all(this.spaceTasks(taskSpaceId).map((task) => this.workers.get(task.taskId)?.catch(() => undefined)))
+        return this.reclaimSpace(taskSpaceId, options.force)
+    }
+    private spaceTasks(taskSpaceId: TaskSpaceId): StoredTask[] {
+        return this.options.store.listTasks().filter((task) => task.taskSpaceId === taskSpaceId)
+    }
+    private async markReclaiming(taskSpaceId: TaskSpaceId, reason: NonNullable<SpaceRecord['reclaimReason']>): Promise<void> {
+        await this.options.store.mutateSpace(taskSpaceId, (current) => current.closed || current.reclaimingSinceMs !== undefined ? null
+            : { reclaimingSinceMs: this.clock.now(), reclaimReason: reason })
+    }
+    private async reclaimSpace(taskSpaceId: TaskSpaceId, force = false): Promise<SpaceReclaimReport> {
+        const space = this.requireSpace(taskSpaceId)
+        const report: SpaceReclaimReport = { taskSpaceId, reason: space.reclaimReason ?? 'operator', closed: false, closedTabs: [] }
+        const tasks = this.spaceTasks(taskSpaceId)
+        // A crash between marking and cancelling is finished here.
+        for (const task of tasks) {
+            if (report.reason !== 'idle' && !FINISHED_STATUSES.has(task.status) && !task.cancelRequested)
+                await this.cancelTask(this.requireTask(task.taskId))
+        }
+        const current = this.spaceTasks(taskSpaceId)
+        const retained = current.filter((task) => !FINISHED_STATUSES.has(task.status) && task.uncertainActions.length && !this.workers.has(task.taskId))
+            .map((task) => task.taskId)
+        const waiting = current.filter((task) => this.workers.has(task.taskId)
+            || (!FINISHED_STATUSES.has(task.status) && !task.uncertainActions.length)).map((task) => task.taskId)
+        if (waiting.length)
+            return { ...report, waiting }
+        if (retained.length && !force)
+            return { ...report, retained }
+        const blockedTabs: TabId[] = []
+        const failedTabs: TabId[] = []
+        for (const tabId of space.tabs) {
+            const outcome = await this.closeSpaceTab(space.profileId, taskSpaceId, tabId)
+            if (outcome === 'closed')
+                report.closedTabs.push(tabId)
+            else if (outcome === 'blocked')
+                blockedTabs.push(tabId)
+            else
+                failedTabs.push(tabId)
+        }
+        await this.options.store.mutateSpace(taskSpaceId, (latest) => blockedTabs.length || failedTabs.length
+            ? { reclaimBlockedTabs: blockedTabs }
+            : { tabs: [], tabTargets: {}, tabLeaseEpochs: {}, profileUserOwner: null, closed: true, reclaimBlockedTabs: undefined,
+                goneTabs: [...new Set([...(latest.goneTabs ?? []), ...latest.tabs])] })
+        if (blockedTabs.length || failedTabs.length)
+            return { ...report, ...(blockedTabs.length ? { blockedTabs } : {}), ...(failedTabs.length ? { failedTabs } : {}),
+                ...(retained.length ? { retained } : {}) }
+        return { ...report, closed: true, ...(retained.length ? { retained } : {}) }
     }
     async revokeGrant(grantId: GrantId): Promise<void> {
         let failure: unknown
@@ -690,7 +989,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 catch {
                     driverConnected = false
                 }
-                if (current.status === 'recovering' && !this.workers.has(current.taskId) && driverConnected) {
+                // While reconnect handling runs it decides (it compares browser identity); a sweep
+                // in between would mark a replaced browser's task as merely waiting for the agent.
+                if (current.status === 'recovering' && !this.workers.has(current.taskId) && driverConnected
+                    && !this.reconnecting.has(current.profileId)) {
                     const writes = inFlightWriteActions(current)
                     const actions = { ...current.actions }
                     for (const actionId of writes)
@@ -783,7 +1085,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (req.decision === 'reject') {
             const cancelled = await this.commit(task, { status: 'cancelled', cancelRequested: true, approvals: { ...task.approvals,
-                [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId })
+                [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId,
+                    attention: 'approval-rejected' })
             for (const lease of this.leases.revokeTask(task.taskId))
                 await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
             return { outcome: 'rejected', task: this.view(cancelled) }
@@ -798,7 +1101,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             nextStep: number
             grant?: AgentGrant
         }
-        const storedStep = batchRecord.steps[Number(approval.nextStep)]
+        // Fill values are never persisted: they come back from this process's memory, or the approval cannot be used.
+        const live = this.liveBatchSteps.get(approval.batchId as BatchId)
+        const batchSteps = batchRecord.steps.map((candidate) => candidate.kind === 'fill' && candidate.value === undefined
+            ? { ...candidate, value: live?.find((step) => step.actionId === candidate.actionId)?.value } : candidate)
+        const storedStep = batchSteps[Number(approval.nextStep)]
+        if (storedStep.kind === 'fill' && storedStep.value === undefined)
+            throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'The approved value is no longer available; submit the step again')
         const approvedStep = { ...storedStep, snapshotId: approval.snapshotId ?? storedStep.snapshotId }
         const driver = this.driver(task.profileId)
         const lease = this.leases.owner(approvedStep.tabId, task.profileId)
@@ -838,11 +1147,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (!description)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval reference can no longer be verified')
+        if (approval.elementIdentity && description.identity !== approval.elementIdentity)
+            throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval element was re-bound to a different node')
         if (this.clock.now() >= Number(approval.expiresAtMs) || originalGrant.expiresAtMs <= this.clock.now()
             || this.options.store.isRevoked(originalGrant.grantId))
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval or execution grant expired before dispatch')
-        const currentApprovalPayloadHash = payloadHash({ step: approvedStep, formValues: description.formValues,
-            frameOrigin: description.frameOrigin, currentPageUrl: description.pageUrl })
+        const currentApprovalPayloadHash = approvalPayloadHash(approvedStep, description)
         if (description.documentGeneration !== Number(approval.documentGeneration)
             || description.frameOrigin !== approval.frameOrigin
             || new URL(description.pageUrl).origin !== approval.origin
@@ -871,11 +1181,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         })
         if (!consumed)
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval changed before consumption')
-        const result = await this.runBatch(consumed, approval.batchId as BatchId, batchRecord.steps, originalAuth,
+        const result = await this.runBatch(consumed, approval.batchId as BatchId, batchSteps, originalAuth,
             Number(approval.nextStep), approvedStep.actionId)
         const finalTask = this.requireTask(req.taskId)
         await this.commit(finalTask, { approvals: { ...finalTask.approvals, [req.approvalId]: { ...finalTask.approvals[req.approvalId],
-            result } } }, 'agent-attention-required', { approvalId: req.approvalId, outcome: result.outcome })
+            result } } }, 'agent-attention-required', { approvalId: req.approvalId, outcome: result.outcome, attention: 'approval-approved' })
         return { outcome: 'approved', task: this.view(this.requireTask(req.taskId)), batch: result }
     }
     private async takeOverImpl(auth: AuthContext, req: {
@@ -941,7 +1251,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.persistTabLease(task.taskId, task.taskSpaceId, req.tabId, epoch, null)
         await this.persistProfileUserOwner(task.profileId, null)
         const next = await this.commit(task, { status: 'paused', pauseReason: 'user-input-complete' }, 'input-owner-changed',
-            { tabId: req.tabId, owner: 'none' }, epoch)
+            { tabId: req.tabId, owner: 'none', attention: 'takeover-released' }, epoch)
         return { leaseEpoch: epoch, owner: { kind: 'none' }, task: this.view(next) }
     }
     private async resumeImpl(auth: AuthContext, req: {
@@ -982,6 +1292,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }): Promise<TaskView> {
         const task = this.requireTask(req.taskId)
         this.authorizeTask(auth, 'resume', task)
+        if (auth.credential.kind === 'interactive')
+            return this.userResume(task)
         if (task.cancelRequested || ['user-control', 'quota', 'task-time-limit', 'outcome-unknown',
             'cancelled-with-unknown-effect'].includes(task.pauseReason ?? '') || task.uncertainActions.length)
             throw new BrowserRuntimeError('CONFLICT', 'Task pause cannot be resumed directly')
@@ -996,20 +1308,14 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (Number(task.waitExpiresAtMs ?? 0) > 0 && this.clock.now() > Number(task.waitExpiresAtMs))
                 return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
                     { pauseReason: 'user-wait-expired', waitReason: task.waitReason }))
-            const wait = task.waitCompletion as {
-                batchId?: string
-                nextStep?: number
-                tabId: TabId
-                predicate: BatchStep['until']
-                notPathPrefix?: string
-            } | undefined
-            if (!wait?.predicate && !wait?.notPathPrefix)
-                throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Wait completion condition is missing')
-            const observation = await this.driver(task.profileId).observe(wait.tabId, auth.credential.allowedOrigins, { timeoutMs: 10000 })
-            const waitCompleted = wait.notPathPrefix
-                ? !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
-                : matchesWait(wait.predicate!, observation)
-            if (!waitCompleted)
+            // A handed-off action was done (or not) by the user: nothing to verify, the agent re-observes.
+            if (task.waitReason === 'handoff')
+                return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
+                    waitCompletion: undefined, waitExpiresAtMs: undefined, agentGrant: auth.credential }, 'state-changed',
+                    { status: 'paused', pauseReason: 'awaiting-agent', handoffEnded: true }))
+            const wait = task.waitCompletion as UserWaitCompletion | undefined
+            const waitCompleted = await this.userWaitCompleted(task, wait, auth.credential.allowedOrigins)
+            if (!wait || !waitCompleted)
                 return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
                     waitReason: task.waitReason }))
             if (!wait.batchId) {
@@ -1067,6 +1373,82 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', agentGrant: auth.credential },
             'state-changed', { status: 'paused', pauseReason: 'awaiting-agent' }))
     }
+    /**
+     * Whether the user side of a wait is done, for both the agent's and the user's resume:
+     * a handoff needs no check (the agent re-observes); a login needs the site's
+     * loginCompleteWhen (or, without one, leaving the login path); other waits their predicate.
+     */
+    private async userWaitCompleted(task: StoredTask, wait: UserWaitCompletion | undefined, allowedOrigins: string[]): Promise<boolean> {
+        if (task.waitReason === 'handoff')
+            return true
+        if (!wait?.predicate && !wait?.notPathPrefix)
+            throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Wait completion condition is missing')
+        const observation = await this.driver(task.profileId).observe(wait.tabId, allowedOrigins, { timeoutMs: 10000 })
+        return wait.notPathPrefix
+            ? task.waitReason === 'login'
+                ? loginCompleted(this.options.sites, observation, wait.notPathPrefix, wait.protectedOrigin)
+                : !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
+            : matchesWait(wait.predicate!, observation)
+    }
+    /**
+     * D8: the user can only hand a task back to the agent after something the user
+     * resolved (a released takeover, possibly finishing a login/challenge wait), and
+     * only while the task's stored execution grant is still valid. Approval waits,
+     * uncertain writes, cancel requests and browser replacement are never released here.
+     */
+    private async userResume(task: StoredTask): Promise<TaskView> {
+        if (task.status === 'paused' && task.pauseReason === 'awaiting-agent')
+            return this.view(task)
+        if (task.cancelRequested || task.uncertainActions.length || task.status !== 'paused'
+            || task.pauseReason !== 'user-input-complete' || task.pendingApproval)
+            throw new BrowserRuntimeError('CONFLICT', 'Task pause cannot be resumed by the user')
+        const grant = task.agentGrant as AgentGrant | undefined
+        if (!grant || grant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(grant.grantId))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Task execution grant is expired or revoked')
+        // Rechecked inside the final write: the page check below awaits the browser, and a
+        // revoke, expiry, cancel or new takeover may land meanwhile.
+        const unchanged = (current: StoredTask) => {
+            if (current.stateVersion !== task.stateVersion || current.status !== task.status || current.pauseReason !== task.pauseReason
+                || current.cancelRequested || current.uncertainActions.length || current.pendingApproval
+                || current.tabs.some((tabId) => this.leases.owner(tabId, current.profileId).owner.kind === 'user'))
+                throw new BrowserRuntimeError('CONFLICT', 'Task changed during resume')
+            const currentGrant = current.agentGrant as AgentGrant | undefined
+            if (!currentGrant || currentGrant.grantId !== grant.grantId || currentGrant.expiresAtMs <= this.clock.now()
+                || this.options.store.isRevoked(currentGrant.grantId))
+                throw new BrowserRuntimeError('SCOPE_DENIED', 'Task execution grant is expired or revoked')
+        }
+        const wait = task.waitCompletion as UserWaitCompletion | undefined
+        // Same completion rules as the agent's resume (handoff, site login condition, predicate).
+        if (task.waitReason) {
+            if (Number(task.waitExpiresAtMs ?? 0) > 0 && this.clock.now() > Number(task.waitExpiresAtMs))
+                return this.view(await this.commit(task, { status: 'paused', pauseReason: 'user-wait-expired' }, 'state-changed',
+                    { pauseReason: 'user-wait-expired', waitReason: task.waitReason }))
+            if (!(await this.userWaitCompleted(task, wait, grant.allowedOrigins)))
+                return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
+                    waitReason: task.waitReason }, 0, false, unchanged))
+        }
+        const batchId = wait?.batchId as BatchId | undefined
+        const batch = batchId ? task.batches[batchId] : undefined
+        // The agent re-plans the rest of an interrupted batch; the user never continues agent steps.
+        // Steps from nextStep on were never dispatched (the wait was committed before them).
+        const remaining = batch ? batch.steps.slice(Number(wait?.nextStep ?? 0)) : []
+        const completed = batch ? batch.steps.filter((step) => task.actions[step.actionId]?.state === 'confirmed') : []
+        const result: BatchResult | undefined = batch && batchId ? {
+            batchId, taskId: task.taskId, outcome: remaining.length ? 'failed' : 'succeeded',
+            completedSteps: completed.map((step) => step.stepId), ...(remaining.length ? { failedStep: remaining[0].stepId } : {}),
+            mayHaveSideEffects: false, lastCheckpointSeq: task.highWatermarkSeq + 1,
+            steps: [...completed.map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'succeeded' as const })),
+                ...remaining.map((step) => ({ stepId: step.stepId, actionId: step.actionId, outcome: 'skipped' as const }))],
+        } : undefined
+        const resumed = await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
+            waitCompletion: undefined, waitExpiresAtMs: undefined,
+            ...(result && batch && batchId ? { currentBatchId: undefined, lastBatch: result, batches: { ...task.batches, [batchId]: { ...batch, result } } } : {}),
+        }, 'agent-attention-required', { attention: 'user-resumed', ...(task.waitReason ? { waitCompleted: task.waitReason } : {}),
+            ...(batchId ? { batchId, skippedSteps: remaining.length } : {}) }, 0, false, unchanged)
+        if (batchId)
+            this.liveBatchSteps.delete(batchId)
+        return this.view(resumed)
+    }
     private async cancelImpl(auth: AuthContext, req: {
         taskId: TaskId
         requestId: RequestId
@@ -1081,6 +1463,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.authorizeTask(auth, 'cancel', task)
         if (['succeeded', 'failed', 'cancelled'].includes(task.status))
             return { status: 'cancel-accepted', task: this.view(task), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        const latest = await this.cancelTask(task)
+        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
+    }
+    /**
+     * The cancel fence: revokes the task's input leases, aborts its worker and durably
+     * records the cancel; writes whose outcome is unknown leave it paused
+     * (`cancelled-with-unknown-effect`) instead of cancelled.
+     */
+    private async cancelTask(task: StoredTask): Promise<StoredTask> {
         const revokedLeases = this.leases.revokeTask(task.taskId)
         for (const lease of revokedLeases)
             await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
@@ -1099,8 +1490,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     current.stateVersion + 1),
             }
         })
-        const latest = next ?? this.requireTask(task.taskId)
-        return { status: 'cancel-accepted', task: this.view(latest), fenceAckMs: Math.max(0, this.clock.now() - started) }
+        return next ?? this.requireTask(task.taskId)
     }
     private async closeSpaceImpl(auth: AuthContext, req: {
         taskSpaceId: TaskSpaceId
@@ -1128,14 +1518,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (result.beforeUnloadBlocked || !result.closed)
                 throw new BrowserRuntimeError('CONFLICT', 'A task space tab could not be closed')
             closedTabs.push(tab as TabId)
-            const current = this.requireSpace(req.taskSpaceId)
-            const { [tab]: _target, ...tabTargets } = current.tabTargets ?? {}
-            const { [tab]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
-            await this.options.store.updateSpace(req.taskSpaceId, {
-                tabs: current.tabs.filter((item) => item !== tab),
-                goneTabs: [...new Set([...(current.goneTabs ?? []), tab as TabId])],
-                tabTargets,
-                tabLeaseEpochs,
+            await this.options.store.mutateSpace(req.taskSpaceId, (current) => {
+                const { [tab]: _target, ...tabTargets } = current.tabTargets ?? {}
+                const { [tab]: _epoch, ...tabLeaseEpochs } = current.tabLeaseEpochs ?? {}
+                return {
+                    tabs: current.tabs.filter((item) => item !== tab),
+                    goneTabs: [...new Set([...(current.goneTabs ?? []), tab as TabId])],
+                    tabTargets,
+                    tabLeaseEpochs,
+                }
             })
         }
         const response = { closedTabs }
@@ -1523,7 +1914,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             else
                 continue
             await this.commit(task, patch, 'recovered', { previousStatus: task.status, pauseReason: patch.pauseReason,
-                uncertainActions: patch.uncertainActions ?? [] }).catch(() => this.options.store.markUnreadable(task.taskId))
+                uncertainActions: patch.uncertainActions ?? [], attention: 'recovered' }).catch(() => this.options.store.markUnreadable(task.taskId))
         }
     }
     pinnedProfiles(nowMs = this.clock.now()): ProfileId[] {
@@ -1558,6 +1949,20 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const pendingPostconditions: Array<{ actionId: ActionId; stepId: BatchStep['stepId']; tabId: TabId }> = []
         const namedObservations = new Map<string, Observation>()
         let preserveLeases = false
+        /** The step is not executed; the task waits for the user (takeover), then the agent re-observes. */
+        const handOff = async (current: StoredTask, step: BatchStep, index: number, leaseEpoch: number, reason: BrowserRuntimeError) => {
+            const waiting = await this.commit(current, {
+                status: 'awaiting-user',
+                waitReason: 'handoff',
+                waitExpiresAtMs: this.clock.now() + POC_LIMITS.userWaitMs,
+                waitCompletion: { batchId, nextStep: index, tabId: step.tabId, handoff: true },
+                actions: { ...current.actions, [step.actionId]: { ...current.actions[step.actionId], state: 'failed' } },
+            }, 'state-changed', { status: 'awaiting-user', waitReason: 'handoff', actionId: step.actionId, error: safeError(reason) }, leaseEpoch)
+            preserveLeases = true
+            results.push({ stepId: step.stepId, actionId: step.actionId, outcome: 'awaiting-user', error: safeError(reason) })
+            return this.saveBatchResult(waiting, batchId, { batchId, taskId: waiting.taskId, outcome: 'awaiting-user', completedSteps,
+                mayHaveSideEffects: false, lastCheckpointSeq: waiting.highWatermarkSeq + 1, steps: results, waitReason: 'handoff' })
+        }
         try {
             for (let index = fromIndex; index < steps.length; index++) {
                 const step = steps[index]
@@ -1651,6 +2056,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Action intent was not committed')
                 task = intent
                 let description: ElementDescription | undefined
+                let decision: ReturnType<typeof classifySiteAction> = 'auto'
                 try {
                     if (['click', 'fill'].includes(step.kind)) {
                         if (refResolutionError)
@@ -1664,7 +2070,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         if (!grant.allowedOrigins.includes(description.frameOrigin)
                             || !grant.allowedOrigins.includes(new URL(description.pageUrl).origin))
                             throw new BrowserRuntimeError('ORIGIN_DENIED', 'Referenced element origin is not allowed', false, false)
+                        // The agent chose this element by its snapshot label; a relabel in place means it chose something else.
+                        if (description.currentName !== undefined && (description.role || description.name)
+                            && (description.currentName !== description.name || description.currentRole !== description.role))
+                            throw new BrowserRuntimeError('STALE_REF', 'Element label changed since the snapshot; observe again', false, false)
                     }
+                    if (step.actionId !== approvedActionId)
+                        decision = classifySiteAction(this.options.sites, effectiveStep, description)
+                    if (decision === 'deny')
+                        throw new BrowserRuntimeError('ORIGIN_DENIED', 'Site policy refuses this destination', false, false)
                 }
                 catch (error) {
                     // Description is read-only preflight; input has not been sent.
@@ -1692,9 +2106,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (approvedActionId === step.actionId) {
                     const boundApproval = Object.values(task.approvals).find((item) => item.actionId === step.actionId
                         && item.batchId === batchId && item.state === 'consumed')
-                    const currentBindingHash = description ? payloadHash({ step: effectiveStep,
-                        formValues: description.formValues, frameOrigin: description.frameOrigin,
-                        currentPageUrl: description.pageUrl }) : ''
+                    const currentBindingHash = description ? approvalPayloadHash(effectiveStep, description) : ''
                     const recomputedApprovalBinding = boundApproval ? approvalBinding({
                         principalId: grant.principalId,
                         workspaceId: grant.workspaceId,
@@ -1716,10 +2128,15 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         || liveLease.owner.segmentId !== batchId || driver.browserInstanceId() !== boundApproval.browserInstanceId
                         || origin !== boundApproval.origin || description.documentGeneration !== boundApproval.documentGeneration
                         || description.frameOrigin !== boundApproval.frameOrigin || currentBindingHash !== boundApproval.payloadHash
+                        || (boundApproval.elementIdentity !== undefined && description.identity !== boundApproval.elementIdentity)
                         || recomputedApprovalBinding !== boundApproval.bindingHash)
                         throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval binding changed before dispatch')
                 }
-                if (classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required' && step.actionId !== approvedActionId) {
+                // Nothing to bind an approval to (a navigation) or nothing that can be bound: the user does it.
+                if (decision === 'handoff' || (step.kind === 'navigate' && decision === 'requires-approval'))
+                    return handOff(task, step, index, leaseEpoch, new BrowserRuntimeError('APPROVAL_REQUIRED',
+                        'Site policy hands this action to the user', false, false))
+                if (['click', 'fill'].includes(step.kind) && decision === 'requires-approval') {
                     const expiresAtMs = this.clock.now() + POC_LIMITS.userWaitMs
                     const approval = createApproval({
                         grant,
@@ -1730,13 +2147,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         origin,
                         leaseEpoch,
                         browserInstanceId: driver.browserInstanceId(),
-                        documentGeneration: description?.documentGeneration ?? 0,
                         snapshotId: agentSnapshot!,
-                        frameOrigin: description!.frameOrigin,
-                        currentPageUrl: description!.pageUrl,
-                        elementName: description?.name,
-                        elementIdentity: description?.identity,
-                        formValues: description ? Object.entries(description.formValues).map(([name, value]) => ({ name, value })) : [],
+                        description: description!,
                         expiresAtMs,
                     })
                     const approvalId = approval.summary.approvalId
@@ -1792,7 +2204,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 armed.armAction?.(step.actionId)
                 this.inFlightDriverCalls.add(task.taskId)
                 try {
-                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal)
+                    const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal,
+                        step.kind === 'click' && description ? dispatchExpectation(description) : undefined)
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!grant.allowedOrigins.includes(finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
@@ -1841,8 +2254,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             }
                         }
                     }
-                    const requiresPostcondition = ['click', 'fill', 'navigate'].includes(step.kind)
-                        && classifyAction(step, description, undefined, description?.pageUrl) === 'approval-required'
+                    // An approved (or held) click or navigation is confirmed only by a trusted postcondition;
+                    // a fill's own effect is the value it typed.
+                    const requiresPostcondition = ['click', 'navigate'].includes(step.kind)
+                        && classifySiteAction(this.options.sites, effectiveStep, description) !== 'auto'
                     const hasPostconditionStep = steps.slice(index + 1).some((candidate) => candidate.tabId === step.tabId
                         && candidate.kind === 'waitFor')
                     if (requiresPostcondition && !hasPostconditionStep) {
@@ -1943,6 +2358,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         outcome = 'cancelled'
                         break
                     }
+                    // The driver could not verify the action (e.g. a transformed frame) and sent nothing: the user does it.
+                    if (error instanceof BrowserRuntimeError && error.code === 'APPROVAL_REQUIRED' && !error.mayHaveSideEffects)
+                        return handOff(task, step, index, leaseEpoch, error)
                     const write = ['click', 'fill', 'navigate'].includes(step.kind)
                     const runtimeError = error instanceof BrowserRuntimeError ? error : undefined
                     const deniedOrigin = runtimeError?.code === 'ORIGIN_DENIED'
@@ -2006,19 +2424,31 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async dispatch(driver: BrowserDriver, step: BatchStep, grant: AgentGrant,
-        signal: AbortSignal): ReturnType<typeof dispatchStep> {
-        return dispatchStep(driver, step, grant, signal)
+        signal: AbortSignal, expect?: DispatchExpectation): ReturnType<typeof dispatchStep> {
+        return dispatchStep(driver, step, grant, signal, expect)
     }
+    /**
+     * `guard` runs against the current task inside the serialized write; if it throws,
+     * nothing is committed and its error is returned as is (leases stay untouched).
+     */
     private async commit(task: StoredTask, patch: Partial<StoredTask>, type: TaskEvent['type'], data: Record<string, unknown>,
-        leaseEpoch = 0, business = false): Promise<StoredTask> {
+        leaseEpoch = 0, business = false, guard?: (current: StoredTask) => void): Promise<StoredTask> {
         const previous = this.commitTails.get(task.taskId) ?? Promise.resolve()
         let release!: () => void
         const current = new Promise<void>((resolve) => { release = resolve; })
         const queued = previous.then(() => current)
         this.commitTails.set(task.taskId, queued)
         await previous
+        let guardFailure: unknown
         try {
             const committed = await this.options.store.mutate(task.taskId, (current) => {
+                try {
+                    guard?.(current)
+                }
+                catch (error) {
+                    guardFailure = error
+                    return null
+                }
                 const rebased = rebaseTaskPatch(task, current, patch)
                 if (current.cancelRequested && !task.cancelRequested && rebased.status !== 'cancelled') {
                     delete rebased.status
@@ -2030,6 +2460,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     business,
                 }
             })
+            if (guardFailure)
+                throw guardFailure
             if (!committed)
                 throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Task disappeared during commit')
             for (const wake of this.eventWaiters.get(task.taskId) ?? [])
@@ -2037,6 +2469,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return committed
         }
         catch (error) {
+            if (guardFailure && error === guardFailure)
+                throw error
             this.leases.revokeTask(task.taskId)
             this.controllers.get(task.taskId)?.abort(new Error('journal unavailable'))
             throw error
@@ -2091,8 +2525,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return credential.expiresAtMs > this.clock.now()
             && !this.options.store.isRevoked(credential.kind === 'agent-grant' ? credential.grantId : credential.capabilityId)
     }
+    /** The agent's grant, narrowed to origins that have a site policy: every navigation, redirect and observation is checked against this. */
     private agentGrant(auth: AuthContext): AgentGrant { if (auth.credential.kind !== 'agent-grant')
-        throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent grant required'); return auth.credential; }
+        throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent grant required')
+    const sited = new Set(this.options.sites.map((site) => site.origin))
+    return { ...auth.credential, allowedOrigins: auth.credential.allowedOrigins.filter((origin) => sited.has(origin)) } }
     private driver(profileId: ProfileId): BrowserDriver { const driver = this.drivers.get(profileId); if (!driver)
         throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'No browser driver is configured for profile'); return driver; }
     private requireTask(id: TaskId): StoredTask { const task = this.options.store.getTask(id); if (!task)
@@ -2101,6 +2538,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const space = this.options.store.getSpace(id)
         if (!space)
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space does not exist'); return space; }
+    /** A closed or reclaiming space takes no new work; the agent creates a new space. */
+    private assertSpaceOpen(space: SpaceRecord): void {
+        if (space.closed || space.reclaimingSinceMs !== undefined)
+            throw new BrowserRuntimeError('CONFLICT', 'Task space was closed; create a new task space')
+    }
     private assertTaskTab(task: StoredTask, tab: TabId): void { if (!task.tabs.includes(tab))
         throw new BrowserRuntimeError('SCOPE_DENIED', 'Tab is not owned by task'); }
     /**
@@ -2219,6 +2661,15 @@ function safeError(error: unknown): RuntimeErrorBody {
     return redact(body)
 }
 
+/** What the driver must find again right before a click: the classified label, link and submission. */
+function dispatchExpectation(description: ElementDescription): DispatchExpectation {
+    return {
+        role: description.currentRole ?? description.role,
+        name: description.currentName ?? description.name,
+        ...(description.linkUrl ? { linkUrl: description.linkUrl, linkTarget: description.linkTarget ?? '' } : {}),
+        ...(description.form ? { formDigest: description.form.digest } : {}),
+    }
+}
 function persistedBatchSteps(steps: BatchStep[]): BatchStep[] {
     return redact(steps.map((step) => step.kind === 'fill' ? { ...step, value: undefined } : step))
 }

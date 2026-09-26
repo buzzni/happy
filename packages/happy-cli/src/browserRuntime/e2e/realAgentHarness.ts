@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { mintAgentGrant, mintInteractiveCapability } from '../auth'
+import { mintAgentGrant, mintInteractiveCapability, signServerCapability } from '../auth'
 import { AGENT_OPERATIONS, INTERACTIVE_OPERATIONS, type AgentSessionId, type GrantId } from '../contracts'
 import { RuntimeClient } from '../runtimeClient'
 import { MACHINE, PRINCIPAL_A, PROFILE_A, SITE_A, SITE_B, WORKSPACE } from './pocStack'
@@ -39,6 +39,27 @@ export interface RunContext {
  * ABP_EXEC_MACHINE = orb machine name, ABP_EXEC_HOST = its address.
  */
 export const execMachine = process.env.ABP_EXEC_MACHINE
+
+/**
+ * Production layout on H (installed by abp-install): the Runtime issues agent grants to the
+ * daemon's sessions itself (broker socket), and only server-signed (abp2) interactive
+ * capabilities are accepted. The harness then signs capabilities with a TEST issuer key whose
+ * public half was installed as a trusted issuer on H, standing in for the Saycode server.
+ */
+export const prodIdentity = process.env.ABP_PROD_MACHINE_ID ? {
+    machineId: process.env.ABP_PROD_MACHINE_ID,
+    principalId: requiredHarnessEnv('ABP_PROD_PRINCIPAL'),
+    workspaceId: requiredHarnessEnv('ABP_PROD_WORKSPACE'),
+    profileId: process.env.ABP_PROD_PROFILE ?? 'main',
+    issuerKid: requiredHarnessEnv('ABP_TEST_ISSUER_KID'),
+    issuerKeyFile: requiredHarnessEnv('ABP_TEST_ISSUER_KEY_FILE'),
+} : undefined
+
+function requiredHarnessEnv(name: string): string {
+    const value = process.env[name]
+    if (!value) throw new Error(`${name} is required with ABP_PROD_MACHINE_ID`)
+    return value
+}
 const execHost = () => process.env.ABP_EXEC_HOST ?? '127.0.0.1'
 export const execHappyHome = () => process.env.ABP_EXEC_HAPPY_HOME ?? '/home/agent/.happy-cli-isolated-abp/home'
 export const execUser = () => process.env.ABP_EXEC_USER ?? 'agent'
@@ -149,6 +170,14 @@ export async function writeAgentGrant(ctx: RunContext, agentSessionId: string, l
 export async function spawnAgentSession(ctx: RunContext, label: string, extraEnv: Record<string, string> = {}): Promise<{ sessionId: string; grantId: GrantId }> {
     let spawned: { success: boolean; sessionId: string }
     let grantFile: string
+    if (execMachine && prodIdentity) {
+        // The daemon registers the session with the Runtime broker; no grant file, no Runtime env.
+        const workspace = `/work/${ctx.run}-${label}`
+        await onExecMachine(`install -d -o ${execUser()} -g abp-work -m 2770 '${workspace}'`)
+        const spawned = JSON.parse(await onExecMachine(daemonCall('/spawn-session'), JSON.stringify({ directory: workspace, agent: 'claude', environmentVariables: extraEnv })))
+        if (!spawned.success) throw new Error('spawn failed')
+        return { sessionId: spawned.sessionId, grantId: 'broker' as GrantId }
+    }
     if (execMachine) {
         const workspace = `/home/${execUser()}/abp-poc-agent-ws/${ctx.run}-${label}`
         grantFile = `/home/${execUser()}/abp-grants/${ctx.run}-${label}.token`
@@ -184,6 +213,15 @@ export async function spawnAgentSession(ctx: RunContext, label: string, extraEnv
 /** The user's reconnecting client with an interactive capability (approve/takeover + read). */
 export function userClient(ctx: RunContext, viewerSessionId: string): RuntimeClient {
     const issuedAt = now()
+    if (prodIdentity) {
+        const token = signServerCapability({
+            kind: 'interactive', capabilityId: `cap-${ctx.run}-${viewerSessionId}-${issuedAt}`, principalId: prodIdentity.principalId as never,
+            workspaceId: prodIdentity.workspaceId as never, machineId: prodIdentity.machineId as never, viewerSessionId,
+            profileId: prodIdentity.profileId as never, aud: prodIdentity.machineId, iss: 'saycode-server',
+            operations: [...INTERACTIVE_OPERATIONS, 'getTask', 'subscribe', 'cancel', 'resume', 'listTasks'], issuedAtMs: issuedAt, expiresAtMs: issuedAt + 5 * 60_000,
+        }, { kid: prodIdentity.issuerKid, privateKey: readFileSync(prodIdentity.issuerKeyFile, 'utf8') })
+        return new RuntimeClient({ baseUrl: ctx.runtimeUrl, token, fetchImpl: harnessFetch })
+    }
     const token = mintInteractiveCapability({
         kind: 'interactive', capabilityId: `cap-${ctx.run}-${viewerSessionId}-${issuedAt}`, principalId: PRINCIPAL_A,
         workspaceId: WORKSPACE, machineId: MACHINE, viewerSessionId, profileId: PROFILE_A,
@@ -209,6 +247,13 @@ export async function sessionClient(...args: string[]): Promise<string> {
 export async function clientProcessCount(): Promise<number> {
     const { stdout } = await execFileAsync('pgrep', ['-f', 'sessionClient.ts']).catch(() => ({ stdout: '' }))
     return stdout.trim() ? stdout.trim().split('\n').length : 0
+}
+
+/** User-role text messages of a session (e.g. a re-invocation delivered by H's daemon), oldest first. */
+export async function userTexts(sessionId: string): Promise<string[]> {
+    const raw = await sessionClient('read', sessionId, '200')
+    const messages = JSON.parse(raw.trim().split('\n').at(-1)!.replace(/[\u0000-\u001f]/g, ' ')) as Array<{ content: { role?: string; content?: { type?: string; text?: string } } }>
+    return messages.filter((message) => message.content?.role === 'user' && typeof message.content.content?.text === 'string').map((message) => message.content.content!.text!)
 }
 
 export async function transcript(sessionId: string): Promise<TranscriptRow[]> {
@@ -241,6 +286,19 @@ export async function waitForTranscript(sessionId: string, predicate: (rows: Tra
 }
 
 export async function fixtureControl(ctx: RunContext, method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
+    // Installed H: the fixture sits on the browser bridge, whose egress rules only answer the
+    // host itself, so control goes through a root shell on H (token and body on stdin).
+    const fixtureOnExec = process.env.ABP_FIXTURE_CONTROL_URL
+    if (fixtureOnExec && execMachine) {
+        const config = [`url = "${fixtureOnExec}${path}"`, `request = "${method}"`, `header = "x-harness-token: ${ctx.env.harnessToken}"`,
+            'header = "content-type: application/json"', ...body ? [`data-binary = ${JSON.stringify(JSON.stringify(body))}`] : [], 'silent', 'max-time = 30'].join('\n')
+        // A rare empty reply from the orb exec relay is retried for reads; a real error body still parses.
+        for (let attempt = 1; ; attempt++) {
+            const out = await onExecMachine('curl -K -', config)
+            if (out.trim() || method !== 'GET' || attempt === 3) return JSON.parse(out) as Record<string, unknown>
+            await sleep(500)
+        }
+    }
     const response = await harnessFetch(`http://${execHost()}:${ctx.env.ports.control}${path}`, {
         method,
         headers: { 'x-harness-token': ctx.env.harnessToken, 'content-type': 'application/json' },

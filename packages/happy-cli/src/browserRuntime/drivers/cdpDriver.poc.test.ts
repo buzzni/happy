@@ -6,7 +6,8 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { BrowserRuntimeError, type BrowserInstanceId, type ElementRef, type Observation, type TabId } from '../contracts'
+import { BrowserRuntimeError, type BrowserInstanceId, type DispatchExpectation, type ElementDescription, type ElementRef, type Observation, type TabId } from '../contracts'
+import { formDigest } from '../policy'
 import { CdpDriver } from './cdpDriver'
 import { HIT_SCRIPT, HarnessCdp, decodePng, delay, eventually, findChrome, launchChrome, startSite, type LaunchedChrome, type Site } from './pocTestKit'
 
@@ -34,6 +35,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
     let driver: CdpDriver
     let harness: HarnessCdp
     const instanceId = `bi-${randomUUID()}` as BrowserInstanceId
+    let bounceCount = () => 0
 
     beforeAll(async () => {
         chrome = await launchChrome()
@@ -91,6 +93,102 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/later', `<body><p>Waiting</p><script>setTimeout(() => { document.body.insertAdjacentHTML('beforeend', '<p>Arrived later</p>'); history.pushState({}, '', '/later/done') }, 400)</script></body>`)
         a.route('/reveal', `${HIT_SCRIPT}<body><button id="r" style="visibility:hidden" onclick="hit('reveal')">Reveal</button><script>setTimeout(() => { document.getElementById('r').style.visibility = 'visible' }, 300)</script></body>`)
         a.route('/form', `${HIT_SCRIPT}<body><input id="name" aria-label="Name" value="old"><button onclick="hit('v-' + encodeURIComponent(document.getElementById('name').value))">Send</button></body>`)
+        a.route('/digest-form', `${HIT_SCRIPT}<body><form id="f" action="/order" method="post" onsubmit="event.preventDefault(); hit('digest-submit')">
+            <input name="item" value="a"><input name="item" value="b">
+            <input type="checkbox" name="gift" value="yes" checked><input type="checkbox" name="wrap" value="yes">
+            <select name="size" multiple><option value="s" selected>S</option><option value="m">M</option><option value="l" selected>L</option></select>
+            <textarea name="note">hi</textarea><input type="hidden" name="token" value="t1">
+            <input name="off" value="ignored" disabled><input type="password" name="pin" value="1234">
+            <input name="action" value="clobber">
+            <button name="op" value="pay">Pay</button>
+            <button name="op" value="alt" formaction="/other" formmethod="get" formenctype="text/plain" type="submit">Alt</button>
+            <button type="button" onclick="hit('plain')">Helper</button>
+            <a href="/help?x=1">Help link</a>
+        </form><button onclick="hit('outside')">Outside</button></body>`)
+        a.route('/relabel', `${HIT_SCRIPT}<body style="margin:0"><button id="b" style="position:absolute;left:20px;top:20px;width:160px;height:40px"
+            onmouseover="this.textContent = 'Pay now'" onclick="hit('relabel-' + this.textContent)">Continue</button></body>`)
+        a.route('/inner-btn', `${HIT_SCRIPT}<body style="margin:0"><button style="position:absolute;left:40px;top:40px;width:120px;height:40px" onclick="hit('inner-btn')">Inner go</button></body>`)
+        b.route('/frame-btn', `${HIT_SCRIPT}<body style="margin:0"><button style="position:absolute;left:40px;top:40px;width:120px;height:40px" onclick="hit('frame-btn')">Frame go</button></body>`)
+        const framed = (src: string, overlay: boolean) => `${HIT_SCRIPT}<body style="margin:0">
+            <iframe src="${src}" style="position:absolute;left:30px;top:30px;width:300px;height:200px;border:5px solid black;padding:3px"></iframe>
+            ${overlay ? `<div style="position:absolute;left:0;top:0;width:500px;height:400px;z-index:10;opacity:0.01" onclick="hit('overlay')"></div>` : ''}</body>`
+        // The inner button sits at 40..160 x 40..80 of the frame; scaled x2 from the frame's corner (30+5+3=38)
+        // it is really at 118..358 x 118..198. The overlay covers only that real area; unscaled maths would
+        // check (138, 98) — outside the overlay — and wrongly pass.
+        const transformed = (transform: string) => `${HIT_SCRIPT}<body style="margin:0">
+            <iframe src="/inner-btn" style="position:absolute;left:30px;top:30px;width:300px;height:200px;border:5px solid black;padding:3px;transform:${transform};transform-origin:0 0"></iframe>
+            <div style="position:absolute;left:200px;top:110px;width:200px;height:100px;z-index:10;opacity:0.01" onclick="hit('overlay')"></div></body>`
+        a.route('/frame-scaled', transformed('scale(2)'))
+        a.route('/frame-rotated', transformed('rotate(3deg)'))
+        a.route('/frame-zoomed-parent', `${HIT_SCRIPT}<body style="margin:0"><div style="zoom:2"><iframe src="/inner-btn" style="width:300px;height:200px;border:0"></iframe></div></body>`)
+        a.route('/frame-clear-same', framed('/inner-btn', false))
+        a.route('/frame-overlay-same', framed('/inner-btn', true))
+        a.route('/frame-clear-oopif', () => framed(b.url('/frame-btn'), false))
+        a.route('/frame-overlay-oopif', () => framed(b.url('/frame-btn'), true))
+        let bounces = 0
+        c.route('/bounce', () => { bounces += 1; return { status: 302, headers: { location: a.url('/plain') } } })
+        a.route('/via-c', () => ({ status: 302, headers: { location: c.url('/bounce') } }))
+        a.route('/redir-hit', () => ({ status: 302, headers: { location: c.url('/hit/redirect') } }))
+        bounceCount = () => bounces
+        a.route('/exfil', () => `${HIT_SCRIPT}<body>
+            <button onclick="window.open('${c.url('/hit/open')}')">Open window</button>
+            <button onclick="window.open('${c.url('/hit/noopener')}', '_blank', 'noopener')">Open noopener</button>
+            <a href="${c.url('/hit/blank')}" target="_blank">Blank link</a>
+            <form action="${c.url('/hit/post')}" method="post"><input name="q" value="synthetic"><button>Post away</button></form>
+            <button onclick="fetch('${c.url('/hit/fetch')}', { method: 'POST', mode: 'no-cors', body: 'x' })">Fetch away</button>
+            <button onclick="navigator.sendBeacon('${c.url('/hit/beacon')}', 'x')">Beacon away</button>
+            <button onclick="window.open('${a.url('/plain')}')">Open allowed</button>
+            <button onclick="window.open('${a.url('/hit/over-cap')}')">Open over cap</button>
+            <iframe src="${c.url('/hit/frame')}"></iframe></body>`)
+        a.route('/meta-refresh', () => `<head><meta http-equiv="refresh" content="1;url=${c.url('/hit/meta')}"></head><body>Refreshing</body>`)
+        a.route('/base-target', `${HIT_SCRIPT}<head><base target="_blank"></head><body>
+            <form action="/order" method="post"><input name="q" value="1"><button>Order</button></form>
+            <a href="/help">Help</a><a href="/self" target="_self">Stay</a>
+            <form action="/login"><input type="password" name="pw" value="synthetic-pw"><button>Sign in</button></form>
+            <form action="/login2"><input type="password" name="pw"><button>Sign in empty</button></form>
+            <form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="f"><button>Upload</button></form></body>`)
+        const guarded = (buttonAttrs: string, script = '') => () => `${HIT_SCRIPT}<body><form id="f" action="/hit/g-post" method="post">
+            <input type="hidden" name="token" value="t1"><input name="amount" value="10">
+            <button id="pay" name="op" value="pay" style="width:120px;height:40px" ${buttonAttrs}>Pay</button></form>
+            <script>const f = document.getElementById('f'), pay = document.getElementById('pay'), token = f.querySelector('[name=token]'); ${script}</script></body>`
+        a.route('/guard-plain', guarded(''))
+        a.route('/guard-hover-value', guarded(`onmouseover="token.value = 't2'"`))
+        a.route('/guard-hover-action', guarded(`onmouseover="pay.setAttribute('formaction', '/hit/g-other')"`))
+        a.route('/guard-hover-method', guarded(`onmouseover="f.method = 'get'"`))
+        a.route('/guard-hover-target', guarded(`onmouseover="f.target = '_blank'"`))
+        a.route('/guard-down', guarded(`onmousedown="token.value = 't2'"`))
+        a.route('/guard-click', guarded(`onclick="pay.setAttribute('formaction', '/hit/g-other')"`))
+        a.route('/guard-submit-late', guarded('', `f.addEventListener('submit', () => { token.value = 't2' })`))
+        a.route('/guard-formdata', guarded('', `f.addEventListener('formdata', (e) => e.formData.set('amount', '999'))`))
+        a.route('/descendants', () => `${HIT_SCRIPT}<body>
+            <button onclick="window.open('${a.url('/hit/popup-ran')}')">Open popup</button>
+            <button onclick="window.open('${a.url('/popup-opener')}')">Open opener popup</button>
+            <button onclick="window.worker = new Worker(window.URL.createObjectURL(new Blob(['fetch(\\'${a.url('/hit/worker-ran')}\\', { method: \\'POST\\' })'], { type: 'text/javascript' })))">Start worker</button>
+            <button onclick="const f = document.createElement('iframe'); f.src = '${b.url('/frame-runs')}'; document.body.append(f)">Add frame</button></body>`)
+        a.route('/popup-opener', () => `<body>popup</body>`)
+        b.route('/frame-runs', () => `<body><script>fetch('/hit/frame-ran', { method: 'POST' })</script>frame</body>`)
+        const encodings = { get: ['get', 'application/x-www-form-urlencoded'], post: ['post', 'application/x-www-form-urlencoded'],
+            multipart: ['post', 'multipart/form-data'], text: ['post', 'text/plain'] } as const
+        for (const [key, [method, enctype]] of Object.entries(encodings)) {
+            const form = (hit: string, script: string, buttonAttrs = '') => () => `${HIT_SCRIPT}<body><form id="f" action="/hit/${hit}?src=cart" method="${method}" enctype="${enctype}">
+                <input type="hidden" name="token" value="t1"><input name="amount" value="10"><textarea name="note">a\nb</textarea>
+                <button id="pay" name="op" value="pay" style="width:120px;height:40px" ${buttonAttrs}>Pay</button></form>
+                <script>const f = document.getElementById('f'), pay = document.getElementById('pay'); ${script}</script></body>`
+            a.route(`/sub-${key}`, form(`sub-${key}`, ''))
+            // After every guard listener: an ancestor seeing the bubbling formdata event, and a form listener added mid-click.
+            a.route(`/late-bubble-${key}`, form(`late-bubble-${key}`, `document.addEventListener('formdata', (e) => e.formData.set('amount', '999'))`))
+            a.route(`/late-form-${key}`, form(`late-form-${key}`, '', `onmousedown="f.addEventListener('formdata', (e) => e.formData.append('extra', '1'))"`))
+            // Registered before the guard, in the capture phase: the guard's listeners never see the events.
+            const swallow = (type: string, mutate = '') => `window.addEventListener('${type}', (e) => { ${mutate} e.stopImmediatePropagation() }, true)`
+            a.route(`/suppress-formdata-${key}`, form(`suppress-formdata-${key}`, swallow('formdata', `e.formData.set('amount', '999');`)))
+            a.route(`/suppress-both-${key}`, form(`suppress-both-${key}`, `${swallow('submit')}; ${swallow('formdata', `e.formData.set('amount', '999');`)}`))
+            a.route(`/suppress-clean-${key}`, form(`suppress-clean-${key}`, `${swallow('submit')}; ${swallow('formdata')}`))
+        }
+        a.route('/suppress-file', () => `${HIT_SCRIPT}<body><form id="f" action="/hit/suppress-file" method="post" enctype="multipart/form-data">
+            <input name="amount" value="10"><input type="file" name="doc">
+            <button id="pay" name="op" value="pay" style="width:120px;height:40px"
+                onmousedown="const d = new DataTransfer(); d.items.add(new File(['synthetic'], 'a.txt')); document.querySelector('[name=doc]').files = d.files">Pay</button></form>
+            <script>for (const type of ['submit', 'formdata']) window.addEventListener(type, (e) => e.stopImmediatePropagation(), true)</script></body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -147,6 +245,206 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         })
     })
 
+    describe('agent window cap', () => {
+        it('gives each owned tab its own window and refuses a tab beyond maxAgentWindows before creating any target', async () => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            try {
+                const first = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                const second = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                const windowOf = async (targetId: string) => (await harness.conn.send('Browser.getWindowForTarget', { targetId })).windowId as number
+                expect(await windowOf(first.targetId)).not.toBe(await windowOf(second.targetId))
+                const before = (await harness.targets()).length
+                const refused = await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                expect(refused.mayHaveSideEffects).toBe(false)
+                expect((await harness.targets()).length).toBe(before)
+                await capped.closeTab(first.tabId, OPTS)
+                const third = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                expect(capped.debugCounts().tabs).toBe(2)
+                await capped.closeTab(second.tabId, OPTS)
+                await capped.closeTab(third.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('counts opens that are still in flight, so concurrent opens never exceed the cap', async () => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            try {
+                const results = await Promise.allSettled([0, 1, 2, 3].map(() => capped.openTab(a.url('/plain'), [a.origin], OPTS)))
+                const opened = results.filter((r) => r.status === 'fulfilled')
+                const refused = results.filter((r) => r.status === 'rejected' && (r.reason as BrowserRuntimeError).code === 'QUOTA_EXCEEDED')
+                expect(opened).toHaveLength(2)
+                expect(refused).toHaveLength(2)
+                for (const r of opened) await capped.closeTab((r as PromiseFulfilledResult<{ tabId: TabId }>).value.tabId, OPTS)
+                // A failed open releases its slot too.
+                await expectCode(capped.openTab('http://unlisted.invalid/', [a.origin], OPTS), 'ORIGIN_DENIED')
+                const again = await Promise.all([0, 1].map(() => capped.openTab(a.url('/plain'), [a.origin], OPTS)))
+                for (const tab of again) await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+    })
+
+    describe('window reservations', () => {
+        const cappedDriver = async (maxAgentWindows: number, testHooks?: ConstructorParameters<typeof CdpDriver>[0]['testHooks']) => {
+            const capped = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows, testHooks })
+            await capped.connect()
+            return capped
+        }
+
+        it('counts a registered tab once while its page is still loading, so a staggered second open fits', async () => {
+            const capped = await cappedDriver(2)
+            try {
+                const slow = capped.openTab(a.url('/slow-load'), [a.origin], { timeoutMs: 20_000 })
+                await eventually(() => capped.debugCounts().tabs, (n) => n === 1)
+                const second = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                const first = await slow
+                expect(capped.debugCounts().windows).toBe(2)
+                await capped.closeTab(first.tabId, OPTS)
+                await capped.closeTab(second.tabId, OPTS)
+                expect(capped.debugCounts().windows).toBe(0)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('keeps a window reserved until its target is confirmed gone, even when cleanup failed', async () => {
+            let closeFails = true
+            const capped = await cappedDriver(1, { discardCloseFails: () => closeFails })
+            try {
+                await expectCode(capped.openTab(a.url('/slow-load'), [a.origin], { timeoutMs: 1_000 }), 'OUTCOME_UNKNOWN')
+                // The discarded tab is forgotten, but its window was never confirmed gone.
+                await eventually(() => capped.debugCounts().tabs, (n) => n === 0, 10_000)
+                expect(capped.debugCounts().windows).toBe(1)
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                closeFails = false
+                const leftover = (await harness.targets()).filter((t) => t.url.includes('/slow-load'))
+                for (const target of leftover) await harness.closeTarget(target.targetId)
+                await eventually(() => capped.debugCounts().windows, (n) => n === 0)
+                const tab = await capped.openTab(a.url('/plain'), [a.origin], OPTS)
+                await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+            }
+        })
+
+        it('counts popups of owned tabs and closes one that would exceed the cap before it loads', async () => {
+            // Its own browser: a second driver on the same browser would release the paused popup.
+            const own = await launchChrome()
+            const capped = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId, maxAgentWindows: 2 })
+            await capped.connect()
+            const ownHarness = await HarnessCdp.connect(own.browserWsUrl)
+            try {
+                const tab = await capped.openTab(a.url('/exfil'), [a.origin], OPTS)
+                const obs = await capped.observe(tab.tabId, [a.origin], OPTS)
+                const press = (name: string) => capped.click(tab.tabId, obs.elements.find((e) => e.name === name)!.ref, obs.snapshotId, OPTS)
+                await press('Open allowed')
+                await eventually(() => capped.debugCounts().windows, (n) => n === 2)
+                await expectCode(capped.openTab(a.url('/plain'), [a.origin], OPTS), 'QUOTA_EXCEEDED')
+                await press('Open over cap')
+                await delay(800)
+                expect(a.hits('over-cap')).toBe(0)
+                expect(capped.debugCounts().windows).toBe(2)
+                const popup = capped.popupReports().find((p) => p.origin === a.origin && !p.closed)!
+                await ownHarness.closeTarget(popup.targetId)
+                await eventually(() => capped.debugCounts().windows, (n) => n === 1)
+                await capped.closeTab(tab.tabId, OPTS)
+            } finally {
+                await capped.close()
+                ownHarness.close()
+                await own.stop()
+            }
+        })
+    })
+
+    describe('interception failure fails closed', () => {
+        // Its own browser: another driver attached to the same browser would release paused popups.
+        type Kind = 'popup' | 'worker' | 'iframe'
+        async function withFailingGuard(fail: (kind: Kind, method: string, depth: number) => boolean, body: (d: CdpDriver, own: HarnessCdp) => Promise<void>) {
+            const own = await launchChrome()
+            const failing = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId, testHooks: { guardFailure: fail } })
+            await failing.connect()
+            const ownHarness = await HarnessCdp.connect(own.browserWsUrl)
+            try {
+                await body(failing, ownHarness)
+            } finally {
+                await failing.close()
+                ownHarness.close()
+                await own.stop()
+            }
+        }
+        async function press(d: CdpDriver, tabId: TabId, name: string) {
+            const obs = await d.observe(tabId, [a.origin, b.origin], OPTS)
+            return d.click(tabId, obs.elements.find((e) => e.name === name)!.ref, obs.snapshotId, OPTS)
+        }
+
+        it('control: with interception working, the popup, worker and frame do run', async () => {
+            await withFailingGuard(() => false, async (d, own) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                for (const name of ['Open popup', 'Start worker', 'Add frame', 'Open opener popup']) await press(d, tab.tabId, name)
+                const child = await eventually(() => own.targets(), (t) => t.some((x) => x.url.endsWith('/popup-opener')))
+                const { sessionId } = await own.conn.send('Target.attachToTarget', { targetId: child.find((x) => x.url.endsWith('/popup-opener'))!.targetId, flatten: true })
+                void own.conn.send('Runtime.evaluate', { expression: `window.open('${a.url('/hit/grandchild-ran')}'); 1`, userGesture: true }, sessionId).catch(() => undefined)
+                const ran = () => ({ popup: a.hits('popup-ran'), worker: a.hits('worker-ran'), frame: b.hits('frame-ran'), grandchild: a.hits('grandchild-ran') })
+                expect(await eventually(ran, (r) => Object.values(r).every((n) => n === 1), 15_000)).toEqual({ popup: 1, worker: 1, frame: 1, grandchild: 1 })
+                for (const site of [a, b]) site.resetHits()
+            })
+        })
+
+        for (const method of ['Fetch.enable', 'Target.setAutoAttach']) {
+            it(`closes a popup whose ${method} failed before it runs, and refuses further work on the tab`, async () => {
+                await withFailingGuard((kind, failed) => kind === 'popup' && failed === method, async (d, own) => {
+                    const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                    await press(d, tab.tabId, 'Open popup').catch(() => undefined)
+                    await delay(1_000)
+                    expect(a.hits('popup-ran')).toBe(0)
+                    expect((await own.targets()).some((t) => t.url.includes('/hit/popup-ran'))).toBe(false)
+                    const refused = await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+                    expect(refused.message).toContain('interception')
+                    expect(await d.closeTab(tab.tabId, OPTS)).toEqual({ closed: true })
+                })
+            })
+        }
+
+        it('keeps a worker whose interception failed paused (it never runs)', async () => {
+            await withFailingGuard((kind) => kind === 'worker', async (d) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                await press(d, tab.tabId, 'Start worker').catch(() => undefined)
+                await delay(1_000)
+                expect(a.hits('worker-ran')).toBe(0)
+                await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+            })
+        })
+
+        it('keeps a cross-site frame whose interception failed paused (its script never runs)', async () => {
+            await withFailingGuard((kind) => kind === 'iframe', async (d) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                await press(d, tab.tabId, 'Add frame').catch(() => undefined)
+                await delay(1_000)
+                expect(b.hits('frame-ran')).toBe(0)
+                await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+            })
+        })
+
+        it('closes a popup opened by a popup (descendant) whose interception failed', async () => {
+            await withFailingGuard((kind, method, depth) => kind === 'popup' && depth >= 2 && method === 'Fetch.enable', async (d, own) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                await press(d, tab.tabId, 'Open opener popup')
+                const child = await eventually(() => own.targets(), (t) => t.some((x) => x.url.endsWith('/popup-opener')))
+                const { sessionId } = await own.conn.send('Target.attachToTarget', { targetId: child.find((x) => x.url.endsWith('/popup-opener'))!.targetId, flatten: true })
+                // A user gesture inside the (allowed, guarded) popup opens its own popup.
+                void own.conn.send('Runtime.evaluate', { expression: `window.open('${a.url('/hit/grandchild-ran')}'); 1`, userGesture: true }, sessionId).catch(() => undefined)
+                await delay(1_500)
+                expect(a.hits('grandchild-ran')).toBe(0)
+                await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+            })
+        })
+    })
+
     describe('OOPIF and snapshot', () => {
         it('attaches the cross-site iframe as a separate child target and observes both frames', async () => {
             const tab = await open('/oopif', [a.origin, b.origin])
@@ -176,8 +474,10 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         it('returns no text or refs from a frame whose origin is not allowed', async () => {
             const tab = await open('/oopif', [a.origin])
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
-            const frameB = obs.frames.find((f) => f.origin === b.origin)
+            // The disallowed frame's document request is stopped unsent: it is reported, not loaded.
+            const frameB = obs.frames.find((f) => f.origin !== a.origin)
             expect(frameB).toMatchObject({ allowed: false })
+            expect(driver.blockedReports().some((r) => r.tabId === tab.tabId && r.origin === b.origin && r.resourceType === 'Document')).toBe(true)
             expect(frameB?.text).toBeUndefined()
             expect(obs.elements.every((e) => e.frameOrigin === a.origin)).toBe(true)
             const serialized = JSON.stringify(obs)
@@ -325,11 +625,201 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             }
         })
 
+        it('describes the full ordered form submission with submitter overrides and a digest that tracks every change', async () => {
+            const tab = await open('/digest-form', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const pay = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
+            expect(pay.submitsForm).toBe(true)
+            expect(pay.form).toMatchObject({
+                // A filled password cannot be bound: the form is opaque (the runtime hands it to the user).
+                action: a.url('/order'), method: 'post', enctype: 'application/x-www-form-urlencoded', target: '', opaque: true,
+                fields: [['item', 'a'], ['item', 'b'], ['gift', 'yes'], ['size', 's'], ['size', 'l'], ['note', 'hi'], ['token', 't1'],
+                    ['pin', { password: 4 }], ['action', 'clobber'], ['op', 'pay']],
+                submitter: { name: 'op', value: 'pay', formaction: null, formmethod: null, formenctype: null },
+            })
+            expect(pay.form!.digest).toBe(formDigest(pay.form!))
+            expect(JSON.stringify(pay)).not.toContain('1234')
+            const alt = await driver.describeRef(tab.tabId, refOf(obs, 'Alt'), obs.snapshotId, OPTS)
+            expect(alt.form).toMatchObject({ action: a.url('/other'), method: 'get', enctype: 'text/plain',
+                submitter: { name: 'op', value: 'alt', formaction: '/other', formmethod: 'get', formenctype: 'text/plain' } })
+            expect(alt.form!.fields.at(-1)).toEqual(['op', 'alt'])
+            expect(alt.form!.digest).not.toBe(pay.form!.digest)
+            const helper = await driver.describeRef(tab.tabId, refOf(obs, 'Helper'), obs.snapshotId, OPTS)
+            expect(helper).toMatchObject({ submitsForm: false, form: { submitter: null } })
+            expect(helper.form!.fields.map(([name]) => name)).not.toContain('op')
+            const link = await driver.describeRef(tab.tabId, refOf(obs, 'Help link'), obs.snapshotId, OPTS)
+            expect(link).toMatchObject({ linkUrl: a.url('/help?x=1'), currentRole: 'link', currentName: 'Help link' })
+            const outside = await driver.describeRef(tab.tabId, refOf(obs, 'Outside'), obs.snapshotId, OPTS)
+            expect(outside.form).toBeUndefined()
+            // Any change to what would be sent changes the digest: a hidden value, the order, the password.
+            for (const mutate of [
+                "document.querySelector('[name=token]').value = 't2'",
+                "document.getElementById('f').prepend(document.querySelector('[name=note]'))",
+                "document.querySelector('[name=pin]').value = '12345'",
+                "document.getElementById('f').setAttribute('action', '/elsewhere')",
+            ]) {
+                const before = (await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)).form!.digest
+                await harness.evaluate(tab.targetId, mutate)
+                const after = await driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS)
+                expect(after.form!.digest, mutate).not.toBe(before)
+            }
+            expect(a.hits('digest-submit')).toBe(0)
+        })
+
+        it('reports effective targets including <base target>, and marks forms whose submitted content cannot be bound', async () => {
+            const tab = await open('/base-target', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const describe = (name: string) => driver.describeRef(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS)
+            expect((await describe('Order')).form).toMatchObject({ target: '_blank', opaque: false })
+            expect(await describe('Help')).toMatchObject({ linkUrl: a.url('/help'), linkTarget: '_blank' })
+            expect(await describe('Stay')).toMatchObject({ linkTarget: '_self' })
+            expect((await describe('Sign in')).form?.opaque).toBe(true)
+            expect((await describe('Sign in empty')).form?.opaque).toBe(false)
+            expect((await describe('Upload')).form?.opaque).toBe(false)
+            // A chosen file's content cannot be bound either.
+            await harness.evaluate(tab.targetId, `(() => { const input = document.querySelector('[name=f]'); const data = new DataTransfer(); data.items.add(new File(['synthetic'], 'a.txt')); input.files = data.files; return 1 })()`)
+            expect((await describe('Upload')).form?.opaque).toBe(true)
+        })
+
         it('fails with STALE_REF when the node behind the ref was replaced', async () => {
             const tab = await open('/spa', [a.origin])
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
             await harness.evaluate(tab.targetId, 'swap()')
             await expectCode(driver.describeRef(tab.tabId, refOf(obs, 'Pay'), obs.snapshotId, OPTS), 'STALE_REF')
+        })
+    })
+
+    describe('dispatch-time label and ancestor overlay checks', () => {
+        it('refuses to click when the same node was relabelled after the snapshot (no dispatch)', async () => {
+            const tab = await open('/relabel', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const error = await expectCode(driver.click(tab.tabId, refOf(obs, 'Continue'), obs.snapshotId, OPTS), 'STALE_REF')
+            expect(error.mayHaveSideEffects).toBe(false)
+            await delay(300)
+            expect(a.hits('relabel-Pay now') + a.hits('relabel-Continue')).toBe(0)
+        })
+
+        it('clicks inside a same-process iframe and an OOPIF when nothing in a parent document covers them', async () => {
+            let tab = await open('/frame-clear-same', [a.origin])
+            let obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Inner go'), obs.snapshotId, OPTS)
+            expect(await eventually(() => a.hits('inner-btn'), (n) => n === 1)).toBe(1)
+            tab = await open('/frame-clear-oopif', [a.origin, b.origin])
+            obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Frame go'), obs.snapshotId, OPTS)
+            expect(await eventually(() => b.hits('frame-btn'), (n) => n === 1)).toBe(1)
+        })
+
+        it('hands off a click in a transformed or zoomed frame instead of trusting untransformed geometry (no dispatch)', async () => {
+            for (const path of ['/frame-scaled', '/frame-rotated', '/frame-zoomed-parent']) {
+                const tab = await open(path, [a.origin])
+                const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+                const error = await expectCode(driver.click(tab.tabId, refOf(obs, 'Inner go'), obs.snapshotId, OPTS), 'APPROVAL_REQUIRED')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+                await delay(300)
+                expect(a.hits('inner-btn'), path).toBe(0)
+                expect(a.hits('overlay'), path).toBe(0)
+            }
+        })
+
+        it('refuses a click whose iframe is covered by an element of the parent document (same-process and OOPIF)', async () => {
+            for (const [path, name, site, hit] of [['/frame-overlay-same', 'Inner go', a, 'inner-btn'], ['/frame-overlay-oopif', 'Frame go', b, 'frame-btn']] as const) {
+                const tab = await open(path, [a.origin, b.origin])
+                const obs = await driver.observe(tab.tabId, [a.origin, b.origin], OPTS)
+                const error = await expectCode(driver.click(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS), 'INVALID_REQUEST')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+                expect(error.message, path).toContain('covered by a parent document')
+                await delay(300)
+                expect(site.hits(hit), path).toBe(0)
+                expect(a.hits('overlay'), path).toBe(0)
+            }
+        })
+    })
+
+    describe('dispatch-time binding and submission guard', () => {
+        const expectationOf = (d: ElementDescription): DispatchExpectation => ({ role: d.currentRole ?? d.role, name: d.currentName ?? d.name,
+            ...(d.linkUrl ? { linkUrl: d.linkUrl, linkTarget: d.linkTarget ?? '' } : {}), ...(d.form ? { formDigest: d.form.digest } : {}) })
+        async function clickExpecting(path: string) {
+            const tab = await open(path, [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            const ref = refOf(obs, 'Pay')
+            const expectation = expectationOf(await driver.describeRef(tab.tabId, ref, obs.snapshotId, OPTS))
+            return driver.click(tab.tabId, ref, obs.snapshotId, { ...OPTS, expect: expectation })
+        }
+
+        it('submits exactly the described form when nothing changed', async () => {
+            await clickExpecting('/guard-plain')
+            expect(await eventually(() => a.hits('g-post'), (n) => n === 1)).toBe(1)
+        })
+
+        it('refuses before pressing when hovering changed a value, formaction, method or target (no dispatch)', async () => {
+            for (const path of ['/guard-hover-value', '/guard-hover-action', '/guard-hover-method', '/guard-hover-target']) {
+                const error = await expectCode(clickExpecting(path), 'STALE_REF')
+                expect(error.mayHaveSideEffects, path).toBe(false)
+            }
+            await delay(500)
+            expect(a.hits('g-post') + a.hits('g-other')).toBe(0)
+        })
+
+        for (const key of ['get', 'post', 'multipart', 'text']) {
+            it(`checks the final ${key} request: an unchanged one is sent once, one changed by a late formdata listener is not sent`, async () => {
+                await clickExpecting(`/sub-${key}`)
+                expect(await eventually(() => a.hits(`sub-${key}`), (n) => n === 1)).toBe(1)
+                for (const late of [`late-bubble-${key}`, `late-form-${key}`]) {
+                    const error = await expectCode(clickExpecting(`/${late}`), 'APPROVAL_EXPIRED')
+                    expect(error.mayHaveSideEffects, late).toBe(true)
+                }
+                await delay(800)
+                expect(a.hits(`late-bubble-${key}`) + a.hits(`late-form-${key}`)).toBe(0)
+            })
+        }
+
+        for (const key of ['get', 'post', 'multipart', 'text']) {
+            it(`verifies the final ${key} request even when the page suppresses the guard's events (capture + stopImmediatePropagation)`, async () => {
+                for (const path of [`suppress-formdata-${key}`, `suppress-both-${key}`]) {
+                    const error = await expectCode(clickExpecting(`/${path}`), 'APPROVAL_EXPIRED')
+                    expect(error.mayHaveSideEffects, path).toBe(true)
+                }
+                // Nothing changed: the request itself is the verdict, and it matches.
+                await clickExpecting(`/suppress-clean-${key}`)
+                expect(await eventually(() => a.hits(`suppress-clean-${key}`), (n) => n === 1)).toBe(1)
+                await delay(800)
+                expect(a.hits(`suppress-formdata-${key}`) + a.hits(`suppress-both-${key}`)).toBe(0)
+            })
+        }
+
+        it('rejects a changed submission when the guard gives no verdict at all (reports lost)', async () => {
+            const silent = new CdpDriver({ browserWsUrl: chrome.browserWsUrl, browserInstanceIdProvider: async () => instanceId, testHooks: { dropGuardReports: () => true } })
+            await silent.connect()
+            try {
+                for (const path of ['/late-bubble-post', '/late-bubble-get']) {
+                    const tab = await silent.openTab(a.url(path), [a.origin], OPTS)
+                    const obs = await silent.observe(tab.tabId, [a.origin], OPTS)
+                    const ref = obs.elements.find((e) => e.name === 'Pay')!.ref
+                    const expectation = expectationOf(await silent.describeRef(tab.tabId, ref, obs.snapshotId, OPTS))
+                    await expectCode(silent.click(tab.tabId, ref, obs.snapshotId, { ...OPTS, expect: expectation }), 'APPROVAL_EXPIRED')
+                }
+                await delay(800)
+                expect(a.hits('late-bubble-post') + a.hits('late-bubble-get')).toBe(0)
+            } finally {
+                await silent.close()
+            }
+        })
+
+        it('does not send a submission it cannot verify (a file added mid-click while the guard is blinded)', async () => {
+            const error = await expectCode(clickExpecting('/suppress-file'), 'APPROVAL_EXPIRED')
+            expect(error.mayHaveSideEffects).toBe(true)
+            await delay(800)
+            expect(a.hits('suppress-file')).toBe(0)
+        })
+
+        it('stops the submission when mousedown, click or later submit/formdata handlers changed it', async () => {
+            for (const path of ['/guard-down', '/guard-click', '/guard-submit-late', '/guard-formdata']) {
+                const error = await expectCode(clickExpecting(path), 'APPROVAL_EXPIRED')
+                expect(error.mayHaveSideEffects, path).toBe(true)
+            }
+            await delay(800)
+            expect(a.hits('g-post') + a.hits('g-other')).toBe(0)
         })
     })
 
@@ -450,6 +940,54 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         })
     })
 
+    describe('destination enforcement before requests', () => {
+        it('blocks redirect hops to a disallowed origin before they are sent, including one that would bounce back', async () => {
+            await expectCode(driver.openTab(a.url('/redir-hit'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            await expectCode(driver.openTab(a.url('/via-c'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            const tab = await open('/plain', [a.origin])
+            await expectCode(driver.navigate(tab.tabId, a.url('/via-c'), [a.origin], OPTS), 'ORIGIN_DENIED')
+            expect(c.hits('redirect')).toBe(0)
+            expect(bounceCount()).toBe(0)
+        })
+
+        it('never lets an owned page, its frames or its popups reach a disallowed destination', async () => {
+            const tab = await open('/exfil', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            for (const name of ['Open window', 'Open noopener', 'Blank link', 'Fetch away', 'Beacon away', 'Post away']) {
+                await driver.click(tab.tabId, refOf(obs, name), obs.snapshotId, OPTS).catch(() => undefined)
+                await delay(300)
+            }
+            const meta = await open('/meta-refresh', [a.origin])
+            await delay(2_500)
+            for (const hit of ['open', 'noopener', 'blank', 'post', 'fetch', 'beacon', 'frame', 'meta']) expect(c.hits(hit), hit).toBe(0)
+            expect(driver.blockedReports().filter((report) => report.origin === c.origin).length).toBeGreaterThanOrEqual(6)
+            expect(JSON.stringify(driver.blockedReports())).not.toContain('/hit/')
+            // Popups whose document was stopped are closed (the owned tabs keep their error pages).
+            const owned = new Set([tab.targetId, meta.targetId])
+            const stray = (t: Array<{ targetId: string; url: string }>) => t.filter((x) => !owned.has(x.targetId) && x.url.startsWith(c.origin))
+            expect(stray(await eventually(() => harness.targets(), (t) => stray(t).length === 0))).toEqual([])
+            expect(driver.popupReports().filter((p) => p.openerTabId === tab.tabId && p.origin === c.origin).every((p) => p.closed)).toBe(true)
+        })
+
+        it('still lets an owned page open an allowed popup and keeps enforcing inside it', async () => {
+            const tab = await open('/exfil', [a.origin])
+            const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
+            await driver.click(tab.tabId, refOf(obs, 'Open allowed'), obs.snapshotId, OPTS)
+            const reports = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === a.origin && !p.closed))
+            const popup = reports.find((p) => p.origin === a.origin && !p.closed)!
+            await harness.evaluate(popup.targetId, `location.href = '${c.url('/hit/from-popup')}'`).catch(() => undefined)
+            await delay(800)
+            expect(c.hits('from-popup')).toBe(0)
+            await harness.closeTarget(popup.targetId)
+        })
+
+        it('does not hold or touch tabs the driver does not own', async () => {
+            const user = await harness.openFrontTab(c.url('/hit/user-tab'))
+            await eventually(() => c.hits('user-tab'), (n) => n === 1)
+            await harness.closeTarget(user)
+        })
+    })
+
     describe('navigation origin checks and popups', () => {
         it('refuses to open a disallowed origin or a redirect to one, leaving no owned tab', async () => {
             const before = driver.debugCounts()
@@ -473,16 +1011,18 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
             const before = driver.debugCounts()
             const obs = await driver.observe(tab.tabId, [a.origin], OPTS)
             await driver.click(tab.tabId, refOf(obs, 'Open C'), obs.snapshotId, OPTS)
-            const reports = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === c.origin && p.closed))
+            const mine = (r: ReturnType<typeof driver.popupReports>) => r.filter((p) => p.openerTabId === tab.tabId)
+            const reports = await eventually(() => mine(driver.popupReports()), (r) => r.some((p) => p.origin === c.origin && p.closed))
             expect(reports.find((p) => p.origin === c.origin)).toMatchObject({ openerTabId: tab.tabId, closed: true })
             const gone = await eventually(() => harness.targets(), (t) => !t.some((x) => x.url.startsWith(c.origin)))
             expect(gone.some((t) => t.url.startsWith(c.origin))).toBe(false)
 
             await driver.click(tab.tabId, refOf(obs, 'Open A'), obs.snapshotId, OPTS)
-            const withA = await eventually(() => driver.popupReports(), (r) => r.some((p) => p.origin === a.origin))
+            const withA = await eventually(() => mine(driver.popupReports()), (r) => r.some((p) => p.origin === a.origin))
             const popupA = withA.find((p) => p.origin === a.origin)!
             expect(popupA.closed).toBe(false)
-            expect(driver.debugCounts()).toEqual(before)
+            // Never adopted as an owned tab, but it is a live agent window.
+            expect(driver.debugCounts()).toEqual({ ...before, windows: before.windows + 1 })
             await harness.closeTarget(popupA.targetId)
         })
     })
@@ -593,7 +1133,7 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 await first.kill()
                 await pendingRejected
                 expect(lossy.hasTab(tab.tabId)).toBe(false)
-                expect(lossy.debugCounts()).toEqual({ tabs: 0, sessions: 0 })
+                expect(lossy.debugCounts()).toEqual({ tabs: 0, sessions: 0, windows: 0 })
                 expect(disconnects).toBe(1)
                 expect(lossy.isConnected()).toBe(false)
                 expect(() => lossy.browserInstanceId()).toThrow()

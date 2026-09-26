@@ -1,7 +1,22 @@
 import { randomUUID } from 'node:crypto'
-import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, PendingApprovalSummary, SnapshotId, TaskId } from './contracts'
-import { approvalBinding, payloadHash, redact, type FormValue } from './policy'
+import type { AgentGrant, ApprovalId, BatchId, BatchStep, BrowserInstanceId, ElementDescription, PendingApprovalSummary, SnapshotId, TaskId } from './contracts'
+import { approvalBinding, formSummary, payloadHash, redact } from './policy'
 import type { ApprovalRecord } from './taskStore'
+
+/**
+ * Hash of what an approval covers; recomputed from a fresh describeRef right
+ * before dispatch. It binds the complete form submission (formDigest: every
+ * field in order, destination, method, enctype, submitter overrides), the
+ * element's live label and link target, so any of them changing expires it.
+ */
+export function approvalPayloadHash(step: BatchStep, description: Pick<ElementDescription, 'formValues' | 'frameOrigin' | 'pageUrl'
+    | 'form' | 'currentRole' | 'currentName' | 'linkUrl'>): string {
+    return payloadHash({ step, formValues: description.formValues, frameOrigin: description.frameOrigin,
+        currentPageUrl: description.pageUrl,
+        ...(description.form ? { formDigest: description.form.digest } : {}),
+        ...(description.currentName !== undefined ? { label: { role: description.currentRole ?? '', name: description.currentName } } : {}),
+        ...(description.linkUrl ? { linkUrl: description.linkUrl } : {}) })
+}
 
 export function createApproval(input: {
     grant: AgentGrant
@@ -12,24 +27,21 @@ export function createApproval(input: {
     origin: string
     leaseEpoch: number
     browserInstanceId: BrowserInstanceId
-    documentGeneration: number
     snapshotId: SnapshotId
-    frameOrigin: string
-    currentPageUrl: string
+    /** describeRef of the step's element, taken right before this approval */
+    description: ElementDescription
     expiresAtMs: number
-    elementName?: string
-    /** Driver element identity (non-secret), used to re-bind the element after a Runtime-only restart */
-    elementIdentity?: string
-    formValues?: FormValue[]
 }): { summary: PendingApprovalSummary; record: ApprovalRecord } {
+    const { description } = input
     const approvalId = `approval-${randomUUID()}` as ApprovalId
-    const formValuesByName = Object.fromEntries((input.formValues ?? []).map(({ name, value }) => [name, value]))
-    const stepHash = payloadHash({ step: input.step, formValues: formValuesByName,
-        frameOrigin: input.frameOrigin, currentPageUrl: input.currentPageUrl })
-    const formSummary = (input.formValues ?? [])
-        .map(({ name, value }) => `${name}=${redact(value)}`)
-        .join(', ')
-    const targetName = input.elementName ? ` "${redact(input.elementName)}"` : ` ${input.step.kind}`
+    const stepHash = approvalPayloadHash(input.step, description)
+    // Persisted with the approval: names only, never a value (the binding above covers the values).
+    const formText = description.form
+        ? formSummary(description.form)
+        : Object.keys(description.formValues).map((name) => redact(name)).join(', ')
+    const label = description.currentName ?? description.name
+    const targetName = label ? ` "${redact(label)}"` : ` ${input.step.kind}`
+    const verb = input.step.kind === 'fill' ? 'Fill' : 'Confirm'
     const bindingHash = approvalBinding({
         principalId: input.grant.principalId,
         workspaceId: input.grant.workspaceId,
@@ -39,15 +51,17 @@ export function createApproval(input: {
         payloadHash: stepHash,
         leaseEpoch: input.leaseEpoch,
         browserInstanceId: input.browserInstanceId,
-        documentGeneration: input.documentGeneration,
+        documentGeneration: description.documentGeneration,
         expiresAtMs: input.expiresAtMs,
-        frameOrigin: input.frameOrigin,
+        frameOrigin: description.frameOrigin,
     })
     const summary: PendingApprovalSummary = {
         approvalId,
         actionId: input.step.actionId,
         origin: input.origin,
-        description: `Confirm${targetName}${formSummary ? ` (${formSummary})` : ''}`,
+        description: input.step.kind === 'fill'
+            ? `${verb}${targetName} (value hidden)`
+            : `${verb}${targetName}${formText ? ` (${formText})` : ''}`,
         bindingHash,
         expiresAtMs: input.expiresAtMs,
     }
@@ -60,13 +74,12 @@ export function createApproval(input: {
             batchId: input.batchId,
             nextStep: input.nextStep,
             payloadHash: stepHash,
-            documentGeneration: input.documentGeneration,
+            documentGeneration: description.documentGeneration,
             leaseEpoch: input.leaseEpoch,
             browserInstanceId: input.browserInstanceId,
             snapshotId: input.snapshotId,
-            frameOrigin: input.frameOrigin,
-            ...(input.elementIdentity ? { elementIdentity: input.elementIdentity } : {}),
-            formValues: Object.fromEntries(Object.entries(formValuesByName).map(([name, value]) => [name, payloadHash(value)])),
+            frameOrigin: description.frameOrigin,
+            elementIdentity: description.identity,
         },
     }
 }

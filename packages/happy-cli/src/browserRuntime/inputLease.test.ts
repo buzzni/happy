@@ -91,3 +91,83 @@ describe('input lease fencing', () => {
         ])
     })
 })
+
+describe('user control view for the viewer proxy (D2)', () => {
+    const profile = 'p' as never
+    const tab = 't' as never
+    const user = { kind: 'user' as const, principalId: 'p1' as never, viewerSessionId: 'viewer-1' }
+    const agent = { kind: 'agent' as const, agentSessionId: 'a' as never, taskId: 'task-1' as never, segmentId: 'batch-1' as never }
+
+    it('reports the user owners of a profile and whether a takeover is still settling', () => {
+        const leases = new InputLeaseManager()
+        expect(leases.userControl(profile)).toEqual({ tabs: [], settling: false })
+        leases.acquire(tab, profile, agent)
+        const fenced = leases.fenceForTakeover(tab, profile, agent.taskId, user)
+        expect(leases.userControl(profile)).toEqual({ tabs: [], settling: true })
+        leases.completePendingTakeovers(agent.taskId)
+        expect(leases.userControl(profile)).toEqual({ tabs: [{ tabId: tab, leaseEpoch: fenced, owner: user }], settling: false })
+        expect(leases.userControl('other' as never)).toEqual({ tabs: [], settling: false })
+        leases.release(tab, profile)
+        expect(leases.userControl(profile)).toEqual({ tabs: [], settling: false })
+    })
+
+    it('notifies subscribers after every lease change and survives a throwing subscriber', () => {
+        const leases = new InputLeaseManager()
+        const seen: string[] = []
+        leases.subscribe(() => { throw new Error('viewer bug') })
+        const unsubscribe = leases.subscribe(() => seen.push(leases.owner(tab, profile).owner.kind))
+        leases.acquire(tab, profile, agent)
+        leases.fenceForTakeover(tab, profile, agent.taskId, user)
+        leases.completePendingTakeovers(agent.taskId)
+        leases.release(tab, profile)
+        leases.takeOver(tab, profile, user)
+        leases.restore(tab, profile, 9)
+        leases.acquire(tab, profile, agent)
+        leases.revokeTask(agent.taskId)
+        expect(seen).toEqual(['agent', 'none', 'user', 'none', 'user', 'none', 'agent', 'none'])
+        unsubscribe()
+        leases.release(tab, profile)
+        expect(seen).toHaveLength(8)
+    })
+
+    it('keeps agent input off a profile while any external fence is held (viewer input barrier)', () => {
+        const leases = new InputLeaseManager()
+        const release = leases.fenceProfile(profile)
+        const second = leases.fenceProfile(profile)
+        expect(leases.isUserFenced(profile)).toBe(true)
+        expect(leases.isUserFenced('other' as never)).toBe(false)
+        expect(() => leases.acquire(tab, profile, agent)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+        release()
+        release()
+        expect(leases.isUserFenced(profile)).toBe(true)
+        second()
+        expect(leases.isUserFenced(profile)).toBe(false)
+        expect(leases.acquire(tab, profile, agent)).toBe(0)
+    })
+
+    it('blocks every new input owner and reports settling while a fence is active, notifying on fence changes', () => {
+        const leases = new InputLeaseManager()
+        let notifications = 0
+        leases.subscribe(() => { notifications += 1 })
+        const lift = leases.fenceProfile(profile)
+        expect(notifications, 'fence set').toBe(1)
+        expect(() => leases.takeOver(tab, profile, user)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+        expect(() => leases.fenceForTakeover(tab, profile, agent.taskId, user)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+        expect(leases.userControl(profile).settling).toBe(true)
+        expect(leases.userControl('other' as never).settling).toBe(false)
+        lift()
+        lift()
+        expect(notifications, 'fence lifted once').toBe(2)
+        expect(leases.userControl(profile).settling).toBe(false)
+        expect(leases.takeOver(tab, profile, user)).toBe(1)
+    })
+
+    it('reports an existing user owner as settling while a later fence is active', () => {
+        const leases = new InputLeaseManager()
+        const epoch = leases.takeOver(tab, profile, user)
+        const lift = leases.fenceProfile(profile)
+        expect(leases.userControl(profile)).toEqual({ tabs: [{ tabId: tab, leaseEpoch: epoch, owner: user }], settling: true })
+        lift()
+        expect(leases.userControl(profile).settling).toBe(false)
+    })
+})

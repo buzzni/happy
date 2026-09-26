@@ -5,8 +5,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { z } from 'zod'
-import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type RuntimeErrorBody, type TaskId } from './contracts'
+import { BrowserRuntimeError, type AuthContext, type BrowserRuntimeApi, type ErrorCode, type Operation, type ProfileId, type RuntimeErrorBody, type TaskId } from './contracts'
 import { renderConsolePage } from './consolePage'
+import { VIEWER_ASSET_PREFIX, VIEWER_WEBSOCKET_PATH, serveViewerAsset, type ViewerProxy } from './viewerProxy'
 
 const MAX_BODY_BYTES = 1024 * 1024
 export const MAX_BATCH_WAIT_MS = 120_000
@@ -47,6 +48,8 @@ export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
     resume: z.object({ taskId: id, expectedVersion: version, requestId: id }).strict(),
     cancel: z.object({ taskId: id, requestId: id }).strict(),
     closeSpace: z.object({ taskSpaceId: id, requestId: id }).strict(),
+    viewerTicket: z.object({ profileId: id }).strict(),
+    listTasks: z.object({ profileId: id }).strict(),
 }
 
 const STATUS: Partial<Record<ErrorCode, number>> = {
@@ -65,7 +68,13 @@ export interface RuntimeServerOptions {
     host?: string
     port: number
     health: () => object
+    /** Readiness checks (browser connection, writer lock, disk); every value must be true. */
+    ready?: () => Promise<Record<string, boolean>>
     log?: (line: string) => void
+    /** Runtime viewer (D2). Without it viewerTicket answers RUNTIME_UNAVAILABLE. */
+    viewer?: Pick<ViewerProxy, 'issueTicket' | 'handleUpgrade' | 'close'>
+    /** Pinned noVNC client files served at /viewer/. */
+    viewerAssetsDir?: string
 }
 
 export interface RuntimeServer { url: string; port: number; close(): Promise<void> }
@@ -104,6 +113,15 @@ function errorBody(err: unknown): { status: number; body: RuntimeErrorBody } {
     return { status: 500, body: { code: 'RUNTIME_UNAVAILABLE', message: 'internal error', retryable: true, mayHaveSideEffects: true } }
 }
 
+/** The request target, or undefined when it does not parse (e.g. `//[`). */
+function parseTarget(target: string | undefined): URL | undefined {
+    try {
+        return new URL(target ?? '/', 'http://localhost')
+    } catch {
+        return undefined
+    }
+}
+
 export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<RuntimeServer> {
     const { api, verifyToken } = opts
     const log = opts.log ?? (() => {})
@@ -135,7 +153,11 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
             throw new BrowserRuntimeError('INVALID_REQUEST', `invalid ${op} request: ${detail}`)
         }
         const { waitMs, ...dto } = parsed.data as { waitMs?: number } & Record<string, unknown>
-        const call = api[op as Operation] as (a: AuthContext, r: unknown, o?: unknown) => Promise<unknown>
+        if (op === 'viewerTicket') {
+            if (!opts.viewer) throw new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'viewer is not configured')
+            return opts.viewer.issueTicket(auth, dto as { profileId: ProfileId })
+        }
+        const call = api[op as keyof typeof api] as (a: AuthContext, r: unknown, o?: unknown) => Promise<unknown>
         if (op === 'submitBatch') return call.call(api, auth, dto, waitMs !== undefined ? { waitMs } : undefined)
         if (op === 'subscribe') {
             const first = (await call.call(api, auth, dto)) as { kind: string; events?: unknown[] }
@@ -147,9 +169,15 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
     }
 
     const server = createServer(async (req, res) => {
-        const url = new URL(req.url ?? '/', 'http://localhost')
+        const url = parseTarget(req.url)
+        if (!url) return send(res, 400, { ok: false, error: { code: 'INVALID_REQUEST', message: 'malformed request target', retryable: false, mayHaveSideEffects: false } })
         try {
             if (req.method === 'GET' && url.pathname === '/v1/health') return send(res, 200, { ok: true, ...opts.health() })
+            if (req.method === 'GET' && url.pathname === '/v1/ready' && opts.ready) {
+                const checks = await opts.ready()
+                const ready = Object.values(checks).every(Boolean)
+                return send(res, ready ? 200 : 503, { ok: ready, ready, checks })
+            }
             if (req.method === 'GET' && url.pathname === '/console') {
                 res.writeHead(200, {
                     'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
@@ -157,6 +185,8 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
                 })
                 return res.end(renderConsolePage())
             }
+            if (req.method === 'GET' && url.pathname.startsWith(VIEWER_ASSET_PREFIX) && opts.viewerAssetsDir
+                && await serveViewerAsset(opts.viewerAssetsDir, url.pathname, res)) return
             const m = /^\/v1\/ops\/([A-Za-z]+)$/.exec(url.pathname)
             if (req.method === 'POST' && m) return send(res, 200, { ok: true, result: await handleOp(req, m[1]) })
             send(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION', message: 'not found', retryable: false, mayHaveSideEffects: false } })
@@ -168,11 +198,34 @@ export async function startRuntimeServer(opts: RuntimeServerOptions): Promise<Ru
         }
     })
 
+    // Clients (undici pools, ~4 s idle) reuse keep-alive sockets; with Node's 5 s default the server can close a
+    // socket just as a client sends a mutation on it, which then fails as "maybe reached". Keep idle sockets
+    // well beyond any client pool idle time; shutdown closes them explicitly (closeAllConnections).
+    server.keepAliveTimeout = 65_000
+    server.headersTimeout = 66_000
+
+    // Unauthenticated input: nothing here may throw past this handler.
+    server.on('upgrade', (req, socket, head) => {
+        socket.on('error', () => socket.destroy())
+        try {
+            const url = parseTarget(req.url)
+            if (!url) return socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+            if (opts.viewer && url.pathname === VIEWER_WEBSOCKET_PATH) return opts.viewer.handleUpgrade(req, socket, head)
+            socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+        } catch {
+            log('[browserRuntime] upgrade handler failed')
+            socket.destroy()
+        }
+    })
+
     await new Promise<void>((resolve) => server.listen(opts.port, opts.host ?? '127.0.0.1', resolve))
     const port = (server.address() as AddressInfo).port
     return {
         url: `http://${opts.host ?? '127.0.0.1'}:${port}`,
         port,
-        close: () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()) }),
+        close: async () => {
+            await opts.viewer?.close()
+            await new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()) })
+        },
     }
 }
