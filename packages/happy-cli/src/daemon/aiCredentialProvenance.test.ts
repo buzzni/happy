@@ -12,7 +12,12 @@ const PROVENANCE = `${HOME}/${AI_CREDENTIAL_PROVENANCE_PATH}`
 const GENERATIONS = `${HOME}/.happy/ai-credential-apply-generations.json`
 
 const input = { companyId: 'co-1', bundleId: 'bundle-1', bundleVersion: 3 }
-const identities = [JSON.stringify(['a@corp.com', 'org-a']), JSON.stringify(['b@corp.com', ''])]
+// [email, organizationUuid, organizationName] — the name is what Claude Code's
+// accountInfo() reports, the uuid is what cswap and the login metadata carry.
+const identities = [
+    JSON.stringify(['a@corp.com', 'org-a', 'Corp Inc']),
+    JSON.stringify(['b@corp.com', '', '']),
+]
 
 function reader(files: Record<string, string>) {
     return async (path: string) => {
@@ -107,6 +112,13 @@ describe('readActiveClaudeProvenance — the generation fence', () => {
             [PROVENANCE]: JSON.stringify({
                 version: 1,
                 claude: { state: 'applied', generation: 12, ...input, identities: [['only-one']] },
+            }),
+            [GENERATIONS]: generations(12),
+        }],
+        ['identities without an organization name — an older record shape', {
+            [PROVENANCE]: JSON.stringify({
+                version: 1,
+                claude: { state: 'applied', generation: 12, ...input, identities: [['a@corp.com', 'org-a']] },
             }),
             [GENERATIONS]: generations(12),
         }],

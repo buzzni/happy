@@ -19,7 +19,9 @@ const configuredClaudeList = JSON.stringify({
   accounts: [{ number: 1, email: 'owner@example.com', active: true }],
 })
 
-function claudeOauthPayload(accounts: Array<{ email: string; organizationUuid?: string }>): string {
+function claudeOauthPayload(
+  accounts: Array<{ email: string; organizationUuid?: string; organizationName?: string }>,
+): string {
   return JSON.stringify({
     version: 1,
     encrypted: false,
@@ -28,6 +30,7 @@ function claudeOauthPayload(accounts: Array<{ email: string; organizationUuid?: 
       number: index + 1,
       email: account.email,
       organizationUuid: account.organizationUuid ?? '',
+      organizationName: account.organizationName ?? '',
       credentials: { claudeAiOauth: { accessToken: `oauth-${index + 1}` } },
       config: { oauthAccount: { emailAddress: account.email } },
     })),
@@ -2236,7 +2239,9 @@ describe('org deployment provenance (specs/agent-ai-source-routing observation i
     })
   }
 
-  const payload = claudeOauthPayload([{ email: 'owner@example.com', organizationUuid: 'org-a' }])
+  const payload = claudeOauthPayload([
+    { email: 'owner@example.com', organizationUuid: 'org-a', organizationName: 'Corp Inc' },
+  ])
 
   async function recorded(files: Map<string, string>) {
     const { readActiveClaudeProvenance } = await import('./aiCredentialProvenance')
@@ -2262,7 +2267,7 @@ describe('org deployment provenance (specs/agent-ai-source-routing observation i
     await expect(recorded(files)).resolves.toEqual({
       ...provenance,
       generation: response.applyGeneration,
-      identities: new Set([JSON.stringify(['owner@example.com', 'org-a'])]),
+      identities: new Set([JSON.stringify(['owner@example.com', 'org-a', 'Corp Inc'])]),
     })
   })
 

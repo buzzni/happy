@@ -792,9 +792,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   ): Promise<void> {
     if (input.trialLease !== undefined) return
     const provenance = parseClaudeProvenanceInput(input.provenance)
-    // The same set `applyClaude` just verified against cswap. `null` means the
-    // payload's accounts could not be identified, so nothing was verified.
-    const identities = claudeImportedAccountIdentities(input.payload)
+    // The same accounts `applyClaude` just verified against cswap, with the
+    // organization name added because that is what Claude Code's accountInfo()
+    // reports. `null` means the payload's accounts could not be identified.
+    const identities = claudeProvenanceIdentities(input.payload)
     if (!provenance || !identities || identities.size === 0) return
     await writeClaudeProvenance(serializeAppliedClaudeProvenance({
       ...provenance,
@@ -1155,6 +1156,21 @@ function claudeImportedAccountIdentities(payload: string): Set<string> | null {
   } catch {
     return null
   }
+}
+
+function claudeProvenanceIdentities(payload: string): Set<string> | null {
+  if (!claudeImportedAccountIdentities(payload)) return null
+  const accounts = (JSON.parse(payload) as { accounts: Array<Record<string, unknown>> }).accounts
+  const identities = new Set<string>()
+  for (const account of accounts) {
+    if (account.organizationName !== undefined && typeof account.organizationName !== 'string') return null
+    identities.add(JSON.stringify([
+      account.email,
+      account.organizationUuid ?? '',
+      account.organizationName ?? '',
+    ]))
+  }
+  return identities
 }
 
 function claudeListAccountIdentity(

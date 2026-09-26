@@ -29,7 +29,11 @@ export type ClaudeProvenanceInput = {
 
 export type ActiveClaudeProvenance = ClaudeProvenanceInput & {
     generation: number
-    /** `JSON.stringify([email, organizationUuid ?? ''])`, the runtime's account identity. */
+    /**
+     * `JSON.stringify([email, organizationUuid, organizationName])` per bundle
+     * account ('' where absent). The uuid is what cswap and the login metadata
+     * carry; the name is what Claude Code's `accountInfo()` reports.
+     */
     identities: Set<string>
 }
 
@@ -76,13 +80,14 @@ export function serializeInvalidatedClaudeProvenance(generation: number): string
 function parseIdentities(value: unknown): Set<string> | null {
     if (!Array.isArray(value) || value.length === 0) return null
     const identities = new Set<string>()
-    for (const pair of value) {
-        if (!Array.isArray(pair) || pair.length !== 2
-            || typeof pair[0] !== 'string' || pair[0] === ''
-            || typeof pair[1] !== 'string') {
+    for (const entry of value) {
+        if (!Array.isArray(entry) || entry.length !== 3
+            || typeof entry[0] !== 'string' || entry[0] === ''
+            || typeof entry[1] !== 'string'
+            || typeof entry[2] !== 'string') {
             return null
         }
-        identities.add(JSON.stringify([pair[0], pair[1]]))
+        identities.add(JSON.stringify([entry[0], entry[1], entry[2]]))
     }
     return identities
 }
