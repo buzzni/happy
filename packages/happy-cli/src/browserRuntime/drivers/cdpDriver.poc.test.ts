@@ -160,6 +160,13 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
         a.route('/guard-click', guarded(`onclick="pay.setAttribute('formaction', '/hit/g-other')"`))
         a.route('/guard-submit-late', guarded('', `f.addEventListener('submit', () => { token.value = 't2' })`))
         a.route('/guard-formdata', guarded('', `f.addEventListener('formdata', (e) => e.formData.set('amount', '999'))`))
+        a.route('/descendants', () => `${HIT_SCRIPT}<body>
+            <button onclick="window.open('${a.url('/hit/popup-ran')}')">Open popup</button>
+            <button onclick="window.open('${a.url('/popup-opener')}')">Open opener popup</button>
+            <button onclick="window.worker = new Worker(window.URL.createObjectURL(new Blob(['fetch(\\'${a.url('/hit/worker-ran')}\\', { method: \\'POST\\' })'], { type: 'text/javascript' })))">Start worker</button>
+            <button onclick="const f = document.createElement('iframe'); f.src = '${b.url('/frame-runs')}'; document.body.append(f)">Add frame</button></body>`)
+        a.route('/popup-opener', () => `<body>popup</body>`)
+        b.route('/frame-runs', () => `<body><script>fetch('/hit/frame-ran', { method: 'POST' })</script>frame</body>`)
         a.route('/beforeunload', `${HIT_SCRIPT}<body><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = '' })</script><button onclick="hit('bu')">Touch</button></body>`)
         a.route('/many', `<body>${Array.from({ length: 5 }, (_, i) => `<button>First ${i}</button>`).join('')}
             <section aria-label="Second list">${Array.from({ length: 30 }, (_, i) => `<button>Second ${i}</button>`).join('')}</section></body>`)
@@ -329,6 +336,89 @@ describe.skipIf(!chromePath)('CdpDriver (real Chrome)', () => {
                 ownHarness.close()
                 await own.stop()
             }
+        })
+    })
+
+    describe('interception failure fails closed', () => {
+        // Its own browser: another driver attached to the same browser would release paused popups.
+        type Kind = 'popup' | 'worker' | 'iframe'
+        async function withFailingGuard(fail: (kind: Kind, method: string, depth: number) => boolean, body: (d: CdpDriver, own: HarnessCdp) => Promise<void>) {
+            const own = await launchChrome()
+            const failing = new CdpDriver({ browserWsUrl: own.browserWsUrl, browserInstanceIdProvider: async () => instanceId, testHooks: { guardFailure: fail } })
+            await failing.connect()
+            const ownHarness = await HarnessCdp.connect(own.browserWsUrl)
+            try {
+                await body(failing, ownHarness)
+            } finally {
+                await failing.close()
+                ownHarness.close()
+                await own.stop()
+            }
+        }
+        async function press(d: CdpDriver, tabId: TabId, name: string) {
+            const obs = await d.observe(tabId, [a.origin, b.origin], OPTS)
+            return d.click(tabId, obs.elements.find((e) => e.name === name)!.ref, obs.snapshotId, OPTS)
+        }
+
+        it('control: with interception working, the popup, worker and frame do run', async () => {
+            await withFailingGuard(() => false, async (d, own) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                for (const name of ['Open popup', 'Start worker', 'Add frame', 'Open opener popup']) await press(d, tab.tabId, name)
+                const child = await eventually(() => own.targets(), (t) => t.some((x) => x.url.endsWith('/popup-opener')))
+                const { sessionId } = await own.conn.send('Target.attachToTarget', { targetId: child.find((x) => x.url.endsWith('/popup-opener'))!.targetId, flatten: true })
+                void own.conn.send('Runtime.evaluate', { expression: `window.open('${a.url('/hit/grandchild-ran')}'); 1`, userGesture: true }, sessionId).catch(() => undefined)
+                expect(await eventually(() => a.hits('popup-ran') + a.hits('worker-ran') + b.hits('frame-ran') + a.hits('grandchild-ran'), (n) => n === 4, 5_000)).toBe(4)
+                for (const site of [a, b]) site.resetHits()
+            })
+        })
+
+        for (const method of ['Fetch.enable', 'Target.setAutoAttach']) {
+            it(`closes a popup whose ${method} failed before it runs, and refuses further work on the tab`, async () => {
+                await withFailingGuard((kind, failed) => kind === 'popup' && failed === method, async (d, own) => {
+                    const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                    await press(d, tab.tabId, 'Open popup').catch(() => undefined)
+                    await delay(1_000)
+                    expect(a.hits('popup-ran')).toBe(0)
+                    expect((await own.targets()).some((t) => t.url.includes('/hit/popup-ran'))).toBe(false)
+                    const refused = await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+                    expect(refused.message).toContain('interception')
+                    expect(await d.closeTab(tab.tabId, OPTS)).toEqual({ closed: true })
+                })
+            })
+        }
+
+        it('keeps a worker whose interception failed paused (it never runs)', async () => {
+            await withFailingGuard((kind) => kind === 'worker', async (d) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                await press(d, tab.tabId, 'Start worker').catch(() => undefined)
+                await delay(1_000)
+                expect(a.hits('worker-ran')).toBe(0)
+                await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+            })
+        })
+
+        it('keeps a cross-site frame whose interception failed paused (its script never runs)', async () => {
+            await withFailingGuard((kind) => kind === 'iframe', async (d) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                await press(d, tab.tabId, 'Add frame').catch(() => undefined)
+                await delay(1_000)
+                expect(b.hits('frame-ran')).toBe(0)
+                await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+            })
+        })
+
+        it('closes a popup opened by a popup (descendant) whose interception failed', async () => {
+            await withFailingGuard((kind, method, depth) => kind === 'popup' && depth >= 2 && method === 'Fetch.enable', async (d, own) => {
+                const tab = await d.openTab(a.url('/descendants'), [a.origin, b.origin], OPTS)
+                await press(d, tab.tabId, 'Open opener popup')
+                const child = await eventually(() => own.targets(), (t) => t.some((x) => x.url.endsWith('/popup-opener')))
+                const { sessionId } = await own.conn.send('Target.attachToTarget', { targetId: child.find((x) => x.url.endsWith('/popup-opener'))!.targetId, flatten: true })
+                // A user gesture inside the (allowed, guarded) popup opens its own popup.
+                void own.conn.send('Runtime.evaluate', { expression: `window.open('${a.url('/hit/grandchild-ran')}'); 1`, userGesture: true }, sessionId).catch(() => undefined)
+                await delay(1_500)
+                expect(a.hits('grandchild-ran')).toBe(0)
+                await expectCode(d.observe(tab.tabId, [a.origin], OPTS), 'RUNTIME_UNAVAILABLE')
+            })
         })
     })
 

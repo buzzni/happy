@@ -54,8 +54,13 @@ export interface CdpDriverOptions {
         afterCapture?: (tabId: TabId) => Promise<void>
         /** Simulates a failed cleanup: discardTarget does not send Target.closeTarget while this returns true. */
         discardCloseFails?: () => boolean
+        /** Fault injection: make a guard command (Fetch.enable, Target.setAutoAttach) fail for a descendant. depth: popup generation */
+        guardFailure?: (kind: GuardedKind, method: string, depth: number) => boolean
     }
 }
+
+/** Descendants of an owned tab whose requests are checked */
+export type GuardedKind = 'popup' | 'worker' | 'iframe'
 
 export interface DialogReport {
     tabId: TabId
@@ -154,6 +159,8 @@ interface TabState {
     generation: number
     /** main-frame navigations stopped by destination enforcement */
     blockedMain: number
+    /** A descendant's request interception could not be established: it never ran, and the tab refuses further work */
+    unenforced?: boolean
     /** Armed by a click on a form element: document requests of this tab consult it before they are sent */
     submitGuard?: SubmitGuard
     /** frameId → generation value of the last event that touched it */
@@ -226,6 +233,10 @@ function originDenied(why: string, retryable = false, mayHaveSideEffects = false
     return new BrowserRuntimeError('ORIGIN_DENIED', why, retryable, mayHaveSideEffects)
 }
 
+function unenforced(mayHaveSideEffects: boolean): BrowserRuntimeError {
+    return new BrowserRuntimeError('RUNTIME_UNAVAILABLE', 'request interception could not be established for a page this tab opened; it was not allowed to run. Close the tab', false, mayHaveSideEffects)
+}
+
 function targetGone(): BrowserRuntimeError {
     return new BrowserRuntimeError('TARGET_GONE', 'tab is not owned by this driver or no longer exists', false, false)
 }
@@ -274,6 +285,8 @@ export class CdpDriver implements BrowserDriver {
     private readonly popupTabs = new Map<string, TabState>()
     /** Popup page session → its target */
     private readonly popupSessions = new Map<string, string>()
+    /** Popup target → generation (1 = opened by the owned tab) */
+    private readonly popupDepths = new Map<string, number>()
     /** Pages auto-attached (paused) while openTab is creating one: claimed by targetId, else released */
     private readonly unclaimed = new Map<string, string>()
     private readonly claimWaiters = new Map<string, (sessionId: string) => void>()
@@ -402,6 +415,7 @@ export class CdpDriver implements BrowserDriver {
                     tab = this.registerTab(targetId, sessionId, allowedOrigins)
                     await this.setupSession(conn, sessionId, true)
                     await this.navigateInternal(conn, tab, url, allowedOrigins, op)
+                    this.assertEnforced(tab)
                     return { tabId: tab.tabId, targetId }
                 } catch (error) {
                     await this.discardTarget(conn, targetId, tab)
@@ -507,12 +521,44 @@ export class CdpDriver implements BrowserDriver {
         await conn.send('Target.detachFromTarget', { sessionId }).catch(() => undefined)
     }
 
-    /** Turns request interception on for a session of an owned tab (or its popup/worker), then lets it run. */
-    private async guardSession(conn: CdpConnection, sessionId: string, tab: TabState): Promise<void> {
+    /** A command that establishes request interception (fault injection point). */
+    private sendGuard(conn: CdpConnection, method: string, params: Record<string, unknown>, sessionId: string, kind: GuardedKind, depth = 0): Promise<unknown> {
+        if (this.options.testHooks?.guardFailure?.(kind, method, depth)) return Promise.reject(new CdpProtocolError(method, -32000, 'injected failure'))
+        return conn.send(method, params, sessionId)
+    }
+
+    /**
+     * Turns request interception on for a descendant of an owned tab, then lets it run.
+     * Fails closed: if interception (pages, frames) or recursive auto-attach cannot be
+     * established, the target is never resumed — a popup is closed, a frame or worker
+     * stays paused — and the owning tab refuses further work. A dedicated worker has no
+     * Fetch domain; its requests pause in its parent's session, which is guarded.
+     */
+    private async guardSession(conn: CdpConnection, sessionId: string, tab: TabState, kind: GuardedKind, depth = 0, targetId?: string): Promise<boolean> {
         this.guarded.set(sessionId, tab)
-        await conn.send('Fetch.enable', { patterns: FETCH_PATTERNS }, sessionId).catch(() => undefined)
-        await conn.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId).catch(() => undefined)
+        try {
+            if (kind !== 'worker') await this.sendGuard(conn, 'Fetch.enable', { patterns: FETCH_PATTERNS }, sessionId, kind, depth)
+            await this.sendGuard(conn, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId, kind, depth)
+        } catch {
+            this.onGuardFailed(conn, tab, kind === 'popup' ? targetId : undefined)
+            return false
+        }
         await conn.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => undefined)
+        return true
+    }
+
+    /** An unguarded descendant is never resumed; a popup is closed (a paused page closes cleanly). */
+    private onGuardFailed(conn: CdpConnection, tab: TabState, closeTargetId: string | undefined): void {
+        tab.unenforced = true
+        if (!closeTargetId) return
+        const report = this.popups.get(closeTargetId)
+        if (report) report.closed = true
+        conn.send('Target.closeTarget', { targetId: closeTargetId }).catch(() => undefined)
+    }
+
+    /** After an input or navigation: a descendant it started could not be guarded (it never ran). */
+    private assertEnforced(tab: TabState): void {
+        if (tab.unenforced) throw unenforced(true)
     }
 
     /** The owned tab a page came from: the tab itself, one of its frames, or one of its popups. */
@@ -534,6 +580,8 @@ export class CdpDriver implements BrowserDriver {
         }
         const openerTab = info.openerId ? this.ownerTabOf(info.openerId) : undefined
         if (openerTab && !this.tabsByTarget.has(info.targetId)) {
+            const depth = (this.popupDepths.get(info.openerId) ?? 0) + 1
+            this.popupDepths.set(info.targetId, depth)
             this.popupTabs.set(info.targetId, openerTab)
             this.popupSessions.set(sessionId, info.targetId)
             this.onTargetInfo(conn, info)
@@ -543,13 +591,13 @@ export class CdpDriver implements BrowserDriver {
                 // it is failed unsent; then it is closed.
                 const report = this.popups.get(info.targetId)
                 if (report) report.closed = true
-                void this.guardSession(conn, sessionId, openerTab)
+                void this.guardSession(conn, sessionId, openerTab, 'popup', depth, info.targetId)
                     .then(() => conn.send('Target.closeTarget', { targetId: info.targetId }))
                     .catch(() => undefined)
                 return
             }
             this.windows.add(info.targetId)
-            void this.guardSession(conn, sessionId, openerTab)
+            void this.guardSession(conn, sessionId, openerTab, 'popup', depth, info.targetId)
             return
         }
         if (this.creating > 0 && !this.tabsByTarget.has(info.targetId)) {
@@ -606,7 +654,9 @@ export class CdpDriver implements BrowserDriver {
     navigate(tabId: TabId, url: string, allowedOrigins: string[], opts: DriverOptions): Promise<{ url: string; documentGeneration: number }> {
         return this.run(opts, async (op, conn) => {
             const tab = this.requireTab(tabId)
-            return this.navigateInternal(conn, tab, url, allowedOrigins, op)
+            const result = await this.navigateInternal(conn, tab, url, allowedOrigins, op)
+            this.assertEnforced(tab)
+            return result
         })
     }
 
@@ -620,7 +670,7 @@ export class CdpDriver implements BrowserDriver {
     closeTab(tabId: TabId, opts: DriverOptions): Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }> {
         if (!this.tabs.has(tabId) && this.closedTabs.has(tabId)) return Promise.resolve({ closed: true })
         return this.run(opts, (op, conn) => {
-            const tab = this.requireTab(tabId)
+            const tab = this.requireTab(tabId, true)
             return new Promise<{ closed: boolean; beforeUnloadBlocked?: boolean }>((resolve, reject) => {
                 const offDialog = conn.on('Page.javascriptDialogOpening', (params, sessionId) => {
                     if (sessionId !== tab.sessionId || params.type !== 'beforeunload') return
@@ -829,6 +879,7 @@ export class CdpDriver implements BrowserDriver {
             if (live?.form && tab.submitGuard && await this.submitGuardStatus(tab.submitGuard, GUARD_SETTLE_MS) === 'blocked') {
                 throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'the form submission changed after it was classified; it was stopped before it was sent', false, true)
             }
+            this.assertEnforced(tab)
         }, true)
     }
 
@@ -908,6 +959,7 @@ export class CdpDriver implements BrowserDriver {
                 await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyDown' }, binding.sessionId)
                 await conn.send('Input.dispatchKeyEvent', { ...key, type: 'keyUp' }, binding.sessionId)
             }
+            this.assertEnforced(tab)
         }, true)
     }
 
@@ -1033,9 +1085,10 @@ export class CdpDriver implements BrowserDriver {
         return this.conn
     }
 
-    private requireTab(tabId: TabId): TabState {
+    private requireTab(tabId: TabId, allowUnenforced = false): TabState {
         const tab = this.tabs.get(tabId)
         if (!tab) throw targetGone()
+        if (tab.unenforced && !allowUnenforced) throw unenforced(false)
         return tab
     }
 
@@ -1103,9 +1156,13 @@ export class CdpDriver implements BrowserDriver {
         const tab = this.sessions.get(sessionId)?.tab
         if (tab) this.guarded.set(sessionId, tab)
         // A paused target answers only these before it runs; Page/Emulation wait for the resume.
-        await Promise.all([
+        const kind: GuardedKind = 'iframe'
+        await Promise.all(isMain ? [
             conn.send('Fetch.enable', { patterns: FETCH_PATTERNS }, sessionId),
             conn.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId),
+        ] : [
+            this.sendGuard(conn, 'Fetch.enable', { patterns: FETCH_PATTERNS }, sessionId, kind),
+            this.sendGuard(conn, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId, kind),
         ])
         await conn.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => undefined)
         const commands: Array<Promise<unknown>> = [conn.send('Page.enable', {}, sessionId)]
@@ -1128,19 +1185,20 @@ export class CdpDriver implements BrowserDriver {
             if (!parent) {
                 // A frame or worker of a guarded popup/worker: checked, never addressable.
                 const guardTab = this.guarded.get(parentSessionId)
-                void (guardTab ? this.guardSession(conn, childSessionId, guardTab) : this.release(conn, childSessionId))
+                void (guardTab ? this.guardSession(conn, childSessionId, guardTab, targetInfo.type === 'iframe' ? 'iframe' : 'worker') : this.release(conn, childSessionId))
                 return
             }
             if (targetInfo.type !== 'iframe') {
                 // Workers are not addressable through this driver, but their requests are checked.
-                void this.guardSession(conn, childSessionId, parent.tab)
+                void this.guardSession(conn, childSessionId, parent.tab, 'worker')
                 return
             }
             const tab = parent.tab
             tab.sessions.add(childSessionId)
             this.sessions.set(childSessionId, { tab, targetId: targetInfo.targetId, isMain: false, parentSessionId })
             this.touch(tab, targetInfo.targetId)
-            const setup = this.setupSession(conn, childSessionId, false).catch(() => undefined)
+            // A frame whose interception fails is never resumed (setupSession stops before that).
+            const setup = this.setupSession(conn, childSessionId, false).catch(() => { tab.unenforced = true })
             tab.pendingSetups.add(setup)
             setup.finally(() => tab.pendingSetups.delete(setup))
         })
@@ -1169,6 +1227,7 @@ export class CdpDriver implements BrowserDriver {
             const popup = this.popups.get(params.targetId)
             if (popup) popup.closed = true
             this.popupTabs.delete(params.targetId)
+            this.popupDepths.delete(params.targetId)
             this.windows.delete(params.targetId)
             for (const done of [...this.destroyedWaiters.get(params.targetId) ?? []]) done()
             this.destroyedWaiters.delete(params.targetId)
