@@ -24,6 +24,17 @@ export interface BrowserRuntimeOptions {
 type DriverWithAction = BrowserDriver & {
     armAction?: (actionId: string) => void
 }
+/** How a user wait is recognised as done (`task.waitCompletion`). */
+type UserWaitCompletion = {
+    batchId?: string
+    nextStep?: number
+    tabId: TabId
+    predicate?: BatchStep['until']
+    notPathPrefix?: string
+    /** The site whose loginCompleteWhen decides a login wait. */
+    protectedOrigin?: string
+    handoff?: true
+}
 /** Durable, scoped task runtime. Driver awaits never hold the task commit queue. */
 /** Finished tasks are not offered to the console; the listing is bounded (D12). */
 const FINISHED_STATUSES: ReadonlySet<TaskStatus> = new Set(TERMINAL_STATUSES)
@@ -1050,22 +1061,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', waitReason: undefined,
                     waitCompletion: undefined, waitExpiresAtMs: undefined, agentGrant: auth.credential }, 'state-changed',
                     { status: 'paused', pauseReason: 'awaiting-agent', handoffEnded: true }))
-            const wait = task.waitCompletion as {
-                batchId?: string
-                nextStep?: number
-                tabId: TabId
-                predicate: BatchStep['until']
-                notPathPrefix?: string
-            } | undefined
-            if (!wait?.predicate && !wait?.notPathPrefix)
-                throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Wait completion condition is missing')
-            const observation = await this.driver(task.profileId).observe(wait.tabId, auth.credential.allowedOrigins, { timeoutMs: 10000 })
-            const waitCompleted = wait.notPathPrefix
-                ? task.waitReason === 'login'
-                    ? loginCompleted(this.options.sites, observation, wait.notPathPrefix, (wait as { protectedOrigin?: string }).protectedOrigin)
-                    : !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
-                : matchesWait(wait.predicate!, observation)
-            if (!waitCompleted)
+            const wait = task.waitCompletion as UserWaitCompletion | undefined
+            const waitCompleted = await this.userWaitCompleted(task, wait, auth.credential.allowedOrigins)
+            if (!wait || !waitCompleted)
                 return this.view(await this.commit(task, { status: 'awaiting-user' }, 'state-changed', { status: 'awaiting-user',
                     waitReason: task.waitReason }))
             if (!wait.batchId) {
@@ -1122,6 +1120,23 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return this.view(task)
         return this.view(await this.commit(task, { status: 'paused', pauseReason: 'awaiting-agent', agentGrant: auth.credential },
             'state-changed', { status: 'paused', pauseReason: 'awaiting-agent' }))
+    }
+    /**
+     * Whether the user side of a wait is done, for both the agent's and the user's resume:
+     * a handoff needs no check (the agent re-observes); a login needs the site's
+     * loginCompleteWhen (or, without one, leaving the login path); other waits their predicate.
+     */
+    private async userWaitCompleted(task: StoredTask, wait: UserWaitCompletion | undefined, allowedOrigins: string[]): Promise<boolean> {
+        if (task.waitReason === 'handoff')
+            return true
+        if (!wait?.predicate && !wait?.notPathPrefix)
+            throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Wait completion condition is missing')
+        const observation = await this.driver(task.profileId).observe(wait.tabId, allowedOrigins, { timeoutMs: 10000 })
+        return wait.notPathPrefix
+            ? task.waitReason === 'login'
+                ? loginCompleted(this.options.sites, observation, wait.notPathPrefix, wait.protectedOrigin)
+                : !new URL(observation.url).pathname.startsWith(wait.notPathPrefix)
+            : matchesWait(wait.predicate!, observation)
     }
     /**
      * D8: the user can only hand a task back to the agent after something the user
