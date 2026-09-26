@@ -37,8 +37,15 @@ async function main(): Promise<void> {
     evidence.readyWithinMs = ready ? now() - rebootAt : null
     evidence.bootIdChanged = (await onExecMachine('cat /proc/sys/kernel/random/boot_id')).trim() !== bootBefore
     evidence.services = (await onExecMachine('systemctl is-active abp-firewall abp-egress abp-egress-proxy abp-stack abp-happy-daemon || true')).trim().split('\n')
-    const check = await onExecMachine(`${process.env.ABP_EXEC_INSTALLER ?? '/opt/src/happy3/packages/happy-cli/scripts/agent-browser/abp-install'} check 2>&1 | tail -1 || true`).catch((error) => String(error))
-    evidence.installCheck = check.trim()
+    // First run right after ready, then settle for up to 60 s: both are recorded; the verdict uses the
+    // settled result and the first run's failing lines are kept so a slow service is visible.
+    const installer = process.env.ABP_EXEC_INSTALLER ?? '/opt/src/happy3/packages/happy-cli/scripts/agent-browser/abp-install'
+    const runCheck = () => onExecMachine(`${installer} check 2>&1 || true`).catch((error) => String(error))
+    const first = await runCheck()
+    evidence.installCheckFirst = { summary: first.trim().split('\n').at(-1), failed: first.split('\n').filter((line) => /^(FAIL|fail|not ok|✗)/.test(line.trim())).map((line) => line.trim().slice(0, 160)) }
+    let settled = first
+    for (const deadline = now() + 60_000; !/all checks passed/.test(settled) && now() < deadline; await sleep(5_000)) settled = await runCheck()
+    evidence.installCheck = settled.trim().split('\n').at(-1)
     // Harness-only pieces are not services: bring the test fixture and the Mac tunnel back.
     await onExecMachine('docker start abp-test-fixture >/dev/null 2>&1 || true; systemctl reset-failed abp-test-tunnel 2>/dev/null; systemctl is-active abp-test-tunnel >/dev/null || systemd-run --unit abp-test-tunnel --property=Restart=always /usr/bin/socat TCP-LISTEN:38780,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:38700 >/dev/null 2>&1 || true')
     save()
