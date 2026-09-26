@@ -136,7 +136,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
-import { createBrowserTaskSessionBroker, registerResumedBrowserSession, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
+import { createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import { findBrowserAttentionSession, startBrowserAttentionWatcher } from './browserAttentionDelivery';
 import {
   createProcFs,
@@ -2744,37 +2744,22 @@ export async function startDaemon(): Promise<void> {
             : undefined,
         ), Object.keys(managedAiCredentialEnvironment).length > 0);
 
-        // A resumed child gets its own broker registration like a fresh spawn: the secret goes to the
-        // session process only, the registration is bound to the child's pid once it runs, and the usual
-        // exit / reconciliation paths revoke it. A failed resume revokes it at once.
-        const resumeBrowserRegistration = await registerResumedBrowserSession(browserTaskBroker, happySessionId);
-        const releaseResumeBrowserRegistration = async (): Promise<void> => {
-          if (resumeBrowserRegistration) {
-            await browserTaskBroker?.revoke({ registrationId: resumeBrowserRegistration.registrationId }).catch(reportBrowserTaskRevokeFailure);
-          }
-        };
-        let result: SpawnSessionResult;
-        try {
-          result = await spawnTrackedHappyProcess({
+        const result = await spawnResumedWithBrowserTaskRegistration({
+          broker: browserTaskBroker,
+          agentSessionId: happySessionId,
+          env: resumedEnvironment,
+          spawn: (env) => spawnTrackedHappyProcess({
             args: launch.args,
             cwd: launch.cwd,
             // resume 는 이 spawn 하나에 한해 lineage 를 명시적으로 부여한다 —
             // 상속분은 scrub 하고 이 세션의 값만 아래에서 다시 넣는다.
-            env: resumeBrowserRegistration
-              ? { ...resumedEnvironment, HAPPY_BROWSER_TASK_SESSION_SECRET: resumeBrowserRegistration.sessionSecret }
-              : resumedEnvironment,
+            env,
             userHomeDir: credentialDecision.kind === 'user-staged' ? credentialDecision.homeDir : undefined,
             resumeTargetSessionId: happySessionId,
-          });
-        } catch (error) {
-          await releaseResumeBrowserRegistration();
-          throw error;
-        }
-        if (resumeBrowserRegistration && !(result.type === 'success'
-          && await browserTaskBroker?.bind(resumeBrowserRegistration.registrationId, happySessionId,
-            Array.from(pidToTrackedSession.values()).find((session) => session.happySessionId === happySessionId)?.pid))) {
-          await releaseResumeBrowserRegistration();
-        }
+          }),
+          ownerPid: () => Array.from(pidToTrackedSession.values()).find((session) => session.happySessionId === happySessionId)?.pid,
+          onRevokeFailure: reportBrowserTaskRevokeFailure,
+        });
         return result.type === 'error'
           ? { ...result, code: 'SESSION_RESUME_FAILED' }
           : result;
