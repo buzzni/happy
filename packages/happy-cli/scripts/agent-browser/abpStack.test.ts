@@ -340,6 +340,36 @@ describe('abp-stack upgrade / rollback', () => {
         expect(host.calls).not.toContain('systemctl stop abp-stack.service')
     })
 
+    it('aborts when Docker cannot tell whether the Runtime runs (inspection error, not a confirmed absence)', async () => {
+        for (const failure of [
+            { status: 1, stderr: 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?' },
+            { status: 0, stdout: '' },
+        ]) {
+            const host = fakeHost({ handlers: [[/^docker inspect -f \{\{\.State\.Running\}\} abp-runtime$/, () => failure]] })
+            await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 1_000 })).rejects.toThrow(/cannot determine whether abp-runtime is running/)
+            expect(host.calls).not.toContain('systemctl stop abp-stack.service')
+            expect(host.calls.some((line) => /^docker (stop|rm|create)/.test(line))).toBe(false)
+            expect(host.state().current).toEqual({ runtime: RUNTIME_OLD, browser: BROWSER_OLD })
+            expect(host.state().history.at(-1)).toMatchObject({ action: 'upgrade', result: 'aborted' })
+        }
+    })
+
+    it('treats a confirmed missing Runtime container as not running', async () => {
+        const host = fakeHost({ handlers: [[/^docker inspect -f \{\{\.State\.Running\}\} abp-runtime$/, () => ({ status: 1, stderr: 'Error: No such object: abp-runtime' })]] })
+        const quiesced = await createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 10_000 }).then(() => host.state().history.at(-1).quiesce)
+        expect(quiesced).toEqual({ fence: 'not-needed', drain: { result: 'runtime-not-running' } })
+    })
+
+    it('does not count a container as stopped when its state cannot be read after the stop', async () => {
+        let stopped = false
+        const host = fakeHost({ handlers: [
+            [/^systemctl stop abp-stack\.service$/, () => { stopped = true; return {} }],
+            [/^docker inspect -f \{\{\.State\.Running\}\} abp-browser-ops$/, () => (stopped ? { status: 1, stderr: 'permission denied' } : { stdout: 'true' })],
+        ] })
+        await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 5_000 })).rejects.toThrow(/rolled back|not ready either/)
+        expect(host.state().history.find((entry: { action: string }) => entry.action === 'upgrade')).toMatchObject({ result: 'failed', error: expect.stringMatching(/cannot determine whether abp-browser-ops is running/) })
+    })
+
     it('treats a stack whose Runtime is not running as quiesced, and says so', async () => {
         const host = fakeHost({ runtimeRunning: false })
         await createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 10_000 })

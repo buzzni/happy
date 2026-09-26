@@ -221,14 +221,14 @@ export function createStack(deps) {
    */
   async function quiesce(action) {
     const { runtime } = layout();
-    if (docker(["inspect", "-f", "{{.State.Running}}", runtime.container], { allowFail: true }).stdout !== "true") {
-      return { fence: "not-needed", drain: { result: "runtime-not-running" } };
-    }
     const abort = (reason, detail) => {
       iptables(["-F", "ABP-FENCE"], { allowFail: true });
       writeState(record(readState(), { action, result: "aborted", reason, ...detail }));
       throw new Error(`${action} aborted: ${reason}; nothing was stopped or changed (abp-stack emergency-stop stops regardless)`);
     };
+    let state;
+    try { state = containerState(runtime.container); } catch (error) { abort(error.message); }
+    if (state !== "running") return { fence: "not-needed", drain: { result: "runtime-not-running" } };
     const fenced = await fence();
     if (!fenced.ok) abort(fenced.reason);
     const drained = await drain(DEFAULT_DRAIN_MS);
@@ -248,16 +248,32 @@ export function createStack(deps) {
   }
   const unfence = () => iptables(["-F", "ABP-FENCE"]);
 
-  /** Every stack container is down; a container that ignores stop is killed; one that survives that is an error. */
+  /**
+   * running | stopped | absent (Docker says the container does not exist). Anything else (Docker
+   * unreachable, permission, unexpected output) is an unknown state and throws: callers must not
+   * treat it as "not running".
+   */
+  function containerState(name) {
+    const result = docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true });
+    if (result.status === 0 && result.stdout === "true") return "running";
+    if (result.status === 0 && result.stdout === "false") return "stopped";
+    if (result.status !== 0 && /No such (object|container)/i.test(result.stderr ?? "")) return "absent";
+    const why = result.status === 0 ? "unexpected output" : (result.stderr ?? "").split("\n")[0] || `status ${result.status}`;
+    throw new Error(`cannot determine whether ${name} is running (docker inspect: ${why})`);
+  }
+
+  /** A container that ignores stop is killed; one that survives that, or whose state cannot be read, is an error. */
+  function ensureStopped(name) {
+    if (containerState(name) !== "running") return;
+    deps.log(`${name} still running after stop; killing it`);
+    docker(["kill", name], { allowFail: true });
+    if (containerState(name) === "running") throw new Error(`${name} is still running`);
+  }
+
+  /** Every stack container is down (verified). */
   function verifyStopped() {
     const plan = layout();
-    for (const name of [plan.runtime.container, ...plan.browsers.map((browser) => browser.container)]) {
-      const running = () => docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true }).stdout === "true";
-      if (!running()) continue;
-      deps.log(`${name} still running after stop; killing it`);
-      docker(["kill", name], { allowFail: true });
-      if (running()) throw new Error(`${name} is still running`);
-    }
+    for (const name of [plan.runtime.container, ...plan.browsers.map((browser) => browser.container)]) ensureStopped(name);
   }
 
   async function waitReady(runtimeImage, timeoutMs) {
@@ -301,10 +317,7 @@ export function createStack(deps) {
   /** Stops one container (killed if it ignores stop) and removes it; throws if it cannot be stopped. */
   function stopAndRemove(name, seconds) {
     docker(["stop", "-t", String(seconds), name], { allowFail: true });
-    if (docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true }).stdout === "true") {
-      docker(["kill", name], { allowFail: true });
-      if (docker(["inspect", "-f", "{{.State.Running}}", name], { allowFail: true }).stdout === "true") throw new Error(`${name} is still running`);
-    }
+    ensureStopped(name);
     docker(["rm", "-f", name], { allowFail: true });
   }
 
