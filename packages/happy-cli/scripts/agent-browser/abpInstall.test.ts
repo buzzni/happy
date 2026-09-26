@@ -215,6 +215,36 @@ describe('abp-install claude-login', () => {
     })
 })
 
+describe('abp-install systemd-resolved (the egress proxy resolves only through it)', () => {
+    /** systemctl stub: `is-enabled` prints the given state, `is-active` succeeds per `active`, everything else is echoed. */
+    const withSystemctl = (state: string, { active = true, installed = true } = {}) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+        systemctl() {
+            case "$1" in
+                is-enabled) [ -n "${state}" ] && echo "${state}"; return 1 ;;
+                is-active) ${active ? 'return 0' : 'return 3'} ;;
+                cat) ${installed ? 'return 0' : 'return 1'} ;;
+            esac
+            echo "+ systemctl $*"
+        }
+        ensure_resolved_service`, 'test', join(here, 'abp-install')], { encoding: 'utf8' })
+
+    it('unmasks a masked systemd-resolved (OrbStack/Debian images) before enabling it', () => {
+        const result = withSystemctl('masked')
+        expect(result.status).toBe(0)
+        expect(result.stdout.split('\n').filter(Boolean)).toEqual(['+ systemctl unmask systemd-resolved.service', '+ systemctl enable --now systemd-resolved.service'])
+        expect(result.stderr).toMatch(/systemd-resolved is masked/)
+    })
+
+    it('fails clearly when systemd-resolved is not installed or does not start', () => {
+        const missing = withSystemctl('', { installed: false })
+        expect(missing.status).not.toBe(0)
+        expect(missing.stderr).toMatch(/systemd-resolved is not installed: apt-get install systemd-resolved libnss-resolve/)
+        const dead = withSystemctl('enabled', { active: false })
+        expect(dead.status).not.toBe(0)
+        expect(dead.stderr).toMatch(/systemd-resolved did not start/)
+    })
+})
+
 describe('abp-uninstall', () => {
     it('keeps profile and journal volumes, configuration and secrets unless --purge', () => {
         const kept = bash('abp-uninstall', ['--dry-run'])

@@ -308,7 +308,28 @@ ensure_resolver() {
     if ! grep -Eq '^hosts:.*[[:space:]]resolve([[:space:]]|$)' /etc/nsswitch.conf 2>/dev/null; then
         run sed -i -E '/^hosts:/s/[[:space:]]dns([[:space:]]|$)/ resolve [!UNAVAIL=return] dns\1/' /etc/nsswitch.conf
     fi
+    ensure_resolved_service
+}
+
+# systemd-resolved must run: images (OrbStack, some Debian cloud images) ship it masked.
+ensure_resolved_service() {
+    local state
+    state=$(systemctl is-enabled systemd-resolved.service 2>/dev/null || true)
+    case "$state" in
+        masked | masked-runtime)
+            warn "systemd-resolved is masked; unmasking it (the egress proxy resolves names only through it)"
+            run systemctl unmask systemd-resolved.service
+            ;;
+        "")
+            if [ "$DRY_RUN" = 0 ] && ! systemctl cat systemd-resolved.service >/dev/null 2>&1; then
+                die "systemd-resolved is not installed: apt-get install systemd-resolved libnss-resolve (or run abp-install with --install-packages)"
+            fi
+            ;;
+    esac
     run systemctl enable --now systemd-resolved.service
+    if [ "$DRY_RUN" = 0 ] && ! systemctl is-active --quiet systemd-resolved.service; then
+        die "systemd-resolved did not start (journalctl -u systemd-resolved); the egress proxy cannot resolve names without it"
+    fi
 }
 
 main_install() {
