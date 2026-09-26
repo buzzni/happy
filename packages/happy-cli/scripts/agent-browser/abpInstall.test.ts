@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir, userInfo } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -103,6 +103,9 @@ describe('abp-install --dry-run', () => {
         expect(out).toContain('+ systemctl restart abp-egress.service')
         expect(out).toMatch(/\+ \S*node \S+abp-stack\.mjs load \S+images --set-initial/)
         expect(out).toContain('+ systemd-tmpfiles --create /etc/tmpfiles.d/abp.conf')
+        expect(out).toContain('+ runuser -u agent -- install -d -g abp-work -m 2770 /work/agent-workspace')
+        expect(out).toContain('+ runuser -u agent -- setfacl -P -d -m g:abp-work:rwX,m::rwx /work/agent-workspace')
+        expect(out).toMatch(/\+ migrate \/home\/agent\/workspace -> \/work\/agent-workspace \(as agent\)/)
     })
 
     it('generates secrets only when missing and never prints them', () => {
@@ -117,10 +120,38 @@ describe('abp-install --dry-run', () => {
         expect(result.status).not.toBe(0)
         expect(result.stderr).toMatch(/profileId/)
         expect(result.stdout).not.toMatch(/useradd/)
+        const other = bash('abp-install', ['--dry-run', 'install', '--machine-id', 'm', '--workspace-id', 'w', '--profile', 'ops=u', '--issuer', `k1=${pemFile}`])
+        expect(other.status).not.toBe(0)
+        expect(other.stderr).toMatch(/exactly one profile named main/)
+        expect(other.stdout).not.toMatch(/useradd/)
     })
 })
 
-describe('abp-install internals (sourced)', () => {
+/**
+ * safe_path refuses paths below directories that others may write (e.g. /tmp, 1777), so its
+ * fixtures must live below a directory whose whole ancestor chain passes the same rule: owned by
+ * root or this user, not group/other-writable, no symlinks. The first such candidate is used.
+ */
+function trustedBase(): string | undefined {
+    const uid = userInfo().uid
+    const passes = (dir: string): boolean => {
+        for (let current = dir; ; current = dirname(current)) {
+            const stat = lstatSync(current)
+            if (stat.isSymbolicLink() || (stat.uid !== 0 && stat.uid !== uid) || (stat.mode & 0o022)) return false
+            if (current === '/') return true
+        }
+    }
+    for (const candidate of [tmpdir(), homedir(), here]) {
+        try {
+            const real = realpathSync(candidate)
+            if (passes(real)) return real
+        } catch { /* try the next one */ }
+    }
+    return undefined
+}
+const fixtureBase = trustedBase()
+
+describe.skipIf(!fixtureBase)('abp-install internals (sourced; needs a directory with a trusted ancestor chain)', () => {
     /** Runs a snippet with abp-install's functions loaded (main does not run when sourced). */
     const sourced = (snippet: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0; ${snippet}`, 'test', join(here, 'abp-install')], {
         encoding: 'utf8', env: { PATH: process.env.PATH, HOME: dir, ABP_NODE: process.execPath },
@@ -134,7 +165,7 @@ describe('abp-install internals (sourced)', () => {
     })
 
     it('records a changed file in the parent shell and not an unchanged one, so restarts follow real changes', () => {
-        const root = realpathSync(mkdtempSync(join(tmpdir(), 'abp-emit-')))
+        const root = mkdtempSync(join(fixtureBase!, '.abp-emit-'))
         chmodSync(root, 0o755)
         const target = join(root, 'config.json')
         const result = sourced(`
@@ -150,7 +181,7 @@ describe('abp-install internals (sourced)', () => {
     })
 
     it('refuses to write through a symlink, under a symlinked or group-writable directory', () => {
-        const root = realpathSync(mkdtempSync(join(tmpdir(), 'abp-path-')))
+        const root = mkdtempSync(join(fixtureBase!, '.abp-path-'))
         chmodSync(root, 0o755)
         mkdirSync(join(root, 'real'), { mode: 0o755 })
         writeFileSync(join(root, 'elsewhere'), 'x')
@@ -164,6 +195,156 @@ describe('abp-install internals (sourced)', () => {
         expect(sourced(`safe_path ${join(root, 'open', 'file')} file ${me}`).stderr).toMatch(/writable by group or others/)
         expect(sourced(`safe_path ${join(root, 'real')} file ${me}`).stderr).toMatch(/not a regular file/)
         rmSync(root, { recursive: true, force: true })
+    })
+})
+
+describe.skipIf(!fixtureBase)('abp-install agent workspace (Desktop chats live under /home/agent/workspace; the sandbox needs /work)', () => {
+    /** migrate_workspace runs file operations as the agent user; here that user is the test user. */
+    const migrate = (link: string, target: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+        as_user() { shift; "$@"; }
+        migrate_workspace "$2" "$3" "$(id -un)"`, 'test', join(here, 'abp-install'), link, target], { encoding: 'utf8' })
+    const fresh = () => {
+        const root = mkdtempSync(join(fixtureBase!, '.abp-ws-'))
+        mkdirSync(join(root, 'work', 'agent-workspace'), { recursive: true })
+        mkdirSync(join(root, 'home'))
+        return { root, link: join(root, 'home', 'workspace'), target: join(root, 'work', 'agent-workspace') }
+    }
+
+    it('creates the symlink when there is no workspace yet, and leaves a correct one alone', () => {
+        const { root, link, target } = fresh()
+        expect(migrate(link, target).status).toBe(0)
+        expect(realpathSync(link)).toBe(realpathSync(target))
+        const again = migrate(link, target)
+        expect(again.status).toBe(0)
+        expect(again.stdout).toMatch(/already links to/)
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('moves an existing workspace (dotfiles included) into /work and replaces it with the symlink', () => {
+        const { root, link, target } = fresh()
+        mkdirSync(join(link, 'aplus-dev-studio-workspace', 'ctx', 'chats', 'c1'), { recursive: true })
+        writeFileSync(join(link, 'aplus-dev-studio-workspace', 'ctx', 'chats', 'c1', 'notes.md'), 'kept')
+        writeFileSync(join(link, '.hidden'), 'dot')
+        const result = migrate(link, target)
+        expect(result.stderr).toBe('')
+        expect(result.status).toBe(0)
+        expect(lstatSync(link).isSymbolicLink()).toBe(true)
+        expect(readFileSync(join(target, 'aplus-dev-studio-workspace', 'ctx', 'chats', 'c1', 'notes.md'), 'utf8')).toBe('kept')
+        expect(readFileSync(join(target, '.hidden'), 'utf8')).toBe('dot')
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('refuses to overwrite: a name present in both places, a symlink elsewhere, or a regular file', () => {
+        const conflict = fresh()
+        mkdirSync(conflict.link)
+        writeFileSync(join(conflict.link, 'same'), 'old')
+        writeFileSync(join(conflict.target, 'same'), 'new')
+        const clash = migrate(conflict.link, conflict.target)
+        expect(clash.status).not.toBe(0)
+        expect(clash.stderr).toMatch(/already exists in/)
+        expect(readFileSync(join(conflict.link, 'same'), 'utf8')).toBe('old')
+        rmSync(conflict.root, { recursive: true, force: true })
+
+        const elsewhere = fresh()
+        symlinkSync(elsewhere.root, elsewhere.link)
+        expect(migrate(elsewhere.link, elsewhere.target).stderr).toMatch(/is a symlink to .* not /)
+        rmSync(elsewhere.root, { recursive: true, force: true })
+
+        const file = fresh()
+        writeFileSync(file.link, 'x')
+        expect(migrate(file.link, file.target).stderr).toMatch(/is neither a directory nor a symlink/)
+        rmSync(file.root, { recursive: true, force: true })
+    })
+
+    const acl = (setfacl: string, call: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+        as_user() { echo "as $1:"; shift; "$@"; }
+        setfacl() { ${setfacl}; }
+        ${call}`, 'test', join(here, 'abp-install')], { encoding: 'utf8' })
+
+    it('grants abp-work access by default ACLs (the daemon runs with umask 077) without walking the tree agent-sbx can write', () => {
+        const ok = acl('echo "setfacl $*"', 'ensure_workspace_acls /work /work/agent-workspace')
+        expect(ok.status).toBe(0)
+        // /work: root (its parent is root's); the workspace: as its owner agent, single paths, -P skips a symlink argument.
+        expect(ok.stdout.split('\n').filter(Boolean)).toEqual([
+            'setfacl -P -d -m g:abp-work:rwX,m::rwx /work',
+            'as agent:', 'setfacl -P -m g:abp-work:rwX /work/agent-workspace',
+            'as agent:', 'setfacl -P -d -m g:abp-work:rwX,m::rwx /work/agent-workspace',
+        ])
+        expect(ok.stdout).not.toMatch(/-R/)
+    })
+
+    it('opens an existing legacy workspace recursively only while it is still inside the private home', () => {
+        const legacy = acl('echo "setfacl $*"', 'grant_legacy_workspace /home/agent/workspace')
+        expect(legacy.stdout.split('\n').filter(Boolean)).toEqual([
+            'setfacl -R -P -m g:abp-work:rwX /home/agent/workspace',
+            'setfacl -R -P -d -m g:abp-work:rwX,m::rwx /home/agent/workspace',
+        ])
+    })
+
+    it('check creates nothing through a workspace link that does not point at /work yet', () => {
+        const { root, link, target } = fresh()
+        const result = spawnSync('bash', ['-c', `source "$1"; AGENT_WORKSPACE_LINK="$2"; AGENT_WORKSPACE="$3"
+            as() { echo "unexpected: $*"; }
+            if workspace_shared; then echo status=0; else echo status=1; fi`, 'test', join(here, 'abp-install'), link, target], { encoding: 'utf8' })
+        expect(result.stdout.trim()).toBe('status=1')
+        expect(() => lstatSync(link)).toThrow()
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('fails clearly when the filesystem has no POSIX ACLs', () => {
+        const unsupported = acl('echo "setfacl: /work/agent-workspace: Operation not supported" >&2; return 1', 'ensure_workspace_acls /work /work/agent-workspace')
+        expect(unsupported.status).not.toBe(0)
+        expect(unsupported.stderr).toMatch(/does not support POSIX ACLs/)
+    })
+})
+
+describe('abp-install claude-login', () => {
+    const sourced = (snippet: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; ${snippet}`, 'test', join(here, 'abp-install')], { encoding: 'utf8' })
+    const sdk = '/opt/abp/happy/lib/node_modules/@buzzni/happy-cli/node_modules/@anthropic-ai'
+
+    it('resolves the Claude Agent SDK native binary for the machine architecture', () => {
+        expect(sourced('claude_binary /opt/abp/happy x86_64').stdout.trim()).toBe(`${sdk}/claude-agent-sdk-linux-x64/claude`)
+        expect(sourced('claude_binary /opt/abp/happy aarch64').stdout.trim()).toBe(`${sdk}/claude-agent-sdk-linux-arm64/claude`)
+        const other = sourced('claude_binary /opt/abp/happy mips')
+        expect(other.status).not.toBe(0)
+        expect(other.stderr).toMatch(/unsupported architecture mips/)
+    })
+
+    it('runs it as agent-sbx with its own home and config, through the egress proxy', () => {
+        const result = bash('abp-install', ['--dry-run', 'claude-login'])
+        expect(result.status).toBe(0)
+        expect(result.stdout).toMatch(new RegExp(`^\\+ sudo -u agent-sbx env HOME=/home/agent-sbx CLAUDE_CONFIG_DIR=/home/agent-sbx/\\.claude HTTPS_PROXY=http://127\\.0\\.0\\.1:3128 ${sdk.replace(/[.]/g, '\\.')}/claude-agent-sdk-linux-(x64|arm64)/claude$`, 'm'))
+        expect(result.stdout).toMatch(/\/login/)
+    })
+})
+
+describe('abp-install systemd-resolved (the egress proxy resolves only through it)', () => {
+    /** systemctl stub: `is-enabled` prints the given state, `is-active` succeeds per `active`, everything else is echoed. */
+    const withSystemctl = (state: string, { active = true, installed = true } = {}) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+        systemctl() {
+            case "$1" in
+                is-enabled) [ -n "${state}" ] && echo "${state}"; return 1 ;;
+                is-active) ${active ? 'return 0' : 'return 3'} ;;
+                cat) ${installed ? 'return 0' : 'return 1'} ;;
+            esac
+            echo "+ systemctl $*"
+        }
+        ensure_resolved_service`, 'test', join(here, 'abp-install')], { encoding: 'utf8' })
+
+    it('unmasks a masked systemd-resolved (OrbStack/Debian images) before enabling it', () => {
+        const result = withSystemctl('masked')
+        expect(result.status).toBe(0)
+        expect(result.stdout.split('\n').filter(Boolean)).toEqual(['+ systemctl unmask systemd-resolved.service', '+ systemctl enable --now systemd-resolved.service'])
+        expect(result.stderr).toMatch(/systemd-resolved is masked/)
+    })
+
+    it('fails clearly when systemd-resolved is not installed or does not start', () => {
+        const missing = withSystemctl('', { installed: false })
+        expect(missing.status).not.toBe(0)
+        expect(missing.stderr).toMatch(/systemd-resolved is not installed: apt-get install systemd-resolved libnss-resolve/)
+        const dead = withSystemctl('enabled', { active: false })
+        expect(dead.status).not.toBe(0)
+        expect(dead.stderr).toMatch(/systemd-resolved did not start/)
     })
 })
 

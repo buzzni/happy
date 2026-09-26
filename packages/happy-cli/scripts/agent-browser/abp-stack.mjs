@@ -3,6 +3,7 @@
 // Installed by abp-install as /usr/local/sbin/abp-stack (root only).
 //
 //   abp-stack up | down | status [--json]
+//   abp-stack emergency-stop                                      (no lock, no drain; incidents only)
 //   abp-stack upgrade (--images <dir> | --runtime-image <sha256:…> --browser-image <sha256:…>) [--ready-timeout <s>]
 //   abp-stack rollback [--ready-timeout <s>]
 //   abp-stack rotate-keys [--daemon-token] [--vnc-password]      (both when neither is given)
@@ -31,6 +32,8 @@ const DEFAULT_READY_TIMEOUT_MS = 180_000;
 const DEFAULT_DRAIN_MS = 60_000;
 const EGRESS_CHECK_INTERVAL_MS = 10_000;
 const FIREWALL = `${PATHS.libexec}/abp-firewall`;
+/** Set by emergency-stop so the service stop skips the drain; removed by the next start. */
+const EMERGENCY_FLAG = "/run/abp-stack-emergency";
 const NETWORK_FORMAT = '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}} {{index .Options "com.docker.network.bridge.name"}}';
 const SERVICE = "abp-stack.service";
 const DAEMON_SERVICE = "abp-happy-daemon.service";
@@ -177,22 +180,64 @@ export function createStack(deps) {
 
   /**
    * Admission fence: host packets to the Runtime API are reset (new tasks and requests on kept-alive
-   * connections alike), then running batches get up to drainMs to finish; whatever is still running
-   * recovers paused when the Runtime restarts.
+   * connections alike). Verified three ways: the rule is in ABP-FENCE, OUTPUT jumps to ABP-FENCE,
+   * and the API really no longer answers.
    */
-  async function fenceAndDrain(drainMs) {
+  async function fence() {
     const { runtimePort } = layout();
     iptables(["-F", "ABP-FENCE"], { allowFail: true });
-    if (iptables(["-A", "ABP-FENCE", ...fenceRule(runtimePort)], { allowFail: true }).status !== 0) deps.log("fence: could not install the admission fence rule; stopping without it");
-    const deadline = deps.now() + drainMs;
+    if (iptables(["-A", "ABP-FENCE", ...fenceRule(runtimePort)], { allowFail: true }).status !== 0) return { ok: false, reason: "fence rule not installed" };
+    if (iptables(["-C", "OUTPUT", "-j", "ABP-FENCE"], { allowFail: true }).status !== 0) return { ok: false, reason: "OUTPUT does not jump to ABP-FENCE" };
+    if ((await deps.ready(runtimePort)).status !== 0) return { ok: false, reason: "the Runtime API still answers behind the fence" };
+    return { ok: true };
+  }
+
+  /** Waits for running/recovering tasks to reach 0: result drained | timeout | unavailable (admin metrics do not answer). */
+  async function drain(drainMs) {
+    const startedMs = deps.now();
     for (;;) {
       const metrics = await deps.adminMetrics();
-      const busy = (metrics?.tasks?.running ?? 0) + (metrics?.tasks?.recovering ?? 0);
-      if (!metrics || busy === 0) return;
-      if (deps.now() >= deadline) { deps.log(`drain timed out with ${busy} running task(s); they recover paused on the next start`); return; }
-      deps.log(`draining: ${busy} running task(s)`);
+      const waitedMs = deps.now() - startedMs;
+      if (!metrics?.tasks) return { result: "unavailable", waitedMs };
+      const running = (metrics.tasks.running ?? 0) + (metrics.tasks.recovering ?? 0);
+      if (running === 0) return { result: "drained", running, waitedMs };
+      if (waitedMs >= drainMs) return { result: "timeout", running, waitedMs };
+      deps.log(`draining: ${running} running task(s)`);
       await deps.sleep(1_000);
     }
+  }
+
+  /**
+   * Controlled operations (upgrade, rollback, rotate-keys, set-principal): a verified fence and a complete
+   * drain, or the operation is aborted with nothing stopped or changed and the fence lifted.
+   * A Runtime that is not running admits nothing, so it counts as quiesced (recorded as such).
+   */
+  async function quiesce(action) {
+    const { runtime } = layout();
+    if (docker(["inspect", "-f", "{{.State.Running}}", runtime.container], { allowFail: true }).stdout !== "true") {
+      return { fence: "not-needed", drain: { result: "runtime-not-running" } };
+    }
+    const abort = (reason, detail) => {
+      iptables(["-F", "ABP-FENCE"], { allowFail: true });
+      writeState(record(readState(), { action, result: "aborted", reason, ...detail }));
+      throw new Error(`${action} aborted: ${reason}; nothing was stopped or changed (abp-stack emergency-stop stops regardless)`);
+    };
+    const fenced = await fence();
+    if (!fenced.ok) abort(fenced.reason);
+    const drained = await drain(DEFAULT_DRAIN_MS);
+    if (drained.result !== "drained") abort(`drain ${drained.result}${drained.running ? ` (${drained.running} running)` : ""}`, { drain: drained });
+    deps.log(`${action}: fence verified, drained in ${drained.waitedMs} ms`);
+    return { fence: "verified", drain: drained };
+  }
+
+  /** Service stop (SIGTERM, reboot): cannot be refused, so fence and drain are best effort and logged. */
+  async function fenceAndDrainBestEffort(drainMs) {
+    const fenced = await fence();
+    deps.log(fenced.ok ? "stop: fence verified" : `stop: fence not verified (${fenced.reason}); stopping anyway`);
+    if (drainMs <= 0) return;
+    const drained = await drain(drainMs);
+    deps.log(drained.result === "drained" ? `stop: drained in ${drained.waitedMs} ms`
+      : `stop: drain ${drained.result}${drained.running ? ` with ${drained.running} running task(s); they recover paused on the next start` : ""}`);
   }
   const unfence = () => iptables(["-F", "ABP-FENCE"]);
 
@@ -224,19 +269,19 @@ export function createStack(deps) {
     return { ok: false, body: last?.body };
   }
 
-  /** Fenced, drained Runtime restart (configuration or secret change); throws unless the same digest is ready again. */
-  async function restartRuntime(readyTimeoutMs = DEFAULT_READY_TIMEOUT_MS) {
+  /** Runtime restart after quiesce() (configuration or secret change); throws unless the same digest is ready again. */
+  async function restartQuiescedRuntime(readyTimeoutMs = DEFAULT_READY_TIMEOUT_MS) {
     const { runtime } = layout();
-    await fenceAndDrain(DEFAULT_DRAIN_MS);
-    if (docker(["restart", "-t", "30", runtime.container], { allowFail: true }).status !== 0) throw new Error("docker restart failed for the Runtime");
+    const restarted = docker(["restart", "-t", "30", runtime.container], { allowFail: true }).status === 0;
     // The fence covers every host packet to the API port, the readiness probe included: lift it first.
-    unfence();
+    iptables(["-F", "ABP-FENCE"], { allowFail: true });
+    if (!restarted) throw new Error("docker restart failed for the Runtime");
     const ready = await waitReady(readState().current?.runtime, readyTimeoutMs);
     if (!ready.ok) throw new Error("the restarted Runtime is not ready (abp-stack status)");
   }
 
   /** Stops the stack (the service fences, drains and stops), verifies it, switches digests, starts, waits for /v1/ready. */
-  async function switchTo(target, previous, action, readyTimeoutMs) {
+  async function switchTo(target, previous, action, readyTimeoutMs, quiesced) {
     const before = readState();
     try {
       systemctl(["stop", SERVICE]);
@@ -244,10 +289,10 @@ export function createStack(deps) {
       writeState({ ...readState(), current: target, previous });
       systemctl(["start", SERVICE]);
       const ready = await waitReady(target.runtime, readyTimeoutMs);
-      writeState(record(readState(), { action, from: before.current, to: target, result: ready.ok ? "ready" : "not-ready", ready: ready.body }));
+      writeState(record(readState(), { action, from: before.current, to: target, result: ready.ok ? "ready" : "not-ready", ready: ready.body, ...quiesced ? { quiesce: quiesced } : {} }));
       return { ok: ready.ok, ready: ready.body, before };
     } catch (error) {
-      writeState(record(readState(), { action, from: before.current, to: target, result: "failed", error: error instanceof Error ? error.message : "failed" }));
+      writeState(record(readState(), { action, from: before.current, to: target, result: "failed", error: error instanceof Error ? error.message : "failed", ...quiesced ? { quiesce: quiesced } : {} }));
       return { ok: false, before };
     }
   }
@@ -259,6 +304,7 @@ export function createStack(deps) {
       const state = readState();
       if (!state.current) throw new Error("no images installed (abp-install --images/--build-from, or abp-stack load --set-initial)");
       if (!egressInPlace()) throw new Error("browser egress firewall is not in place (abp-firewall check-egress); not starting");
+      if (deps.exists(EMERGENCY_FLAG)) deps.remove(EMERGENCY_FLAG);
       const plan = layout();
       const old = docker(["ps", "-aq", "--filter", `label=${STACK_LABEL}`]).stdout.split("\n").filter(Boolean);
       if (old.length) docker(["rm", "-f", ...old]);
@@ -317,13 +363,33 @@ export function createStack(deps) {
       }
     },
 
-    /** Fence and drain the Runtime, stop it (running tasks recover paused), then the browsers; verified. The fence stays until start. */
+    /**
+     * Service stop: fence and drain (best effort; no drain after emergency-stop), stop the Runtime
+     * (running tasks recover paused), then the browsers; verified. The fence stays until start.
+     */
     async stop({ drainMs = DEFAULT_DRAIN_MS } = {}) {
       const plan = layout();
-      await fenceAndDrain(drainMs);
+      await fenceAndDrainBestEffort(deps.exists(EMERGENCY_FLAG) ? 0 : drainMs);
       docker(["stop", "-t", "30", plan.runtime.container], { allowFail: true });
       for (const browser of plan.browsers) docker(["stop", "-t", "10", browser.container], { allowFail: true });
       verifyStopped();
+    },
+
+    /**
+     * Incident path: no lock (a hung operation may hold it), best-effort fence, no drain (running tasks
+     * recover paused or uncertain), service and containers stopped at once and verified down.
+     */
+    async emergencyStop() {
+      const plan = layout();
+      deps.writeFileAtomic(EMERGENCY_FLAG, "", { mode: 0o600, owner: "root", group: "root" });
+      iptables(["-F", "ABP-FENCE"], { allowFail: true });
+      iptables(["-A", "ABP-FENCE", ...fenceRule(plan.runtimePort)], { allowFail: true });
+      systemctl(["stop", SERVICE], { allowFail: true });
+      docker(["stop", "-t", "10", plan.runtime.container], { allowFail: true });
+      for (const browser of plan.browsers) docker(["stop", "-t", "5", browser.container], { allowFail: true });
+      verifyStopped();
+      writeState(record(readState(), { action: "emergency-stop", result: "stopped" }));
+      deps.log("emergency stop: stack down; abp-stack up to start again");
     },
 
     load(dir) {
@@ -353,7 +419,8 @@ export function createStack(deps) {
         const state = readState();
         if (!state.current) throw new Error("no current images; install first");
         if (state.current.runtime === target.runtime && state.current.browser === target.browser) return { changed: false };
-        const switched = await switchTo(target, state.current, "upgrade", readyTimeoutMs);
+        const quiesced = await quiesce("upgrade");
+        const switched = await switchTo(target, state.current, "upgrade", readyTimeoutMs, quiesced);
         if (switched.ok) return { changed: true, ready: switched.ready };
         deps.log("upgrade: new stack failed or not ready; rolling back to the previous digests (volumes kept)");
         const back = await switchTo(state.current, state.previous, "auto-rollback", readyTimeoutMs);
@@ -367,7 +434,8 @@ export function createStack(deps) {
         const state = readState();
         if (!state.previous) throw new Error("no previous digests recorded");
         assertImages(state.previous);
-        const switched = await switchTo(state.previous, state.current, "rollback", readyTimeoutMs);
+        const quiesced = await quiesce("rollback");
+        const switched = await switchTo(state.previous, state.current, "rollback", readyTimeoutMs, quiesced);
         if (!switched.ok) throw new Error("rollback: Runtime not ready (a journal from a newer schema is refused on purpose); see abp-stack status");
         return { ready: switched.ready };
       });
@@ -383,6 +451,7 @@ export function createStack(deps) {
     rotateKeys({ daemonToken = true, vncPassword = true } = {}) {
       return locked(async () => {
         const done = [daemonToken && "daemon-token", vncPassword && "vnc-password"].filter(Boolean).join(",");
+        const quiesced = await quiesce("rotate-keys");
         try {
           let token;
           if (daemonToken) {
@@ -396,7 +465,7 @@ export function createStack(deps) {
             deps.writeFileAtomic(SECRET_FILES.browserVnc.path, password, SECRET_FILES.browserVnc);
             for (const browser of layout().browsers) docker(["exec", browser.container, "pkill", "-x", "x11vnc"], { allowFail: true });
           }
-          await restartRuntime();
+          await restartQuiescedRuntime();
           if (vncPassword) {
             for (const browser of layout().browsers) {
               let back = false;
@@ -412,9 +481,10 @@ export function createStack(deps) {
             systemctl(["restart", DAEMON_SERVICE]);
             if (systemctl(["is-active", DAEMON_SERVICE], { allowFail: true }).status !== 0) throw new Error("the Happy daemon is not active after the restart");
           }
-          writeState(record(readState(), { action: "rotate-keys", result: done }));
+          writeState(record(readState(), { action: "rotate-keys", result: done, quiesce: quiesced }));
           deps.log(`rotated ${done}`);
         } catch (error) {
+          iptables(["-F", "ABP-FENCE"], { allowFail: true });
           writeState(record(readState(), { action: "rotate-keys", result: "failed", keys: done, error: error instanceof Error ? error.message : "failed" }));
           throw error;
         }
@@ -425,10 +495,11 @@ export function createStack(deps) {
       const options = install();
       if (!options.profiles.some((profile) => profile.profileId === profileId)) throw new Error(`unknown profile ${profileId}`);
       return locked(async () => {
+        await quiesce("set-principal");
         const merged = mergeInstallOptions(options, { profiles: options.profiles.map((profile) => (profile.profileId === profileId ? { profileId, principalId } : profile)) });
         deps.writeFileAtomic(PATHS.installConfig, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600, owner: "root", group: "root" });
         writeRuntimeConfig(merged);
-        await restartRuntime();
+        await restartQuiescedRuntime();
       });
     },
 
@@ -539,6 +610,7 @@ export async function main(argv, deps = systemDeps()) {
       return;
     }
     case "down": await stack.locked(async () => deps.run("systemctl", ["stop", SERVICE])); return;
+    case "emergency-stop": await stack.emergencyStop(); return;
     case "status": {
       const report = await stack.status();
       if (args.includes("--json")) console.log(JSON.stringify(report, null, 2));
@@ -575,7 +647,7 @@ export async function main(argv, deps = systemDeps()) {
       await stack.setPrincipal(args[0], args[1]);
       return;
     default:
-      throw new Error("usage: abp-stack up|down|status|upgrade|rollback|rotate-keys|set-principal|load|build|run");
+      throw new Error("usage: abp-stack up|down|emergency-stop|status|upgrade|rollback|rotate-keys|set-principal|load|build|run");
   }
 }
 

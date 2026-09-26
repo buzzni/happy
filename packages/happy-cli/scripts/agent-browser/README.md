@@ -26,6 +26,7 @@ the Saycode server flag is on (S7); nothing here changes the server or Desktop.
 | `/var/lib/abp` | root:abp-session 0710 | `daemon-token` (agent 0400), `secrets/runtime/vnc-password` (abp-runtime:root 0440), `secrets/browser/vnc-password` (abp-browser 0400), `stack-state.json` (digests, 0600) |
 | `/run/abp`, `/run/abp-mcp` (tmpfiles.d) | root:abp-session 0750; agent:agent-sbx 0710 | broker socket 0660 root:abp-session and admin socket 0600 root are created by the Runtime |
 | `/home/agent`, `/home/agent-sbx`, `/work` | owner 0700; agent:abp-work 2770 | workspaces must be under `/work` (S1) |
+| `/work/agent-workspace`, `/home/agent/workspace` → it | agent:abp-work 2770 + default ACL `g:abp-work:rwX`; symlink owned by agent | see "Agent workspace" below |
 | `/usr/local/libexec/abp/` | root 0755 | `claude-sbx-launch` 0755, `abp-firewall-read` root:abp-session **4750**, `abp-firewall`, `abp-stack.mjs` |
 | `/etc/sudoers.d/abp-agent-sbx` | root 0440, `visudo -c` | `agent ALL=(agent-sbx) NOPASSWD: /usr/local/libexec/abp/claude-sbx-launch 0` |
 | `/etc/aplus/sandbox-policy.json` | root 0644 | `{"mode":"mandatory"}`; `claude-sandbox.json` only with `--egress-domain` |
@@ -62,7 +63,7 @@ and `abp-egress.service` re-runs whenever Docker restarts.
 
 Debian 12 / Ubuntu 22.04+ (arm64 tested), systemd, Docker Engine, Node 20+ at `/usr/bin/node`
 (root-owned; NodeSource or distro package), npm for `--happy-tarball`. `--install-packages`
-apt-gets the rest: bubblewrap, sudo, iptables, ipset, gcc, libc6-dev, systemd-resolved,
+apt-gets the rest: bubblewrap, sudo, iptables, ipset, acl, gcc, libc6-dev, systemd-resolved,
 libnss-resolve (the kernel needs `xt_set`/`ip_set_hash_net`, standard in Debian/Ubuntu kernels). The proxy resolves through systemd-resolved's socket (`hosts: … resolve …` in
 `/etc/nsswitch.conf`, set by the installer); the firewall gives it no DNS port. Installing
 systemd-resolved switches `/etc/resolv.conf` to its stub.
@@ -98,8 +99,11 @@ sudo ./abp-install                       # re-run: resolves machineId, writes ru
 - `--machine-id` defaults to `auto` (the agent's `~/.happy/settings.json` machineId), which the
   Runtime uses as capability `aud`. Options are saved in `/etc/abp/install.json`; a re-run
   without flags keeps them, flags override single fields.
+- **Release 1: exactly one profile, `main`** (`--profile main=<studio userId>`); the Desktop
+  requests profile `main`, and any other id or a second profile is refused. The generators and
+  the stack support several profiles for later releases.
 - `--sites` is the Runtime `sites` array (`[{ "origin": "https://…", "actions": […], "loginCompleteWhen": … }]`).
-- Other options: `--agent-profile`, `--runtime-port` (38700), `--max-agent-windows` (4),
+- Other options: `--runtime-port` (38700), `--max-agent-windows` (4),
   `--retention-days` (7), `--viewer-origin <tunnel origin>` (needs the viewer stream, S4),
   `--egress-domain` (replaces the proxy's default Claude domains), `--happy-prefix`,
   `--build-from <happy-cli>` instead of `--images`, `--no-start`.
@@ -109,10 +113,13 @@ sudo ./abp-install                       # re-run: resolves machineId, writes ru
 - Claude login for the sandbox user (once, outside the sandbox, through the proxy):
 
   ```sh
-  CLI=$(find /opt/abp/happy/lib/node_modules/@buzzni/happy-cli -path '*claude-agent-sdk/cli.js' | head -1)
-  sudo -u agent-sbx env HOME=/home/agent-sbx CLAUDE_CONFIG_DIR=/home/agent-sbx/.claude \
-    HTTPS_PROXY=http://127.0.0.1:3128 /usr/bin/node "$CLI"      # then /login
+  sudo ./abp-install claude-login        # then /login in Claude, follow the prompts, /exit
   ```
+
+  It runs the Claude Agent SDK's native binary for this machine's architecture (x86_64 → `x64`,
+  aarch64 → `arm64`) from the Happy package, i.e. the verified command:
+  `sudo -u agent-sbx env HOME=/home/agent-sbx CLAUDE_CONFIG_DIR=/home/agent-sbx/.claude
+  HTTPS_PROXY=http://127.0.0.1:3128 <happy prefix>/lib/node_modules/@buzzni/happy-cli/node_modules/@anthropic-ai/claude-agent-sdk-linux-<arch>/claude`.
 
 ## Verify
 
@@ -123,6 +130,35 @@ sudo abp-install check     # accounts, every path's owner/mode, sudoers, firewal
 sudo abp-stack status      # service, pinned digests, only 127.0.0.1:38700 published, /v1/ready,
                            # Chromium sandbox (renderers in a nested PID namespace, no --no-sandbox)
 ```
+
+## Agent workspace (Desktop chats)
+
+The Saycode server makes the daemon create chat workspaces under
+`/home/agent/workspace/aplus-dev-studio-workspace/<context>/chats/<id>`, which cannot be changed
+here, while the sandbox launcher accepts only working directories whose realpath is under
+`/work`. Without the steps below every Desktop-started session exits at once (code 1).
+`abp-install` therefore:
+
+1. creates `/work/agent-workspace` (agent:abp-work 2770) **as agent**;
+2. makes `/home/agent/workspace` a symlink to it, as agent. An existing directory is first opened to
+   `abp-work` (recursive ACL while it is still inside the private home, so `agent-sbx` cannot
+   interfere), then its entries (dotfiles too) are moved in; nothing moves if a name already exists
+   in `/work/agent-workspace`. The daemon is stopped for the move and started again at the end.
+   A symlink pointing anywhere else, or a regular file, stops the installer.
+3. sets default POSIX ACLs `g:abp-work:rwX,m::rwx` on `/work` and `/work/agent-workspace` (single
+   paths, `-P`; the workspace's as agent). The daemon runs with `UMask=0077`; with a default ACL the
+   umask does not apply, so everything it creates later stays readable and writable for `agent-sbx`.
+   No recursive ACL walk runs over the live `/work` tree: `agent-sbx` can write there, and a symlink
+   swapped in during a root walk could redirect the grant.
+
+The filesystem must support POSIX ACLs (ext4, xfs, btrfs); otherwise the installer stops with a
+message. `abp-install check` verifies that the link resolves to `/work/agent-workspace`, that both
+directories carry the default ACL, and that `agent-sbx` can read and create files in a directory
+`agent` created with umask 077. Uninstall keeps both (with the other data) unless `--purge`.
+
+After the Happy daemon restarts (install, key rotation), the first Desktop-started chat may fail
+with `MCP caller grant rejected (invalid-envelope)` until the server refreshes the daemon key;
+retry after about a minute (existing Happy behaviour, not specific to this installer).
 
 ## Operate
 
@@ -146,15 +182,26 @@ abp-stack upgrade --runtime-image sha256:… --browser-image sha256:…   # alre
 abp-stack rollback                                                    # back to the previous digests
 ```
 
-Upgrade: load and verify the digests → stop the stack, which **fences** (every host packet to
-the Runtime API port is reset by the `ABP-FENCE` chain, so no new task, batch or request on a
-kept-alive connection gets in), **drains** (waits up to 60 s, via admin metrics, until no task is
-`running`/`recovering`; what is still running recovers paused on the next start), stops the
-Runtime, then the browsers, and **verifies** they are down (kill, else error) → record
+Upgrade (and rollback, rotate-keys, set-principal): load and verify the digests → **fence**
+(every host packet to the Runtime API port is reset by the `ABP-FENCE` chain, so no new task,
+batch or request on a kept-alive connection gets in) and **verify** it: the rule is installed,
+`OUTPUT` jumps to `ABP-FENCE`, and the API really stops answering → **drain**: admin metrics
+must answer and reach 0 `running`/`recovering` tasks within 60 s. A fence that cannot be
+verified, metrics that do not answer, or a drain timeout **abort** the operation: the fence is
+lifted, nothing is stopped or changed, history records `aborted` with the reason (retry later,
+or use `emergency-stop`). A Runtime that is not running is recorded as `runtime-not-running`
+and needs no fence. Then: stop the stack, verify it is down (kill, else error) → record
 current/previous → start with the new digests (the fence is lifted after start) → wait until the
 Runtime **of the new digest** answers `/v1/ready`. Not ready, or any step fails (e.g. the service
 does not start) → automatic rollback to the previous digests and exit 1. Volumes are never
-touched. A journal written by a newer schema is refused by the
+touched. The history entry carries the fence and drain result (`quiesce`). The broker socket is
+not fenced: registrations, grants and attention polls continue during the drain (they do not
+admit work; grants stay valid on the new Runtime, same agent key).
+
+`abp-stack emergency-stop` is the incident path: no lock, no drain, best-effort fence, service and
+containers stopped at once and verified down; running tasks recover paused or uncertain.
+`abp-stack up` starts again. A plain service stop (`abp-stack down`, reboot) cannot be refused,
+so its fence and drain are best effort and logged. A journal written by a newer schema is refused by the
 older Runtime on rollback (it stays not-ready: safe stop) — see `abp-stack status`.
 History of every switch is in `/var/lib/abp/stack-state.json`.
 
@@ -196,6 +243,12 @@ same tasks, profiles and secrets. Accounts and homes (Happy and Claude logins) a
 | `/v1/ready` `revocations:false` | broker is replaying interrupted revocations; wait |
 | `/v1/ready` `browsers:false` | browser container or Chromium down: `docker logs abp-browser-<p>`, `/tmp/chromium.log` inside |
 | sessions refused with MandatorySandboxError | `abp-install check`; usually firewall prefix (another tool inserted OUTPUT rules → `systemctl restart abp-firewall`), proxy down, or sudoers |
+| `systemd-resolved is masked` (warning) / `not installed` / `did not start` | abp-install unmasks a masked unit (OrbStack and some Debian images ship it masked); install `systemd-resolved libnss-resolve` (or `--install-packages`); `journalctl -u systemd-resolved` |
+| Desktop-started sessions exit immediately (code 1) | the chat workspace is not under `/work`: `abp-install check` (workspace lines); re-run `abp-install` |
+| `… already exists in /work/agent-workspace` / `… is a symlink to …, not /work/agent-workspace` | the installer will not merge or overwrite: move the conflicting entry (or the old link) aside, re-run |
+| `does not support POSIX ACLs` / `missing: setfacl getfacl` | put `/work` on ext4/xfs/btrfs with ACLs; install `acl` (or `--install-packages`) |
+| first Desktop chat after a daemon restart: `MCP caller grant rejected (invalid-envelope)` | the server has not refreshed the daemon key yet; retry after ~1 minute |
+| `upgrade aborted: …` | fence not verifiable (`abp-firewall check`, then `systemctl restart abp-firewall`), admin metrics down (`docker logs abp-runtime`), or batches still running after 60 s (retry later); nothing was changed |
 | proxy 502 / resolution fails | `sudo -u abp-proxy getent hosts api.anthropic.com`; nsswitch `resolve`, systemd-resolved active |
 | broker 401 from the daemon | token and hash out of step (interrupted rotation) → `abp-stack rotate-keys --daemon-token` |
 | browsers cannot load a site | `abp-firewall check-egress`; a site on a private or `--deny-cidr` address is blocked by design; DNS: `--browser-dns` must list the resolvers Docker forwards to |
@@ -215,7 +268,8 @@ arm64 exercised); the S9 acceptance runs (reboot ×3, A01–A12, GD gates).
 1. **Fence and drain are done by the stack, not the Runtime:** the Runtime has no admin
    drain/fence operation, so the fence is a host packet filter on the API port (`ABP-FENCE`,
    which also blocks requests on kept-alive connections and the tunnel) and the drain polls
-   admin metrics until no task is `running`/`recovering` (60 s cap; the rest recover paused).
+   admin metrics until no task is `running`/`recovering` (60 s cap). Controlled operations abort
+   unless both are verified; only service stop and `emergency-stop` proceed without them.
    A Runtime-side admission fence would additionally let the broker socket refuse grants.
 2. **Upgrade restarts the browsers too** (full stack stop); page state is lost, profiles kept.
 3. **Port:** the Runtime listens on 38700 inside the container (`runtimeHost` 0.0.0.0 there) and
@@ -256,5 +310,29 @@ running 25 s batch reset new API requests, drained ~20 s, then verified the cont
 concurrent rotate-keys refused; rotation with all checks; egress rules restored after
 `systemctl restart docker`, a reboot and a manual jump deletion; uninstall with a live
 SIGTERM-ignoring agent-sbx process killed it before removing the rules; a symlinked config
-path made the installer refuse. The firewall script was exercised in its own
+path made the installer refuse.
+
+Fourth round (2026-09-26, same kind of host, `acl` package missing at first): the installer
+refused with "missing: setfacl getfacl"; with it, a fresh install created the link and ACLs and
+`check` passed (including the workspace lines). A pre-fix layout (real `/home/agent/workspace`
+with a umask-077 Desktop-style chat dir and a dotfile, daemon running) was migrated by a
+re-run: link in place, daemon active again, `agent-sbx` read and wrote the migrated files, a new
+chat dir created by `agent` with umask 077 through the link resolved under `/work` and was
+readable/writable for `agent-sbx`; S1 preflight passed. The first attempt showed that a root-owned
+recursive ACL walk under `/work` is refused by the installer's own path check (`/work` is
+group-writable), which led to the as-agent, single-path design above.
+
+Third round (2026-09-26, merged integration tree, clean Debian 12 systemd + DinD with
+systemd-resolved **masked**): profile `ops` refused; the install unmasked and started
+systemd-resolved; `check` all passed; S1 preflight passed; `claude-login` ran the resolved
+`linux-arm64` binary (a stand-in) as agent-sbx with its home, config dir and the proxy. Upgrade
+with the `OUTPUT → ABP-FENCE` jump removed aborted ("OUTPUT does not jump to ABP-FENCE"), and
+upgrade with a 110 s batch running aborted after the 60 s drain ("drain timeout (1 running)");
+both times the Runtime kept serving on v1 with the fence lifted and history recorded `aborted`.
+Upgrade with a 20 s batch running and broker register/attention traffic in parallel: fence
+verified, drained in 20.1 s, then switched and was ready on v2 (history `quiesce`); the broker
+answered 200 throughout the drain and was refused only while the containers were swapped.
+`emergency-stop` stopped the stack at once and `up` cleared its flag.
+
+The firewall script was exercised in its own
 network namespace (idempotent, foreign rules kept, shadowing repaired).

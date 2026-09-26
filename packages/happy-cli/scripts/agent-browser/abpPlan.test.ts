@@ -64,6 +64,12 @@ describe('install options', () => {
         expect(() => mergeInstallOptions(undefined, { workspaceId: 'w', profiles: [{ profileId: 'a', principalId: 'u' }], issuers: [{ kid: 'k', publicKeyPem: pem() }] }), 'missing machineId').toThrow(/machineId/)
     })
 
+    it('allows exactly one profile named main in release 1 (the Desktop requests profile main)', () => {
+        expect(() => mergeInstallOptions(base(), { profiles: [{ profileId: 'ops', principalId: 'u' }] })).toThrow(/exactly one profile named main/)
+        expect(() => mergeInstallOptions(base(), { profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }] })).toThrow(/exactly one profile named main/)
+        expect(mergeInstallOptions(base(), { profiles: [{ profileId: 'main', principalId: 'u9' }] }).profiles).toEqual([{ profileId: 'main', principalId: 'u9' }])
+    })
+
     it('refuses a private key given as the issuer key and never echoes it', () => {
         const privatePem = generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
         let message = ''
@@ -242,10 +248,11 @@ describe('browser networks and egress firewall', () => {
         expect(() => mergeInstallOptions(base(), { testAllowCidrs: ['0.0.0.0/0'] })).toThrow(/testAllowCidrs/)
     })
 
-    const install = mergeInstallOptions(base(), {
+    // The generators support several profiles; the installer allows only main in release 1, so build the options directly.
+    const install = {
+        ...mergeInstallOptions(base(), { denyCidrs: ['203.0.114.0/24'], browserDns: ['10.0.0.2'] }),
         profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }],
-        denyCidrs: ['203.0.114.0/24'], browserDns: ['10.0.0.2'],
-    })
+    }
     const layout = stackLayout(install)
 
     it('gives every profile a fixed bridge name and fixed addresses from the pool', () => {
@@ -333,7 +340,7 @@ describe('Chromium seccomp profile', () => {
 })
 
 describe('stack containers', () => {
-    const layout = stackLayout(mergeInstallOptions(base(), { profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }] }))
+    const layout = stackLayout({ ...base(), profiles: [{ profileId: 'main', principalId: 'u1' }, { profileId: 'ops', principalId: 'u2' }] })
     const IMAGE_R = 'sha256:' + '1'.repeat(64)
     const IMAGE_B = 'sha256:' + '2'.repeat(64)
 

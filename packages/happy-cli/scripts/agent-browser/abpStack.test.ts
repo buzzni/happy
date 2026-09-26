@@ -20,6 +20,9 @@ interface HostOptions {
     handlers?: Array<[RegExp, Handler]>
     /** tasks.running per admin metrics call (drain); undefined = Runtime unreachable */
     running?: Array<number | undefined>
+    /** whether `docker inspect` reports the Runtime running (controlled operations) */
+    runtimeRunning?: boolean
+    profiles?: Array<{ profileId: string; principalId: string }>
 }
 
 /** Records every command; files live in a map; the Runtime's image label follows the state file (as abp-stack run would). */
@@ -27,25 +30,39 @@ function fakeHost(options: HostOptions = {}) {
     const calls: string[] = []
     const logs: string[] = []
     const files = new Map<string, { data: string; mode: number; owner: string; group: string }>()
-    const install = mergeInstallOptions(undefined, {
-        machineId: 'machine-1', workspaceId: 'ws-1',
-        profiles: [{ profileId: 'main', principalId: 'user-1' }, { profileId: 'ops', principalId: 'user-2' }],
-        issuers: [{ kid: 'k1', publicKeyPem: generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString() }],
-    })
+    const install = {
+        ...mergeInstallOptions(undefined, {
+            machineId: 'machine-1', workspaceId: 'ws-1',
+            profiles: [{ profileId: 'main', principalId: 'user-1' }],
+            issuers: [{ kid: 'k1', publicKeyPem: generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString() }],
+        }),
+        // Two profiles exercise the per-profile loops; release 1 installs only main (see the set-principal test).
+        profiles: options.profiles ?? [{ profileId: 'main', principalId: 'user-1' }, { profileId: 'ops', principalId: 'user-2' }],
+    }
     files.set(PATHS.installConfig, { data: JSON.stringify(install), mode: 0o600, owner: 'root', group: 'root' })
     files.set(PATHS.runtimeConfig, { data: JSON.stringify({ daemonTokenSha256: 'e'.repeat(64) }), mode: 0o600, owner: 'root', group: 'root' })
     files.set(PATHS.stackState, { data: JSON.stringify({ schemaVersion: 1, current: options.current === undefined ? { runtime: RUNTIME_OLD, browser: BROWSER_OLD } : options.current, previous: options.previous ?? null, history: [] }), mode: 0o600, owner: 'root', group: 'root' })
     const state = () => JSON.parse(files.get(PATHS.stackState)!.data)
     const running = [...(options.running ?? [])]
+    let runtimeRunning = options.runtimeRunning ?? true
     let lockHeld = false
+    // The fence resets host packets to the API port: while it is up, the Runtime does not answer.
+    let fenced = false
     let secretCount = 0
     const deps = {
         run(cmd: string, args: string[], opts: { allowFail?: boolean } = {}): Result {
             const line = [cmd, ...args].join(' ')
             calls.push(line)
+            if (line === FENCE) fenced = true
+            if (line === UNFENCE) fenced = false
+            // abp-stack.service: its stop takes the Runtime down; its start recreates it and lifts the fence.
+            if (line === 'systemctl stop abp-stack.service') runtimeRunning = false
+            if (line === 'systemctl start abp-stack.service') { runtimeRunning = true; fenced = false }
             const handlers: Array<[RegExp, Handler]> = [
                 ...options.handlers ?? [],
                 [/^docker image inspect/, (a) => ({ stdout: a.at(-1) })],
+                // Controlled operations ask whether the Runtime runs before fencing it.
+                [/^docker inspect -f \{\{\.State\.Running\}\} abp-runtime$/, () => ({ stdout: runtimeRunning ? 'true' : 'false' })],
                 [new RegExp(`^${LABEL.replace(/[{}.]/g, '\\$&')}$`), () => ({ stdout: state().current?.runtime })],
             ]
             for (const [pattern, handler] of handlers) {
@@ -65,7 +82,7 @@ function fakeHost(options: HostOptions = {}) {
         exists: (path: string) => files.has(path),
         writeFileAtomic(path: string, data: string, meta: { mode: number; owner: string; group: string }) { files.set(path, { data, ...meta }) },
         groupId: (name: string) => (name === 'abp-session' ? 990 : 1),
-        async ready() { return { status: 200, body: {} } },
+        async ready() { return { status: fenced ? 0 : 200, body: {} } },
         async adminMetrics() {
             const value = running.length ? running.shift() : 0
             return value === undefined ? undefined : { tasks: { running: value } }
@@ -81,7 +98,7 @@ function fakeHost(options: HostOptions = {}) {
             return () => { lockHeld = false }
         },
     }
-    return { deps, calls, logs, files, state }
+    return { deps, calls, logs, files, state, setRuntimeRunning: (value: boolean) => { runtimeRunning = value } }
 }
 
 const indexOf = (calls: string[], pattern: RegExp | string) => calls.findIndex((line) => (typeof pattern === 'string' ? line === pattern : pattern.test(line)))
@@ -134,7 +151,7 @@ describe('abp-stack start', () => {
 
 describe('abp-stack stop (admission fence, drain, verified stop)', () => {
     it('fences the Runtime API, waits for running batches, stops Runtime then browsers and verifies they are down', async () => {
-        const host = fakeHost({ running: [2, 1, 0] })
+        const host = fakeHost({ running: [2, 1, 0], runtimeRunning: false })
         await createStack(host.deps).stop()
         const { calls } = host
         expect(calls.slice(0, 2)).toEqual([UNFENCE, FENCE])
@@ -148,20 +165,49 @@ describe('abp-stack stop (admission fence, drain, verified stop)', () => {
 
     it('stops anyway after the drain timeout (tasks then recover paused) and kills a container that does not stop', async () => {
         let killed = false
-        const host = fakeHost({ running: Array(200).fill(1), handlers: [
+        const host = fakeHost({ running: Array(200).fill(1), runtimeRunning: false, handlers: [
             [/^docker inspect -f \{\{\.State\.Running\}\} abp-browser-ops$/, () => ({ stdout: killed ? 'false' : 'true' })],
             [/^docker kill abp-browser-ops$/, () => { killed = true; return {} }],
         ] })
         let clock = 0
         host.deps.now = () => (clock += 1_000)
         await createStack(host.deps).stop({ drainMs: 10_000 })
-        expect(host.logs.join('\n')).toMatch(/drain timed out/)
+        expect(host.logs.join('\n')).toMatch(/drain timeout with 1 running task\(s\); they recover paused/)
         expect(host.calls).toContain('docker kill abp-browser-ops')
     })
 
     it('fails loudly when a container survives the kill', async () => {
         const host = fakeHost({ handlers: [[/^docker inspect -f \{\{\.State\.Running\}\} abp-runtime$/, () => ({ stdout: 'true' })]] })
         await expect(createStack(host.deps).stop()).rejects.toThrow(/abp-runtime is still running/)
+    })
+})
+
+describe('abp-stack emergency-stop', () => {
+    it('stops at once without draining or the operations lock, and verifies the containers are down', async () => {
+        const host = fakeHost({ running: Array(100).fill(3), runtimeRunning: false })
+        const release = await host.deps.opLock()
+        let metricsCalls = 0
+        host.deps.adminMetrics = async () => { metricsCalls++; return { tasks: { running: 3 } } }
+        await createStack(host.deps).emergencyStop()
+        expect(metricsCalls).toBe(0)
+        expect(host.files.has('/run/abp-stack-emergency')).toBe(true)
+        const stopService = host.calls.indexOf('systemctl stop abp-stack.service')
+        expect(stopService).toBeGreaterThan(host.calls.indexOf(FENCE))
+        expect(indexOf(host.calls, 'docker stop -t 10 abp-runtime')).toBeGreaterThan(stopService)
+        expect(host.calls).toContain('docker inspect -f {{.State.Running}} abp-browser-ops')
+        release()
+    })
+
+    it('makes the service stop skip the drain while the emergency flag is set, and start clears it', async () => {
+        const host = fakeHost({ running: Array(100).fill(3), runtimeRunning: false })
+        host.files.set('/run/abp-stack-emergency', { data: '', mode: 0o600, owner: 'root', group: 'root' })
+        let metricsCalls = 0
+        host.deps.adminMetrics = async () => { metricsCalls++; return { tasks: { running: 3 } } }
+        await createStack(host.deps).stop()
+        expect(metricsCalls).toBe(0)
+        host.deps.remove = (path: string) => { host.files.delete(path) }
+        await createStack(host.deps).start()
+        expect(host.files.has('/run/abp-stack-emergency')).toBe(false)
     })
 })
 
@@ -208,13 +254,17 @@ describe('abp-stack upgrade / rollback', () => {
         const stop = host.calls.indexOf('systemctl stop abp-stack.service')
         expect(host.calls.indexOf('systemctl start abp-stack.service')).toBeGreaterThan(stop)
         // systemctl stop returned: the containers must really be down before the switch.
-        expect(indexOf(host.calls, 'docker inspect -f {{.State.Running}} abp-runtime')).toBeGreaterThan(stop)
+        expect(host.calls.indexOf('docker inspect -f {{.State.Running}} abp-runtime', stop)).toBeGreaterThan(stop)
         expect(host.calls.some((line) => /volume rm/.test(line))).toBe(false)
     })
 
     it('rolls back to the previous digests when the new Runtime never becomes ready', async () => {
         const host = fakeHost()
-        host.deps.ready = async () => ({ status: host.state().current.runtime === RUNTIME_OLD ? 200 : 503, body: {} })
+        const fencedAware = host.deps.ready
+        host.deps.ready = async () => {
+            const reply = await fencedAware()
+            return reply.status === 0 ? reply : { status: host.state().current.runtime === RUNTIME_OLD ? 200 : 503, body: {} }
+        }
         let clock = 0
         host.deps.now = () => (clock += 1_000)
         await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 5_000 })).rejects.toThrow(/rolled back/)
@@ -229,6 +279,47 @@ describe('abp-stack upgrade / rollback', () => {
         await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 5_000 })).rejects.toThrow(/rolled back/)
         expect(host.state().current).toEqual({ runtime: RUNTIME_OLD, browser: BROWSER_OLD })
         expect(host.state().history.map((entry: { action: string; result: string }) => `${entry.action}:${entry.result}`)).toEqual(['upgrade:failed', 'auto-rollback:ready'])
+    })
+
+    it('records the verified fence and the explicit drain result, waiting for running batches first', async () => {
+        const host = fakeHost({ running: [1, 1, 0] })
+        await createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 10_000 })
+        const upgrade = host.state().history.at(-1)
+        expect(upgrade).toMatchObject({ action: 'upgrade', result: 'ready', quiesce: { fence: 'verified', drain: { result: 'drained', running: 0 } } })
+        expect(indexOf(host.calls, FENCE)).toBeLessThan(indexOf(host.calls, 'systemctl stop abp-stack.service'))
+        expect(host.calls).toContain('iptables -w -t filter -C OUTPUT -j ABP-FENCE')
+    })
+
+    const aborts: Array<[string, HostOptions, RegExp]> = [
+        ['the fence rule cannot be installed', { handlers: [[/^iptables -w -t filter -A ABP-FENCE/, () => ({ status: 1 })]] }, /fence rule not installed/],
+        ['OUTPUT does not jump to the fence chain', { handlers: [[/^iptables -w -t filter -C OUTPUT -j ABP-FENCE$/, () => ({ status: 1 })]] }, /OUTPUT does not jump to ABP-FENCE/],
+        ['the admin metrics are unavailable', { running: [undefined] }, /drain unavailable/],
+        ['running batches do not finish in time', { running: Array(500).fill(2) }, /drain timeout \(2 running\)/],
+    ]
+    for (const [name, options, message] of aborts) {
+        it(`aborts before stopping anything when ${name}, and lifts the fence`, async () => {
+            const host = fakeHost(options)
+            let clock = 0
+            host.deps.now = () => (clock += 1_000)
+            await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 1_000 })).rejects.toThrow(message)
+            expect(host.calls).not.toContain('systemctl stop abp-stack.service')
+            expect(host.calls.at(-1)).toBe(UNFENCE)
+            expect(host.state().current).toEqual({ runtime: RUNTIME_OLD, browser: BROWSER_OLD })
+            expect(host.state().history.at(-1)).toMatchObject({ action: 'upgrade', result: 'aborted' })
+        })
+    }
+
+    it('aborts when the Runtime API still answers behind the fence', async () => {
+        const host = fakeHost()
+        host.deps.ready = async () => ({ status: 200, body: {} })
+        await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 1_000 })).rejects.toThrow(/still answers behind the fence/)
+        expect(host.calls).not.toContain('systemctl stop abp-stack.service')
+    })
+
+    it('treats a stack whose Runtime is not running as quiesced, and says so', async () => {
+        const host = fakeHost({ runtimeRunning: false })
+        await createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 10_000 })
+        expect(host.state().history.at(-1)).toMatchObject({ action: 'upgrade', result: 'ready', quiesce: { fence: 'not-needed', drain: { result: 'runtime-not-running' } } })
     })
 
     it('refuses an upgrade to digests that are not loaded', async () => {
@@ -248,7 +339,7 @@ describe('abp-stack upgrade / rollback', () => {
         const release = await host.deps.opLock()
         await expect(createStack(host.deps).upgrade({ ids: { runtime: RUNTIME_NEW, browser: BROWSER_NEW }, readyTimeoutMs: 1 })).rejects.toThrow(/another abp-stack operation/)
         await expect(createStack(host.deps).rotateKeys()).rejects.toThrow(/another abp-stack operation/)
-        await expect(createStack(host.deps).setPrincipal('ops', 'x')).rejects.toThrow(/another abp-stack operation/)
+        await expect(createStack(host.deps).setPrincipal('main', 'x')).rejects.toThrow(/another abp-stack operation/)
         expect(host.calls).toEqual([])
         release()
         await createStack(host.deps).rotateKeys({ daemonToken: false, vncPassword: true })
@@ -315,6 +406,15 @@ describe('abp-stack rotate-keys', () => {
         expect(host.state().history.at(-1)).toMatchObject({ action: 'rotate-keys', result: 'daemon-token' })
     })
 
+    it('aborts a rotation before writing anything when the drain cannot be measured', async () => {
+        const host = fakeHost({ running: [undefined] })
+        const before = host.files.get(PATHS.runtimeConfig)!.data
+        await expect(createStack(host.deps).rotateKeys({ daemonToken: true, vncPassword: false })).rejects.toThrow(/drain unavailable/)
+        expect(host.files.get(PATHS.runtimeConfig)!.data).toBe(before)
+        expect(host.files.has(PATHS.daemonToken)).toBe(false)
+        expect(host.calls).not.toContain('docker restart -t 30 abp-runtime')
+    })
+
     it('fails when the restarted Runtime does not accept the new daemon token', async () => {
         const host = fakeHost()
         host.deps.brokerProbe = async () => 401
@@ -324,11 +424,11 @@ describe('abp-stack rotate-keys', () => {
 
 describe('abp-stack set-principal', () => {
     it('reassigns a profile owner in both config files and restarts the Runtime behind the fence', async () => {
-        const host = fakeHost()
-        await createStack(host.deps).setPrincipal('ops', 'user-9')
-        expect(JSON.parse(host.files.get(PATHS.installConfig)!.data).profiles).toContainEqual({ profileId: 'ops', principalId: 'user-9' })
+        const host = fakeHost({ profiles: [{ profileId: 'main', principalId: 'user-1' }] })
+        await createStack(host.deps).setPrincipal('main', 'user-9')
+        expect(JSON.parse(host.files.get(PATHS.installConfig)!.data).profiles).toEqual([{ profileId: 'main', principalId: 'user-9' }])
         const config = JSON.parse(host.files.get(PATHS.runtimeConfig)!.data)
-        expect(config.profiles).toContainEqual({ profileId: 'ops', principalId: 'user-9' })
+        expect(config.profiles).toEqual([{ profileId: 'main', principalId: 'user-9' }])
         expect(config.daemonTokenSha256).toBe('e'.repeat(64))
         expect(host.calls.indexOf('docker restart -t 30 abp-runtime')).toBeGreaterThan(host.calls.indexOf(FENCE))
         expect(() => createStack(host.deps).setPrincipal('nope', 'user-9')).toThrow(/unknown profile/)
