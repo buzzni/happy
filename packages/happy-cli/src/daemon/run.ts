@@ -1,3 +1,4 @@
+import { inspectStandaloneCandidatePresence, assertStandaloneCandidateIdentity, readStandaloneCandidateId, createStandaloneWindowsRuntime } from './standaloneWindowsRuntime';
 import { DIFFICULTY_CLASSIFIER_REVISION } from './difficultyRoutingArtifacts';
 import { healInstallArtifacts } from './installArtifactsHeal';
 import fs from 'fs/promises';
@@ -6,7 +7,7 @@ import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
 import { AUTOMATION_PROTOCOL_VERSION, SCRIPT_AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
 import { prepareManagedScriptRuntime, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
 import { runManagedScript } from './automations/managedScriptRunner';
@@ -106,6 +107,7 @@ import {
 } from './reconnectSessionEnv';
 import {
   decideAutomationResumePreflight,
+  createLaunchReadinessGate,
   hasLiveDaemonChild,
   resolveAutomationDirectoryMatch,
   shareInFlight,
@@ -664,7 +666,14 @@ export async function startDaemon(): Promise<void> {
   logger.debug('[DAEMON RUN] Starting daemon process...');
   logger.debugLargeJson('[DAEMON RUN] Environment', getEnvironmentInfo());
 
+  const requestedCandidateId = readStandaloneCandidateId(process.env);
+  const previousCandidateState = await readDaemonState();
+  const candidateIdentityApplies = Boolean(requestedCandidateId || previousCandidateState?.windowsCandidateId);
+  const previousCandidatePresence = candidateIdentityApplies && previousCandidateState
+    ? await inspectStandaloneCandidatePresence(configuration.happyHomeDir, process.env, previousCandidateState) : 'gone';
+  assertStandaloneCandidateIdentity(requestedCandidateId, previousCandidateState, previousCandidatePresence);
   const startupDisposition = await prepareDaemonStartup({
+    previousDaemonGone: candidateIdentityApplies && previousCandidatePresence === 'gone',
     preflightCandidate: preflightDaemonControlServer,
     runningVersionMatches: isDaemonRunningCurrentlyInstalledHappyVersion,
     stopRunningDaemon: async () => {
@@ -706,6 +715,7 @@ export async function startDaemon(): Promise<void> {
 
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
+  let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   try {
     // npm 12 blocks install scripts it was not told to allow, so a plain
@@ -1104,11 +1114,12 @@ export async function startDaemon(): Promise<void> {
     const persistedSessions = readPersistedSessions();
 
     // Recover sessions from previous daemon run
+    const windowsTrialRequested = process.platform === 'win32' && Boolean(process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER);
     const previousState = await readDaemonState();
     if (previousState?.trackedSessions?.length) {
       logger.debug(`[DAEMON RUN] Found ${previousState.trackedSessions.length} sessions from previous daemon (state: ${previousState.state || 'unknown'})`);
       for (const persisted of previousState.trackedSessions) {
-        const processIdentity = classifyRecoveredTrackedProcess({
+        const processIdentity = windowsTrialRequested ? 'unverified' : classifyRecoveredTrackedProcess({
           pid: persisted.pid,
           recordedStartedAt: persisted.startedAt,
           isPidAlive,
@@ -1178,7 +1189,7 @@ export async function startDaemon(): Promise<void> {
       const resumableHomeDirs = Object.values(persistedSessions)
         .map((s) => s.userHomeDir)
         .filter((d): d is string => typeof d === 'string');
-      const removed = await sweepOrphanUserHomeDirs([
+      const removed = windowsTrialRequested ? [] : await sweepOrphanUserHomeDirs([
         ...liveHomeDirs,
         ...unverifiedRecoveredHomeDirs,
         ...resumableHomeDirs,
@@ -1200,7 +1211,7 @@ export async function startDaemon(): Promise<void> {
           .map((session) => session.deferredContinuationContextFile)
           .filter((file): file is string => typeof file === 'string'),
       ];
-      const removed = await sweepOrphanDeferredContinuationContextFiles(
+      const removed = windowsTrialRequested ? [] : await sweepOrphanDeferredContinuationContextFiles(
         configuration.happyHomeDir,
         pendingContextFiles,
       );
@@ -1231,13 +1242,19 @@ export async function startDaemon(): Promise<void> {
 
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
+    standaloneWindows = await createStandaloneWindowsRuntime({ homeDir: configuration.happyHomeDir,
+      env: process.env, managed: managedIdentity.status === 'active', getChildren: getCurrentChildren,
+      onRetired: pid => onChildExited(pid) });
+    if (standaloneWindows) process.env.HAPPY_REMOTE_TERMINAL_POLICY = 'disabled';
     const autonomousQualityGateStore = await AutonomousQualityGateRunStore.open(
       join(configuration.happyHomeDir, 'autonomous-quality-gates.json'),
     );
     const autonomousQualityGateRegistry = new AutonomousQualityGateDaemonRegistry({
       store: autonomousQualityGateStore,
       capture: captureAutonomousWorktreeFingerprint,
-      runPhase: (phase, cwd, signal) => runAutonomousQualityGatePhase(phase, { cwd, signal }),
+      runPhase: (phase, cwd, signal) => standaloneWindows
+        ? Promise.reject(new Error('Standalone Windows trial cannot run unfenced quality-gate commands'))
+        : runAutonomousQualityGatePhase(phase, { cwd, signal }),
       sendRepair: async (sessionId, message, options) => {
         const session = getCurrentChildren().find(candidate => candidate.happySessionId === sessionId);
         if (!session?.encryption) throw new Error(`Session encryption unavailable for ${sessionId}`);
@@ -1641,11 +1658,18 @@ export async function startDaemon(): Promise<void> {
       _agent: string | undefined,
     ): Promise<Record<string, string>> => ({});
 
+    const launchReadiness = createLaunchReadinessGate();
+    const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;
+
     // Spawn a new session (sessionId reserved for future --resume functionality)
     const spawnSession = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
     ): Promise<SpawnSessionResult> => {
+      if (!launchReadiness.isReady()) return { type: 'error', errorMessage: 'Daemon is initializing; retry the launch shortly' };
+      if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || options.agent !== 'codex')) {
+        return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
+      }
       // Spawn options can contain the encrypted one-use envelope as well as
       // unrelated project secrets. Log only routing metadata so neither the
       // envelope nor a client-supplied plaintext grant becomes replayable log
@@ -1922,6 +1946,7 @@ export async function startDaemon(): Promise<void> {
             // native hook to stand down and no account credential to be a
             // host with.
             managedIdentity.status !== 'active'
+            && !standaloneWindows
             && lessonStudioOrigin
             && machineId,
           ),
@@ -2029,7 +2054,7 @@ export async function startDaemon(): Promise<void> {
         });
 
         // Check if tmux is available and should be used
-        const tmuxAvailable = await isTmuxAvailable();
+        const tmuxAvailable = !standaloneWindows && await isTmuxAvailable();
         let useTmux = tmuxAvailable;
 
         // Get tmux session name from environment variables (now set by profile system)
@@ -2227,7 +2252,7 @@ export async function startDaemon(): Promise<void> {
       }
     };
 
-    const spawnTrackedHappyProcess = ({
+    const spawnTrackedHappyProcess = async ({
       args,
       cwd,
       env,
@@ -2249,28 +2274,22 @@ export async function startDaemon(): Promise<void> {
        */
       resumeTargetSessionId?: string;
     }): Promise<SpawnSessionResult> => {
-      const happyProcess = spawnHappyCLI(args, {
-        cwd,
-        detached: true,
-        stdio: 'ignore',
-        env,
-      });
-
-      if (!happyProcess.pid) {
-        logger.debug('[DAEMON RUN] Failed to spawn process - no PID returned');
-        return Promise.resolve({
-          type: 'error',
-          errorMessage: 'Failed to spawn Happy process - no PID returned'
-        });
+      if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || args[0] !== 'codex')) {
+        return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
       }
+      const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
+      const happyProcess = prepared?.childProcess ?? spawnHappyCLI(args, { cwd, detached: true, stdio: 'ignore', env });
+      const rootPid = prepared?.pid ?? happyProcess.pid;
+      if (!rootPid) return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
+      logger.debug(`[DAEMON RUN] Spawned session root PID ${rootPid}`);
 
-      logger.debug(`[DAEMON RUN] Spawned process with PID ${happyProcess.pid}`);
-
+      let resumed = false;
+      try {
       const agentEnvironment = captureSaycodeAgentEnvironment(env);
       const deferredContinuationContextFile = env.HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE;
       const trackedSession: TrackedSession = {
         startedBy: 'daemon',
-        pid: happyProcess.pid,
+        pid: rootPid,
         directory: cwd,
         childProcess: happyProcess,
         directoryCreated,
@@ -2281,30 +2300,32 @@ export async function startDaemon(): Promise<void> {
         ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
       };
 
-      recoveredPendingSpawnStartedAt.delete(happyProcess.pid);
-      pidToTrackedSession.set(happyProcess.pid, trackedSession);
-      sessionStartTimes.set(happyProcess.pid, Date.now());
+      recoveredPendingSpawnStartedAt.delete(rootPid);
+      pidToTrackedSession.set(rootPid, trackedSession);
+      sessionStartTimes.set(rootPid, Date.now());
       persistTrackedSessions();
 
-      happyProcess.on('exit', (code, signal) => {
-        logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} exited with code ${code}, signal ${signal}`);
-        if (happyProcess.pid) {
-          onChildExited(happyProcess.pid);
+      if (prepared) {
+        // Helper exit by itself is not root/Job proof. Preserve tracking on unknown evidence.
+        void prepared.exit.catch(() => {
+          logger.warn('[DAEMON RUN] Windows session exit remains unverified');
+        });
+      } else {
+        happyProcess.on('exit', () => onChildExited(rootPid));
+        happyProcess.on('error', () => onChildExited(rootPid));
+      }
+      const webhookCancellation = new AbortController();
+      const webhook = waitForSessionWebhook({ pid: rootPid, pidToAwaiter, logger, signal: webhookCancellation.signal });
+      if (prepared) {
+        try {
+          if (!standaloneWindows?.owner.acceptingLaunches) throw new Error('Standalone launch frozen before resume');
+          await prepared.resume(); resumed = true;
         }
-      });
+        catch (error) { webhookCancellation.abort(); prepared.cancelBeforeResume?.(); throw error; }
+      }
+      return webhook;
+      } finally { if (prepared && !resumed) prepared.cancelBeforeResume?.(); }
 
-      happyProcess.on('error', (error) => {
-        logger.debug(`[DAEMON RUN] Child process error:`, error);
-        if (happyProcess.pid) {
-          onChildExited(happyProcess.pid);
-        }
-      });
-
-      return waitForSessionWebhook({
-        pid: happyProcess.pid,
-        pidToAwaiter,
-        logger,
-      });
     };
 
     const findTrackedSessionById = (happySessionId: string): TrackedSession | undefined => {
@@ -2442,8 +2463,9 @@ export async function startDaemon(): Promise<void> {
     };
 
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
+      if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
       try {
-        if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive)) {
+        if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {
           if (options?.automation) {
             return {
               type: 'error',
@@ -2691,7 +2713,7 @@ export async function startDaemon(): Promise<void> {
           projectId: authoritativeCheckpointProjectId ?? null,
           hasSessionAuthority: Boolean(authoritativeCheckpointProjectId
             && mcpEnvironment.environmentVariables.HAPPY_APLUS_MCP_CALLER_GRANT),
-          eligible: Boolean(process.env.HAPPY_APLUS_MCP_CONFIG_URL && machineId),
+          eligible: !standaloneWindows && Boolean(process.env.HAPPY_APLUS_MCP_CONFIG_URL && machineId),
           hostIsReady: async () => Boolean(
             authoritativeCheckpointProjectId
             && await lessonHosts.ensureOpen(authoritativeCheckpointProjectId),
@@ -2798,6 +2820,8 @@ export async function startDaemon(): Promise<void> {
       });
 
     const verifyRecoveryNativeSession = async (session: ReconnectableHappySession): Promise<boolean> => {
+      // Recovery inspection starts another provider app-server outside the owned session Job.
+      if (standaloneWindows) return false;
       const metadata = session.metadata;
       if ((metadata.flavor === 'codex' || metadata.codexThreadId) && metadata.codexThreadId) {
         const client = new CodexAppServerClient();
@@ -2964,7 +2988,7 @@ export async function startDaemon(): Promise<void> {
         : null;
       const preflight = decideAutomationResumePreflight({
         resumeInFlight: resumeInFlight.has(input.sessionId),
-        live: hasLiveDaemonChild(input.sessionId, pidToTrackedSession.values(), isPidAlive),
+        live: hasLiveDaemonChild(input.sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
         sameDirectory,
       });
       if (preflight === 'fallback') {
@@ -3001,6 +3025,7 @@ export async function startDaemon(): Promise<void> {
             input.sessionId,
             pidToTrackedSession.values(),
             isPidAlive,
+            ownsUnresolvedJob,
           ),
         };
     };
@@ -3135,6 +3160,20 @@ export async function startDaemon(): Promise<void> {
             return { stopped: false, reason: 'managed-generation', detail: 'supervisor-stop-requested' };
           }
 
+          if (standaloneWindows) {
+            if (!standaloneWindows.owner.ownsRoot(pid)) {
+              return { stopped: false, reason: 'standalone-unowned', detail: 'native-owner-unavailable' };
+            }
+            if (!standaloneWindows.owner.canDrainRoot(pid)) {
+              return { stopped: false, reason: 'standalone-blocked', detail: 'drain-admission-closed' };
+            }
+            void standaloneWindows.owner.stopRoot(pid).then(evidence => {
+              logger.debug('[DAEMON RUN] Windows session drain result', { pid, ...evidence });
+            }).catch(() => logger.warn('[DAEMON RUN] Windows session drain remains blocked'));
+            // Keep root tracking until native evidence; never signal a helper or a reused PID.
+            return { stopped: false, reason: 'standalone-drain', detail: 'native-exit-pending' };
+          }
+
           if (session.startedBy === 'daemon' && session.childProcess) {
             try {
               session.childProcess.kill('SIGTERM');
@@ -3250,7 +3289,7 @@ export async function startDaemon(): Promise<void> {
     // 겹침 가드(R5)용: 데몬이 추적 중인 자식 세션의 프로세스 생존 여부.
     const isAutomationSessionRunning = (sessionId: string): boolean => {
       for (const [pid, session] of pidToTrackedSession.entries()) {
-        if (session.happySessionId === sessionId) return isPidAlive(pid);
+        if (session.happySessionId === sessionId) return ownsUnresolvedJob(pid) || isPidAlive(pid);
       }
       return false;
     };
@@ -3258,7 +3297,7 @@ export async function startDaemon(): Promise<void> {
       return isGithubTriggerWorktreeDirectoryInUse({
         directory,
         sessions: pidToTrackedSession,
-        isPidAlive,
+        isPidAlive: pid => ownsUnresolvedJob(pid) || isPidAlive(pid),
       });
     };
     const spawnAutomationSession = async (
@@ -3303,7 +3342,7 @@ export async function startDaemon(): Promise<void> {
     // detach 실행 + 자체 리엔트런시 가드(heartbeatRunning과 별개) — spawn의
     // webhook 대기(최대 60초×due 수)가 하트비트의 나머지 임무를 막지 않게.
     const automationTickRunner = createAutomationTickRunner({
-      runTick: () => runAutomationTick({
+      runTick: () => standaloneWindows ? Promise.resolve() : runAutomationTick({
         store: automationStore,
         now: Date.now(),
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
@@ -3317,7 +3356,9 @@ export async function startDaemon(): Promise<void> {
     // Prepare/migrate the token before exposing the helper manifest. Chrome
     // can launch the helper as soon as the manifest exists, and must not race
     // legacy-token migration by creating a different machine-wide token.
-    const nativeMessaging = await prepareBrowserNativeMessaging({
+    const nativeMessaging = standaloneWindows
+      ? { token: randomUUID(), manifestPath: null }
+      : await prepareBrowserNativeMessaging({
       readToken: () => readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile
       }),
@@ -3339,7 +3380,7 @@ export async function startDaemon(): Promise<void> {
     // fixed loopback port because the extension cannot read daemon.state.json
     // to discover an ephemeral one. A bind failure (port taken) must not take
     // the daemon down — browser control is simply unavailable until restart.
-    const browserSessionBroker = process.env.HAPPY_BROWSER_BROKER_SOCKET
+    const browserSessionBroker = !standaloneWindows && process.env.HAPPY_BROWSER_BROKER_SOCKET
       ? new BrowserSessionBrokerClient(process.env.HAPPY_BROWSER_BROKER_SOCKET)
       : null;
     const browserBridge = new BrowserBridge({
@@ -3356,15 +3397,17 @@ export async function startDaemon(): Promise<void> {
     });
     let stopBrowserBridge: () => Promise<void> = async () => {};
     try {
-      const bridgeHost = resolveBrowserBridgeHost(process.env);
-      const bridgeServer = await startBrowserBridgeServer({
-        bridge: browserBridge,
-        port: DEFAULT_BROWSER_BRIDGE_PORT,
-        host: bridgeHost
-      });
-      stopBrowserBridge = bridgeServer.stop;
-      if (bridgeHost !== '127.0.0.1') {
-        logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
+      if (!standaloneWindows) {
+        const bridgeHost = resolveBrowserBridgeHost(process.env);
+        const bridgeServer = await startBrowserBridgeServer({
+          bridge: browserBridge,
+          port: DEFAULT_BROWSER_BRIDGE_PORT,
+          host: bridgeHost
+        });
+        stopBrowserBridge = bridgeServer.stop;
+        if (bridgeHost !== '127.0.0.1') {
+          logger.debug(`[DAEMON RUN] Browser bridge bound to ${bridgeHost} (HAPPY_BROWSER_BRIDGE_HOST) — not loopback-only`);
+        }
       }
     } catch (err) {
       logger.debug(`[DAEMON RUN] Browser bridge failed to start on ${DEFAULT_BROWSER_BRIDGE_PORT}: ${err instanceof Error ? err.message : String(err)}`);
@@ -3389,6 +3432,7 @@ export async function startDaemon(): Promise<void> {
       browserBridge,
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      standaloneDrain: standaloneWindows?.drain,
       managedRuntime: managedIdentity.status === 'active',
       /*
        * Without this the control server refuses every managed report with
@@ -3408,6 +3452,8 @@ export async function startDaemon(): Promise<void> {
     // Write initial daemon state (no lock needed for state file)
     const fileState: DaemonLocallyPersistedState = {
       pid: process.pid,
+      ...(standaloneWindows?.candidateId ? { windowsCandidateId: standaloneWindows.candidateId } : {}),
+      ...(standaloneWindows ? { windowsProcessIdentity: standaloneWindows.windowsProcessIdentity } : {}),
       httpPort: controlPort,
       startTime: new Date().toLocaleString(),
       startedWithCliVersion: packageJson.version,
@@ -3521,7 +3567,7 @@ export async function startDaemon(): Promise<void> {
     // encryption key, not server registration — set it either way so an
     // offline-degraded daemon still serves same-machine desktop clients.
     machineEncryptionForTerminalWs = { encryptionKey: machine.encryptionKey, encryptionVariant: machine.encryptionVariant };
-    startDifficultyRoutingElectionPoll({
+    if (!standaloneWindows) startDifficultyRoutingElectionPoll({
       host: difficultyRoutingHost,
       machineId: machine.id,
       hostProcessKeyId: difficultyRoutingHostKey.id,
@@ -3530,6 +3576,7 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({
       apiMachine,
       host: difficultyRoutingHost,
@@ -3931,12 +3978,12 @@ export async function startDaemon(): Promise<void> {
       join(configuration.happyHomeDir, 'claude-swap-supervisor.json'),
     );
     stopClaudeSwapSupervisor = () => claudeSwapSupervisor.shutdown();
-    await claudeSwapSupervisor.restore();
+    if (!standaloneWindows) await claudeSwapSupervisor.restore();
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor);
     resolveManagedAiCredentialEnvironment = (agent) => aiCredentialRuntime.sessionEnvironment(agent);
     let activeServerAutomationLeaseCount = 0;
     let scriptWorker: ReturnType<typeof createScriptAutomationWorker> | null = null;
-    if (shouldRunScriptAutomations({
+    if (!standaloneWindows && shouldRunScriptAutomations({
         managedRuntimeActive: managedIdentity.status === 'active',
         enabled: process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED,
     })) {
@@ -4074,10 +4121,10 @@ export async function startDaemon(): Promise<void> {
         lessonReviewOutcomePath(configuration.happyHomeDir, projectId),
       ).read(),
     });
-    await apiMachine.setLessonHosts(lessonHosts);
+    if (!standaloneWindows) await apiMachine.setLessonHosts(lessonHosts);
     apiMachine.setServerAutomationCache(serverAutomationCache);
     const serverAutomationTickRunner = createAutomationTickRunner({
-      runTick: () => runServerAutomationTick({
+      runTick: () => standaloneWindows ? Promise.resolve() : runServerAutomationTick({
         cache: serverAutomationCache,
         runtimeStore: serverAutomationRuntimeStore,
         machineSecretKey: machineAutomationKey.secretKey,
@@ -4200,7 +4247,7 @@ export async function startDaemon(): Promise<void> {
             directory,
             encryptionKey: tracked.encryption.encryptionKey,
             encryptionVariant: tracked.encryption.encryptionVariant,
-            live: hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive),
+            live: hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
           };
         },
         sameDirectory: async (left, right) => (
@@ -4337,7 +4384,10 @@ export async function startDaemon(): Promise<void> {
       recoverSession,
       stopSession,
       stopSessionWithExitVerification,
-      requestShutdown: () => requestShutdown('happy-app'),
+      requestShutdown: () => {
+        if (standaloneWindows) throw new Error('Standalone Windows sessions require authenticated drain and commit');
+        requestShutdown('happy-app');
+      },
       portRegistry,
       automationStore,
       aiCredentialRuntime,
@@ -4381,7 +4431,8 @@ export async function startDaemon(): Promise<void> {
       },
     });
     const getRuntimeActivity = () => ({
-      activeSessionCount: getCurrentChildren().filter((session) => isPidAlive(session.pid)).length
+      activeSessionCount: (standaloneWindows?.owner.unresolvedLaunchCount ?? 0)
+        + getCurrentChildren().filter(session => !standaloneWindows?.owner.ownsRoot(session.pid) && isPidAlive(session.pid)).length
         + getDaemonTerminalSessionCount(),
       activeAutomationCount: Number(automationTickRunner.isRunning())
         + Number(serverAutomationTickRunner.isRunning())
@@ -4391,6 +4442,8 @@ export async function startDaemon(): Promise<void> {
     });
     apiMachine.setRuntimeActivityProvider(getRuntimeActivity);
 
+    // All launch dependencies and RPC handlers now exist; early HTTP requests were refused.
+    launchReadiness.markReady();
     // Connect to server
     apiMachine.connect();
 
@@ -4466,7 +4519,7 @@ export async function startDaemon(): Promise<void> {
 
       // Prune stale sessions
       for (const [pid, _] of pidToTrackedSession.entries()) {
-        if (!isPidAlive(pid)) {
+        if (!standaloneWindows?.owner.ownsRoot(pid) && !isPidAlive(pid)) {
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           onChildExited(pid);
         }
@@ -4520,7 +4573,7 @@ export async function startDaemon(): Promise<void> {
       // then tearing down the control server in the same heartbeat loses the
       // spawned session's webhook, report and project link.
       let bundleReplaced = false;
-      if (initialBundleMtimeMs > 0) {
+      if (initialBundleMtimeMs > 0 && !standaloneWindows?.candidateId) {
         try {
           const currentMtimeMs = statSync(bundlePath).mtimeMs;
           bundleReplaced = currentMtimeMs !== initialBundleMtimeMs;
@@ -4585,6 +4638,7 @@ export async function startDaemon(): Promise<void> {
             claudeSwapSupervisor.shutdown();
             apiMachine.shutdown();
             await stopControlServer();
+            await standaloneWindows?.owner.close();
             await stopBrowserBridge();
             await cleanupDaemonState();
             try {
@@ -4677,6 +4731,8 @@ export async function startDaemon(): Promise<void> {
         const connection = apiMachine.getConnectionHealth();
         const updatedState: DaemonLocallyPersistedState = {
           pid: process.pid,
+          ...(fileState.windowsCandidateId ? { windowsCandidateId: fileState.windowsCandidateId } : {}),
+          ...(fileState.windowsProcessIdentity ? { windowsProcessIdentity: fileState.windowsProcessIdentity } : {}),
           httpPort: controlPort,
           startTime: fileState.startTime,
           startedWithCliVersion: packageJson.version,
@@ -4733,6 +4789,7 @@ export async function startDaemon(): Promise<void> {
 
       apiMachine.shutdown();
       await stopControlServer();
+      await standaloneWindows?.owner.close();
       await stopBrowserBridge();
 
       // Preserve state file with stopped status and final session list
@@ -4764,6 +4821,7 @@ export async function startDaemon(): Promise<void> {
     const shutdownRequest = await resolvesWhenShutdownRequested;
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
+    await standaloneWindows?.owner.close().catch(() => {});
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));
