@@ -157,7 +157,13 @@ async function main(): Promise<void> {
     const sleepHeld = fault !== 'sleep' || ((evidence.desktopSleep as { allStopped?: boolean })?.allStopped === true
         && (evidence.desktopStatesAtRelease as string[]).every((state) => state === 'T'))
     const cutHeld = fault !== 'netcut' || (evidence.proxyAtRelease as { tunnels: number }).tunnels === (evidence.proxyBeforeCut as { tunnels: number }).tunnels
-    if (proxy) await proxy.close()
+    if (proxy) {
+        // Leave a normal client behind: a Desktop pointing at a closed proxy has no network at all.
+        await quitDesktop()
+        await proxy.close()
+        launchDesktop(join(ctx.runDir, 'desktop-after-netcut.log'))
+        await DesktopGui.connect().then((restored) => restored.close()).catch(() => undefined)
+    }
     evidence.pass = quit.remaining === 0 && sleepHeld && cutHeld
         && (fault !== 'quit' || evidence.desktopProcessesAtRelease === 0) && evidence.clientProcessesAtRelease === 0
         && evidence.releaseWithinWaitLimit === true
