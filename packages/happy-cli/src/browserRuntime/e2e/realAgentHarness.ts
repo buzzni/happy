@@ -279,6 +279,14 @@ export async function waitForTranscript(sessionId: string, predicate: (rows: Tra
 }
 
 export async function fixtureControl(ctx: RunContext, method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
+    // Installed H: the fixture sits on the browser bridge, whose egress rules only answer the
+    // host itself, so control goes through a root shell on H (token and body on stdin).
+    const fixtureOnExec = process.env.ABP_FIXTURE_CONTROL_URL
+    if (fixtureOnExec && execMachine) {
+        const config = [`url = "${fixtureOnExec}${path}"`, `request = "${method}"`, `header = "x-harness-token: ${ctx.env.harnessToken}"`,
+            'header = "content-type: application/json"', ...body ? [`data-binary = ${JSON.stringify(JSON.stringify(body))}`] : [], 'silent', 'max-time = 30'].join('\n')
+        return JSON.parse(await onExecMachine('curl -K -', config)) as Record<string, unknown>
+    }
     const response = await harnessFetch(`http://${execHost()}:${ctx.env.ports.control}${path}`, {
         method,
         headers: { 'x-harness-token': ctx.env.harnessToken, 'content-type': 'application/json' },

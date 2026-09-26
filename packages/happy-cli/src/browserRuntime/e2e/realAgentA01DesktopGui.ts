@@ -21,7 +21,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { TaskEvent, TaskId } from '../contracts'
-import { DesktopGui, desktopProcesses, launchDesktop, quitDesktop } from './desktopGuiClient'
+import { DesktopGui, desktopProcesses, launchDesktop, quitDesktop, signalDesktop, startClientProxy } from './desktopGuiClient'
 import {
     clientProcessCount, evidenceFile, execDaemonSessions, execMachine, fixtureControl, prodIdentity, ledger, loadRun, now, parseArgs, sleep,
     userClient, waitForTranscript, writeAgentGrant,
@@ -41,7 +41,16 @@ async function main(): Promise<void> {
     const title = `ABP ${ctx.run}-${iteration}-${now().toString(36)}`
     const shots = (name: string) => join(ctx.runDir, `a01-gui-${iteration}-${name}.png`)
     const { data: evidence, save } = evidenceFile(join(ctx.runDir, `a01-gui-${iteration}.json`))
-    Object.assign(evidence, { run: ctx.run, iteration, barrierKey, executionMachine: execMachine, client: 'desktop-gui' })
+    // quit: the whole Desktop tree ends; sleep: it is frozen (SIGSTOP) and later continued;
+    // netcut: only the Desktop's (Chromium) traffic is cut through a local proxy, then restored.
+    const fault = (args['client-fault'] ?? 'quit') as 'quit' | 'sleep' | 'netcut'
+    if (!['quit', 'sleep', 'netcut'].includes(fault)) throw new Error('--client-fault quit|sleep|netcut')
+    Object.assign(evidence, { run: ctx.run, iteration, barrierKey, executionMachine: execMachine, client: 'desktop-gui', fault })
+    const proxy = fault === 'netcut' ? await startClientProxy() : undefined
+    if (proxy) {
+        await quitDesktop()
+        launchDesktop(join(ctx.runDir, `desktop-netcut-${iteration}.log`), { proxyPort: proxy.port })
+    }
 
     // 1. The user opens a chat on H from the Desktop.
     const before = new Set(await execDaemonSessions())
@@ -73,8 +82,17 @@ async function main(): Promise<void> {
     if (!started.some((row) => row.t === 'tool-call-start' && row.time > sentAt)) throw new Error('the task never reached the agent')
     await gui.screenshot(shots('before-quit'))
     gui.close()
-    const quit = await quitDesktop()
-    evidence.desktopQuit = { atMs: now(), processesBefore: quit.before, killedAfterGrace: quit.killedAfterGrace, remaining: quit.remaining }
+    let quit = { before: [] as Array<{ pid: number; command: string }>, killedAfterGrace: 0, remaining: 0 }
+    if (fault === 'quit') {
+        quit = await quitDesktop()
+        evidence.desktopQuit = { atMs: now(), processesBefore: quit.before, killedAfterGrace: quit.killedAfterGrace, remaining: quit.remaining }
+    } else if (fault === 'sleep') {
+        const stopped = await signalDesktop('SIGSTOP')
+        evidence.desktopSleep = { atMs: now(), processes: stopped.processes, states: stopped.states, allStopped: stopped.states.length === stopped.processes && stopped.states.every((state) => state === 'T') }
+    } else {
+        evidence.proxyBeforeCut = proxy!.stats()
+        evidence.desktopNetcut = { atMs: now(), connectionsCut: proxy!.cut() }
+    }
     save()
 
     // 4. Wait for the agent's waitFor batch, then release the barrier with no client alive.
@@ -84,6 +102,8 @@ async function main(): Promise<void> {
     if (!waitingSince) throw new Error('agent never submitted the waiting batch')
     evidence.agentWaitBatchStartedAtMs = waitingSince
     evidence.desktopProcessesAtRelease = (await desktopProcesses()).length
+    if (fault === 'sleep') evidence.desktopStatesAtRelease = (await signalDesktop('SIGSTOP')).states
+    if (proxy) evidence.proxyAtRelease = proxy.stats()
     evidence.clientProcessesAtRelease = await clientProcessCount()
     const released = now()
     evidence.barrierReleasedAtMs = released
@@ -103,11 +123,18 @@ async function main(): Promise<void> {
     evidence.ledgerAnswers = answers.map((entry) => ({ correct: entry.correct, atMs: entry.atMs }))
     save()
 
-    // 5. The user reopens the Desktop and the chat.
-    launchDesktop(join(ctx.runDir, 'desktop-relaunch.log'))
-    gui = await DesktopGui.connect()
-    const reopened = await gui.openPersonalChatByTitle(title)
-    const shown = reopened && await gui.waitFor(`document.body.innerText.includes('A01-DONE')`, 60_000)
+    // 5. The client comes back: relaunch after quit; wake-up or network return keep the same window.
+    let reopened = true
+    if (fault === 'quit') {
+        launchDesktop(join(ctx.runDir, 'desktop-relaunch.log'))
+        gui = await DesktopGui.connect()
+        reopened = await gui.openPersonalChatByTitle(title)
+    } else {
+        if (fault === 'sleep') evidence.desktopWake = { atMs: now(), states: (await signalDesktop('SIGCONT')).states }
+        else { proxy!.restore(); evidence.netRestoredAtMs = now() }
+        gui = await DesktopGui.connect()
+    }
+    const shown = reopened && await gui.waitFor(`document.body.innerText.includes('A01-DONE')`, 180_000)
     await gui.screenshot(shots('after-reconnect'))
     evidence.desktopReconnect = { reopenedChat: reopened, showsAgentResult: shown }
     gui.close()
@@ -127,12 +154,16 @@ async function main(): Promise<void> {
 
     const batches = (evidence.batchesAccepted ?? []) as Array<{ afterRelease: boolean }>
     const task = evidence.task as { status?: string; agentSessionId?: string; profileId?: string } | undefined
-    evidence.pass = quit.remaining === 0
-        && evidence.desktopProcessesAtRelease === 0 && evidence.clientProcessesAtRelease === 0
+    const sleepHeld = fault !== 'sleep' || ((evidence.desktopSleep as { allStopped?: boolean })?.allStopped === true
+        && (evidence.desktopStatesAtRelease as string[]).every((state) => state === 'T'))
+    const cutHeld = fault !== 'netcut' || (evidence.proxyAtRelease as { tunnels: number }).tunnels === (evidence.proxyBeforeCut as { tunnels: number }).tunnels
+    if (proxy) await proxy.close()
+    evidence.pass = quit.remaining === 0 && sleepHeld && cutHeld
+        && (fault !== 'quit' || evidence.desktopProcessesAtRelease === 0) && evidence.clientProcessesAtRelease === 0
         && evidence.releaseWithinWaitLimit === true
         && answers.length === 1 && answers[0].correct === true
         && batches.some((batch) => batch.afterRelease)
-        && task?.status === 'succeeded' && task.agentSessionId === sessionId && task.profileId === 'profile-a'
+        && task?.status === 'succeeded' && task.agentSessionId === sessionId && task.profileId === (prodIdentity?.profileId ?? 'profile-a')
         && shown === true
     save()
     console.log(JSON.stringify({ pass: evidence.pass, sessionId }))

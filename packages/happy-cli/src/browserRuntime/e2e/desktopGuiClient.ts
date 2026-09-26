@@ -9,6 +9,8 @@
  */
 import { execFile, spawn } from 'node:child_process'
 import { openSync, writeFileSync } from 'node:fs'
+import { createServer, request as httpRequest, type Server } from 'node:http'
+import { connect as netConnect, type Socket } from 'node:net'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -146,12 +148,60 @@ export async function quitDesktop(graceMs = 10_000): Promise<{ before: Array<{ p
     return { before, killedAfterGrace: survivors.length, remaining: (await desktopProcesses()).length }
 }
 
+/** "Sleep" of the client PC, simulated for the Desktop only: stop (and later continue) its whole process tree. */
+export async function signalDesktop(signal: 'SIGSTOP' | 'SIGCONT'): Promise<{ processes: number; states: string[] }> {
+    const processes = await desktopProcesses()
+    for (const { pid } of processes) try { process.kill(pid, signal) } catch { /* gone */ }
+    await sleep(500)
+    const { stdout } = await execFileAsync('ps', ['-o', 'stat=', '-p', processes.map((p) => p.pid).join(',')]).catch(() => ({ stdout: '' }))
+    return { processes: processes.length, states: stdout.trim().split('\n').map((line) => line.trim()[0]).filter(Boolean) }
+}
+
+/**
+ * Client-only network cut: Desktop is launched with --proxy-server pointing here. cut() destroys
+ * every tunnelled connection and refuses new ones; restore() lets traffic through again. Covers
+ * Chromium's network stack (renderer API, realtime socket); node-side helpers of the app bypass it.
+ */
+export async function startClientProxy(): Promise<{ port: number; cut(): number; restore(): void; stats(): { tunnels: number; refused: number }; close(): Promise<void> }> {
+    const sockets = new Set<Socket>()
+    let blocked = false
+    let tunnels = 0
+    let refused = 0
+    const track = (socket: Socket) => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) }
+    const server: Server = createServer((req, res) => {
+        if (blocked) { refused++; req.socket.destroy(); return }
+        const upstream = httpRequest(req.url ?? '', { method: req.method, headers: req.headers }, (answer) => { res.writeHead(answer.statusCode ?? 502, answer.headers); answer.pipe(res) })
+        upstream.on('error', () => res.destroy())
+        req.pipe(upstream)
+    })
+    server.on('connection', track)
+    server.on('connect', (req, client: Socket, head) => {
+        if (blocked) { refused++; client.destroy(); return }
+        const [host, port] = String(req.url).split(':')
+        const upstream = netConnect(Number(port) || 443, host, () => { client.write('HTTP/1.1 200 Connection Established\r\n\r\n'); upstream.write(head); upstream.pipe(client); client.pipe(upstream) })
+        tunnels++
+        track(upstream)
+        upstream.on('error', () => client.destroy())
+        client.on('error', () => upstream.destroy())
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+    return {
+        port,
+        cut: () => { blocked = true; const n = sockets.size; for (const socket of sockets) socket.destroy(); return n },
+        restore: () => { blocked = false },
+        stats: () => ({ tunnels, refused }),
+        close: () => new Promise<void>((resolve) => { for (const socket of sockets) socket.destroy(); server.close(() => resolve()) }),
+    }
+}
+
 /** Relaunch the same Desktop build with the same user data (the user reopening the app). */
-export function launchDesktop(logFile: string): void {
+export function launchDesktop(logFile: string, options: { proxyPort?: number } = {}): void {
     const out = openSync(logFile, 'a')
     const env = { ...process.env }
     for (const key of ['SAYCODE_AGENT_ENV', 'SAYCODE_AGENT_ROOT', 'HAPPY_HOME_DIR', 'ELECTRON_RUN_AS_NODE']) delete env[key]
     if (process.env.ABP_DESKTOP_USER_DATA_DIR) env.APLUS_DESKTOP_USER_DATA_DIR = process.env.ABP_DESKTOP_USER_DATA_DIR
-    const child = spawn('npx', ['electron-vite', 'dev', '--remoteDebuggingPort', String(cdpPort())], { cwd: desktopDir(), env, detached: true, stdio: ['ignore', out, out] })
+    const extra = options.proxyPort ? ['--', `--proxy-server=http://127.0.0.1:${options.proxyPort}`] : []
+    const child = spawn('npx', ['electron-vite', 'dev', '--remoteDebuggingPort', String(cdpPort()), ...extra], { cwd: desktopDir(), env, detached: true, stdio: ['ignore', out, out] })
     child.unref()
 }
