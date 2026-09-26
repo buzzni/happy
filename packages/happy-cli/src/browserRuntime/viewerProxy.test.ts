@@ -271,7 +271,8 @@ describe('viewer proxy connection', () => {
         viewer.send(Buffer.concat([keyEvent(true, 0x61), fbur(20)]))
         await waitFor(markerSeen(x11vnc, 20), 'held marker')
         leases.release(TAB, PROFILE)
-        leases.takeOver(TAB, PROFILE, OWNER)
+        // Re-taking control waits for the drain of what this viewer already sent.
+        expect(() => leases.takeOver(TAB, PROFILE, OWNER)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
         viewer.send(Buffer.concat([keyEvent(true, 0x62), fbur(21)]))
         expect(await viewer.closed).toMatchObject({ code: 4002 })
         await waitFor(() => x11vnc.closedAfterEof === 1, 'upstream closed')
@@ -296,6 +297,35 @@ describe('viewer proxy connection', () => {
         await waitFor(() => !leases.isUserFenced(PROFILE), 'fence lifted after the stalled x11vnc drained and closed')
         expect(keys(x11vnc)).toEqual(['down:61', 'ptr:1', 'down:62', 'up:61', 'up:62', 'ptr:0'])
         expect(leases.acquire(TAB, PROFILE, AGENT)).toBeGreaterThan(0)
+    })
+
+    it('lets no replacement viewer input through while a stalled old viewer is still draining', async () => {
+        const { x11vnc, leases, connect } = await viewerStack()
+        const old = await connect()
+        await old.handshake()
+        leases.takeOver(TAB, PROFILE, OWNER)
+        old.send(Buffer.concat([keyEvent(true, 0x61), fbur(90)]))
+        await waitFor(markerSeen(x11vnc, 90), 'old viewer marker')
+        x11vnc.stall()
+        old.send(keyEvent(true, 0x62))
+        await sleep(50)
+        // The old viewer disconnects without releasing the lease; its input is still unread by x11vnc.
+        old.ws.close()
+        await waitFor(() => leases.isUserFenced(PROFILE) && leases.userControl(PROFILE).settling, 'drain fence')
+        // A different viewer cannot take over during the drain.
+        expect(() => leases.takeOver(TAB, PROFILE, OTHER_VIEWER)).toThrowError(expect.objectContaining({ code: 'STALE_LEASE' }))
+        // The same viewer session reconnecting still owns the lease, but gets no input through during the drain.
+        const replacement = await connect()
+        await replacement.handshake()
+        replacement.send(Buffer.concat([keyEvent(true, 0x63), keyEvent(false, 0x63), cutText('early'), fbur(91)]))
+        await waitFor(markerSeen(x11vnc, 91), 'replacement marker')
+        expect(keys(x11vnc)).toEqual(['down:61'])
+        x11vnc.resume()
+        await waitFor(() => !leases.userControl(PROFILE).settling, 'drain completed')
+        expect(x11vnc.closedAfterEof, 'old connection drained to EOF').toBe(1)
+        replacement.send(Buffer.concat([keyEvent(true, 0x64), keyEvent(false, 0x64), fbur(92)]))
+        await waitFor(markerSeen(x11vnc, 92), 'after-drain marker')
+        expect(keys(x11vnc)).toEqual(['down:61', 'down:62', 'up:61', 'up:62', 'down:64', 'up:64'])
     })
 
     it('generates releases from what was dispatched, not from queued key-up / button-up that control loss discards', async () => {

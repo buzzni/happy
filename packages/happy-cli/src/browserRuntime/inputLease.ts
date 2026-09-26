@@ -15,14 +15,19 @@ export class InputLeaseManager {
     private readonly externalFences = new Map<symbol, ProfileId>()
 
     /**
-     * Keeps agent input off the profile until the returned function is called
-     * (idempotent). The viewer holds this while x11vnc may still be consuming
-     * human input written before control was lost (D2).
+     * Keeps every new input owner off the profile until the returned function
+     * is called (idempotent): agents cannot acquire, users cannot take over,
+     * and userControl reports settling so no viewer's input passes. The viewer
+     * holds this while x11vnc may still be consuming human input written before
+     * control was lost (D2). Setting and lifting notify subscribers.
      */
     fenceProfile(profileId: ProfileId): () => void {
         const token = Symbol('fence')
         this.externalFences.set(token, profileId)
-        return () => { this.externalFences.delete(token) }
+        this.changed()
+        return () => {
+            if (this.externalFences.delete(token)) this.changed()
+        }
     }
 
     /** Called after every lease change; viewer connections re-check their control here (D2). */
@@ -31,13 +36,14 @@ export class InputLeaseManager {
         return () => { this.listeners.delete(listener) }
     }
 
-    /** The profile's user-owned tabs, and whether a takeover still waits for an in-flight driver call. */
+    /** The profile's user-owned tabs, and whether a takeover still waits for an in-flight driver call or a drain fence. */
     userControl(profileId: ProfileId): { tabs: Array<{ tabId: TabId; leaseEpoch: number; owner: Extract<InputOwner, { kind: 'user' }> }>; settling: boolean } {
         const tabs: Array<{ tabId: TabId; leaseEpoch: number; owner: Extract<InputOwner, { kind: 'user' }> }> = []
         for (const [tabId, lease] of this.tabs) {
             if (lease.profileId === profileId && lease.owner.kind === 'user') tabs.push({ tabId, leaseEpoch: lease.epoch, owner: structuredClone(lease.owner) })
         }
-        const settling = [...this.pendingTakeovers.keys()].some((tabId) => this.tabs.get(tabId)?.profileId === profileId)
+        const settling = this.isDrainFenced(profileId)
+            || [...this.pendingTakeovers.keys()].some((tabId) => this.tabs.get(tabId)?.profileId === profileId)
         return { tabs, settling }
     }
 
@@ -62,6 +68,7 @@ export class InputLeaseManager {
     }
 
     takeOver(tabId: TabId, profileId: ProfileId, owner: Extract<InputOwner, { kind: 'user' }>): number {
+        this.assertNotDrainFenced(profileId)
         const priorUser = [...this.tabs.values()].find((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
         if (priorUser?.owner.kind === 'user' && (priorUser.owner.principalId !== owner.principalId || priorUser.owner.viewerSessionId !== owner.viewerSessionId)) throw new BrowserRuntimeError('STALE_LEASE', 'Another viewer owns profile input')
         const lease = this.get(tabId, profileId)
@@ -73,6 +80,7 @@ export class InputLeaseManager {
 
     fenceForTakeover(tabId: TabId, profileId: ProfileId, taskId: TaskId,
         owner: Extract<InputOwner, { kind: 'user' }>): number {
+        this.assertNotDrainFenced(profileId)
         const priorUser = [...this.tabs.values()].find((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
         if (priorUser?.owner.kind === 'user'
             && (priorUser.owner.principalId !== owner.principalId || priorUser.owner.viewerSessionId !== owner.viewerSessionId))
@@ -145,9 +153,17 @@ export class InputLeaseManager {
     }
 
     isUserFenced(profileId: ProfileId): boolean {
-        return [...this.externalFences.values()].includes(profileId)
+        return this.isDrainFenced(profileId)
             || [...this.tabs.values()].some((tab) => tab.profileId === profileId && tab.owner.kind === 'user')
             || [...this.pendingTakeovers.keys()].some((tabId) => this.tabs.get(tabId)?.profileId === profileId)
+    }
+
+    private isDrainFenced(profileId: ProfileId): boolean {
+        return [...this.externalFences.values()].includes(profileId)
+    }
+
+    private assertNotDrainFenced(profileId: ProfileId): void {
+        if (this.isDrainFenced(profileId)) throw new BrowserRuntimeError('STALE_LEASE', 'Earlier viewer input is still draining', true)
     }
 
     private changed(): void {
