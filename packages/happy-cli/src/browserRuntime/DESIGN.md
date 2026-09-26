@@ -114,7 +114,11 @@ Saydo `specs/agent-browser-deploy/` D3 (verify), D4, D8, D9, D10 (Runtime side).
   input ownership, since the login check awaits the browser, and records `user-resumed`.
 - Retention (`retentionDays`, config mode, at start and hourly): terminal tasks without
   uncertain actions whose last change is older than the retention are deleted
-  (`TaskStore.purgeExpiredTasks`). The task directory (journal, checkpoint with approvals,
+  (`BrowserRuntime.purgeExpiredTasks`). Their still-open browser tabs are closed first and
+  only then dropped from the space; if one cannot be closed (browser unreachable,
+  beforeunload, a user holding it) the task keeps all its state and the next run (also after
+  a restart) retries. The store never deletes a task whose tab is still open. The task
+  directory (journal, checkpoint with approvals,
   batches and request records) is renamed into `tasks-purged/` — the commit point — then the
   space references (tabs, targets, lease epochs, request records naming the task) are dropped
   and the directory removed; an interrupted deletion finishes on the next open or run. The
