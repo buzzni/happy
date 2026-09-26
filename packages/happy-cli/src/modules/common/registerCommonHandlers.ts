@@ -1,4 +1,5 @@
 import { listWorkspaceDirectory, readWorkspaceFile } from './workspaceFileBoundary';
+import { fileDiscovery } from './fileDiscovery';
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
@@ -381,6 +382,7 @@ export type RecoverSessionResult =
  * Register all RPC handlers with the session
  */
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string) {
+    rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
 
     // Shell command handler - executes commands in the default shell
