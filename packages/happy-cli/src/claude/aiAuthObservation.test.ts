@@ -312,15 +312,18 @@ describe('startClaudeAuthObservation — one per provider run', () => {
             expect(observation.current()).toBe(ORG_BUNDLE_OBSERVED)
         })
 
-        it('stops for good when a recheck does not answer in time', async () => {
+        it('stops for good when a recheck does not answer in time — a late answer does not revive it', async () => {
+            const late = deferred<ActiveClaudeProvenance | null>()
             let reads = 0
             const observation = startClaudeAuthObservation(observationDeps({
-                readProvenance: () => (++reads <= 2 ? Promise.resolve(provenance) : new Promise(() => {})),
+                readProvenance: () => (++reads <= 2 ? Promise.resolve(provenance) : late.promise),
                 timeoutMs: 5,
             }))
             await flush()
             observation.noteTurnApiKeySource('none')
             await new Promise((r) => setTimeout(r, 20))
+            late.resolve(provenance)
+            await flush()
             expect(observation.current()).toBeUndefined()
         })
 
