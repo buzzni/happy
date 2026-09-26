@@ -86,6 +86,10 @@ export async function observeClaudeAiAuthSource(input: {
     env: Record<string, string | undefined>
     /** The child's working directory — where project settings are read from. */
     cwd: string | undefined
+    /**
+     * The daemon's home — where it wrote the deployment record. Claude's own
+     * files are resolved from the child's `HOME` when the child has one.
+     */
     homeDir: string
     readFile: ReadFile
     managedSettingsPaths?: readonly string[]
@@ -107,8 +111,9 @@ export async function observeClaudeAiAuthSource(input: {
         if (!provenance) return 'unknown'
 
         const configDir = input.env.CLAUDE_CONFIG_DIR || undefined
+        const childHome = input.env.HOME || input.homeDir
         const settingsPaths = [
-            join(configDir ?? join(input.homeDir, '.claude'), 'settings.json'),
+            join(configDir ?? join(childHome, '.claude'), 'settings.json'),
             join(input.cwd, '.claude', 'settings.json'),
             join(input.cwd, '.claude', 'settings.local.json'),
             ...(input.managedSettingsPaths ?? CLAUDE_MANAGED_SETTINGS_PATHS),
@@ -117,7 +122,7 @@ export async function observeClaudeAiAuthSource(input: {
             if (settingsDivert(await readOptionalJson(input.readFile, path))) return 'unknown'
         }
 
-        const identity = await liveIdentity(input.readFile, input.homeDir, configDir)
+        const identity = await liveIdentity(input.readFile, childHome, configDir)
         if (!identity || !provenance.identities.has(identity)) return 'unknown'
 
         return 'org-bundle'
