@@ -101,7 +101,8 @@ class FakeX11vnc {
     authFailures = 0
     /** Connections this fake closed after reading the proxy's EOF (it had consumed every earlier byte). */
     closedAfterEof = 0
-    private readonly raw: Buffer[] = []
+    /** Bytes after ClientInit, per connection (connection order). */
+    private readonly raws: Buffer[][] = []
     private constructor(private readonly server: Server, readonly port: number) {}
 
     static async start(): Promise<FakeX11vnc> {
@@ -134,7 +135,9 @@ class FakeX11vnc {
             socket.write(Buffer.concat([u16(64), u16(48), PIXEL_FORMAT_32, u32(name.length), name]))
             yield { skip: Number.MAX_SAFE_INTEGER }
         }
-        const framer = new StreamFramer(serve(), (bytes) => this.raw.push(Buffer.from(bytes)), 1 << 20)
+        const raw: Buffer[] = []
+        this.raws.push(raw)
+        const framer = new StreamFramer(serve(), (bytes) => raw.push(Buffer.from(bytes)), 1 << 20)
         socket.on('data', (chunk) => framer.push(chunk))
         socket.on('end', () => { this.closedAfterEof += 1 })
     }
@@ -143,11 +146,13 @@ class FakeX11vnc {
     stall(): void { for (const socket of this.sockets) socket.pause() }
     resume(): void { for (const socket of this.sockets) socket.resume() }
 
-    /** Everything received after ClientInit, parsed as viewer messages. */
+    /** Everything received after ClientInit, parsed as viewer messages, connection by connection. */
     messages(): ClientMessage[] {
         const messages: ClientMessage[] = []
-        const parser = new StreamFramer(clientParser({ send: () => undefined, serverInit: Buffer.alloc(0), onReady: () => undefined, onMessage: (m) => messages.push(m) }), () => undefined, 1 << 30)
-        parser.push(Buffer.concat([Buffer.from(RFB_VERSION, 'latin1'), Buffer.from([1, 0]), ...this.raw]))
+        for (const raw of this.raws) {
+            const parser = new StreamFramer(clientParser({ send: () => undefined, serverInit: Buffer.alloc(0), onReady: () => undefined, onMessage: (m) => messages.push(m) }), () => undefined, 1 << 30)
+            parser.push(Buffer.concat([Buffer.from(RFB_VERSION, 'latin1'), Buffer.from([1, 0]), ...raw]))
+        }
         return messages
     }
     inputs(): ClientMessage[] { return this.messages().filter((m) => m.kind === 'key' || m.kind === 'pointer' || m.kind === 'cutText') }
