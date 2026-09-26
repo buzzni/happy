@@ -196,9 +196,15 @@ function renderLessonBlock(lessons: readonly unknown[], projectPath?: string): s
      */
     const preview = renderLessonPreviews(lessons, wrap);
     if (preview !== null && fits(preview)) return preview;
+    /*
+     * The last resort is the tightest form: the block's lookup line already
+     * says how to read a lesson, and the heading carries its id, so repeating
+     * the lookup per lesson would only spend the room long names need.
+     */
     const references = lessons.map(entry => {
         const lesson = entry as Record<string, unknown>;
-        return `${lessonHeading(lesson)}\n  (reference only — ${lessonLookup(lesson)})`;
+        const revision = typeof lesson.revision === 'number' ? `, delivered revision ${lesson.revision}` : '';
+        return `${lessonHeading(lesson)}\n  (reference only${revision})`;
     });
     const referenceBlock = wrap(references);
     return fits(referenceBlock) ? referenceBlock : null;
