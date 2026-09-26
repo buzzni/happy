@@ -166,7 +166,12 @@ export function mergeInstallOptions(saved, flags) {
     fail("browserSubnetPool", "must be a private IPv4 /20 (one /24 per profile)");
   }
   if (!Array.isArray(merged.denyCidrs) || merged.denyCidrs.length > 256) fail("denyCidrs", "at most 256");
-  merged.denyCidrs.forEach((cidr, index) => { if (!parseCidr(cidr)) fail(`denyCidrs[${index}]`, "must be an aligned IPv4 CIDR such as 10.20.0.0/16"); });
+  merged.denyCidrs.forEach((cidr, index) => {
+    const parsed = parseCidr(cidr);
+    if (!parsed) fail(`denyCidrs[${index}]`, "must be an aligned IPv4 CIDR such as 10.20.0.0/16");
+    // ipset hash:net cannot hold prefix 0; denying everything would also cut the browsers off entirely.
+    if (parsed[1] === 0) fail(`denyCidrs[${index}]`, "must not be /0");
+  });
   if (!Array.isArray(merged.testAllowCidrs) || merged.testAllowCidrs.length > 8) fail("testAllowCidrs", "at most 8");
   merged.testAllowCidrs.forEach((cidr, index) => {
     const parsed = parseCidr(cidr);
@@ -310,7 +315,8 @@ export function egressRules(layout, install) {
   chain.push("-j REJECT");
   return {
     4: {
-      sets: { "abp-deny4": [...new Set([...DENIED_IPV4, ...install.denyCidrs])] },
+      // A /32 is written as the bare host: ipset save reports it that way and check-egress compares the two.
+      sets: { "abp-deny4": [...new Set([...DENIED_IPV4, ...install.denyCidrs].map((cidr) => cidr.replace(/\/32$/, "")))] },
       chains: { "ABP-EGRESS": chain, "ABP-INPUT": ["-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN", "-j REJECT"] },
       jumps: [["DOCKER-USER", "-i br-abp+ -j ABP-EGRESS"], ["INPUT", "-i br-abp+ -j ABP-INPUT"]],
     },

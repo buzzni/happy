@@ -135,4 +135,42 @@ describe('GD2 viewer proxy on the real stack', () => {
             for (const task of tasks) await cleanupTask(task.agent, task.taskId, task.taskSpaceId)
         }
     }, 120_000)
+
+    /** The capability payload (abp1.<payload>.<sig>) names the capability the admin socket revokes. */
+    const capabilityIdOf = (token: string): string => JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')).capabilityId
+
+    it.each(range(ITERATIONS).flatMap((i) => (['expiry', 'revocation'] as const).map((end) => [i, end] as const)))(
+        'iteration %i: at capability %s during a takeover no raw RFB input reaches the page and the viewer is closed', async (i, end) => {
+            const tag = tagOf(end === 'expiry' ? 've' : 'vr', i)
+            const task = await openLoginTask(tag)
+            const ttlMs = end === 'expiry' ? 20_000 : 30 * 60_000
+            const issuedAt = Date.now()
+            const interactive = mintInteractive(stack, { ttlMs })
+            const human = clientFor(stack, interactive)
+            const { viewer } = await openViewer(interactive)
+            try {
+                const lease = (await human.getTask({ taskId: task.taskId })).tabLeases!.find((l) => l.tabId === task.tabId)!
+                await human.takeOver({ taskId: task.taskId, tabId: task.tabId, expectedEpoch: lease.leaseEpoch, requestId: rid() })
+                await waitForTask(human, task.taskId, (t) => t.tabLeases?.find((l) => l.tabId === task.tabId)?.owner.kind === 'user', 15_000)
+                if (end === 'expiry') await sleep(Math.max(0, issuedAt + ttlMs - Date.now()) + 50)
+                else await stack.admin('/admin/revoke-capability', { capabilityId: capabilityIdOf(interactive) })
+                // Straight after the end: the whole login, as a human still typing would send it.
+                if (viewer.ws.readyState === 1) viewer.send(loginKeystrokes())
+                const closed = await Promise.race([viewer.closed.then((c) => c.code), sleep(10_000).then(() => undefined)])
+                await sleep(NEGATIVE_WAIT_MS)
+                const entries = logins(await stack.ledger(), tag)
+                evidence({ gate: 'GD2', path: `takeover-then-${end}`, i, closeCode: closed ?? null, loginsAfterEnd: entries.length })
+                expect(entries, `login after capability ${end}`).toEqual([])
+                expect(closed, `viewer closed after capability ${end}`).toBeDefined()
+            } finally {
+                viewer.ws.close()
+                // The takeover belongs to the user's viewer session, not to the ended capability: it stays (and fences
+                // the profile) until released, so a renewed capability for the same viewer session releases it.
+                const viewerSessionId = JSON.parse(Buffer.from(interactive.split('.')[1], 'base64url').toString('utf8')).viewerSessionId as string
+                const fresh = clientFor(stack, stack.mintInteractive({ viewerSessionId }))
+                const held = (await fresh.getTask({ taskId: task.taskId })).tabLeases?.find((l) => l.tabId === task.tabId)
+                if (held?.owner.kind === 'user') await fresh.releaseControl({ taskId: task.taskId, tabId: task.tabId, expectedEpoch: held.leaseEpoch, requestId: rid() })
+                await cleanupTask(task.agent, task.taskId, task.taskSpaceId)
+            }
+        }, 120_000)
 })

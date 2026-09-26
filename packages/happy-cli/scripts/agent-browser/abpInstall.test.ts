@@ -357,11 +357,13 @@ describe.skipIf(!fixtureBase)('abp-install agent workspace (Desktop chats live u
 
 describe('abp-install Happy package replacement', () => {
     /** Root-only helpers stubbed; `npm` either fails (a full disk) or installs a complete package into --prefix. */
-    const replace = (prefix: string, npmBody: string) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+    /** `legacyDefault`: the path the installer treats as its own default prefix (unmarked installs are trusted only there). */
+    const replace = (prefix: string, npmBody: string, legacyDefault = prefix) => spawnSync('bash', ['-c', `set -euo pipefail; source "$1"; DRY_RUN=0
+        DEFAULT_HAPPY_PREFIX="$3"
         safe_path() { :; }; ensure_dir() { mkdir -p "$1"; }; chown() { :; }
         mv() { [ "$1" = -T ] && shift; command mv "$@"; }
         npm() { local p=""; while [ $# -gt 0 ]; do [ "$1" = --prefix ] && p=$2; shift; done; ${npmBody}; }
-        replace_happy_package "$2" /tmp/pkg.tgz`, 'test', join(here, 'abp-install'), prefix], { encoding: 'utf8' })
+        replace_happy_package "$2" /tmp/pkg.tgz`, 'test', join(here, 'abp-install'), prefix, legacyDefault], { encoding: 'utf8' })
     /** A previously installed Happy package (no marker yet: installs made before the marker existed). */
     const live = () => {
         const root = mkdtempSync(join(tmpdir(), '.abp-happy-'))
@@ -403,6 +405,16 @@ describe('abp-install Happy package replacement', () => {
         expect(result.stderr).toMatch(/not a dedicated Happy prefix/)
         expect(readFileSync(join(prefix, 'bin', 'tool'), 'utf8')).toBe('keep')
         expect(() => lstatSync(`${prefix}.new`)).toThrow()
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('refuses an unmarked Happy install outside the default prefix (it may share lib/node_modules with other packages)', () => {
+        const { root, prefix } = live()
+        mkdirSync(join(prefix, 'lib', 'node_modules', 'other-package'), { recursive: true })
+        const result = replace(prefix, complete, join(root, 'somewhere-else'))
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).toMatch(/not a dedicated Happy prefix/)
+        expect(() => lstatSync(join(prefix, 'lib', 'node_modules', 'other-package'))).not.toThrow()
         rmSync(root, { recursive: true, force: true })
     })
 

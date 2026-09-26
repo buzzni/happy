@@ -3,10 +3,18 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { PendingRevocationQueueError, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration } from './browserTaskBroker'
+import { PendingRevocationQueueError, createBrowserTaskSessionBroker, registerResumedBrowserSession, spawnResumedWithBrowserTaskRegistration } from './browserTaskBroker'
 
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
+
+/** procfs fixture with a known boot id, so register() sends the same body on every host. */
+async function procRoot(bootId = 'boot-fixture'): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-proc-')); dirs.push(dir)
+    mkdirSync(join(dir, 'sys/kernel/random'), { recursive: true })
+    writeFileSync(join(dir, 'sys/kernel/random/boot_id'), `${bootId}\n`)
+    return dir
+}
 
 async function tokenFile(content = 'synthetic-daemon-token-0123456789abcdef\n'): Promise<string> {
     const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-broker-')); dirs.push(dir)
@@ -38,15 +46,39 @@ describe('daemon browser task broker hook', () => {
             '/v1/sessions/bind': { status: 200, body: { ok: true, result: { bound: true } } },
             '/v1/sessions/revoke': { status: 200, body: { ok: true, result: { revoked: true, grants: 2 } } },
         })
-        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }, request)!
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }, request, { procRoot: await procRoot() })!
         expect(await broker.register()).toEqual({ registrationId: 'reg-1', sessionSecret: 'secret-1' })
         expect(await broker.bind('reg-1', 'session-1')).toBe(true)
         await broker.revoke({ agentSessionId: 'session-1' })
         expect(calls.map((call) => [call.path, call.headers['x-abp-daemon-token'], call.body])).toEqual([
-            ['/v1/sessions/register', 'synthetic-daemon-token-0123456789abcdef', { schemaVersion: 1 }],
+            ['/v1/sessions/register', 'synthetic-daemon-token-0123456789abcdef', { schemaVersion: 1, bootId: 'boot-fixture' }],
             ['/v1/sessions/bind', 'synthetic-daemon-token-0123456789abcdef', { schemaVersion: 1, registrationId: 'reg-1', agentSessionId: 'session-1' }],
             ['/v1/sessions/revoke', 'synthetic-daemon-token-0123456789abcdef', { schemaVersion: 1, agentSessionId: 'session-1' }],
         ])
+    })
+
+    it('on resume, first clears any registration still bound to the session (a queued exit revoke included), then registers afresh', async () => {
+        const { calls, request } = recorder({
+            '/v1/sessions/register': { status: 200, body: { ok: true, result: { registrationId: 'reg-2', sessionSecret: 'secret-2' } } },
+            '/v1/sessions/revoke': { status: 200, body: { ok: true, result: { revoked: true, grants: 0 } } },
+        })
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }, request, { procRoot: await procRoot() })!
+        expect(await registerResumedBrowserSession(broker, 'session-1')).toEqual({ registrationId: 'reg-2', sessionSecret: 'secret-2' })
+        expect(calls.map((call) => [call.path, call.body])).toEqual([
+            ['/v1/sessions/revoke', { schemaVersion: 1, agentSessionId: 'session-1' }],
+            ['/v1/sessions/register', { schemaVersion: 1, bootId: 'boot-fixture' }],
+        ])
+    })
+
+    it('on resume, registers nothing while a revocation for that session is unconfirmed (it would later revoke the new binding)', async () => {
+        const { calls, request } = recorder({
+            '/v1/sessions/register': { status: 200, body: { ok: true, result: { registrationId: 'reg-2', sessionSecret: 'secret-2' } } },
+        })
+        const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-queue-')); dirs.push(dir)
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }, request,
+            { procRoot: await procRoot(), pendingRevocationsFile: join(dir, 'pending.json'), retryBaseMs: 3_600_000 })!
+        expect(await registerResumedBrowserSession(broker, 'session-1')).toBeUndefined()
+        expect(calls.map((call) => call.path)).toEqual(['/v1/sessions/revoke'])
     })
 
     it('spawns without browser grants when registration fails, instead of failing the spawn', async () => {
@@ -168,7 +200,7 @@ describe('resumed session browser task registration', () => {
         })
         expect(result).toEqual({ type: 'success', sessionId: 'session-1' })
         expect(spawned).toEqual([{ APLUS_SESSION_ID: 'session-1', HAPPY_BROWSER_TASK_SESSION_SECRET: 'secret-2' }])
-        expect(paths()).toEqual([['/v1/sessions/register', undefined, undefined], ['/v1/sessions/bind', 'reg-2', 'session-1']])
+        expect(paths()).toEqual([['/v1/sessions/revoke', undefined, 'session-1'], ['/v1/sessions/register', undefined, undefined], ['/v1/sessions/bind', 'reg-2', 'session-1']])
     })
 
     it('revokes the registration when the resume spawn fails or throws', async () => {
@@ -178,7 +210,7 @@ describe('resumed session browser task registration', () => {
             spawn: async () => ({ type: 'error', errorMessage: 'no pid' }),
             ownerPid: () => undefined, onRevokeFailure: () => {},
         })
-        expect(failed.paths()).toEqual([['/v1/sessions/register', undefined, undefined], ['/v1/sessions/revoke', 'reg-2', undefined]])
+        expect(failed.paths()).toEqual([['/v1/sessions/revoke', undefined, 'session-1'], ['/v1/sessions/register', undefined, undefined], ['/v1/sessions/revoke', 'reg-2', undefined]])
 
         const thrown = await resumeBroker()
         await expect(spawnResumedWithBrowserTaskRegistration({
@@ -186,7 +218,22 @@ describe('resumed session browser task registration', () => {
             spawn: async () => { throw new Error('spawn failed') },
             ownerPid: () => undefined, onRevokeFailure: () => {},
         })).rejects.toThrow('spawn failed')
-        expect(thrown.paths()).toEqual([['/v1/sessions/register', undefined, undefined], ['/v1/sessions/revoke', 'reg-2', undefined]])
+        expect(thrown.paths()).toEqual([['/v1/sessions/revoke', undefined, 'session-1'], ['/v1/sessions/register', undefined, undefined], ['/v1/sessions/revoke', 'reg-2', undefined]])
+    })
+
+    it('resumes without a secret while the earlier revocation of that session is unconfirmed', async () => {
+        const { calls, request } = recorder({ '/v1/sessions/register': replies['/v1/sessions/register'] })
+        const dir = await mkdtemp(join(tmpdir(), 'abp-daemon-queue-')); dirs.push(dir)
+        const broker = createBrowserTaskSessionBroker({ HAPPY_BROWSER_TASK_BROKER_SOCKET: '/run/abp/broker.sock', HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE: await tokenFile() }, request,
+            { pendingRevocationsFile: join(dir, 'pending.json'), retryBaseMs: 3_600_000 })!
+        const spawned: Record<string, string>[] = []
+        await spawnResumedWithBrowserTaskRegistration({
+            broker, agentSessionId: 'session-1', env: { APLUS_SESSION_ID: 'session-1' },
+            spawn: async (env) => { spawned.push(env); return { type: 'success', sessionId: 'session-1' } },
+            ownerPid: () => undefined, onRevokeFailure: () => {},
+        })
+        expect(spawned).toEqual([{ APLUS_SESSION_ID: 'session-1' }])
+        expect(calls.map((call) => call.path)).toEqual(['/v1/sessions/revoke'])
     })
 
     it('resumes without a secret when the machine has no broker', async () => {

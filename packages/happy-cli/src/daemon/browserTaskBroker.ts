@@ -41,6 +41,8 @@ export interface BrowserTaskSessionBroker {
     revoke(target: RevokeTarget): Promise<void>
     /** Retries every pending revocation once; resolves to how many remain. */
     retryPendingRevocations(): Promise<number>
+    /** Whether a revocation of this target is still unconfirmed (queued for retry). */
+    isRevocationPending(target: RevokeTarget): boolean
 }
 
 export interface BrowserTaskSessionBrokerOptions {
@@ -255,13 +257,28 @@ export function createBrowserTaskSessionBroker(
             if (outstanding && !saved) throw new PendingRevocationQueueError('Browser task revocation was neither confirmed nor saved; retrying in memory')
         },
         retryPendingRevocations,
+        isRevocationPending: (target) => pending.some((entry) => key(entry) === key(target)),
     }
     return broker
 }
 
 /**
+ * Registration for a resumed session, whose Happy session id is already known. The previous process is
+ * gone, so any registration still bound to that id is revoked first (as its exit or reconciliation would
+ * have); while that revocation is unconfirmed nothing is registered, because the queued retry revokes by
+ * session id and would take the new binding with it. The caller binds the result once the child runs.
+ */
+export async function registerResumedBrowserSession(broker: BrowserTaskSessionBroker | undefined, agentSessionId: string): Promise<{ registrationId: string; sessionSecret: string } | undefined> {
+    if (!broker) return undefined
+    await broker.revoke({ agentSessionId }).catch(() => undefined)
+    if (broker.isRevocationPending({ agentSessionId })) return undefined
+    return broker.register()
+}
+
+/**
  * Resumed session processes need their own registration: the previous process's one was revoked at its exit.
- * Registers, hands the secret to the spawn, binds the known session id, and revokes it if the spawn does not succeed.
+ * Registers (registerResumedBrowserSession), hands the secret to the spawn, binds the known session id, and
+ * revokes it if the spawn does not succeed.
  */
 export async function spawnResumedWithBrowserTaskRegistration<R extends { type: string }>(input: {
     broker: BrowserTaskSessionBroker | undefined
@@ -272,7 +289,7 @@ export async function spawnResumedWithBrowserTaskRegistration<R extends { type: 
     onRevokeFailure: (error: unknown) => void
 }): Promise<R> {
     const { broker, agentSessionId } = input
-    const registration = await broker?.register()
+    const registration = await registerResumedBrowserSession(broker, agentSessionId)
     if (!broker || !registration) return input.spawn(input.env)
     const release = () => broker.revoke({ registrationId: registration.registrationId }).catch(input.onRevokeFailure)
     let result: R
