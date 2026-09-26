@@ -6,7 +6,7 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync } from 'node:fs'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync, statSync, openSync, closeSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
@@ -15,6 +15,7 @@ import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
 import type { SaycodeAgentEnvironment } from '@/daemon/sessionEnv';
 import { logger } from '@/ui/logger';
+import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime';
 
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(true),
@@ -608,10 +609,25 @@ export async function clearDaemonState(): Promise<void> {
  * The lock file proves the daemon is running and prevents multiple instances.
  * Returns the file handle to hold for the daemon's lifetime, or null if locked.
  */
+// A holder writes the lock after it starts, so a pid whose process started
+// after the write belongs to someone else. The slack absorbs `ps`'s whole-second
+// start times and small clock steps.
+const REUSED_LOCK_PID_SLACK_MS = 2_000
+
+export interface DaemonLockDeps {
+  /** Epoch ms a live process started, or undefined when it cannot be read. */
+  getProcessStartedAt?: (pid: number) => number | undefined | Promise<number | undefined>
+  /** Whether the pid is the daemon answering the control port in daemon.state.json. */
+  answersAsDaemon?: (pid: number) => Promise<boolean>
+}
+
 export async function acquireDaemonLock(
   maxAttempts: number = 5,
-  delayIncrementMs: number = 200
+  delayIncrementMs: number = 200,
+  deps: DaemonLockDeps = {}
 ): Promise<FileHandle | null> {
+  // One verdict per lock observed: a live holder is not re-examined on every retry.
+  const verdicts = new Map<string, boolean>();
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       // O_EXCL ensures we only create if it doesn't exist (atomic lock acquisition)
@@ -624,20 +640,17 @@ export async function acquireDaemonLock(
       return fileHandle;
     } catch (error: any) {
       if (error.code === 'EEXIST') {
-        // Lock file exists, check if process is still running
-        try {
-          const lockPid = readFileSync(configuration.daemonLockFile, 'utf-8').trim();
-          if (lockPid && !isNaN(Number(lockPid))) {
-            try {
-              process.kill(Number(lockPid), 0); // Check if process exists
-            } catch {
-              // Process doesn't exist, remove stale lock
-              unlinkSync(configuration.daemonLockFile);
-              continue; // Retry acquisition
-            }
+        const seen = readLockSnapshot();
+        if (seen) {
+          const key = `${seen.raw}:${seen.mtimeMs}:${seen.ino}`;
+          let stale = verdicts.get(key);
+          if (stale === undefined) {
+            stale = await lockHolderIsGone(seen, deps);
+            verdicts.set(key, stale);
           }
-        } catch {
-          // Can't read lock file, might be corrupted
+          if (stale && reclaimLock(seen)) {
+            continue; // Retry acquisition
+          }
         }
       }
 
@@ -649,6 +662,87 @@ export async function acquireDaemonLock(
     }
   }
   return null;
+}
+
+type LockSnapshot = { pid: number; raw: string; mtimeMs: number; ino: number };
+
+function readLockSnapshot(): LockSnapshot | null {
+  try {
+    const raw = readFileSync(configuration.daemonLockFile, 'utf-8');
+    const { mtimeMs, ino } = statSync(configuration.daemonLockFile);
+    return /^\d+$/.test(raw.trim()) ? { pid: Number(raw.trim()), raw, mtimeMs, ino } : null;
+  } catch {
+    return null; // Missing or unreadable: leave it to the next attempt
+  }
+}
+
+async function lockHolderIsGone(lock: LockSnapshot, deps: DaemonLockDeps): Promise<boolean> {
+  try {
+    process.kill(lock.pid, 0);
+  } catch (error: any) {
+    // Only ESRCH proves absence; EPERM is a live process of another account.
+    if (error?.code === 'ESRCH') return true;
+  }
+  // After a logoff or reboot the dead holder's pid can be handed to an unrelated
+  // process; an existence check alone would then refuse to start a daemon forever.
+  const lookup = deps.getProcessStartedAt
+    ?? (process.platform === 'win32' ? getWindowsProcessStartedAt : getProcessStartedAt);
+  const startedAt = await lookup(lock.pid);
+  if (startedAt === undefined || startedAt <= lock.mtimeMs + REUSED_LOCK_PID_SLACK_MS) return false;
+  // A clock step can make a genuine holder look newer than its lock; keep it
+  // while it still answers as the daemon.
+  return !(await (deps.answersAsDaemon ?? answersAsDaemon)(lock.pid));
+}
+
+// Stale tokens older than this belong to a reclaimer that died mid-way.
+const RECLAIM_TOKEN_TTL_MS = 30_000;
+
+/**
+ * Remove the lock only while it is still the one judged stale. The token makes
+ * check-and-unlink exclusive between starters, so one of them cannot delete the
+ * fresh lock another has just written.
+ */
+function reclaimLock(judged: LockSnapshot): boolean {
+  const token = `${configuration.daemonLockFile}.reclaim`;
+  let fd: number;
+  try {
+    fd = openSync(token, 'wx');
+  } catch {
+    try {
+      if (Date.now() - statSync(token).mtimeMs > RECLAIM_TOKEN_TTL_MS) unlinkSync(token);
+    } catch { }
+    return false;
+  }
+  try {
+    const current = readLockSnapshot();
+    if (!current || current.raw !== judged.raw || current.mtimeMs !== judged.mtimeMs || current.ino !== judged.ino) return false;
+    unlinkSync(configuration.daemonLockFile);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    closeSync(fd);
+    try { unlinkSync(token); } catch { }
+  }
+}
+
+async function answersAsDaemon(pid: number): Promise<boolean> {
+  const state = await readDaemonState();
+  if (state?.pid !== pid || !state.httpPort) return false;
+  try {
+    const response = await fetch(`http://127.0.0.1:${state.httpPort}/list`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(state.controlSecret ? { Authorization: `Bearer ${state.controlSecret}` } : {}),
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(2000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -673,7 +767,8 @@ export async function releaseDaemonLock(lockHandle: FileHandle): Promise<void> {
   } catch { }
 
   try {
-    if (existsSync(configuration.daemonLockFile)) {
+    // Never remove a lock another daemon now holds.
+    if (readDaemonLockHolderPid() === process.pid) {
       unlinkSync(configuration.daemonLockFile);
     }
   } catch { }
