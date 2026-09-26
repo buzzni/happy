@@ -104,7 +104,20 @@ export interface SpaceRecord {
         hash: string
         result: unknown
     }>
+    /** Agent session that created the space; its end reclaims the space. */
+    agentSessionId?: string
+    /** Reclamation started (owning session ended, idle, operator): no new work, closed once its tasks allow. */
+    reclaimingSinceMs?: number
+    reclaimReason?: 'session-ended' | 'idle' | 'operator'
+    /** Tabs a reclamation could not close (beforeunload); reported, retried. */
+    reclaimBlockedTabs?: TabId[]
 }
+/**
+ * Spaces being reclaimed do not count against maxSpacesPerProfile, except those beyond
+ * this reserve per profile: retained spaces (a task with an unknown write outcome left for
+ * the user) cannot pile up unnoticed.
+ */
+export const RECLAIMING_SPACE_RESERVE = 2
 export interface TaskMutation {
     patch: Partial<StoredTask>
     event: StoreEventInput
@@ -171,11 +184,12 @@ export class TaskStore {
             heartbeatAtMs: this.now(),
         }, 'metadata')
     }
-    async createSpace(record: SpaceRecord): Promise<void> {
+    async createSpace(record: SpaceRecord, maxSpacesPerProfile: number = POC_LIMITS.maxSpacesPerProfile): Promise<void> {
         await this.withMetadataQueue(async () => {
             await this.assertWriter()
-            const perProfile = [...this.spaces.values()].filter((space) => space.profileId === record.profileId && !space.closed)
-            if (perProfile.length >= POC_LIMITS.maxSpacesPerProfile)
+            const open = [...this.spaces.values()].filter((space) => space.profileId === record.profileId && !space.closed)
+            const reclaiming = open.filter((space) => space.reclaimingSinceMs !== undefined).length
+            if (open.length - reclaiming + Math.max(0, reclaiming - RECLAIMING_SPACE_RESERVE) >= maxSpacesPerProfile)
                 throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'Profile has reached its space limit')
             this.spaces.set(record.taskSpaceId, structuredClone(record))
             try {
