@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir, userInfo } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -362,10 +362,12 @@ describe('abp-install Happy package replacement', () => {
         mv() { [ "$1" = -T ] && shift; command mv "$@"; }
         npm() { local p=""; while [ $# -gt 0 ]; do [ "$1" = --prefix ] && p=$2; shift; done; ${npmBody}; }
         replace_happy_package "$2" /tmp/pkg.tgz`, 'test', join(here, 'abp-install'), prefix], { encoding: 'utf8' })
+    /** A previously installed Happy package (no marker yet: installs made before the marker existed). */
     const live = () => {
         const root = mkdtempSync(join(tmpdir(), '.abp-happy-'))
         const prefix = join(root, 'happy')
         mkdirSync(join(prefix, 'bin'), { recursive: true })
+        mkdirSync(join(prefix, 'lib', 'node_modules', '@buzzni', 'happy-cli'), { recursive: true })
         writeFileSync(join(prefix, 'bin', 'happy'), 'old')
         return { root, prefix }
     }
@@ -390,11 +392,39 @@ describe('abp-install Happy package replacement', () => {
         rmSync(root, { recursive: true, force: true })
     })
 
-    it('swaps in a complete package and removes the previous one', () => {
+    it('refuses to replace a prefix that holds other software', () => {
+        const root = mkdtempSync(join(tmpdir(), '.abp-happy-'))
+        const prefix = join(root, 'local')
+        mkdirSync(join(prefix, 'bin'), { recursive: true })
+        mkdirSync(join(prefix, 'other-tool'), { recursive: true })
+        writeFileSync(join(prefix, 'bin', 'tool'), 'keep')
+        const result = replace(prefix, complete)
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).toMatch(/not a dedicated Happy prefix/)
+        expect(readFileSync(join(prefix, 'bin', 'tool'), 'utf8')).toBe('keep')
+        expect(() => lstatSync(`${prefix}.new`)).toThrow()
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('restores the previous package left by an interrupted swap before anything else, even if the retry fails', () => {
+        const { root, prefix } = live()
+        // Interrupted between the two moves: the live prefix is gone, the good copy is in .old.
+        rmSync(`${prefix}.old`, { recursive: true, force: true })
+        renameSync(prefix, `${prefix}.old`)
+        mkdirSync(join(`${prefix}.new`, 'bin'), { recursive: true })
+        const result = replace(prefix, 'echo ENOSPC >&2; return 1')
+        expect(result.status).not.toBe(0)
+        expect(readFileSync(join(prefix, 'bin', 'happy'), 'utf8')).toBe('old')
+        expect(() => lstatSync(`${prefix}.old`)).toThrow()
+        rmSync(root, { recursive: true, force: true })
+    })
+
+    it('swaps in a complete package, marks the prefix as installer-owned and removes the previous one', () => {
         const { root, prefix } = live()
         const result = replace(prefix, complete)
         expect(result.status).toBe(0)
         expect(readFileSync(join(prefix, 'bin', 'happy'), 'utf8').trim()).toBe('new')
+        expect(() => lstatSync(join(prefix, '.abp-happy-prefix'))).not.toThrow()
         expect(() => lstatSync(`${prefix}.old`)).toThrow()
         expect(() => lstatSync(`${prefix}.new`)).toThrow()
         rmSync(root, { recursive: true, force: true })

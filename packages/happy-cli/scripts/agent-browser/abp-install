@@ -352,13 +352,34 @@ ensure_accounts() {
     case "$members" in "" | agent) ;; *) die "group abp-session must contain only agent (has: $members)" ;; esac
 }
 
+HAPPY_PREFIX_MARKER=.abp-happy-prefix
+
+# happy_prefix_is_dedicated <prefix>: absent, empty, marked by this installer, or an earlier install that
+# holds only a Happy package. Anything else may be shared with other software and is never replaced.
+happy_prefix_is_dedicated() {
+    local prefix=$1 entry
+    [ -e "$prefix" ] || return 0
+    [ -e "$prefix/$HAPPY_PREFIX_MARKER" ] && return 0
+    [ -d "$prefix/lib/node_modules/@buzzni/happy-cli" ] || [ -z "$(ls -A "$prefix")" ] || return 1
+    for entry in "$prefix"/* "$prefix"/.[!.]*; do
+        [ -e "$entry" ] || continue
+        case "${entry##*/}" in bin | lib | share | etc) ;; *) return 1 ;; esac
+    done
+}
+
 # replace_happy_package <prefix> <tarball>: npm installs into a sibling staging prefix and the live
 # prefix is swapped only once the new package is complete, so a failed install (a full disk, a
 # network error) leaves the running daemon's files untouched. Relative bin links survive the rename.
+# The swap is two renames; a run interrupted between them is recovered first (<prefix>.old back).
 replace_happy_package() {
     local prefix=$1 tarball=$2 stage=$1.new old=$1.old
     safe_path "$stage" dir root
     safe_path "$old" dir root
+    if [ ! -e "$prefix" ] && [ -d "$old" ]; then
+        say "restoring $prefix from an interrupted package swap"
+        run mv -T "$old" "$prefix"
+    fi
+    happy_prefix_is_dedicated "$prefix" || die "$prefix is not a dedicated Happy prefix (it holds other files; the installer replaces the whole directory)"
     run rm -rf "$stage" "$old"
     ensure_dir "$stage" root root 0755
     if ! run npm install --global --prefix "$stage" --omit=dev --no-audit --no-fund "$tarball"; then
@@ -369,6 +390,7 @@ replace_happy_package() {
         rm -rf "$stage"
         die "the staged Happy package is incomplete; $prefix is unchanged"
     fi
+    run touch "$stage/$HAPPY_PREFIX_MARKER"
     # Root-owned and not writable by anyone else (sandbox preflight), readable by agent, agent-sbx and abp-proxy.
     run chown -R root:root "$stage"
     run chmod -R a+rX,go-w "$stage"

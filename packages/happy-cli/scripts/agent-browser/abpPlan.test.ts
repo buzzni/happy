@@ -52,6 +52,12 @@ describe('install options', () => {
             ['relative Happy prefix', { happyPrefix: 'opt/happy' }],
             ['Happy prefix under a writable tree', { happyPrefix: '/tmp/happy' }],
             ['Happy prefix in a private home', { happyPrefix: '/home/agent/happy' }],
+            // The installer replaces the whole prefix: it must be a directory of its own.
+            ['shared prefix /usr/local', { happyPrefix: '/usr/local' }],
+            ['shared prefix /opt', { happyPrefix: '/opt' }],
+            ['shared prefix /usr', { happyPrefix: '/usr' }],
+            ['Happy prefix with a trailing slash', { happyPrefix: '/opt/abp/happy/' }],
+            ['Happy prefix with a doubled slash', { happyPrefix: '/opt//happy' }],
             ['public browser subnet pool', { browserSubnetPool: '8.8.0.0/20' }],
             ['browser subnet pool not a /20', { browserSubnetPool: '10.249.0.0/16' }],
             ['deny CIDR not a network', { denyCidrs: ['10.0.0.1/33'] }],

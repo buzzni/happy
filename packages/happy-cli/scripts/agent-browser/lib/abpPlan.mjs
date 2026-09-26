@@ -178,6 +178,12 @@ export function mergeInstallOptions(saved, flags) {
   if (!/^\/[A-Za-z0-9._/-]+$/.test(merged.happyPrefix) || /(^|\/)\.\.?(\/|$)/.test(merged.happyPrefix) || /^\/(home|tmp|var\/tmp|root|work|run)(\/|$)/.test(merged.happyPrefix)) {
     fail("happyPrefix", "must be an absolute root-owned location outside /home, /root, /tmp, /var/tmp, /run and /work");
   }
+  // abp-install replaces the whole prefix on a package update, so it must be a dedicated directory: canonical
+  // (no trailing or doubled slash), at least two levels deep and not a shared system prefix.
+  if (/\/$|\/\//.test(merged.happyPrefix) || merged.happyPrefix.split("/").length < 3
+      || /^\/(usr|usr\/local|usr\/lib|usr\/share|usr\/local\/lib|usr\/local\/share|opt\/local|var\/lib|etc\/opt|srv\/local)$/.test(merged.happyPrefix)) {
+    fail("happyPrefix", "must be a dedicated directory such as /opt/abp/happy (the installer replaces it), not a shared prefix");
+  }
   return merged;
 }
 
