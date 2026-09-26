@@ -350,6 +350,19 @@ describe('BrowserRuntime durable request contract', () => {
         await h.store.close()
     })
 
+    it('leaves a recovering task to reconnect handling while it runs, so a replaced browser is still recorded as replaced', async () => {
+        const h = await createHarness('abp-runtime-sweep-reconnect-race-')
+        await h.runtime.onDriverDisconnected(h.profileId)
+        expect(h.store.getTask(h.task.taskId)?.status).toBe('recovering')
+        // The driver is connected to a new browser, but reconnect handling has not reached this task yet.
+        h.driver.swapInstance()
+        await h.runtime.sweep(h.clock.now())
+        expect(h.store.getTask(h.task.taskId)?.status).toBe('recovering')
+        await h.runtime.onDriverReconnected(h.profileId)
+        expect(h.store.getTask(h.task.taskId)).toMatchObject({ status: 'paused', pauseReason: 'browser-replaced' })
+        await h.store.close()
+    })
+
     it('accepts only one concurrent batch for an expected task version', async () => {
         const dir = await mkdtemp(join(tmpdir(), 'abp-runtime-version-')); dirs.push(dir)
         const store = await TaskStore.open(dir); const clock = new FakeClock(100)

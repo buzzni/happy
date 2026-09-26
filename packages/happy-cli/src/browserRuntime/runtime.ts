@@ -39,6 +39,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly inFlightDriverCalls = new Set<TaskId>()
     private readonly latestAgentSnapshots = new Map<TabId, SnapshotId>()
     private readonly liveBatchSteps = new Map<BatchId, BatchStep[]>()
+    /** Profiles between a driver disconnect and the end of its reconnect handling (which alone judges browser identity) */
+    private readonly reconnecting = new Set<ProfileId>()
     private readonly latestAgentUrls = new Map<TabId, string>()
     private readonly commitTails = new Map<TaskId, Promise<unknown>>()
     private readonly eventWaiters = new Map<TaskId, Set<() => void>>()
@@ -625,6 +627,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return read()
     }
     async onDriverDisconnected(profileId: ProfileId): Promise<void> {
+        this.reconnecting.add(profileId)
         await this.recovery
         for (const task of this.options.store.listTasks()) {
             if (task.profileId !== profileId || ['succeeded', 'failed', 'cancelled'].includes(task.status))
@@ -646,6 +649,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     async onDriverReconnected(profileId: ProfileId): Promise<void> {
+        try {
+            await this.handleDriverReconnected(profileId)
+        } finally {
+            this.reconnecting.delete(profileId)
+        }
+    }
+    private async handleDriverReconnected(profileId: ProfileId): Promise<void> {
         await this.recovery
         await this.restorePersistedTabs(profileId)
         const driver = this.drivers.get(profileId)
@@ -729,7 +739,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 catch {
                     driverConnected = false
                 }
-                if (current.status === 'recovering' && !this.workers.has(current.taskId) && driverConnected) {
+                // While reconnect handling runs it decides (it compares browser identity); a sweep
+                // in between would mark a replaced browser's task as merely waiting for the agent.
+                if (current.status === 'recovering' && !this.workers.has(current.taskId) && driverConnected
+                    && !this.reconnecting.has(current.profileId)) {
                     const writes = inFlightWriteActions(current)
                     const actions = { ...current.actions }
                     for (const actionId of writes)
