@@ -1369,6 +1369,41 @@ describe('AI credential machine runtime', () => {
     expect(supervisor.enable).not.toHaveBeenCalled()
   })
 
+  it('reports relogin required when the imported account expires after switching to it', async () => {
+    let switched = false
+    const execFile = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'cswap' && args[0] === '--version') {
+        return { stdout: 'cswap 0.25.0', stderr: '' }
+      }
+      if (command === 'cswap' && args[0] === 'switch') switched = true
+      if (command === 'cswap' && args[0] === 'list') {
+        return {
+          stdout: JSON.stringify({
+            schemaVersion: 1,
+            activeAccountNumber: switched ? 1 : null,
+            accounts: [{
+              number: 1, email: 'owner@example.com', organizationUuid: 'org-a',
+              usageStatus: switched ? 'relogin_required' : 'ok',
+            }],
+          }),
+          stderr: '',
+        }
+      }
+      return { stdout: '', stderr: '' }
+    })
+    const { runtime, supervisor } = setup({ execFile })
+
+    await expect(runtime.apply({
+      provider: 'claude',
+      payload: claudeOauthPayload([{ email: 'owner@example.com', organizationUuid: 'org-a' }]),
+    })).rejects.toMatchObject({ kind: 'CLAUDE_APPLY_RELOGIN_REQUIRED' })
+
+    expect(execFile).toHaveBeenCalledWith(
+      'cswap', ['switch', '1', '--force', '--json'], expect.anything(),
+    )
+    expect(supervisor.enable).not.toHaveBeenCalled()
+  })
+
   it('activates an imported Claude API key, removes prior accounts, and stops OAuth rotation', async () => {
     let activeAccountNumber: number | null = 1
     let accounts = [
