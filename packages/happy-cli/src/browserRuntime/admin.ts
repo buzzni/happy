@@ -1,6 +1,7 @@
 /**
- * Admin API of the Browser Runtime: revocation, trusted reconciliation and
- * metrics. Never reachable with an agent grant or an interactive capability.
+ * Admin API of the Browser Runtime: revocation, trusted reconciliation,
+ * metrics and task spaces (`GET /admin/spaces`, `POST /admin/close-space
+ * { taskSpaceId, force? }`). Never reachable with an agent grant or an interactive capability.
  *
  * Production: a unix socket only (host /run/abp/admin.sock, 0600) — file
  * permissions are the authentication. Harness: the PoC TCP port with a bearer
@@ -11,7 +12,7 @@ import { statfs } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { listenOnSocket } from './broker'
-import { BrowserRuntimeError, type ActionId, type GrantId, type ProfileId, type TaskId } from './contracts'
+import { BrowserRuntimeError, type ActionId, type GrantId, type ProfileId, type TaskId, type TaskSpaceId } from './contracts'
 import type { CdpDriver } from './drivers/cdpDriver'
 import type { BrowserRuntime } from './runtime'
 import type { TaskStore } from './taskStore'
@@ -40,7 +41,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 export interface AdminServerInput {
-    runtime: Pick<BrowserRuntime, 'revokeGrant' | 'reconcileAction' | 'pinnedProfiles'>
+    runtime: Pick<BrowserRuntime, 'revokeGrant' | 'reconcileAction' | 'pinnedProfiles'> & Partial<Pick<BrowserRuntime, 'spaceReport' | 'closeSpaceAsOperator'>>
     drivers: Map<ProfileId, Pick<CdpDriver, 'isConnected' | 'debugCounts'>>
     /** `server`: already listening on the admin socket (bound before the Runtime dropped root). */
     listen: { socketPath: string } | { server: Server } | { host: string; port: number; adminToken: string }
@@ -67,6 +68,8 @@ export async function startAdminServer(input: AdminServerInput): Promise<AdminSe
                     return sendJson(res, 200, { ok: true, result: { drivers, pinnedProfiles: input.runtime.pinnedProfiles(), memory: process.memoryUsage() } })
                 }
                 if (req.method === 'GET' && path === '/admin/metrics') return sendJson(res, 200, { ok: true, result: await input.metrics() })
+                if (req.method === 'GET' && path === '/admin/spaces' && input.runtime.spaceReport)
+                    return sendJson(res, 200, { ok: true, result: { spaces: input.runtime.spaceReport() } })
                 if (req.method !== 'POST') return sendJson(res, 404, { ok: false, error: { code: 'UNSUPPORTED_OPERATION' } })
                 const body = await readBody(req)
                 if (path === '/admin/revoke-grant') {
@@ -77,6 +80,11 @@ export async function startAdminServer(input: AdminServerInput): Promise<AdminSe
                     if (typeof body.capabilityId !== 'string' || !body.capabilityId) throw new BrowserRuntimeError('INVALID_REQUEST', 'capabilityId is required')
                     await input.revokeCapability(body.capabilityId)
                     return sendJson(res, 200, { ok: true, result: { revoked: true } })
+                }
+                if (path === '/admin/close-space' && input.runtime.closeSpaceAsOperator) {
+                    if (typeof body.taskSpaceId !== 'string' || !body.taskSpaceId) throw new BrowserRuntimeError('INVALID_REQUEST', 'taskSpaceId is required')
+                    const result = await input.runtime.closeSpaceAsOperator(body.taskSpaceId as TaskSpaceId, { force: body.force === true })
+                    return sendJson(res, 200, { ok: true, result })
                 }
                 if (path === '/admin/reconcile-action') {
                     const task = await input.runtime.reconcileAction(body.taskId as TaskId, body.actionId as ActionId, body.confirmed === true)
