@@ -556,6 +556,12 @@ type MachineRpcHandlers = {
      * observe lineage before the project can load the child. Failure still leaves spawn successful.
      */
     linkSpawnedSession?: (input: { sessionId: string; directory: string }) => void | Promise<void>;
+    /**
+     * Whether a browser task of the session waits for the user (Agent Browser). A run-once host (Studio
+     * Chat(beta)) keeps the session instead of deleting it, so the attention after an approval or a login
+     * can resume it. Absent on a machine without the browser runtime.
+     */
+    browserSessionWaiting?: (sessionId: string) => Promise<boolean>;
     aiCredentialRuntime: AiCredentialRuntime;
     autonomousQualityGate?: AutonomousQualityGateRpcHandlers;
     checkpoint?: CheckpointRpcHandlers;
@@ -925,10 +931,20 @@ export class ApiMachineClient {
         byosOfflineReceive,
         linkSpawnedSession,
         difficultyRouting,
+        browserSessionWaiting,
     }: MachineRpcHandlers) {
         this.daemonSessionStateRpcAvailable = !!daemonSessionState;
         if (daemonSessionState) {
             this.rpcHandlerManager.registerHandler('daemon-session-state', daemonSessionState);
+        }
+        if (browserSessionWaiting) {
+            this.rpcHandlerManager.registerHandler('browser-session-waiting', async (params: unknown) => {
+                const sessionId = (params as { sessionId?: unknown } | null)?.sessionId;
+                if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 256) {
+                    throw new Error('browser-session-waiting needs a sessionId');
+                }
+                return { waiting: await browserSessionWaiting(sessionId) };
+            });
         }
         this.previewPortRegistry = portRegistry;
         this.resumeSessionHandler = resumeSession ?? null;

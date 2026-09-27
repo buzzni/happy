@@ -4409,6 +4409,7 @@ export async function startDaemon(): Promise<void> {
       portRegistry,
       automationStore,
       aiCredentialRuntime,
+      ...(browserTaskBroker ? { browserSessionWaiting: (sessionId: string) => browserTaskBroker!.waiting(sessionId) } : {}),
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       checkpoint: createCheckpointRpcHandlers({
         checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
