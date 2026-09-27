@@ -126,6 +126,9 @@ describe('Happy server of the agent', () => {
         const options = mergeInstallOptions(base(), { serverUrl: 'https://dev-studio.example' })
         expect(() => happySettings({ serverUrl: 'https://prod-studio.example', machineId: 'm' }, options)).toThrow(/happy auth logout/)
         expect(happySettings({ serverUrl: 'https://dev-studio.example', machineId: 'm' }, options)).toMatchObject({ machineId: 'm' })
+        // `happy auth login` without a server URL registers with Happy's default and writes no serverUrl.
+        expect(() => happySettings({ machineId: 'm' }, options)).toThrow(/registered with https:\/\/saycode\.ai/)
+        expect(happySettings({ machineId: 'm' }, mergeInstallOptions(base(), { serverUrl: 'https://saycode.ai' }))).toMatchObject({ machineId: 'm' })
         // Not registered yet: switching is safe.
         expect(happySettings({ serverUrl: 'https://prod-studio.example' }, options)).toMatchObject({ serverUrl: 'https://dev-studio.example' })
     })
