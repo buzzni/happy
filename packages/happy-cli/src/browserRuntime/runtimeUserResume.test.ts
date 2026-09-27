@@ -184,6 +184,17 @@ describe('whether an agent session waits for the user (a host keeps a run-once c
         await h.store.close()
     })
 
+    it('is false after the user finished a login and the run-once turn then ended (its grant revoked)', async () => {
+        const h = await createHarness({ url: 'https://fixture.test/login' })
+        const released = await h.takeOverAndRelease()
+        expect(released.pauseReason).toBe('user-input-complete')
+        await h.runtime.revokeGrant(h.auth.credential.grantId)
+        // The user's part is done; revocation fences execution but must not make the task look like a new wait.
+        expect(h.store.getTask(h.task.taskId)!.pauseReason).toBe('user-input-complete')
+        expect(await h.runtime.sessionWaiting('a')).toBe(false)
+        await h.store.close()
+    })
+
     it('is true while the user holds control and false once it returns to the agent', async () => {
         const h = await createHarness()
         expect(await h.runtime.sessionWaiting('a')).toBe(false)

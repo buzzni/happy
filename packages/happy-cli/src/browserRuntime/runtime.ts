@@ -1038,6 +1038,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (reason) {
                     if (current.status === 'paused' && current.pauseReason === reason)
                         return null
+                    // The user finished a login or hand-off and nothing runs until the agent resumes (with a new grant,
+                    // which resume accepts from here). Keep that record instead of turning it into a new wait.
+                    if (reason === 'grant-expired' && current.status === 'paused' && current.pauseReason === 'user-input-complete'
+                        && !revokedActionIds.length)
+                        return null
                     fenceReason = reason
                     const actions = { ...current.actions }
                     const uncertainWrites = revokedActionIds.filter((id) => ['intent-committed', 'dispatched']
