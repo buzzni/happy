@@ -160,3 +160,24 @@ describe('user resume revalidates the task when it commits', () => {
         await h.store.close()
     })
 })
+
+describe('whether an agent session waits for the user (a host keeps a run-once chat parked meanwhile)', () => {
+    it('is true during a login wait and while the user holds control, and false for other sessions and after the end', async () => {
+        const h = await createHarness({ url: 'https://fixture.test/login' })
+        expect(await h.runtime.sessionWaiting('a')).toBe(true)
+        expect(await h.runtime.sessionWaiting('other')).toBe(false)
+        await h.runtime.endSession('a')
+        expect(await h.runtime.sessionWaiting('a')).toBe(false)
+        await h.store.close()
+    })
+
+    it('is true while the user holds control and false once it returns to the agent', async () => {
+        const h = await createHarness()
+        expect(await h.runtime.sessionWaiting('a')).toBe(false)
+        let during = false
+        await h.takeOverAndRelease(() => { void h.runtime.sessionWaiting('a').then((value) => { during = value }) })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(during).toBe(true)
+        await h.store.close()
+    })
+})

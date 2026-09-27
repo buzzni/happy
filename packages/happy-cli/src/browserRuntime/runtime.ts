@@ -811,6 +811,16 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         return 'closed'
     }
     /**
+     * An unfinished task of the agent session waits for the user: an approval, a login or other hand-off,
+     * or the user holding control. A run-once host keeps its chat parked meanwhile, so the attention that
+     * follows can resume the same session.
+     */
+    async sessionWaiting(agentSessionId: string): Promise<boolean> {
+        await this.recovery
+        return this.options.store.listTasks().some((task) => task.agentSessionId === agentSessionId && !FINISHED_STATUSES.has(task.status)
+            && (task.status === 'awaiting-user' || Boolean(task.pendingApproval) || task.pauseReason === 'user-control'))
+    }
+    /**
      * The logical agent session ended (explicit termination or orphan TTL expiry): its spaces are marked
      * for reclamation (durably, so a restart finishes it) and its unfinished tasks go
      * through the cancel fence. reclaimSpaces closes them once their tasks allow.
