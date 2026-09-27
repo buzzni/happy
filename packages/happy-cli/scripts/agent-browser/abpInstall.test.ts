@@ -515,6 +515,8 @@ describe('abp-uninstall', () => {
         expect(purged.status).toBe(0)
         expect(purged.stdout).toMatch(/docker volume rm/)
         expect(purged.stdout).toMatch(/\+ rm -rf \/etc\/abp \/var\/lib\/abp/)
+        // A digest tagged in several repositories (abp-stack load and a build tag) is removed only with --force.
+        expect(purged.stdout).toMatch(/\+ docker image rm --force /)
     })
 
     it('fences new sessions, terminates every session process, and only then removes the owner firewall rules', () => {
