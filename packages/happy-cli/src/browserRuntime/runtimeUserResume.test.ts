@@ -171,6 +171,19 @@ describe('whether an agent session waits for the user (a host keeps a run-once c
         await h.store.close()
     })
 
+    it('stays true for a login wait whose grant expired when the chat turn ended, but not once the user finished', async () => {
+        const h = await createHarness({ url: 'https://fixture.test/login' })
+        const expire = (pauseReason: 'grant-expired' | 'user-input-complete') => h.store.commit(h.task.taskId,
+            { status: 'paused', pauseReason, stateVersion: h.store.getTask(h.task.taskId)!.stateVersion + 1 },
+            { type: 'state-changed', atMs: 200, leaseEpoch: 0, data: {} })
+        await expire('grant-expired')
+        expect(await h.runtime.sessionWaiting('a')).toBe(true)
+        // The login wait ended (the reason stays recorded on the task): the agent continues, nobody waits for the user.
+        await expire('user-input-complete')
+        expect(await h.runtime.sessionWaiting('a')).toBe(false)
+        await h.store.close()
+    })
+
     it('is true while the user holds control and false once it returns to the agent', async () => {
         const h = await createHarness()
         expect(await h.runtime.sessionWaiting('a')).toBe(false)

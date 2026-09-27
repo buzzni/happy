@@ -818,7 +818,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     async sessionWaiting(agentSessionId: string): Promise<boolean> {
         await this.recovery
         return this.options.store.listTasks().some((task) => task.agentSessionId === agentSessionId && !FINISHED_STATUSES.has(task.status)
-            && (task.status === 'awaiting-user' || Boolean(task.pendingApproval) || task.pauseReason === 'user-control'))
+            && (task.status === 'awaiting-user' || Boolean(task.pendingApproval) || task.pauseReason === 'user-control'
+                // The run-once turn ended (its grant revoked) while a login, captcha or hand-off waited for the user.
+                || (task.pauseReason === 'grant-expired' && (task.waitReason === 'login' || task.waitReason === 'captcha' || task.waitReason === 'handoff'))))
     }
     /**
      * The logical agent session ended (explicit termination or orphan TTL expiry): its spaces are marked
