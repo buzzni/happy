@@ -659,6 +659,9 @@ async function withCodexAppServerClient<T>(handler: (client: CodexAppServerClien
     }
 }
 
+/** How long a keep-alive capability update may await the server before another may start. */
+const CAPABILITY_UPDATE_WAIT_MS = 2 * 60_000;
+
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     /** Set when the managed credential ended; suppresses every reconnect. */
@@ -675,8 +678,11 @@ export class ApiMachineClient {
     // 이므로 첫 keep-alive 가 무조건 publish 하여 stale 한 server-side
     // happyCliVersion 을 갱신한다.
     private lastKnownCliVersion: string | null = null;
-    /** True while a keep-alive capability update awaits the server; see `publishKeepAlive`. */
-    private capabilityUpdateInFlight = false;
+    /**
+     * The keep-alive capability update awaiting the server, if any; see `publishKeepAlive`. Its own
+     * object, so a late settle of an update that was given up on cannot clear a newer one.
+     */
+    private capabilityUpdateInFlight: { startedAt: number } | null = null;
     // Whether the automation RPCs were registered (setRPCHandlers with an
     // automationStore). Advertised as metadata.automationSupport.rpcAvailable.
     private automationRpcAvailable = false;
@@ -3851,13 +3857,17 @@ export class ApiMachineClient {
             // when an update is acknowledged, so a slow acknowledgement read as stale on every
             // keep-alive and stacked updates, each with its own retry loop. Skipped changes are
             // seen again on the next tick: `lastKnown*` moves only when an update is sent.
-            if (!this.capabilityUpdateInFlight && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale)) {
+            // Bounded: an acknowledgement that never comes must not block every later change.
+            const awaitingServer = this.capabilityUpdateInFlight !== null
+                && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
                 this.lastKnownAutonomousQualityGateRpcAvailable = this.autonomousQualityGateRpcAvailable;
                 this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
+                const inFlight = { startedAt: Date.now() };
                 this.updateMachineMetadata((metadata) => ({
                     ...(metadata || {} as any),
                     cliAvailability: newAvailability,
@@ -3881,9 +3891,9 @@ export class ApiMachineClient {
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);
                 }).finally(() => {
-                    this.capabilityUpdateInFlight = false;
+                    if (this.capabilityUpdateInFlight === inFlight) this.capabilityUpdateInFlight = null;
                 });
-                this.capabilityUpdateInFlight = true;
+                this.capabilityUpdateInFlight = inFlight;
             }
         };
         publishKeepAlive();

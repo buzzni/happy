@@ -942,6 +942,32 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    it('starts another advertisement update once the unanswered one has waited past its bound', async () => {
+        // A single-flight guard that only an acknowledgement clears would block every capability
+        // change forever if that acknowledgement never came.
+        vi.useFakeTimers();
+        let metadataUpdates = 0;
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                metadataUpdates += 1;
+                return new Promise(() => undefined);
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        socketHandlers.connect![0]!();
+        await vi.advanceTimersByTimeAsync(0);
+        const first = metadataUpdates;
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+        expect(metadataUpdates).toBeGreaterThan(first);
+        client.shutdown();
+    });
+
     it('clears stale autonomous quality-gate capability when RPC handlers are unavailable', async () => {
         vi.useFakeTimers();
         mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
