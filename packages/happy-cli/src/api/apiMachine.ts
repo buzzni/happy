@@ -675,6 +675,8 @@ export class ApiMachineClient {
     // 이므로 첫 keep-alive 가 무조건 publish 하여 stale 한 server-side
     // happyCliVersion 을 갱신한다.
     private lastKnownCliVersion: string | null = null;
+    /** True while a keep-alive capability update awaits the server; see `publishKeepAlive`. */
+    private capabilityUpdateInFlight = false;
     // Whether the automation RPCs were registered (setRPCHandlers with an
     // automationStore). Advertised as metadata.automationSupport.rpcAvailable.
     private automationRpcAvailable = false;
@@ -3834,14 +3836,22 @@ export class ApiMachineClient {
             // keeps an existing machine's metadata, so a machine first registered by a daemon that
             // predates an advertisement would otherwise never carry it. The same holds
             // for every static capability published only at startup.
+            // A managed runtime serves only `managed:*` RPCs, so the spawn path both promise is
+            // refused there: it advertises neither, and a stored copy is cleared.
+            const advertisedChannelSupport = this.managedHandlers ? undefined : CHANNEL_SUPPORT_CAPABILITY;
+            const advertisedAiAuthSelection = this.managedHandlers ? undefined : AI_AUTH_SELECTION_CAPABILITY;
             const channelSupportStale = JSON.stringify(this.machine.metadata?.channelSupport)
-                !== JSON.stringify(CHANNEL_SUPPORT_CAPABILITY);
+                !== JSON.stringify(advertisedChannelSupport);
             const aiAuthSelectionStale = JSON.stringify(this.machine.metadata?.aiAuthSelection)
-                !== JSON.stringify(AI_AUTH_SELECTION_CAPABILITY);
+                !== JSON.stringify(advertisedAiAuthSelection);
 
             this.syncResumeSessionRpcRegistration();
 
-            if (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale) {
+            // One update at a time. The staleness checks read the server's copy, which changes only
+            // when an update is acknowledged, so a slow acknowledgement read as stale on every
+            // keep-alive and stacked updates, each with its own retry loop. Skipped changes are
+            // seen again on the next tick: `lastKnown*` moves only when an update is sent.
+            if (!this.capabilityUpdateInFlight && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -3864,13 +3874,16 @@ export class ApiMachineClient {
                         rpcAvailable: this.autonomousQualityGateRpcAvailable,
                     },
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
-                    channelSupport: CHANNEL_SUPPORT_CAPABILITY,
-                    aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
+                    channelSupport: advertisedChannelSupport,
+                    aiAuthSelection: advertisedAiAuthSelection,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
                     logger.debug('[API MACHINE] Failed to update machine capabilities:', err);
+                }).finally(() => {
+                    this.capabilityUpdateInFlight = false;
                 });
+                this.capabilityUpdateInFlight = true;
             }
         };
         publishKeepAlive();
