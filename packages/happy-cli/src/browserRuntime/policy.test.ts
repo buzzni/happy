@@ -1,3 +1,4 @@
+/** Site classification and form digest safety contracts. */
 import { describe, expect, it } from 'vitest'
 import { BrowserRuntimeError, type BatchStep, type ElementDescription, type ElementRef, type FormSubmission } from './contracts'
 import { assertAllowedOrigin, approvalBinding, classifySiteAction, classifyUserWait, formDigest, formSummary, loginCompleted, parseSitePolicies, redact, type SitePolicy } from './policy'
@@ -113,8 +114,8 @@ describe('site action policy (D7)', () => {
         expect(classifySiteAction(strict, click, element({ form: form(`${origin}/cart/update`) }))).toBe('requires-approval')
         expect(classifySiteAction(strict, click, element({ form: form(`${origin}/checkout`), submitsForm: true }))).toBe('requires-approval')
         expect(classifySiteAction(strict, click, element({ role: 'link', currentRole: 'link', tag: 'a', linkUrl: `${origin}/help` }))).toBe('auto')
-        // A fill can trigger autosave: approval unless the policy marks it automatic.
-        expect(classifySiteAction(strict, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('requires-approval')
+        // Plain fills are automatic; submit binds the complete form digest.
+        expect(classifySiteAction(strict, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('auto')
         expect(classifySiteAction(strict, { ...step, kind: 'navigate', url: `${origin}/cart` })).toBe('auto')
         expect(classifySiteAction(strict, { ...step, kind: 'observe' })).toBe('auto')
     })
@@ -134,7 +135,7 @@ describe('site action policy (D7)', () => {
     it('marks an explicitly automatic fill as automatic', () => {
         const sites: SitePolicy[] = [{ origin, actions: [{ match: { kinds: ['fill'], namePrefixes: ['search'] }, risk: 'auto' }] }]
         expect(classifySiteAction(sites, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox', name: 'Search', currentName: 'Search' }))).toBe('auto')
-        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox', name: 'Amount', currentName: 'Amount' }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: 'x' }, element({ role: 'textbox', currentRole: 'textbox', name: 'Amount', currentName: 'Amount' }))).toBe('auto')
     })
 
     it('applies the first matching rule; a rule matches only when all of its conditions do', () => {
@@ -150,7 +151,7 @@ describe('site action policy (D7)', () => {
         expect(classifySiteAction(sites, { ...step, kind: 'navigate', url: `${origin}/api/delete?id=1` })).toBe('requires-approval')
         expect(classifySiteAction(sites, click, element({ role: 'link', currentRole: 'link', tag: 'a', linkUrl: `${origin}/api/delete?id=1` }))).toBe('requires-approval')
         expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox', pageUrl: `${origin}/transfer` }))).toBe('requires-approval')
-        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('requires-approval')
+        expect(classifySiteAction(sites, { ...step, kind: 'fill', value: '1' }, element({ role: 'textbox', currentRole: 'textbox' }))).toBe('auto')
     })
 
     it('hands an action to the user when its effect cannot be bound, and refuses a destination outside the site list', () => {
@@ -169,7 +170,7 @@ describe('site action policy (D7)', () => {
         const valid = [{ origin, actions: [{ match: { kinds: ['submit'], targetPaths: ['/pay*'], namePrefixes: ['Pay'] }, risk: 'requires-approval' }],
             loginCompleteWhen: { urlPrefix: `${origin}/account`, text: 'Signed in' } }]
         expect(parseSitePolicies(valid)).toEqual(valid)
-        // An origin-only site is allowed and has no automatic writes: every write needs approval.
+        // An origin-only site allows plain fill; unmatched submission and clicks require approval.
         expect(parseSitePolicies([{ origin }])).toEqual([{ origin, actions: [] }])
         for (const bad of [
             [{ origin: `${origin}/path`, actions: [] }],

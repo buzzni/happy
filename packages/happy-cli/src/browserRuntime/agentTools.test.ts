@@ -1,3 +1,4 @@
+/** Agent tool contract and granted profile defaults. */
 import { describe, expect, it, vi } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -8,7 +9,7 @@ import type { RuntimeClient } from './runtimeClient'
 
 async function connect(fake: Partial<Record<keyof RuntimeClient, ReturnType<typeof vi.fn>>>) {
     const mcp = new McpServer({ name: 't', version: '1' })
-    registerBrowserTaskTools(mcp, fake as unknown as RuntimeClient, { agentSessionId: 'a1' })
+    registerBrowserTaskTools(mcp, fake as unknown as RuntimeClient, { agentSessionId: 'a1', profileId: 'main' })
     const [a, b] = InMemoryTransport.createLinkedPair()
     const client = new Client({ name: 'c', version: '1' })
     await Promise.all([mcp.connect(a), client.connect(b)])
@@ -26,6 +27,25 @@ describe('browser task agent tools', () => {
         const names = (await client.listTools()).tools.map((t) => t.name).sort()
         expect(names).toEqual([...BROWSER_TASK_TOOL_NAMES].sort())
         expect(names.some((n) => /approve|take_?over|release|evaluate|cdp|export/i.test(n))).toBe(false)
+    })
+
+    it('rejects press Enter instead of letting keyboard submission bypass approval', async () => {
+        const submitBatch = vi.fn()
+        const client = await connect({ submitBatch })
+        const result = await client.callTool({ name: 'browser_task_submit_batch', arguments: {
+            taskId: 't', expectedVersion: 1, steps: [{ kind: 'press', tabId: 'tab', value: 'Enter' }],
+        } })
+        expect(result.isError).toBe(true)
+        expect(submitBatch).not.toHaveBeenCalled()
+    })
+
+    it('defaults create-space to the granted profile and accepts an explicit profile', async () => {
+        const createSpace = vi.fn(async () => ({}))
+        const client = await connect({ createSpace })
+        await client.callTool({ name: 'browser_task_create_space', arguments: {} })
+        expect(createSpace).toHaveBeenLastCalledWith(expect.objectContaining({ profileId: 'main' }))
+        await client.callTool({ name: 'browser_task_create_space', arguments: { profileId: 'explicit' } })
+        expect(createSpace).toHaveBeenLastCalledWith(expect.objectContaining({ profileId: 'explicit' }))
     })
 
     it('generates a requestId when omitted and returns it', async () => {

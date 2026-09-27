@@ -80,14 +80,14 @@ const stepSchema = z.object({
     ]).optional(),
 })
 
-export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, _opts: { agentSessionId: string }): void {
+export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, opts: { agentSessionId: string; profileId: string }): void {
     const id = (v?: string) => v ?? randomUUID()
 
     mcp.registerTool('browser_task_create_space', {
         title: 'Create browser task space',
-        description: 'Create an isolated task space (tab group) in the granted browser profile.',
-        inputSchema: { profileId: z.string().min(1), requestId: reqId },
-    }, async (a) => { const r = id(a.requestId); return run(r, () => client.createSpace({ profileId: a.profileId as never, requestId: r as never })) })
+        description: 'Create an isolated task space (tab group) in the granted browser profile. profileId defaults to the session’s granted profile.',
+        inputSchema: { profileId: z.string().min(1).optional(), requestId: reqId },
+    }, async (a) => { const r = id(a.requestId); return run(r, () => client.createSpace({ profileId: (a.profileId ?? opts.profileId) as never, requestId: r as never })) })
 
     mcp.registerTool('browser_task_create', {
         title: 'Create browser task',

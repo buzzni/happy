@@ -48,6 +48,7 @@ export interface HappyServerHandlers {
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
     browserTaskRuntime?: RuntimeClient;
+    browserTaskProfileId?: string;
     mandatorySandbox?: boolean;
 }
 
@@ -258,7 +259,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // Agent Browser PoC: the task runtime replaces the extension-bridge tools,
     // which fall back to the active tab and would bypass the task lease.
     if (handlers.browserTaskRuntime) {
-        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId });
+        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default' });
     } else if (!handlers.mandatorySandbox) {
         registerBrowserTools(mcp, runTool);
     }
@@ -431,7 +432,7 @@ function takeBrowserTaskSessionSecret(): string | undefined {
     return browserTaskSessionSecret;
 }
 
-function createBrowserTaskRuntimeClient(client: ApiSessionClient): RuntimeClient | undefined {
+function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: string): RuntimeClient | undefined {
     const baseUrl = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
     if (!baseUrl) return undefined;
     const socketPath = process.env.HAPPY_BROWSER_TASK_BROKER_SOCKET;
@@ -444,7 +445,7 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient): RuntimeClient
                 socketPath,
                 sessionSecret,
                 agentSessionId: () => client.sessionId,
-                profileId: process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default',
+                profileId,
             }),
         });
     }
@@ -471,7 +472,8 @@ export async function startHappyServer(
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
-    const browserTaskRuntime = createBrowserTaskRuntimeClient(client);
+    const browserTaskProfileId = process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default';
+    const browserTaskRuntime = createBrowserTaskRuntimeClient(client, browserTaskProfileId);
     if (browserTaskRuntime) {
         logger.debug('[happyMCP] legacy browser_* tools disabled by HAPPY_BROWSER_TASK_RUNTIME_URL (agent browser PoC)');
     }
@@ -516,6 +518,7 @@ export async function startHappyServer(
             protectedBashCwd: options.protectedBashCwd,
             trackProtectedBashProcess: options.trackProtectedBashProcess,
             browserTaskRuntime,
+            browserTaskProfileId,
         });
         try {
             const transport = new StreamableHTTPServerTransport({
