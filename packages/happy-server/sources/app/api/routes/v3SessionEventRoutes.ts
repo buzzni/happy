@@ -3,6 +3,7 @@ import { checkpointEventEnvelopeSchema } from "@/app/events/checkpointEventEnvel
 import { persistCheckpointSessionEvent } from "@/app/events/persistCheckpointSessionEvent";
 import { SESSION_EVENT_TYPES, type SessionEventType } from "@/app/events/sessionEventTypes";
 import { db } from "@/storage/db";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { type Fastify } from "../types";
 import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
@@ -46,6 +47,10 @@ export const getEventsQuerySchema = z
         limit: z.coerce.number().int().min(1).max(500).default(100),
         type: z.string().optional(),
         order: z.enum(['asc', 'desc']).default('asc'),
+        // COMPAT(web-checkpoint-history): released Desktop builds reject a whole
+        // checkpoint timeline on one envelope-less row, so only readers that
+        // understand legacy web history receive it.
+        include_legacy: z.literal('1').optional(),
     })
     .refine(
         // `after_seq` defaults to 0, so treat "explicitly > 0 AND before_seq set" as the ambiguous case.
@@ -93,7 +98,7 @@ export function v3SessionEventRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = request.userId;
         const { sessionId } = request.params;
-        const { after_seq, before_seq, limit, type, order } = request.query;
+        const { after_seq, before_seq, limit, type, order, include_legacy } = request.query;
 
         const session = await db.session.findFirst({
             where: {
@@ -111,12 +116,16 @@ export function v3SessionEventRoutes(app: Fastify) {
             sessionId: string;
             seq: { gt: number } | { lt: number };
             eventType?: string;
+            checkpoint?: { not: typeof Prisma.DbNull };
         } = {
             sessionId,
             seq: before_seq !== undefined ? { lt: before_seq } : { gt: after_seq },
         };
         if (type) {
             where.eventType = type;
+            if (checkpointEventTypes.has(type) && !include_legacy) {
+                where.checkpoint = { not: Prisma.DbNull };
+            }
         }
 
         const events = await db.sessionEvent.findMany({

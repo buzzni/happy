@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import { beforeEach, describe, it, expect, vi } from 'vitest';
@@ -90,6 +91,12 @@ describe('getEventsQuerySchema', () => {
             getEventsQuerySchema.parse({ after_seq: 10, before_seq: 500 }),
         ).toThrow();
     });
+
+    it('leaves legacy checkpoint history out unless include_legacy=1', () => {
+        expect(getEventsQuerySchema.parse({}).include_legacy).toBeUndefined();
+        expect(getEventsQuerySchema.parse({ include_legacy: '1' }).include_legacy).toBe('1');
+        expect(() => getEventsQuerySchema.parse({ include_legacy: 'yes' })).toThrow();
+    });
 });
 
 describe('sendEventBodySchema', () => {
@@ -173,14 +180,48 @@ describe('checkpoint session event route', () => {
         expect(mocks.persistCheckpointEvent).not.toHaveBeenCalled();
         expect(response.json().event).not.toHaveProperty('idempotent');
         const history = await app.inject({
-            method: 'GET', url: `/v3/sessions/session-1/events?type=${eventType}`,
+            method: 'GET', url: `/v3/sessions/session-1/events?type=${eventType}&include_legacy=1`,
             headers: { 'x-user-id': 'account-1' },
         });
         expect(history.statusCode).toBe(200);
+        expect(mocks.findEvents.mock.calls[0][0].where).not.toHaveProperty('checkpoint');
         expect(history.json().events[0]).toMatchObject({
             id: 'legacy-1', eventType, content: { t: 'encrypted', c: 'encrypted-web-history' },
         });
         expect(history.json().events[0]).not.toHaveProperty('checkpoint');
+        await app.close();
+    });
+
+    // Released Desktop builds drop the whole timeline on one envelope-less
+    // entry, so they must never receive legacy rows they did not ask for.
+    it.each(['checkpoint-snapshot', 'checkpoint-rewind'])('hides legacy %s rows from readers that do not opt in', async (eventType) => {
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.findEvents.mockResolvedValue([]);
+        const app = await createApp();
+        const response = await app.inject({
+            method: 'GET', url: `/v3/sessions/session-1/events?type=${eventType}`,
+            headers: { 'x-user-id': 'account-1' },
+        });
+        expect(response.statusCode).toBe(200);
+        expect(mocks.findEvents.mock.calls[0][0].where).toEqual({
+            sessionId: 'session-1',
+            seq: { gt: 0 },
+            eventType,
+            checkpoint: { not: Prisma.DbNull },
+        });
+        await app.close();
+    });
+
+    it.each([
+        '/v3/sessions/session-1/events?type=message-hidden',
+        '/v3/sessions/session-1/events',
+    ])('leaves reads other than checkpoint types unfiltered (%s)', async (url) => {
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.findEvents.mockResolvedValue([]);
+        const app = await createApp();
+        const response = await app.inject({ method: 'GET', url, headers: { 'x-user-id': 'account-1' } });
+        expect(response.statusCode).toBe(200);
+        expect(mocks.findEvents.mock.calls[0][0].where).not.toHaveProperty('checkpoint');
         await app.close();
     });
 
