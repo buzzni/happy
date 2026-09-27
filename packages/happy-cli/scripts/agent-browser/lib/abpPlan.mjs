@@ -372,13 +372,17 @@ const SESSION_SANDBOX_CONFIG = { enabled: true, workspaceRoot: "/work", sessionI
 /**
  * The agent's ~/.happy/settings.json with install.serverUrl applied (Happy reads serverUrl/webappUrl
  * from it for `happy auth login` and the daemon alike), or undefined without --server-url. A machine
- * already registered with another server keeps it: its credentials belong to that server.
+ * already registered with another server keeps it: its credentials belong to that server. Without a
+ * serverUrl in its settings, a registered machine is on Happy's default server (src/configuration.ts).
  */
+const HAPPY_DEFAULT_SERVER_URL = "https://saycode.ai";
+
 export function happySettings(existing, install) {
   if (install.serverUrl === undefined) return undefined;
   const settings = existing ?? {};
-  if (settings.machineId && settings.serverUrl && settings.serverUrl !== install.serverUrl) {
-    fail("serverUrl", `the agent is registered with ${settings.serverUrl}; run sudo -iu agent happy auth logout first to move it`);
+  const registeredWith = settings.serverUrl ?? HAPPY_DEFAULT_SERVER_URL;
+  if (settings.machineId && registeredWith !== install.serverUrl) {
+    fail("serverUrl", `the agent is registered with ${registeredWith}; run sudo -iu agent happy auth logout first to move it`);
   }
   return { ...settings, serverUrl: install.serverUrl, webappUrl: install.serverUrl };
 }
