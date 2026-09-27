@@ -1085,7 +1085,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('APPROVAL_EXPIRED', 'Approval expired')
         }
         if (req.decision === 'reject') {
-            const cancelled = await this.commit(task, { status: 'cancelled', cancelRequested: true, approvals: { ...task.approvals,
+            const cancelled = await this.commit(task, { status: 'cancelled', cancelRequested: true,
+                pendingApproval: undefined, waitReason: undefined, waitExpiresAtMs: undefined, approvals: { ...task.approvals,
                 [req.approvalId]: { ...approval, state: 'rejected' } } }, 'approval-rejected', { approvalId: req.approvalId,
                     attention: 'approval-rejected' })
             for (const lease of this.leases.revokeTask(task.taskId))
@@ -1190,7 +1191,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             }
             const { [approvedStep.actionId]: _priorAction, ...remainingActions } = current.actions
             return {
-                patch: { status: 'running', pauseReason: undefined, waitReason: undefined, waitExpiresAtMs: undefined,
+                patch: { status: 'running', pauseReason: undefined, pendingApproval: undefined, waitReason: undefined, waitExpiresAtMs: undefined,
                     actions: remainingActions,
                     batches: { ...current.batches, [String(approval.batchId)]: { ...current.batches[String(approval.batchId)], grant: originalGrant } },
                     approvals: { ...current.approvals, [req.approvalId]: { ...latestApproval, state: 'consumed' } } },
@@ -2114,6 +2115,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                         decision = classifySiteAction(this.options.sites, effectiveStep, description)
                     if (decision === 'deny')
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Site policy refuses this destination', false, false)
+                    // Refuse an incomplete plan before creating approval or sending browser input.
+                    // Reclassify approved steps too: approval bypasses the prompt, not the postcondition.
+                    if (['click', 'navigate'].includes(step.kind)
+                        && classifySiteAction(this.options.sites, effectiveStep, description) !== 'auto'
+                        && !steps.slice(index + 1).some(candidate => candidate.tabId === step.tabId && candidate.kind === 'waitFor'))
+                        throw new BrowserRuntimeError('INVALID_REQUEST',
+                            'Add a waitFor step (until text, url, or element of the expected result) on the same tab after this action and resubmit the batch with new requestId and actionId values.', false, false)
                 }
                 catch (error) {
                     // Description is read-only preflight; input has not been sent.

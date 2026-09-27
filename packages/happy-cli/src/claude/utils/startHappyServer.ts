@@ -49,6 +49,7 @@ export interface HappyServerHandlers {
     trackProtectedBashProcess?: (child: ChildProcess) => void;
     browserTaskRuntime?: RuntimeClient;
     browserTaskProfileId?: string;
+    exitAfterFirstTurn?: boolean;
     mandatorySandbox?: boolean;
 }
 
@@ -259,7 +260,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // Agent Browser PoC: the task runtime replaces the extension-bridge tools,
     // which fall back to the active tab and would bypass the task lease.
     if (handlers.browserTaskRuntime) {
-        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default' });
+        registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn });
     } else if (!handlers.mandatorySandbox) {
         registerBrowserTools(mcp, runTool);
     }
@@ -463,6 +464,7 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
+        exitAfterFirstTurn?: boolean;
         mandatorySandbox?: boolean;
         admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
         proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
@@ -519,6 +521,7 @@ export async function startHappyServer(
             trackProtectedBashProcess: options.trackProtectedBashProcess,
             browserTaskRuntime,
             browserTaskProfileId,
+            exitAfterFirstTurn: options.exitAfterFirstTurn,
         });
         try {
             const transport = new StreamableHTTPServerTransport({

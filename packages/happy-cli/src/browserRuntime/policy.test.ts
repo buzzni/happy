@@ -120,6 +120,14 @@ describe('site action policy (D7)', () => {
         expect(classifySiteAction(strict, { ...step, kind: 'observe' })).toBe('auto')
     })
 
+    it.each(['radio', 'checkbox', 'switch', 'option', 'menuitemradio', 'menuitemcheckbox'])('classifies non-submitting %s selection as fill', role => {
+        const control = element({ role, currentRole: role, submitsForm: false, form: form(`${origin}/order`) })
+        expect(classifySiteAction(strict, click, control)).toBe('auto')
+        expect(classifySiteAction([{ origin, actions: [{ match: { kinds: ['fill'] }, risk: 'requires-approval' }] }], click, control)).toBe('requires-approval')
+        expect(classifySiteAction(strict, click, { ...control, submitsForm: true })).toBe('requires-approval')
+        expect(classifySiteAction(strict, click, { ...control, linkUrl: `${origin}/next` })).toBe('requires-approval')
+    })
+
     it('treats a link inside a form as a form click, and refuses executable or unsited link and form destinations outright', () => {
         const link = { role: 'link', currentRole: 'link', tag: 'a' }
         const permissive: SitePolicy[] = [{ origin, actions: [{ match: { kinds: ['link'] }, risk: 'auto' }] }]
