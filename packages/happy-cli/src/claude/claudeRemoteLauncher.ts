@@ -561,6 +561,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             hasHeldBackInput: () => pending !== null,
             lastResultInterrupted: () => lastResultInterrupted,
         });
+        // A dispatched turn has no result yet: an earlier turn's interrupt must not answer for it.
+        const dispatchTurn = () => { lastResultInterrupted = false; drain?.dispatched(); };
 
         // Track session ID to detect when it actually changes
         // This prevents context loss when mode changes (permission mode, model, etc.)
@@ -720,7 +722,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 mode = revisedMode;
                                 p = { ...p, mode: revisedMode };
                             }
-                            drain?.dispatched();
+                            dispatchTurn();
                             return { ...p, latency: toTurnLatency(p) };
                         }
 
@@ -860,7 +862,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 contentBlocks.push({ type: 'text' as const, text: msg.message });
                                 logger.debug(`[remote] Combined ${contentBlocks.length - 1} image(s) with text message`);
-                                drain?.dispatched();
+                                dispatchTurn();
                                 return {
                                     message: contentBlocks,
                                     mode: msg.mode,
@@ -873,7 +875,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // this text was relayed rather than typed into the app. A channel
                             // batch normally reaches that parser via the `pending` branch above,
                             // but the handle travels on every path so no future route drops it.
-                            drain?.dispatched();
+                            dispatchTurn();
                             return {
                                 message: msg.message,
                                 mode: msg.mode,
