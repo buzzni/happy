@@ -268,6 +268,12 @@ describe('system files', () => {
         expect(env).not.toMatch(/SECRET|GRANT_FILE|TOKEN=/)
     })
 
+    it('roots the daemon\'s machine file RPCs at /work, where abp-install keeps every project', () => {
+        // The daemon default is its home, but the workspace moved to /work (the home keeps only a link to it),
+        // so the document list and file reads of every project on H were refused.
+        expect(daemonEnv(base()).split('\n')).toContain(`HAPPY_WORKSPACE_ROOT=${PATHS.work}`)
+    })
+
     it('gives every daemon session an enabled sandbox config bounded to /work (mandatory machine)', () => {
         const line = daemonEnv(base()).split('\n').find((entry: string) => entry.startsWith('HAPPY_PROJECT_SANDBOX_CONFIG='))!
         const value = line.slice('HAPPY_PROJECT_SANDBOX_CONFIG='.length)

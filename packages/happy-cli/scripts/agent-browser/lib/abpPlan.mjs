@@ -394,6 +394,9 @@ export function daemonEnv(install) {
     `HAPPY_BROWSER_TASK_BROKER_SOCKET=${PATHS.brokerSocket}`,
     `HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE=${PATHS.daemonToken}`,
     `HAPPY_BROWSER_TASK_PROFILE_ID=${install.agentProfileId}`,
+    // Machine file RPCs (document list, file reads) accept paths under this root only; the default is the
+    // daemon's home, but every project here lives under /work (the home keeps only a link to it).
+    `HAPPY_WORKSPACE_ROOT=${PATHS.work}`,
     // The machine policy is mandatory: a session without an enabled sandbox config refuses to
     // start. Every daemon session gets this one (writes bounded to its /work workspace).
     `HAPPY_PROJECT_SANDBOX_CONFIG='${JSON.stringify(SESSION_SANDBOX_CONFIG)}'`,
