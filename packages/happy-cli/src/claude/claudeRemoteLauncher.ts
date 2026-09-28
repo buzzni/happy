@@ -172,11 +172,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (!text.trim()) {
             return { success: false, error: 'Steer text is required' };
         }
-        if (!await activeInputSender?.(text)) {
-            return { success: false, error: 'No active Claude turn' };
-        }
-        session.onActiveUserInputAccepted?.(text);
-        return { success: true };
+        // Steering is input: refused once a standalone drain froze the runtime, tracked while it runs.
+        const gate = session.standaloneDrain?.gate;
+        if (gate?.isClosed()) return { success: false, error: 'This session is shutting down' };
+        const steer = async () => {
+            if (!await activeInputSender?.(text)) {
+                return { success: false, error: 'No active Claude turn' };
+            }
+            session.onActiveUserInputAccepted?.(text);
+            return { success: true };
+        };
+        return gate ? gate.admit(steer) : steer();
     });
     // Removed catch-all stdin handler - now handled by RemoteModeDisplay keyboard handlers
 
@@ -549,6 +555,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             requestEndInput: () => { gracefulStop?.request(); },
             cancelPendingPermissions: () => { permissionHandler.reset('Session is shutting down'); },
             generation: () => startedGeneration()?.observer ?? null,
+            hasHeldBackInput: () => pending !== null,
         });
 
         // Track session ID to detect when it actually changes

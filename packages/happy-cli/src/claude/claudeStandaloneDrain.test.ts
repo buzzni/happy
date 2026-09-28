@@ -8,7 +8,8 @@ function gate() {
 }
 function launcher() {
     const observer = createProviderExitObserver();
-    return { observer, port: { requestEndInput: vi.fn(), cancelPendingPermissions: vi.fn(), generation: () => observer } };
+    let held = false;
+    return { observer, hold: (value: boolean) => { held = value; }, port: { requestEndInput: vi.fn(), cancelPendingPermissions: vi.fn(), generation: () => observer, hasHeldBackInput: () => held } };
 }
 
 describe('Claude standalone drain hooks', () => {
@@ -67,5 +68,14 @@ describe('Claude standalone drain hooks', () => {
         const drain = new ClaudeStandaloneDrain(gate());
         drain.markLoopFinished(); drain.markLoopFinished();
         await expect(drain.providerDeps().loopFinished).resolves.toBeUndefined();
+    });
+
+    it('reports input the launcher held back outside the queue', () => {
+        const drain = new ClaudeStandaloneDrain(gate());
+        expect(drain.hasHeldBackInput()).toBe(false);
+        const l = launcher();
+        drain.attachLauncher(l.port);
+        l.hold(true);
+        expect(drain.hasHeldBackInput()).toBe(true);
     });
 });

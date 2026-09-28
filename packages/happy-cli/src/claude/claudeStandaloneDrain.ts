@@ -10,6 +10,8 @@ export type ClaudeLauncherDrainPort = {
     cancelPendingPermissions: () => void;
     /** The current provider generation's exit observer; `null` before any SDK process started. */
     generation: () => ProviderExitObserver | null;
+    /** A batch the loop took off the queue but held back for the next generation (mode change). */
+    hasHeldBackInput: () => boolean;
 };
 
 /**
@@ -45,6 +47,9 @@ export class ClaudeStandaloneDrain {
     turnEnded(): void { this.turnRunning = false; this.gate.endTurn(); }
     /** A claimed batch was held back (mode change) instead of dispatched. */
     releaseClaim(): void { if (!this.turnRunning) this.gate.endTurn(); }
+
+    /** Input the launcher holds outside the queue; the drain refuses while there is any. */
+    hasHeldBackInput(): boolean { return this.launcher?.hasHeldBackInput() ?? false; }
 
     /** After the loop's last write. */
     markLoopFinished(): void {
