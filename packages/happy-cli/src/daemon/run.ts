@@ -2013,6 +2013,12 @@ export async function startDaemon(): Promise<void> {
         if (options.appendSystemPrompt !== undefined) {
           extraEnv.HAPPY_INITIAL_APPEND_SYSTEM_PROMPT = options.appendSystemPrompt;
         }
+        // Channel host spawn: the daemon created this session and holds its key. Set after the
+        // caller's environment was scrubbed of lineage and expanded, so only this internal option
+        // can attach a child to an existing session.
+        if (options.reconnectEnvironment) {
+          Object.assign(extraEnv, options.reconnectEnvironment);
+        }
         if (options.saycodeSystemPromptEnabled !== undefined) {
           extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
             options.saycodeSystemPromptEnabled,
