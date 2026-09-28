@@ -83,4 +83,25 @@ describe('Claude launcher under a Windows standalone drain', () => {
         expect(query).not.toHaveBeenCalled();
         expect(drain.providerDeps().isLoopFinished()).toBe(true);
     });
+
+    it('ends the loop on its own when a kill closed the gate with a batch still queued', async () => {
+        const { queue, gate, drain, session } = harness();
+        vi.mocked(query).mockReset();
+        // runClaude's kill path only seals the gate; it neither requests a stop nor closes the queue.
+        gate.beginTermination();
+        queue.push('queued-behind-turn', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        let waits = 0;
+        const wait = queue.waitForMessagesAndGetAsString.bind(queue);
+        queue.waitForMessagesAndGetAsString = (signal, claim) => {
+            waits += 1;
+            // Safety valve so a relaunch spin fails this test instead of starving the worker.
+            if (waits > 20) { drain.providerDeps().requestEndInput(); queue.close(); }
+            return wait(signal, claim);
+        };
+        await expect(claudeRemoteLauncher(session)).resolves.toBe('exit');
+        expect(waits).toBe(1);
+        expect(query).not.toHaveBeenCalled();
+        expect(queue.size()).toBe(1);
+        expect(drain.providerDeps().isLoopFinished()).toBe(true);
+    });
 });
