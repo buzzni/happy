@@ -30,11 +30,15 @@ export const launchReplySchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('outcome'), nonce: id, launchId: id, decision: z.enum(['none', 'confirmed', 'blocked']) }).strict(),
 ]);
 
+/** The runtimes that implement the session drain; any other command must not adopt a standalone launch. */
+const DRAINABLE_COMMANDS: ReadonlySet<string> = new Set(['codex', 'claude']);
 // index.ts captures before loading provider modules with import-time side effects.
 let entryBootstrap: StandaloneLaunchBootstrap | undefined;
 export function captureStandaloneLaunchBootstrap(env: NodeJS.ProcessEnv, command: string | undefined): void {
   entryBootstrap = consumeStandaloneLaunchBootstrap(env);
-  if (entryBootstrap && command !== 'codex') { entryBootstrap = undefined; throw new Error('Standalone launch requires Codex'); }
+  if (entryBootstrap && !DRAINABLE_COMMANDS.has(command ?? '')) {
+    entryBootstrap = undefined; throw new Error('Standalone launch requires a drainable agent');
+  }
 }
 export function takeStandaloneLaunchBootstrap(env: NodeJS.ProcessEnv): StandaloneLaunchBootstrap | undefined {
   const bootstrap = entryBootstrap ?? consumeStandaloneLaunchBootstrap(env);
