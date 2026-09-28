@@ -12,7 +12,7 @@ import type { AttentionEvent } from '@/browserRuntime/contracts'
 import { TaskStore, type StoredTask } from '@/browserRuntime/taskStore'
 import { readDaemonState, writeDaemonState } from '@/persistence'
 import { BrowserAttentionWatcher, createAttentionCursorStore } from './browserAttentionWatcher'
-import { deliverBrowserAttention, findBrowserAttentionSession, pollBrowserAttention, startBrowserAttentionWatcher } from './browserAttentionDelivery'
+import { createHeldBrowserAttentions, deliverBrowserAttention, findBrowserAttentionSession, pollBrowserAttention, startBrowserAttentionWatcher } from './browserAttentionDelivery'
 import { mergeTrackedSessionWebhook } from './persistedSessionHydration'
 import type { TrackedSession } from './types'
 
@@ -68,6 +68,43 @@ describe('attention delivery over the existing encrypted server path', () => {
         expect(resumed).toEqual([{ sessionId: 'session-1', directory: '/work', localId: 'abp-task-1-2',
             text: '[agent-browser] task task-1 status=paused eventSeq=2. Call getTask for the current state before continuing.' }])
         await expect(deliverBrowserAttention(event, new AbortController().signal, { ...options, resumeSession: async () => false })).resolves.toBe('ended')
+    })
+
+    describe('a live run-once chat whose host parks it (Chat(beta))', () => {
+        const text = '[agent-browser] task task-1 status=paused eventSeq=2. Call getTask for the current state before continuing.'
+        const parked = { ...session, happySessionMetadataFromLocalWebhook: { path: '/work' } } as TrackedSession
+
+        it('holds the attention for the exit instead of posting into a turn that will not read it', async () => {
+            const held = createHeldBrowserAttentions()
+            const resumed: unknown[] = []
+            const options = { serverUrl: 'http://127.0.0.1:1', findSession: () => parked, isAlive: () => true, readToken: async () => 'token',
+                resumeSession: async (input: unknown) => { resumed.push(input); return true },
+                holdUntilExit: { applies: () => true, held } }
+            await expect(deliverBrowserAttention(event, new AbortController().signal, options)).resolves.toBe('sent')
+            expect(resumed).toEqual([])
+            expect(held.has('session-1')).toBe(true)
+            expect(held.take('session-1')).toEqual({ sessionId: 'session-1', directory: '/work', text, localId: 'abp-task-1-2' })
+            expect(held.has('session-1')).toBe(false)
+        })
+
+        it('resumes at once when the process exited while the attention was being held, exactly once', async () => {
+            const held = createHeldBrowserAttentions()
+            const resumed: unknown[] = []
+            let checks = 0
+            const options = { serverUrl: 'http://127.0.0.1:1', findSession: () => parked, isAlive: () => checks++ === 0, readToken: async () => 'token',
+                resumeSession: async (input: unknown) => { resumed.push(input); return true },
+                holdUntilExit: { applies: () => true, held } }
+            await expect(deliverBrowserAttention(event, new AbortController().signal, options)).resolves.toBe('sent')
+            expect(resumed).toEqual([{ sessionId: 'session-1', directory: '/work', text, localId: 'abp-task-1-2' }])
+            expect(held.has('session-1')).toBe(false)
+        })
+
+        it('keeps only the latest attention per session (the agent reads the task state anyway)', () => {
+            const held = createHeldBrowserAttentions()
+            held.hold({ sessionId: 's', directory: '/w', text: 'first', localId: 'a' })
+            held.hold({ sessionId: 's', directory: '/w', text: 'second', localId: 'b' })
+            expect(held.take('s')).toMatchObject({ text: 'second' })
+        })
     })
 
     it('skips ended/unowned sessions and retries missing encryption or credentials without posting', async () => {
