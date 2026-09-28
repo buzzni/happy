@@ -25,11 +25,23 @@ import { scrubSessionLineageEnv } from '@/daemon/sessionEnv';
 
 export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
 
+/**
+ * The host's state lives in the happy home (sealed keys and credential; the adapter sandbox denies it).
+ * Adapters are public catalog code and must be readable to the sandboxed adapter process, so they go
+ * in a sibling of the happy home rather than inside it.
+ */
+export function channelHostDirectories(happyHomeDir: string): { dataDir: string; extensionsDir: string } {
+    const home = happyHomeDir.replace(/[\\/]+$/, '');
+    return { dataDir: join(home, 'channel-host'), extensionsDir: `${home}-channel-extensions` };
+}
+
 export type ChannelHostAdvertisement = NonNullable<MachineMetadata['channelHost']>;
 
 export interface ChannelHostInit {
     v: typeof CHANNEL_HOST_PROTOCOL_VERSION;
     dataDir: string;
+    /** Where the host installs adapters: outside the happy home, which its sandbox denies to adapters. */
+    extensionsDir: string;
     machine: {
         id: string;
         platform: string;

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
     ChannelHostRequestError,
+    channelHostDirectories,
     createChannelHostSupervisor,
     resolveChannelHostEntry,
     spawnChannelHostChild,
@@ -56,6 +57,7 @@ class FakeChild extends EventEmitter implements ChannelHostChild {
 const init: ChannelHostInit = {
     v: 1,
     dataDir: '/home/u/.happy/channel-host',
+    extensionsDir: '/home/u/.happy-channel-extensions',
     machine: { id: 'm-1', platform: 'darwin', hostname: 'box', homeDir: '/home/u', capabilities: { happyCliVersion: '1.0.0' } },
     happyBaseUrl: 'https://happy.example',
     happy: { token: 'SECRET-TOKEN', secret: null },
@@ -68,6 +70,17 @@ const ready = {
 const advertisement = {
     protocolVersion: 1, custody: 'available', isolation: 'available', providers: ['telegram'], hostKey: 'host-key', fingerprint: 'aa:bb',
 };
+
+describe('channelHostDirectories', () => {
+    it('keeps adapters outside the happy home, which the host sandbox denies to adapter code', () => {
+        expect(channelHostDirectories('/home/u/.happy')).toEqual({
+            dataDir: '/home/u/.happy/channel-host',
+            extensionsDir: '/home/u/.happy-channel-extensions',
+        });
+        // A custom HAPPY_HOME_DIR gets its own sibling, so two daemons never share adapters.
+        expect(channelHostDirectories('/srv/happy-b/').extensionsDir).toBe('/srv/happy-b-channel-extensions');
+    });
+});
 
 describe('resolveChannelHostEntry', () => {
     const present = new Set(['/cli/index.mjs', '/cli/channel-extension-host.mjs']);

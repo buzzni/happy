@@ -269,6 +269,7 @@ import {
 import { mergeAdditionalDirectoriesIntoSandboxEnvironment } from '@/utils/additionalDirectoriesEnv';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import {
+  channelHostDirectories,
   createChannelHostSupervisor,
   resolveChannelHostEntry,
   spawnChannelHostChild,
@@ -4461,12 +4462,13 @@ export async function startDaemon(): Promise<void> {
         createSession: (input) => api.getOrCreateSession({ ...input, state: { controlledByUser: false } }),
         spawnSession: (options) => spawnSession(options),
       });
-      const channelHostDataDir = join(configuration.happyHomeDir, 'channel-host');
+      const channelHostDirs = channelHostDirectories(configuration.happyHomeDir);
       channelHost = createChannelHostSupervisor({
         spawnChild: () => spawnChannelHostChild(channelHostEntry.entry, configuration.happyHomeDir),
         buildInit: () => ({
           v: 1,
-          dataDir: channelHostDataDir,
+          dataDir: channelHostDirs.dataDir,
+          extensionsDir: channelHostDirs.extensionsDir,
           machine: {
             id: machine.id,
             platform: os.platform(),
