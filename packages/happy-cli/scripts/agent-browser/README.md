@@ -153,11 +153,12 @@ here, while the sandbox launcher accepts only working directories whose realpath
    umask does not apply, so everything it creates later stays readable and writable for `agent-sbx`.
    No recursive ACL walk runs over the live `/work` tree: `agent-sbx` can write there, and a symlink
    swapped in during a root walk could redirect the grant.
-4. roots the daemon's machine file RPCs (a project's document list, file reads) at `/work`
-   (`HAPPY_WORKSPACE_ROOT` in `/etc/abp/happy-daemon.env`; the daemon default is its home). They refuse a
-   path that goes through a link, so set this machine's workspace root in Studio to the real path
-   (`/work/agent-workspace/...`), not `/home/agent/workspace/...`: projects registered under the link path
-   cannot list their documents.
+4. roots the daemon's machine RPCs (a project's document list, file reads, bash, terminal cwd) at the
+   link `/home/agent/workspace` (`HAPPY_WORKSPACE_ROOT` in `/etc/abp/happy-daemon.env`; the daemon default
+   is its home). They check the root lexically, and the document list refuses a link below its root, so
+   the root is the link the server puts every chat under; the realpath checks then run in
+   `/work/agent-workspace`. Keep projects registered under `/home/agent/workspace/...`: a real
+   `/work/...` path is outside the root and refused.
 
 The filesystem must support POSIX ACLs (ext4, xfs, btrfs); otherwise the installer stops with a
 message. `abp-install check` verifies that the link resolves to `/work/agent-workspace`, that both

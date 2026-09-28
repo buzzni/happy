@@ -31,6 +31,8 @@ export const PATHS = {
   adminSocket: "/run/abp/admin.sock",
   mcp: "/run/abp-mcp",
   work: "/work",
+  /** Link to /work/agent-workspace where the Saycode server makes the daemon create Desktop chats. */
+  agentWorkspaceLink: "/home/agent/workspace",
   libexec: "/usr/local/libexec/abp",
   launcher: "/usr/local/libexec/abp/claude-sbx-launch",
   firewallReader: "/usr/local/libexec/abp/abp-firewall-read",
@@ -394,9 +396,10 @@ export function daemonEnv(install) {
     `HAPPY_BROWSER_TASK_BROKER_SOCKET=${PATHS.brokerSocket}`,
     `HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE=${PATHS.daemonToken}`,
     `HAPPY_BROWSER_TASK_PROFILE_ID=${install.agentProfileId}`,
-    // Machine file RPCs (document list, file reads) accept paths under this root only; the default is the
-    // daemon's home, but every project here lives under /work (the home keeps only a link to it).
-    `HAPPY_WORKSPACE_ROOT=${PATHS.work}`,
+    // Machine RPCs (document list, file reads, bash, terminal cwd) accept paths under this root only; the
+    // default is the daemon's home. They check the root lexically and the document list refuses a link below
+    // its root, so the root is the link the server puts every chat under (the realpath checks then run in /work).
+    `HAPPY_WORKSPACE_ROOT=${PATHS.agentWorkspaceLink}`,
     // The machine policy is mandatory: a session without an enabled sandbox config refuses to
     // start. Every daemon session gets this one (writes bounded to its /work workspace).
     `HAPPY_PROJECT_SANDBOX_CONFIG='${JSON.stringify(SESSION_SANDBOX_CONFIG)}'`,

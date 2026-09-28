@@ -1,9 +1,13 @@
 import { generateKeyPairSync } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import type { RpcHandlerManager } from '../../src/api/rpc/RpcHandlerManager'
 import { parseRuntimeConfig } from '../../src/browserRuntime/runtimeConfig'
+import { registerCommonHandlers } from '../../src/modules/common/registerCommonHandlers'
+import { resolveDaemonAllowedRoot } from '../../src/modules/common/resolveAllowedRoot'
 import {
     DEFAULT_RUNTIME_PORT, PATHS, browserCreateArgs, chromiumSeccompProfile, daemonEnv, egressRules, egressRulesFile, fenceRule, firewallRules,
     firewallRulesFile, happySettings, mergeInstallOptions, networkCreateArgs, permissionTable, runtimeConfig, runtimeCreateArgs, stackLayout, sudoersDropIn,
@@ -268,10 +272,32 @@ describe('system files', () => {
         expect(env).not.toMatch(/SECRET|GRANT_FILE|TOKEN=/)
     })
 
-    it('roots the daemon\'s machine file RPCs at /work, where abp-install keeps every project', () => {
-        // The daemon default is its home, but the workspace moved to /work (the home keeps only a link to it),
-        // so the document list and file reads of every project on H were refused.
-        expect(daemonEnv(base()).split('\n')).toContain(`HAPPY_WORKSPACE_ROOT=${PATHS.work}`)
+    it('lets the daemon\'s machine file RPCs reach a Desktop chat under the /home/agent/workspace link the server uses', async () => {
+        // The Saycode server creates chats under the link (README "Agent workspace"), which points into /work.
+        // The file RPCs check the root lexically and the document list refuses a link below its root, so the
+        // root must be the link itself. The host tree is rebuilt under a temporary directory.
+        const host = mkdtempSync(join(tmpdir(), 'abp-workspace-root-'))
+        try {
+            const at = (path: string) => join(host, path)
+            const chat = at('home/agent/workspace/aplus-dev-studio-workspace/ctx/chats/c1')
+            mkdirSync(at('work/agent-workspace/aplus-dev-studio-workspace/ctx/chats/c1'), { recursive: true })
+            writeFileSync(at('work/agent-workspace/aplus-dev-studio-workspace/ctx/chats/c1/notes.md'), 'notes')
+            mkdirSync(at('home/agent'), { recursive: true })
+            symlinkSync(at('work/agent-workspace'), at('home/agent/workspace'))
+            const line = daemonEnv(base()).split('\n').find((entry: string) => entry.startsWith('HAPPY_WORKSPACE_ROOT='))
+            const env = line === undefined ? {} : { HAPPY_WORKSPACE_ROOT: at(line.slice('HAPPY_WORKSPACE_ROOT='.length)) }
+            const handlers = new Map<string, (data: Record<string, unknown>) => Promise<Record<string, unknown>>>()
+            registerCommonHandlers({ registerHandler: (method: string, handler: any) => handlers.set(method, handler) } as unknown as RpcHandlerManager,
+                resolveDaemonAllowedRoot(env, at('home/agent')))
+
+            await expect(handlers.get('readFile')!({ path: join(chat, 'notes.md') })).resolves.toMatchObject({ success: true })
+            await expect(handlers.get('listDirectory')!({ path: chat })).resolves.toMatchObject({ success: true })
+            await expect(handlers.get('listWorkspaceDirectory')!({ workspaceRoot: chat, path: chat })).resolves.toMatchObject({
+                success: true, entries: [expect.objectContaining({ name: 'notes.md', type: 'file' })],
+            })
+        } finally {
+            rmSync(host, { recursive: true, force: true })
+        }
     })
 
     it('gives every daemon session an enabled sandbox config bounded to /work (mandatory machine)', () => {
