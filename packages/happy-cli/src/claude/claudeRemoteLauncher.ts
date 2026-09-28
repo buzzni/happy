@@ -283,6 +283,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * would relay whatever text happened to be standing (Saycode specs/desktop-messenger-channels).
      */
     let lastResultSucceeded = true;
+    /** The drain reads it: after its interrupt Claude Code exits 1, which only an interrupted turn explains. */
+    let lastResultInterrupted = false;
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
@@ -335,6 +337,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
              */
             const result = message as unknown as { subtype?: unknown; is_error?: unknown; result?: unknown };
             lastResultSucceeded = result.subtype === 'success' && result.is_error !== true;
+            lastResultInterrupted = result.subtype === 'error_during_execution';
             // Only a successful result carries an answer. A failed one must not leave an earlier
             // candidate standing either — the queue marker with an empty text clears it, and the
             // terminal that follows then reports no answer rather than an old one.
@@ -556,6 +559,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             cancelPendingPermissions: () => { permissionHandler.reset('Session is shutting down'); },
             generation: () => startedGeneration()?.observer ?? null,
             hasHeldBackInput: () => pending !== null,
+            lastResultInterrupted: () => lastResultInterrupted,
         });
 
         // Track session ID to detect when it actually changes
