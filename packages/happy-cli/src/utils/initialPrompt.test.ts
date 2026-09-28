@@ -2,7 +2,10 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+const happyHome = vi.hoisted(() => ({ dir: '' }))
+vi.mock('@/configuration', () => ({ configuration: { get happyHomeDir() { return happyHome.dir } } }))
 
 import {
   consumeConfirmedInitialPromptDelivery,
@@ -30,6 +33,18 @@ describe('initial prompt staging (E2BIG)', () => {
 
     expect(staged.env).toEqual({ HAPPY_INITIAL_PROMPT: 'review this' })
     expect(staged.cleanup).toBeUndefined()
+  })
+
+  // Desktop specs/windows-build-support W0-5g: the OS temp directory is not guaranteed
+  // private (a Windows user's %TEMP% can carry another principal's access); the Happy
+  // home is the directory Desktop keeps owner-only.
+  it('stages an oversized prompt inside the Happy home, not the OS temp directory', async () => {
+    happyHome.dir = await mkdtemp(join(tmpdir(), 'happy-home-test-'))
+    const staged = await stageInitialPromptEnvironment('x'.repeat(INITIAL_PROMPT_INLINE_LIMIT_BYTES + 1))
+    const file = staged.env.HAPPY_INITIAL_PROMPT_FILE!
+    expect(file.startsWith(join(happyHome.dir, 'tmp') + (process.platform === 'win32' ? '\\' : '/'))).toBe(true)
+    await staged.cleanup?.()
+    expect(existsSync(file)).toBe(false)
   })
 
   it('stages a prompt over the inline limit as a file instead of an env value', async () => {

@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { RawJSONLines } from '@/claude/types'
+import { configuration } from '@/configuration'
 import type { PermissionMode } from '@/api/types'
 import { ZAI_CLAUDE_DEFAULT_MODEL } from '@/managed/zaiClaudeEnvironment'
 
@@ -42,8 +42,13 @@ export async function stageInitialPromptEnvironment(
   if (Buffer.byteLength(prompt, 'utf8') < INITIAL_PROMPT_INLINE_LIMIT_BYTES) {
     return { env: { HAPPY_INITIAL_PROMPT: prompt } }
   }
-  const makeTempDir = deps.makeTempDir
-    ?? (() => mkdtemp(join(tmpdir(), 'happy-initial-prompt-')))
+  // Inside the Happy home, which Desktop keeps owner-only on Windows; the OS temp
+  // directory can grant other principals access (specs/windows-build-support W0-5g).
+  const makeTempDir = deps.makeTempDir ?? (async () => {
+    const root = join(configuration.happyHomeDir, 'tmp')
+    await mkdir(root, { recursive: true })
+    return mkdtemp(join(root, 'happy-initial-prompt-'))
+  })
   const directory = await makeTempDir()
   const file = join(directory, 'initial-prompt.txt')
   // 0600: the prompt carries untrusted repository text and project context.
