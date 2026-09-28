@@ -769,6 +769,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             if (proof) proof.inputExhausted = true;
                             exitReason = 'exit';
                         }
+                        // A kill seals the gate without requesting a stop; a batch it refused must
+                        // end the loop, or every relaunch meets the same refusal and spins forever.
+                        if (msg === null && drain?.gate.isClosed()) exitReason = 'exit';
 
                         // Check if mode has changed
                         if (msg) {
