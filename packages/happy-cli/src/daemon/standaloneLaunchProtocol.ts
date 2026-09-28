@@ -30,8 +30,9 @@ export const launchReplySchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('outcome'), nonce: id, launchId: id, decision: z.enum(['none', 'confirmed', 'blocked']) }).strict(),
 ]);
 
-/** The runtimes that implement the session drain; any other command must not adopt a standalone launch. */
-const DRAINABLE_COMMANDS: ReadonlySet<string> = new Set(['codex', 'claude']);
+/** The runtimes that implement the session drain; nothing else may run in the Windows standalone runtime. */
+export const STANDALONE_DRAIN_PROVIDERS = ['codex', 'claude'] as const;
+const DRAINABLE_COMMANDS: ReadonlySet<string> = new Set(STANDALONE_DRAIN_PROVIDERS);
 // index.ts captures before loading provider modules with import-time side effects.
 let entryBootstrap: StandaloneLaunchBootstrap | undefined;
 export function captureStandaloneLaunchBootstrap(env: NodeJS.ProcessEnv, command: string | undefined): void {
