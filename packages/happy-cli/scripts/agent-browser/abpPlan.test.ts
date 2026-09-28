@@ -268,10 +268,12 @@ describe('system files', () => {
         expect(env).not.toMatch(/SECRET|GRANT_FILE|TOKEN=/)
     })
 
-    it('roots the daemon\'s machine file RPCs at /work, where abp-install keeps every project', () => {
-        // The daemon default is its home, but the workspace moved to /work (the home keeps only a link to it),
-        // so the document list and file reads of every project on H were refused.
-        expect(daemonEnv(base()).split('\n')).toContain(`HAPPY_WORKSPACE_ROOT=${PATHS.work}`)
+    it('roots the daemon\'s machine file RPCs at the agent workspace link, the path the server uses', () => {
+        // Studio and the Desktop address projects and chats as /home/agent/workspace/... (a link to
+        // /work/agent-workspace). Rooted at the home, a project-scoped read refused the link below the root;
+        // rooted at /work, every RPC on a link path was refused. The link itself as the root admits both checks.
+        expect(daemonEnv(base()).split('\n')).toContain(`HAPPY_WORKSPACE_ROOT=${PATHS.agentWorkspaceLink}`)
+        expect(PATHS.agentWorkspaceLink).toBe('/home/agent/workspace')
     })
 
     it('gives every daemon session an enabled sandbox config bounded to /work (mandatory machine)', () => {
