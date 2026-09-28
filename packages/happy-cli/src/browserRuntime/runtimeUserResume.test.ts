@@ -199,9 +199,11 @@ describe('whether an agent session waits for the user (a host keeps a run-once c
         const h = await createHarness()
         expect(await h.runtime.sessionWaiting('a')).toBe(false)
         let during = false
-        await h.takeOverAndRelease(() => { void h.runtime.sessionWaiting('a').then((value) => { during = value }) })
+        const released = await h.takeOverAndRelease(() => { void h.runtime.sessionWaiting('a').then((value) => { during = value }) })
         await new Promise((resolve) => setTimeout(resolve, 0))
         expect(during).toBe(true)
+        expect(released.pauseReason).toBe('user-input-complete')
+        expect(await h.runtime.sessionWaiting('a')).toBe(false)
         await h.store.close()
     })
 })
