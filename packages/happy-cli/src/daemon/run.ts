@@ -3289,9 +3289,10 @@ export async function startDaemon(): Promise<void> {
       pidToAdoptedAt.delete(pid);
       if (tracked?.happySessionId) resumeCursorPersistedAt.delete(tracked.happySessionId);
       persistTrackedSessions();
-      const heldAttention = tracked?.happySessionId ? heldBrowserAttentions.take(tracked.happySessionId) : undefined;
-      if (heldAttention && preservedForResume) void resumeHeldBrowserAttention(heldAttention);
-      else if (heldAttention) logger.debug(`[agent-browser] held attention dropped: session not resumable sessionId=${heldAttention.sessionId}`);
+      if (tracked?.happySessionId && preservedForResume) heldBrowserAttentions.resumeAtExit(tracked.happySessionId, resumeHeldBrowserAttention);
+      else if (tracked?.happySessionId && heldBrowserAttentions.take(tracked.happySessionId)) {
+        logger.debug(`[agent-browser] held attention dropped: session not resumable sessionId=${tracked.happySessionId}`);
+      }
       if (tracked?.userHomeDir) {
         const homeDir = tracked.userHomeDir;
         if (preservedForResume) {

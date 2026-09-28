@@ -66,16 +66,31 @@ export interface HeldBrowserAttention { sessionId: string; directory: string; te
  * Attentions for live run-once chats whose host parks them (Studio Chat(beta)). Such a turn exits after its
  * reply without reading a message posted meanwhile, so the attention waits for the exit and resumes the
  * session then. In memory only: a daemon restart forgets them (the session is then no longer daemon-owned).
+ * A session also counts as held while its exit-time resume runs: the attention is already delivered upstream,
+ * so nothing else reports it as waiting until the resumed turn is live.
  */
 export function createHeldBrowserAttentions() {
     const held = new Map<string, HeldBrowserAttention>()
+    const resuming = new Map<string, number>()
     return {
         hold(attention: HeldBrowserAttention): void { held.set(attention.sessionId, attention) },
-        has(sessionId: string): boolean { return held.has(sessionId) },
+        has(sessionId: string): boolean { return held.has(sessionId) || resuming.has(sessionId) },
         take(sessionId: string): HeldBrowserAttention | undefined {
             const attention = held.get(sessionId)
             held.delete(sessionId)
             return attention
+        },
+        resumeAtExit(sessionId: string, resume: (attention: HeldBrowserAttention) => Promise<void>): boolean {
+            const attention = held.get(sessionId)
+            held.delete(sessionId)
+            if (!attention) return false
+            resuming.set(sessionId, (resuming.get(sessionId) ?? 0) + 1)
+            void resume(attention).catch(() => {}).finally(() => {
+                const left = (resuming.get(sessionId) ?? 1) - 1
+                if (left > 0) resuming.set(sessionId, left)
+                else resuming.delete(sessionId)
+            })
+            return true
         },
     }
 }

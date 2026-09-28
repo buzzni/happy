@@ -99,6 +99,31 @@ describe('attention delivery over the existing encrypted server path', () => {
             expect(held.has('session-1')).toBe(false)
         })
 
+        it('keeps the session waiting from the exit until the resume that delivers the held attention settles', async () => {
+            const held = createHeldBrowserAttentions()
+            const attention = { sessionId: 's', directory: '/w', text: 'approved', localId: 'a' }
+            held.hold(attention)
+            let finish!: () => void
+            const resumed: unknown[] = []
+            const resume = (input: unknown) => { resumed.push(input); return new Promise<void>(resolve => { finish = resolve }) }
+            expect(held.resumeAtExit('s', resume)).toBe(true)
+            expect(resumed).toEqual([attention])
+            // The attention left the held map, but its resume (spawn, retries) has not run a turn yet.
+            expect(held.has('s')).toBe(true)
+            finish(); await new Promise(resolve => setImmediate(resolve))
+            expect(held.has('s')).toBe(false)
+            expect(held.resumeAtExit('s', resume)).toBe(false)
+            expect(resumed).toHaveLength(1)
+        })
+
+        it('stops reporting the session as waiting when the exit-time resume fails', async () => {
+            const held = createHeldBrowserAttentions()
+            held.hold({ sessionId: 's', directory: '/w', text: 'approved', localId: 'a' })
+            expect(held.resumeAtExit('s', async () => { throw new Error('spawn failed') })).toBe(true)
+            await new Promise(resolve => setImmediate(resolve))
+            expect(held.has('s')).toBe(false)
+        })
+
         it('keeps only the latest attention per session (the agent reads the task state anyway)', () => {
             const held = createHeldBrowserAttentions()
             held.hold({ sessionId: 's', directory: '/w', text: 'first', localId: 'a' })
