@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
 
@@ -52,6 +53,8 @@ const mocks = vi.hoisted(() => {
     /** Lifecycle events in order, for the standalone drain tests. */
     order: [] as string[],
     exit: null as { code: number | null; signal: string | null; forced: boolean } | null,
+    /** When set, the next backend is the real AcpBackend driving a real agent process. */
+    realBackend: false,
   };
 
   return {
@@ -131,13 +134,20 @@ vi.mock('@/utils/serverConnectionErrors', () => ({
 vi.mock('@/ui/logger', () => ({
   logger: {
     debug: mocks.mockLoggerDebug,
+    debugLargeJson: vi.fn(),
+    warn: vi.fn(),
   },
 }));
 
-vi.mock('./AcpBackend', () => ({
+vi.mock('./AcpBackend', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./AcpBackend')>();
+  return {
   AcpBackend: class MockAcpBackend {
     constructor(args: any) {
       mocks.backendState.constructorArgs = args;
+      if (mocks.backendState.realBackend) {
+        return new actual.AcpBackend(args) as any;
+      }
     }
 
     onMessage(handler: (message: any) => void) {
@@ -232,7 +242,8 @@ vi.mock('./AcpBackend', () => ({
       mocks.backendState.order.push(mocks.backendState.exit ? 'disposed-after-exit' : 'disposed-live');
     }
   },
-}));
+  };
+});
 
 import { runAcp } from './runAcp';
 
@@ -263,6 +274,7 @@ describe('runAcp', () => {
     mocks.backendState.resolveHangingPrompt = null;
     mocks.backendState.order = [];
     mocks.backendState.exit = null;
+    mocks.backendState.realBackend = false;
 
     mocks.mockApiCreate.mockResolvedValue({
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
@@ -984,5 +996,31 @@ describe('runAcp', () => {
         });
       } finally { await parent.close(); }
     });
+
+    it('finishes the drain when a real agent exits on input EOF without answering the cancelled prompt', async () => {
+      const { StandaloneLaunchControl } = await import('@/daemon/standaloneLaunchControl');
+      const parent = await StandaloneLaunchControl.open('acp-eof-instance');
+      const bootstrap = parent.reserve('acp-eof-launch');
+      const agent = fileURLToPath(new URL('./__fixtures__/fakeAcpAgent.mjs', import.meta.url));
+      mocks.backendState.realBackend = true;
+      vi.stubEnv('FAKE_ACP_HOLD_PROMPT', '1');
+      try {
+        await withStorage(async () => {
+          const runPromise = runAcp({ credentials, agentName: 'grok', command: process.execPath, args: [agent], startedBy: 'daemon', standaloneLaunch: bootstrap });
+          await vi.waitFor(() => expect(mocks.getUserMessageHandler()).toBeTypeOf('function'), { timeout: 10_000 });
+          mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'long work' } });
+          await vi.waitFor(() => expect(mocks.mockSession.keepAlive).toHaveBeenCalledWith(true, 'remote'), { timeout: 10_000 });
+          const proof = await parent.drain(bootstrap.launchId, new AbortController().signal, { remainingMs: () => 30_000 });
+          expect(proof).toEqual({ stored: true, releaseAcknowledged: true });
+          await expect(runPromise).resolves.toBeUndefined();
+          const turnEnds = mocks.mockSession.sendSessionProtocolMessage.mock.calls
+            .map(([envelope]: any[]) => envelope?.ev).filter((ev: any) => ev?.t === 'turn-end');
+          expect(turnEnds.map((ev: any) => ev.status)).toEqual(['cancelled']);
+        });
+      } finally {
+        vi.unstubAllEnvs();
+        await parent.close();
+      }
+    }, 40_000);
   });
 });

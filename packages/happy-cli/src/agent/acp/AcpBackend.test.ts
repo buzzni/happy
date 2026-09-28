@@ -60,6 +60,17 @@ describe('AcpBackend process', () => {
     expect(await exited(b)).toEqual({ code: 0, signal: null, forced: false });
   });
 
+  it('settles an unanswered prompt once the agent ends after its input was closed', async () => {
+    const b = backend([], { FAKE_ACP_HOLD_PROMPT: '1' });
+    await b.startSession();
+    const prompt = b.sendPrompt('fake-session', 'hello').then(() => 'settled', () => 'rejected');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    b.endInput();
+    await exited(b);
+    const outcome = await Promise.race([prompt, new Promise((resolve) => setTimeout(() => resolve('pending'), 2000))]);
+    expect(outcome).toBe('settled');
+  });
+
   it('reports an agent it had to kill as forced, whatever the exit code said', async () => {
     const b = backend([], { FAKE_ACP_IGNORE_EOF: '1' });
     await b.startSession();

@@ -1071,7 +1071,18 @@ export class AcpBackend implements AgentBackend {
       };
 
       logger.debugLargeJson(`[AcpBackend] Prompt request:`, promptRequest);
-      await this.connection.prompt(promptRequest);
+      // The SDK never settles a pending request when the stream closes, so an
+      // agent that ends on EOF before answering would strand this call. Once we
+      // closed its input ourselves, the connection closing is the turn's end.
+      const connection = this.connection;
+      const answered = await Promise.race([
+        connection.prompt(promptRequest).then(() => true),
+        connection.closed.then(() => this.inputEnded ? false : new Promise<never>(() => {})),
+      ]);
+      if (!answered) {
+        logger.debug('[AcpBackend] Agent ended after its input closed; the prompt went unanswered');
+        return;
+      }
       logger.debug('[AcpBackend] Prompt request sent to ACP connection');
       
       // Don't emit 'idle' here - it will be emitted after all message chunks are received
