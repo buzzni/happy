@@ -199,6 +199,22 @@ describe('createChannelHostSupervisor', () => {
         expect(logs.join(' ')).not.toContain('SEALED');
     });
 
+    it('passes on the closed code a host sends for a call it could not open, and nothing else', async () => {
+        const supervisor = make();
+        supervisor.start();
+        children[0].send(ready);
+        await flush();
+        const refused = supervisor.call({ wire: { sealed: 'SEALED-CALL' } });
+        const first = children[0].written.find((message) => message.t === 'settings')!;
+        children[0].send({ t: 'settings-result', id: first.id, wire: { sealed: '', error: 'ENVELOPE_EXPIRED' } });
+        await expect(refused).resolves.toEqual({ wire: { sealed: '', error: 'ENVELOPE_EXPIRED' } });
+
+        const odd = supervisor.call({ wire: { sealed: 'SEALED-CALL' } });
+        const second = children[0].written.filter((message) => message.t === 'settings')[1];
+        children[0].send({ t: 'settings-result', id: second.id, wire: { sealed: '', error: 'token 123:abc leaked' } });
+        await expect(odd).resolves.toEqual({ wire: { sealed: '' } });
+    });
+
     it('answers a settings call with closed codes: unavailable, malformed, and timed out', async () => {
         const supervisor = make();
         await expect(supervisor.call({ wire: { sealed: 'x' } }))

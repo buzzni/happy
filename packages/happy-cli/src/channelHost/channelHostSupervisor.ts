@@ -61,7 +61,7 @@ export class ChannelHostRequestError extends Error {
     }
 }
 
-type ChannelHostCallResult = { wire: { sealed: string } } | { error: string; code: string };
+type ChannelHostCallResult = { wire: { sealed: string; error?: string } } | { error: string; code: string };
 
 export interface ChannelHostSupervisor {
     start(): void;
@@ -125,10 +125,15 @@ function isNonEmptyString(value: unknown): value is string {
     return typeof value === 'string' && value.length > 0;
 }
 
-function readSealedWire(value: unknown): { sealed: string } | null {
+/**
+ * A host that cannot open a call answers `{sealed: '', error}` in plaintext. Only a closed code is
+ * carried on; anything else in `error` is dropped rather than relayed.
+ */
+function readSealedWire(value: unknown): { sealed: string; error?: string } | null {
     if (!value || typeof value !== 'object') return null;
-    const sealed = (value as { sealed?: unknown }).sealed;
-    return typeof sealed === 'string' ? { sealed } : null;
+    const { sealed, error } = value as { sealed?: unknown; error?: unknown };
+    if (typeof sealed !== 'string') return null;
+    return typeof error === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error) ? { sealed, error } : { sealed };
 }
 
 function readAdvertisement(message: Record<string, unknown>): ChannelHostAdvertisement | null {
