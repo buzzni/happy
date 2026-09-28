@@ -67,15 +67,32 @@ export interface HeldBrowserAttention { sessionId: string; directory: string; te
  * reply without reading a message posted meanwhile, so the attention waits for the exit and resumes the
  * session then. In memory only: a daemon restart forgets them (the session is then no longer daemon-owned).
  */
-export function createHeldBrowserAttentions() {
-    const held = new Map<string, HeldBrowserAttention>()
+export function createHeldBrowserAttentions(now: () => number = Date.now) {
+    const held = new Map<string, { attention: HeldBrowserAttention; answered: boolean }>()
+    /**
+     * The host asks "waiting?" once, at the turn end, which may come just after the exit took the attention
+     * to resume the session: that first question is still owed a true answer. Forgotten after 10 minutes.
+     */
+    const owed = new Map<string, number>()
     return {
-        hold(attention: HeldBrowserAttention): void { held.set(attention.sessionId, attention) },
+        hold(attention: HeldBrowserAttention): void { held.set(attention.sessionId, { attention, answered: false }) },
         has(sessionId: string): boolean { return held.has(sessionId) },
         take(sessionId: string): HeldBrowserAttention | undefined {
-            const attention = held.get(sessionId)
+            const entry = held.get(sessionId)
             held.delete(sessionId)
-            return attention
+            if (entry && !entry.answered) owed.set(sessionId, now())
+            return entry?.attention
+        },
+        /** For browser-session-waiting: true while held, and once for an attention taken before anyone asked. */
+        answerWaiting(sessionId: string): boolean {
+            const entry = held.get(sessionId)
+            if (entry) {
+                entry.answered = true
+                return true
+            }
+            const since = owed.get(sessionId)
+            owed.delete(sessionId)
+            return since !== undefined && now() - since < 10 * 60_000
         },
     }
 }

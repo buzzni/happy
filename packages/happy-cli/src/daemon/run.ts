@@ -4441,7 +4441,7 @@ export async function startDaemon(): Promise<void> {
       automationStore,
       aiCredentialRuntime,
       ...(browserTaskBroker ? {
-        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.has(sessionId) || browserTaskBroker!.waiting(sessionId),
+        browserSessionWaiting: async (sessionId: string) => heldBrowserAttentions.answerWaiting(sessionId) || browserTaskBroker!.waiting(sessionId),
       } : {}),
       autonomousQualityGate: createAutonomousQualityGateRpcHandlers(autonomousQualityGateRegistry),
       checkpoint: createCheckpointRpcHandlers({

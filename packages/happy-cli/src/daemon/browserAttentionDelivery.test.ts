@@ -99,6 +99,31 @@ describe('attention delivery over the existing encrypted server path', () => {
             expect(held.has('session-1')).toBe(false)
         })
 
+        it('owes the host one "waiting" answer per held attention, before or after the exit', () => {
+            // Before the exit: the host asks while it is held; the exit then owes nothing more.
+            const early = createHeldBrowserAttentions()
+            early.hold({ sessionId: 's', directory: '/w', text: 't', localId: 'a' })
+            expect(early.answerWaiting('s')).toBe(true)
+            expect(early.take('s')).toMatchObject({ localId: 'a' })
+            expect(early.answerWaiting('s')).toBe(false)
+            // After the exit (the exit handler took it to resume): the host's first question still gets true, once.
+            const late = createHeldBrowserAttentions()
+            late.hold({ sessionId: 's', directory: '/w', text: 't', localId: 'b' })
+            late.take('s')
+            expect(late.answerWaiting('s')).toBe(true)
+            expect(late.answerWaiting('s')).toBe(false)
+            expect(late.answerWaiting('other')).toBe(false)
+        })
+
+        it('forgets an owed answer nobody asked for (a host that never parks)', () => {
+            let now = 0
+            const held = createHeldBrowserAttentions(() => now)
+            held.hold({ sessionId: 's', directory: '/w', text: 't', localId: 'a' })
+            held.take('s')
+            now = 11 * 60_000
+            expect(held.answerWaiting('s')).toBe(false)
+        })
+
         it('keeps only the latest attention per session (the agent reads the task state anyway)', () => {
             const held = createHeldBrowserAttentions()
             held.hold({ sessionId: 's', directory: '/w', text: 'first', localId: 'a' })
