@@ -11,7 +11,7 @@ Choose a wire-compatible client change instead of introducing a machine-wide pol
 1. Add idle bound/recovery regression: observed 13 message reads in one idle minute before the change (done).
 2. Implement bounded idle delay at existing receive loop (done).
 3. Targeted ApiSession suite plus build: 138 tests passed on latest main 50cca826; existing build warnings recorded.
-4. Claude Opus 5.5/high review PASS after replacing wall-clock deadlines with 5s tick countdown and adding steady-state cap, clock rollback and live-socket reset regressions. PR pending.
+4. Claude Opus 5.5/high review PASS after replacing wall-clock deadlines with 5s tick countdown and adding steady-state cap, clock rollback and live-socket reset regressions. PR: https://github.com/buzzni/happy/pull/588.
 
 ## Rollout
 After merge, use the existing explicit-approval GitHub Actions release runbook. Roll back via previous released runtime pin. Validate empty GETs per connected session, missed-event recovery, receive lag and reconnect behavior before broad rollout. No production reduction is claimed by unit tests.
