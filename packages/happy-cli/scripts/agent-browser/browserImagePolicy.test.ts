@@ -22,4 +22,10 @@ describe('browser image Chromium policy', () => {
             .toMatch(/^COPY chromium-policy\.json \/etc\/chromium\/policies\/managed\/abp\.json$/m)
         expect(readFileSync(join(here, 'abp-stack.mjs'), 'utf8')).toContain('"chromium-policy.json"')
     })
+
+    it('makes the policy readable by the browser user whatever mode the checkout gave the file', () => {
+        // COPY keeps the build context mode: a checkout made under umask 077 ships a root-only 0600 file Chromium silently ignores.
+        expect(readFileSync(join(here, 'images/browser.Dockerfile'), 'utf8'))
+            .toMatch(/^(?:RUN|\s+&&) chmod 644 \/etc\/chromium\/policies\/managed\/abp\.json$/m)
+    })
 })

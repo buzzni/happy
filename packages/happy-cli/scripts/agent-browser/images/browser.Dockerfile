@@ -13,7 +13,8 @@ COPY chromium-policy.json /etc/chromium/policies/managed/abp.json
 COPY browser-entrypoint.sh /usr/local/bin/browser-entrypoint
 COPY instance-server.py /usr/local/bin/instance-server
 COPY cdp-proxy.py /usr/local/bin/cdp-proxy
-RUN chmod 755 /usr/local/bin/browser-entrypoint /usr/local/bin/instance-server /usr/local/bin/cdp-proxy
+RUN chmod 755 /usr/local/bin/browser-entrypoint /usr/local/bin/instance-server /usr/local/bin/cdp-proxy \
+    && chmod 644 /etc/chromium/policies/managed/abp.json
 USER browser
 EXPOSE 5900 9223 9224
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/browser-entrypoint"]
