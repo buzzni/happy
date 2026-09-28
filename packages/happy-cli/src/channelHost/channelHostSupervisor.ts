@@ -13,6 +13,7 @@
  * init carries the daemon's credential, so diagnostics are closed codes only; the child's stderr is
  * drained and dropped.
  */
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -20,6 +21,7 @@ import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 
 import type { MachineMetadata } from '@/api/types';
+import { scrubSessionLineageEnv } from '@/daemon/sessionEnv';
 
 export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
 
@@ -101,6 +103,20 @@ export function resolveChannelHostEntry(deps: {
     if (!deps.exists(entry)) return { ok: false, code: 'CLI_MISSING' };
     if (!deps.exists(join(cliDir, 'channel-extension-host.mjs'))) return { ok: false, code: 'HOST_MISSING' };
     return { ok: true, entry };
+}
+
+/**
+ * Starts `node <entry> channel-host` with three pipes. Nothing secret goes in argv or the
+ * environment — the credential travels in `init` on stdin — and session lineage the daemon may have
+ * inherited is scrubbed like for any other child.
+ */
+export function spawnChannelHostChild(entry: string, cwd: string): ChannelHostChild {
+    return spawn(process.execPath, ['--no-warnings', '--no-deprecation', entry, 'channel-host'], {
+        cwd,
+        env: scrubSessionLineageEnv(process.env),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+    });
 }
 
 const UNAVAILABLE_REASONS = new Set(['CUSTODY_UNAVAILABLE', 'NODE_TOO_OLD', 'LOCK_HELD', 'INIT_INVALID']);

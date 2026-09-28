@@ -1,4 +1,7 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -6,6 +9,7 @@ import {
     ChannelHostRequestError,
     createChannelHostSupervisor,
     resolveChannelHostEntry,
+    spawnChannelHostChild,
     type ChannelHostChild,
     type ChannelHostInit,
 } from './channelHostSupervisor';
@@ -294,4 +298,41 @@ describe('createChannelHostSupervisor', () => {
         await vi.advanceTimersByTimeAsync(120_000);
         expect(children).toHaveLength(1);
     });
+});
+
+describe('spawnChannelHostChild', () => {
+    it('gives the real child its credential on stdin only — never in argv or the environment', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'channel-host-spawn-'));
+        try {
+            const entry = join(dir, 'index.mjs');
+            // Reports whether the token is visible anywhere but stdin, then waits for stop.
+            writeFileSync(entry, [
+                "import { createInterface } from 'node:readline';",
+                "const lines = createInterface({ input: process.stdin });",
+                "lines.on('line', (line) => {",
+                "  const message = JSON.parse(line);",
+                "  if (message.t === 'stop') process.exit(0);",
+                "  if (message.t !== 'init') return;",
+                "  const visible = (process.argv.join(' ') + JSON.stringify(process.env)).includes('SECRET-TOKEN');",
+                "  process.stdout.write(JSON.stringify({ t: 'ready', custody: 'available', isolation: 'available', providers: [],",
+                "    hostKey: visible ? 'leaked' : 'clean', fingerprint: message.init.happy.token === 'SECRET-TOKEN' ? 'got-init' : 'no-init' }) + '\\n');",
+                "});",
+            ].join('\n'));
+            const advertised: unknown[] = [];
+            const supervisor = createChannelHostSupervisor({
+                spawnChild: () => spawnChannelHostChild(entry, dir),
+                buildInit: () => init,
+                onAdvertisement: (value) => { advertised.push(value); },
+                handleRequest: async () => undefined,
+                log: () => undefined,
+            });
+            supervisor.start();
+            await vi.waitFor(() => expect(advertised[0]).toBeDefined(), { timeout: 10_000 });
+            expect(advertised[0]).toMatchObject({ hostKey: 'clean', fingerprint: 'got-init' });
+            await supervisor.stop();
+            expect(advertised.at(-1)).toBeUndefined();
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }, 20_000);
 });
