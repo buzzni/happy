@@ -49,6 +49,9 @@ const mocks = vi.hoisted(() => {
      */
     hangPromptUntilCancel: false,
     resolveHangingPrompt: null as (() => void) | null,
+    /** Lifecycle events in order, for the standalone drain tests. */
+    order: [] as string[],
+    exit: null as { code: number | null; signal: string | null; forced: boolean } | null,
   };
 
   return {
@@ -190,8 +193,23 @@ vi.mock('./AcpBackend', () => ({
       return true;
     }
 
+    endInput() {
+      mocks.backendState.order.push('input-ended');
+      // The fake agent ends on its own when its input closes.
+      mocks.backendState.exit = { code: 0, signal: null, forced: false };
+    }
+
+    processExit() {
+      return mocks.backendState.exit;
+    }
+
+    processId() {
+      return mocks.backendState.startSessionCalls > 0 ? 4242 : undefined;
+    }
+
     async cancel(sessionId: string) {
       mocks.backendState.cancelCalls.push(sessionId);
+      mocks.backendState.order.push('turn-cancelled');
       // The real AcpBackend awaits the cancel RPC before emitting, so emitting
       // synchronously here would let 'stopped' pre-empt the caller's own
       // post-cancel bookkeeping and exercise a path production never takes.
@@ -211,6 +229,7 @@ vi.mock('./AcpBackend', () => ({
 
     async dispose() {
       mocks.backendState.disposeCalls += 1;
+      mocks.backendState.order.push(mocks.backendState.exit ? 'disposed-after-exit' : 'disposed-live');
     }
   },
 }));
@@ -242,6 +261,8 @@ describe('runAcp', () => {
     mocks.backendState.silentPrompt = false;
     mocks.backendState.hangPromptUntilCancel = false;
     mocks.backendState.resolveHangingPrompt = null;
+    mocks.backendState.order = [];
+    mocks.backendState.exit = null;
 
     mocks.mockApiCreate.mockResolvedValue({
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
@@ -877,5 +898,91 @@ describe('runAcp', () => {
     expect(mocks.backendState.setConfigOptionCalls).toEqual([]);
     expect(mocks.backendState.setModeCalls).toEqual([]);
     expect(mocks.backendState.setModelCalls).toEqual([]);
+  });
+  describe('runAcp under a Windows standalone drain (W0-5f)', () => {
+    const credentials = { token: 'token', encryption: { type: 'legacy' as const, secret: new Uint8Array(32) } };
+    const storage = (order: string[]) => ({
+      tracksShutdownStorage: true,
+      canFreezeInboundMessagesForShutdown: () => true,
+      freezeInboundMessagesForShutdown: vi.fn(() => { order.push('inbound-frozen'); return true; }),
+      flushForShutdown: vi.fn(async () => { order.push('storage-flushed'); return { stored: true as const, revision: 1 }; }),
+      isStorageConfirmationCurrent: () => true,
+    });
+    async function withStorage<T>(work: (order: string[]) => Promise<T>): Promise<T> {
+      const order = mocks.backendState.order;
+      const extra = storage(order);
+      Object.assign(mocks.mockSession, extra);
+      mocks.mockSession.close.mockImplementation(async () => { order.push('session-closed'); });
+      try { return await work(order); } finally {
+        for (const key of Object.keys(extra)) delete (mocks.mockSession as Record<string, unknown>)[key];
+        mocks.mockSession.close.mockImplementation(async () => {});
+      }
+    }
+
+    it('refuses a standalone launch the daemon did not start, before creating an API client', async () => {
+      const { StandaloneLaunchControl } = await import('@/daemon/standaloneLaunchControl');
+      const parent = await StandaloneLaunchControl.open('acp-terminal-instance');
+      try {
+        await expect(runAcp({ credentials, agentName: 'opencode', command: 'opencode', args: ['acp'], startedBy: 'terminal',
+          standaloneLaunch: parent.reserve('acp-terminal-launch') })).rejects.toThrow(/daemon-started/);
+        expect(mocks.mockApiCreate).not.toHaveBeenCalled();
+      } finally { await parent.close(); }
+    });
+
+    it('drains an idle agent through the real launch channel: freeze, input EOF, storage proof, then cleanup', async () => {
+      const { StandaloneLaunchControl } = await import('@/daemon/standaloneLaunchControl');
+      const parent = await StandaloneLaunchControl.open('acp-idle-instance');
+      const bootstrap = parent.reserve('acp-idle-launch');
+      try {
+        await withStorage(async (order) => {
+          const runPromise = runAcp({ credentials, agentName: 'opencode', command: 'opencode', args: ['acp'], startedBy: 'daemon', standaloneLaunch: bootstrap });
+          await vi.waitFor(() => expect(mocks.backendState.startSessionCalls).toBe(1));
+          expect(mocks.mockSetupOfflineReconnection).toHaveBeenCalledWith(expect.objectContaining({ sessionOptions: { trackShutdownStorage: true } }));
+          const proof = await parent.drain(bootstrap.launchId, new AbortController().signal, { remainingMs: () => 30_000 });
+          expect(proof).toEqual({ stored: true, releaseAcknowledged: true });
+          await runPromise;
+          expect(order).toEqual(['inbound-frozen', 'input-ended', 'storage-flushed', 'disposed-after-exit', 'session-closed']);
+        });
+      } finally { await parent.close(); }
+    });
+
+    it('stops on SIGTERM through the same path as a kill, instead of dying mid-decision', async () => {
+      const { StandaloneLaunchControl } = await import('@/daemon/standaloneLaunchControl');
+      const parent = await StandaloneLaunchControl.open('acp-signal-instance');
+      const before = process.listenerCount('SIGTERM');
+      try {
+        await withStorage(async () => {
+          const runPromise = runAcp({ credentials, agentName: 'opencode', command: 'opencode', args: ['acp'], startedBy: 'daemon', standaloneLaunch: parent.reserve('acp-signal-launch') });
+          await vi.waitFor(() => expect(mocks.backendState.startSessionCalls).toBe(1));
+          expect(process.listenerCount('SIGTERM')).toBe(before + 1);
+          process.emit('SIGTERM', 'SIGTERM');
+          await expect(runPromise).resolves.toBeUndefined();
+          expect(mocks.backendState.disposeCalls).toBe(1);
+          expect(process.listenerCount('SIGTERM')).toBe(before);
+        });
+      } finally { await parent.close(); }
+    });
+
+    it('cancels a running turn before closing the input, and ends that turn as cancelled rather than failed', async () => {
+      const { StandaloneLaunchControl } = await import('@/daemon/standaloneLaunchControl');
+      const parent = await StandaloneLaunchControl.open('acp-busy-instance');
+      const bootstrap = parent.reserve('acp-busy-launch');
+      mocks.backendState.hangPromptUntilCancel = true;
+      try {
+        await withStorage(async (order) => {
+          const runPromise = runAcp({ credentials, agentName: 'grok', command: 'grok', args: ['agent', 'stdio'], startedBy: 'daemon', standaloneLaunch: bootstrap });
+          await vi.waitFor(() => expect(mocks.getUserMessageHandler()).toBeTypeOf('function'));
+          mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'long work' } });
+          await vi.waitFor(() => expect(mocks.backendState.prompts).toHaveLength(1));
+          const proof = await parent.drain(bootstrap.launchId, new AbortController().signal, { remainingMs: () => 30_000 });
+          expect(proof).toEqual({ stored: true, releaseAcknowledged: true });
+          await expect(runPromise).resolves.toBeUndefined();
+          expect(order).toEqual(['inbound-frozen', 'turn-cancelled', 'input-ended', 'storage-flushed', 'disposed-after-exit', 'session-closed']);
+          const turnEnds = mocks.mockSession.sendSessionProtocolMessage.mock.calls
+            .map(([envelope]: any[]) => envelope?.ev).filter((ev: any) => ev?.t === 'turn-end');
+          expect(turnEnds.map((ev: any) => ev.status)).toEqual(['cancelled']);
+        });
+      } finally { await parent.close(); }
+    });
   });
 });
