@@ -48,7 +48,7 @@ const receipt = (id: string, fields: Record<string, unknown>) => writeFileSync(j
 
 describe('remote terminal under the Windows pty host (Desktop W0-5h)', () => {
     it('runs the shell under the verified launcher, which owns the terminal Job', () => {
-        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory })
+        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory, acceptingTerminals: () => true })
         const session = createPtySession({ userId: 'u1' })
 
         expect(pty.calls).toEqual([{ file: 'C:\\happy\\launcher.exe', args: [
@@ -57,7 +57,7 @@ describe('remote terminal under the Windows pty host (Desktop W0-5h)', () => {
     })
 
     it('reports a closed terminal only once its receipt shows the Job empty', async () => {
-        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory })
+        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory, acceptingTerminals: () => true })
         const session = createPtySession({ userId: 'u1' })
         pty.kill.mockImplementation(() => { receipt(session.id, {}); pty.exit?.({ exitCode: 0 }) })
 
@@ -67,7 +67,7 @@ describe('remote terminal under the Windows pty host (Desktop W0-5h)', () => {
     })
 
     it('treats a terminal whose Job is not proven empty as escaped', async () => {
-        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory })
+        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory, acceptingTerminals: () => true })
         const unproven = createPtySession({ userId: 'u1' })
         pty.kill.mockImplementation(() => { receipt(unproven.id, { jobEmpty: false }); pty.exit?.({ exitCode: 125 }) })
         await expect(unproven.terminate({ graceMs: 200, killGraceMs: 100 })).resolves.toBe('escaped')
@@ -78,13 +78,19 @@ describe('remote terminal under the Windows pty host (Desktop W0-5h)', () => {
     })
 
     it('reports a shell that already ended as gone only with an empty-Job receipt', async () => {
-        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory })
+        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory, acceptingTerminals: () => true })
         const session = createPtySession({ userId: 'u1' })
         receipt(session.id, { closeRequested: false, terminated: false })
         pty.exit?.({ exitCode: 0 })
 
         await expect(session.terminate({ graceMs: 200, killGraceMs: 100 })).resolves.toBe('already-gone')
         expect(pty.kill).not.toHaveBeenCalled()
+    })
+
+    it('refuses a new terminal once the runtime stopped accepting them (drain)', () => {
+        configureWindowsTerminalHost({ launcher: 'C:\\happy\\launcher.exe', receiptDirectory, acceptingTerminals: () => false })
+        expect(() => createPtySession({ userId: 'u1' })).toThrow(/closed/)
+        expect(pty.calls).toEqual([])
     })
 
     it('keeps spawning the shell directly when no host is configured', () => {

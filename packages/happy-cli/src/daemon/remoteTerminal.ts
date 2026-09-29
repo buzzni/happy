@@ -103,6 +103,8 @@ export interface WindowsTerminalHost {
     launcher: string
     /** Protected directory for the per-terminal receipts. */
     receiptDirectory: string
+    /** False once the runtime is draining: no new terminal may start behind the teardown. */
+    acceptingTerminals(): boolean
 }
 let windowsTerminalHost: WindowsTerminalHost | null = null
 export function configureWindowsTerminalHost(host: WindowsTerminalHost | null): void {
@@ -123,6 +125,7 @@ function resolveWindowsShell(shell: string | undefined): string {
 }
 
 function createHostedPtySession(opts: PtySessionOpts, host: WindowsTerminalHost): PtySession {
+    if (!host.acceptingTerminals()) throw new Error('Terminal launch gate closed')
     const id = randomUUID()
     const receipt = join(host.receiptDirectory, `${id}.json`)
     const initialCols = opts.cols ?? 80
