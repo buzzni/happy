@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 
 const happyHome = vi.hoisted(() => ({ dir: '' }))
@@ -99,6 +99,31 @@ describe('consumePendingInitialPrompt', () => {
     expect(consumePendingInitialPrompt(env)).toBe('a very large review prompt')
     expect(env).not.toHaveProperty('HAPPY_INITIAL_PROMPT_FILE')
     expect(existsSync(file)).toBe(false)
+  })
+
+  it('removes the staging directory the daemon created once the prompt is read', async () => {
+    happyHome.dir = await mkdtemp(join(tmpdir(), 'happy-home-test-'))
+    const staged = await stageInitialPromptEnvironment('y'.repeat(INITIAL_PROMPT_INLINE_LIMIT_BYTES + 1))
+    const file = staged.env.HAPPY_INITIAL_PROMPT_FILE!
+
+    expect(consumePendingInitialPrompt({ ...staged.env })).toHaveLength(INITIAL_PROMPT_INLINE_LIMIT_BYTES + 1)
+    expect(existsSync(dirname(file))).toBe(false)
+    expect(existsSync(join(happyHome.dir, 'tmp'))).toBe(true)
+  })
+
+  it('never removes a directory that is not an empty prompt staging directory', async () => {
+    const shared = await mkdtemp(join(tmpdir(), 'shared-'))
+    const sharedFile = join(shared, 'prompt.txt')
+    await writeFile(sharedFile, 'prompt', 'utf8')
+    expect(consumePendingInitialPrompt({ HAPPY_INITIAL_PROMPT_FILE: sharedFile })).toBe('prompt')
+    expect(existsSync(shared)).toBe(true)
+
+    const busy = await mkdtemp(join(tmpdir(), 'happy-initial-prompt-busy-'))
+    const busyFile = join(busy, 'initial-prompt.txt')
+    await writeFile(busyFile, 'prompt', 'utf8')
+    await writeFile(join(busy, 'other.txt'), 'keep', 'utf8')
+    expect(consumePendingInitialPrompt({ HAPPY_INITIAL_PROMPT_FILE: busyFile })).toBe('prompt')
+    expect(existsSync(join(busy, 'other.txt'))).toBe(true)
   })
 
   // 파일이 사라졌다고 세션 시작 자체가 죽으면 안 된다 — 프롬프트 없이 뜨는 게

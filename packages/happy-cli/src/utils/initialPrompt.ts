@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { readFileSync, rmSync } from 'node:fs'
+import { readFileSync, rmdirSync, rmSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import type { RawJSONLines } from '@/claude/types'
 import { configuration } from '@/configuration'
@@ -35,6 +35,8 @@ export type StagedInitialPrompt = {
  * Only oversized prompts, which currently fail 100% of the time, take the
  * file path.
  */
+const STAGING_DIRECTORY_PREFIX = 'happy-initial-prompt-'
+
 export async function stageInitialPromptEnvironment(
   prompt: string,
   deps: { makeTempDir?: () => Promise<string> } = {},
@@ -47,7 +49,7 @@ export async function stageInitialPromptEnvironment(
   const makeTempDir = deps.makeTempDir ?? (async () => {
     const root = join(configuration.happyHomeDir, 'tmp')
     await mkdir(root, { recursive: true })
-    return mkdtemp(join(root, 'happy-initial-prompt-'))
+    return mkdtemp(join(root, STAGING_DIRECTORY_PREFIX))
   })
   const directory = await makeTempDir()
   const file = join(directory, 'initial-prompt.txt')
@@ -80,6 +82,10 @@ export function consumePendingInitialPrompt(env: NodeJS.ProcessEnv): string | nu
     }
     try {
       rmSync(file, { force: true })
+      // The daemon staged it in its own mkdtemp directory; drop that too, or the
+      // directories pile up. Non-recursive: only ever an emptied staging directory.
+      const directory = dirname(file)
+      if (basename(directory).startsWith(STAGING_DIRECTORY_PREFIX)) rmdirSync(directory)
     } catch {
       // best-effort cleanup
     }
