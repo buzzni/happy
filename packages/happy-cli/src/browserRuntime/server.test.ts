@@ -184,6 +184,12 @@ describe('runtime HTTP server', () => {
         expect(html).not.toContain('localStorage')
         expect(html).toContain('abp-capability-request')
     })
+
+    it('tells the console which Studio origins may hand it a capability', async () => {
+        server = await startRuntimeServer({ api: makeFake().api, verifyToken, port: 0, health: () => ({}), consoleHostOrigins: ['https://studio.example'] })
+        const html = await (await fetch(`${server.url}/console`)).text()
+        expect(html).toContain('HOST_ORIGINS=["https://studio.example"]')
+    })
 })
 
 describe('runtime readiness', () => {

@@ -225,6 +225,8 @@ export function runtimeConfig(install, { sessionGid, daemonTokenSha256 }) {
     brokerSocketGid: sessionGid,
     daemonTokenSha256,
     ...install.viewerOrigins.length ? { viewerOrigins: install.viewerOrigins } : {},
+    // Studio web opens the console through its preview relay and hands it the capability as window.opener.
+    ...install.serverUrl !== undefined ? { consoleHostOrigins: [new URL(install.serverUrl).origin] } : {},
     maxAgentWindows: install.maxAgentWindows,
     retentionDays: install.retentionDays,
   };

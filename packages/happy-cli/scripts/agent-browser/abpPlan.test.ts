@@ -153,6 +153,14 @@ describe('runtime.json', () => {
         expect(runtimeConfig(withViewer, { sessionGid: 1, daemonTokenSha256: 'b'.repeat(64) }).viewerOrigins).toEqual(['https://tunnel.example'])
     })
 
+    it('lets the Studio of --server-url hand the console its capability (web entry)', () => {
+        expect(runtimeConfig(base(), { sessionGid: 1, daemonTokenSha256: 'b'.repeat(64) })).not.toHaveProperty('consoleHostOrigins')
+        const withServer = mergeInstallOptions(base(), { serverUrl: 'https://dev-studio.example' })
+        const config = runtimeConfig(withServer, { sessionGid: 1, daemonTokenSha256: 'b'.repeat(64) })
+        expect(config.consoleHostOrigins).toEqual(['https://dev-studio.example'])
+        expect(() => parseRuntimeConfig(config)).not.toThrow()
+    })
+
     it('refuses a missing or malformed daemon token hash', () => {
         expect(() => runtimeConfig(base(), { sessionGid: 1, daemonTokenSha256: 'xyz' })).toThrow()
     })
