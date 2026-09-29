@@ -258,6 +258,22 @@ describe('viewer client assets (D2)', () => {
         }
     })
 
+    it("restores the viewer path a relay stripped from vnc_lite.html's address, from its same-origin console", async () => {
+        const root = mkdtempSync(join(tmpdir(), 'abp-viewer-assets-'))
+        try {
+            writeFileSync(join(root, 'vnc_lite.html'), '<html><head><title>noVNC</title><script type="module">read()</script></head><body></body></html>')
+            server = await startRuntimeServer({ api: makeFake().api, verifyToken, port: 0, health: () => ({}), viewerAssetsDir: root })
+            const html = await (await fetch(`${server.url}/viewer/vnc_lite.html`)).text()
+            const restore = html.indexOf('__abpViewerPath')
+            // Last in <head>: after anything a relay puts at its start; the module that reads the address runs after parsing.
+            expect(restore).toBeGreaterThan(html.indexOf('<script type="module">'))
+            expect(restore).toBeLessThan(html.indexOf('</head>'))
+            expect(html).toContain('location.search')
+        } finally {
+            rmSync(root, { recursive: true, force: true })
+        }
+    })
+
     it('answers 404 under /viewer/ when no assets directory is configured', async () => {
         const { base } = await start()
         expect((await fetch(`${base}/viewer/`)).status).toBe(404)

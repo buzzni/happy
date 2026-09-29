@@ -128,7 +128,8 @@ $('resume').onclick=function(){if(S.task)act(op('resume',{taskId:S.task.taskId,e
 $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),requestId:rid()}))};
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
 function openScreen(){op('viewerTicket',{profileId:S.profileId}).then(function(r){S.screenOpen=true;
- $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent('v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket));$('screenBox').hidden=false
+ var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;
+ $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path);$('screenBox').hidden=false
 },function(e){$('actionResult').textContent=e.message})}
 $('openScreen').onclick=openScreen;
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.

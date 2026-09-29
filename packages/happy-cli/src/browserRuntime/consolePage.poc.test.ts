@@ -205,6 +205,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
         await harness.evaluate(target, `document.getElementById('openScreen').click()`)
         expect(await eventually(() => ops.find((entry) => entry.op === 'viewerTicket'), Boolean, 5_000)).toMatchObject({ bearer: cap, body: { profileId: 'profile-a' } })
+        // Also kept on the console window: a preview relay strips the frame's query (vnc_lite.html restores it from here).
+        expect(await eventually(() => harness.evaluate(target, 'window.__abpViewerPath'), Boolean, 5_000)).toMatch(/^v1\/viewer\/websockify\?ticket=ticket-/)
         await harness.closeTarget(target)
     }, 30_000)
 
