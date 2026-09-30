@@ -140,16 +140,20 @@ const UNSAFE_REQUEST_ENV_KEYS = new Set([
     'PATH', 'HOME', 'SHELL', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'IFS', 'PROMPT_COMMAND', 'TMPDIR',
     'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
     'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSH_ASKPASS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+    // OpenSSL loads config, providers and engines (code) from these; bash runs startup options and traces.
+    'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES', 'SHELLOPTS', 'BASHOPTS', 'PS4',
 ])
-const UNSAFE_REQUEST_ENV_PREFIXES = ['LD_', 'DYLD_', 'GIT_', 'HAPPY_', 'SAYCODE_']
+const UNSAFE_REQUEST_ENV_PREFIXES = ['LD_', 'DYLD_', 'GIT_', 'HAPPY_', 'SAYCODE_', 'BASH_FUNC_']
 /** Request values under the Happy/Saycode prefixes that are legitimately per-session (validated elsewhere). */
 const REQUEST_ENV_ALLOWED_INTERNAL = new Set(['HAPPY_PROJECT_SANDBOX_CONFIG'])
 
 function isUnsafeRequestKey(key: string): boolean {
+    // Environment names are case-insensitive on Windows (Path, node_options): compare them upper-cased.
+    const name = key.toUpperCase()
     // Commit identity only; every other GIT_* variable can point git at config, hooks or programs.
-    if (REQUEST_ENV_ALLOWED_INTERNAL.has(key) || /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL|DATE)$/.test(key)) return false
-    if (UNSAFE_REQUEST_ENV_KEYS.has(key) || /_proxy$/i.test(key)) return true
-    return UNSAFE_REQUEST_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
+    if (REQUEST_ENV_ALLOWED_INTERNAL.has(name) || /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL|DATE)$/.test(name)) return false
+    if (UNSAFE_REQUEST_ENV_KEYS.has(name) || name.endsWith('_PROXY')) return true
+    return UNSAFE_REQUEST_ENV_PREFIXES.some((prefix) => name.startsWith(prefix))
 }
 
 /** Returns a copy of request-supplied environment without the variables above. */

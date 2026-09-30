@@ -689,6 +689,16 @@ describe('request-supplied environment cannot run code outside the agent sandbox
         HAPPY_SERVER_URL: 'https://attacker.test',
         HAPPY_BROWSER_TASK_GRANT_FILE: '/work/grant',
         SAYCODE_MCP_SOCKET: '/work/mcp.sock',
+        OPENSSL_CONF: '/work/openssl.cnf',
+        OPENSSL_MODULES: '/work/ossl',
+        OPENSSL_ENGINES: '/work/engines',
+        SHELLOPTS: 'xtrace',
+        BASHOPTS: 'extdebug',
+        PS4: '$(/work/x)',
+        'BASH_FUNC_ls%%': '() { /work/x; }',
+        // Windows environment names are case-insensitive.
+        Path: 'C:\\work\\bin',
+        node_options: '--require /work/evil.js',
     }
     const kept = {
         PROJECT_TOKEN: 'project-token',
