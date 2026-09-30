@@ -210,10 +210,17 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await harness.closeTarget(target)
     }, 30_000)
 
+    /** The opener page, once its script has run (openFrontTab does not wait for the load). */
+    const openStudio = async () => {
+        const studio = await harness.openFrontTab(`http://studio.poc-one.test:${port()}/studio`)
+        await eventually(() => harness.evaluate(studio, 'typeof window.__requests'), (type) => type === 'number', 10_000)
+        return studio
+    }
+
     it('takes its capability from the Studio window that opened it, and only from a trusted origin', async () => {
         ops.length = 0
         const cap = token('opener', Date.now() + 600_000)
-        const studio = await harness.openFrontTab(`http://studio.poc-one.test:${port()}/studio`)
+        const studio = await openStudio()
         await harness.evaluate(studio, `window.__tokens = [${JSON.stringify(cap)}]; window.__console = window.open(${JSON.stringify(`${origin}/console-hosted`)}); !!window.__console`, { userGesture: true })
         expect((await eventually(() => ops.find((entry) => entry.op === 'listTasks'), Boolean, 10_000))?.bearer).toBe(cap)
         expect(await harness.evaluate(studio, 'window.__requestOrigin')).toBe(origin)
@@ -223,11 +230,14 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
 
     it('ignores an opener whose origin is not a configured host', async () => {
         ops.length = 0
-        const studio = await harness.openFrontTab(`http://studio.poc-one.test:${port()}/studio`)
+        const studio = await openStudio()
         await harness.evaluate(studio, `window.__tokens = [${JSON.stringify(token('untrusted', Date.now() + 600_000))}]; window.__console = window.open(${JSON.stringify(`${origin}/console-hosted?trust=none`)}); !!window.__console`, { userGesture: true })
         await new Promise((resolve) => setTimeout(resolve, 3_000))
         // The request is addressed to the configured origin only, so this opener never hears it.
         expect(await harness.evaluate(studio, 'window.__requests')).toBe(0)
+        // Nor is a capability it pushes unasked accepted: the answer must come from a configured origin.
+        await harness.evaluate(studio, `window.__console.postMessage({ type: 'abp-capability', token: ${JSON.stringify(token('pushed', Date.now() + 600_000))}, expiresAtMs: Date.now() + 600_000 }, '*')`)
+        await new Promise((resolve) => setTimeout(resolve, 1_000))
         expect(ops.some((entry) => entry.op === 'listTasks')).toBe(false)
         await harness.evaluate(studio, 'window.__console.close()')
         await harness.closeTarget(studio)
