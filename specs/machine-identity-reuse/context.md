@@ -6,3 +6,4 @@
 - 전체 unit: 77 실패 = checkpoint 74(origin/main 동일 실패, 환경 기인) + 전체 동시 실행 시에만 실패하는 3개 파일(단독 실행 106/106 통과).
 - 미검증: 실제 서버 계정으로 logout→login 후 같은 머신으로 붙는지(릴리스 후 Windows 실기에서 확인 예정).
 - 셀프 리뷰 결함: 키가 발급됐던 legacy 계정이 재로그인 직후(계정 공개키 아직 없음) identity 를 덮어써 machineKey 를 잃음 → 같은 machineId 면 이전 값 계승(`buildMachineIdentity(..., previous)`), 회귀 테스트 Red→Green.
+- 리뷰(low) 반영: `src/ui/auth.relogin.test.ts` — ink 선택·QR·`/v1/auth/request` 응답만 가짜로 두고 실제 logout→doAuth→machine setup 을 태워 dataKey 재로그인이 같은 machineId·machineKey 로 돌아오는지, 다른 계정은 새 머신·새 키인지 검증. 뮤테이션(auth.ts 의 machineKey 재사용 제거) 시 같은 계정 테스트 실패 확인.
