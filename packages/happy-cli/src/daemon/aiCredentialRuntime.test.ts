@@ -374,6 +374,20 @@ describe('AI credential machine runtime', () => {
     expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'switch')).toBe(false)
   })
 
+  it('keeps shared Claude accounts attributed to the company when activating one fails after they were imported', async () => {
+    // The usage fetch was down, so cswap reported the fresh slot 'unavailable' and the first merge failed after the
+    // import. The retry imports nothing new, so only the first apply can say which slots came from the bundle.
+    const { runtime, files, state, input } = freshMachineAdding([
+      { number: 1, email: 'shared@example.com', organizationUuid: '', usageStatus: 'unavailable' },
+    ])
+    await expect(runtime.apply(input)).rejects.toMatchObject({ kind: 'CLAUDE_APPLY_VERIFICATION_FAILED' })
+    state.accounts = [{ ...state.accounts[0], usageStatus: 'ok' }]
+    expect(await runtime.apply(input)).toMatchObject({ configured: true })
+    expect(state.active).toBe(1)
+    const provenance = JSON.parse(files.get('/home/operator/.happy/ai-credential-provenance.json')!)
+    expect(provenance.claude).toMatchObject({ state: 'applied', identities: [['shared@example.com', '', '']] })
+  })
+
   it('rolls back both Codex files if an additive write fails without touching live auth', async () => {
     const { runtime, files, writeFile } = setup()
     const path = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'

@@ -443,7 +443,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     await deps.execFile('cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first'])
   }
 
-  async function applyClaudeAdditive(payload: string, knownCompanyIdentities: Set<string>) {
+  async function applyClaudeAdditive(
+    payload: string,
+    knownCompanyIdentities: Set<string>,
+    recordImported: (accounts: ClaudeListDetails['accounts']) => Promise<void>,
+  ) {
     const incoming = claudeImportedAccountIdentities(payload)
     if (!incoming) throw new AiCredentialRuntimeError('AI_CREDENTIAL_MERGE_UNSUPPORTED')
     await ensureClaudeSwap(true)
@@ -474,26 +478,34 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const retained = after.accounts.find(candidate => claudeListAccountIdentity(candidate) === claudeListAccountIdentity(account))
         return retained?.number !== account.number || retained?.disabled !== account.disabled
       })) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+    // Only newly imported slots are proven organizational material. Matching
+    // personal credentials were deliberately not overwritten by this import.
+    const verifiedAccounts = after.accounts.filter(account => incoming.has(claudeListAccountIdentity(account)) && (!existing.has(claudeListAccountIdentity(account)) || knownCompanyIdentities.has(JSON.stringify([account.email, account.organizationUuid ?? '', account.organizationName ?? '']))))
     if (before.activeAccountNumber !== null) {
       if (after.activeAccountNumber !== before.activeAccountNumber) {
         throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
       }
     } else {
-      // Nothing personal is active to keep. Like a replace, activate a usable account rather than report
-      // "configured" while Claude Code stays signed out (a fresh Windows PC, 2026-10-02).
-      const target = after.activeAccountNumber !== null && (after.activeUsable || after.activeCredentialKind === 'api_key')
-        ? after.activeAccountNumber
-        : after.usableAccountNumber
-      if (target === null) throw new AiCredentialRuntimeError(claudeNoUsableAccountKind(after))
-      await deps.execFile('cswap', ['switch', String(target), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
-      after = await list()
-      if (!after.activeUsable && after.activeCredentialKind !== 'api_key') throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      try {
+        // Nothing personal is active to keep. Like a replace, activate a usable account rather than report
+        // "configured" while Claude Code stays signed out (a fresh Windows PC, 2026-10-02).
+        const target = after.activeAccountNumber !== null && (after.activeUsable || after.activeCredentialKind === 'api_key')
+          ? after.activeAccountNumber
+          : after.usableAccountNumber
+        if (target === null) throw new AiCredentialRuntimeError(claudeNoUsableAccountKind(after))
+        await deps.execFile('cswap', ['switch', String(target), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        after = await list()
+        if (!after.activeUsable && after.activeCredentialKind !== 'api_key') throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      } catch (error) {
+        // The import already landed. A retry finds these slots existing and cannot tell them from personal ones,
+        // so only this apply can attribute them to the company.
+        await recordImported(verifiedAccounts)
+        throw error
+      }
     }
     return {
       result: { provider: 'claude' as const, configured: true, accountCount: after.accounts.length, rotation: deps.supervisor.status() },
-      // Only newly imported slots are proven organizational material. Matching
-      // personal credentials were deliberately not overwritten by this import.
-      verifiedAccounts: after.accounts.filter(account => incoming.has(claudeListAccountIdentity(account)) && (!existing.has(claudeListAccountIdentity(account)) || knownCompanyIdentities.has(JSON.stringify([account.email, account.organizationUuid ?? '', account.organizationName ?? ''])))),
+      verifiedAccounts,
     }
   }
 
@@ -1145,7 +1157,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
             markerChanged = true
           }
           const claudeApplied = selected === 'claude'
-            ? await (repair ? applyClaudeRepair(repair) : applyMode === 'merge' ? applyClaudeAdditive(input.payload, knownCompanyIdentities) : applyClaude(input.payload))
+            ? await (repair ? applyClaudeRepair(repair) : applyMode === 'merge'
+              ? applyClaudeAdditive(input.payload, knownCompanyIdentities, (accounts) => recordClaudeProvenance(input, applyGeneration, accounts))
+              : applyClaude(input.payload))
             : null
           const result = claudeApplied
             ? claudeApplied.result
