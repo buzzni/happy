@@ -366,12 +366,27 @@ describe('AI credential machine runtime', () => {
   })
 
   it('fails an additive Claude apply that leaves a machine without an active account because every account needs re-login', async () => {
-    const { runtime, calls, state, input } = freshMachineAdding([
+    const { runtime, calls, files, state, input } = freshMachineAdding([
       { number: 1, email: 'expired@example.com', organizationUuid: '', usageStatus: 'relogin_required' },
     ])
     await expect(runtime.apply(input)).rejects.toMatchObject({ kind: 'CLAUDE_APPLY_RELOGIN_REQUIRED' })
     expect(state.active).toBeNull()
     expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'switch')).toBe(false)
+    // The imported slots stay on the machine, so they stay attributed to the organization (a later merge sees them as existing).
+    expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-provenance.json')!).claude.identities).toEqual([['expired@example.com', '', '']])
+  })
+
+  it('keeps the imported shared Claude slots attributed when the switch to one of them does not take', async () => {
+    const { runtime, execFile, files, state, input } = freshMachineAdding([
+      { number: 2, email: 'shared@example.com', organizationUuid: '', usageStatus: 'ok' },
+    ])
+    const original = execFile.getMockImplementation()!
+    execFile.mockImplementation(async (command, args, options) => command === 'cswap' && args[0] === 'switch'
+      ? { stdout: '', stderr: '' } // the switch reports nothing and leaves no active account
+      : original(command, args, options))
+    await expect(runtime.apply(input)).rejects.toMatchObject({ kind: 'CLAUDE_APPLY_VERIFICATION_FAILED' })
+    expect(state.active).toBeNull()
+    expect(JSON.parse(files.get('/home/operator/.happy/ai-credential-provenance.json')!).claude.identities).toEqual([['shared@example.com', '', '']])
   })
 
   it('rolls back both Codex files if an additive write fails without touching live auth', async () => {
