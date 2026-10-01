@@ -1,7 +1,7 @@
 import ignore from 'ignore';
 import { z } from 'zod';
 
-const pathSchema = z.string().min(1).max(4096).refine(value => !/[\u0000-\u001F\u007F]/.test(value)
+const pathSchema = z.string().min(1).max(4096).refine(value => !value.includes('\0')
     && !/^(?:[A-Za-z]:|[\\/])/.test(value) && !value.split(/[\\/]+/).includes('..'));
 const coverageSchema = z.object({ schemaVersion: z.literal(1),
     excludedPaths: z.array(pathSchema).max(100_000),

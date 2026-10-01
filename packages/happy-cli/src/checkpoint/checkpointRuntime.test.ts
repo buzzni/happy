@@ -167,4 +167,22 @@ describe('createCheckpointRuntime', () => {
         await expect(runtime.beforeTurn('unsupported-entries')).resolves.toMatchObject({ checkpointId: expect.any(String) });
         expect(runtime.excludedPaths).toContain(kind === 'fifo' ? 'named-pipe' : 'nested');
     });
+
+    it('records excluded file names containing control characters in the coverage trailer', async () => {
+        await writeFile(join(projectPath, '.gitignore'), 'Icon?\n');
+        await writeFile(join(projectPath, 'Icon\r'), '');
+        await writeFile(join(projectPath, 'big\tdata.bin'), 'more than eight bytes');
+        const runtime = await createCheckpointRuntime({ provider: 'codex', platform: 'darwin', projectPath,
+            checkpointRoot, binding, protection });
+        if (runtime.status !== 'protected') throw new Error('expected protected runtime');
+        const snapshot = await runtime.beforeTurn('control-character-paths');
+        expect(runtime.excludedPaths).toEqual(expect.arrayContaining(['Icon\r', 'big\tdata.bin']));
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot, ...binding });
+        const { stdout } = await execFileAsync('git', [`--git-dir=${layout.gitDirectory}`,
+            'show', '-s', '--format=%B', snapshot.checkpointId]);
+        const matcher = checkpointCoverageMatcher(stdout);
+        expect(matcher?.('Icon\r')).toBe(true);
+        expect(matcher?.('big\tdata.bin')).toBe(true);
+        expect(matcher?.('source.txt')).toBe(false);
+    });
 });

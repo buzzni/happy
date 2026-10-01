@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { checkpointExclusionChanges, checkpointRecoveryRevision, checkpointRecoveryStatus } from './checkpointRecovery';
+import { checkpointExclusionChanges, checkpointRecoveryDetailSchema, checkpointRecoveryRevision, checkpointRecoveryStatus } from './checkpointRecovery';
 import type { CheckpointPendingDecision } from './checkpointProtectionState';
 
 const pending: CheckpointPendingDecision = {
@@ -36,5 +36,15 @@ describe('checkpoint recovery diagnostics', () => {
         });
         expect(status.diagnostic?.excluded).toHaveLength(100);
         expect(status.diagnostic?.totalExcluded).toBe(101);
+    });
+
+    it('accepts legal file names with control characters but still rejects NUL', () => {
+        const detail = (path: string) => ({
+            changes: [{ path, previousReason: null, currentReason: 'ignored', change: 'added' }],
+            counts: { capturedFiles: 1, capturedBytes: 1, excludedFiles: 1, totalChanges: 1 },
+        });
+        expect(checkpointRecoveryDetailSchema.safeParse(detail('Icon\r')).success).toBe(true);
+        expect(checkpointRecoveryDetailSchema.safeParse(detail('big\tdata.bin')).success).toBe(true);
+        expect(checkpointRecoveryDetailSchema.safeParse(detail('bad\0name')).success).toBe(false);
     });
 });
