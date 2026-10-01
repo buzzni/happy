@@ -478,8 +478,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       if (after.activeAccountNumber !== before.activeAccountNumber) {
         throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
       }
-    } else if (after.activeAccountNumber !== null) {
-      await deps.execFile('cswap', ['switch', String(after.activeAccountNumber), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+    } else {
+      // Nothing personal is active to keep. Like a replace, activate a usable account rather than report
+      // "configured" while Claude Code stays signed out (a fresh Windows PC, 2026-10-02).
+      const target = after.activeAccountNumber !== null && (after.activeUsable || after.activeCredentialKind === 'api_key')
+        ? after.activeAccountNumber
+        : after.usableAccountNumber
+      if (target === null) throw new AiCredentialRuntimeError(claudeNoUsableAccountKind(after))
+      await deps.execFile('cswap', ['switch', String(target), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
       after = await list()
       if (!after.activeUsable && after.activeCredentialKind !== 'api_key') throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
     }
@@ -1514,6 +1520,14 @@ function claudeListAccountIdentity(
     account.email,
     typeof account.organizationUuid === 'string' ? account.organizationUuid : '',
   ])
+}
+
+/** Why no Claude account can be made active: every enabled account needs re-login, or the list is not as expected. */
+function claudeNoUsableAccountKind(details: ClaudeListDetails): 'CLAUDE_APPLY_RELOGIN_REQUIRED' | 'CLAUDE_APPLY_VERIFICATION_FAILED' {
+  const enabled = details.accounts.filter((account) => account.disabled !== true)
+  return enabled.length > 0 && enabled.every((account) => account.usageStatus === 'relogin_required')
+    ? 'CLAUDE_APPLY_RELOGIN_REQUIRED'
+    : 'CLAUDE_APPLY_VERIFICATION_FAILED'
 }
 
 function parseClaudeListDetails(stdout: string): ClaudeListDetails {
