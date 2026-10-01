@@ -6,7 +6,7 @@ const reason = z.enum(['secret', 'ignored', 'too-large', 'file-limit', 'total-si
 export class CheckpointRefreshRejectedError extends Error {}
 export const checkpointRecoveryDetailSchema = z.object({
     changes: z.array(z.object({
-        path: z.string().min(1).max(4096).refine(value => !/[\u0000-\u001F\u007F]/.test(value)
+        path: z.string().min(1).max(4096).refine(value => !value.includes('\0')
             && !/^(?:[A-Za-z]:|[\\/])/.test(value) && !value.split(/[\\/]+/).includes('..')),
         previousReason: reason.nullable(), currentReason: reason.nullable(),
         change: z.enum(['added', 'removed', 'reason-changed', 'unchanged']),
