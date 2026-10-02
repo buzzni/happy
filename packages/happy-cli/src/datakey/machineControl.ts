@@ -20,7 +20,7 @@
  */
 import { createHash } from 'node:crypto'
 import * as z from 'zod'
-import { buildMachineKeyEnvelopes, decodeBase64, encodeBase64, encrypt } from '@/api/encryption'
+import { buildMachineKeyEnvelopes, decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption'
 import type { MachineMetadata } from '@/api/types'
 import type { Credentials } from '@/persistence'
 
@@ -47,7 +47,7 @@ export function parsePendingMachineKeyRotation(raw: unknown): PendingMachineKeyR
 }
 
 /** What the rotation needs from the server's machine record. */
-export type ServerMachineKeyState = { dataEncryptionKey: string | null; metadataVersion: number }
+export type ServerMachineKeyState = { dataEncryptionKey: string | null; metadata: string | null; metadataVersion: number }
 
 /** Body of POST /v1/machines/:id/key-rotation. It never carries a machine key envelope for the server. */
 export type MachineKeyRotationRequest = {
@@ -123,7 +123,7 @@ export async function settleMachineControl(input: {
   machineId: string
   /** The server service key (base64) registration wraps to, if configured. */
   serverPublicKey: string | null
-  /** Re-encrypted under the new key in place of whatever the server stored under the old one. */
+  /** Merged over the server's copy and re-encrypted under the new key. */
   metadata: MachineMetadata
   io: MachineControlIo
 }): Promise<Credentials> {
@@ -153,7 +153,7 @@ export async function settleMachineControl(input: {
 
   const rotation = pending ?? await startRotation(input, encryption)
   try {
-    await swapOnServer(input, rotation)
+    await swapOnServer(input, encryption.machineKey, rotation)
     const replaced = withKey(credentials, encryption, decodeBase64(rotation.machineKey), mode === 'strict')
     await io.writeCredentials(replaced)
     await io.deletePending()
@@ -210,18 +210,37 @@ async function startRotation(
   return pending
 }
 
+/**
+ * The server's copy of the metadata, which other writers such as the app's
+ * rename also change. It is under the current key, or under the new one when
+ * an earlier swap landed before access.key was replaced.
+ */
+function readServerMetadata(sealed: string | null, keys: Uint8Array[]): Record<string, unknown> | null {
+  if (!sealed) return null
+  for (const key of keys) {
+    const opened = decrypt(key, 'dataKey', decodeBase64(sealed))
+    if (opened && typeof opened === 'object') return opened
+  }
+  return null
+}
+
 /** Swaps the server's envelopes for the pending ones; a machine the server does not have needs no swap. */
 async function swapOnServer(
   input: { machineId: string; metadata: MachineMetadata; io: MachineControlIo },
+  currentKey: Uint8Array,
   rotation: PendingMachineKeyRotation,
 ): Promise<void> {
-  const metadata = encodeBase64(encrypt(decodeBase64(rotation.machineKey), 'dataKey', input.metadata))
+  const newKey = decodeBase64(rotation.machineKey)
   for (let attempt = 1; ; attempt++) {
     const current = await input.io.fetchMachine(input.machineId)
     if (current === null) return
     if (!current.dataEncryptionKey) {
       throw new Error('The server holds no account envelope for this machine')
     }
+    // Merged like ApiMachineClient.updateMachineMetadata, so fields only other
+    // writers set, such as displayName, survive the swap.
+    const stored = readServerMetadata(current.metadata, [currentKey, newKey])
+    const metadata = encodeBase64(encrypt(newKey, 'dataKey', { ...stored, ...input.metadata }))
     try {
       await input.io.rotate(input.machineId, {
         expectedDataEncryptionKey: current.dataEncryptionKey,

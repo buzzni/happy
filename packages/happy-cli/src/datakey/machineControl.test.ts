@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import tweetnacl from 'tweetnacl';
-import { decodeBase64, decrypt, deriveServerRpcKey, encodeBase64 } from '@/api/encryption';
+import { decodeBase64, decrypt, deriveServerRpcKey, encodeBase64, encrypt } from '@/api/encryption';
 import type { MachineMetadata } from '@/api/types';
 import type { Credentials } from '@/persistence';
 import {
@@ -54,7 +54,7 @@ function harness(options: {
         writeCredentials: async (credentials) => { calls.push('writeCredentials'); state.written = credentials; },
         fetchMachine: async (machineId) => {
             calls.push('fetchMachine');
-            return options.fetchMachine ? options.fetchMachine(machineId) : { dataEncryptionKey: 'current-envelope', metadataVersion: 7 };
+            return options.fetchMachine ? options.fetchMachine(machineId) : { dataEncryptionKey: 'current-envelope', metadata: null, metadataVersion: 7 };
         },
         rotate: async (machineId, request) => {
             calls.push('rotate');
@@ -179,6 +179,36 @@ describe('settleMachineControl in strict mode', () => {
         expect(decrypt(newKey, 'dataKey', decodeBase64(request.metadata))).toEqual(metadata);
     });
 
+    it('keeps what only the server copy of the metadata holds, such as the name the user gave the machine', async () => {
+        const stored = { ...metadata, host: 'old-host', displayName: 'My Work Mac' };
+        const h = harness({
+            fetchMachine: async () => ({
+                dataEncryptionKey: 'current-envelope',
+                metadata: encodeBase64(encrypt(oldKey, 'dataKey', stored)),
+                metadataVersion: 7,
+            }),
+        });
+
+        await settle(h, { mode: 'strict', credentials: dataKeyCredentials() });
+
+        expect(decrypt(newKey, 'dataKey', decodeBase64(h.state.rotations[0].request.metadata))).toEqual({ ...metadata, displayName: 'My Work Mac' });
+    });
+
+    it('reads the server copy under the new key when an earlier swap already landed', async () => {
+        const h = harness({
+            pending: pendingFrom(oldKey),
+            fetchMachine: async () => ({
+                dataEncryptionKey: 'pending-account-envelope',
+                metadata: encodeBase64(encrypt(newKey, 'dataKey', { ...metadata, displayName: 'My Work Mac' })),
+                metadataVersion: 8,
+            }),
+        });
+
+        await settle(h, { mode: 'strict', credentials: dataKeyCredentials() });
+
+        expect(decrypt(newKey, 'dataKey', decodeBase64(h.state.rotations[0].request.metadata))).toEqual({ ...metadata, displayName: 'My Work Mac' });
+    });
+
     it('rotates without a server lane when no server key is configured', async () => {
         const h = harness();
 
@@ -215,7 +245,7 @@ describe('settleMachineControl in strict mode', () => {
     });
 
     it('refuses to start when the server holds no account envelope to swap', async () => {
-        const h = harness({ fetchMachine: async () => ({ dataEncryptionKey: null, metadataVersion: 0 }) });
+        const h = harness({ fetchMachine: async () => ({ dataEncryptionKey: null, metadata: null, metadataVersion: 0 }) });
 
         await expect(settle(h, { mode: 'strict', credentials: dataKeyCredentials() })).rejects.toMatchObject({ reason: 'rotation-failed' });
         expect(h.calls).not.toContain('rotate');
@@ -225,7 +255,7 @@ describe('settleMachineControl in strict mode', () => {
         let attempts = 0;
         let version = 7;
         const h = harness({
-            fetchMachine: async () => ({ dataEncryptionKey: 'current-envelope', metadataVersion: version }),
+            fetchMachine: async () => ({ dataEncryptionKey: 'current-envelope', metadata: null, metadataVersion: version }),
             rotate: async () => {
                 attempts += 1;
                 if (attempts === 1) { version = 8; throw new MachineKeyRotationConflict(); }

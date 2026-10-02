@@ -63,12 +63,16 @@ export function createMachineControlIo(input: { token: string; machineId: string
     },
     fetchMachine: async () => {
       try {
-        const response = await axios.get<{ machine?: { dataEncryptionKey?: string | null; metadataVersion?: number } }>(
+        const response = await axios.get<{ machine?: { dataEncryptionKey?: string | null; metadata?: string | null; metadataVersion?: number } }>(
           machineUrl, { headers, timeout: 15000 },
         )
         const machine = response.data.machine
         if (!machine) return null
-        return { dataEncryptionKey: machine.dataEncryptionKey ?? null, metadataVersion: machine.metadataVersion ?? 0 }
+        return {
+          dataEncryptionKey: machine.dataEncryptionKey ?? null,
+          metadata: machine.metadata ?? null,
+          metadataVersion: machine.metadataVersion ?? 0,
+        }
       } catch (error) {
         if (axios.isAxiosError(error) && error.response?.status === 404) return null
         throw error

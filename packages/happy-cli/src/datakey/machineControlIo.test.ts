@@ -72,9 +72,9 @@ describe('createMachineControlIo', () => {
         expect(readMachineIdentity()).toMatchObject({ machineId: 'machine-1', machineKey: encodeBase64(machineKey) });
     });
 
-    it('reads the account envelope and metadata version, and a missing machine as null', async () => {
-        get.mockResolvedValueOnce({ data: { machine: { dataEncryptionKey: 'envelope', metadataVersion: 4 } } });
-        await expect(io.fetchMachine('machine-1')).resolves.toEqual({ dataEncryptionKey: 'envelope', metadataVersion: 4 });
+    it('reads the account envelope, metadata and its version, and a missing machine as null', async () => {
+        get.mockResolvedValueOnce({ data: { machine: { dataEncryptionKey: 'envelope', metadata: 'sealed', metadataVersion: 4 } } });
+        await expect(io.fetchMachine('machine-1')).resolves.toEqual({ dataEncryptionKey: 'envelope', metadata: 'sealed', metadataVersion: 4 });
         expect(get).toHaveBeenCalledWith(
             `${configuration.serverUrl}/v1/machines/machine-1`,
             expect.objectContaining({ headers: { Authorization: 'Bearer token' } }),
