@@ -434,6 +434,7 @@ describe('ApiMachineClient socket reconnection', () => {
             status: vi.fn(),
             list: vi.fn(),
             preview: vi.fn(),
+            diff: vi.fn(),
             execute: vi.fn(),
             cancel: vi.fn(),
             retry: vi.fn(),
