@@ -120,6 +120,7 @@ export type CheckpointRpcHandlers = {
     status(params: unknown): Promise<unknown>;
     list(params: unknown): Promise<unknown>;
     preview(params: unknown): Promise<unknown>;
+    retireWorktree?(params: unknown): Promise<unknown>;
     diff?(params: unknown): Promise<unknown>;
     execute(params: unknown): Promise<unknown>;
     retry(params: unknown): Promise<unknown>;

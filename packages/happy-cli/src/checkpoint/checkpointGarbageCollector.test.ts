@@ -65,6 +65,25 @@ describe('CheckpointGarbageCollector', () => {
         await expectObject(checkpointRoot, binding, checkpoints[0]!, false);
     });
 
+    it('preserves latest baseline and latest safety above age, count and soft capacity', async () => {
+        const store = new CheckpointStore(checkpointRoot);
+        const ids: string[] = [];
+        for (const [index, record] of (['before', 'safety', 'after'] as const).entries()) {
+            await writeFile(join(projectPath, 'tracked.txt'), `version ${index}`);
+            ids.push((await store.snapshotTurn({ ...binding, projectPath, operationId: `protected-${index}`,
+                workTree: { maxFileBytes: 1024, record } })).checkpointId);
+        }
+        const result = await new CheckpointGarbageCollector(checkpointRoot).collect({
+            maxCheckpointsPerBinding: 0, maxAgeMs: 0, now: Date.now() + 10_000,
+            maxStoreBytes: 0, preserveLatest: true,
+        });
+        expect(result.prunedCheckpoints).toBe(1);
+        await expectObject(checkpointRoot, binding, ids[0]!, false);
+        await expectObject(checkpointRoot, binding, ids[1]!, true);
+        await expectObject(checkpointRoot, binding, ids[2]!, true);
+        expect(result.storeBytes).toBeGreaterThan(0);
+    });
+
     it('refuses to create a pin for a checkpoint owned by another binding', async () => {
         await writeFile(join(projectPath, 'tracked.txt'), 'owned\n');
         const checkpointId = (await new CheckpointStore(checkpointRoot).snapshotTurn({
