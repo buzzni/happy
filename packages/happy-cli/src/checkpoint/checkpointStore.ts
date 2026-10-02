@@ -4,7 +4,7 @@ import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, 
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
-import { withCheckpointStoreLock } from './checkpointStoreLock';
+import { withCheckpointStaging, withCheckpointStoreLock } from './checkpointStoreLock';
 import { CheckpointPolicyDriftError, type CheckpointExclusionManifest } from './checkpointExclusionPolicy';
 import { checkpointCoverageTrailer } from './checkpointCoverage';
 
@@ -192,11 +192,41 @@ export class CheckpointStore {
             userHomePath,
         });
         await this.ensureInitialized(layout.gitDirectory);
+        if (request.workTree) return this.createWorkTreeSnapshot(request, layout, projectPath);
         return withCheckpointStoreLock(this.checkpointRoot, () => this.createSnapshotLocked(
             request,
             layout,
             projectPath,
         ));
+    }
+
+    /**
+     * A whole-folder record can hash for minutes the first time; it stages outside the store lock
+     * and takes it only for the tree, commit and refs. Its index never reads the parent record.
+     */
+    private async createWorkTreeSnapshot(
+        request: CheckpointSnapshotRequest,
+        layout: CheckpointStoreLayout,
+        projectPath: string,
+    ): Promise<CheckpointSnapshotResult> {
+        await bindSnapshotFiles(request, layout, projectPath);
+        const snapshotLayout = { ...layout, indexFile: `${layout.indexFile}.${randomUUID()}` };
+        const environment = this.gitEnvironment(snapshotLayout, projectPath);
+        try {
+            const completed = await completedSnapshot(request, snapshotLayout, projectPath, environment);
+            if (completed) return completed;
+            return await withCheckpointStaging(this.checkpointRoot, async () => {
+                const staged = await stageSnapshotIndex(request, layout, snapshotLayout, projectPath, environment, null);
+                return withCheckpointStoreLock(this.checkpointRoot, async () => {
+                    const raced = await completedSnapshot(request, snapshotLayout, projectPath, environment);
+                    if (raced) return raced;
+                    const parentId = await latestCheckpointId(layout, projectPath, environment);
+                    return commitStagedSnapshot(request, layout, snapshotLayout, projectPath, environment, parentId, staged);
+                });
+            });
+        } finally {
+            await removeSnapshotFiles(snapshotLayout);
+        }
     }
 
     private async createSnapshotLocked(

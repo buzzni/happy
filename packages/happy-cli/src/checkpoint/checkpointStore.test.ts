@@ -5,6 +5,7 @@ import { join, parse, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { checkpointCoverageMatcher } from './checkpointCoverage';
+import { withCheckpointStoreLock } from './checkpointStoreLock';
 import {
     checkpointOperationRefPrefix,
     CheckpointStore,
@@ -430,6 +431,24 @@ describe('CheckpointStore', () => {
                 expect(results.filter((result) => /^[a-f0-9]{40,64}$/.test(result.checkpointId))).toHaveLength(8);
             }
         }, 60_000);
+
+        // A large first record hashes for a long time; it must not hold every other session's turn.
+        it('hashes a whole-folder record while another writer holds the store lock', async () => {
+            await new CheckpointStore(checkpointRoot).snapshotTurn({ ...binding(), operationId: 'init' });
+            for (let index = 0; index < 400; index += 1) {
+                await writeFile(join(projectPath, `file-${index}.txt`), `content ${index}\n`);
+            }
+            const last = (await execFileAsync('git', ['hash-object', join(projectPath, 'file-399.txt')])).stdout.trim();
+            const staging = join(checkpointRoot, 'store', 'checkpoint-staging');
+
+            const snapshot = new CheckpointStore(checkpointRoot).snapshotTurn({ ...binding(), operationId: 'turn-1', workTree: { maxFileBytes: 1024 } });
+            await expect.poll(() => readdir(staging).then((names) => names.length, () => 0), { timeout: 10_000 }).toBeGreaterThan(0);
+            await withCheckpointStoreLock(checkpointRoot, async () => {
+                await expect.poll(() => git(['cat-file', '-e', last]).then(() => true, () => false), { timeout: 10_000 }).toBe(true);
+            });
+            expect((await git(['show', `${(await snapshot).checkpointId}:file-399.txt`])).stdout).toBe('content 399\n');
+            expect(await readdir(staging)).toEqual([]);
+        }, 30_000);
 
         it('keeps a per-binding index so later turns only rehash what changed', async () => {
             await writeFile(join(projectPath, 'a.txt'), 'one\n');
