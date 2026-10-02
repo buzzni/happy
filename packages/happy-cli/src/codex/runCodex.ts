@@ -2000,6 +2000,9 @@ export async function runCodex(opts: {
                                 throw new Error('checkpoint protection could not resume the Codex thread');
                             }
                         }
+                    } else if (checkpointComposition.localHistory) {
+                        // specs/checkpoint-local-history — the record is the dispatch gate; Codex keeps running.
+                        await checkpointComposition.localHistory.beforeTurn();
                     }
                     // Map permission mode to approval policy and sandbox.
                     // With app-server, these are per-turn — no restart needed on mode change.
@@ -2202,6 +2205,12 @@ export async function runCodex(opts: {
                             ? (isSupportedCodexReasoningEffort(appliedRoute.effort) ? appliedRoute.effort : undefined)
                             : message.mode.effort,
                         extraInputItems: imageInputs.inputItems,
+                    }).finally(async () => {
+                        // Recorded even after a failed turn: it may already have changed files. A
+                        // missing record only makes a later restore more cautious.
+                        await checkpointComposition.localHistory?.afterTurn().catch((error) => {
+                            logger.debug('[Codex] local history record after turn failed', error);
+                        });
                     });
                     lessonFrame.acceptingSteer = false;
                     if (lessonFrame.pendingSteer) preemptLessonReview();

@@ -100,6 +100,8 @@ export type CheckpointRpcSessionAuthority = {
     excludedPatterns: string[];
     canRestoreHistory?: boolean;
     limits?: { maxFileBytes: number; maxFiles: number; maxTotalBytes: number };
+    /** specs/checkpoint-local-history R5 — additive: a Desktop that knows it drops the old decision UI. */
+    mode?: 'local-history';
 };
 
 export type CheckpointRpcHandlers = {
@@ -147,6 +149,7 @@ export function createCheckpointRpcHandlers(input: {
                 projectId: authority.projectId,
                 worktreeId: authority.worktreeId,
                 protection: authority.protection,
+                ...(authority.mode ? { mode: authority.mode } : {}),
                 pendingDecision: authority.pendingDecision,
                 ...(input.refreshSession ? { recovery: checkpointRecoveryStatus({
                     pendingDecision: authority.pendingDecision,
