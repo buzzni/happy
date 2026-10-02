@@ -1,4 +1,6 @@
 import { readCheckpointRestoreJournal } from './checkpointRestoreJournal';
+import { sweepStaleCheckpointDiffOperands } from './checkpointFileDiff';
+import { withCheckpointStoreLock } from './checkpointStoreLock';
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -12,6 +14,7 @@ export const HISTORY_RETENTION = {
     maxAgeMs: 30 * 86400_000,
     maxStoreBytes: 5 * 1024 ** 3,
     preserveLatest: true,
+    capacityBudgetMs: 60_000,
 } as const;
 const identifier = z.string().min(1).max(128).refine(value => value.trim() === value && !/[\u0000-\u001F\u007F]/.test(value));
 const bindingSchema = z.object({ sessionId: identifier, projectId: identifier,
@@ -31,8 +34,10 @@ export class CheckpointRetention {
         this.gitDirectory = join(resolve(checkpointRoot), 'store');
     }
 
-    collect(now = Date.now()) {
-        return this.collectPolicy(now);
+    async collect(now = Date.now()) {
+        const result = await this.collectPolicy(now);
+        await sweepStaleCheckpointDiffOperands(this.gitDirectory);
+        return result;
     }
 
     async retireWorktree(params: unknown) {
@@ -46,21 +51,39 @@ export class CheckpointRetention {
             await this.matchBindings(request);
             return { ...request, status: 'supported' as const };
         }
+        if (!request.immediate) {
+            await this.markMissing(request);
+            return { ...request, status: 'retained' as const };
+        }
         await this.collectPolicy(Date.now(), request);
         const remaining = await this.matchBindings(request);
-        return { ...request, status: request.immediate ? (remaining.length ? 'deferred' : 'deleted') : 'retained' };
+        return { ...request, status: remaining.length ? 'deferred' as const : 'deleted' as const };
     }
 
+    /** A normal retirement only starts the grace clock; pruning and packing stay with the idle pass. */
+    private async markMissing(request: Retirement) {
+        if (!(await exists(this.gitDirectory))) return;
+        await withCheckpointStoreLock(this.checkpointRoot, async () => {
+            const now = Date.now();
+            for (const binding of this.selectBindings((await this.readBindings()).bindings, request)) {
+                const markerPath = join(this.gitDirectory, 'retention', `${binding.key}.json`);
+                if (!(await readMarker(markerPath))) await writeMarker(markerPath, { missingSince: now, immediate: false });
+            }
+        });
+    }
+
+    /** With a request, only that worktree's bindings are retired; other limits wait for the idle pass. */
     private collectPolicy(now: number, request?: Retirement) {
-        const policy: RetentionPolicy = { ...HISTORY_RETENTION, now, resolveBindings: async () => {
+        const policy: RetentionPolicy = { ...HISTORY_RETENTION, now, retireOnly: request !== undefined, resolveBindings: async () => {
             const keep = new Set<string>();
             const retire = new Set<string>();
             const safety = new Set<string>();
-            const bindings = await this.readBindings();
-            if (request) this.selectBindings(bindings, request);
-            for (const binding of bindings) {
-                const targeted = request?.action === 'retire' && binding.projectId === request.projectId
-                    && binding.projectPath === request.worktreePath;
+            const { bindings, unreadable } = await this.readBindings();
+            if (request && unreadable.length > 0) throw new Error('checkpoint retirement binding metadata is unreadable');
+            // Unreadable metadata cannot prove where its history belongs, so all of it is kept.
+            for (const key of unreadable) keep.add(key);
+            for (const binding of request ? this.selectBindings(bindings, request) : bindings) {
+                const targeted = request !== undefined;
                 try {
                     const restore = await this.restoreProtection(binding.key);
                     for (const id of restore.safetyIds) safety.add(`${binding.key}:${id}`);
@@ -76,7 +99,7 @@ export class CheckpointRetention {
                     }
                     let marker = await readMarker(markerPath);
                     if (!marker) marker = { missingSince: now, immediate: false };
-                    if (targeted && request?.immediate) marker.immediate = true;
+                    if (targeted) marker.immediate = true;
                     await writeMarker(markerPath, marker);
                     if (restore.pending) { keep.add(binding.key); continue; }
                     if (marker.immediate || now - marker.missingSince >= WORKTREE_HISTORY_GRACE_MS) retire.add(binding.key);
@@ -92,8 +115,11 @@ export class CheckpointRetention {
         return new CheckpointGarbageCollector(this.checkpointRoot).collect(policy);
     }
 
+    /** Explicit retirement fails closed: unreadable metadata might belong to the requested worktree. */
     private async matchBindings(request: Retirement) {
-        return this.selectBindings(await this.readBindings(), request);
+        const { bindings, unreadable } = await this.readBindings();
+        if (unreadable.length > 0) throw new Error('checkpoint retirement binding metadata is unreadable');
+        return this.selectBindings(bindings, request);
     }
 
     private selectBindings(bindings: Binding[], request: Retirement) {
@@ -102,22 +128,28 @@ export class CheckpointRetention {
         return samePath;
     }
 
-    private async readBindings(): Promise<Binding[]> {
+    private async readBindings(): Promise<{ bindings: Binding[]; unreadable: string[] }> {
         const directory = join(this.gitDirectory, 'bindings');
         const names = await listDirectory(directory);
         const bindings: Binding[] = [];
+        const unreadable: string[] = [];
         for (const name of names) {
             if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
             const file = join(directory, name);
-            if (!(await lstat(file)).isFile()) throw new Error('checkpoint retention binding is not a regular file');
-            const binding = bindingSchema.parse(JSON.parse(await readFile(file, 'utf8')));
-            const layout = resolveCheckpointStoreLayout({ checkpointRoot: this.checkpointRoot, ...binding });
-            if (layout.metadataFile !== file || resolve(binding.projectPath) !== binding.projectPath) {
-                throw new Error('checkpoint retention binding identity mismatch');
+            try {
+                if (!(await lstat(file)).isFile()) throw new Error('checkpoint retention binding is not a regular file');
+                const binding = bindingSchema.parse(JSON.parse(await readFile(file, 'utf8')));
+                const layout = resolveCheckpointStoreLayout({ checkpointRoot: this.checkpointRoot, ...binding });
+                if (layout.metadataFile !== file || resolve(binding.projectPath) !== binding.projectPath) {
+                    throw new Error('checkpoint retention binding identity mismatch');
+                }
+                bindings.push({ ...binding, key: name.slice(0, -5) });
+            } catch (error) {
+                if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+                unreadable.push(name.slice(0, -5));
             }
-            bindings.push({ ...binding, key: name.slice(0, -5) });
         }
-        return bindings;
+        return { bindings, unreadable };
     }
 
     private async restoreProtection(key: string): Promise<{ pending: boolean; safetyIds: string[] }> {

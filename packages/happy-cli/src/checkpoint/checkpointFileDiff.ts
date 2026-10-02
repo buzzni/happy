@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { lstat, mkdtemp, open, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, open, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { CheckpointRestorePlanner, type CheckpointRestorePlanRequest } from './checkpointRestorePlan';
@@ -9,6 +9,9 @@ import { resolveCheckpointStoreLayout } from './checkpointStore';
 
 const MAX_BYTES = 1024 * 1024;
 const MAX_DIFF_BYTES = 2 * MAX_BYTES;
+const OPERAND_PREFIX = 'diff-';
+/** A comparison runs a few bounded git calls; an operand this old belongs to a daemon that died mid-diff. */
+const STALE_OPERAND_MS = 3600_000;
 type FileDiff = { status: 'text' | 'binary' | 'too-large'; diff: string };
 
 /** Read-only, current -> selected checkpoint. The planner owns binding and exclusion checks. */
@@ -54,7 +57,7 @@ export async function checkpointFileDiff(checkpointRoot: string, request: Checkp
         decoder.decode(current); decoder.decode(target);
     } catch { return { status: 'binary', diff: '' }; }
     // Temporary comparison operands contain private bytes and are removed even on failure.
-    const directory = await mkdtemp(join(layout.gitDirectory, 'diff-'));
+    const directory = await mkdtemp(join(layout.gitDirectory, OPERAND_PREFIX));
     try {
         await writeFile(join(directory, 'current'), current, { mode: 0o600 });
         await writeFile(join(directory, 'checkpoint'), target, { mode: 0o600 });
@@ -70,6 +73,20 @@ export async function checkpointFileDiff(checkpointRoot: string, request: Checkp
         }
         throw error;
     } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+/** Idle cleanup of private operands a crash left; recent (possibly in-flight) ones and links stay. */
+export async function sweepStaleCheckpointDiffOperands(gitDirectory: string): Promise<void> {
+    const entries = await readdir(gitDirectory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+    });
+    for (const entry of entries) {
+        if (!entry.isDirectory() || !/^diff-[A-Za-z0-9]{6}$/.test(entry.name)) continue;
+        const path = join(gitDirectory, entry.name);
+        const stats = await lstat(path);
+        if (stats.isDirectory() && Date.now() - stats.mtimeMs >= STALE_OPERAND_MS) await rm(path, { recursive: true, force: true });
+    }
 }
 
 async function currentContents(projectPath: string, path: string): Promise<{ contents: Buffer; exists: boolean; mode: string | null } | null> {

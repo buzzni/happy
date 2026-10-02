@@ -1,7 +1,7 @@
 import { recordCheckpointRetentionBoundary } from './checkpointRetentionBoundary';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { access, lstat, readdir, rm } from 'node:fs/promises';
+import { access, lstat, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
 import {
@@ -18,9 +18,16 @@ export type RetentionPolicy = {
     maxStoreBytes?: number;
     now?: number;
     preserveLatest?: boolean;
+    /** Capacity batches start only while the pass is younger than this; packing resumes next pass. */
+    capacityBudgetMs?: number;
+    /** Explicit retirement: drop only retired bindings, leaving every other limit and packing to the idle pass. */
+    retireOnly?: boolean;
     /** Resolved under the store lock so worktree observation and pruning share one boundary. */
     resolveBindings?: () => Promise<{ keep: Set<string>; retire: Set<string>; safety?: Set<string> }>;
 };
+
+/** Objects of an explicit retirement wait for the next idle pass to pack and prune them. */
+const RECLAIM_PENDING_FILE = 'checkpoint-reclaim-pending';
 
 type CheckpointRef = {
     refName: string;
@@ -81,6 +88,7 @@ export class CheckpointGarbageCollector {
         storeBytes: number;
     }> {
         const gitDirectory = join(this.checkpointRoot, 'store');
+        const started = Date.now();
         const [refs, pins] = await Promise.all([
             listCheckpointRefs(gitDirectory),
             listCheckpointPins(gitDirectory),
@@ -99,9 +107,12 @@ export class CheckpointGarbageCollector {
                 if (safety) protectedCheckpoints.add(checkpointKey(safety));
             }
         }
-        const managedBindings = new Set([...refs.map(({ bindingKey }) => bindingKey), ...lifecycle.retire]);
+        const managedBindings = policy.retireOnly
+            ? new Set(lifecycle.retire)
+            : new Set([...refs.map(({ bindingKey }) => bindingKey), ...lifecycle.retire]);
         const expired = selectExpired(refs, protectedBindings, protectedCheckpoints, lifecycle.retire, policy);
         const pruned = new Set<string>();
+        const pendingFile = join(gitDirectory, RECLAIM_PENDING_FILE);
         if (expired.size > 0) {
             await deleteCheckpointRefs(gitDirectory, refs, expired);
             for (const key of expired) pruned.add(key);
@@ -110,13 +121,19 @@ export class CheckpointGarbageCollector {
                 refs.filter((ref) => !expired.has(checkpointKey(ref))),
                 managedBindings,
             );
+            if (policy.retireOnly) await writeFile(pendingFile, '', { mode: 0o600 });
+        }
+        let reclaimed = false;
+        if (!policy.retireOnly && (expired.size > 0 || await pathExists(pendingFile))) {
             await reclaimObjects(gitDirectory);
+            await rm(pendingFile, { force: true });
+            reclaimed = true;
         }
 
-        if (policy.maxStoreBytes !== undefined) {
+        if (policy.maxStoreBytes !== undefined && !policy.retireOnly) {
             let remaining = refs.filter((ref) => !pruned.has(checkpointKey(ref)));
             let storeBytes = await directorySize(gitDirectory);
-            if (storeBytes > policy.maxStoreBytes && expired.size === 0) {
+            if (storeBytes > policy.maxStoreBytes && !reclaimed) {
                 await reclaimObjects(gitDirectory);
                 storeBytes = await directorySize(gitDirectory);
             }
@@ -126,7 +143,9 @@ export class CheckpointGarbageCollector {
             // require packing to measure reclamation, so pack once per small batch, not per record.
             const batchSize = policy.preserveLatest ? 16 : 1;
             const limit = policy.preserveLatest ? Math.min(candidates.length, 128) : candidates.length;
-            for (let offset = 0; offset < limit && storeBytes > policy.maxStoreBytes; offset += batchSize) {
+            // Writers wait for the store lock for minutes, not indefinitely: start a batch only inside the budget.
+            const withinBudget = () => policy.capacityBudgetMs === undefined || Date.now() - started < policy.capacityBudgetMs;
+            for (let offset = 0; offset < limit && storeBytes > policy.maxStoreBytes && withinBudget(); offset += batchSize) {
                 const selected = new Set(candidates.slice(offset, Math.min(offset + batchSize, limit)).map(checkpointKey));
                 await deleteCheckpointRefs(gitDirectory, remaining, selected);
                 for (const key of selected) pruned.add(key);
@@ -195,6 +214,9 @@ export async function withCheckpointPin<T>(
 
 function validatePolicy(policy: RetentionPolicy): void {
     const limits = [policy.maxCheckpointsPerBinding, policy.maxAgeMs, policy.maxStoreBytes];
+    if (policy.capacityBudgetMs !== undefined && (!Number.isSafeInteger(policy.capacityBudgetMs) || policy.capacityBudgetMs < 0)) {
+        throw new Error('checkpoint retention budget is invalid');
+    }
     if (limits.every((value) => value === undefined)) {
         throw new Error('checkpoint retention policy requires a limit');
     }
@@ -261,7 +283,7 @@ function selectExpired(
     const now = policy.now ?? Date.now();
     const byBinding = groupByBinding(oldestUnique(refs));
     for (const [bindingKey, checkpoints] of byBinding) {
-        if (pinnedBindings.has(bindingKey)) continue;
+        if (pinnedBindings.has(bindingKey) || (policy.retireOnly && !retiredBindings.has(bindingKey))) continue;
         const newest = [...checkpoints].sort(newestFirst);
         for (const [index, checkpoint] of newest.entries()) {
             if (protectedCheckpoints.has(checkpointKey(checkpoint))) continue;
@@ -346,6 +368,16 @@ async function reclaimObjects(gitDirectory: string): Promise<void> {
         ? 'now'
         : `${Math.ceil(Math.max(0, Date.now() - stagingStart) / 1000) + 60}.seconds.ago`;
     await runGit(['gc', `--prune=${prune}`, '--quiet'], gitDirectory, environment);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+    try {
+        await lstat(path);
+        return true;
+    } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
+        throw error;
+    }
 }
 
 async function directorySize(path: string): Promise<number> {

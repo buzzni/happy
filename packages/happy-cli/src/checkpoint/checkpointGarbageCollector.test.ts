@@ -84,6 +84,18 @@ describe('CheckpointGarbageCollector', () => {
         expect(result.storeBytes).toBeGreaterThan(0);
     });
 
+    it('stops capacity reclamation once the pass budget is spent and resumes on the next pass', async () => {
+        const store = new CheckpointStore(checkpointRoot);
+        for (let index = 0; index < 3; index += 1) {
+            await writeFile(join(projectPath, 'tracked.txt'), `version ${index}`);
+            await store.snapshotTurn({ ...binding, projectPath, operationId: `budget-${index}` });
+        }
+        const collector = new CheckpointGarbageCollector(checkpointRoot);
+        const policy = { maxStoreBytes: 0, preserveLatest: true } as const;
+        expect((await collector.collect({ ...policy, capacityBudgetMs: 0 })).prunedCheckpoints).toBe(0);
+        expect((await collector.collect({ ...policy, capacityBudgetMs: 60_000 })).prunedCheckpoints).toBe(2);
+    });
+
     it('refuses to create a pin for a checkpoint owned by another binding', async () => {
         await writeFile(join(projectPath, 'tracked.txt'), 'owned\n');
         const checkpointId = (await new CheckpointStore(checkpointRoot).snapshotTurn({

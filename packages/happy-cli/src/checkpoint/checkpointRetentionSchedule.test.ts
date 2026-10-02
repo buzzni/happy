@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { CheckpointRetentionSchedule } from './checkpointRetentionSchedule';
 describe('checkpoint retention schedule', () => {
-    it('checks startup at idle then daily; retries failures, prevents overlaps, drains on stop', async () => {
+    it('checks startup at idle then daily; retries failures after an hour, prevents overlaps, drains on stop', async () => {
         let idle = false;
         let now = 0;
         const collect = vi.fn(async () => undefined);
@@ -21,6 +21,11 @@ describe('checkpoint retention schedule', () => {
         idle = true;
         collect.mockRejectedValueOnce(new Error('collection failed'));
         await schedule.tick();
+        await schedule.tick();
+        now += 3600_000 - 1;
+        await schedule.tick();
+        expect(collect).toHaveBeenCalledTimes(2);
+        now++;
         await schedule.tick();
         expect(collect).toHaveBeenCalledTimes(3);
         let release!: () => void;
