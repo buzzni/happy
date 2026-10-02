@@ -16,12 +16,13 @@ function parseReleaseVersion(version: unknown): [number, number, number] | null 
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null
 }
 
+const MINIMUM_RELEASE = parseReleaseVersion(MINIMUM_CODEX_MULTI_AUTH_VERSION)!
+
 export function isSupportedCodexMultiAuthVersion(version: unknown): version is string {
   const parsed = parseReleaseVersion(version)
-  const minimum = parseReleaseVersion(MINIMUM_CODEX_MULTI_AUTH_VERSION)!
   if (!parsed) return false
   for (let i = 0; i < 3; i++) {
-    if (parsed[i] !== minimum[i]) return parsed[i] > minimum[i]
+    if (parsed[i] !== MINIMUM_RELEASE[i]) return parsed[i] > MINIMUM_RELEASE[i]
   }
   return true
 }
