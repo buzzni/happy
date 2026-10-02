@@ -616,3 +616,23 @@ that may be stuck on the same studio it is shutting down because of.
 
 Operator-facing configuration, rollout and rollback live in the studio
 repository (`aplus-dev-studio`) under `docs/runbooks/lesson-host-operations.md`.
+
+## Checkpoint history comparison and retention
+
+The daemon owns the shared checkpoint Git store and binding lifecycle.
+`checkpointFileDiff` serves bounded, read-only current-to-record comparisons after the
+restore planner validates binding ownership, historical coverage and current exclusions.
+It rejects unsafe paths and returns explicit binary/size outcomes; file lifecycle metadata
+keeps empty-file creation and deletion visible without sending temporary machine paths.
+
+`checkpointRetention` applies 30-day/200-record retention per binding and a 5GiB soft
+machine target through the store lock and garbage collector. It preserves latest baseline
+and safety records, pins and uncertain/incomplete work; trusted absence of a managed
+worktree starts a durable seven-day grace period. The additive retirement RPC resolves
+bindings from daemon metadata and requires explicit confirmation for immediate deletion.
+The heartbeat schedule runs at startup and daily only with no live session/terminal or
+automation activity, and drains on shutdown/handoff. Deleted intermediate records write
+a durable provenance boundary before refs disappear so older restores require explicit
+file inclusion. Revisit the conservative idle rule if long-lived sessions prevent cleanup,
+and the bounded capacity batches if storage pressure persists. Runtime release and
+Desktop pin adoption remain separate from these source changes.

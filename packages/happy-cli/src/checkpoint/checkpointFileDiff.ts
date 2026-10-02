@@ -33,15 +33,20 @@ export async function checkpointFileDiff(checkpointRoot: string, request: Checkp
     const tree = (await git(['ls-tree', '-z', request.checkpointId, '--', `:(top,literal)${path}`], projectPath, env)).toString('utf8');
     if (!entry && !tree) throw new Error('checkpoint diff path is unavailable');
     let target: Buffer = Buffer.alloc(0);
+    let targetMode = '100644';
     if (tree) {
         const match = /^(100644|100755) blob ([a-f0-9]{40,64})\t/.exec(tree);
         if (!match) throw new Error('checkpoint diff target is unsupported');
+        targetMode = match[1]!;
         const size = Number((await git(['cat-file', '-s', match[2]], projectPath, env)).toString('utf8'));
         if (!Number.isSafeInteger(size) || size > MAX_BYTES) return { status: 'too-large', diff: '' };
         target = await git(['cat-file', 'blob', match[2]], projectPath, env);
     }
-    const current = await currentContents(projectPath, path);
-    if (current === null) return { status: 'too-large', diff: '' };
+    const source = await currentContents(projectPath, path);
+    if (source === null) return { status: 'too-large', diff: '' };
+    const current = source.contents;
+    const metadata = !source.exists && tree ? `new file mode ${targetMode}\n`
+        : source.exists && !tree ? `deleted file mode ${source.mode}\n` : '';
     if (!entry && !current.equals(target)) throw new Error('checkpoint diff file changed while loading');
     const decoder = new TextDecoder('utf-8', { fatal: true });
     try {
@@ -55,9 +60,10 @@ export async function checkpointFileDiff(checkpointRoot: string, request: Checkp
         await writeFile(join(directory, 'checkpoint'), target, { mode: 0o600 });
         const output = await git(['diff', '--no-index', '--no-ext-diff', '--no-textconv', '--no-color', '--', 'current', 'checkpoint'], directory, env, true);
         const text = output.toString('utf8');
-        // Only hunks cross the wire: no machine-local temporary paths.
+        // Send file lifecycle metadata and hunks, never machine-local temporary paths.
         const start = text.indexOf('@@ ');
-        return { status: 'text', diff: start < 0 ? '' : text.slice(start) };
+        const diff = metadata + (start < 0 ? '' : text.slice(start));
+        return Buffer.byteLength(diff) > MAX_DIFF_BYTES ? { status: 'too-large', diff: '' } : { status: 'text', diff };
     } catch (error) {
         if (error instanceof Error && 'code' in error && error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
             return { status: 'too-large', diff: '' };
@@ -66,7 +72,7 @@ export async function checkpointFileDiff(checkpointRoot: string, request: Checkp
     } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
-async function currentContents(projectPath: string, path: string): Promise<Buffer | null> {
+async function currentContents(projectPath: string, path: string): Promise<{ contents: Buffer; exists: boolean; mode: string | null } | null> {
     let absolute = projectPath;
     const segments = path.split('/');
     for (let i = 0; i < segments.length; i++) {
@@ -74,7 +80,7 @@ async function currentContents(projectPath: string, path: string): Promise<Buffe
         let stats;
         try { stats = await lstat(absolute); }
         catch (error) {
-            if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return Buffer.alloc(0);
+            if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { contents: Buffer.alloc(0), exists: false, mode: null };
             throw error;
         }
         if (stats.isSymbolicLink() || (i < segments.length - 1 ? !stats.isDirectory() : !stats.isFile())) {
@@ -95,7 +101,7 @@ async function currentContents(projectPath: string, path: string): Promise<Buffe
             count += bytesRead;
         }
         if (await realpath(absolute) !== absolute) throw new Error('checkpoint diff path changed');
-        return count > MAX_BYTES ? null : contents.subarray(0, count);
+        return count > MAX_BYTES ? null : { contents: contents.subarray(0, count), exists: true, mode: stats.mode & 0o111 ? '100755' : '100644' };
     } finally { await handle.close(); }
 }
 

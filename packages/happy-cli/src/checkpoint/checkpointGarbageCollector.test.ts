@@ -232,7 +232,7 @@ describe('CheckpointGarbageCollector', () => {
     });
 
     it.each([
-        ['age', { maxAgeMs: 0, now: Date.now() + 10_000 }],
+        ['age', { maxAgeMs: 0 }],
         ['capacity', { maxStoreBytes: 0 }],
     ] as const)('reclaims checkpoints using the explicit %s limit', async (_name, policy) => {
         const store = new CheckpointStore(checkpointRoot);
@@ -246,7 +246,7 @@ describe('CheckpointGarbageCollector', () => {
             })).checkpointId);
         }
 
-        const result = await new CheckpointGarbageCollector(checkpointRoot).collect(policy);
+        const result = await new CheckpointGarbageCollector(checkpointRoot).collect({ ...policy, now: Date.now() + 10_000 });
 
         expect(result.prunedCheckpoints).toBe(2);
         for (const checkpointId of checkpoints) {

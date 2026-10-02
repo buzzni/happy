@@ -44,7 +44,7 @@ it('handles deleted and newly created files, including empty files', async () =>
     await writeFile(join(projectPath, 'new.txt'), 'new\n');
     expect(await handlers.diff!({ ...request, path: 'new.txt' })).toMatchObject({ status: 'text', diff: expect.stringContaining('-new') });
     await writeFile(join(projectPath, 'empty.txt'), '');
-    expect(await handlers.diff!({ ...request, path: 'empty.txt' })).toMatchObject({ status: 'text', diff: '' });
+    expect(await handlers.diff!({ ...request, path: 'empty.txt' })).toMatchObject({ status: 'text', diff: expect.stringContaining('deleted file mode') });
 });
 it('rejects other bindings, unowned checkpoints, excluded paths and traversal', async () => {
     const { handlers, request } = await fixture();
@@ -70,4 +70,13 @@ it('returns explicit binary and size statuses with no file content', async () =>
     expect(await handlers.diff!(request)).toMatchObject({ status: 'binary', diff: '' });
     await writeFile(join(projectPath, 'a.txt'), 'x'.repeat(1024 * 1024 + 1));
     expect(await handlers.diff!(request)).toMatchObject({ status: 'too-large', diff: '' });
+});
+
+it('shows creation of an empty recorded file even though its bytes match an absent file', async () => {
+    await writeFile(join(projectPath, 'empty.txt'), '');
+    const { handlers, request } = await fixture();
+    await rm(join(projectPath, 'empty.txt'));
+    expect(await handlers.diff!({ ...request, path: 'empty.txt' })).toMatchObject({
+        status: 'text', diff: expect.stringContaining('new file mode 100644'),
+    });
 });
