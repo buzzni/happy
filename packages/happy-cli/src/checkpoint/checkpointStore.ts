@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
@@ -30,7 +30,16 @@ export type CheckpointSnapshotRequest = Omit<CheckpointStoreBinding, 'checkpoint
     excludedPatterns?: string[];
     capturedFiles?: CheckpointExclusionManifest['capturedFiles'];
     validateCapture?: () => Promise<void>;
+    /**
+     * specs/checkpoint-local-history R2 — record the whole folder (ignore rules and excluded patterns
+     * applied) through a per-binding index, so a later turn only rehashes what changed. Files over
+     * `maxFileBytes` stay unrecorded and are listed in the coverage trailer.
+     */
+    workTree?: { maxFileBytes: number };
 };
+
+const LOCAL_HISTORY_MARKER = 'saycode-local-history-v1';
+const WORK_TREE_ADD_TIMEOUT_MS = 10 * 60_000;
 
 export type CheckpointSnapshotResult = {
     checkpointId: string;
@@ -216,14 +225,28 @@ export class CheckpointStore {
             );
             const parentId = parent.exitCode === 0 ? parent.stdout.trim() : null;
 
-            if (request.capturedFiles) {
+            const workTreeIndex = request.workTree
+                ? await copyFile(layout.indexFile, snapshotLayout.indexFile).then(() => true, () => false)
+                : false;
+            if (request.capturedFiles || (request.workTree && !workTreeIndex)) {
                 await runGit(['read-tree', '--empty'], projectPath, environment);
-            } else if (parentId) {
+            } else if (parentId && !request.workTree) {
                 await runGit(['read-tree', parentId], projectPath, environment);
             }
 
-            const excludedPaths = normalizeExcludedPaths(request.excludedPaths ?? []);
             const excludedPatterns = normalizeExcludedPatterns(request.excludedPatterns ?? []);
+            // A work tree takes its patterns as an ignore file: a glob exclude pathspec under an
+            // ignored directory (`.aplus/worktrees/**`) makes `git add` fail on the ignored parent.
+            const excludesFile = `${snapshotLayout.indexFile}.exclude`;
+            const workTreeConfig = request.workTree ? ['-c', `core.excludesFile=${excludesFile}`] : [];
+            if (request.workTree) await writeFile(excludesFile, excludedPatterns.map((pattern) => `${pattern}\n`).join(''), { mode: 0o600 });
+            const excludedPaths = normalizeExcludedPaths([
+                ...(request.excludedPaths ?? []),
+                ...(request.workTree
+                    ? await unrecordedWorkTreePaths(request.workTree.maxFileBytes, workTreeConfig, projectPath, environment)
+                    : []),
+            ]);
+            const recordRequest = { ...request, excludedPaths };
             const capturePathspec = `${snapshotLayout.indexFile}.paths`;
             if (request.capturedFiles) {
                 const paths = normalizeExcludedPaths(request.capturedFiles.map((file) => file.path));
@@ -232,13 +255,14 @@ export class CheckpointStore {
                     await runGit(['add', '-A', `--pathspec-from-file=${capturePathspec}`, '--pathspec-file-nul'], projectPath, environment);
                 }
             } else await runGit([
+                ...workTreeConfig,
                 'add',
                 '-A',
                 '--',
                 '.',
                 ...excludedPaths.map((path) => `:(exclude,top,literal)${path}`),
-                ...excludedPatterns.map((pattern) => `:(exclude,top,glob)${pattern}`),
-            ], projectPath, environment);
+                ...(request.workTree ? [] : excludedPatterns.map((pattern) => `:(exclude,top,glob)${pattern}`)),
+            ], projectPath, environment, new Set([0]), request.workTree ? WORK_TREE_ADD_TIMEOUT_MS : undefined);
             if (excludedPaths.length > 0 || excludedPatterns.length > 0) {
                 await runGit([
                     'rm',
@@ -253,6 +277,11 @@ export class CheckpointStore {
             }
             const tree = (await runGit(['write-tree'], projectPath, environment)).stdout.trim();
             await validateCapturedTree(tree, request, projectPath, environment);
+            const body = checkpointBody(recordRequest);
+            const keepIndex = async <T>(result: T): Promise<T> => {
+                if (request.workTree) await rename(snapshotLayout.indexFile, layout.indexFile);
+                return result;
+            };
             if (parentId) {
                 const parentTree = (await runGit(
                     ['rev-parse', `${parentId}^{tree}`],
@@ -260,8 +289,8 @@ export class CheckpointStore {
                     environment,
                 )).stdout.trim();
                 const parentBody = (await runGit(['show', '-s', '--format=%b', parentId], projectPath, environment)).stdout;
-                if (tree === parentTree && parentBody.trim() === checkpointCoverageTrailer(request)) {
-                    return completeCheckpointRefs({
+                if (tree === parentTree && parentBody.trim() === body) {
+                    return keepIndex(await completeCheckpointRefs({
                         layout: snapshotLayout,
                         operationRef,
                         checkpointId: parentId,
@@ -269,16 +298,16 @@ export class CheckpointStore {
                         updateLatest: false,
                         projectPath,
                         environment,
-                    });
+                    }));
                 }
             }
 
             const createdAt = await nextCheckpointTimestamp(parentId, projectPath, environment);
             const messageFile = `${snapshotLayout.indexFile}.message`;
-            await writeFile(messageFile, `saycode-checkpoint-v1 ${createdAt}\n\n${checkpointCoverageTrailer(request)}`, { mode: 0o600 });
+            await writeFile(messageFile, `saycode-checkpoint-v1 ${createdAt}\n\n${body}`, { mode: 0o600 });
             const commitArgs = ['commit-tree', tree, '-F', messageFile, '--no-gpg-sign'];
             const checkpointId = (await runGit(commitArgs, projectPath, environment)).stdout.trim();
-            return completeCheckpointRefs({
+            return keepIndex(await completeCheckpointRefs({
                 layout: snapshotLayout,
                 operationRef,
                 checkpointId,
@@ -286,11 +315,12 @@ export class CheckpointStore {
                 updateLatest: true,
                 projectPath,
                 environment,
-            });
+            }));
         } finally {
             await rm(snapshotLayout.indexFile, { force: true });
             await rm(`${snapshotLayout.indexFile}.paths`, { force: true });
             await rm(`${snapshotLayout.indexFile}.message`, { force: true });
+            await rm(`${snapshotLayout.indexFile}.exclude`, { force: true });
         }
     }
 
@@ -363,6 +393,38 @@ async function nextCheckpointTimestamp(
     return Number.isSafeInteger(nextTimestamp)
         ? Math.max(currentTime, nextTimestamp)
         : currentTime;
+}
+
+function checkpointBody(request: CheckpointSnapshotRequest): string {
+    const trailer = checkpointCoverageTrailer(request);
+    return request.workTree ? `${LOCAL_HISTORY_MARKER}\n${trailer}` : trailer;
+}
+
+/**
+ * Paths a local-history record leaves out, found through the index's stat cache: nested
+ * repositories (git lists them as `dir/`, and one without a commit fails `git add`) and changed or
+ * new regular files over the cap.
+ */
+async function unrecordedWorkTreePaths(
+    maxFileBytes: number,
+    workTreeConfig: string[],
+    projectPath: string,
+    environment: NodeJS.ProcessEnv,
+): Promise<string[]> {
+    const listing = await runGit([
+        ...workTreeConfig,
+        'ls-files', '-z', '--modified', '--others', '--exclude-standard',
+    ], projectPath, environment, new Set([0]), WORK_TREE_ADD_TIMEOUT_MS);
+    const oversized: string[] = [];
+    for (const path of new Set(listing.stdout.split('\0').filter(Boolean))) {
+        if (path.endsWith('/')) {
+            oversized.push(path.slice(0, -1));
+            continue;
+        }
+        const entry = await lstat(join(projectPath, path)).catch(() => null);
+        if (entry?.isFile() && entry.size > maxFileBytes) oversized.push(path);
+    }
+    return oversized;
 }
 
 function checkpointOperationRef(layout: CheckpointStoreLayout, operationId: string): string {
@@ -539,7 +601,15 @@ async function initializeGitStore(gitDirectory: string): Promise<void> {
     environment.GIT_CONFIG_SYSTEM = process.platform === 'win32' ? 'NUL' : '/dev/null';
     environment.GIT_CONFIG_NOSYSTEM = '1';
 
-    await runGit(['init', '--bare', gitDirectory], dirname(gitDirectory), environment);
+    try {
+        await runGit(['init', '--bare', gitDirectory], dirname(gitDirectory), environment);
+    } catch (error) {
+        // Another session can initialize the shared store at the same moment; git then fails
+        // copying its templates. Re-running init on a complete store is safe.
+        await runGit(['init', '--bare', gitDirectory], dirname(gitDirectory), environment).catch(() => {
+            throw error;
+        });
+    }
     await mkdir(join(gitDirectory, 'indexes'), { recursive: true });
     await mkdir(join(gitDirectory, 'bindings'), { recursive: true });
     await writeFile(join(gitDirectory, 'info', 'exclude'), '.git/\n');
@@ -550,14 +620,15 @@ function runGit(
     cwd: string,
     environment: NodeJS.ProcessEnv,
     allowedExitCodes = new Set([0]),
+    timeout = 60_000,
 ): Promise<GitResult> {
     return new Promise((resolvePromise, rejectPromise) => {
         execFile('git', args, {
             cwd,
             env: environment,
             encoding: 'utf8',
-            maxBuffer: 10 * 1024 * 1024,
-            timeout: 60_000,
+            maxBuffer: 256 * 1024 * 1024,
+            timeout,
         }, (error, stdout, stderr) => {
             const exitCode = typeof error?.code === 'number' ? error.code : error ? -1 : 0;
             if (error && !allowedExitCodes.has(exitCode)) {
