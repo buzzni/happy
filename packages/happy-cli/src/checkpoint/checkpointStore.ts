@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
@@ -226,7 +226,7 @@ export class CheckpointStore {
             const parentId = parent.exitCode === 0 ? parent.stdout.trim() : null;
 
             const workTreeIndex = request.workTree
-                ? await copyFile(layout.indexFile, snapshotLayout.indexFile).then(() => true, () => false)
+                ? await copyIndexKeepingTimes(layout.indexFile, snapshotLayout.indexFile)
                 : false;
             if (request.capturedFiles || (request.workTree && !workTreeIndex)) {
                 await runGit(['read-tree', '--empty'], projectPath, environment);
@@ -393,6 +393,21 @@ async function nextCheckpointTimestamp(
     return Number.isSafeInteger(nextTimestamp)
         ? Math.max(currentTime, nextTimestamp)
         : currentTime;
+}
+
+/**
+ * Git decides whether an entry written in the same second as its index needs a content re-check
+ * from the index file's mtime, so a copy keeps the original times.
+ */
+async function copyIndexKeepingTimes(source: string, target: string): Promise<boolean> {
+    try {
+        await copyFile(source, target);
+        const times = await stat(source);
+        await utimes(target, times.atime, times.mtime);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function checkpointBody(request: CheckpointSnapshotRequest): string {
