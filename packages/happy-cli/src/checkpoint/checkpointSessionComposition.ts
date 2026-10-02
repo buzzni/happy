@@ -12,7 +12,9 @@ import {
     type CheckpointLocalHistory,
 } from './checkpointLocalHistory';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
-import type { CheckpointTurnApplyResult } from './checkpointTurnApply';
+
+/** The isolated-turn apply outcome providers still type against; local history never produces one. */
+export type CheckpointTurnApplyResult = { status: 'completed' | 'partial' };
 
 export type CheckpointTurnPreparation = {
     operationId: string;
