@@ -65,6 +65,22 @@ describe('buildResumeLaunch', () => {
         });
     });
 
+    it('explains that a Codex session without a thread never started instead of only naming the missing ID', () => {
+        expect(() => buildResumeLaunch({
+            id: 'session-4',
+            active: false,
+            metadata: {
+                path: '/tmp/repo',
+                flavor: 'codex',
+                host: 'localhost',
+                homeDir: '/tmp',
+                happyHomeDir: '/tmp/.happy',
+                happyLibDir: '/tmp/happy',
+                happyToolsDir: '/tmp/happy/tools',
+            },
+        })).toThrow('Happy session session-4 has no Codex thread to resume because Codex never started in it. Start a new conversation.');
+    });
+
     it('rejects unsupported flavors', () => {
         expect(() => buildResumeLaunch({
             id: 'session-3',

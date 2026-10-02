@@ -10,6 +10,7 @@ const fixture = vi.hoisted(() => ({
     onInterrupt: null as null | (() => void),
     onSend: null as null | (() => Promise<void>),
     onSteer: null as null | (() => Promise<void>),
+    onConnect: null as null | (() => Promise<void>),
     proposal: { name: 'Verified recovery' },
     gate: null as import('../sessionDrain/runtimeProducerGate').RuntimeProducerGate | null,
     events: [] as string[],
@@ -73,7 +74,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     authRecoveryBusy = false;
     reconnectForAuth = fixture.reconnect;
     threadId: string | null = null;
-    connect = async () => {};
+    connect = async () => { await fixture.onConnect?.(); };
     disconnect = fixture.disconnect;
     steerTurn = async (text: string) => { fixture.steerText = text; await fixture.onSteer?.(); };
     setApprovalHandler = vi.fn();
@@ -104,6 +105,7 @@ import { StandaloneLaunchControl } from '../daemon/standaloneLaunchControl';
 import type { StandaloneLaunchBootstrap } from '../daemon/standaloneLaunchProtocol';
 import { SessionDrain, type DrainReceipt } from '../sessionDrain/sessionDrain';
 import { CodexAuthRecovery } from './codexAuthRecovery';
+import { logger } from '@/ui/logger';
 const originalSignals = new Map<string, Function[]>();
 const originalExitCode = process.exitCode;
 beforeEach(() => { for (const signal of ['SIGINT', 'SIGTERM'] as const) originalSignals.set(signal, process.listeners(signal)); });
@@ -114,7 +116,7 @@ afterEach(() => {
         }
     }
 });
-afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.steerText = ''; fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
+afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.steerText = ''; fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
@@ -133,6 +135,25 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    // The daemon spawns the CLI with stdio ignored, so a start failure that only
+    // reaches stderr leaves no reason anywhere and the user later sees only
+    // that the session has no Codex thread to resume.
+    it('records why Codex failed to start in the session log and the conversation before ending the session', async () => {
+        const failure = new Error('Unsupported codex-multi-auth version 2.15.0; supported: >=2.16.0');
+        fixture.onConnect = async () => { throw failure; };
+
+        await expect(start()).rejects.toBe(failure);
+
+        expect(logger.warn).toHaveBeenCalledWith('[codex]: Codex failed to start', failure);
+        const notice = { type: 'message', message: 'Codex failed to start: Unsupported codex-multi-auth version 2.15.0; supported: >=2.16.0' };
+        expect(fixture.session.sendSessionEvent).toHaveBeenCalledWith(notice);
+        const noticeOrder = fixture.session.sendSessionEvent.mock.invocationCallOrder[
+            fixture.session.sendSessionEvent.mock.calls.findIndex(([event]) => JSON.stringify(event) === JSON.stringify(notice))
+        ];
+        expect(noticeOrder).toBeLessThan(fixture.session.sendSessionDeath.mock.invocationCallOrder[0]);
+        expect(noticeOrder).toBeLessThan(fixture.session.flush.mock.invocationCallOrder[0]);
+        expect(fixture.send).not.toHaveBeenCalled();
+    });
     it('rejects standalone authentication before creating an API client or server session', async () => {
         const parent = await StandaloneLaunchControl.open('early-auth-instance');
         const bootstrap = parent.reserve('early-auth-launch');
