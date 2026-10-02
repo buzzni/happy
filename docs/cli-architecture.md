@@ -625,6 +625,18 @@ restore planner validates binding ownership, historical coverage and current exc
 It rejects unsafe paths and returns explicit binary/size outcomes; file lifecycle metadata
 keeps empty-file creation and deletion visible without sending temporary machine paths.
 
+`checkpointAgentReader` captures the launcher session/project/worktree binding and
+canonical project path, rechecks current persisted availability per call, and delegates
+to existing read RPC ownership/coverage/exclusion validation. `checkpointAgentTools`
+registers only status/list/preview/diff on the session Happy MCP with strict inputs,
+read-only annotations and the existing host admission/drain boundary. Responses are
+paginated (50 records/100 files) or truncated (500 lines/64KiB UTF-8 diff); errors never
+return raw store paths. Provider query/thread setup includes short guidance only while
+history is enabled. Claude follow-ups within one live SDK query retain its initial
+guidance, so tool status/call checks remain authoritative. Neither snapshot creation
+nor restore execution is exposed; Desktop confirmation still owns restoration. Revisit
+this read-only boundary only with a separately reviewed mutation/confirmation contract.
+
 `checkpointRetention` applies 30-day/200-record retention per binding and a 5GiB soft
 machine target through the store lock and garbage collector. It preserves latest baseline
 and safety records, pins and uncertain/incomplete work; trusted absence of a managed
