@@ -11,6 +11,7 @@ const fixture = vi.hoisted(() => ({
     onSend: null as null | (() => Promise<void>),
     onSteer: null as null | (() => Promise<void>),
     onConnect: null as null | (() => Promise<void>),
+    onResumeThread: null as null | (() => Promise<void>),
     proposal: { name: 'Verified recovery' },
     gate: null as import('../sessionDrain/runtimeProducerGate').RuntimeProducerGate | null,
     events: [] as string[],
@@ -75,6 +76,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     reconnectForAuth = fixture.reconnect;
     threadId: string | null = null;
     connect = async () => { await fixture.onConnect?.(); };
+    resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); return { threadId, model: 'test' }; };
     disconnect = fixture.disconnect;
     steerTurn = async (text: string) => { fixture.steerText = text; await fixture.onSteer?.(); };
     setApprovalHandler = vi.fn();
@@ -116,8 +118,8 @@ afterEach(() => {
         }
     }
 });
-afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.steerText = ''; fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
-async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap) {
+afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
+async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
     }
@@ -125,7 +127,7 @@ async function start(prompt = 'Test input', confirmed = false, review?: import('
     if (confirmed) { vi.stubEnv('HAPPY_MANAGED_REQUIRE_PROMPT_ACK', '1'); vi.stubEnv('HAPPY_INITIAL_PROMPT_LOCAL_ID', 'test-ack'); }
     vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
     const { runCodex } = await import('./runCodex');
-    return runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true, ...(standaloneLaunch ? { standaloneLaunch, startedBy: 'daemon' as const } : {}), ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}) });
+    return runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true, ...(resumeThreadId ? { resumeThreadId } : {}), ...(standaloneLaunch ? { standaloneLaunch, startedBy: 'daemon' as const } : {}), ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}) });
 }
 async function finishFrozenFixture(running: Promise<void>) {
     await vi.waitFor(() => expect(fixture.events).toContain('loopExited'));
@@ -152,6 +154,20 @@ describe('Codex runtime producer bookkeeping', () => {
         ];
         expect(noticeOrder).toBeLessThan(fixture.session.sendSessionDeath.mock.invocationCallOrder[0]);
         expect(noticeOrder).toBeLessThan(fixture.session.flush.mock.invocationCallOrder[0]);
+        expect(fixture.send).not.toHaveBeenCalled();
+    });
+
+    it('records why resuming the Codex thread failed instead of ending the session silently', async () => {
+        fixture.onResumeThread = async () => { throw new Error('thread not found'); };
+
+        await expect(start('Resume input', false, undefined, undefined, 'thread-gone'))
+            .rejects.toThrow('Failed to resume Codex thread thread-gone: thread not found');
+
+        expect(logger.warn).toHaveBeenCalledWith('[codex]: Codex failed to start', expect.any(Error));
+        expect(fixture.session.sendSessionEvent).toHaveBeenCalledWith({
+            type: 'message',
+            message: 'Codex failed to start: Failed to resume Codex thread thread-gone: thread not found',
+        });
         expect(fixture.send).not.toHaveBeenCalled();
     });
     it('rejects standalone authentication before creating an API client or server session', async () => {

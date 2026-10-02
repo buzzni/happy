@@ -1781,6 +1781,21 @@ export async function runCodex(opts: {
         logger.debug('[codex]: client.connect begin');
         try {
             await client.connect();
+            logger.debug('[codex]: client.connect done');
+
+            if (opts.resumeThreadId) {
+                await resumeExistingThread({
+                    client,
+                    session,
+                    messageBuffer,
+                    threadId: opts.resumeThreadId,
+                    cwd: process.cwd(),
+                    mcpServers: mcpConfigSynchronizer.mcpServers,
+                    developerInstructions: currentDeveloperInstructions,
+                });
+                await reportMcpStatuses();
+                appendSystemPromptInjected = true;
+            }
         } catch (error) {
             // The daemon spawns this process with stdio ignored, so the caller's
             // stderr report reaches no one. Record the reason here; the finally
@@ -1790,21 +1805,6 @@ export async function runCodex(opts: {
             messageBuffer.addMessage(failureMessage, 'status');
             session.sendSessionEvent({ type: 'message', message: failureMessage });
             throw error;
-        }
-        logger.debug('[codex]: client.connect done');
-
-        if (opts.resumeThreadId) {
-            await resumeExistingThread({
-                client,
-                session,
-                messageBuffer,
-                threadId: opts.resumeThreadId,
-                cwd: process.cwd(),
-                mcpServers: mcpConfigSynchronizer.mcpServers,
-                developerInstructions: currentDeveloperInstructions,
-            });
-            await reportMcpStatuses();
-            appendSystemPromptInjected = true;
         }
 
         const forkCodexThreadId = process.env.HAPPY_FORK_CODEX_THREAD_ID;
