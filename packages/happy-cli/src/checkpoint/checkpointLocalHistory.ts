@@ -48,12 +48,12 @@ export function createCheckpointLocalHistory(input: {
     checkpointEvents: Pick<CheckpointEventPublisher, 'snapshot'>;
 }): CheckpointLocalHistory {
     const store = new CheckpointStore(input.checkpointRoot);
-    const record = (operationId: string) => store.snapshotTurn({
+    const record = (operationId: string, kind: 'before' | 'after') => store.snapshotTurn({
         ...input.binding,
         projectPath: input.projectPath,
         operationId,
         excludedPatterns: [...input.secretPatterns, ...LOCAL_HISTORY_ALWAYS_EXCLUDED],
-        workTree: { maxFileBytes: LOCAL_HISTORY_MAX_FILE_BYTES },
+        workTree: { maxFileBytes: LOCAL_HISTORY_MAX_FILE_BYTES, record: kind },
     });
     // A gate that failed before its event was acknowledged retries the same operation, so the
     // record and the event stay one-to-one.
@@ -63,7 +63,7 @@ export function createCheckpointLocalHistory(input: {
         beforeTurn: async () => {
             const operationId = pendingOperationId ?? randomUUID();
             pendingOperationId = operationId;
-            const snapshot = await record(operationId);
+            const snapshot = await record(operationId, 'before');
             await input.checkpointEvents.snapshot({ operationId, checkpointId: snapshot.checkpointId, excluded: [] });
             pendingOperationId = null;
             lastOperationId = operationId;
@@ -71,7 +71,7 @@ export function createCheckpointLocalHistory(input: {
         },
         afterTurn: async () => {
             if (!lastOperationId) return;
-            await record(`${lastOperationId}:after`);
+            await record(`${lastOperationId}:after`, 'after');
         },
     };
 }

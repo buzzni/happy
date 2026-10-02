@@ -8,7 +8,8 @@ import { CheckpointRestorePlanner } from './checkpointRestorePlan';
 
 // specs/checkpoint-local-history R4 — a local-history checkpoint restores what this conversation's
 // turns changed and, by default, keeps anything changed after its last record.
-describe('local history restore', () => {
+// Each case drives several real git records and restores; the default 5s is too tight under suite load.
+describe('local history restore', { timeout: 20_000 }, () => {
     let fixtureRoot: string;
     let projectPath: string;
     let checkpointRoot: string;
@@ -102,6 +103,22 @@ describe('local history restore', () => {
         ]);
         await restore(start, 'restore-a', 'session-a');
         expect(await readFile(join(projectPath, 'b.txt'), 'utf8')).toBe('theirs');
+    });
+
+    it('keeps an edit made between this conversation’s turns, even though the next turn recorded it', async () => {
+        const recorder = history();
+        const start = await turn(recorder, () => writeFile(join(projectPath, 'a.txt'), 'turn 1'));
+        await writeFile(join(projectPath, 'between.txt'), 'edited between turns');
+        await turn(recorder, () => writeFile(join(projectPath, 'a.txt'), 'turn 2'));
+
+        const { plan, details } = await preview(start);
+        expect(plan.entries).toEqual([
+            { path: 'a.txt', action: 'delete', reason: 'agent-created' },
+            { path: 'between.txt', action: 'skip', reason: 'user-modified' },
+        ]);
+        expect(details).toEqual([{ path: 'between.txt', detail: 'changed-after-record' }]);
+        await restore(start, 'restore-between');
+        expect(await readFile(join(projectPath, 'between.txt'), 'utf8')).toBe('edited between turns');
     });
 
     it('marks files the record left out instead of touching them', async () => {

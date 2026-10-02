@@ -162,7 +162,7 @@ export class CheckpointRestoreExecutor {
                 projectPath,
                 excludedPaths: request.excludedPaths,
                 excludedPatterns: request.excludedPatterns,
-                ...(request.localHistory ? { workTree: request.localHistory } : {}),
+                ...(request.localHistory ? { workTree: { ...request.localHistory, record: 'safety' as const } } : {}),
             });
             journal = createCheckpointRestoreJournal(
                 requestFingerprint,
@@ -187,7 +187,7 @@ export class CheckpointRestoreExecutor {
                 projectPath,
                 operationId: `${safetyOperationId(request.operationId)}:after:${randomUUID()}`,
                 excludedPatterns: request.excludedPatterns,
-                workTree: request.localHistory,
+                workTree: { ...request.localHistory, record: 'restored' },
             });
         }
         return {

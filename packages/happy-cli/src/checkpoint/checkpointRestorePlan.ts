@@ -51,8 +51,12 @@ type PlanContext = {
     records: Map<string, CheckpointLedgerRecord>;
     coverage: ((path: string) => boolean) | null;
     currentExcludes: (path: string) => boolean;
-    /** The binding's latest record when the target was made by local history. */
-    localHistory: { latestId: string; includePaths: Set<string> } | null;
+    /**
+     * When the target was made by local history: the binding's latest record, and the paths that
+     * changed outside this conversation's turns after the target (first seen in a `before` or
+     * `safety` record).
+     */
+    localHistory: { latestId: string; includePaths: Set<string>; changedOutsideTurns: () => Promise<Set<string>> } | null;
 };
 
 const LOCAL_HISTORY_MARKER = 'saycode-local-history-v1';
@@ -141,9 +145,44 @@ export class CheckpointRestorePlanner {
                     latestId: (await runGit(['rev-parse', '--verify', `${layout.refName}^{commit}`], projectPath,
                         checkpointGitEnvironment(layout.gitDirectory))).toString('utf8').trim(),
                     includePaths: new Set(request.includePaths ?? []),
+                    changedOutsideTurns: once(() => this.changedOutsideTurns(request, projectPath)),
                 }
                 : null,
         };
+    }
+
+    /**
+     * Records are independent commits; the binding's operation refs and their record times give
+     * their order. Walking from the target, a change that first shows up in a `before` or `safety`
+     * record happened between turns, so it is someone else's.
+     */
+    private async changedOutsideTurns(request: CheckpointRestorePlanRequest, projectPath: string): Promise<Set<string>> {
+        const layout = resolveCheckpointStoreLayout({ checkpointRoot: this.checkpointRoot, ...request });
+        const environment = checkpointGitEnvironment(layout.gitDirectory);
+        const ids = [...new Set((await runGit(['for-each-ref', '--format=%(objectname)', checkpointOperationRefPrefix(layout)],
+            projectPath, environment)).toString('utf8').split('\n').filter(Boolean))];
+        if (ids.length === 0) return new Set();
+        const records = (await runGit(['log', '--no-walk=unsorted', '--format=%H%x00%s%x00%b%x01', ...ids], projectPath, environment))
+            .toString('utf8').split('\x01').map((chunk) => chunk.trim()).filter(Boolean).map((chunk) => {
+                const [id, subject, body] = chunk.split('\0');
+                return {
+                    id: id!,
+                    createdAt: Number(subject?.match(/^saycode-checkpoint-v1 (\d+)$/)?.[1] ?? Number.NaN),
+                    kind: body?.match(/^saycode-record (\w+)$/m)?.[1] ?? null,
+                };
+            })
+            .filter((record) => Number.isFinite(record.createdAt))
+            .sort((left, right) => left.createdAt - right.createdAt);
+        const start = records.findIndex((record) => record.id === request.checkpointId);
+        const changed = new Set<string>();
+        if (start < 0) return changed;
+        for (let index = start + 1; index < records.length; index += 1) {
+            const record = records[index]!;
+            if (record.kind === 'after' || record.kind === 'restored') continue;
+            const diff = await runGit(['diff', '--name-only', '-z', records[index - 1]!.id, record.id], projectPath, environment);
+            for (const path of parseNullTerminatedPaths(diff)) changed.add(path);
+        }
+        return changed;
     }
 
     private async entryFor(
@@ -172,7 +211,12 @@ export class CheckpointRestorePlanner {
             const entry = createPlanEntry(path, context.records.get(path), current, targetHash);
             return entry ? { entry } : null;
         }
-        return localHistoryEntry(path, current, targetHash, latestHash, context.localHistory.includePaths.has(path));
+        const included = context.localHistory.includePaths.has(path);
+        // Only a file this conversation's turns could have left needs the record walk.
+        const unchangedSinceRecord = current.kind === 'missing' ? latestHash === null
+            : current.kind === 'regular' && current.contentHash === latestHash;
+        const outside = unchangedSinceRecord && !included && (await context.localHistory.changedOutsideTurns()).has(path);
+        return localHistoryEntry(path, current, targetHash, latestHash, included, outside);
     }
 
     async matchesTargetHash(projectPath: string, path: string, expectedHash: string | null): Promise<boolean> {
@@ -280,6 +324,11 @@ export class CheckpointRestorePlanner {
     }
 }
 
+function once<T>(load: () => Promise<T>): () => Promise<T> {
+    let value: Promise<T> | null = null;
+    return () => (value ??= load());
+}
+
 function summarizePlan(plan: CheckpointRestorePlan) {
     const counts = { restore: 0, delete: 0, skip: 0, conflict: 0 };
     for (const entry of plan.entries) counts[entry.action] += 1;
@@ -296,6 +345,7 @@ function localHistoryEntry(
     targetHash: string | null,
     latestHash: string | null,
     included: boolean,
+    changedOutsideTurns: boolean,
 ): { entry: CheckpointRestorePlanEntry; detail?: CheckpointRestoreSkipDetail['detail'] } | null {
     if (current.kind === 'regular' && current.contentHash === targetHash) return null;
     if (current.kind === 'missing' && targetHash === null) return null;
@@ -303,7 +353,7 @@ function localHistoryEntry(
     const unchangedSinceRecord = current.kind === 'missing'
         ? latestHash === null
         : current.contentHash === latestHash;
-    if (!unchangedSinceRecord && !included) {
+    if ((!unchangedSinceRecord || changedOutsideTurns) && !included) {
         return { entry: { path, action: 'skip', reason: 'user-modified' }, detail: 'changed-after-record' };
     }
     if (targetHash === null) return { entry: { path, action: 'delete', reason: 'agent-created' } };

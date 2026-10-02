@@ -35,7 +35,15 @@ export type CheckpointSnapshotRequest = Omit<CheckpointStoreBinding, 'checkpoint
      * applied) through a per-binding index, so a later turn only rehashes what changed. Files over
      * `maxFileBytes` stay unrecorded and are listed in the coverage trailer.
      */
-    workTree?: { maxFileBytes: number };
+    workTree?: {
+        maxFileBytes: number;
+        /**
+         * What the record marks: a turn's start (`before`) or end (`after`), or a restore's safety
+         * point (`safety`) and result (`restored`). Restore planning treats changes that first
+         * appear in a `before`/`safety` record as made outside this conversation's turns.
+         */
+        record?: 'before' | 'after' | 'safety' | 'restored';
+    };
 };
 
 const LOCAL_HISTORY_MARKER = 'saycode-local-history-v1';
@@ -412,7 +420,9 @@ async function copyIndexKeepingTimes(source: string, target: string): Promise<bo
 
 function checkpointBody(request: CheckpointSnapshotRequest): string {
     const trailer = checkpointCoverageTrailer(request);
-    return request.workTree ? `${LOCAL_HISTORY_MARKER}\n${trailer}` : trailer;
+    if (!request.workTree) return trailer;
+    const record = request.workTree.record ? `saycode-record ${request.workTree.record}\n` : '';
+    return `${LOCAL_HISTORY_MARKER}\n${record}${trailer}`;
 }
 
 /**
