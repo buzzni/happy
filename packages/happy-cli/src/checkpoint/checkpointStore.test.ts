@@ -419,6 +419,18 @@ describe('CheckpointStore', () => {
             expect((await git(['rev-parse', worktreeLayout.refName])).stdout.trim()).toBe(second.checkpointId);
         });
 
+        it('initializes one shared store when many sessions record for the first time at once', async () => {
+            await writeFile(join(projectPath, 'a.txt'), 'one\n');
+            for (let round = 0; round < 3; round += 1) {
+                const root = join(fixtureRoot, `race-${round}`);
+                const results = await Promise.all(Array.from({ length: 8 }, (_unused, index) =>
+                    new CheckpointStore(root).snapshotTurn({
+                        ...binding(), sessionId: `session-${index}`, operationId: 'turn-1', workTree: { maxFileBytes: 1024 },
+                    })));
+                expect(results.filter((result) => /^[a-f0-9]{40,64}$/.test(result.checkpointId))).toHaveLength(8);
+            }
+        }, 60_000);
+
         it('keeps a per-binding index so later turns only rehash what changed', async () => {
             await writeFile(join(projectPath, 'a.txt'), 'one\n');
             const store = new CheckpointStore(checkpointRoot);

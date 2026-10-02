@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { observeCheckpointOperation, type CheckpointOperationObserver } from './checkpointObservability';
@@ -616,18 +616,22 @@ async function initializeGitStore(gitDirectory: string): Promise<void> {
     environment.GIT_CONFIG_SYSTEM = process.platform === 'win32' ? 'NUL' : '/dev/null';
     environment.GIT_CONFIG_NOSYSTEM = '1';
 
+    // Sessions that record for the first time at once race on one shared store; git init copies
+    // its templates non-atomically. Build the store aside and install it with one rename, so a loser
+    // finds a complete store instead of a half-written one.
+    const staging = await mkdtemp(join(dirname(gitDirectory), '.store-init-'));
     try {
-        await runGit(['init', '--bare', gitDirectory], dirname(gitDirectory), environment);
-    } catch (error) {
-        // Another session can initialize the shared store at the same moment; git then fails
-        // copying its templates. Re-running init on a complete store is safe.
-        await runGit(['init', '--bare', gitDirectory], dirname(gitDirectory), environment).catch(() => {
-            throw error;
+        await runGit(['init', '--bare', staging], dirname(gitDirectory), environment);
+        await mkdir(join(staging, 'indexes'), { recursive: true });
+        await mkdir(join(staging, 'bindings'), { recursive: true });
+        await writeFile(join(staging, 'info', 'exclude'), '.git/\n');
+        await rename(staging, gitDirectory).catch(async (error) => {
+            if (!(error instanceof Error && 'code' in error && (error.code === 'ENOTEMPTY' || error.code === 'EEXIST'))) throw error;
+            await readFile(join(gitDirectory, 'HEAD'));
         });
+    } finally {
+        await rm(staging, { recursive: true, force: true });
     }
-    await mkdir(join(gitDirectory, 'indexes'), { recursive: true });
-    await mkdir(join(gitDirectory, 'bindings'), { recursive: true });
-    await writeFile(join(gitDirectory, 'info', 'exclude'), '.git/\n');
 }
 
 function runGit(
