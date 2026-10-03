@@ -24,6 +24,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     const ops: Array<{ op: string; bearer: string; body: Record<string, unknown> }> = []
     const defaultTasks = () => [{ taskId: 'task-1', status: 'awaiting-user', pauseReason: 'awaiting-user', tabs: ['tab-1'], updatedAtMs: Date.now() }]
     let listedTasks: Array<Record<string, unknown>> = defaultTasks()
+    let taskDetail: Record<string, unknown> | undefined
 
     beforeAll(async () => {
         server = http.createServer((req, res) => {
@@ -59,7 +60,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 const result = m[1] === 'listTasks'
                     ? { tasks: listedTasks }
                     : m[1] === 'getTask'
-                        ? { taskId: 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
+                        ? taskDetail ?? { taskId: 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
                             tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'none' } }, { tabId: 'tab-2', leaseEpoch: 2, owner: { kind: 'none' } }] }
                         : m[1] === 'subscribe'
                             ? { kind: 'events', events: [{ seq: 1, type: 'state-changed', leaseEpoch: 11, data: {} }] }
@@ -203,6 +204,32 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             expect(await harness.evaluate(korean, 'document.documentElement.lang')).toBe('ko')
             await harness.closeTarget(korean)
         } finally { listedTasks = defaultTasks() }
+    }, 30_000)
+
+    it('tells the user to resume after they released control, though the wait reason stays recorded', async () => {
+        const now = Date.now()
+        // The Runtime keeps waitReason on the task after release (user-input-complete) and after the wait expired.
+        const released = { taskId: 'task-released', status: 'paused', pauseReason: 'user-input-complete', waitReason: 'login', tabs: ['tab-1'], updatedAtMs: now }
+        listedTasks = [
+            released,
+            { taskId: 'task-login-parked', status: 'paused', pauseReason: 'grant-expired', waitReason: 'login', tabs: [], updatedAtMs: now },
+            { taskId: 'task-expired', status: 'paused', pauseReason: 'user-wait-expired', waitReason: 'login', tabs: [], updatedAtMs: now },
+        ]
+        taskDetail = { ...released, stateVersion: 4, uncertainActions: [], cancelRequested: false, tabLeases: [{ tabId: 'tab-1', leaseEpoch: 2, owner: { kind: 'none' } }] }
+        try {
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('released', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => harness.evaluate(target, `document.querySelectorAll('#tasks button').length`), (n) => n === 3, 10_000)
+            const chips = await harness.evaluate(target, `JSON.stringify(Object.fromEntries([...document.querySelectorAll('#tasks button')]
+                .map((b) => [b.getAttribute('data-task'), b.querySelector('.chip').textContent])))`)
+            expect(JSON.parse(String(chips))).toEqual({ 'task-released': 'Released', 'task-login-parked': 'Login needed', 'task-expired': 'Paused' })
+            await harness.evaluate(target, `document.querySelector('[data-task="task-released"]').click()`)
+            await eventually(() => harness.evaluate(target, `(() => { const d = document.getElementById('detail'); return !!d && !d.hidden })()`), Boolean, 10_000)
+            const detail = await harness.evaluate(target, `JSON.stringify({ title: document.getElementById('detailTitle').textContent,
+                reason: document.getElementById('detailReason').textContent, takeOver: document.getElementById('takeOver').className,
+                resume: document.getElementById('resume').className })`)
+            expect(JSON.parse(String(detail))).toEqual({ title: 'Released', reason: 'Resume to hand the page back to the agent, or wait for it to continue.', takeOver: '', resume: 'primary' })
+            await harness.closeTarget(target)
+        } finally { listedTasks = defaultTasks(); taskDetail = undefined }
     }, 30_000)
 
     it('opens the screen through a one-time viewer ticket for the capability profile', async () => {

@@ -169,10 +169,11 @@ var M={en:{title:'Agent Browser',tasks:'Tasks',refresh:'Refresh',advanced:'Advan
  notConnected:'not connected',waitingHost:'Waiting for Saycode',connected:'Connected',until:'until',unreadable:'capability is not readable',loading:'loading',
  noTasksTitle:'Nothing needs you',noTasks:'no open tasks',others:function(n){return n+' other open task'+(n>1?'s':'')},live:'live',retrying:'retrying',
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
- running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',done:'Done',
+ running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',done:'Done',
  rLogin:'Take over, sign in on the screen, then release.',rCaptcha:'Take over and complete the verification on the screen, then release.',
  rHandoff:'The agent handed the page to you. Take over to continue.',rApproval:'The agent wants to do something that needs your approval.',
  rControl:'Your input reaches the page. Release when you are done so the agent continues.',rRunning:'The agent is working on it.',
+ rReleased:'Resume to hand the page back to the agent, or wait for it to continue.',
  origin:'Site',expires:'Expires',ok:'Done'},
  ko:{title:'에이전트 브라우저',tasks:'작업',refresh:'새로고침',advanced:'고급',taskId:'작업 ID',tabId:'탭 ID (제어권 가져오기/반납용)',watch:'작업 보기',
  paste:'권한 토큰 붙여넣기',useToken:'토큰 사용',rawTask:'작업 상세',pickTitle:'작업을 고르세요',pickBody:'확인이 필요한 작업이 왼쪽에 나타나요.',
@@ -182,10 +183,11 @@ var M={en:{title:'Agent Browser',tasks:'Tasks',refresh:'Refresh',advanced:'Advan
  notConnected:'연결 안 됨',waitingHost:'Saycode 연결 대기 중',connected:'연결됨',until:'까지',unreadable:'권한을 읽을 수 없어요',loading:'불러오는 중',
  noTasksTitle:'지금 확인할 작업이 없어요',noTasks:'열린 작업이 없어요',others:function(n){return '다른 작업 '+n+'개'},live:'실시간 연결됨',retrying:'다시 시도 중',
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
- running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',done:'완료',
+ running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',done:'완료',
  rLogin:'제어권을 가져와 화면에서 로그인한 뒤 반납하세요.',rCaptcha:'제어권을 가져와 화면에서 확인을 마친 뒤 반납하세요.',
  rHandoff:'에이전트가 화면을 넘겼어요. 제어권을 가져와 이어서 진행하세요.',rApproval:'에이전트가 승인이 필요한 작업을 하려고 해요.',
  rControl:'입력이 화면에 전달되고 있어요. 다 하면 반납해야 에이전트가 이어서 진행해요.',rRunning:'에이전트가 작업하고 있어요.',
+ rReleased:'계속 진행을 눌러 에이전트에게 넘기거나, 에이전트가 이어서 진행하기를 기다리세요.',
  origin:'사이트',expires:'만료',ok:'완료했어요'}};
 var T=M[LANG];document.documentElement.lang=LANG;
 document.querySelectorAll('[data-t]').forEach(function(el){var v=T[el.getAttribute('data-t')];if(typeof v==='string')el.textContent=v});
@@ -224,13 +226,19 @@ readFragment();
 window.addEventListener('hashchange',function(){if(readFragment())listTasks()});
 function op(name,body){return fetch('/v1/ops/'+name,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+S.token},body:JSON.stringify(body)})
  .then(function(r){return r.json()}).then(function(j){if(!j.ok){var e=new Error(j.error.code+': '+j.error.message);e.body=j.error;throw e}return j.result})}
-/** What the task is waiting for, in the user's words, and how loud to show it. */
+/**
+ * What the task is waiting for, in the user's words, and how loud to show it. The Runtime keeps
+ * waitReason after the wait ends (released, expired), so it counts only while the user is still
+ * awaited: the same rule as waitsForUser.
+ */
 function describe(t){
  if(t.pendingApproval&&!t.cancelRequested)return {label:T.needApproval,tone:'warn',reason:T.rApproval};
  if(t.pauseReason==='user-control')return {label:T.userControl,tone:'ok',reason:T.rControl};
- if(t.waitReason==='login')return {label:T.needLogin,tone:'warn',reason:T.rLogin};
- if(t.waitReason==='captcha')return {label:T.needCaptcha,tone:'warn',reason:T.rCaptcha};
- if(t.waitReason==='handoff')return {label:T.needHandoff,tone:'warn',reason:T.rHandoff};
+ if(t.pauseReason==='user-input-complete')return {label:T.released,tone:'ok',reason:T.rReleased};
+ var waiting=t.status==='awaiting-user'||t.pauseReason==='grant-expired';
+ if(waiting&&t.waitReason==='login')return {label:T.needLogin,tone:'warn',reason:T.rLogin};
+ if(waiting&&t.waitReason==='captcha')return {label:T.needCaptcha,tone:'warn',reason:T.rCaptcha};
+ if(waiting&&t.waitReason==='handoff')return {label:T.needHandoff,tone:'warn',reason:T.rHandoff};
  if(t.status==='awaiting-user')return {label:T.awaitingUser,tone:'warn',reason:''};
  if(t.status==='running')return {label:T.running,tone:'run',reason:T.rRunning};
  if(t.pauseReason==='awaiting-agent')return {label:T.awaitingAgent,tone:'',reason:''};
@@ -242,7 +250,8 @@ function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.sta
  var d=describe(t);$('placeholder').hidden=true;$('detail').hidden=false;
  $('detailTitle').textContent=d.label||t.taskId; $('detailReason').textContent=d.reason;$('detailReason').hidden=!d.reason;$('detailId').textContent=t.taskId;
  // The control a user is most likely to need next is the loud one.
- var holding=t.pauseReason==='user-control';$('takeOver').className=holding?'':'primary';$('release').className=holding?'primary':'';
+ var holding=t.pauseReason==='user-control',released=t.pauseReason==='user-input-complete';
+ $('takeOver').className=holding||released?'':'primary';$('release').className=holding?'primary':'';$('resume').className=released?'primary':'';
  markSelected(t.taskId);
  var a=t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a)}
 function renderApproval(a){var box=$('approval');box.textContent='';var d=document.createElement('div');d.className='desc';d.textContent=a.description;
