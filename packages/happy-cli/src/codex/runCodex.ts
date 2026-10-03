@@ -117,7 +117,7 @@ import {
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
-import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
     codexGoalActionCapabilities,
@@ -236,7 +236,7 @@ export async function runCodex(opts: {
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
-    const reconnectSession = readReconnectSessionEnvironment(process.env);
+    const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
