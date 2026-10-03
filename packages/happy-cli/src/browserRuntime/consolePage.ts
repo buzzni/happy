@@ -55,6 +55,7 @@ main>*{min-width:0}
 @media (max-width:860px){main{grid-template-columns:1fr;padding:12px}header{padding:12px}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
 .card+.card,.col>*+*,#detail>*+*{margin-top:12px}
+.col>[hidden]+*{margin-top:0}
 .card h2{font-size:13px;font-weight:600;margin:0 0 10px;display:flex;align-items:center;gap:8px}
 .card h2 svg{color:var(--muted)}
 .head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
@@ -105,6 +106,7 @@ details.fold[open]>summary{margin-bottom:10px}
 #events .t{color:var(--muted);flex:none}#events .k{font-weight:600;flex:none}#events .d{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 pre{white-space:pre-wrap;word-break:break-word;margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:var(--soft);padding:10px;border-radius:10px}
 #detail[hidden],#placeholder[hidden]{display:none}
+summary::-webkit-details-marker{display:none}
 </style></head><body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
 <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
@@ -118,14 +120,14 @@ pre{white-space:pre-wrap;word-break:break-word;margin:0;font-family:ui-monospace
 <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
 <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
 </defs></svg>
-<header><h1><svg><use href="#i-globe"/></svg><span data-t="title">Agent Browser</span></h1><span class="spacer"></span>
+<header><h1><svg aria-hidden="true"><use href="#i-globe"/></svg><span data-t="title">Agent Browser</span></h1><span class="spacer"></span>
 <span id="capState" class="pill"><i></i><span>not connected</span></span></header>
 <main>
 <aside>
-<section class="card"><div class="head"><h2><svg><use href="#i-list"/></svg><span data-t="tasks">Tasks</span></h2>
-<button id="refreshTasks" class="icon" type="button" data-tt="refresh" title="Refresh"><svg><use href="#i-refresh"/></svg></button></div>
+<section class="card"><div class="head"><h2><svg aria-hidden="true"><use href="#i-list"/></svg><span data-t="tasks">Tasks</span></h2>
+<button id="refreshTasks" class="icon" type="button" data-tt="refresh" title="Refresh"><svg aria-hidden="true"><use href="#i-refresh"/></svg></button></div>
 <div id="tasks" class="muted">not connected</div></section>
-<section class="card"><details class="fold" id="advanced"><summary><svg><use href="#i-settings"/></svg><span data-t="advanced">Advanced</span></summary>
+<section class="card"><details class="fold" id="advanced"><summary><svg aria-hidden="true"><use href="#i-settings"/></svg><span data-t="advanced">Advanced</span></summary>
 <label><span data-t="taskId">Task id</span><input id="taskId" autocomplete="off"></label>
 <label><span data-t="tabId">Tab id (for take over / release)</span><input id="tabId" autocomplete="off"></label>
 <div class="row"><button id="connect" type="button" data-t="watch">Watch task</button><span id="conn" class="muted small"></span></div>
@@ -135,30 +137,30 @@ pre{white-space:pre-wrap;word-break:break-word;margin:0;font-family:ui-monospace
 </details></section>
 </aside>
 <div class="col">
-<section class="card" id="placeholder"><div class="empty"><svg><use href="#i-inbox"/></svg><b data-t="pickTitle">Pick a task</b><span data-t="pickBody">Tasks that need you appear on the left.</span></div></section>
+<section class="card" id="placeholder"><div class="empty"><svg aria-hidden="true"><use href="#i-inbox"/></svg><b data-t="pickTitle">Pick a task</b><span data-t="pickBody">Tasks that need you appear on the left.</span></div></section>
 <div id="detail" hidden>
 <section class="card"><div class="title"><h2 id="detailTitle"></h2></div>
 <p id="detailReason" class="reason"></p><p class="mono muted" id="detailId" style="margin:6px 0 0"></p></section>
-<section class="card" id="approvalBox" hidden><h2><svg><use href="#i-shield"/></svg><span data-t="approvalTitle">Approval required</span></h2>
+<section class="card" id="approvalBox" hidden><h2><svg aria-hidden="true"><use href="#i-shield"/></svg><span data-t="approvalTitle">Approval required</span></h2>
 <div id="approval"></div>
 <div class="row"><button id="approve" class="primary" type="button" data-t="approve">Approve</button><button id="reject" type="button" data-t="reject">Reject</button></div></section>
-<section class="card"><h2><svg><use href="#i-hand"/></svg><span data-t="control">Control</span></h2>
+<section class="card"><h2><svg aria-hidden="true"><use href="#i-hand"/></svg><span data-t="control">Control</span></h2>
 <div class="row"><button id="takeOver" class="primary" type="button" data-t="takeOver">Take over</button><button id="release" type="button" data-t="release">Release</button>
 <button id="resume" type="button" data-t="resume">Resume</button><button id="stop" class="danger" type="button" data-t="stop">Stop</button></div>
-<div class="hint"><svg><use href="#i-info"/></svg><span data-t="controlHint">Take over to use the page yourself (login, verification). Release it and the agent continues.</span></div>
+<div class="hint"><svg aria-hidden="true"><use href="#i-info"/></svg><span data-t="controlHint">Take over to use the page yourself (login, verification). Release it and the agent continues.</span></div>
 <div id="actionResult"></div></section>
 </div>
-<section class="card"><div class="head"><h2><svg><use href="#i-monitor"/></svg><span data-t="screen">Screen</span></h2>
+<section class="card"><div class="head"><h2><svg aria-hidden="true"><use href="#i-monitor"/></svg><span data-t="screen">Screen</span></h2>
 <button id="openScreen" type="button" data-t="openScreen">Open screen</button></div>
 <p class="muted small" style="margin:0" data-t="screenHint">input reaches the page only while you hold take over</p>
 <div id="screenBox" hidden><iframe id="screen" title="Browser screen" referrerpolicy="no-referrer"></iframe></div></section>
-<section class="card"><details class="fold"><summary><svg><use href="#i-activity"/></svg><span data-t="events">Activity</span></summary><div id="events"></div></details></section>
+<section class="card"><details class="fold"><summary><svg aria-hidden="true"><use href="#i-activity"/></svg><span data-t="events">Activity</span></summary><div id="events"></div></details></section>
 </div>
 </main>
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
-var S={cursor:0,seen:{},task:null,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false};
+var S={cursor:0,seen:{},task:null,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false,screenSeq:0};
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000,HOST_ORIGINS=${hostOrigins};
 var LANG=(new URLSearchParams(location.search).get('lang')||navigator.language||'en').toLowerCase().indexOf('ko')===0?'ko':'en';
 var M={en:{title:'Agent Browser',tasks:'Tasks',refresh:'Refresh',advanced:'Advanced',taskId:'Task id',tabId:'Tab id (for take over / release)',watch:'Watch task',
@@ -169,7 +171,7 @@ var M={en:{title:'Agent Browser',tasks:'Tasks',refresh:'Refresh',advanced:'Advan
  notConnected:'not connected',waitingHost:'Waiting for Saycode',connected:'Connected',until:'until',unreadable:'capability is not readable',loading:'loading',
  noTasksTitle:'Nothing needs you',noTasks:'no open tasks',others:function(n){return n+' other open task'+(n>1?'s':'')},live:'live',retrying:'retrying',
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
- running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',done:'Done',
+ running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',
  rLogin:'Take over, sign in on the screen, then release.',rCaptcha:'Take over and complete the verification on the screen, then release.',
  rHandoff:'The agent handed the page to you. Take over to continue.',rApproval:'The agent wants to do something that needs your approval.',
  rControl:'Your input reaches the page. Release when you are done so the agent continues.',rRunning:'The agent is working on it.',
@@ -183,7 +185,7 @@ var M={en:{title:'Agent Browser',tasks:'Tasks',refresh:'Refresh',advanced:'Advan
  notConnected:'연결 안 됨',waitingHost:'Saycode 연결 대기 중',connected:'연결됨',until:'까지',unreadable:'권한을 읽을 수 없어요',loading:'불러오는 중',
  noTasksTitle:'지금 확인할 작업이 없어요',noTasks:'열린 작업이 없어요',others:function(n){return '다른 작업 '+n+'개'},live:'실시간 연결됨',retrying:'다시 시도 중',
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
- running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',done:'완료',
+ running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',
  rLogin:'제어권을 가져와 화면에서 로그인한 뒤 반납하세요.',rCaptcha:'제어권을 가져와 화면에서 확인을 마친 뒤 반납하세요.',
  rHandoff:'에이전트가 화면을 넘겼어요. 제어권을 가져와 이어서 진행하세요.',rApproval:'에이전트가 승인이 필요한 작업을 하려고 해요.',
  rControl:'입력이 화면에 전달되고 있어요. 다 하면 반납해야 에이전트가 이어서 진행해요.',rRunning:'에이전트가 작업하고 있어요.',
@@ -203,7 +205,7 @@ function askHost(){clearTimeout(S.renewTimer);window.parent.postMessage({type:'a
  S.renewTimer=setTimeout(askHost,RENEW_RETRY_MS)}
 function fromHost(event){return (event.source===window.parent&&event.origin===location.origin)
  ||(!!window.opener&&event.source===window.opener&&HOST_ORIGINS.indexOf(event.origin)>=0)}
-function hhmm(ms){return new Date(ms).toLocaleTimeString(LANG==='ko'?'ko-KR':undefined,{hour:'2-digit',minute:'2-digit'})}
+function hhmm(ms){var d=new Date(ms);return isFinite(d.getTime())?d.toLocaleTimeString(LANG==='ko'?'ko-KR':'en-US',{hour:'2-digit',minute:'2-digit'}):''}
 function setCapability(token,expiresAtMs){var renewal=!!S.token;
  var parts=String(token||'').split('.');var payload=parts.length>=3?decodePart(parts[parts.length===4?2:1]):null;
  if(!payload||typeof payload.profileId!=='string'){capPill(T.unreadable,'bad');return false}
@@ -259,7 +261,7 @@ function renderApproval(a){var box=$('approval');box.textContent='';var d=docume
  var x=document.createElement('span');x.textContent=T.expires+' · '+hhmm(a.expiresAtMs);m.appendChild(o);m.appendChild(x);box.appendChild(d);box.appendChild(m)}
 function markSelected(id){Array.prototype.forEach.call(document.querySelectorAll('#tasks button'),function(b){b.classList.toggle('sel',b.getAttribute('data-task')===id)})}
 function emptyState(box,title,body){box.textContent='';var e=document.createElement('div');e.className='empty';
- e.innerHTML='<svg><use href="#i-inbox"/></svg>';var b=document.createElement('b');b.textContent=title;var s=document.createElement('span');s.textContent=body;
+ e.innerHTML='<svg aria-hidden="true"><use href="#i-inbox"/></svg>';var b=document.createElement('b');b.textContent=title;var s=document.createElement('span');s.textContent=body;
  e.appendChild(b);e.appendChild(s);box.appendChild(e)}
 /** A task card. Its text starts with the task id (the tests read it that way). */
 function taskButton(t){var b=document.createElement('button');b.type='button';b.setAttribute('data-task',t.taskId);var d=describe(t);
@@ -269,7 +271,7 @@ function taskButton(t){var b=document.createElement('button');b.type='button';b.
  what.appendChild(c);what.appendChild(document.createTextNode(' '));what.appendChild(when);
  b.appendChild(id);b.appendChild(document.createTextNode(' '));b.appendChild(what);
  b.onclick=function(){$('taskId').value=t.taskId;$('tabId').value=(t.tabs&&t.tabs[0])||'';watch()};return b}
-function listTasks(){if(!S.token)return;$('tasks').textContent=T.loading;
+function listTasks(){if(!S.token)return;$('tasks').className='muted';$('tasks').textContent=T.loading;
  op('listTasks',{profileId:S.profileId}).then(function(r){var box=$('tasks');box.textContent='';box.className='';
   if(!r.tasks.length){emptyState(box,T.noTasksTitle,T.noTasks);return}
   // Tasks waiting for the user come first; the others (running, parked for the agent) are folded away.
@@ -290,7 +292,8 @@ function addEvent(e){if(S.seen[e.seq])return;S.seen[e.seq]=1;if(e.seq>S.cursor)S
  var line=document.createElement('div');var t=document.createElement('span');t.className='t';t.textContent='#'+e.seq;
  var k=document.createElement('span');k.className='k';k.textContent=e.type;var d=document.createElement('span');d.className='d';
  var data=JSON.stringify(e.data);d.textContent=data;d.title=data;line.appendChild(t);line.appendChild(k);line.appendChild(d);$('events').prepend(line)}
-function refresh(){return op('getTask',{taskId:$('taskId').value.trim()}).then(showTask)}
+/** A late answer for a task the user has since left (an automatic pick racing a manual one) is dropped. */
+function refresh(){return op('getTask',{taskId:$('taskId').value.trim()}).then(function(t){if(t&&t.taskId===$('taskId').value.trim())showTask(t)})}
 function loop(gen){if(gen!==S.gen)return;
  op('subscribe',{taskId:$('taskId').value.trim(),afterSeq:S.cursor,waitMs:25000}).then(function(r){
   if(gen!==S.gen)return;$('conn').textContent=T.live;
@@ -301,7 +304,7 @@ function watch(){S.cursor=0;S.seen={};$('events').textContent='';var gen=++S.gen
 $('useToken').onclick=function(){if(setCapability($('token').value.trim()))listTasks();$('token').value=''};
 $('refreshTasks').onclick=listTasks;$('connect').onclick=watch;
 function act(p){var out=$('actionResult');out.className='';out.textContent='…';
- p.then(function(r){out.textContent=T.ok+' · '+JSON.stringify(r.status||r.outcome||r.owner||r,null,0);if(r.task)showTask(r.task);return refresh()})
+ p.then(function(r){var v=r.status||r.outcome||r.owner;out.textContent=typeof v==='string'?T.ok+' · '+v:T.ok;if(r.task)showTask(r.task);return refresh()})
  .catch(function(e){out.className='err';out.textContent=e.message;if(e.body&&e.body.code==='STALE_LEASE')refresh()})}
 function decide(d){var a=S.task&&S.task.pendingApproval;if(!a)return;act(op('approve',{taskId:S.task.taskId,approvalId:a.approvalId,bindingHash:a.bindingHash,requestId:rid(),decision:d}))}
 $('approve').onclick=function(){decide('approve')};$('reject').onclick=function(){decide('reject')};
@@ -310,10 +313,11 @@ $('release').onclick=function(){act(op('releaseControl',{taskId:$('taskId').valu
 $('resume').onclick=function(){if(S.task)act(op('resume',{taskId:S.task.taskId,expectedVersion:S.task.stateVersion,requestId:rid()}))};
 $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),requestId:rid()}))};
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
-function openScreen(){op('viewerTicket',{profileId:S.profileId}).then(function(r){S.screenOpen=true;
+/** The screen counts as open from the click, so a renewal during the first ticket request reopens it; only the latest reply is shown. */
+function openScreen(){S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{profileId:S.profileId}).then(function(r){if(n!==S.screenSeq)return;
  var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path);$('screenBox').hidden=false
-},function(e){var out=$('actionResult');out.className='err';out.textContent=e.message})}
+},function(e){if(n!==S.screenSeq)return;S.screenOpen=false;var out=$('actionResult');out.className='err';out.textContent=e.message})}
 $('openScreen').onclick=openScreen;
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
 if(S.token)listTasks();else askHost();
