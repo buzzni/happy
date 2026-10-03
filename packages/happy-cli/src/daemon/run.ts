@@ -567,6 +567,9 @@ export function shouldRunScriptAutomations(input: {
 }
 
 export async function startDaemon(): Promise<void> {
+  // Host bootstrap belongs to this incarnation, never to spawned agent children.
+  const writeScopeHostEnvironment = Object.fromEntries(Object.entries(process.env)
+    .filter(([key]) => key.startsWith('HAPPY_WRITE_SCOPE_HOST_')));
   // Direct `daemon start-sync` must not retain a disposable caller worktree.
   process.chdir(os.homedir());
 
@@ -3547,7 +3550,7 @@ export async function startDaemon(): Promise<void> {
     let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' } | null = null;
 
     writeScopeRuntime = await createSessionWriteScopeRuntime({
-      machineId, env: process.env, managed: managedIdentity.status === 'active' || Boolean(standaloneWindows),
+      machineId, env: writeScopeHostEnvironment, managed: managedIdentity.status === 'active' || Boolean(standaloneWindows),
       findSession: findTrackedSessionById,
       preserve: session => preserveSessionForResume(session, 'session-write-scope'),
       resume: (id, environment, validate) => spawnResumedSession(id, { writeScopeEnvironment: environment, writeScopeValidate: validate }),

@@ -12,6 +12,16 @@ export type ScopeRequest = {
   description: string; kind: 'grant' | 'revoke'; createdAt: number; expiresAt: number;
   state: ScopeState; grantActive?: boolean; profileApplied?: boolean; cleanup?: 'unresolved' | 'confirmed'; error?: string;
 };
+/** Prune ordinary status history only; uncertainty and authority are never aged out. */
+export function retainScopeHistory(requests: readonly ScopeRequest[]): ScopeRequest[] {
+  const protectedRecord = (request: ScopeRequest) => request.grantActive === true || request.cleanup === 'unresolved'
+    || ['pending', 'applying', 'applied', 'cleanup-unresolved'].includes(request.state);
+  const safety = requests.filter(protectedRecord);
+  const available = Math.max(0, Math.min(128, 512 - safety.length));
+  const ordinary = requests.filter(request => !protectedRecord(request)).sort((a, b) => a.createdAt - b.createdAt);
+  const retained = new Set([...safety, ...(available ? ordinary.slice(-available) : [])]);
+  return requests.filter(request => retained.has(request));
+}
 export function decisionBytes(value: ScopeDecision): Buffer {
   return Buffer.from(JSON.stringify([value.version, value.requestId, value.digest, value.incarnation,
     value.accountId, value.machineId, value.sessionId, value.action]));
@@ -29,6 +39,8 @@ type Dependencies = {
 
 /** In-memory, daemon-owned authority. Restart expires requests and never restores grants. */
 export class SessionWriteScopeBroker {
+  private persistTail: Promise<void> = Promise.resolve();
+  private requestTail: Promise<unknown> = Promise.resolve();
   private readonly entries = new Map<string, Entry>();
   private readonly grants = new Map<string, Map<string, WriteRoot>>();
   private readonly busy = new Set<string>();
@@ -38,6 +50,9 @@ export class SessionWriteScopeBroker {
     for (const { request } of this.entries.values()) {
       if (request.state === 'pending' && request.expiresAt <= this.now()) request.state = 'expired';
     }
+    const retained = new Set(retainScopeHistory([...this.entries.values()]
+      .map(entry => ({ ...entry.request, grantActive: this.grantActive(entry.request) }))).map(request => request.id));
+    for (const id of this.entries.keys()) if (!retained.has(id)) this.entries.delete(id);
   }
   private grantActive(request: ScopeRequest): boolean {
     return request.kind === 'grant' && request.profileApplied === true
@@ -48,7 +63,13 @@ export class SessionWriteScopeBroker {
     return [...this.entries.values()].filter(entry => entry.request.sessionId === sessionId)
       .map(entry => ({ ...entry.request, grantActive: this.grantActive(entry.request) }));
   }
-  async request(sessionId: string, path: string, description: string, kind: 'grant' | 'revoke' = 'grant'): Promise<ScopeRequest> {
+  request(sessionId: string, path: string, description: string, kind: 'grant' | 'revoke' = 'grant'): Promise<ScopeRequest> {
+    // Staged requests are neither visible nor approvable until durable admission succeeds.
+    const operation = this.requestTail.catch(() => {}).then(() => this.createRequest(sessionId, path, description, kind));
+    this.requestTail = operation;
+    return operation;
+  }
+  private async createRequest(sessionId: string, path: string, description: string, kind: 'grant' | 'revoke'): Promise<ScopeRequest> {
     if (!description || description.length > 240 || /[\x00-\x1f\x7f]/.test(description)
       || /(?:secret|token|password|api[_ -]?key|cookie|authorization)\s*[:=]|Bearer\s|-----BEGIN|https?:\/\/\S+[?@]/i.test(description)) {
       throw new Error('SECRET_FREE_DESCRIPTION_REQUIRED');
@@ -63,19 +84,26 @@ export class SessionWriteScopeBroker {
     const duplicate = this.list(sessionId).find(request => request.state === 'pending'
       && request.root === inspected.root && request.kind === kind);
     if (duplicate) return duplicate;
-    if (this.entries.size >= 128) throw new Error('REQUEST_LIMIT_REACHED');
+    if ([...this.entries.values()].filter(entry => ['pending', 'applying'].includes(entry.request.state)).length >= 128) throw new Error('REQUEST_LIMIT_REACHED');
     if (kind === 'grant' && (this.grants.get(sessionId)?.size ?? 0) >= 8) throw new Error('GRANT_LIMIT_REACHED');
     const descriptor = { version: 1 as const, id: randomUUID(), incarnation: this.deps.incarnation,
       accountId: this.deps.accountId, machineId: this.deps.machineId, sessionId, ...session,
       requestedPath: path, root: inspected.root, description, kind, createdAt: this.now(), expiresAt: this.now() + 600000 };
     const digest = createHash('sha256').update(JSON.stringify([descriptor, inspected.identity, inspected.floor])).digest('hex');
     const request: ScopeRequest = { ...descriptor, digest, state: 'pending' };
+    await this.persist(request);
     this.entries.set(request.id, { request, inspected });
-    await this.persist();
     return { ...request };
   }
-  private persist(): Promise<void> {
-    return this.deps.changed?.([...this.entries.values()].map(entry => ({ ...entry.request }))) ?? Promise.resolve();
+  private persist(staged?: ScopeRequest): Promise<void> {
+    // Snapshot at our turn, after earlier admission has published its durable entry.
+    const operation = this.persistTail.catch(() => {}).then(async () => {
+      const requests: ScopeRequest[] = [...this.entries.values()].map(entry => ({ ...entry.request, grantActive: this.grantActive(entry.request) }));
+      if (staged) requests.push({ ...staged });
+      await this.deps.changed?.(requests);
+    });
+    this.persistTail = operation;
+    return operation;
   }
   async cancel(sessionId: string, id: string): Promise<ScopeRequest> {
     this.expire();

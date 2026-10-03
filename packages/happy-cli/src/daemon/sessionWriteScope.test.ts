@@ -155,4 +155,72 @@ describe('session write scope approval authority', () => {
     expect(f.apply).toHaveBeenCalledTimes(2);
     expect(f.broker.list('session').find(request => request.id === replacement.id)?.grantActive).toBe(true);
   });
+  it('admits new work after more than 128 cancelled requests while retaining the live limit', async () => {
+    const f = fixture();
+    for (let i = 0; i < 140; i++) {
+      const request = await f.broker.request('session', '/target', 'Install tool');
+      await f.broker.cancel('session', request.id);
+    }
+    const pending = await Promise.all(Array.from({ length: 128 }, (_, i) =>
+      f.broker.request('session', `/pending-${i}`, 'Install tool')));
+    expect(pending).toHaveLength(128);
+    await expect(f.broker.request('session', '/overflow', 'Install tool')).rejects.toThrow('REQUEST_LIMIT_REACHED');
+    await f.broker.cancel('session', pending[0].id);
+    expect((await f.broker.request('session', '/replacement', 'Install tool')).state).toBe('pending');
+  });
+  it('does not publish or approve a request until its creation has been persisted', async () => {
+    const f = fixture();
+    let rejectWrite!: (error: Error) => void;
+    let staged!: ScopeRequest;
+    const writeStarted = new Promise<void>(resolve => {
+      f.changed.mockImplementationOnce(requests => {
+        staged = requests.at(-1)!; resolve();
+        return new Promise<void>((_, reject) => { rejectWrite = reject; });
+      });
+    });
+    const requested = f.broker.request('session', '/target', 'Install tool');
+    const failed = expect(requested).rejects.toThrow('journal failed');
+    await writeStarted;
+    expect(f.broker.list('session')).toEqual([]);
+    await expect(f.broker.decide(f.decide(staged))).rejects.toThrow('REQUEST_NOT_PENDING');
+    rejectWrite(new Error('journal failed')); await failed;
+    expect(f.broker.list('session')).toEqual([]);
+    expect((await f.broker.request('session', '/target', 'Install tool')).id).not.toBe(staged.id);
+    expect(f.apply).not.toHaveBeenCalled();
+  });
+  it('serializes concurrent admission and releases capacity after a failed creation write', async () => {
+    const f = fixture();
+    for (let i = 0; i < 127; i++) await f.broker.request('session', `/pending-${i}`, 'Install tool');
+    let finish!: () => void;
+    let started!: () => void;
+    const writing = new Promise<void>(resolve => { started = resolve; });
+    f.changed.mockImplementationOnce(() => { started(); return new Promise<void>(resolve => { finish = resolve; }); });
+    const last = f.broker.request('session', '/last', 'Install tool');
+    await writing;
+    const overflow = f.broker.request('session', '/overflow', 'Install tool');
+    const rejected = expect(overflow).rejects.toThrow('REQUEST_LIMIT_REACHED');
+    finish(); await last; await rejected;
+    expect(f.broker.list('session').filter(request => request.state === 'pending')).toHaveLength(128);
+    await f.broker.cancel('session', (await last).id);
+    f.changed.mockRejectedValueOnce(new Error('journal failed'));
+    await expect(f.broker.request('session', '/retry', 'Install tool')).rejects.toThrow('journal failed');
+    expect((await f.broker.request('session', '/retry', 'Install tool')).state).toBe('pending');
+  });
+
+  it('keeps a newly persisted request in later snapshots while another request is cancelled', async () => {
+    const f = fixture();
+    const existing = await f.broker.request('session', '/existing', 'Install tool');
+    let finish!: () => void, started!: () => void;
+    const writing = new Promise<void>(resolve => { started = resolve; });
+    f.changed.mockImplementationOnce(() => { started(); return new Promise<void>(resolve => { finish = resolve; }); });
+    const admission = f.broker.request('session', '/new', 'Install tool');
+    await writing;
+    const cancelled = f.broker.cancel('session', existing.id);
+    finish(); const added = await admission; await cancelled;
+    expect(f.changed.mock.calls.at(-1)![0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: existing.id, state: 'cancelled' }),
+      expect.objectContaining({ id: added.id, state: 'pending' }),
+    ]));
+  });
+
 });
