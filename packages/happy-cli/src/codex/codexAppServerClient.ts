@@ -18,6 +18,7 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
+import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroundTasks';
 import { readCodexOutput } from './codexOutputReader';
 import type {
@@ -421,6 +422,8 @@ export class CodexAppServerClient {
          */
         managedProviderArgs?: string[] | null,
         markTurnDispatched?: () => void,
+        /** Host-only decision retained across reconnects; never a user/provider override. */
+        private readonly recallHostPrepared = false,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
@@ -1076,6 +1079,9 @@ export class CodexAppServerClient {
                 env = this.multiAuthProxy.env;
             }
         }
+
+        // Older/missing hosts must never inherit another launch's ownership marker.
+        env = withCodexRecallOwnership(env, this.recallHostPrepared && !this.managedProviderArgs && this.sandboxPolicyMode === 'owner-choice');
 
         let command = 'codex';
         let args = [
@@ -2128,6 +2134,8 @@ export class CodexAppServerClient {
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
+        /** Host observer invoked only after the provider accepts turn/start. */
+        onSubmitted?: () => void;
     }): Promise<void> {
         if (!this._threadId) {
             throw new Error('No active thread. Call startThread first.');
@@ -2171,6 +2179,7 @@ export class CodexAppServerClient {
         // We don't await completion here — the caller's event handler
         // tracks task_complete / turn_aborted.
         const result = await this.request('turn/start', params) as { turn?: { id?: string | null } };
+        try { opts?.onSubmitted?.(); } catch { logger.warn('[CodexAppServer] Submission observer failed'); }
         const turnId = result?.turn?.id;
         if (typeof turnId === 'string' && turnId.length > 0) {
             this._turnId = turnId;
@@ -2206,6 +2215,8 @@ export class CodexAppServerClient {
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
+        /** Host observer invoked only after the provider accepts turn/start. */
+        onSubmitted?: () => void;
         /** Max time without any turn activity before interrupting the provider. */
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
