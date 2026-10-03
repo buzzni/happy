@@ -10,15 +10,26 @@ import {
     RpcHandlerMap,
     RpcRequest,
     RpcHandlerConfig,
+    ServerLaneConfig,
 } from './types';
 import { Socket } from 'socket.io-client';
-import { createRpcLatency, parseRpcLatencyRequest } from '@slopus/happy-wire';
+import {
+    RPC_BINDING_WINDOW_MS,
+    bindRpcResponse,
+    createRpcLatency,
+    parseRpcLatencyRequest,
+    readBoundRpcRequest,
+} from '@slopus/happy-wire';
+import { RpcNonceGuard } from './rpcNonceGuard';
 
 export class RpcHandlerManager {
     private handlers: RpcHandlerMap = new Map();
     private readonly scopePrefix: string;
     private readonly encryptionKey: Uint8Array;
     private readonly encryptionVariant: 'legacy' | 'dataKey';
+    private readonly serverLane: ServerLaneConfig | null;
+    private readonly requireBoundRequests: boolean;
+    private readonly nonceGuard: RpcNonceGuard;
     private readonly logger: (message: string, data?: any) => void;
     private socket: Socket | null = null;
     /**
@@ -34,6 +45,13 @@ export class RpcHandlerManager {
         this.scopePrefix = config.scopePrefix;
         this.encryptionKey = config.encryptionKey;
         this.encryptionVariant = config.encryptionVariant;
+        this.serverLane = config.serverLane ?? null;
+        this.requireBoundRequests = config.requireBoundRequests === true;
+        this.nonceGuard = new RpcNonceGuard({
+            windowMs: RPC_BINDING_WINDOW_MS,
+            maxEntries: config.maxBoundRequestsInWindow ?? 10_000,
+            whenFull: this.requireBoundRequests ? 'refuse' : 'evict-oldest',
+        });
         this.logger = config.logger || ((msg, data) => defaultLogger.debug(msg, data));
     }
 
@@ -107,55 +125,130 @@ export class RpcHandlerManager {
     }
 
     private async executeRequest(request: RpcRequest, trace?: ReturnType<typeof createRpcLatency>): Promise<any> {
+        const sealWithScopeKey = (value: unknown) => encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, value));
         try {
             const prefix = `${this.scopePrefix}:`;
             const bareMethod = request.method.startsWith(prefix) ? request.method.slice(prefix.length) : request.method;
-            const refusal = this.methodPolicy?.(bareMethod);
-            if (refusal) return encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, refusal));
-            if (this.managedAllowlist) {
-                const prefix = `${this.scopePrefix}:`;
-                const bare = request.method.startsWith(prefix)
-                    ? request.method.slice(prefix.length)
-                    : request.method;
-                if (!this.managedAllowlist.has(bare)) {
-                    this.logger('[RPC] [MANAGED] Method not permitted', { method: request.method });
-                    return encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, {
-                        error: `${bare} is not available on a managed runtime; use the managed dispatch RPCs`,
-                        code: 'MANAGED_CAPABILITY_REQUIRED',
-                    }));
+
+            // Decrypt the incoming params. The key that opens them is the
+            // caller's only credential and decides its lane: the scope key
+            // reaches every handler, the server lane key only its allowlist.
+            const decode = () => this.openParams(request.params);
+            const opened = trace ? trace.measureSync('daemon-decrypt', decode) : decode();
+            if (!opened) {
+                this.logger('[RPC] [ERROR] Request was not sealed with this scope key', { method: request.method });
+                return sealWithScopeKey({
+                    error: 'Request could not be decrypted',
+                    code: 'RPC_DECRYPT_FAILED',
+                });
+            }
+
+            // aplus-dev-studio specs/e2ee-machine-control-boundary R18/R19 — a
+            // customer-lane request names its method, scope, issue time and
+            // nonce inside the ciphertext; the server routes the method in
+            // clear. The reply to a bound request carries its nonce back.
+            let params: unknown = opened.value;
+            let replyNonce: string | null = null;
+            if (opened.lane === 'customer') {
+                const now = Date.now();
+                const binding = readBoundRpcRequest(opened.value, {
+                    method: bareMethod,
+                    scope: this.scopePrefix,
+                    now,
+                    // Under compat the server can already obtain the scope key, so the
+                    // window would protect nothing and only refuse a client whose clock
+                    // is off. Strict keeps it.
+                    allowStale: !this.requireBoundRequests,
+                });
+                if (binding.kind === 'refused') {
+                    this.logger('[RPC] Bound request refused', { method: request.method, code: binding.code });
+                    const refusal = {
+                        // Only strict refuses on the window, and then mostly because a clock is off.
+                        error: binding.code === 'RPC_REQUEST_STALE'
+                            ? 'Request was issued outside the allowed time window; check that the clocks of this device and the machine agree'
+                            : 'Request binding refused',
+                        code: binding.code,
+                    };
+                    return sealWithScopeKey(binding.nonce ? bindRpcResponse(binding.nonce, refusal) : refusal);
                 }
+                if (binding.kind === 'unbound' && this.requireBoundRequests) {
+                    this.logger('[RPC] Unbound request refused under strict machine control', { method: request.method });
+                    return sealWithScopeKey({
+                        error: 'Strict machine control accepts only bound requests',
+                        code: 'RPC_UNBOUND_REQUEST',
+                    });
+                }
+                if (binding.kind === 'bound') {
+                    if (binding.stale) {
+                        this.logger('[RPC] Bound request outside the time window accepted under compat', {
+                            method: request.method,
+                            skewMs: now - binding.issuedAt,
+                        });
+                    }
+                    // A stale request is remembered from when it arrived. Its own issue time
+                    // would forget it at once, or hold the guard's oldest slot for hours.
+                    const admission = this.nonceGuard.admit(binding.nonce, binding.stale ? now : binding.issuedAt, now);
+                    if (admission === 'full') {
+                        this.logger('[RPC] Bound request refused: the time window holds as many as it can remember', { method: request.method });
+                        return sealWithScopeKey(bindRpcResponse(binding.nonce, {
+                            error: 'Too many requests within the time window; retry shortly',
+                            code: 'RPC_TOO_MANY_REQUESTS',
+                        }));
+                    }
+                    if (admission === 'replayed') {
+                        this.logger('[RPC] Replayed request refused', { method: request.method });
+                        return sealWithScopeKey(bindRpcResponse(binding.nonce, {
+                            error: 'Request was already received',
+                            code: 'RPC_REQUEST_REPLAYED',
+                        }));
+                    }
+                    params = binding.params;
+                    replyNonce = binding.nonce;
+                }
+            }
+            const seal = (value: unknown) => encodeBase64(encrypt(
+                opened.key,
+                opened.variant,
+                replyNonce ? bindRpcResponse(replyNonce, value) : value,
+            ));
+            // Refusals before dispatch stay sealed with the scope key, so a
+            // server-lane caller cannot read them; a bound one is bound.
+            const sealRefusal = (value: unknown) => opened.lane === 'customer' ? seal(value) : sealWithScopeKey(value);
+
+            const refusal = this.methodPolicy?.(bareMethod);
+            if (refusal) return sealRefusal(refusal);
+            if (this.managedAllowlist && !this.managedAllowlist.has(bareMethod)) {
+                this.logger('[RPC] [MANAGED] Method not permitted', { method: request.method });
+                return sealRefusal({
+                    error: `${bareMethod} is not available on a managed runtime; use the managed dispatch RPCs`,
+                    code: 'MANAGED_CAPABILITY_REQUIRED',
+                });
             }
 
             const handler = this.handlers.get(request.method);
-
             if (!handler) {
                 this.logger('[RPC] [ERROR] Method not found', { method: request.method });
-                const errorResponse = { error: 'Method not found' };
-                const encryptedError = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, errorResponse));
-                return encryptedError;
+                return sealRefusal({ error: 'Method not found' });
             }
 
-            // Decrypt the incoming params
-            const decode = () => tryDecrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(request.params));
-            const opened = trace ? trace.measureSync('daemon-decrypt', decode) : decode();
-            // The scope key is the caller's only credential: a request it
-            // cannot open is not a call, however harmless the method looks.
-            if (!opened.ok) {
-                this.logger('[RPC] [ERROR] Request was not sealed with this scope key', { method: request.method });
-                return encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, {
-                    error: 'Request could not be decrypted',
-                    code: 'RPC_DECRYPT_FAILED',
-                }));
+            if (opened.lane === 'server' && !this.serverLane!.allows(bareMethod)) {
+                this.logger('[RPC] Server lane method refused', { method: request.method });
+                return seal({ error: `${bareMethod} is not available to the server lane`, code: 'SERVER_LANE_METHOD_NOT_ALLOWED' });
             }
-            const decryptedParams = opened.value;
 
             // Call the handler
-            this.logger('[RPC] Calling handler', { method: request.method });
-            const result = await (trace ? trace.measure('daemon-handler', () => Promise.resolve(handler(decryptedParams))) : handler(decryptedParams));
+            this.logger('[RPC] Calling handler', { method: request.method, lane: opened.lane, bound: replyNonce !== null });
+            let result: unknown;
+            try {
+                result = await (trace ? trace.measure('daemon-handler', () => Promise.resolve(handler(params))) : handler(params));
+            } catch (error) {
+                this.logger('[RPC] [ERROR] Error handling request', { error });
+                return seal({ error: error instanceof Error ? error.message : 'Unknown error' });
+            }
             this.logger('[RPC] Handler returned', { method: request.method, hasResult: result !== undefined });
 
-            // Encrypt and return the response
-            const encode = () => encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, result));
+            // Encrypt and return the response with the key the request used
+            const encode = () => seal(result);
             const encryptedResponse = trace ? trace.measureSync('daemon-encrypt', encode) : encode();
             this.logger('[RPC] Sending encrypted response', { method: request.method, responseLength: encryptedResponse.length });
             return encryptedResponse;
@@ -164,8 +257,22 @@ export class RpcHandlerManager {
             const errorResponse = {
                 error: error instanceof Error ? error.message : 'Unknown error'
             };
-            return encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, errorResponse));
+            return sealWithScopeKey(errorResponse);
         }
+    }
+
+    /** Opens params with the scope key, then the server lane key; null when neither does. */
+    private openParams(params: string): { value: any; lane: 'customer' | 'server'; key: Uint8Array; variant: 'legacy' | 'dataKey' } | null {
+        const bytes = decodeBase64(params);
+        const asCustomer = tryDecrypt(this.encryptionKey, this.encryptionVariant, bytes);
+        if (asCustomer.ok) {
+            return { value: asCustomer.value, lane: 'customer', key: this.encryptionKey, variant: this.encryptionVariant };
+        }
+        if (!this.serverLane) return null;
+        const asServer = tryDecrypt(this.serverLane.encryptionKey, 'dataKey', bytes);
+        return asServer.ok
+            ? { value: asServer.value, lane: 'server', key: this.serverLane.encryptionKey, variant: 'dataKey' }
+            : null;
     }
 
     onSocketConnect(socket: Socket): void {

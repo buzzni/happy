@@ -39,6 +39,12 @@ class Configuration {
 
   public readonly isExperimentalEnabled: boolean
   public readonly disableCaffeinate: boolean
+  /**
+   * aplus-dev-studio specs/e2ee-machine-control-boundary — whether the server
+   * may hold this machine's key. Read once per process, so every check in it
+   * agrees; switching takes a daemon restart.
+   */
+  public readonly machineControl: 'compat' | 'strict'
 
   constructor() {
     // Check if we're running as daemon based on process args
@@ -94,6 +100,13 @@ class Configuration {
       this.serverUrl ||
       'https://saycode.ai'
 
+    // HAPPY_MACHINE_CONTROL=strict runs a process strict whatever its settings say, for a happy
+    // home without settings.json. The variable can only raise compat to strict, never lower it.
+    this.machineControl = readSettingsStringSync(this.settingsFile, 'machineControl') === 'strict'
+      || process.env.HAPPY_MACHINE_CONTROL === 'strict'
+      ? 'strict'
+      : 'compat'
+
     this.isExperimentalEnabled = ['true', '1', 'yes'].includes(process.env.HAPPY_EXPERIMENTAL?.toLowerCase() || '');
     this.disableCaffeinate = ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_CAFFEINATE?.toLowerCase() || '');
 
@@ -128,7 +141,7 @@ class Configuration {
   }
 }
 
-function readSettingsStringSync(settingsFile: string, key: 'serverUrl' | 'webappUrl'): string | undefined {
+function readSettingsStringSync(settingsFile: string, key: 'serverUrl' | 'webappUrl' | 'machineControl'): string | undefined {
   try {
     if (!existsSync(settingsFile)) return undefined
     const raw = JSON.parse(readFileSync(settingsFile, 'utf8'))

@@ -1,12 +1,16 @@
 import type { EventEmitter } from 'node:events';
 import { generateKeyPairSync } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
+import { logger } from '@/ui/logger';
 import { startDaemon } from './run';
 import { createSessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { startDaemonControlServer } from './controlServer';
 
 vi.mock('@/sandbox/dependencyPreflight', () => ({ reportSandboxDependencyPreflight: vi.fn(), reportSandboxExecutionPreflight: vi.fn() }));
-vi.mock('@/ui/auth', () => ({ authAndSetupMachineIfNeeded: vi.fn(async () => ({ credentials: { token: 'fixture' }, machineId: 'machine' })) }));
+vi.mock('@/ui/auth', () => ({ authAndSetupMachineIfNeeded: vi.fn(async () => ({
+  credentials: { token: 'fixture', encryption: { type: 'dataKey', publicKey: new Uint8Array(32),
+    machineKey: new Uint8Array(32), neverEscrowed: true } }, machineId: 'machine', serverPublicKey: null,
+} satisfies Awaited<ReturnType<typeof import('@/ui/auth')['authAndSetupMachineIfNeeded']>>) ) }));
 vi.mock('@/utils/caffeinate', () => ({ startCaffeinate: vi.fn(() => false), stopCaffeinate: vi.fn() }));
 vi.mock('./installArtifactsHeal', () => ({ healInstallArtifacts: vi.fn() }));
 vi.mock('./managedRuntimeIdentity', () => ({ managedProvisioningPath: vi.fn(), resolveManagedRuntimeIdentity: vi.fn(() => ({ status: 'absent' })) }));
@@ -35,10 +39,14 @@ it('passes private host bootstrap through real daemon startup while scrubbing ch
   for (const [key, value] of Object.entries(bootstrap)) vi.stubEnv(key, value);
   vi.stubEnv('HAPPY_WRITE_SCOPE_SESSION', '1'); vi.stubEnv('HAPPY_RECONNECT_SESSION', 'poison');
   const listeners = signals.map(signal => [signal, new Set(events.rawListeners(signal))] as const);
+  const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+  vi.spyOn(logger, 'debugLargeJson').mockImplementation(() => {});
   vi.spyOn(process, 'chdir').mockImplementation(() => {});
   vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('fixture exit'); });
   try {
     await expect(startDaemon()).rejects.toThrow('fixture exit');
+    expect(debug.mock.calls.filter(([message]) => message.startsWith('[DAEMON RUN][FATAL]'))
+      .map(([, error]) => (error as Error).message)).toEqual(['fixture startup stopped']);
     expect(createSessionWriteScopeRuntime).toHaveBeenCalledOnce();
     const input = vi.mocked(createSessionWriteScopeRuntime).mock.calls[0][0];
     expect(Object.keys(input.env).sort()).toEqual(Object.keys(bootstrap).sort());

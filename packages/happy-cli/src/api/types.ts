@@ -1,6 +1,7 @@
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, rpcBindingCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -165,6 +166,8 @@ export const MachineMetadataSchema = z.object({
     protocolVersion: z.number().int().min(1).optional(),
     /** false: 스크립트 조건·GitHub 트리거처럼 Job 밖 명령이 필요한 자동화는 실행하지 않는다(Windows 정식 빌드). */
     hostCommands: z.boolean().optional(),
+    /** aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — seal with this sender, to this key. */
+    authenticatedEnvelopes: authenticatedEnvelopesCapabilitySchema.optional(),
   }).optional(),
   /**
    * External messenger channel support (Saycode specs/desktop-messenger-channels).
@@ -236,6 +239,8 @@ export const MachineMetadataSchema = z.object({
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
   /** Current tracked-child presence via encrypted machine RPC (BYOS only). */
   daemonSessionState: z.object({ version: z.literal(1) }).optional(),
+  /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound machine-scope requests (BYOS only). */
+  rpcBinding: rpcBindingCapabilitySchema.optional(),
   /**
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
@@ -443,6 +448,8 @@ export type Metadata = {
   runtimeCapabilities?: {
     saycodeSystemPromptPreference?: boolean,
   },
+  /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound session-scope requests. */
+  rpcBinding?: RpcBindingCapability,
   name?: string,
   os?: string,
   summary?: {

@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY } from '@slopus/happy-wire';
+import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
-import { encodeBase64, encrypt } from './encryption';
+import { deriveServerRpcKey, encodeBase64, encrypt } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import type { Machine } from './types';
+import type { RpcHandlerConfig } from './rpc/types';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
 import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
@@ -13,10 +15,12 @@ import { join } from 'node:path';
 
 const {
     mockIo,
-    mockShouldReconnect
+    mockShouldReconnect,
+    rpcManagerConfigs
 } = vi.hoisted(() => ({
     mockIo: vi.fn(),
-    mockShouldReconnect: vi.fn(() => true)
+    mockShouldReconnect: vi.fn(() => true),
+    rpcManagerConfigs: [] as RpcHandlerConfig[]
 }));
 
 vi.mock('socket.io-client', () => ({
@@ -44,6 +48,9 @@ vi.mock('@/modules/common/registerCommonHandlers', () => ({
 
 vi.mock('@/api/rpc/RpcHandlerManager', () => ({
     RpcHandlerManager: class {
+        constructor(config: RpcHandlerConfig) {
+            rpcManagerConfigs.push(config);
+        }
         onSocketConnect = vi.fn();
         onSocketDisconnect = vi.fn();
         handleRequest = vi.fn(async () => '');
@@ -100,6 +107,49 @@ function makeMachine(): Machine {
         encryptionVariant: 'legacy'
     };
 }
+
+/*
+ * aplus-dev-studio specs/e2ee-machine-control-boundary R2/R3 — the machine scope
+ * also answers the server's own key, for the server lane methods only.
+ */
+describe('ApiMachineClient machine RPC server lane', () => {
+    beforeEach(() => {
+        rpcManagerConfigs.length = 0;
+    });
+
+    it('keys a dataKey machine server lane with the key derived from its machine key', () => {
+        const machine: Machine = { ...makeMachine(), encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'dataKey' };
+        new ApiMachineClient('fake-token', machine);
+
+        const lane = rpcManagerConfigs.at(-1)?.serverLane;
+        expect(lane?.encryptionKey).toEqual(deriveServerRpcKey(machine.encryptionKey));
+        expect(lane?.allows('daemon-session-state')).toBe(true);
+        expect(lane?.allows('bash')).toBe(false);
+    });
+
+    it('gives a legacy machine no server lane', () => {
+        new ApiMachineClient('fake-token', makeMachine());
+
+        expect(rpcManagerConfigs.at(-1)).toBeDefined();
+        expect(rpcManagerConfigs.at(-1)?.serverLane).toBeUndefined();
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary R19
+    it('requires bound customer-lane requests under strict machine control only', () => {
+        const mode = configuration as { machineControl?: 'compat' | 'strict' };
+        try {
+            mode.machineControl = 'strict';
+            new ApiMachineClient('fake-token', makeMachine());
+            expect(rpcManagerConfigs.at(-1)?.requireBoundRequests).toBe(true);
+
+            mode.machineControl = 'compat';
+            new ApiMachineClient('fake-token', makeMachine());
+            expect(rpcManagerConfigs.at(-1)?.requireBoundRequests).toBe(false);
+        } finally {
+            delete mode.machineControl;
+        }
+    });
+});
 
 describe('ApiMachineClient socket reconnection', () => {
     let socketHandlers: SocketHandlers;
@@ -1028,6 +1078,30 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/e2ee-machine-control-boundary R18 — clients bind requests only for
+    // a daemon that says it reads them, in metadata only the machine key opens.
+    it('advertises bound requests on a machine registered before the advertisement existed', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.rpcBinding).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
+
+        client.shutdown();
+    });
+
     describe('channel host', () => {
         const advertisement = {
             protocolVersion: 1 as const,
@@ -1281,6 +1355,42 @@ describe('ApiMachineClient socket reconnection', () => {
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
         expect(machine.metadata?.automationSupport?.hostCommands).toBe(expected);
+        client.shutdown();
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — a client seals for this
+    // daemon with a sender only when it says so, and only to the automation key it publishes.
+    it.each([
+        { sender: true, required: false },
+        { sender: true, required: true },
+        { sender: false, required: false },
+    ])('publishes the authenticated-envelope capability only with a trusted sender (sender=$sender, required=$required)', async ({ sender, required }) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        if (sender) client.setAuthenticatedEnvelopeSender(new Uint8Array(32).fill(9), { required });
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
+        expect(machine.metadata?.automationSupport?.authenticatedEnvelopes).toEqual(sender ? {
+            version: 1,
+            automationPublicKey: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
+            trustedSenderPublicKey: Buffer.from(new Uint8Array(32).fill(9)).toString('base64'),
+            required,
+        } : undefined);
         client.shutdown();
     });
 
