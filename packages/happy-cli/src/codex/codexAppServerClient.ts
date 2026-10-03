@@ -1,3 +1,4 @@
+import { takeScopeConfirmation, confirmSessionWriteScope } from '@/daemon/sessionWriteScopeConfirmation';
 /**
  * Codex App Server Client — drives Codex via the v2 JSON-RPC protocol
  * (`codex app-server`), replacing the legacy MCP-based CodexMcpClient.
@@ -1038,6 +1039,7 @@ export class CodexAppServerClient {
     // ─── Lifecycle ──────────────────────────────────────────────
 
     async connect(): Promise<void> {
+        const scopeConfirmation = takeScopeConfirmation();
         const revision = this.disconnectRevision;
         this.assertInputOpen();
         if ((this.outputFailed && this.process) || (!this.connected && !this.outputSettled)) throw new Error('Codex output must drain before reconnect');
@@ -1091,9 +1093,9 @@ export class CodexAppServerClient {
                 this.sandboxCleanup = await initializeSandbox(
                     this.sandboxConfig,
                     process.cwd(),
-                    this.sandboxPolicyMode,
+                    scopeConfirmation ? 'mandatory' : this.sandboxPolicyMode,
                 );
-                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                if (scopeConfirmation || resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
                     const capability = await verifySandboxExecutionCapability();
                     if (!capability.ok) {
                         throw new MandatorySandboxError(
@@ -1113,7 +1115,7 @@ export class CodexAppServerClient {
                 this.sandboxInitFailureReason = error instanceof Error ? error.message : String(error);
                 // 공유 머신에서는 턴을 기다리지 않는다 — 폴백한 네이티브 정책이
                 // workspace-write/danger-full-access 면 호스트 전체가 열린다.
-                if (resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
+                if (scopeConfirmation || resolveSandboxInitFailureAction(this.sandboxPolicyMode) === 'abort') {
                     throw error instanceof MandatorySandboxError
                         ? error
                         : new MandatorySandboxError('init-failed', this.sandboxInitFailureReason);
@@ -1263,6 +1265,7 @@ export class CodexAppServerClient {
             this.notify('initialized');
             this.initializedEpoch = epoch;
             this.connected = true;
+            await confirmSessionWriteScope(scopeConfirmation, this.sandboxEnabled, this.sandboxConfig ?? undefined);
             logger.debug('[CodexAppServer] Connected and initialized');
         } catch (error) {
             await this.disconnectInternal();
