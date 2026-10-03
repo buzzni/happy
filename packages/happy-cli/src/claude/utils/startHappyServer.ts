@@ -565,7 +565,9 @@ export async function startHappyServer(
             }
         }
         const mcp = createMcpServer({
-            localToolAvailable: await computerAvailable(),
+            // Keep the advertised tools and stateless request registration in sync.
+            // Invocation still resolves the caller and enforces current grants.
+            localToolAvailable: initialComputerAvailable,
             changeTitle,
             checkpointReader: options.checkpointReader,
             admitTool: options.admitTool,
