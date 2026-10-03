@@ -23,6 +23,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     const port = () => (server.address() as AddressInfo).port
     const ops: Array<{ op: string; bearer: string; body: Record<string, unknown> }> = []
     const defaultTasks = () => [{ taskId: 'task-1', status: 'awaiting-user', pauseReason: 'awaiting-user', tabs: ['tab-1'], updatedAtMs: Date.now() }]
+    /** A long poll that does not answer within the test, as a quiet task does. */
+    let holdSubscribe = false
     let listedTasks: Array<Record<string, unknown>> = defaultTasks()
 
     beforeAll(async () => {
@@ -55,17 +57,22 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             let raw = ''
             req.on('data', (chunk) => { raw += chunk })
             req.on('end', () => {
-                ops.push({ op: m[1], bearer: String(req.headers.authorization ?? '').replace(/^Bearer /, ''), body: JSON.parse(raw || '{}') })
+                const body = JSON.parse(raw || '{}')
+                ops.push({ op: m[1], bearer: String(req.headers.authorization ?? '').replace(/^Bearer /, ''), body })
                 const result = m[1] === 'listTasks'
                     ? { tasks: listedTasks }
                     : m[1] === 'getTask'
-                        ? { taskId: 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
+                        ? { taskId: body.taskId || 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
                             tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'none' } }, { tabId: 'tab-2', leaseEpoch: 2, owner: { kind: 'none' } }] }
                         : m[1] === 'subscribe'
                             ? { kind: 'events', events: [{ seq: 1, type: 'state-changed', leaseEpoch: 11, data: {} }] }
                             : m[1] === 'viewerTicket' ? { ticket: `ticket-${ops.filter((entry) => entry.op === 'viewerTicket').length}`, expiresAtMs: Date.now() + 30_000 } : {}
-                res.writeHead(200, { 'content-type': 'application/json' })
-                res.end(JSON.stringify({ ok: true, result }))
+                // A slow task answers late, after the user may have picked another one.
+                const delay = m[1] === 'getTask' && body.taskId === 'task-slow' ? 800 : m[1] === 'subscribe' && holdSubscribe ? 5_000 : 0
+                setTimeout(() => {
+                    res.writeHead(200, { 'content-type': 'application/json' })
+                    res.end(JSON.stringify({ ok: true, result }))
+                }, delay)
             })
         })
         await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -202,6 +209,20 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             expect(await eventually(() => harness.evaluate(korean, `(document.querySelector('#tasks summary') || {}).textContent`), Boolean, 10_000)).toBe('다른 작업 3개')
             expect(await harness.evaluate(korean, 'document.documentElement.lang')).toBe('ko')
             await harness.closeTarget(korean)
+        } finally { listedTasks = defaultTasks(); holdSubscribe = false }
+    }, 30_000)
+
+    it("keeps the task the user picked when the automatically opened one answers late", async () => {
+        listedTasks = [{ taskId: 'task-slow', status: 'awaiting-user', tabs: ['tab-1'], updatedAtMs: Date.now() }]
+        holdSubscribe = true
+        try {
+            const cap = token('race', Date.now() + 600_000)
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => ops.some((entry) => entry.op === 'getTask' && entry.body.taskId === 'task-slow'), Boolean, 10_000)
+            await harness.evaluate(target, `document.getElementById('taskId').value = 'task-1'; document.getElementById('connect').click()`)
+            await harness.evaluate(target, `new Promise((r) => setTimeout(r, 1500))`)
+            expect(await harness.evaluate(target, `document.getElementById('detailId').textContent`)).toBe('task-1')
+            await harness.closeTarget(target)
         } finally { listedTasks = defaultTasks() }
     }, 30_000)
 
