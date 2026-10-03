@@ -94,4 +94,27 @@ describe('session write scope approval authority', () => {
     expect((await f.broker.decide(f.decide(second))).state).toBe('failed');
     expect(f.apply).toHaveBeenCalledTimes(1);
   });
+  it('enforces the active root limit when approving requests prepared before any grant', async () => {
+    const f = fixture();
+    const requests = await Promise.all(Array.from({ length: 9 }, (_, index) =>
+      f.broker.request('session', `/target-${index}`, 'Install tool')));
+    for (const request of requests.slice(0, 8)) await f.broker.decide(f.decide(request));
+    expect((await f.broker.decide(f.decide(requests[8]))).state).toBe('failed');
+    expect(f.apply).toHaveBeenCalledTimes(8);
+    expect(f.broker.list('session').filter(request => request.grantActive)).toHaveLength(8);
+    const revoke = await f.broker.request('session', requests[0].root, 'Revoke tool', 'revoke');
+    await f.broker.decide(f.decide(revoke));
+    const retry = await f.broker.request('session', requests[8].root, 'Install tool');
+    expect((await f.broker.decide(f.decide(retry))).profileApplied).toBe(true);
+  });
+  it('does not mark cancelled or project-local requests active when the same root is later granted', async () => {
+    for (const action of ['cancel', 'project'] as const) {
+      const f = fixture();
+      const abandoned = await f.broker.request('session', '/target', 'Install tool');
+      await f.broker.decide(f.decide(abandoned, action));
+      const granted = await f.broker.request('session', '/target', 'Install tool');
+      await f.broker.decide(f.decide(granted));
+      expect(f.broker.list('session').filter(request => request.grantActive).map(request => request.id)).toEqual([granted.id]);
+    }
+  });
 });

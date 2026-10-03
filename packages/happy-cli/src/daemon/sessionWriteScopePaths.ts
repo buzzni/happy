@@ -1,5 +1,5 @@
-import { realpath, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { lstat, realpath, stat } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 
 export type WriteRoot = { requestedPath: string; root: string; identity: string; floor: string[] };
 export function containsPath(root: string, candidate: string): boolean {
@@ -11,6 +11,20 @@ async function existingParent(path: string): Promise<string> {
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(path) === path) throw error;
     return existingParent(dirname(path));
+  }
+}
+
+/** Preserve absent suffixes after resolving existing ancestors; dangling aliases are unsafe. */
+async function protectedPath(path: string): Promise<string> {
+  try { return await realpath(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || dirname(path) === path) throw error;
+    const existing = await lstat(path).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return null;
+    });
+    if (existing) throw new Error('UNRESOLVED_PROTECTED_PATH');
+    return join(await protectedPath(dirname(path)), basename(path));
   }
 }
 
@@ -31,10 +45,7 @@ export async function canonicalizeSessionWriteRoot(requestedPath: string, input:
       '.local/share/keyrings'].map(path => join(home, path))];
   const floor: string[] = [];
   for (const path of protectedRoots) {
-    const canonical = await realpath(path).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      return resolve(path);
-    });
+    const canonical = await protectedPath(resolve(path));
     if (containsPath(root, canonical) || containsPath(canonical, root)) throw new Error('PROTECTED_WRITE_ROOT');
     if (path === join(home, '.codex')) floor.push(join(canonical, 'auth.json'), join(canonical, 'config.toml'));
     else if (path === join(home, '.claude')) floor.push(join(canonical, '.credentials.json'), join(canonical, 'settings.json'));

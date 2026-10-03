@@ -39,10 +39,14 @@ export class SessionWriteScopeBroker {
       if (request.state === 'pending' && request.expiresAt <= this.now()) request.state = 'expired';
     }
   }
+  private grantActive(request: ScopeRequest): boolean {
+    return request.kind === 'grant' && request.profileApplied === true
+      && this.grants.get(request.sessionId)?.has(request.root) === true;
+  }
   list(sessionId: string): ScopeRequest[] {
     this.expire();
     return [...this.entries.values()].filter(entry => entry.request.sessionId === sessionId)
-      .map(entry => ({ ...entry.request, grantActive: entry.request.kind === 'grant' && this.grants.get(sessionId)?.has(entry.request.root) === true }));
+      .map(entry => ({ ...entry.request, grantActive: this.grantActive(entry.request) }));
   }
   async request(sessionId: string, path: string, description: string, kind: 'grant' | 'revoke' = 'grant'): Promise<ScopeRequest> {
     if (!description || description.length > 240 || /[\x00-\x1f\x7f]/.test(description)
@@ -106,6 +110,7 @@ export class SessionWriteScopeBroker {
         || JSON.stringify(current.floor) !== JSON.stringify(inspected.floor)) throw new Error('WRITE_SCOPE_CHANGED');
       if (request.expiresAt <= this.now()) throw new Error('REQUEST_EXPIRED');
       const roots = new Map(this.grants.get(request.sessionId));
+      if (request.kind === 'grant' && !roots.has(request.root) && roots.size >= 8) throw new Error('GRANT_LIMIT_REACHED');
       for (const root of roots.values()) {
         const checked = await this.deps.canonicalize(root.root);
         if (checked.root !== root.root || checked.identity !== root.identity
@@ -123,7 +128,7 @@ export class SessionWriteScopeBroker {
     } catch { request.state = 'failed'; request.error = 'SCOPE_APPLICATION_FAILED'; }
     finally { this.busy.delete(request.sessionId); }
     await this.persist();
-    return { ...request, grantActive: request.kind === 'grant' && this.grants.get(request.sessionId)?.has(request.root) === true };
+    return { ...request, grantActive: this.grantActive(request) };
   }
   sessionEnded(sessionId: string): void { this.grants.delete(sessionId); }
 }

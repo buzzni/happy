@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -32,5 +32,20 @@ describe('narrow write root', () => {
   it('refuses granting a parent containing a protected store', async () => {
     const f = await fixture(); const protectedRoot = join(f.root, 'keys'); await mkdir(protectedRoot);
     await expect(canonicalizeSessionWriteRoot(f.root, { ...f.input, protectedRoots: [protectedRoot] })).rejects.toThrow();
+  });
+  it('protects a future keyring under a symlinked parent before the store exists', async () => {
+    const f = await fixture();
+    await symlink(f.root, join(f.home, '.local', 'share'));
+    await expect(canonicalizeSessionWriteRoot(f.root, f.input)).rejects.toThrow('PROTECTED_WRITE_ROOT');
+  });
+  it('canonicalizes missing protected suffixes and rejects dangling protected aliases', async () => {
+    const f = await fixture();
+    await symlink(f.protectedRoot, join(f.home, 'alias'));
+    const protectedPath = join(f.home, 'alias', 'missing', 'keys');
+    const inspected = await canonicalizeSessionWriteRoot(f.root, { ...f.input, protectedRoots: [protectedPath] });
+    expect(inspected.floor).toContain(join(await realpath(f.protectedRoot), 'missing', 'keys'));
+    expect(inspected.floor).not.toContain(protectedPath);
+    await symlink(join(f.home, 'absent'), join(f.home, 'dangling'));
+    await expect(canonicalizeSessionWriteRoot(f.root, { ...f.input, protectedRoots: [join(f.home, 'dangling', 'keys')] })).rejects.toThrow();
   });
 });

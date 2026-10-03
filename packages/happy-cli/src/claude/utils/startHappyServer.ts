@@ -125,7 +125,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         version: "1.0.0",
     });
 
-    registerSessionWriteScopeTools(mcp, handlers.client.sessionId, runTool);
+    if (!handlers.mandatorySandbox || scopedSession) registerSessionWriteScopeTools(mcp, handlers.client.sessionId, runTool);
 
     if (handlers.checkpointReader) registerCheckpointAgentTools(mcp, handlers.checkpointReader, runTool);
 
