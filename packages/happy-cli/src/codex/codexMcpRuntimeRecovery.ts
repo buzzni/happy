@@ -132,9 +132,6 @@ export class CodexMcpRuntimeRecovery {
         } catch {
             // Missing startup notifications are unknown, not failure.
         }
-        const startup = new Map(startupEntries
-            .filter((entry) => !entry.threadId || entry.threadId === input.threadId)
-            .map((entry) => [entry.name, entry]));
         let inventory: Map<string, CodexMcpServerInventory> | undefined;
         try {
             const result = await this.client.listMcpServerStatus({ threadId: input.threadId });
@@ -142,6 +139,17 @@ export class CodexMcpRuntimeRecovery {
         } catch {
             // No inventory is unknown, never proof of a healthy connection.
         }
+        return this.buildStatuses(input, startupEntries, inventory);
+    }
+
+    private buildStatuses(
+        input: RecoveryInput,
+        startupEntries: CodexMcpStartupStatus[],
+        inventory: Map<string, CodexMcpServerInventory> | undefined,
+    ): McpRuntimeServerStatus[] {
+        const startup = new Map(startupEntries
+            .filter((entry) => !entry.threadId || entry.threadId === input.threadId)
+            .map((entry) => [entry.name, entry]));
         const checkedAt = this.now();
         return [...new Set(input.expectedServerNames)].sort().map((name) => {
             const started = startup.get(name);
