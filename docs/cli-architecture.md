@@ -655,3 +655,11 @@ restores require explicit file inclusion. Revisit the conservative idle rule if 
 sessions prevent cleanup, and the capacity budget if a single packing run outlasts it and
 storage pressure persists. Runtime release and Desktop pin adoption remain separate from
 these source changes.
+
+Checkpoint pin creation acquires the non-reentrant store lock and releases it before
+running the restore action. `withManagedProducerLock` holds that same lock throughout
+its callback, so `prepareManagedVolume` must not directly use the ordinary
+`CheckpointRestoreExecutor` for that store: pin and snapshot operations would reacquire
+it. The current production boot path initializes only an empty volume with no checkpoint
+and an unwired restore port. Before wiring checkpoint boot restore, provide and verify an
+adapter that honors the already-held lock; do not weaken GC pin ownership to allow nesting.

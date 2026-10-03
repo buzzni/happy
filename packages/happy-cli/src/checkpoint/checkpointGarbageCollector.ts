@@ -176,6 +176,11 @@ export class CheckpointGarbageCollector {
     }
 }
 
+/**
+ * Acquires the non-reentrant store lock to publish an owned pin, then releases
+ * it before action runs. Call outside any lock for this same store, including
+ * withManagedProducerLock; pin protection must not be removed to permit nesting.
+ */
 export async function withCheckpointPin<T>(
     checkpointRoot: string,
     request: Omit<CheckpointStoreBinding, 'checkpointRoot'> & {
