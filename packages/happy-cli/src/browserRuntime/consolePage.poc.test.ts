@@ -186,7 +186,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         ]
         try {
             const cap = token('fold', Date.now() + 600_000)
-            const target = await harness.openFrontTab(`${origin}/console#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+            // The language is explicit: the page otherwise follows the browser's.
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
             await eventually(() => harness.evaluate(target, `document.querySelectorAll('#tasks button').length`), (n) => n === 6, 10_000)
             const layout = await harness.evaluate(target, `JSON.stringify({
                 top: [...document.querySelectorAll('#tasks > button')].map((b) => b.textContent.split(' ')[0]),
@@ -197,6 +198,10 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 top: ['task-approval', 'task-login', 'task-login-parked'], folded: ['task-idle', 'task-running', 'task-cancelling'], open: false, summary: '3 other open tasks',
             })
             await harness.closeTarget(target)
+            const korean = await harness.openFrontTab(`${origin}/console?lang=ko#abp-cap=${token('fold-ko', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            expect(await eventually(() => harness.evaluate(korean, `(document.querySelector('#tasks summary') || {}).textContent`), Boolean, 10_000)).toBe('다른 작업 3개')
+            expect(await harness.evaluate(korean, 'document.documentElement.lang')).toBe('ko')
+            await harness.closeTarget(korean)
         } finally { listedTasks = defaultTasks() }
     }, 30_000)
 
