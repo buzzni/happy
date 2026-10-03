@@ -1,6 +1,6 @@
 ---
 기능: happy-cli-checkpoint-release
-상태: 진행중(Phase 1)
+상태: Phase 1 완료(main 통합·발행 승인 대기)
 마지막 갱신: 2026-10-03
 ---
 
@@ -10,7 +10,7 @@
 
 Happy #650과 Desktop #1323의 main 머지를 확인했다. registry 최신 `.278`은 #649 기준이고 #650을 포함하지 않으며 Desktop pin은 `.275`다. 별도 `release/happy-cli-279` worktree에서 후보를 준비한다. 기존 Happy 개발 worktree와 그 미추적 파일은 보존한다.
 
-후보 version bump와 준비 문서만 변경했다. frozen install, wire build, CLI typecheck/build, 관련 unit 19 files / 479 tests, 동일 tarball guard/install-smoke가 통과했다. 의존성·lockfile·Desktop pin·전역 runtime 변경은 없다. 준비 PR 생성이 다음 단계다.
+후보 version bump와 준비 문서만 변경했다. frozen install, wire build, CLI typecheck/build, 관련 unit 19 files / 479 tests, 동일 tarball guard/install-smoke가 통과했다. 의존성·lockfile·Desktop pin·전역 runtime 변경은 없다. 준비 commit `4d3e6db8d`를 push하고 [Happy #655](https://github.com/buzzni/happy/pull/655)를 생성했다. 최초 push 직전 origin/main behind=0, `.279` registry/tag 부재를 재확인했다.
 
 ## 결정·권한
 
@@ -20,7 +20,7 @@ Happy #650과 Desktop #1323의 main 머지를 확인했다. registry 최신 `.27
 
 ## 다음 시작점
 
-main 뒤처짐·candidate 미사용을 다시 확인한 뒤 commit/push와 준비 PR을 만든다. PR merge 후 main commit과 정확한 tag action을 제시해 발행 승인을 받는다. 발행 뒤 registry identity를 확인하고 Desktop pin 및 root vendor pointer로 이어 간다. 기능 spec은 Desktop의 checkpoint-agent-history / checkpoint-history-retention / checkpoint-history-usability가 소유한다.
+PR #655의 CI·main 통합 후 main commit과 정확한 tag action을 제시해 발행 승인을 받는다. merge·tag push·게시를 실행하지 않았다. 발행 뒤 registry identity를 확인하고 Desktop pin 및 root vendor pointer로 이어 간다. 기능 spec은 Desktop의 checkpoint-agent-history / checkpoint-history-retention / checkpoint-history-usability가 소유한다.
 
 ## 검증 증거와 한계
 

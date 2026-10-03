@@ -25,6 +25,6 @@
 ## 완료 기준
 
 - [x] 후보 build·관련 테스트·동일 tarball 설치 guard 통과
-- [ ] release 준비 PR와 포함 범위·한계·검증 증거 기록
+- [x] release 준비 PR와 포함 범위·한계·검증 증거 기록
 - [ ] 승인 후 main tag 발행·registry smoke 완료
 - [ ] Desktop pin/vendor 적용 및 실제 provider 수락 완료

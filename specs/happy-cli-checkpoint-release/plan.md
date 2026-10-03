@@ -1,6 +1,6 @@
 # Happy CLI 체크포인트 릴리스 Plan
 
-> 작성일: 2026-10-03 / 상태: 진행중 / 근거: [spec.md](./spec.md)
+> 작성일: 2026-10-03 / 상태: Phase 1 완료, main 통합·발행 승인 대기 / 근거: [spec.md](./spec.md)
 
 ## 아키텍처 영향
 
@@ -12,7 +12,7 @@ Happy main의 별도 worktree에 후보를 준비하고 기존 CI와 동일한 a
 
 ## 단계
 
-- [ ] Phase 1: `.279` 준비 PR — frozen install, 관련 테스트/build, package guard/install-smoke, source/metadata/hash 대조
+- [x] Phase 1: `.279` 준비 PR — frozen install, 관련 테스트/build, package guard/install-smoke, source/metadata/hash 대조
 - [ ] Phase 2: main 통합·직전 승인 후 tag workflow — registry 전파/독립 설치 확인
 - [ ] Phase 3: Desktop exact pin 및 root vendor pointer PR — staging·부팅·daemon smoke
 - [ ] Phase 4: 실제 Claude/Codex tool discovery·diff, 사용자 확인 restore, worktree grace/즉시 정리·운용 관측
