@@ -56,8 +56,10 @@ export class SessionWriteScopeBroker {
     this.expire();
     const session = await this.deps.resolveSession(sessionId);
     if (!session) throw new Error('SESSION_SCOPE_UNSUPPORTED');
-    const inspected = await this.deps.canonicalize(path);
-    if (kind === 'revoke' && !this.grants.get(sessionId)?.has(inspected.root)) throw new Error('GRANT_NOT_ACTIVE');
+    // Revocation removes a saved grant; it never approves the current filesystem target.
+    const granted = kind === 'revoke' ? this.grants.get(sessionId)?.get(path) : undefined;
+    if (kind === 'revoke' && !granted) throw new Error('GRANT_NOT_ACTIVE');
+    const inspected = granted ?? await this.deps.canonicalize(path);
     const duplicate = this.list(sessionId).find(request => request.state === 'pending'
       && request.root === inspected.root && request.kind === kind);
     if (duplicate) return duplicate;
@@ -104,22 +106,28 @@ export class SessionWriteScopeBroker {
     try {
       await this.persist();
       const session = await this.deps.resolveSession(request.sessionId);
-      const current = await this.deps.canonicalize(request.requestedPath);
-      if (!session || session.generation !== request.generation || session.projectRoot !== request.projectRoot
-        || current.root !== inspected.root || current.identity !== inspected.identity
-        || JSON.stringify(current.floor) !== JSON.stringify(inspected.floor)) throw new Error('WRITE_SCOPE_CHANGED');
+      if (!session || session.generation !== request.generation || session.projectRoot !== request.projectRoot) throw new Error('WRITE_SCOPE_CHANGED');
+      if (request.kind === 'grant') {
+        const current = await this.deps.canonicalize(request.requestedPath);
+        if (current.root !== inspected.root || current.identity !== inspected.identity
+          || JSON.stringify(current.floor) !== JSON.stringify(inspected.floor)) throw new Error('WRITE_SCOPE_CHANGED');
+      }
       if (request.expiresAt <= this.now()) throw new Error('REQUEST_EXPIRED');
       const roots = new Map(this.grants.get(request.sessionId));
       if (request.kind === 'grant' && !roots.has(request.root) && roots.size >= 8) throw new Error('GRANT_LIMIT_REACHED');
+      if (request.kind === 'revoke') {
+        if (roots.get(request.root) !== inspected) throw new Error('GRANT_NOT_ACTIVE');
+        roots.delete(request.root);
+        // A failed replacement must not restore a withdrawn future grant.
+        this.grants.set(request.sessionId, roots);
+      }
       for (const root of roots.values()) {
         const checked = await this.deps.canonicalize(root.root);
         if (checked.root !== root.root || checked.identity !== root.identity
           || JSON.stringify(checked.floor) !== JSON.stringify(root.floor)) throw new Error('WRITE_SCOPE_CHANGED');
       }
       if (request.expiresAt <= this.now()) throw new Error('REQUEST_EXPIRED');
-      if (request.kind === 'revoke') roots.delete(request.root); else roots.set(request.root, inspected);
-      // Remove the future grant before a revoke attempt; failure must not restore it.
-      if (request.kind === 'revoke') this.grants.set(request.sessionId, roots);
+      if (request.kind === 'grant') roots.set(request.root, inspected);
       const result = await this.deps.apply({ ...request }, [...roots.values()]);
       request.profileApplied = result.profileApplied; request.cleanup = result.cleanup;
       if (result.profileApplied) this.grants.set(request.sessionId, roots);

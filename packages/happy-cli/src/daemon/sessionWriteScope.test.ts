@@ -117,4 +117,42 @@ describe('session write scope approval authority', () => {
       expect(f.broker.list('session').filter(request => request.grantActive).map(request => request.id)).toEqual([granted.id]);
     }
   });
+  it.each(['missing', 'replaced'])('revokes an existing grant after its directory is %s', async state => {
+    const f = fixture();
+    const grant = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(grant));
+    f.canonicalize.mockImplementation(async path => {
+      if (state === 'missing') throw new Error('ENOENT');
+      return { requestedPath: path, root: path, identity: 'replacement-inode', floor: ['/protected'] };
+    });
+    const revoke = await f.broker.request('session', '/target', 'Revoke tool', 'revoke');
+    expect((await f.broker.decide(f.decide(revoke))).profileApplied).toBe(true);
+    expect(f.apply).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'revoke' }), []);
+    expect(f.broker.list('session').find(request => request.id === grant.id)?.grantActive).toBe(false);
+    expect(f.broker.list('session').find(request => request.id === revoke.id)?.state).toBe('cleanup-unresolved');
+  });
+  it('does not reuse a revoked root when another remaining grant fails revalidation', async () => {
+    const f = fixture();
+    for (const path of ['/target', '/other']) {
+      const request = await f.broker.request('session', path, 'Install tool');
+      await f.broker.decide(f.decide(request));
+    }
+    const revoke = await f.broker.request('session', '/target', 'Revoke tool', 'revoke');
+    f.canonicalize.mockImplementation(async path => ({ requestedPath: path, root: path,
+      identity: path === '/other' ? 'replacement-inode' : 'dev:ino', floor: ['/protected'] }));
+    expect((await f.broker.decide(f.decide(revoke))).state).toBe('failed');
+    expect(f.apply).toHaveBeenCalledTimes(2);
+    expect(f.broker.list('session').filter(request => request.grantActive).map(request => request.root)).toEqual(['/other']);
+  });
+  it('does not let an old revocation remove a subsequently replaced grant record', async () => {
+    const f = fixture();
+    const first = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(first));
+    const oldRevoke = await f.broker.request('session', '/target', 'Revoke tool', 'revoke');
+    const replacement = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(replacement));
+    expect((await f.broker.decide(f.decide(oldRevoke))).state).toBe('failed');
+    expect(f.apply).toHaveBeenCalledTimes(2);
+    expect(f.broker.list('session').find(request => request.id === replacement.id)?.grantActive).toBe(true);
+  });
 });
