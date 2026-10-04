@@ -606,6 +606,11 @@ describe('abp-stack pull', () => {
         expect(host.calls.filter((line) => line.startsWith('docker pull'))).toEqual([`docker pull ${RUNTIME_REF}`, `docker pull ${BROWSER_REF}`])
     })
 
+    it('accepts the pulled index digest as the local id (containerd image store) and returns that id', () => {
+        const host = hostWith(manifest(), (ref) => ref.split('@')[1])
+        expect(createStack(host.deps).pull('/rel/abp-images.json', { arch: 'amd64' })).toEqual({ runtime: RUNTIME_REF.split('@')[1], browser: BROWSER_REF.split('@')[1] })
+    })
+
     it('refuses an image whose local id differs from the released one (a replaced image)', () => {
         const host = hostWith(manifest(), (ref) => (ref === RUNTIME_REF ? RUNTIME_NEW : 'sha256:' + '0'.repeat(64)))
         expect(() => createStack(host.deps).pull('/rel/abp-images.json', { arch: 'amd64' })).toThrow(/browser image digest mismatch/)
