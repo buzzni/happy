@@ -5,6 +5,7 @@
 // installed copy runs with /usr/bin/node alone and the unit tests pin it.
 // Errors name the field, never the value (issuer keys, tokens).
 import { createHash, createPublicKey, randomBytes } from "node:crypto";
+import { join } from "node:path";
 
 export const DEFAULT_RUNTIME_PORT = 38700;
 export const PACKAGE_NAME = "@buzzni/happy-cli";
@@ -793,5 +794,16 @@ export function browserCreateArgs(layout, browser, image) {
     `--mount=type=bind,source=${PATHS.browserSecrets},target=${IN_CONTAINER.secrets},readonly`,
     `--env=ABP_CDP_HOST=${browser.alias}:9223`,
     image,
+  ];
+}
+
+/** The files the runtime and browser images are built from (besides runtime.mjs), as [source, name in the build context]. */
+export function imageContextFiles(packageDir) {
+  const poc = join(packageDir, "scripts/browser-poc/images");
+  const own = join(packageDir, "scripts/agent-browser/images");
+  return [
+    [join(poc, "runtime-entrypoint.sh"), "runtime-entrypoint.sh"], [join(poc, "cdp-proxy.py"), "cdp-proxy.py"], [join(poc, "instance-server.py"), "instance-server.py"],
+    [join(own, "runtime.Dockerfile"), "runtime.Dockerfile"], [join(own, "browser.Dockerfile"), "browser.Dockerfile"], [join(own, "browser-entrypoint.sh"), "browser-entrypoint.sh"],
+    [join(own, "browser-shutdown.py"), "browser-shutdown.py"], [join(own, "chromium-policy.json"), "chromium-policy.json"],
   ];
 }

@@ -27,7 +27,7 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { CONTAINER_MEMORY_GIB, MAX_SHARED_PROFILES, PATHS, STACK_LABEL, browserCreateArgs, fenceRule, legacyProfileVolumeName, profileVolumeName, profileVolumeLabels, mergeInstallOptions, networkCreateArgs, runtimeConfig, runtimeCreateArgs, sharedProfileId, stackLayout } from "./lib/abpPlan.mjs";
+import { CONTAINER_MEMORY_GIB, MAX_SHARED_PROFILES, PATHS, STACK_LABEL, browserCreateArgs, fenceRule, imageContextFiles, legacyProfileVolumeName, profileVolumeName, profileVolumeLabels, mergeInstallOptions, networkCreateArgs, runtimeConfig, runtimeCreateArgs, sharedProfileId, stackLayout } from "./lib/abpPlan.mjs";
 
 import { PROFILE_COPY } from "./lib/profileCopy.mjs";
 
@@ -1313,13 +1313,7 @@ export function createStack(deps) {
       const staging = deps.tempDir();
       try {
         deps.run(process.execPath, [join(packageDir, "scripts/browser-poc/build-runtime.mjs"), join(staging, "runtime.mjs")]);
-        const poc = join(packageDir, "scripts/browser-poc/images");
-        const own = join(packageDir, "scripts/agent-browser/images");
-        for (const [from, name] of [[join(poc, "runtime-entrypoint.sh"), "runtime-entrypoint.sh"], [join(poc, "cdp-proxy.py"), "cdp-proxy.py"], [join(poc, "instance-server.py"), "instance-server.py"],
-          [join(own, "runtime.Dockerfile"), "runtime.Dockerfile"], [join(own, "browser.Dockerfile"), "browser.Dockerfile"], [join(own, "browser-entrypoint.sh"), "browser-entrypoint.sh"], [join(own, "browser-shutdown.py"), "browser-shutdown.py"],
-          [join(own, "chromium-policy.json"), "chromium-policy.json"]]) {
-          deps.copyFile(from, join(staging, name));
-        }
+        for (const [from, name] of imageContextFiles(packageDir)) deps.copyFile(from, join(staging, name));
         const ids = {};
         for (const role of ["runtime", "browser"]) {
           docker(["build", "--pull=false", "-f", join(staging, `${role}.Dockerfile`), "-t", `abp-${role}:${tag}`, staging]);
