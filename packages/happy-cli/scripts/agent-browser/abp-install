@@ -12,9 +12,12 @@
 #   --happy-tarball <tgz>     install this Happy package (npm pack) under the Happy prefix
 #   --images <dir>            load images.tar + manifest.json (abp-stack build --out) on first install
 #   --build-from <happy-cli>  build the images on this machine instead (needs a source checkout with deps)
+#   --agent-credentials <file> log the agent in to Happy from a machine registration claim response (token, secret,
+#                             machineId; needs --server-url), so a first install finishes in one run. Deleted after use
 #   --install-packages        apt-get the host prerequisites (bubblewrap sudo iptables ipset acl gcc libc6-dev systemd-resolved libnss-resolve)
 #   --no-start                write everything, start nothing
 # Machine options (saved in /etc/abp/install.json; see abp-plan.mjs parseOptionFlags):
+#   --config <file>           all of the options below as one JSON object, in install.json's shape (later flags win)
 #   --machine-id <id|auto> --workspace-id <id> --profile main=<principalId> (release 1: exactly main)
 #   --issuer <kid>=<public-key.pem>... --sites <policy.json> --runtime-port <n> --max-agent-windows <n>
 #   --retention-days <n> --viewer-origin <origin>... --egress-domain <domain>... --happy-prefix <dir>
@@ -501,6 +504,7 @@ main_install() {
             --happy-tarball) HAPPY_TARBALL=$2; shift 2 ;;
             --images) IMAGES_DIR=$2; shift 2 ;;
             --build-from) BUILD_FROM=$2; shift 2 ;;
+            --agent-credentials) AGENT_CREDENTIALS=$2; shift 2 ;;
             --install-packages) INSTALL_PACKAGES=1; shift ;;
             --no-start) NO_START=1; shift ;;
             --*) [ $# -ge 2 ] || die "$1 needs a value"; forward+=("$1" "$2"); shift 2 ;;
@@ -532,6 +536,12 @@ main_install() {
         fi
     fi
     HAPPY_PREFIX=$("$NODE" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).happyPrefix)' "$WORK/install.json")
+    if [ -n "$AGENT_CREDENTIALS" ]; then
+        # The machine registration claim response: the agent logs in without `happy auth login`, so one run finishes.
+        plan agent-access-key --credentials "$AGENT_CREDENTIALS" > "$WORK/access.key"
+        "$NODE" -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).serverUrl ? 0 : 1)' "$WORK/install.json" \
+            || die "--agent-credentials needs --server-url (the server the credentials belong to)"
+    fi
     preflight
 
     ensure_accounts
@@ -593,12 +603,24 @@ main_install() {
     say "machine identity and Runtime configuration"
     local machine_id token_file=$DAEMON_TOKEN
     # --server-url: `happy auth login` and the daemon both read the server from the agent's settings.
-    plan happy-settings --install "$WORK/install.json" --settings "$AGENT_HAPPY_SETTINGS" > "$WORK/happy-settings.json"
+    local credential_flags=()
+    [ -n "$AGENT_CREDENTIALS" ] && credential_flags=(--credentials "$AGENT_CREDENTIALS")
+    plan happy-settings --install "$WORK/install.json" --settings "$AGENT_HAPPY_SETTINGS" ${credential_flags[@]+"${credential_flags[@]}"} > "$WORK/happy-settings.json"
     if [ -s "$WORK/happy-settings.json" ]; then
         ensure_dir /home/agent/.happy agent agent 0700
+        if [ -n "$AGENT_CREDENTIALS" ]; then
+            # Never shown, also not in a dry run.
+            write_file /home/agent/.happy/access.key agent agent 0600 < "$WORK/access.key"
+            rm -f "$WORK/access.key"
+        fi
         write_file "$AGENT_HAPPY_SETTINGS" agent agent 0600 show < "$WORK/happy-settings.json"
+        # The credentials file has done its job; a real run does not leave it behind.
+        if [ -n "$AGENT_CREDENTIALS" ] && [ "$DRY_RUN" = 0 ]; then rm -f "$AGENT_CREDENTIALS"; fi
     fi
-    machine_id=$(plan resolve-machine-id --install "$WORK/install.json" --settings "$AGENT_HAPPY_SETTINGS" 2>/dev/null || true)
+    # The settings just computed (they include the saved ones and any credential machine id), also in a dry run.
+    local settings_now=$AGENT_HAPPY_SETTINGS
+    [ -s "$WORK/happy-settings.json" ] && settings_now=$WORK/happy-settings.json
+    machine_id=$(plan resolve-machine-id --install "$WORK/install.json" --settings "$settings_now" 2>/dev/null || true)
     if [ -n "$machine_id" ]; then
         plan install-options --saved "$WORK/install.json" --machine-id "$machine_id" > "$WORK/install.resolved.json"
         mv "$WORK/install.resolved.json" "$WORK/install.json"
@@ -787,6 +809,7 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 HAPPY_TARBALL=""
 IMAGES_DIR=""
 BUILD_FROM=""
+AGENT_CREDENTIALS=""
 INSTALL_PACKAGES=0
 NO_START=0
 HAPPY_PREFIX=$DEFAULT_HAPPY_PREFIX

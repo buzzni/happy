@@ -442,14 +442,31 @@ const SESSION_SANDBOX_CONFIG = { enabled: true, workspaceRoot: "/work", sessionI
  */
 const HAPPY_DEFAULT_SERVER_URL = "https://saycode.ai";
 
-export function happySettings(existing, install) {
+export function happySettings(existing, install, credentials) {
   if (install.serverUrl === undefined) return undefined;
   const settings = existing ?? {};
   const registeredWith = settings.serverUrl ?? HAPPY_DEFAULT_SERVER_URL;
   if (settings.machineId && registeredWith !== install.serverUrl) {
     fail("serverUrl", `the agent is registered with ${registeredWith}; run sudo -iu agent happy auth logout first to move it`);
   }
-  return { ...settings, serverUrl: install.serverUrl, webappUrl: install.serverUrl };
+  // Credentials from the machine registration claim register the agent as that machine (one-pass install).
+  if (credentials?.machineId && settings.machineId && settings.machineId !== credentials.machineId) {
+    fail("machineId", `the agent is already registered as ${settings.machineId}; run sudo -iu agent happy auth logout first to register it again`);
+  }
+  return { ...settings, serverUrl: install.serverUrl, webappUrl: install.serverUrl, ...credentials?.machineId ? { machineId: credentials.machineId } : {} };
+}
+
+/**
+ * The machine registration claim response (Studio /api/auth/claim-machine-token: token, secret, machineId, ...) as the
+ * agent's Happy credentials: the access.key payload and the machine id. Saydo specs/agent-browser-one-click-install I6.
+ */
+export function agentCredentials(raw) {
+  const bad = (why) => { throw new Error(`agent credentials: ${why}`); };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) bad("expected a JSON object");
+  if (typeof raw.token !== "string" || !raw.token) bad("token is missing");
+  if (typeof raw.secret !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw.secret) || raw.secret.length % 4 !== 0) bad("secret is not base64");
+  if (raw.machineId !== undefined && (typeof raw.machineId !== "string" || !raw.machineId)) bad("machineId must be a non-empty string");
+  return { accessKey: { token: raw.token, secret: raw.secret }, ...raw.machineId ? { machineId: raw.machineId } : {} };
 }
 
 export function daemonEnv(install) {
