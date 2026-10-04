@@ -3,6 +3,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 const fixture = vi.hoisted(() => ({
     submit: null as null | ((input: { token: string; proposal: unknown }) => { accepted: boolean }),
     aborted: false,
+    omitCompletionObservers: false,
     token: '',
     steerText: '',
     emit: null as null | ((event: unknown) => void),
@@ -88,10 +89,17 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     startThread = async () => { this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     abortPreparedTurn = vi.fn();
     abortTurnWithFallback = async () => ({ forcedRestart: false });
-    sendTurnAndWait = async (prompt: string) => {
+    sendTurnAndWait = async (prompt: string, options?: {
+        onCompleted?: (turnId: string, thread: { id: string; path: string }) => void;
+        onCompletionObservationSettled?: () => void;
+    }) => {
         fixture.send(prompt);
         fixture.markDispatched?.();
         await fixture.onSend?.();
+        if (!fixture.omitCompletionObservers) {
+            if (!fixture.aborted) options?.onCompleted?.('native-completed-turn', { id: 'thread', path: '/tmp/native-rollout.jsonl' });
+            options?.onCompletionObservationSettled?.();
+        }
         return { aborted: fixture.aborted };
     };
 } }));
@@ -120,7 +128,7 @@ afterEach(() => {
         }
     }
 });
-afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
+afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
 async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string) {
     for (const key of Object.keys(process.env)) {
@@ -140,6 +148,43 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    it('keeps the completed native memory continuation admitted when shutdown freezes during inference', async () => {
+        const memory = await import('@/memory/codexIngestHost');
+        const ingest = vi.fn(async () => ({ reason: 'imported' as const, importedPrompts: 1, importedResponses: 1, skippedDuplicates: 0, completedTurns: 1 }));
+        const close = vi.fn(async () => {});
+        vi.spyOn(memory, 'prepareCodexIngestHost').mockResolvedValue({ ingest, close });
+        fixture.aborted = false;
+        fixture.onSend = async () => { fixture.gate!.freeze(); };
+        const running = start();
+        // Wait for the provider boundary first; this is the first test and loads the
+        // real runner lazily. Lifecycle assertions begin only once inference entered.
+        await vi.waitFor(() => expect(fixture.send).toHaveBeenCalledOnce(), { timeout: 5_000 });
+        await finishFrozenFixture(running);
+        expect(ingest).toHaveBeenCalledWith({ threadId: 'thread', transcriptPath: '/tmp/native-rollout.jsonl', throughTurnId: 'native-completed-turn' });
+        expect(close).toHaveBeenCalledOnce();
+        expect(fixture.gate?.hasLiveProducers()).toBe(false);
+    });
+
+    it('cancels a still-waiting native memory continuation before forced kill joins writers', async () => {
+        const memory = await import('@/memory/codexIngestHost');
+        const ingest = vi.fn(async () => ({ reason: 'imported' as const, importedPrompts: 1, importedResponses: 1, skippedDuplicates: 0, completedTurns: 1 }));
+        const close = vi.fn(async () => {});
+        vi.spyOn(memory, 'prepareCodexIngestHost').mockResolvedValue({ ingest, close });
+        const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+        fixture.aborted = false;
+        // Model a provider UI fallback whose completion observer never settles.
+        fixture.omitCompletionObservers = true;
+        fixture.onSend = async () => {
+            const kill = fixture.session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'killSession')![1] as () => Promise<unknown>;
+            await kill();
+        };
+        await start();
+        await vi.waitFor(() => expect(exit).toHaveBeenCalled());
+        expect(ingest).not.toHaveBeenCalled();
+        expect(close).toHaveBeenCalled();
+        expect(fixture.gate?.hasLiveProducers()).toBe(false);
+    });
+
     it('publishes same-turn MCP recovery metadata without a second pre-turn status query', async () => {
         const statuses = [{ name: 'notion', status: 'connected' as const, checkedAt: 5 }];
         fixture.recoverMcp.mockResolvedValue({ status: 'ready', affectedServers: [], runtimeStatuses: statuses });
