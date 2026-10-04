@@ -36,7 +36,7 @@ real host-signed approval, storage/cursor drain, old parent exit, same-ID/thread
 resume and profile receipt. They also cover queued input exactly once, encrypted history,
 another session's PID/settings, forged reports, replay, revoke, discarded approval results
 reconciled through list, server disconnect and journal recovery across daemon incarnations.
-The suite runs both cases for Codex/Claude × legacy/dataKey (eight cases per platform).
+The suite runs both cases for Codex/Claude × legacy/dataKey (eight cases on macOS; Linux runs the four Codex cases).
 In dataKey mode, the fixture opens each session key envelope with its account private key,
 checks that two sessions and the machine have distinct keys, and decrypts stored metadata
 and transcript using the session key. Recovery opens the machine envelope and uses the
@@ -54,9 +54,11 @@ Published artifact installation/rollback and Desktop pin acceptance remain separ
 The Codex app-server receives the native `CODEX_SANDBOX=seatbelt` marker only on macOS;
 setting it on Linux suppresses its model proxy route despite the external bubblewrap wrapper.
 A protected Claude scope launch is authenticated by its daemon launch channel and stays at
-the parent UID. Its mandatory MCP transport uses an owner-only temporary directory and
-a token-authenticated Unix socket, while separate-UID Linux launches retain the existing
-`agent-sbx` group and `/run/abp-mcp` requirements. Neither change opens an unprotected fallback.
+the parent UID. On macOS its mandatory MCP transport uses an owner-only temporary directory and
+a token-authenticated Unix socket. On Linux the same-UID boundary's seccomp filter denies
+`socket(AF_UNIX)`, so no MCP transport reaches its children; the launch fails closed with
+`MandatorySandboxError` instead of starting a session without Happy tools. Separate-UID Linux
+launches retain the existing `agent-sbx` group and `/run/abp-mcp` requirements. Neither path opens an unprotected fallback.
 
 This document covers the local environment manager in [`environments/environments.ts`](../environments/environments.ts).
 
