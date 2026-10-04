@@ -53,6 +53,8 @@ Published artifact installation/rollback and Desktop pin acceptance remain separ
 
 The Codex app-server receives the native `CODEX_SANDBOX=seatbelt` marker only on macOS;
 setting it on Linux suppresses its model proxy route despite the external bubblewrap wrapper.
+Externally sandboxed Linux launches also strip an inherited `seatbelt` marker from the
+child environment without changing the parent's environment.
 A protected Claude scope launch is authenticated by its daemon launch channel and stays at
 the parent UID. Its mandatory MCP transport uses an owner-only temporary directory and
 a token-authenticated Unix socket, while separate-UID Linux launches retain the existing

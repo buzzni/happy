@@ -1477,14 +1477,20 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    it.each(['darwin', 'linux'] as const)('wraps transport with the correct native sandbox marker on %s', async (platform) => {
+    it.each([
+        { platform: 'darwin', inheritedMarker: undefined },
+        { platform: 'darwin', inheritedMarker: 'seatbelt' },
+        { platform: 'linux', inheritedMarker: undefined },
+        { platform: 'linux', inheritedMarker: 'seatbelt' },
+    ] as const)('wraps transport with the correct native sandbox marker on $platform (inherited: $inheritedMarker)', async ({ platform, inheritedMarker }) => {
         const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
         const originalMarker = process.env.CODEX_SANDBOX;
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(sandboxConfig);
         try {
             Object.defineProperty(process, 'platform', { ...platformDescriptor, value: platform });
-            delete process.env.CODEX_SANDBOX;
+            if (inheritedMarker === undefined) delete process.env.CODEX_SANDBOX;
+            else process.env.CODEX_SANDBOX = inheritedMarker;
             await client.connect();
             expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd(), 'owner-choice');
             expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
@@ -1493,7 +1499,7 @@ describe('CodexAppServerClient sandbox integration', () => {
             if (platform === 'darwin') expect(env.CODEX_SANDBOX).toBe('seatbelt');
             else expect(env).not.toHaveProperty('CODEX_SANDBOX');
             expect(env.RUST_LOG).toContain('codex_core::rollout::list=off');
-            expect(process.env.CODEX_SANDBOX).toBeUndefined();
+            expect(process.env.CODEX_SANDBOX).toBe(inheritedMarker);
             expect(client.sandboxEnabled).toBe(true);
         } finally {
             await client.disconnect();

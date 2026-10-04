@@ -1147,6 +1147,8 @@ export class CodexAppServerClient {
         // Linux remains protected by the external bubblewrap wrapper.
         if (this.sandboxEnabled && process.platform === 'darwin') {
             env.CODEX_SANDBOX = 'seatbelt';
+        } else if (this.sandboxEnabled && process.platform === 'linux' && env.CODEX_SANDBOX === 'seatbelt') {
+            delete env.CODEX_SANDBOX;
         }
 
         logger.debug(`[CodexAppServer] Spawning: ${command} ${args.join(' ')}`);
