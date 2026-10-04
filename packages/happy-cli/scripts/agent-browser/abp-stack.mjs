@@ -1001,7 +1001,7 @@ export function createStack(deps) {
 
     /**
      * Released images (abp-images.json in the Happy package): pull each by its pinned registry digest and accept it only
-     * when the local image id is the one released for this machine's architecture. Saydo specs/agent-browser-one-click-install I5.
+     * when the local image id is the one released for this machine's architecture, or the pinned digest itself (containerd image store). Saydo specs/agent-browser-one-click-install I5.
      */
     pull(manifestPath, { arch = process.arch } = {}) {
       const manifest = readJson(manifestPath);
@@ -1014,12 +1014,14 @@ export function createStack(deps) {
         if (!IMAGE_ID.test(id ?? "")) throw refusal(`no ${role} image for ${platform} in ${manifestPath}`);
         wanted[role] = { ref, id };
       }
+      const ids = {};
       for (const role of ["runtime", "browser"]) {
         docker(["pull", wanted[role].ref]);
         const local = docker(["image", "inspect", "--format", "{{.Id}}", wanted[role].ref]).stdout;
-        if (local !== wanted[role].id) throw refusal(`${role} image digest mismatch`);
+        // The classic image store reports the platform config digest; the containerd image store reports the pulled index digest.
+        if (local !== wanted[role].id && local !== wanted[role].ref.split("@")[1]) throw refusal(`${role} image digest mismatch`);
+        ids[role] = local;
       }
-      const ids = { runtime: wanted.runtime.id, browser: wanted.browser.id };
       assertImages(ids);
       return ids;
     },
