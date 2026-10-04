@@ -498,7 +498,7 @@ export async function startHappyServer(
     }
 
     const changeTitle = createChangeTitleHandler(client);
-    // The same-UID Linux scope boundary (bwrap + seccomp) denies socket(AF_UNIX), so no MCP transport reaches its children.
+    // The same-UID Linux scope boundary denies socket(AF_UNIX); do not start without Happy tools.
     if (options.mandatorySandbox && options.sameUidSandbox && process.platform === 'linux') {
         throw new MandatorySandboxError('capability-unavailable', 'Same-UID Linux scope MCP transport unavailable');
     }

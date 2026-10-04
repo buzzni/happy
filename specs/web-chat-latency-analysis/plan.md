@@ -30,3 +30,42 @@ Implementation and parser regression checks complete. Runtime-loop baseline fail
 2. Prepare .285 on merged main; related195 tests/build/prepared install guard — Done.
 3. Ready version PR; after merge request exact-tag approval, CI publish/registry verify — Pending.
 4. Consume only released vendor and verify ethan runtime before collecting recovery substages — Pending.
+
+## Selected runtime inventory — 2026-10-04
+1. Exact0.160.0 upstream semantics.
+2. Red scoped pagination/runtime precedence then minimal implementation.
+3. Related tests/type/build and local20-pair A/B.
+4. Record limits and Ready PR; no release/runtime update.
+
+Steps1–3 Done: native semantics, Red/Green182 tests/build/typecheck, changed-file unused checks and20-pair real A/B. Step4 records ready; implementation PR next. External release and Web20 remain pending, no live speedup claim.
+
+## Review compatibility fix
+1. Red first/later-page ignored serverName response tests.
+2. Finish that inventory pagination and skip remaining server queries; no persistent capability cache.
+3. Regression/build and update existing Ready PR.
+
+Compatibility steps1–3 Done: Red3, Green185, build/typecheck/unused0/diff checks, existing Ready PR update. Native older-version/Web latency remains unmeasured.
+
+## .287 release preparation
+1. Confirm #685 merge/CI and published .286; prepare next .287.
+2. Related regressions/build and prepared artifact install guard.
+3. Ready version PR; after merge present exact tag for approval.
+4. CI-only publish then released vendor/ethan runtime and Web20. No unreleased runtime consumption.
+
+.287 steps1–2 preparation/validation Done. Steps3–4 publish part superseded: .287 (tag 510b0b6c, PR #686, includes #685) was already published by CI; no .287 tag creation. Released vendor/ethan runtime and Web20 measurement pending.
+
+## Initial inventory cost investigation
+1. Exact0.160.0 startup/catalog await semantics.
+2. Provider-free20 fresh-thread cold/warm pairs with4 local MCPs; retain per-server timing and initializer counts.
+3. Validate raw outcomes, cleanup and distinguish fixture mechanism from real ethan root cause.
+4. Record evidence; do not skip readiness or infer a safe optimization without measured duplicate work.
+
+Investigation1–3 Done: exact native await semantics and fully verified20 cold/warm pairs. Step4 evidence recorded; next separate increment is privacy-bounded server-ordinal inventory timing, parser compatibility and actual cold measurements. No readiness bypass or speculative parallel implementation.
+
+## Per-server inventory timing
+1. Red full-pagination/diagnostic exception and single execution contracts.
+2. Fixed repeated mcp-inventory-server spans; no identifiers, same32-span limit.
+3. Web allowlist Red then scoped regressions/build.
+4. Ready companion PRs; Web deploy before future released CLI; no runtime change.
+
+Per-server timing steps1–3 Done: Red4+1, Green194+66, CLI build/typecheck and Web lint. Step4 Ready PR publication next; deployment/release/live measurement pending.

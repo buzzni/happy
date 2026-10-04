@@ -36,7 +36,7 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform) || process.env.H
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     vi.mocked(readDaemonControlPort).mockResolvedValue({ port: (server.address() as { port: number }).port, controlSecret: 'fixture' });
-    const overrides = { HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEX_HOME: join(home, '.codex') };
+    const overrides = { HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEX_HOME: join(home, '.codex'), TMPDIR: project };
     const previous = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
     Object.assign(process.env, overrides);
     let prepared: Awaited<ReturnType<typeof prepareSessionWriteScopeClaude>> | undefined;
@@ -52,6 +52,7 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform) || process.env.H
         await new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', code => code === 0 ? resolve() : reject(new Error('sandbox child failed'))); });
         return JSON.parse(output.trim());
       }
+      expect(await execute(join(home, '.claude', 'scope-state'))).toEqual({ allowed: true, leaked: false });
       expect(await execute(join(root, "quote'$`file"))).toEqual({ allowed: true, leaked: false });
       for (const path of [join(sibling, 'denied'), join(root, 'escape', 'denied')]) {
         const result = await execute(path); expect(['EPERM', 'EACCES', 'EROFS']).toContain(result.code); expect(result.leaked).toBe(false);
@@ -78,10 +79,11 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform) || process.env.H
     await new Promise<void>(resolve => control.listen(0, '127.0.0.1', resolve));
     await new Promise<void>(resolve => probe.listen(socketPath, resolve));
     vi.mocked(readDaemonControlPort).mockResolvedValue({ port: (control.address() as { port: number }).port, controlSecret: 'fixture' });
-    const overrides = { HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEX_HOME: join(home, '.codex') };
+    const overrides = { HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEX_HOME: join(home, '.codex'), TMPDIR: project };
     const previous = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]]));
     Object.assign(process.env, overrides);
     let prepared: Awaited<ReturnType<typeof prepareSessionWriteScopeClaude>> | undefined;
+    let mcp: Awaited<ReturnType<typeof startHappyServer>> | undefined;
     try {
       prepared = await prepareSessionWriteScopeClaude({ path: project, config, confirmation });
       const code = `require('http').get({socketPath:process.argv[1],path:'/'},r=>console.log(r.statusCode)).on('error',e=>console.log(e.code))`;
@@ -92,8 +94,10 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform) || process.env.H
       // If this ever connects, the boundary gained a Unix-socket path and startHappyServer's same-UID guard can be revisited.
       expect(output.trim()).toBe('EPERM');
       const client = { hasTitle: () => false, sendClaudeSessionMessage: () => {}, updateMetadata: () => {} } as unknown as ApiSessionClient;
-      await expect(startHappyServer(client, { mandatorySandbox: true, sameUidSandbox: true })).rejects.toBeInstanceOf(MandatorySandboxError);
+      await expect(startHappyServer(client, { mandatorySandbox: true, sameUidSandbox: true })
+        .then(value => { mcp = value; return value; })).rejects.toBeInstanceOf(MandatorySandboxError);
     } finally {
+      mcp?.stop();
       await prepared?.close();
       for (const key of Object.keys(overrides)) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }
       await new Promise<void>(resolve => probe.close(() => resolve()));

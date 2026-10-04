@@ -54,13 +54,16 @@ describe('Happy MCP shutdown admission', () => {
         const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
         const previousTmp = process.env.TMPDIR;
         const isolatedTmp = await mkdtemp(join(tmpdir(), 'happy-mcp-test-'));
+        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
         try {
             process.env.TMPDIR = isolatedTmp;
             Object.defineProperty(process, 'platform', { ...descriptor, value: 'linux' });
-            await expect(startHappyServer(makeFakeClient(false), { mandatorySandbox: true, sameUidSandbox: true }))
+            await expect(startHappyServer(makeFakeClient(false), { mandatorySandbox: true, sameUidSandbox: true })
+                .then(value => { server = value; return value; }))
                 .rejects.toBeInstanceOf(MandatorySandboxError);
             expect(await readdir(isolatedTmp)).toEqual([]);
         } finally {
+            server?.stop();
             Object.defineProperty(process, 'platform', descriptor);
             if (previousTmp === undefined) delete process.env.TMPDIR;
             else process.env.TMPDIR = previousTmp;

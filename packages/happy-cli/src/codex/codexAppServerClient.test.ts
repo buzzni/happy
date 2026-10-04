@@ -1067,6 +1067,99 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('queries only requested thread servers with scoped pagination', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method !== 'mcpServerStatus/list' || msg.id == null) return;
+            requests.push(msg);
+            const name = msg.params?.serverName;
+            pushJsonLine(stdout, { id: msg.id, result: { data: [{ name, authStatus: 'unsupported', tools: {} }], nextCursor: name === 'one' && !msg.params?.cursor ? 'page-2' : null } });
+        } }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        const result = await client.listMcpServerStatus({ threadId: 'thread-1', serverNames: ['one', 'two', 'one'] });
+        expect(requests.map(({ params }) => [params?.serverName, params?.cursor])).toEqual([['one', null], ['one', 'page-2'], ['two', null]]);
+        expect(result.data.map(entry => entry.name)).toEqual(['one', 'one', 'two']);
+        requests.length = 0;
+        await expect(client.listMcpServerStatus({ threadId: 'thread-1', serverNames: [] })).resolves.toEqual({ data: [], nextCursor: null });
+        expect(requests).toHaveLength(0);
+        await client.disconnect();
+    });
+
+    it.each([null, 'page-2'])('finishes a scope-ignored inventory when mismatch appears at cursor %s', async mismatchCursor => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method !== 'mcpServerStatus/list' || msg.id == null) return;
+            requests.push(msg);
+            const cursor = msg.params?.cursor ?? null;
+            const names = cursor === mismatchCursor ? ['other'] : cursor === 'page-3' ? ['last'] : ['one'];
+            const nextCursor = cursor === null ? 'page-2' : cursor === 'page-2' ? 'page-3' : null;
+            pushJsonLine(stdout, { id: msg.id, result: { data: names.map(name => ({ name, authStatus: 'unsupported', tools: {} })), nextCursor } });
+        } }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        const result = await client.listMcpServerStatus({ threadId: 'thread-1', serverNames: ['one', 'two', 'three'] });
+        expect(result.data.map(entry => entry.name)).toEqual(mismatchCursor === null ? ['other', 'one', 'last'] : ['one', 'other', 'last']);
+        expect(requests.map(({ params }) => [params?.serverName, params?.cursor])).toEqual([['one', null], ['one', 'page-2'], ['one', 'page-3']]);
+        await client.disconnect();
+    });
+
+    it('replaces earlier scoped data with a later scope-ignored complete inventory', async () => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method !== 'mcpServerStatus/list' || msg.id == null) return;
+            requests.push(msg);
+            const names = msg.params?.serverName === 'one' ? ['one'] : ['one', 'two', 'three'];
+            pushJsonLine(stdout, { id: msg.id, result: { data: names.map(name => ({ name, authStatus: 'unsupported', tools: {} })), nextCursor: null } });
+        } }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+        const result = await client.listMcpServerStatus({ threadId: 'thread-1', serverNames: ['one', 'two', 'three'] });
+        expect(result.data.map(entry => entry.name)).toEqual(['one', 'two', 'three']);
+        expect(requests.map(({ params }) => params?.serverName)).toEqual(['one', 'two']);
+        await client.disconnect();
+    });
+
+    it.each(['normal', 'before', 'after', 'twice'])('measures each complete scoped pagination without changing RPCs when observer is %s', async mode => {
+        const requests: MockRpcMessage[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method !== 'mcpServerStatus/list' || msg.id == null) return;
+            requests.push(msg);
+            pushJsonLine(stdout, { id: msg.id, result: { data: [{ name: msg.params?.serverName, authStatus: 'unsupported', tools: {} }], nextCursor: msg.params?.serverName === 'one' && !msg.params?.cursor ? 'page-2' : null } });
+        } }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();await client.connect();
+        let measurements = 0;
+        const measureServer = async <T>(action: () => Promise<T>) => {
+            measurements++;
+            if (mode === 'before') throw Error('observer');
+            const result = await action();
+            if (mode === 'after') throw Error('observer');
+            if (mode === 'twice') await action();
+            return result;
+        };
+        const result = await client.listMcpServerStatus({ threadId: 't', serverNames: ['one', 'two'], measureServer });
+        expect(result.data.map(x => x.name)).toEqual(['one', 'one', 'two']);
+        expect(requests.map(x => [x.params?.serverName, x.params?.cursor])).toEqual([['one', null], ['one', 'page-2'], ['two', null]]);
+        expect(measurements).toBe(2);
+        await client.disconnect();
+    });
+
+    it('preserves inventory rejection when the observer swallows it', async () => {
+        let calls = 0;
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method !== 'mcpServerStatus/list' || msg.id == null) return;
+            calls++;pushJsonLine(stdout, { id: msg.id, error: { code: -32000, message: 'inventory failed' } });
+        } }));
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();await client.connect();
+        await expect(client.listMcpServerStatus({ threadId: 't', serverNames: ['one'], measureServer: async <T>(action: () => Promise<T>) => { try { return await action(); } catch { return undefined as T; } } })).rejects.toThrow('inventory failed');
+        expect(calls).toBe(1);await client.disconnect();
+    });
+
     it('completes MCP runtime recovery before starting the next user turn', async () => {
         const requests: MockRpcMessage[] = [];
         let appServerStdout: (NodeJS.ReadableStream & { push: (chunk: string) => void }) | null = null;
@@ -1477,14 +1570,20 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
-    it.each(['darwin', 'linux'] as const)('wraps transport with the correct native sandbox marker on %s', async (platform) => {
+    it.each([
+        { platform: 'darwin', inheritedMarker: undefined },
+        { platform: 'darwin', inheritedMarker: 'seatbelt' },
+        { platform: 'linux', inheritedMarker: undefined },
+        { platform: 'linux', inheritedMarker: 'seatbelt' },
+    ] as const)('wraps transport with the correct native sandbox marker on $platform (inherited: $inheritedMarker)', async ({ platform, inheritedMarker }) => {
         const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
         const originalMarker = process.env.CODEX_SANDBOX;
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient(sandboxConfig);
         try {
             Object.defineProperty(process, 'platform', { ...platformDescriptor, value: platform });
-            delete process.env.CODEX_SANDBOX;
+            if (inheritedMarker === undefined) delete process.env.CODEX_SANDBOX;
+            else process.env.CODEX_SANDBOX = inheritedMarker;
             await client.connect();
             expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd(), 'owner-choice');
             expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
@@ -1493,7 +1592,7 @@ describe('CodexAppServerClient sandbox integration', () => {
             if (platform === 'darwin') expect(env.CODEX_SANDBOX).toBe('seatbelt');
             else expect(env).not.toHaveProperty('CODEX_SANDBOX');
             expect(env.RUST_LOG).toContain('codex_core::rollout::list=off');
-            expect(process.env.CODEX_SANDBOX).toBeUndefined();
+            expect(process.env.CODEX_SANDBOX).toBe(inheritedMarker);
             expect(client.sandboxEnabled).toBe(true);
         } finally {
             await client.disconnect();

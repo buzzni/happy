@@ -16,7 +16,7 @@ describe('Codex MCP same-operation status reporting', () => {
         expect(await recovery.recoverBeforeTurn(input)).toEqual({
             status: 'ready', affectedServers: [], runtimeStatuses: [{ name: 'notion', status: 'connected', checkedAt: 5 }],
         });
-        expect(client.listMcpServerStatus).toHaveBeenCalledExactlyOnceWith({ threadId: 't' });
+        expect(client.listMcpServerStatus).toHaveBeenCalledExactlyOnceWith({ threadId: 't', serverNames: ['notion'] });
         expect(client.resumeThread).not.toHaveBeenCalled();
     });
 
@@ -108,7 +108,7 @@ describe('Codex MCP same-operation status reporting', () => {
         await Promise.all([first, second]);
         expect(list).toHaveBeenCalledOnce();
         await recovery.recoverBeforeTurn({ ...input, threadId: 'other-thread', mcpServers: { notion: { revision: 2 } } });
-        expect(list.mock.calls).toEqual([[{ threadId: 't' }], [{ threadId: 'other-thread' }]]);
+        expect(list.mock.calls).toEqual([[{ threadId: 't', serverNames: ['notion'] }], [{ threadId: 'other-thread', serverNames: ['notion'] }]]);
         await recovery.recoverBeforeTurn({ ...input, mcpServers: { notion: { revision: 3 } } });
         expect(list).toHaveBeenCalledTimes(3);
     });
@@ -906,4 +906,36 @@ describe('Codex MCP recovery preparation spans', () => {
         expect(joined).not.toHaveBeenCalled();
         expect(list).toHaveBeenCalledOnce();
     });
+});
+
+it.each(['failed', 'cancelled', 'disabled', 'starting', 'notStarted', 'authenticationRequired'])('does not call %s runtime evidence connected despite settled auth', async runtimeStatus => {
+    const list = vi.fn(async () => ({ data: [{ name: 'probe', authStatus: 'unsupported', tools: { probe: {} }, runtimeStatus }] }));
+    const recovery = new CodexMcpRuntimeRecovery({ getMcpStartupStatuses: () => [], listMcpServerStatus: list, resumeThread: vi.fn() }, { connectorNames: [] });
+    const input = { threadId: 'thread-1', mcpServers: {}, expectedServerNames: ['probe'] };
+    const statuses = await recovery.readStatuses(input);
+    expect(list).toHaveBeenCalledWith({ threadId: 'thread-1', serverNames: ['probe'] });
+    expect(statuses[0].status).toBe(runtimeStatus === 'authenticationRequired' ? 'needs-auth' : ['failed', 'cancelled', 'disabled'].includes(runtimeStatus) ? 'failed' : 'reconnecting');
+});
+
+it('recovers failed runtime even without a startup failure and rechecks the resumed runtime', async () => {
+    const list = vi.fn().mockResolvedValueOnce({ data: [{ name: 'probe', authStatus: 'unsupported', tools: {}, runtimeStatus: 'failed' }] }).mockResolvedValueOnce({ data: [{ name: 'probe', authStatus: 'unsupported', tools: {}, runtimeStatus: 'connected' }] });
+    const resume = vi.fn(async () => ({ threadId: 't', model: 'model' }));
+    const recovery = new CodexMcpRuntimeRecovery({ getMcpStartupStatuses: () => [], listMcpServerStatus: list, resumeThread: resume }, { connectorNames: [], sleep: async () => {} });
+    const result = await recovery.recoverBeforeTurn({ threadId: 't', mcpServers: { probe: {} }, expectedServerNames: ['probe'], includeRuntimeStatuses: true });
+    expect(result.status).toBe('recovered');
+    expect(result.runtimeStatuses?.[0].status).toBe('connected');
+    expect(resume).toHaveBeenCalledOnce();
+    expect(list).toHaveBeenCalledTimes(2);
+});
+
+it('forwards opt-in server measurement through the owning inventory operation only', async () => {
+    const stages: string[] = [];
+    const action = vi.fn(async () => ({ data: [{ name: 'probe', authStatus: 'unsupported', tools: {} }] }));
+    const list = vi.fn(async (opts: { measureServer?: <T>(action: () => Promise<T>) => Promise<T> }) => opts.measureServer ? opts.measureServer(action) : action());
+    const recovery = new CodexMcpRuntimeRecovery({ getMcpStartupStatuses: () => [], listMcpServerStatus: list, resumeThread: vi.fn() }, { connectorNames: [] });
+    await recovery.recoverBeforeTurn({ threadId: 't', mcpServers: {}, expectedServerNames: ['probe'], measure: async (stage, execute) => { stages.push(stage); return execute(); } });
+    expect(stages).toEqual(['mcp-inventory', 'mcp-inventory-server']);
+    expect(action).toHaveBeenCalledOnce();
+    await recovery.recoverBeforeTurn({ threadId: 't', mcpServers: {}, expectedServerNames: ['probe'] });
+    expect(list.mock.calls[1][0]).not.toHaveProperty('measureServer');
 });
