@@ -404,6 +404,8 @@ export async function runCodex(opts: {
     let memoryIngestHost: CodexIngestHost | null = null;
     const pendingMemoryIngest = new Set<Promise<void>>();
     const waitingMemoryIngest = new Set<() => void>();
+    const memoryIngestShutdown = new AbortController();
+    let memoryIngestClose: Promise<void> | null = null;
     let reasoningProcessor!: ReasoningProcessor;
     let abortInProgress: Promise<void> | null = null;
     // Assigned after handleKillSession is defined; re-attached on session swap
@@ -1054,7 +1056,7 @@ export async function runCodex(opts: {
         runtimeGate?.beginTermination();
         // An admitted continuation may still await its provider acknowledgement.
         // Closing a worker host cannot settle that wait, so seal it before abort/join.
-        for (const cancel of [...waitingMemoryIngest]) cancel();
+        cancelMemoryIngest();
         logger.debug('[Codex] Kill session requested - terminating process');
         await handleAbort();
         logger.debug('[Codex] Abort completed, proceeding with termination');
@@ -1062,7 +1064,7 @@ export async function runCodex(opts: {
         try {
             // This path exits directly rather than entering the loop's finally. Reap any
             // host memory writer before releasing the account session's ownership.
-            await memoryIngestHost?.close();
+            await closeMemoryIngest();
             await Promise.all([...pendingMemoryIngest]);
             // Update lifecycle state to archived before closing —
             // unless the caller says the session may still be alive
@@ -1218,6 +1220,15 @@ export async function runCodex(opts: {
     });
     logger.debug('[CodexMemoryIngest]', { status: memoryIngestHost ? 'prepared' : sandboxPolicyMode === 'mandatory' ? 'policy_requires_binding' : 'unsupported' });
 
+    function cancelMemoryIngest(): void {
+        if (!memoryIngestShutdown.signal.aborted) memoryIngestShutdown.abort();
+        for (const cancel of [...waitingMemoryIngest]) cancel();
+    }
+    function closeMemoryIngest(): Promise<void> {
+        if (!memoryIngestClose) memoryIngestClose = memoryIngestHost?.close() ?? Promise.resolve();
+        return memoryIngestClose;
+    }
+
     client = new CodexAppServerClient(
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
@@ -1245,21 +1256,32 @@ export async function runCodex(opts: {
     const resolveIngestTranscript = (threadId: string, providerThread: { id: string; path: string } | null): Promise<string | null> => {
         // This snapshot survives checkpoint quiescence, which may have already stopped
         // the app-server. It was captured from thread/start, resume or fork.
+        if (memoryIngestShutdown.signal.aborted) return Promise.resolve(null);
         if (providerThread?.id === threadId && providerThread.path) return Promise.resolve(providerThread.path);
         if (ingestThreadMetadata?.threadId === threadId) return ingestThreadMetadata.path;
         const cached = {
             threadId,
             path: (async () => {
                 let timer: ReturnType<typeof setTimeout> | undefined;
+                let cancelled: (() => void) | undefined;
                 try {
                     const result = await Promise.race([
                         client.readThread({ threadId, includeTurns: false }),
                         new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 2_000); }),
+                        new Promise<null>(resolve => {
+                            if (memoryIngestShutdown.signal.aborted) { resolve(null); return; }
+                            cancelled = () => resolve(null);
+                            memoryIngestShutdown.signal.addEventListener('abort', cancelled, { once: true });
+                        }),
                     ]);
-                    return result?.thread.id === threadId && typeof result.thread.path === 'string' && result.thread.path
+                    return !memoryIngestShutdown.signal.aborted
+                        && result?.thread.id === threadId && typeof result.thread.path === 'string' && result.thread.path
                         ? result.thread.path : null;
                 } catch { return null; }
-                finally { if (timer) clearTimeout(timer); }
+                finally {
+                    if (timer) clearTimeout(timer);
+                    if (cancelled) memoryIngestShutdown.signal.removeEventListener('abort', cancelled);
+                }
             })(),
         };
         ingestThreadMetadata = cached;
@@ -1286,7 +1308,7 @@ export async function runCodex(opts: {
         const work = async () => {
             try {
                 const native = await completion;
-                if (!native) return;
+                if (!native || memoryIngestShutdown.signal.aborted) return;
                 // Resolve the owning rollout from the provider, never from a user-supplied
                 // path or prompt. A stalled metadata read must not stall another turn.
                 const transcriptPath = await resolveIngestTranscript(threadId, native.providerThread);
@@ -2560,6 +2582,14 @@ export async function runCodex(opts: {
         let loopExitRecorded = false;
         try {
             preemptLessonReview();
+            const frozen = runtimeGate?.isFrozen() === true;
+            if (frozen) {
+                // Optional memory is outside the foreground drain contract. Stop its
+                // pending metadata reads and kill/join its worker before exposing the
+                // frozen runtime to SessionDrain's deadline.
+                cancelMemoryIngest();
+                await closeMemoryIngest();
+            }
             if (runtimeGate) {
                 // Seal synchronously before stopping the listener; existing callbacks retain their promises.
                 const producers = runtimeGate.closeAdmissionAndWait();
@@ -2587,7 +2617,7 @@ export async function runCodex(opts: {
             // Run-once sessions need the same durable completion as long-lived sessions;
             // do not cancel their just-enqueued import merely because the loop ended.
             await Promise.all([...pendingMemoryIngest]);
-            await memoryIngestHost?.close();
+            await closeMemoryIngest();
             await reportManagedStop();
             /*
              * The bridge points at this run's loop. Left registered, a stop
