@@ -38,3 +38,10 @@ Implementation and parser regression checks complete. Runtime-loop baseline fail
 4. Record limits and Ready PR; no release/runtime update.
 
 Steps1–3 Done: native semantics, Red/Green182 tests/build/typecheck, changed-file unused checks and20-pair real A/B. Step4 records ready; implementation PR next. External release and Web20 remain pending, no live speedup claim.
+
+## Review compatibility fix
+1. Red first/later-page ignored serverName response tests.
+2. Finish that inventory pagination and skip remaining server queries; no persistent capability cache.
+3. Regression/build and update existing Ready PR.
+
+Compatibility steps1–3 Done: Red3, Green185, build/typecheck/unused0/diff checks, existing Ready PR update. Native older-version/Web latency remains unmeasured.
