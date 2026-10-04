@@ -211,6 +211,13 @@ describe('abp-install --dry-run', () => {
         expect(noServer.stderr).toMatch(/--agent-credentials needs --server-url/)
     })
 
+    it('pulls the released images by digest with --images-manifest instead of loading or building them', () => {
+        const out = bash('abp-install', ['--dry-run', 'install', '--machine-id', 'machine-1', '--workspace-id', 'ws-1', '--profile', 'main=user-1',
+            '--issuer', `k1=${pemFile}`, '--sites', sitesFile, '--images-manifest', join(dir, 'abp-images.json')]).stdout
+        expect(out).toMatch(/\+ \S+ \S*abp-stack\.mjs pull \S*abp-images\.json --set-initial/)
+        expect(out).not.toMatch(/abp-stack\.mjs (load|build)/)
+    })
+
     it('leaves the default server alone without --server-url', () => {
         expect(run().stdout).not.toContain('/home/agent/.happy/settings.json (')
     })

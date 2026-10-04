@@ -10,6 +10,7 @@
 #
 # Installer options:
 #   --happy-tarball <tgz>     install this Happy package (npm pack) under the Happy prefix
+#   --images-manifest <file>  pull the released images by digest (abp-images.json of the Happy release) on first install
 #   --images <dir>            load images.tar + manifest.json (abp-stack build --out) on first install
 #   --build-from <happy-cli>  build the images on this machine instead (needs a source checkout with deps)
 #   --agent-credentials <file> log the agent in to Happy from a machine registration claim response (token, secret,
@@ -503,6 +504,7 @@ main_install() {
         case "$1" in
             --happy-tarball) HAPPY_TARBALL=$2; shift 2 ;;
             --images) IMAGES_DIR=$2; shift 2 ;;
+            --images-manifest) IMAGES_MANIFEST=$2; shift 2 ;;
             --build-from) BUILD_FROM=$2; shift 2 ;;
             --agent-credentials) AGENT_CREDENTIALS=$2; shift 2 ;;
             --install-packages) INSTALL_PACKAGES=1; shift ;;
@@ -643,12 +645,14 @@ main_install() {
     emit "$ETC/happy-daemon.env" root root 0644 show daemon-env --install "$WORK/install.json"
 
     say "images"
-    if [ -n "$IMAGES_DIR" ]; then
+    if [ -n "$IMAGES_MANIFEST" ]; then
+        run "$NODE" "$here/abp-stack.mjs" pull "$IMAGES_MANIFEST" --set-initial
+    elif [ -n "$IMAGES_DIR" ]; then
         run "$NODE" "$here/abp-stack.mjs" load "$IMAGES_DIR" --set-initial
     elif [ -n "$BUILD_FROM" ]; then
         run "$NODE" "$here/abp-stack.mjs" build --source "$BUILD_FROM" --set-initial
     elif [ ! -s "$VARLIB/stack-state.json" ]; then
-        warn "no images installed yet (--images <dir> or --build-from <happy-cli>)"
+        warn "no images installed yet (--images-manifest <abp-images.json>, --images <dir> or --build-from <happy-cli>)"
     fi
 
     say "Happy package digest"
@@ -808,6 +812,7 @@ main_check() {
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 HAPPY_TARBALL=""
 IMAGES_DIR=""
+IMAGES_MANIFEST=""
 BUILD_FROM=""
 AGENT_CREDENTIALS=""
 INSTALL_PACKAGES=0
