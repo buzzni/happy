@@ -103,6 +103,12 @@ describe('parseRuntimeConfig', () => {
         expect(message).not.toContain('SECRET-LOOKING-GARBAGE')
     })
 
+    it('accepts the any-origin site policy "*" next to exact sites (Studio one-line install "all sites")', () => {
+        expect(parseRuntimeConfig({ ...valid(), sites: [{ origin: '*' }, { origin: 'https://shop.example' }] }).sites.map((site) => site.origin)).toEqual(['*', 'https://shop.example'])
+        expect(() => parseRuntimeConfig({ ...valid(), viewerOrigins: ['*'] })).toThrow(/viewerOrigins/)
+        expect(() => parseRuntimeConfig({ ...valid(), consoleHostOrigins: ['*'] })).toThrow(/consoleHostOrigins/)
+    })
+
     it('rejects site origins that are not bare origins', () => {
         expect(() => parseRuntimeConfig({ ...valid(), sites: [{ origin: 'https://shop.example/path' }] })).toThrow(/origin/)
     })

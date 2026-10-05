@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { parseSitePolicies } from '../../src/browserRuntime/policy'
 import { parseRuntimeConfig } from '../../src/browserRuntime/runtimeConfig'
 import { sharedProfileId } from '../../src/browserRuntime/tenancy'
 import { parseOptionFlags } from './abp-plan.mjs'
@@ -46,6 +47,18 @@ describe('install options', () => {
             issuers: [{ kid: 'k1', publicKeyPem: pem() }], sites: [{ origin: '*' }, ...SITES],
         })
         expect(options.sites.map((site: { origin: string }) => site.origin)).toEqual(['*', 'https://shop.example'])
+    })
+
+    // 1.1.10-aplus.293 accepted "*" in the installer and the site policy parser but not in runtime.json, so the
+    // Runtime exited at start ("sites.0.origin: must be a bare origin"). Check the whole chain, not one validator.
+    it('writes an all-sites install into a runtime.json the Runtime accepts', () => {
+        const install = mergeInstallOptions(undefined, {
+            machineId: 'machine-1', workspaceId: 'ws-1', profiles: [{ profileId: 'main', principalId: 'user-1' }],
+            issuers: [{ kid: 'k1', publicKeyPem: pem() }],
+            sites: [{ origin: '*' }, { origin: 'https://shop.example', actions: [{ match: { roles: ['button'], namePrefixes: ['Buy'] }, risk: 'requires-approval' }] }],
+        })
+        const config = parseRuntimeConfig(runtimeConfig(install, { sessionGid: 1, daemonTokenSha256: 'b'.repeat(64) }))
+        expect(parseSitePolicies(config.sites).map((site) => site.origin)).toEqual(['*', 'https://shop.example'])
     })
 
     it('refuses what the Runtime or the stack could not use', () => {
