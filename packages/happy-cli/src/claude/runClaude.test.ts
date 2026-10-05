@@ -1426,6 +1426,26 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it('keeps the change_title instruction for an untitled chat under a mandatory sandbox policy', async () => {
+        process.env.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
+        process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({ enabled: true });
+        const harness = await startRemoteRunClaudeHarness();
+        expect(harness.loopOptions.sandboxPolicyMode).toBe('mandatory');
+        harness.sessionClient.hasTitle.mockReturnValue(false);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: '로그인 버튼이 안 눌려' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued).toHaveLength(1);
+        expect(queued[0].message).toContain('로그인 버튼이 안 눌려');
+        expect(queued[0].message).toContain(TITLE_INSTRUCTION);
+        await harness.finish();
+    });
+
     it.each(['auto', 'user'])('preserves durable message identity for %s routing receipts', async (modelSource) => {
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(true);
