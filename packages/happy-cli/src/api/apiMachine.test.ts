@@ -646,6 +646,9 @@ describe('ApiMachineClient socket reconnection', () => {
         const handler=(method:string)=>(client as any).rpcHandlerManager.registerHandler.mock.calls.find(([name]:[string])=>name===method)[1];
         const input={version:1,scope:'company',provider:'claude'};
         await handler('ai-credential:group-sync')(input);expect(runtime.groupSync).toHaveBeenCalledWith(input);
+        const groupRegistration=(client as any).rpcHandlerManager.registerHandler.mock.calls
+            .find(([method]:[string])=>method==='ai-credential:group-sync');
+        expect(groupRegistration?.[2]).toEqual({customerBound:true});
         await handler('ai-credential:status')({provider:'claude'});expect(runtime.status).toHaveBeenCalledWith({provider:'claude'});
         expect(await handler('ai-credential:status')({provider:'claude',groupScope:'company'})).toEqual({reconciled:true});
         expect(runtime.groupReceipt).toHaveBeenCalledWith('company','claude');

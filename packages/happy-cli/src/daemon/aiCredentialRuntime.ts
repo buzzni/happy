@@ -1532,6 +1532,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     managedIdentities: (selected, payload) => selected !== 'claude' ? [] : (JSON.parse(payload).accounts as Array<Record<string, unknown>>)
       .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string')
       .map(account => setupTokenGroupIdentity(account.managedAccountId as string)),
+    appliedCredentials: (selected, payload) => selected !== 'claude' ? [] : (JSON.parse(payload).accounts as Array<Record<string, unknown>>)
+      .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string' && Number.isSafeInteger(account.credentialGeneration) && Number(account.credentialGeneration) >= 1)
+      .map(account => ({ managedAccountId: account.managedAccountId as string, credentialGeneration: account.credentialGeneration as number })),
     apply: async (selected, payload, owned) => {
       const marker = await readTrialMarker()
       if (marker.leases[selected] || (selected === 'claude' && marker.leases.zai)) throw new AiCredentialRuntimeError('AI_CREDENTIAL_MERGE_UNSUPPORTED')

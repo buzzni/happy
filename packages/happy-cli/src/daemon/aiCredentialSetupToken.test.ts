@@ -252,6 +252,10 @@ describe('managed Claude setup-token runtime', () => {
     const { runtime, calls, state } = fakeMachine([], null)
     const receipt = await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')), { ...managed(B, 1, fakeToken('b')), number: 2 })))
     expect(receipt.reconciled).toBe(true)
+    expect(receipt.appliedCredentials).toEqual([
+      { managedAccountId: A, credentialGeneration: 1 },
+      { managedAccountId: B, credentialGeneration: 1 },
+    ])
     expect(state.slots.map(slot => [slot.managedAccountId, slot.credentialGeneration])).toEqual([[A, 1], [B, 1]])
     expect(state.active).toBe(1)
     expect(inference(calls)).toEqual([])

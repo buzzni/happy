@@ -2,14 +2,17 @@ import { createHash } from 'node:crypto'
 /** Group custody journal: hashes only, durable intent before changing credentials. */
 export type GroupProvider = 'claude' | 'codex'
 export type CredentialGroupRequest = { version:1; scope:string; userId:string; provider:GroupProvider; generation:number; fingerprint:string; payload:string|null }
+export type AppliedCredentialReceipt = { managedAccountId:string; credentialGeneration:number }
 /** `managed`: the desired identities that are org-managed setup-tokens (absent in older journals). */
-type Entry = Omit<CredentialGroupRequest,'version'|'payload'> & { desired:string[]; owned:string[]; pending:boolean; payloadDigest:string|null; managed?:string[] }
+type Entry = Omit<CredentialGroupRequest,'version'|'payload'> & { desired:string[]; owned:string[]; pending:boolean; payloadDigest:string|null; managed?:string[]; appliedCredentials?:AppliedCredentialReceipt[] }
 type Journal = { version:1; entries:Entry[] }
 export type CredentialGroupDeps = {
   read():Promise<string|null>; write(value:string):Promise<void>
   snapshot(provider:GroupProvider):Promise<string[]>
   incoming(provider:GroupProvider,payload:string):string[]
   managedIdentities?(provider:GroupProvider,payload:string):string[]
+  /** Secret-free receipt projection for setup-token rows applied by this operation. */
+  appliedCredentials?(provider:GroupProvider,payload:string):AppliedCredentialReceipt[]
   /** `owned` are identities this scope installed earlier: the only slots it may replace. */
   apply(provider:GroupProvider,payload:string,owned:string[]):Promise<unknown>
   remove(provider:GroupProvider,identities:string[]):Promise<void>
@@ -30,12 +33,13 @@ function parse(raw:string|null):Journal {
     for(const entry of value.entries){
       request({...entry,version:1,payload:null})
       if(!(entry.payloadDigest===null||typeof entry.payloadDigest==='string'&&/^[a-f0-9]{64}$/.test(entry.payloadDigest))||typeof entry.pending!=='boolean'||![entry.desired,entry.owned,entry.managed??[]].every(items=>Array.isArray(items)&&items.length<=1000&&items.every(id)))fail('AI_GROUP_JOURNAL_INVALID')
+      if(entry.appliedCredentials!==undefined&&(!Array.isArray(entry.appliedCredentials)||entry.appliedCredentials.length>500||entry.appliedCredentials.some(value=>!value||!id(value.managedAccountId)||!Number.isSafeInteger(value.credentialGeneration)||value.credentialGeneration<1)))fail('AI_GROUP_JOURNAL_INVALID')
     }
     if(new Set(value.entries.map(e=>JSON.stringify([e.scope,e.provider]))).size!==value.entries.length)fail('AI_GROUP_JOURNAL_INVALID')
     return value
   }catch{ return fail('AI_GROUP_JOURNAL_INVALID') }
 }
-const receipt=(entry:Entry)=>({version:1 as const,scope:entry.scope,userId:entry.userId,provider:entry.provider,generation:entry.generation,fingerprint:entry.fingerprint,payloadDigest:entry.payloadDigest,reconciled:!entry.pending})
+const receipt=(entry:Entry)=>({version:1 as const,scope:entry.scope,userId:entry.userId,provider:entry.provider,generation:entry.generation,fingerprint:entry.fingerprint,payloadDigest:entry.payloadDigest,reconciled:!entry.pending,appliedCredentials:[...(entry.appliedCredentials??[])]})
 export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   async function readReceipt(scope:string,provider:GroupProvider) {
     return parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider)
@@ -54,7 +58,9 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     const desired=input.payload===null?[]:[...new Set(deps.incoming(input.provider,input.payload))]
     if(desired.length>500||desired.some(value=>!id(value)))fail('AI_GROUP_INVALID_INPUT')
     const managed=input.payload===null?[]:(deps.managedIdentities?.(input.provider,input.payload)??[]).filter(value=>desired.includes(value))
-    const entry:Entry={scope:input.scope,userId:input.userId,provider:input.provider,generation:input.generation,fingerprint:input.fingerprint,payloadDigest,desired,managed,
+    const appliedCredentials=input.payload===null?[]:(deps.appliedCredentials?.(input.provider,input.payload)??[])
+    if(appliedCredentials.length>500||appliedCredentials.some(value=>!value||!id(value.managedAccountId)||!Number.isSafeInteger(value.credentialGeneration)||value.credentialGeneration<1))fail('AI_GROUP_INVALID_PAYLOAD')
+    const entry:Entry={scope:input.scope,userId:input.userId,provider:input.provider,generation:input.generation,fingerprint:input.fingerprint,payloadDigest,desired,managed,appliedCredentials,
       owned:[...new Set([...(prior?.owned??[]),...desired.filter(value=>!before.has(value))])],pending:true}
     journal.entries=journal.entries.filter(e=>!(e.scope===input.scope&&e.provider===input.provider))
     journal.entries.push(entry)

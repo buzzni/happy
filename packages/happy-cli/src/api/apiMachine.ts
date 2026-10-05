@@ -1049,7 +1049,7 @@ export class ApiMachineClient {
         this.rpcHandlerManager.registerHandler('ai-credential:apply', (params) => (
             aiCredentialRuntime.apply(params)
         ));
-        this.rpcHandlerManager.registerHandler('ai-credential:group-sync', (params) => aiCredentialRuntime.groupSync(params));
+        this.rpcHandlerManager.registerHandler('ai-credential:group-sync', (params) => aiCredentialRuntime.groupSync(params), { customerBound: true });
         this.rpcHandlerManager.registerHandler('ai-credential:purge', (params) => (
             aiCredentialRuntime.purge(params)
         ));

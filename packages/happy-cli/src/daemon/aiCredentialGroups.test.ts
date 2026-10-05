@@ -3,7 +3,7 @@ import { createCredentialGroupSync } from './aiCredentialGroups'
 function setup() {
   let journal:string|null=null
   const installed=new Set(['personal'])
-  const deps={read:async()=>journal,write:vi.fn(async(value:string)=>{journal=value}),snapshot:async()=>[...installed],incoming:(_provider:string,payload:string)=>JSON.parse(payload) as string[],apply:vi.fn(async(_provider:string,payload:string)=>{for(const id of JSON.parse(payload))installed.add(id)}),remove:vi.fn(async(_provider:string,ids:string[])=>{ids.forEach(id=>installed.delete(id))})}
+  const deps={read:async()=>journal,write:vi.fn(async(value:string)=>{journal=value}),snapshot:async()=>[...installed],incoming:(_provider:string,payload:string)=>JSON.parse(payload) as string[],appliedCredentials:(_provider:string,payload:string)=>JSON.parse(payload).map((managedAccountId:string, index:number)=>({managedAccountId,credentialGeneration:index+1})),apply:vi.fn(async(_provider:string,payload:string)=>{for(const id of JSON.parse(payload))installed.add(id)}),remove:vi.fn(async(_provider:string,ids:string[])=>{ids.forEach(id=>installed.delete(id))})}
   const sync=createCredentialGroupSync(deps)
   const input=(generation:number,payload:string|null,scope='company')=>({version:1 as const,provider:'claude' as const,scope,userId:'user',generation,fingerprint:String(generation).padStart(64,'a'),payload})
   return {deps,installed,sync,input,restart:()=>createCredentialGroupSync(deps)}
@@ -11,7 +11,11 @@ function setup() {
 describe('scoped credential group synchronization',()=>{
   it('records introduced accounts only and preserves personal credentials on revoke',async()=>{
     const {sync,input,installed,deps}=setup()
-    await sync.sync(input(1,JSON.stringify(['personal','shared'])))
+    const receipt = await sync.sync(input(1,JSON.stringify(['personal','shared'])))
+    expect(receipt.appliedCredentials).toEqual([
+      { managedAccountId: 'personal', credentialGeneration: 1 },
+      { managedAccountId: 'shared', credentialGeneration: 2 },
+    ])
     expect(deps.write).toHaveBeenCalledBefore(deps.apply)
     await sync.sync(input(2,null))
     expect([...installed]).toEqual(['personal'])
