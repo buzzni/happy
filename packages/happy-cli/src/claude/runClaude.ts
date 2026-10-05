@@ -776,10 +776,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const hookSettingsPath = generateHookSettingsFile(hookServer.port);
 
     // Titles a new chat outside the user's turn with claudeRemote's own launch
-    // options (see claudeOffTurnTitle). Managed runs, scoped write sandboxes
-    // and run-once hosts keep the in-turn instruction.
+    // options (see claudeOffTurnTitle). Managed runs, process sandboxes (scoped
+    // or mandatory policy) and run-once hosts keep the in-turn instruction.
     const offTurnTitleBridge = createClaudeTitleBridge();
-    const offTurnTitleEligible = managedStartup === null && !scopeLaunch && !exitAfterFirstTurn;
+    const offTurnTitleEligible = managedStartup === null && !scopeLaunch && !exitAfterFirstTurn
+        && sandboxPolicyMode !== 'mandatory';
     const offTurnTitle = createOffTurnTitleJob({
         run: offTurnTitleBridge.run,
         changeTitle: createChangeTitleHandler(session),
