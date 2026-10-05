@@ -162,3 +162,9 @@ Verification:
 - Real local Claude Code smoke: Haiku returned a valid Korean title and slug, and no session directory was created.
 - 24 related files / 687 tests pass, build exit0.
 - Not yet run: isolated-daemon Web E2E and an ethan A/B.
+
+Isolated E2E (Claude): separate home `~/.happy-claude-title-iso`, new machineId, dev server. Shared daemons' pid/session counts were unchanged; the isolated tree (9 sessions + 18 children) was terminated and removed afterwards.
+- Web Claude Code/Haiku 4.5/low, 3 new chats.
+- Main turn: no title instruction, 1 model call, 0 tools. Answer 3.26/1.74/2.80s after the prompt record; Web first text 7.9/3.8/4.9s.
+- Titles were recorded off-turn 3/3 with 0 warnings, and no title-query session file was persisted.
+- Descriptive only; the ethan A/B is pending release.
