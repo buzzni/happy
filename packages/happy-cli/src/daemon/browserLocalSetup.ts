@@ -47,6 +47,7 @@ export class BrowserLocalSetup {
             if (!profile.trim() || profile.length > 128 || /[\x00-\x1f]/.test(profile)) throw new Error('INVALID_PROFILE')
             const metadata = this.metadata()
             const target = extensionId ?? metadata.extensionId
+            // The daemon cannot see which store version Chrome installed; callers send the store ID only once it supports setup pairing (>= 0.2.0).
             if (target !== metadata.extensionId && target !== CHROME_WEB_STORE_EXTENSION_ID) throw new Error('INVALID_EXTENSION')
             const operation: Operation = { id: randomBytes(24).toString('base64url'), profile, expires: this.now() + TTL, consumed: false }
             const policy = this.options.bridge.getSetupPolicy()
