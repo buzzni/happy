@@ -63,7 +63,6 @@ vi.mock('@/daemon/run', () => ({
 
 vi.mock('@/claude/utils/startHappyServer', () => ({
     startHappyServer: mockStartHappyServer,
-    createChangeTitleHandler: () => async () => ({ success: true }),
 }));
 
 vi.mock('@/claude/utils/startHookServer', () => ({

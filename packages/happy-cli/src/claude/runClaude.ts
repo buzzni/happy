@@ -782,7 +782,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const offTurnTitleEligible = managedStartup === null && !scopeLaunch && !exitAfterFirstTurn;
     const offTurnTitle = createOffTurnTitleJob({
         run: offTurnTitleBridge.run,
-        changeTitle: createChangeTitleHandler(session),
+        // Built per call, as runCodex does: nothing about titling runs at startup.
+        changeTitle: (title, branchSlug) => createChangeTitleHandler(session)(title, branchSlug),
         hasTitle: () => session.hasTitle(),
         log: (message, detail) => logger.warn(message, detail),
     });
