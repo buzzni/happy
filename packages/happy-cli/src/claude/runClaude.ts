@@ -20,7 +20,7 @@ import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { initialMachineMetadata } from '@/daemon/run';
-import { startHappyServer } from '@/claude/utils/startHappyServer';
+import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
@@ -43,6 +43,8 @@ import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/
 import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
+import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
+import { createClaudeTitleBridge } from './claudeOffTurnTitle';
 import { registerAxRpcHandlers } from '@/orchestrator/registerAxRpcHandlers';
 import {
     fetchAplusMcpConfigSnapshot,
@@ -772,6 +774,18 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
     // Generate hook settings file for Claude
     const hookSettingsPath = generateHookSettingsFile(hookServer.port);
+
+    // Titles a new chat outside the user's turn with claudeRemote's own launch
+    // options (see claudeOffTurnTitle). Managed runs, scoped write sandboxes
+    // and run-once hosts keep the in-turn instruction.
+    const offTurnTitleBridge = createClaudeTitleBridge();
+    const offTurnTitleEligible = managedStartup === null && !scopeLaunch && !exitAfterFirstTurn;
+    const offTurnTitle = createOffTurnTitleJob({
+        run: offTurnTitleBridge.run,
+        changeTitle: createChangeTitleHandler(session),
+        hasTitle: () => session.hasTitle(),
+        log: (message, detail) => logger.warn(message, detail),
+    });
     logger.debug(`[START] Generated hook settings file: ${hookSettingsPath}`);
 
     // Print log file path
@@ -1520,7 +1534,13 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         // Only the model's copy changes; the app renders its own user bubble.
         // recordAppPrompt() de-dupes the modified turn so the remote-mode JSONL
         // scanner doesn't forward it back to the app as a second message.
-        if (!session.hasTitle()) {
+        if (!titleCoveredForTurn({
+            hasTitle: session.hasTitle(),
+            job: offTurnTitle,
+            eligible: offTurnTitleEligible,
+            message: pushText,
+            model: messageModel,
+        })) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
@@ -1752,6 +1772,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             await checkpointComposition.dispose?.();
 
             // Stop Hook server and cleanup settings file
+            offTurnTitle.cancel();
             hookServer.stop();
             cleanupHookSettingsFile(hookSettingsPath);
 
@@ -1944,6 +1965,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         sandboxConfig: checkpointComposition.sandboxConfig,
         checkpointComposition,
         hookSettingsPath,
+        offTurnTitle: offTurnTitleBridge,
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
@@ -1996,6 +2018,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     await checkpointComposition.dispose?.();
 
     // Stop Hook server and cleanup settings file
+    offTurnTitle.cancel();
     hookServer.stop();
     cleanupHookSettingsFile(hookSettingsPath);
     logger.debug('Stopped Hook server and cleaned up settings file');
