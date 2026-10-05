@@ -39,6 +39,14 @@ describe('scoped credential group synchronization',()=>{
     await expect(sync.sync(input(1,null))).rejects.toThrow('AI_GROUP_GENERATION_STALE')
     await expect(sync.sync({...first,payload:null,fingerprint:'b'.repeat(64)})).rejects.toThrow('AI_GROUP_GENERATION_CONFLICT')
   })
+  it('persists assignment generation and lease correlation across restart and rejects lease replay conflicts',async()=>{
+    const {sync,input,restart}=setup()
+    const first={...input(2,'["shared"]'),assignmentGeneration:2,leaseId:'lease-a'}
+    expect(await sync.sync(first)).toMatchObject({assignmentGeneration:2,leaseId:'lease-a'})
+    expect(await restart().receipt('company','claude')).toMatchObject({assignmentGeneration:2,leaseId:'lease-a'})
+    await expect(sync.sync({...first,leaseId:'lease-b'})).rejects.toThrow('AI_GROUP_LEASE_CONFLICT')
+    await expect(sync.sync({...first,generation:1,assignmentGeneration:1,leaseId:'lease-a'})).rejects.toThrow('AI_GROUP_GENERATION_STALE')
+  })
   it('recovers introduced account custody when an import was interrupted',async()=>{
     const {sync,input,deps,installed,restart}=setup()
     deps.apply.mockImplementationOnce(async()=>{installed.add('shared');throw new Error('interrupted')})

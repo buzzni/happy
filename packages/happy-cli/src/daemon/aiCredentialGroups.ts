@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 /** Group custody journal: hashes only, durable intent before changing credentials. */
 export type GroupProvider = 'claude' | 'codex'
-export type CredentialGroupRequest = { version:1; scope:string; userId:string; provider:GroupProvider; generation:number; fingerprint:string; payload:string|null }
+export type CredentialGroupRequest = { version:1; scope:string; userId:string; provider:GroupProvider; generation:number; fingerprint:string; payload:string|null; assignmentGeneration?:number; leaseId?:string }
 export type AppliedCredentialReceipt = { managedAccountId:string; credentialGeneration:number }
 /** `managed`: the desired identities that are org-managed setup-tokens (absent in older journals). */
 type Entry = Omit<CredentialGroupRequest,'version'|'payload'> & { desired:string[]; owned:string[]; pending:boolean; payloadDigest:string|null; managed?:string[]; appliedCredentials?:AppliedCredentialReceipt[] }
@@ -12,7 +12,7 @@ export type CredentialGroupDeps = {
   incoming(provider:GroupProvider,payload:string):string[]
   managedIdentities?(provider:GroupProvider,payload:string):string[]
   /** Secret-free receipt projection for setup-token rows applied by this operation. */
-  appliedCredentials?(provider:GroupProvider,payload:string):AppliedCredentialReceipt[]
+  appliedCredentials?(provider:GroupProvider,payload:string,applied:unknown):AppliedCredentialReceipt[]
   /** `owned` are identities this scope installed earlier: the only slots it may replace. */
   apply(provider:GroupProvider,payload:string,owned:string[]):Promise<unknown>
   remove(provider:GroupProvider,identities:string[]):Promise<void>
@@ -22,7 +22,9 @@ const id=(value:unknown)=>typeof value==='string'&&value.length>0&&value.length<
 function request(value:CredentialGroupRequest) {
   if(!value||value.version!==1||!id(value.scope)||!id(value.userId)
     ||!['claude','codex'].includes(value.provider)||!Number.isSafeInteger(value.generation)||value.generation<1
-    ||!(/^[a-f0-9]{64}$/).test(value.fingerprint)||!(value.payload===null||typeof value.payload==='string'&&Buffer.byteLength(value.payload)<=1024*1024))fail('AI_GROUP_INVALID_INPUT')
+    ||!(/^[a-f0-9]{64}$/).test(value.fingerprint)||!(value.payload===null||typeof value.payload==='string'&&Buffer.byteLength(value.payload)<=1024*1024)
+    ||(value.assignmentGeneration!==undefined&&(!Number.isSafeInteger(value.assignmentGeneration)||value.assignmentGeneration!==value.generation))
+    ||(value.leaseId!==undefined&&(!/^[A-Za-z0-9_-]{1,128}$/.test(value.leaseId))))fail('AI_GROUP_INVALID_INPUT')
 }
 function parse(raw:string|null):Journal {
   if(raw===null)return {version:1,entries:[]}
@@ -33,13 +35,13 @@ function parse(raw:string|null):Journal {
     for(const entry of value.entries){
       request({...entry,version:1,payload:null})
       if(!(entry.payloadDigest===null||typeof entry.payloadDigest==='string'&&/^[a-f0-9]{64}$/.test(entry.payloadDigest))||typeof entry.pending!=='boolean'||![entry.desired,entry.owned,entry.managed??[]].every(items=>Array.isArray(items)&&items.length<=1000&&items.every(id)))fail('AI_GROUP_JOURNAL_INVALID')
-      if(entry.appliedCredentials!==undefined&&(!Array.isArray(entry.appliedCredentials)||entry.appliedCredentials.length>500||entry.appliedCredentials.some(value=>!value||!id(value.managedAccountId)||!Number.isSafeInteger(value.credentialGeneration)||value.credentialGeneration<1)))fail('AI_GROUP_JOURNAL_INVALID')
+      if(entry.appliedCredentials!==undefined&&(!Array.isArray(entry.appliedCredentials)||entry.appliedCredentials.length>500||entry.appliedCredentials.some(value=>!value||!id(value.managedAccountId)||!Number.isSafeInteger(value.credentialGeneration)||value.credentialGeneration<1)||new Set(entry.appliedCredentials.map(value=>value.managedAccountId)).size!==entry.appliedCredentials.length))fail('AI_GROUP_JOURNAL_INVALID')
     }
     if(new Set(value.entries.map(e=>JSON.stringify([e.scope,e.provider]))).size!==value.entries.length)fail('AI_GROUP_JOURNAL_INVALID')
     return value
   }catch{ return fail('AI_GROUP_JOURNAL_INVALID') }
 }
-const receipt=(entry:Entry)=>({version:1 as const,scope:entry.scope,userId:entry.userId,provider:entry.provider,generation:entry.generation,fingerprint:entry.fingerprint,payloadDigest:entry.payloadDigest,reconciled:!entry.pending,appliedCredentials:[...(entry.appliedCredentials??[])]})
+const receipt=(entry:Entry)=>({version:1 as const,scope:entry.scope,userId:entry.userId,provider:entry.provider,generation:entry.generation,assignmentGeneration:entry.assignmentGeneration??entry.generation,leaseId:entry.leaseId??null,fingerprint:entry.fingerprint,payloadDigest:entry.payloadDigest,reconciled:!entry.pending,appliedCredentials:[...(entry.appliedCredentials??[])]})
 export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   async function readReceipt(scope:string,provider:GroupProvider) {
     return parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider)
@@ -50,22 +52,26 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     const prior=journal.entries.find(e=>e.scope===input.scope&&e.provider===input.provider)
     if(prior&&input.generation<prior.generation)fail('AI_GROUP_GENERATION_STALE')
     if(prior&&input.generation===prior.generation&&(input.fingerprint!==prior.fingerprint||input.userId!==prior.userId))fail('AI_GROUP_GENERATION_CONFLICT')
+    if(prior&&input.generation===prior.generation&&input.fingerprint===prior.fingerprint&&(input.leaseId??null)!==(prior.leaseId??null))fail('AI_GROUP_LEASE_CONFLICT')
     if(prior&&input.fingerprint===prior.fingerprint&&(input.payload===null?null:createHash('sha256').update(input.payload).digest('hex'))!==prior.payloadDigest)fail('AI_GROUP_PAYLOAD_CONFLICT')
-    if(prior&&!prior.pending&&input.fingerprint===prior.fingerprint&&input.userId===prior.userId){prior.generation=input.generation;await deps.write(JSON.stringify(journal));return receipt(prior)}
+    if(prior&&!prior.pending&&input.fingerprint===prior.fingerprint&&input.userId===prior.userId){prior.generation=input.generation;prior.assignmentGeneration=input.assignmentGeneration??input.generation;prior.leaseId=input.leaseId;await deps.write(JSON.stringify(journal));return receipt(prior)}
     const payloadDigest=input.payload===null?null:createHash('sha256').update(input.payload).digest('hex')
     if(prior&&input.fingerprint===prior.fingerprint&&payloadDigest!==prior.payloadDigest)fail('AI_GROUP_PAYLOAD_CONFLICT')
     const before=new Set(await deps.snapshot(input.provider))
     const desired=input.payload===null?[]:[...new Set(deps.incoming(input.provider,input.payload))]
     if(desired.length>500||desired.some(value=>!id(value)))fail('AI_GROUP_INVALID_INPUT')
     const managed=input.payload===null?[]:(deps.managedIdentities?.(input.provider,input.payload)??[]).filter(value=>desired.includes(value))
-    const appliedCredentials=input.payload===null?[]:(deps.appliedCredentials?.(input.provider,input.payload)??[])
-    if(appliedCredentials.length>500||appliedCredentials.some(value=>!value||!id(value.managedAccountId)||!Number.isSafeInteger(value.credentialGeneration)||value.credentialGeneration<1))fail('AI_GROUP_INVALID_PAYLOAD')
-    const entry:Entry={scope:input.scope,userId:input.userId,provider:input.provider,generation:input.generation,fingerprint:input.fingerprint,payloadDigest,desired,managed,appliedCredentials,
+    const entry:Entry={scope:input.scope,userId:input.userId,provider:input.provider,generation:input.generation,assignmentGeneration:input.assignmentGeneration??input.generation,leaseId:input.leaseId,fingerprint:input.fingerprint,payloadDigest,desired,managed,appliedCredentials:[],
       owned:[...new Set([...(prior?.owned??[]),...desired.filter(value=>!before.has(value))])],pending:true}
     journal.entries=journal.entries.filter(e=>!(e.scope===input.scope&&e.provider===input.provider))
     journal.entries.push(entry)
     await deps.write(JSON.stringify(journal))
-    if(input.payload!==null)await deps.apply(input.provider,input.payload,prior?.owned??[])
+    let applied:unknown = null
+    if(input.payload!==null) {
+      applied=await deps.apply(input.provider,input.payload,prior?.owned??[])
+      entry.appliedCredentials=deps.appliedCredentials?.(input.provider,input.payload,applied)??[]
+      if(entry.appliedCredentials.length>500||entry.appliedCredentials.some(value=>!value||!id(value.managedAccountId)||!Number.isSafeInteger(value.credentialGeneration)||value.credentialGeneration<1)||new Set(entry.appliedCredentials.map(value=>value.managedAccountId)).size!==entry.appliedCredentials.length)fail('AI_GROUP_INVALID_PAYLOAD')
+    }
     const after=new Set(await deps.snapshot(input.provider))
     if(desired.some(identity=>!after.has(identity)))fail('AI_GROUP_INSTALL_INCOMPLETE')
     const related=journal.entries.filter(e=>e.provider===input.provider)
