@@ -107,6 +107,8 @@ type Supervisor = {
 
 export type AiCredentialRuntimeDependencies = {
   homeDir: string
+  /** Happy machine identity used to bind server-side machine principal mutations. */
+  machineId?: string
   now(): number
   env: Record<string, string | undefined>
   execFile(command: string, args: string[], options?: CommandOptions): Promise<AiCredentialCommandResult>
@@ -690,7 +692,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     const accepted = envelope.accounts.filter((_account: unknown, index: number) => verification.accounts[index]?.ok)
       .map((account: { email: string }) => ({ ...account, disabled: before.accounts.find(existing =>
         claudeListAccountIdentity(existing) === claudeListAccountIdentity(account))?.disabled }))
-    if (accepted.length === 0) throw new AiCredentialRuntimeError('CLAUDE_APPLY_RELOGIN_REQUIRED')
+    if (accepted.length === 0) {
+      // Keep request rejection reasons observable without exposing identities or provider output.
+      deps.warn?.(`Claude repair preflight rejected: ${JSON.stringify(verification.accounts.map(({ account, ok, errorKind }) => ({ account, ok, errorKind })))}`)
+      throw new AiCredentialRuntimeError('CLAUDE_APPLY_RELOGIN_REQUIRED')
+    }
     return { before, envelope: { ...envelope, accounts: accepted }, requested, verification }
   }
 
@@ -1568,6 +1574,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function groupSync(input: CredentialGroupRequest) {
     if (input?.provider === 'claude') cancelPersonal()
     return serialize(() => withSafeErrors('AI_GROUP_SYNC_FAILED', async () => {
+      if (input?.principalType === 'machine' && (!deps.machineId || input.machineId !== deps.machineId)) {
+        throw new AiCredentialRuntimeError('AI_GROUP_MACHINE_MISMATCH')
+      }
       // The journal snapshots cswap before applying, so the runtime gate must come first.
       if (input?.provider === 'claude' && typeof input.payload === 'string' && containsManagedSetupTokens(input.payload)
         && !await setupTokenRuntimeSupported()) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_UNSUPPORTED')
@@ -2160,7 +2169,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
-  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex') => serialize(() => groups.receipt(scope, selected)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1 } : {}), groupAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
@@ -2569,14 +2578,14 @@ export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
   homeDir: string = homedir(),
-  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'> = {},
+  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'> = {},
 ) {
   return createAiCredentialRuntime({
     ...options,
     homeDir,
     now: Date.now,
     env,
-    execFile: (command, args, options) => runAiCredentialCommand(command, args, options, options?.terminateProcessTree ? crossSpawn as typeof spawn : spawn),
+    execFile: (command, args, options) => runAiCredentialCommand(command, args, options),
     readFile: (path) => readFile(path, 'utf8'),
     readdir: (path) => readdir(path),
     syncFile: async (path) => { const file = await open(path, 'r+'); try { await file.sync() } finally { await file.close() } },
@@ -2596,7 +2605,8 @@ export function runAiCredentialCommand(
   command: string,
   args: string[],
   options: CommandOptions = {},
-  spawnCommand: typeof spawn = spawn,
+  // Windows npm installs expose .cmd shims; native spawn cannot resolve them.
+  spawnCommand: typeof spawn = process.platform === 'win32' || options.terminateProcessTree ? crossSpawn as typeof spawn : spawn,
 ): Promise<AiCredentialCommandResult> {
   return new Promise((resolve, reject) => {
     if (options.signal?.aborted) { reject(new AiCredentialRuntimeError('COMMAND_CANCELLED')); return }
@@ -2619,7 +2629,8 @@ export function runAiCredentialCommand(
       settled = true
       options.signal?.removeEventListener('abort', abort)
       if (timeout) clearTimeout(timeout)
-      if (options.terminateProcessTree && child.pid) {
+      // A Windows npm shim owns a shell wrapper as well as the actual CLI process.
+      if ((options.terminateProcessTree || process.platform === 'win32') && child.pid) {
         if (process.platform === 'win32') {
           const killer = spawnCommand('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
           const killTimeout = setTimeout(() => { killer.kill('SIGKILL'); child.kill('SIGKILL'); reject(new AiCredentialRuntimeError('COMMAND_TREE_TERMINATION_FAILED')) }, 5_000)

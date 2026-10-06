@@ -34,6 +34,7 @@ import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
 import type { DifficultyRoutingClassifierHost } from '@/daemon/difficultyRoutingClassifierHost';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { machineServerLane } from './rpc/serverLane';
+import { createMachineMetadataHandlers, probeLocalHttp, runFileWithoutShell } from '@/daemon/machineMetadataMethods';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -917,6 +918,19 @@ export class ApiMachineClient {
             MACHINE_RESOURCE_METRICS_RPC,
             async (params) => this.machineResourceService.handleRequest(params),
         );
+        // D4-2 metadata on the server lane (fixed shapes, no content); see
+        // daemon/machineMetadataMethods.
+        const metadataHandlers = createMachineMetadataHandlers({
+            allowedRoot,
+            happyHomeDir: configuration.happyHomeDir,
+            platform: process.platform,
+            cliVersion: packageJson.version,
+            runFile: runFileWithoutShell,
+            probeHttp: probeLocalHttp,
+        });
+        for (const [method, handler] of Object.entries(metadataHandlers)) {
+            this.rpcHandlerManager.registerHandler(method, handler);
+        }
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
             createClaudeSessionTransferHandler({ allowedRoot }),
@@ -1099,7 +1113,10 @@ export class ApiMachineClient {
         ));
         this.rpcHandlerManager.registerHandler('ai-credential:status', async (params): Promise<unknown> => (
             params?.groupScope && (params.provider === 'claude' || params.provider === 'codex')
-                ? aiCredentialRuntime.groupReceipt(params.groupScope, params.provider) : aiCredentialRuntime.status(params)
+                ? params.principalType === 'machine' && typeof params.machineId === 'string'
+                    ? aiCredentialRuntime.groupReceipt(params.groupScope, params.provider, { principalType: 'machine', machineId: params.machineId })
+                    : aiCredentialRuntime.groupReceipt(params.groupScope, params.provider)
+                : aiCredentialRuntime.status(params)
         ));
         this.rpcHandlerManager.registerHandler('ai-credential:verify', (params) => aiCredentialRuntime.verify(params));
         this.rpcHandlerManager.registerHandler('ai-credential:rotation', (params) => (
