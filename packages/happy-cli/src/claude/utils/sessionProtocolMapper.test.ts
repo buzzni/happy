@@ -761,4 +761,86 @@ describe('channel correlation on runs that produce no text', () => {
         const start = ordinary.envelopes.find((envelope) => (envelope.ev as { t: string }).t === 'turn-start');
         expect(start?.ev).toEqual({ t: 'turn-start' });
     });
+
+    it('reuses the channel request for the turn after a background task notification', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-bg' };
+        mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'bg-assistant',
+            message: {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'tool-bg', name: 'Agent', input: { run_in_background: true } }],
+            },
+        } as any, state);
+        const result = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'bg-result',
+            message: {
+                role: 'user',
+                content: [{
+                    type: 'tool_result',
+                    tool_use_id: 'tool-bg',
+                    content: 'Async agent launched successfully.\nagentId: task-bg-1',
+                }],
+            },
+        } as any, state);
+        expect(result.envelopes).toEqual(expect.arrayContaining([
+            expect.objectContaining({ ev: { t: 'tool-call-end', call: 'tool-bg', backgroundTaskId: 'task-bg-1' } }),
+        ]));
+        closeClaudeTurnWithStatus(state, 'completed');
+
+        mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user',
+            uuid: 'bg-notification',
+            happyTaskNotification: true,
+            message: {
+                role: 'user',
+                content: '<task-notification>\n<task-id>task-bg-1</task-id>\n<tool-use-id>tool-bg</tool-use-id>\n<status>completed</status>\n</task-notification>',
+            },
+        } as any, state);
+        const resumed = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant',
+            uuid: 'bg-follow-up',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'background work is complete' }] },
+        } as any, state);
+        expect(resumed.envelopes.find((item) => item.ev.t === 'turn-start')?.ev)
+            .toMatchObject({ t: 'turn-start', requestId: 'core-req-bg' });
+    });
+
+    it('correlates a hidden Task launch before dropping its parent tool envelope', () => {
+        const state = { currentTurnId: null, pendingRequestId: 'core-req-task' };
+        mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant', uuid: 'task-assistant',
+            message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-task', name: 'Task', input: { run_in_background: true } }] },
+        } as any, state);
+        const result = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user', uuid: 'task-result',
+            message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-task', content: 'Async agent launched successfully.\nagentId: task-hidden-1' }] },
+        } as any, state);
+        expect(result.envelopes.some((item) => item.ev.t === 'tool-call-end')).toBe(false);
+        closeClaudeTurnWithStatus(state, 'completed');
+        mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user', uuid: 'task-notification', happyTaskNotification: true,
+            message: { role: 'user', content: '<task-notification><task-id>task-hidden-1</task-id></task-notification>' },
+        } as any, state);
+        const resumed = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant', uuid: 'task-follow-up',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'hidden task complete' }] },
+        } as any, state);
+        expect(resumed.envelopes.find((item) => item.ev.t === 'turn-start')?.ev)
+            .toMatchObject({ t: 'turn-start', requestId: 'core-req-task' });
+    });
+
+    it('does not attach an unrelated task notification to an ordinary turn', () => {
+        const state = { currentTurnId: null };
+        mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user', uuid: 'unknown-notification', happyTaskNotification: true,
+            message: { role: 'user', content: '<task-notification><task-id>unknown</task-id></task-notification>' },
+        } as any, state);
+        const resumed = mapClaudeLogMessageToSessionEnvelopes({
+            type: 'assistant', uuid: 'ordinary-follow-up',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'ordinary' }] },
+        } as any, state);
+        expect(resumed.envelopes.find((item) => item.ev.t === 'turn-start')?.ev).toEqual({ t: 'turn-start' });
+    });
 });
