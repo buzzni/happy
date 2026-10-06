@@ -137,6 +137,21 @@ function rememberBackgroundTaskRequest(state: ClaudeSessionProtocolState, id: st
     }
 }
 
+/**
+ * A background task launched while answering a channel request has reported back. Claude Code
+ * answers it with a turn of its own once idle, so that turn answers the same request. Re-arm only
+ * the request whose own launch produced this task; an unknown notification stays an in-app event.
+ */
+function rearmBackgroundTaskRequest(state: ClaudeSessionProtocolState, ids: { taskId?: string; toolUseId?: string }): void {
+    const requests = state.backgroundTaskRequestIds;
+    const requestId = (ids.taskId ? requests?.get(ids.taskId) : undefined)
+        ?? (ids.toolUseId ? requests?.get(ids.toolUseId) : undefined);
+    if (!requestId) return;
+    if (!state.currentTurnId && !state.pendingRequestId) state.pendingRequestId = requestId;
+    if (ids.taskId) requests?.delete(ids.taskId);
+    if (ids.toolUseId) requests?.delete(ids.toolUseId);
+}
+
 function isSubagentTool(name: string): boolean {
     return name === 'Task' || name === 'Agent';
 }
@@ -666,6 +681,16 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
     }
 
     if (message.type === 'system') {
+        // The SDK's own report of a finished background task. It precedes the provider's
+        // follow-up turn on the same ordered stream; the transcript row of an idle notification
+        // reaches us only through the scanner, which can be late.
+        const notification = message as { subtype?: unknown; task_id?: unknown; tool_use_id?: unknown };
+        if (notification.subtype === 'task_notification') {
+            rearmBackgroundTaskRequest(state, {
+                ...(typeof notification.task_id === 'string' ? { taskId: notification.task_id } : {}),
+                ...(typeof notification.tool_use_id === 'string' ? { toolUseId: notification.tool_use_id } : {}),
+            });
+        }
         return {
             currentTurnId: state.currentTurnId,
             envelopes,
@@ -775,18 +800,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             // (specs/midturn-task-notification-sync R2). Emit the user text
             // and leave the turn state untouched.
             if ((message as { happyTaskNotification?: unknown }).happyTaskNotification === true) {
-                const ids = extractTaskNotificationIds(message.message.content);
-                const requests = state.backgroundTaskRequestIds;
-                const requestId = (ids.taskId ? requests?.get(ids.taskId) : undefined)
-                    ?? (ids.toolUseId ? requests?.get(ids.toolUseId) : undefined);
-                // The notification arrives after the launch turn's result closed. Re-arm only the
-                // request whose own launch produced this task; an unknown notification must stay
-                // an ordinary in-app event.
-                if (requestId) {
-                    if (!state.currentTurnId && !state.pendingRequestId) state.pendingRequestId = requestId;
-                    if (ids.taskId) requests?.delete(ids.taskId);
-                    if (ids.toolUseId) requests?.delete(ids.toolUseId);
-                }
+                rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
                 envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
                 return {
                     currentTurnId: state.currentTurnId,
@@ -797,6 +811,13 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 const turnId = ensureTurn(state, envelopes);
                 maybeEmitSubagentStart(state, turnId, subagent, envelopes);
                 envelopes.push(createEnvelope('agent', { t: 'text', text: message.message.content }, { turn: turnId, subagent, claudeUuid }));
+            } else if ((message as { origin?: { kind?: unknown } }).origin?.kind === 'task-notification') {
+                // A notification consumed while idle starts the provider's follow-up turn. Close
+                // what is open as any user row does, but never open-and-close an empty turn for a
+                // waiting request: that would answer it before the follow-up does.
+                if (state.currentTurnId) closeTurn(state, 'completed', envelopes);
+                rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
+                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
             } else {
                 closeTurn(state, 'completed', envelopes);
                 envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
