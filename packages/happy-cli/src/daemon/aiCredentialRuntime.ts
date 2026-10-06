@@ -1541,28 +1541,22 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       .map(account => setupTokenGroupIdentity(account.managedAccountId as string)),
     appliedCredentials: (selected, payload, applied) => {
       if (selected !== 'claude') return []
-      const payloadAccounts = JSON.parse(payload).accounts as Array<Record<string, unknown>>
-      const expected = payloadAccounts
-        .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string'
-          && Number.isSafeInteger(account.credentialGeneration) && Number(account.credentialGeneration) >= 1)
-        .map(account => `${account.managedAccountId}:${account.credentialGeneration}`)
-      const verified = isObject(applied) && Array.isArray(applied.verifiedAccounts)
+      const managedPairs = (accounts: unknown) => (Array.isArray(accounts) ? accounts : [])
+        .filter((account): account is Record<string, unknown> => isObject(account) && account.credentialType === 'setup_token'
+          && typeof account.managedAccountId === 'string' && Number.isSafeInteger(account.credentialGeneration) && Number(account.credentialGeneration) >= 1)
+        .map(account => ({ managedAccountId: account.managedAccountId as string, credentialGeneration: account.credentialGeneration as number }))
+      const key = (pair: { managedAccountId: string; credentialGeneration: number }) => `${pair.managedAccountId}:${pair.credentialGeneration}`
+      const expected = managedPairs(JSON.parse(payload).accounts).map(key)
+      // Only cswap's verified import proves what was applied; the requested payload never does.
+      const verified = isObject(applied) && Array.isArray(applied.verifiedAccounts) ? managedPairs(applied.verifiedAccounts) : null
       if (expected.length > 0 && !verified) throw new AiCredentialRuntimeError('AI_GROUP_RECEIPT_INVALID')
-      const accounts = verified
-        ? applied.verifiedAccounts as Array<Record<string, unknown>>
-        : payloadAccounts
-      const appliedPairs = accounts
-        .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string'
-          && Number.isSafeInteger(account.credentialGeneration) && Number(account.credentialGeneration) >= 1)
-        .map(account => `${account.managedAccountId}:${account.credentialGeneration}`)
-      if (new Set(expected).size !== expected.length || expected.length !== appliedPairs.length
-        || new Set(appliedPairs).size !== appliedPairs.length || expected.some(pair => !appliedPairs.includes(pair))) {
+      const result = verified ?? []
+      const actual = result.map(key)
+      if (new Set(expected).size !== expected.length || new Set(actual).size !== actual.length
+        || expected.length !== actual.length || expected.some(pair => !actual.includes(pair))) {
         throw new AiCredentialRuntimeError('AI_GROUP_RECEIPT_INVALID')
       }
-      return accounts
-        .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string'
-          && Number.isSafeInteger(account.credentialGeneration) && Number(account.credentialGeneration) >= 1)
-        .map(account => ({ managedAccountId: account.managedAccountId as string, credentialGeneration: account.credentialGeneration as number }))
+      return result
     },
     apply: async (selected, payload, owned) => {
       const marker = await readTrialMarker()
