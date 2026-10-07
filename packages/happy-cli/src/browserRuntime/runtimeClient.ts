@@ -30,6 +30,8 @@ export class RuntimeClient {
     }
 
     createSpace(req: Req<'createSpace'>) { return this.call('createSpace', req) }
+    listSpaces(req: Req<'listSpaces'>) { return this.call('listSpaces', req) }
+    joinSpace(req: Req<'joinSpace'>) { return this.call('joinSpace', req) }
     createTask(req: Req<'createTask'>) { return this.call('createTask', req) }
     openPage(req: Req<'openPage'>) { return this.call('openPage', req) }
     closePage(req: Req<'closePage'>) { return this.call('closePage', req) }

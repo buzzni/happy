@@ -85,6 +85,20 @@ describe('spawn webhook wait', () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(logger.debug).not.toHaveBeenCalledWith(expect.stringContaining('timeout'));
   });
+
+  it('fails as soon as the child exits before reporting its webhook', async () => {
+    const awaiters = new Map<number, (s: any) => void>();
+    let exitListener: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+    const child = {
+      once: (_event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void) => { exitListener = listener },
+      removeListener: () => {},
+    };
+    const result = waitForSessionWebhook({ pid: 123, pidToAwaiter: awaiters, logger: { debug: vi.fn() }, child,
+      startupErrorDetail: () => 'fatal startup error', timeouts: { softTimeoutMs: 15_000, finalTimeoutMs: 60_000 } });
+    exitListener?.(1, null);
+    await expect(result).resolves.toMatchObject({ type: 'error', errorMessage: expect.stringContaining('fatal startup error') });
+    expect(awaiters.has(123)).toBe(false);
+  });
   it('cancelling an old waiter does not delete a replacement waiter for the same PID', async () => {
     vi.useFakeTimers(); const awaiters = new Map<number, (s: any) => void>(); const cancellation = new AbortController();
     const result = waitForSessionWebhook({ pid: 123, pidToAwaiter: awaiters, logger: { debug: vi.fn() }, signal: cancellation.signal });

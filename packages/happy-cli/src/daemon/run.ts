@@ -36,7 +36,7 @@ import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
-import { captureSpawnOutputStdio, preflightInstalledHappyCLI, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
+import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
 import {
   writeDaemonState,
   writeDaemonStateDebounced,
@@ -2389,10 +2389,14 @@ export async function startDaemon(): Promise<void> {
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
+      const startupLogFileName = 'daemon-session-startup.log';
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(managedAiCredentialEnvironment,
-        () => spawnHappyCLI(args, { cwd, detached: true,
-        stdio: scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe'] : 'ignore',
-        env: { ...env, ...scopeReports?.environment } }));
+        () => {
+          const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
+            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
+          try { return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          finally { closeCapturedSpawnOutputStdio(stdio); }
+        });
       scopeReports?.attach(happyProcess);
       const rootPid = prepared?.pid ?? happyProcess.pid;
       if (!rootPid) return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
@@ -2430,7 +2434,8 @@ export async function startDaemon(): Promise<void> {
         happyProcess.on('error', () => onChildExited(rootPid));
       }
       const webhookCancellation = new AbortController();
-      const webhook = waitForSessionWebhook({ pid: rootPid, pidToAwaiter, logger, signal: webhookCancellation.signal });
+      const webhook = waitForSessionWebhook({ pid: rootPid, pidToAwaiter, logger, signal: webhookCancellation.signal,
+        ...(!prepared && !scopeReports ? { child: happyProcess, startupErrorDetail: () => readCapturedSpawnOutputTail(startupLogFileName) } : {}) });
       if (prepared) {
         try {
           if (!standaloneWindows?.owner.acceptingLaunches) throw new Error('Standalone launch frozen before resume');

@@ -54,7 +54,7 @@ describe('browser image fonts', () => {
 
 describe('image assignment contract', () => {
     it('matches the package contract marker', () => {
-        expect(JSON.parse(readFileSync(join(here, 'contract.json'), 'utf8'))).toEqual({ contractVersion: 3 })
+        expect(JSON.parse(readFileSync(join(here, 'contract.json'), 'utf8'))).toEqual({ contractVersion: 4 })
     })
 
     it.each(['runtime', 'browser'])('labels the final %s image stage', (role) => {

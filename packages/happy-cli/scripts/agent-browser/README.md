@@ -85,6 +85,35 @@ new digests, which reach H only through `abp-stack upgrade`.
 
 ## Install
 
+### Existing Happy machine: browser-only mode
+
+Use browser-only mode when a normal Happy daemon already runs on the machine. It installs only
+the Runtime, Chromium containers, browser egress firewall, fence chain and seccomp profile; it
+does not install a second daemon, Happy package, sandbox policy, Claude sandbox accounts, owner
+firewall or resolver configuration.
+
+```sh
+sudo ./abp-install install --browser-only --daemon-user walter \
+  --machine-id <existing machine id> --workspace-id <studio workspace> \
+  --profile main=<studio userId> --issuer <kid>=/path/capability.pem --sites /path/sites.json \
+  --images /tmp/abp-images
+```
+
+The daemon user's primary group owns `/run/abp` and the daemon token so an already-running daemon
+can use the broker without relying on a supplementary-group refresh. The installer writes the five
+browser task settings plus `HAPPY_BROWSER_TASK_HOST_MODE=browser-only` to
+`/etc/abp/browser-only.env`; the existing daemon must be restarted by its normal supervisor or
+launcher so it reads that file. `abp-stack rotate-keys` rotates the token but prints a reminder
+instead of restarting that daemon. Browser-only uninstall stops the browser stack and removes its
+files without killing the daemon user's processes or removing `/usr/local/bin/happy`.
+
+Users of one browser-only machine share the daemon user's OS permissions, including access to its
+token and processes. This is an explicit trust model; use a dedicated H machine when users need
+an OS-level boundary. The daemon user must also not be in the Docker group. Chromium user, PID and
+network namespaces are allowed by the installed seccomp profile; mount, UTS, IPC and cgroup
+namespaces remain denied. Ensure the selected private `/20` does not overlap Docker or host
+networks.
+
 Copy `scripts/agent-browser/` (with the S1 files), the tarball, the images directory, the
 Saycode server's capability public key (Ed25519 PEM) and the site policy to H, then:
 
