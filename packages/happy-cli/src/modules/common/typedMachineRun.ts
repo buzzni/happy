@@ -11,6 +11,7 @@ export type TypedMachineRunRequest =
         cwd?: string;
         env?: Record<string, string>;
         timeoutMs?: number;
+        timeoutGraceMs?: number;
         outputLimitBytes?: number;
     }
     | { version: 1; action: 'status'; operationId: string }
@@ -28,8 +29,17 @@ export type TypedMachineRunResponse =
         exitCode: number | null;
         truncated: boolean;
         timedOut: boolean;
+        remoteMayContinue: boolean;
+        descendantsReaped: boolean;
     }
-    | { version: 1; action: 'cancel'; operationId: string; state: 'cancelled' | 'already-terminal' };
+    | {
+        version: 1;
+        action: 'cancel';
+        operationId: string;
+        state: 'cancelled' | 'already-terminal';
+        remoteMayContinue: boolean;
+        descendantsReaped: boolean;
+    };
 
 type Operation = {
     process: ChildProcess;
@@ -40,10 +50,19 @@ type Operation = {
     truncated: boolean;
     timedOut: boolean;
     exitCode: number | null;
+    remoteMayContinue: boolean;
+    descendantsReaped: boolean;
+    finishedAt: number;
+    termination?: Promise<void>;
 };
 
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_TIMEOUT_GRACE_MS = 30_000;
+const DEFAULT_TIMEOUT_GRACE_MS = 2_000;
+const MAX_ACTIVE_OPERATIONS = 32;
+const MAX_RETAINED_OPERATIONS = 128;
+const OPERATION_RETENTION_MS = 15 * 60 * 1000;
 const MAX_ARGS = 64;
 const SAFE_EXECUTABLE = /^[a-z][a-z0-9._-]*$/;
 const FORBIDDEN_EXECUTABLE = /^(?:sh|bash|zsh|fish|cmd|powershell|pwsh|node|python|python3|npm|npx|env|xargs|ssh|tmux)$/i;
@@ -71,6 +90,7 @@ function assertRequest(value: unknown): asserts value is TypedMachineRunRequest 
     const env = request.env as Record<string, unknown> | undefined;
     if (env && Object.keys(env).some((key) => !/^[A-Z][A-Z0-9_]*$/.test(key) || DANGEROUS_ENV.test(key) || typeof env[key] !== 'string' || SHELL_SYNTAX.test(env[key] as string))) throw invalid('unsafe env');
     if (request.timeoutMs !== undefined && (typeof request.timeoutMs !== 'number' || !Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1 || request.timeoutMs > MAX_TIMEOUT_MS)) throw invalid('invalid timeout');
+    if (request.timeoutGraceMs !== undefined && (typeof request.timeoutGraceMs !== 'number' || !Number.isSafeInteger(request.timeoutGraceMs) || request.timeoutGraceMs < 1 || request.timeoutGraceMs > MAX_TIMEOUT_GRACE_MS)) throw invalid('invalid timeout grace');
     if (request.outputLimitBytes !== undefined && (typeof request.outputLimitBytes !== 'number' || !Number.isSafeInteger(request.outputLimitBytes) || request.outputLimitBytes < 1 || request.outputLimitBytes > MAX_OUTPUT_BYTES)) throw invalid('invalid output limit');
 }
 
@@ -82,30 +102,77 @@ function append(output: Buffer, chunk: Buffer, limit: number): { value: Buffer; 
         : { value: Buffer.concat([output, chunk.subarray(0, remaining)]), truncated: true };
 }
 
-function terminate(child: ChildProcess): void {
+function processGroupExists(pid: number | undefined): boolean {
+    if (!pid || process.platform === 'win32') return false;
+    try {
+        process.kill(-pid, 0);
+        return true;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+}
+
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
     const pid = child.pid;
     if (!pid) return;
     try {
-        if (process.platform === 'win32') child.kill();
-        else process.kill(-pid, 'SIGTERM');
+        if (process.platform === 'win32') child.kill(signal);
+        else process.kill(-pid, signal);
     } catch { /* already exited */ }
 }
 
 export function createTypedMachineRunHandler(workingDirectory: string) {
     const operations = new Map<string, Operation>();
 
+    const reapExpired = () => {
+        const cutoff = Date.now() - OPERATION_RETENTION_MS;
+        for (const [id, operation] of operations) {
+            if (operation.state !== 'running' && operation.finishedAt < cutoff) operations.delete(id);
+        }
+        const terminal = [...operations.entries()].filter(([, operation]) => operation.state !== 'running');
+        if (terminal.length > MAX_RETAINED_OPERATIONS) {
+            terminal.sort(([, a], [, b]) => a.finishedAt - b.finishedAt);
+            for (const [id] of terminal.slice(0, terminal.length - MAX_RETAINED_OPERATIONS)) operations.delete(id);
+        }
+    };
+
+    const updateReapEvidence = (operation: Operation) => {
+        operation.descendantsReaped = !processGroupExists(operation.process.pid);
+        operation.remoteMayContinue = !operation.descendantsReaped;
+    };
+
+    const terminate = (operation: Operation, graceMs: number): Promise<void> => {
+        if (operation.termination) return operation.termination;
+        operation.termination = (async () => {
+            signalGroup(operation.process, 'SIGTERM');
+            await new Promise<void>((resolve) => {
+                if (operation.process.exitCode !== null || operation.process.signalCode !== null) return resolve();
+                const timer = setTimeout(resolve, graceMs);
+                operation.process.once('close', () => { clearTimeout(timer); resolve(); });
+            });
+            updateReapEvidence(operation);
+            if (!operation.descendantsReaped) {
+                signalGroup(operation.process, 'SIGKILL');
+                await new Promise((resolve) => setTimeout(resolve, Math.min(graceMs, 1_000)));
+                updateReapEvidence(operation);
+            }
+        })();
+        return operation.termination;
+    };
+
     return async (input: unknown): Promise<TypedMachineRunResponse> => {
         assertRequest(input);
         if (process.platform === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
+        reapExpired();
 
         if (input.action === 'status' || input.action === 'cancel') {
             const operation = operations.get(input.operationId);
             if (!operation) throw new Error('MACHINE_RUN_NOT_FOUND: operationId is unknown');
             if (input.action === 'cancel') {
-                if (operation.state !== 'running') return { version: 1, action: 'cancel', operationId: input.operationId, state: 'already-terminal' };
-                terminate(operation.process);
+                if (operation.state !== 'running') return { version: 1, action: 'cancel', operationId: input.operationId, state: 'already-terminal', remoteMayContinue: operation.remoteMayContinue, descendantsReaped: operation.descendantsReaped };
                 operation.state = 'cancelled';
-                return { version: 1, action: 'cancel', operationId: input.operationId, state: 'cancelled' };
+                void terminate(operation, DEFAULT_TIMEOUT_GRACE_MS);
+                return { version: 1, action: 'cancel', operationId: input.operationId, state: 'cancelled', remoteMayContinue: operation.remoteMayContinue, descendantsReaped: operation.descendantsReaped };
             }
             return {
                 version: 1,
@@ -117,8 +184,12 @@ export function createTypedMachineRunHandler(workingDirectory: string) {
                 exitCode: operation.exitCode,
                 truncated: operation.truncated,
                 timedOut: operation.timedOut,
+                remoteMayContinue: operation.remoteMayContinue,
+                descendantsReaped: operation.descendantsReaped,
             };
         }
+
+        if ([...operations.values()].filter((operation) => operation.state === 'running').length >= MAX_ACTIVE_OPERATIONS) throw new Error('MACHINE_RUN_QUOTA_EXCEEDED: too many active operations');
 
         const cwd = input.cwd ? validatePath(input.cwd, workingDirectory) : { valid: true as const, resolvedPath: workingDirectory };
         if (!cwd.valid || !cwd.resolvedPath) throw new Error(`MACHINE_RUN_PATH_DENIED: ${cwd.error}`);
@@ -132,13 +203,13 @@ export function createTypedMachineRunHandler(workingDirectory: string) {
             env: { PATH: process.env.PATH ?? '', ...(input.env ?? {}) },
         });
         const operationId = randomUUID();
-        const operation: Operation = { process: child, state: 'running', stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), outputLimitBytes, truncated: false, timedOut: false, exitCode: null };
+        const operation: Operation = { process: child, state: 'running', stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), outputLimitBytes, truncated: false, timedOut: false, exitCode: null, remoteMayContinue: true, descendantsReaped: false, finishedAt: Number.POSITIVE_INFINITY };
         operations.set(operationId, operation);
         child.stdout?.on('data', (chunk: Buffer) => { const result = append(operation.stdout, chunk, outputLimitBytes); operation.stdout = result.value; operation.truncated ||= result.truncated; });
         child.stderr?.on('data', (chunk: Buffer) => { const result = append(operation.stderr, chunk, outputLimitBytes); operation.stderr = result.value; operation.truncated ||= result.truncated; });
         child.once('error', (error) => { operation.state = 'failed'; operation.stderr = append(operation.stderr, Buffer.from(error.message), outputLimitBytes).value; });
-        child.once('close', (code) => { operation.exitCode = typeof code === 'number' ? code : null; if (operation.state === 'running') operation.state = code === 0 ? 'passed' : 'failed'; });
-        const timer = setTimeout(() => { if (operation.state !== 'running') return; operation.timedOut = true; terminate(child); operation.state = 'failed'; }, input.timeoutMs ?? 30_000);
+        child.once('close', (code) => { operation.exitCode = typeof code === 'number' ? code : null; if (operation.state === 'running') operation.state = code === 0 ? 'passed' : 'failed'; updateReapEvidence(operation); operation.finishedAt = Date.now(); });
+        const timer = setTimeout(() => { if (operation.state !== 'running') return; operation.timedOut = true; operation.state = 'failed'; operation.finishedAt = Date.now(); void terminate(operation, input.timeoutGraceMs ?? DEFAULT_TIMEOUT_GRACE_MS); }, input.timeoutMs ?? 30_000);
         child.once('close', () => clearTimeout(timer));
         return { version: 1, action: 'start', operationId, state: 'accepted' };
     };
