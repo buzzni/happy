@@ -20,6 +20,8 @@ export interface TypedMachineRunHandlerOptions {
     baseEnvironment?: Record<string, string>;
     /** A trusted profile may render its workspace root as an absolute argv value. */
     allowAbsoluteArguments?: boolean;
+    /** A trusted structured profile may pass shell-looking text as argv data (shell remains false). */
+    allowStructuredArguments?: boolean;
 }
 
 export const MACHINE_RUN_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -72,7 +74,8 @@ function assertRequest(value: unknown, options: TypedMachineRunHandlerOptions = 
     }
     if (typeof request.executable !== 'string' || !SAFE_EXECUTABLE.test(request.executable) || FORBIDDEN_EXECUTABLE.test(request.executable)) throw invalid('unsupported executable');
     const allowAbsoluteArguments = options.allowAbsoluteArguments === true;
-    if (!Array.isArray(request.args) || request.args.length > MAX_ARGS || request.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || SHELL_SYNTAX.test(arg) || FORBIDDEN_FLAG.test(arg) || (!allowAbsoluteArguments && (arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg))))) throw invalid('unsafe args');
+    const rejectShellSyntax = options.allowStructuredArguments !== true;
+    if (!Array.isArray(request.args) || request.args.length > MAX_ARGS || request.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || (rejectShellSyntax && SHELL_SYNTAX.test(arg)) || FORBIDDEN_FLAG.test(arg) || (!allowAbsoluteArguments && (arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg))))) throw invalid('unsafe args');
     if (request.cwd !== undefined && typeof request.cwd !== 'string') throw invalid('cwd must be a string');
     if (request.env !== undefined && (!request.env || typeof request.env !== 'object' || Array.isArray(request.env))) throw invalid('env must be an object');
     const env = request.env as Record<string, unknown> | undefined;

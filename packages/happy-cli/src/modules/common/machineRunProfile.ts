@@ -191,7 +191,7 @@ function assertCapabilityRequest(value: unknown): asserts value is MachineRunCap
 
 function parameterValue(parameter: MachineRunParameter, value: unknown, name: string): string {
     if (parameter.type === 'string') {
-        if (typeof value !== 'string' || value.length === 0 || value.length > parameter.maxLength || value.includes('\0') || /[\x00-\x1f;&|`$<>]/.test(value) || value.startsWith('-') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.split('/').includes('..')) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
+        if (typeof value !== 'string' || value.length === 0 || value.length > parameter.maxLength || value.includes('\0') || value.startsWith('-') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.split('/').includes('..')) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
         if (parameter.values && !parameter.values.includes(value)) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
         return value;
     }
@@ -255,6 +255,7 @@ export function createProfileAwareMachineRunHandler(
         platform,
         baseEnvironment,
         allowAbsoluteArguments: true,
+        allowStructuredArguments: true,
     });
 
     return async (input: unknown) => {
