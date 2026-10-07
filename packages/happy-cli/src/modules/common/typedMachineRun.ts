@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { probeProcessGroup, signalProcessGroup, type ProcessGroupEvidence, type SignalOutcome } from '../../daemon/managedProcessGroup';
 import { validatePath } from './pathSecurity';
 
@@ -98,6 +99,7 @@ function signalGroup(child: ChildProcess, signal: NodeJS.Signals): SignalOutcome
 
 export function createTypedMachineRunHandler(workingDirectory: string, options: TypedMachineRunHandlerOptions = {}) {
     const operations = new Map<string, Operation>();
+    const allowedWorkingDirectory = realpathSync(workingDirectory);
     const refreshEvidence = (operation: Operation) => {
         if (!operation.process.pid) operation.processGroupEvidence = { kind: 'indeterminate', detail: 'child has no pid' };
         else operation.processGroupEvidence = probeProcessGroup(operation.process.pid);
@@ -110,7 +112,7 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
     // retention, but that absence is still not proof that descendants were
     // reaped. Keep `remoteMayContinue` true in its response. Positive or
     // indeterminate group evidence remains unresolved for quota purposes.
-    const unresolved = (operation: Operation) => operation.state === 'running' || !operation.childClosed || !operation.terminationSettled || operation.processGroupEvidence.kind !== 'no-local-trace';
+    const unresolved = (operation: Operation) => operation.state === 'running' || !operation.childClosed || (Boolean(operation.process.pid) && (!operation.terminationSettled || operation.processGroupEvidence.kind !== 'no-local-trace'));
     const reapExpired = () => {
         const cutoff = Date.now() - OPERATION_RETENTION_MS;
         for (const [id, operation] of operations) if (!unresolved(operation) && operation.finishedAt < cutoff) operations.delete(id);
@@ -158,7 +160,8 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
             return { version: 1, action: 'status', operationId: input.operationId, state: operation.state, stdout: operation.stdout.toString('utf8'), stderr: operation.stderr.toString('utf8'), exitCode: operation.exitCode, truncated: operation.truncated, timedOut: operation.timedOut, remoteMayContinue: operation.remoteMayContinue, descendantsReaped: operation.descendantsReaped, processGroupEvidence: operation.processGroupEvidence };
         }
         if ([...operations.values()].filter(unresolved).length >= MAX_ACTIVE_OPERATIONS) throw new Error('MACHINE_RUN_QUOTA_EXCEEDED: too many active operations');
-        const cwd = input.cwd ? validatePath(input.cwd, workingDirectory) : { valid: true as const, resolvedPath: workingDirectory };
+        const requestedCwd = input.cwd ? (realpathSync(input.cwd) as string) : allowedWorkingDirectory;
+        const cwd = input.cwd ? validatePath(requestedCwd, allowedWorkingDirectory) : { valid: true as const, resolvedPath: allowedWorkingDirectory };
         if (!cwd.valid || !cwd.resolvedPath) throw new Error(`MACHINE_RUN_PATH_DENIED: ${cwd.error}`);
         const outputLimitBytes = input.outputLimitBytes ?? MAX_OUTPUT_BYTES;
         const child = spawn(input.executable, input.args, { cwd: cwd.resolvedPath, shell: false, detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ...(options.baseEnvironment ?? {}), ...(input.env ?? {}) } });
@@ -175,7 +178,11 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
             refreshEvidence(operation);
             operation.finishedAt = Date.now();
             if (operation.processGroupEvidence.kind !== 'no-local-trace') void terminate(operation, DEFAULT_TIMEOUT_GRACE_MS);
-            else if (!operation.termination) operation.terminationSettled = true;
+            // A spawn error has no PID and therefore no process group to drain. It is
+            // terminal lifecycle evidence; retain the failure without consuming an
+            // active-operation slot forever. A no-local-trace close is likewise settled,
+            // while alive/indeterminate evidence remains unresolved conservatively.
+            else if (!operation.process.pid || !operation.termination) operation.terminationSettled = true;
         });
         const timer = setTimeout(() => { if (operation.state !== 'running') return; operation.timedOut = true; operation.state = 'failed'; operation.finishedAt = Date.now(); void terminate(operation, input.timeoutGraceMs ?? DEFAULT_TIMEOUT_GRACE_MS); }, input.timeoutMs ?? 30_000);
         child.once('close', () => clearTimeout(timer));

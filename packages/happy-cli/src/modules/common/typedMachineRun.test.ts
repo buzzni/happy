@@ -122,6 +122,24 @@ describe('typed machine-run handler', () => {
         }
     });
 
+    it('does not let spawn failures exhaust the active-operation quota', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
+        const handler = createTypedMachineRunHandler(root);
+        try {
+            const ids: string[] = [];
+            for (let index = 0; index < 32; index++) {
+                const started = await handler({ version: 1, action: 'start', executable: 'definitely-missing-machine-run-binary', args: [], cwd: root, timeoutMs: 2_000 });
+                if (started.action !== 'start') throw new Error('machine-run start did not return an operation');
+                ids.push(started.operationId);
+            }
+            for (const id of ids) await waitForTerminal(handler, id);
+            await expect(handler({ version: 1, action: 'start', executable: 'definitely-missing-machine-run-binary', args: [], cwd: root, timeoutMs: 2_000 })).resolves.toMatchObject({ action: 'start', state: 'accepted' });
+            for (const id of ids) await expect(handler({ version: 1, action: 'status', operationId: id })).resolves.toMatchObject({ state: 'failed' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
     it('keeps a surviving-leader observation as no-local-trace evidence', () => {
         const deps = { kill: (target: number, signal: NodeJS.Signals | 0) => { if (signal === 0) throw Object.assign(new Error('gone leader'), { code: 'ESRCH' }); }, sleep: async () => {}, now: Date.now };
         expect(probeProcessGroup(4242, deps)).toEqual({ kind: 'no-local-trace' });

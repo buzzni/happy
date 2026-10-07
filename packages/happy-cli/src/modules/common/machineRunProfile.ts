@@ -1,4 +1,5 @@
 import { tmpdir } from 'node:os';
+import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 import { hashObject } from '../../utils/deterministicJson';
 import {
@@ -233,6 +234,19 @@ function assertKnownFields(request: Record<string, unknown>, allowed: readonly s
     if (unknown) throw new Error(`MACHINE_RUN_INVALID: unknown field ${unknown}`);
 }
 
+async function resolveWorkspaceRoot(target: string, workingDirectory: string): Promise<string> {
+    const lexical = validatePath(target, workingDirectory);
+    if (!lexical.valid || !lexical.resolvedPath) throw new Error(`MACHINE_RUN_WORKSPACE_ROOT_DENIED: ${lexical.error ?? 'workspaceRoot is outside the daemon root'}`);
+    const [root, resolved] = await Promise.all([
+        realpath(workingDirectory).catch(() => null),
+        realpath(lexical.resolvedPath).catch(() => null),
+    ]);
+    if (!root || !resolved || (resolved !== root && !resolved.startsWith(`${root}/`))) throw new Error('MACHINE_RUN_WORKSPACE_ROOT_DENIED: realpath is outside the daemon root');
+    const info = await stat(resolved).catch(() => null);
+    if (!info?.isDirectory()) throw new Error('MACHINE_RUN_WORKSPACE_ROOT_DENIED: workspaceRoot must be a directory');
+    return resolved;
+}
+
 function parameterValue(parameter: MachineRunParameter, value: unknown, name: string): string {
     if (parameter.type === 'string') {
         if (typeof value !== 'string' || value.length === 0 || value.length > parameter.maxLength || value.includes('\0') || value.startsWith('-') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.split('/').includes('..')) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
@@ -315,9 +329,7 @@ export function createProfileAwareMachineRunHandler(
         const profile = resolver.resolve(input.profileId);
         if (!profile) throw new Error(`MACHINE_RUN_PROFILE_NOT_FOUND: ${input.profileId}`);
         if (profile.profileDigest !== input.profileDigest) throw new Error(`MACHINE_RUN_PROFILE_DIGEST_MISMATCH: ${input.profileId}`);
-        const workspace = validatePath(input.workspaceRoot, workingDirectory);
-        if (!workspace.valid || !workspace.resolvedPath) throw new Error(`MACHINE_RUN_WORKSPACE_ROOT_DENIED: ${workspace.error ?? 'workspaceRoot is outside the daemon root'}`);
-        const requestedWorkspaceRoot = workspace.resolvedPath;
+        const requestedWorkspaceRoot = await resolveWorkspaceRoot(input.workspaceRoot, workingDirectory);
         if ((profile.writeScope ?? 'none') !== 'none') throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
         const cwd = profile.cwd === 'workspaceRoot'
             ? requestedWorkspaceRoot
