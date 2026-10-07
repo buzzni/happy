@@ -27,6 +27,7 @@ import {
     type BashRpcExecutionClass,
 } from './bashRpcScheduler';
 import type { PermissionMode } from '@/api/types';
+import { createTypedMachineRunHandler } from './typedMachineRun';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -404,6 +405,7 @@ export type RecoverSessionResult =
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string) {
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
+    rpcHandlerManager.registerHandler('machine-run', createTypedMachineRunHandler(workingDirectory));
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {
