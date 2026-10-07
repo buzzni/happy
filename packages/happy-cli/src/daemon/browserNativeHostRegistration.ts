@@ -80,6 +80,16 @@ export function resolveBrowserNativeHostManifestPath({ platform, homeDir }: {
 /** The same extension published on the Chrome Web Store; users install it there instead of loading the bundle unpacked. */
 export const CHROME_WEB_STORE_EXTENSION_ID = 'oonefemjapkafdiibkllemkjdlmmblbc'
 
+export function resolveBrowserNativeHostHelperPath({ platform, standaloneLauncher, fallback }: {
+    platform: NodeJS.Platform
+    standaloneLauncher?: string
+    fallback: string
+}): string {
+    return platform === 'win32' && standaloneLauncher?.toLowerCase().endsWith('.exe')
+        ? standaloneLauncher
+        : fallback
+}
+
 export function buildBrowserNativeHostManifest({ extensionId, helperPath }: {
     extensionId: string
     helperPath: string

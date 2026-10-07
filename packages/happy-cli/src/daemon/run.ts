@@ -64,7 +64,7 @@ import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
-import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
+import { prepareBrowserNativeMessaging, registerBrowserNativeHost, resolveBrowserNativeHostHelperPath } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
@@ -3545,6 +3545,11 @@ export async function startDaemon(): Promise<void> {
     // Prepare/migrate the token before exposing the helper manifest. Chrome
     // can launch the helper as soon as the manifest exists, and must not race
     // legacy-token migration by creating a different machine-wide token.
+    const nativeMessagingHelperPath = resolveBrowserNativeHostHelperPath({
+      platform: process.platform,
+      standaloneLauncher: process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER,
+      fallback: join(projectPath(), 'bin', 'happy-browser-native-host.mjs'),
+    });
     const nativeMessaging = await prepareBrowserNativeMessaging({
       readToken: () => readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile
@@ -3553,7 +3558,7 @@ export async function startDaemon(): Promise<void> {
         platform: process.platform,
         homeDir: os.homedir(),
         extensionId: resolveExtensionId(resolveExtensionDir()),
-        helperPath: join(projectPath(), 'bin', 'happy-browser-native-host.mjs'),
+        helperPath: nativeMessagingHelperPath,
       }),
       // Browser control can still be paired manually through `happy browser`.
       // A registration failure must not take the whole daemon down.
