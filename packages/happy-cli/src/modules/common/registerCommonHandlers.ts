@@ -30,9 +30,9 @@ import type { PermissionMode } from '@/api/types';
 import { createTypedMachineRunHandler } from './typedMachineRun';
 import {
     createProfileAwareMachineRunHandler,
-    createTrustedMachineRunProfileResolver,
-    type MachineRunProfile,
+    TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
     type MachineRunProfileHandlerOptions,
+    type TrustedMachineRunProfileRegistry,
 } from './machineRunProfile';
 
 const execAsync = promisify(exec);
@@ -410,7 +410,8 @@ export type RecoverSessionResult =
  */
 export interface CommonHandlerOptions {
     machineRun?: {
-        profiles: readonly MachineRunProfile[];
+        /** Host-owned immutable registry. Extension input must never populate this. */
+        profileRegistry: TrustedMachineRunProfileRegistry;
         extensionDataDirectory?: string;
         tempDirectory?: string;
         environment?: NodeJS.ProcessEnv;
@@ -434,7 +435,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     // and argv directly.
     const profileMachineRunHandler = createProfileAwareMachineRunHandler(
         workingDirectory,
-        createTrustedMachineRunProfileResolver(machineRunOptions?.profiles ?? []),
+        machineRunOptions?.profileRegistry ?? TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
         profileHandlerOptions,
     );
     const machineRunHandler = async (request: unknown) => {

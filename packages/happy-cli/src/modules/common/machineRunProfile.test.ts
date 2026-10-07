@@ -34,10 +34,20 @@ async function waitForStatus(handler: (input: unknown) => Promise<any>, operatio
 
 describe('profile-aware machine.run adapter', () => {
     it('validates and freezes trusted profiles before resolving them', () => {
-        const source = profile();
+        const source = profile({
+            parameters: { message: { type: 'string', maxLength: 128, values: ['safe'] } },
+            descendantAllowlist: ['git'],
+        });
         const resolver = createTrustedMachineRunProfileResolver([source]);
         source.argv[0] = 'changed';
+        if (source.parameters.message.type === 'string' && source.parameters.message.values) source.parameters.message.values.push('changed');
         expect(resolver.resolve('buzzni.test.echo')?.argv).toEqual(['{{message}}']);
+        expect(resolver.resolve('buzzni.test.echo')?.parameters.message).toEqual({ type: 'string', maxLength: 128, values: ['safe'] });
+        expect(resolver.resolve('buzzni.test.echo')?.descendantAllowlist).toEqual(['git']);
+        expect(() => {
+            const parameter = resolver.resolve('buzzni.test.echo')?.parameters.message;
+            if (parameter?.type === 'string') parameter.values?.push('still-immutable');
+        }).toThrow();
         expect(() => createTrustedMachineRunProfileResolver([profile(), profile({ id: 'buzzni.test.echo' })])).toThrow('duplicate profile id');
         expect(() => createTrustedMachineRunProfileResolver([profile({ executable: 'sh' })])).toThrow('unsupported executable');
         expect(() => createTrustedMachineRunProfileResolver([profile({ argv: ['/tmp/tool'] })])).toThrow('unsafe argument');
@@ -92,6 +102,20 @@ describe('profile-aware machine.run adapter', () => {
                 profiles: [],
             });
             await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_UNSUPPORTED_PLATFORM');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('reports an unavailable capability when no trusted profile is registered', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const handler = createProfileAwareMachineRunHandler(root, []);
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({
+                supported: false,
+                profiles: [],
+                reason: 'MACHINE_RUN_PROFILE_REGISTRY_UNAVAILABLE: no trusted profiles are registered',
+            });
         } finally {
             await rm(root, { recursive: true, force: true });
         }

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
+import { createTrustedMachineRunProfileResolver } from './machineRunProfile';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -57,16 +58,28 @@ describe('registerCommonHandlers machine.run capability', () => {
     it('keeps the raw RPC and exposes profile capability negotiation on both method names', async () => {
         const { handlers } = await createHandlers(undefined, {
             machineRun: {
-                profiles: [{
+                profileRegistry: createTrustedMachineRunProfileResolver([{
                     id: 'buzzni.test.echo', executable: 'printf', argv: ['{{message}}'],
                     parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
                     envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
-                }],
+                }]),
             },
         });
         await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
         await expect(handlers.get('machine-run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
         await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] })).resolves.toMatchObject({ action: 'start', state: 'accepted' });
+    });
+
+    it('fails closed when the daemon has no host-owned profile registry', async () => {
+        const { handlers } = await createHandlers();
+        await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
+            supported: false,
+            profiles: [],
+            reason: 'MACHINE_RUN_PROFILE_REGISTRY_UNAVAILABLE: no trusted profiles are registered',
+        });
+        await expect(handlers.get('machine.run')?.({
+            action: 'start', profileId: 'extension.arbitrary', parameters: {},
+        })).rejects.toThrow('MACHINE_RUN_PROFILE_NOT_FOUND');
     });
 });
 

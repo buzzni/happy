@@ -33,6 +33,12 @@ export interface MachineRunProfileResolver {
     list(): readonly MachineRunProfile[];
 }
 
+/**
+ * A profile resolver is the daemon's trust boundary. Extension input must not
+ * be used to populate it at runtime; only a host-owned registry may do that.
+ */
+export type TrustedMachineRunProfileRegistry = MachineRunProfileResolver;
+
 export type MachineRunCapabilityRequest =
     | { action: 'capabilities'; version?: 1 }
     | { action: 'start'; profileId: string; parameters: Record<string, MachineRunJsonValue> }
@@ -147,9 +153,14 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
         argv: Object.freeze(profile.argv) as unknown as string[],
         parameters: Object.freeze(Object.fromEntries(Object.entries(parameters).map(([name, parameter]) => [
             name,
-            Object.freeze(parameter),
+            Object.freeze(parameter.type === 'string' && parameter.values
+                ? { ...parameter, values: Object.freeze([...parameter.values]) }
+                : parameter),
         ]))) as Record<string, MachineRunParameter>,
         envAllowlist: Object.freeze(profile.envAllowlist) as unknown as string[],
+        ...(profile.descendantAllowlist
+            ? { descendantAllowlist: Object.freeze([...profile.descendantAllowlist]) as unknown as string[] }
+            : {}),
     });
 }
 
@@ -160,10 +171,21 @@ export function createTrustedMachineRunProfileResolver(profiles: readonly Machin
         if (byId.has(validated.id)) throw profileError(`duplicate profile id ${validated.id}`);
         byId.set(validated.id, validated);
     }
-    return {
-        resolve: (profileId) => byId.get(profileId),
+    return Object.freeze({
+        resolve: (profileId: string) => byId.get(profileId),
         list: () => [...byId.values()],
-    };
+    });
+}
+
+/** No host-owned profiles are currently shipped by the daemon. */
+export const TRUSTED_MACHINE_RUN_PROFILE_REGISTRY: TrustedMachineRunProfileRegistry =
+    createTrustedMachineRunProfileResolver([]);
+
+export function machineRunCapabilitySupported(
+    registry: TrustedMachineRunProfileRegistry,
+    platform: NodeJS.Platform = process.platform,
+): boolean {
+    return platform !== 'win32' && registry.list().length > 0;
 }
 
 function resolverFor(source: MachineRunProfileResolver | readonly MachineRunProfile[]): MachineRunProfileResolver {
@@ -222,7 +244,7 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
 }
 
 function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform): Extract<MachineRunCapabilityResponse, { action: 'capabilities' }> {
-    const supported = platform !== 'win32';
+    const supported = machineRunCapabilitySupported(resolver, platform);
     return {
         version: 1,
         action: 'capabilities',
@@ -235,7 +257,11 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
         profiles: supported ? resolver.list().map(({ id, cwd, parameters, timeoutMs, outputLimitBytes }) => ({
             id, cwd, parameters, timeoutMs, outputLimitBytes,
         })) : [],
-        ...(supported ? {} : { reason: 'MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required' }),
+        ...(platform === 'win32'
+            ? { reason: 'MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required' }
+            : supported
+                ? {}
+                : { reason: 'MACHINE_RUN_PROFILE_REGISTRY_UNAVAILABLE: no trusted profiles are registered' }),
     };
 }
 

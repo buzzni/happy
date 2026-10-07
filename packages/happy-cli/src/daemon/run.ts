@@ -341,6 +341,7 @@ import {
   MACHINE_RUN_MAX_OUTPUT_BYTES,
   MACHINE_RUN_MAX_TIMEOUT_MS,
 } from '@/modules/common/typedMachineRun';
+import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -371,7 +372,7 @@ export const initialMachineMetadata: MachineMetadata = {
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
-    supported: process.platform !== 'win32',
+    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY),
     shell: false,
     stdin: 'none',
     maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
