@@ -6,6 +6,7 @@ import {
     buildBrowserNativeHostManifest,
     prepareBrowserNativeMessaging,
     registerBrowserNativeHost,
+    resolveBrowserNativeHostHelperPath,
     resolveBrowserNativeHostManifestPath,
 } from './browserNativeHostRegistration'
 
@@ -18,6 +19,15 @@ afterEach(async () => {
 })
 
 describe('browser native host registration', () => {
+    it('uses the verified Windows launcher for native messaging and keeps the script fallback elsewhere', () => {
+        expect(resolveBrowserNativeHostHelperPath({ platform: 'win32', standaloneLauncher: 'C:\\runtime\\session-launcher.exe', fallback: 'C:\\cli\\host.mjs' }))
+            .toBe('C:\\runtime\\session-launcher.exe')
+        expect(resolveBrowserNativeHostHelperPath({ platform: 'win32', standaloneLauncher: 'C:\\cli\\host.mjs', fallback: 'C:\\cli\\host.mjs' }))
+            .toBe('C:\\cli\\host.mjs')
+        expect(resolveBrowserNativeHostHelperPath({ platform: 'darwin', standaloneLauncher: '/runtime/session-launcher.exe', fallback: '/cli/host.mjs' }))
+            .toBe('/cli/host.mjs')
+    })
+
     it('prepares or migrates the bridge token before exposing the native host manifest', async () => {
         const events: string[] = []
 
