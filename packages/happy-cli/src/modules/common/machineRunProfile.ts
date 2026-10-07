@@ -119,6 +119,8 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
     if (!Number.isSafeInteger(raw.timeoutMs) || raw.timeoutMs < 1 || raw.timeoutMs > MACHINE_RUN_MAX_TIMEOUT_MS) throw profileError(`invalid timeout for ${raw.id}`);
     if (!Number.isSafeInteger(raw.outputLimitBytes) || raw.outputLimitBytes < 1 || raw.outputLimitBytes > MACHINE_RUN_MAX_OUTPUT_BYTES) throw profileError(`invalid output limit for ${raw.id}`);
     if (raw.stdin !== 'none') throw profileError(`stdin must be none for ${raw.id}`);
+    if (raw.writeScope !== undefined && raw.writeScope !== 'none' && raw.writeScope !== 'moai' && raw.writeScope !== 'project') throw profileError(`unsupported write scope for ${raw.id}`);
+    if (raw.descendantAllowlist !== undefined && (!Array.isArray(raw.descendantAllowlist) || raw.descendantAllowlist.length > 8 || raw.descendantAllowlist.some((name) => typeof name !== 'string' || !/^[a-z][a-z0-9._-]{0,63}$/i.test(name) || /^(?:sh|bash|zsh|fish|cmd|powershell|pwsh|node|python|python3|npm|npx|env|xargs|ssh|tmux|vi|vim|nvim|nano|less|more)$/i.test(name)))) throw profileError(`unsafe descendants for ${raw.id}`);
 
     // Validate placeholders against the profile's declaration while keeping the
     // declaration immutable after the trusted host has accepted it.
@@ -266,6 +268,7 @@ export function createProfileAwareMachineRunHandler(
 
         const profile = resolver.resolve(input.profileId);
         if (!profile) throw new Error(`MACHINE_RUN_PROFILE_NOT_FOUND: ${input.profileId}`);
+        if ((profile.writeScope ?? 'none') !== 'none') throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
         const cwd = profile.cwd === 'workspaceRoot'
             ? workingDirectory
             : profile.cwd === 'extensionData'

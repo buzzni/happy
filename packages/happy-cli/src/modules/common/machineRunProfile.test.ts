@@ -96,4 +96,14 @@ describe('profile-aware machine.run adapter', () => {
             await rm(root, { recursive: true, force: true });
         }
     });
+
+    it('refuses declared write scopes until the daemon has a filesystem evidence backend', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const handler = createProfileAwareMachineRunHandler(root, [profile({ writeScope: 'project', descendantAllowlist: ['git'] })]);
+            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
 });
