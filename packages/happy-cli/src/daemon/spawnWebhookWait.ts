@@ -3,7 +3,9 @@ import type { TrackedSession } from './types';
 
 type SpawnedChild = {
   once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  once(event: 'error', listener: (error: Error) => void): unknown;
   removeListener?(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  removeListener?(event: 'error', listener: (error: Error) => void): unknown;
 };
 
 export const DEFAULT_SESSION_START_SOFT_TIMEOUT_MS = 15_000;
@@ -60,11 +62,17 @@ export function waitForSessionWebhook({
       const suffixDetail = detail ? `: ${detail.slice(-4_000)}` : '';
       finish({ type: 'error', errorMessage: `Session process exited before webhook for PID ${pid}${suffix} (code=${code ?? 'null'}, signal=${signalName ?? 'none'})${suffixDetail}` });
     };
+    const onChildError = (error: Error) => {
+      const detail = [error.message, startupErrorDetail?.()].filter(Boolean).join('\n').trim();
+      const suffixDetail = detail ? `: ${detail.slice(-4_000)}` : '';
+      finish({ type: 'error', errorMessage: `Session process failed before webhook for PID ${pid}${suffix}${suffixDetail}` });
+    };
     const finish = (result: SpawnSessionResult) => {
       if (settled) return;
       settled = true; clearTimeout(softTimeout); clearTimeout(finalTimeout);
       signal?.removeEventListener('abort', abort);
       child?.removeListener?.('exit', onChildExit);
+      child?.removeListener?.('error', onChildError);
       if (pidToAwaiter.get(pid) === completed) pidToAwaiter.delete(pid);
       resolve(result);
     };
@@ -85,6 +93,7 @@ export function waitForSessionWebhook({
     };
     pidToAwaiter.set(pid, completed);
     child?.once('exit', onChildExit);
+    child?.once('error', onChildError);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
   });
