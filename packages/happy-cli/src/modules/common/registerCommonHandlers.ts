@@ -28,6 +28,12 @@ import {
 } from './bashRpcScheduler';
 import type { PermissionMode } from '@/api/types';
 import { createTypedMachineRunHandler } from './typedMachineRun';
+import {
+    createProfileAwareMachineRunHandler,
+    createTrustedMachineRunProfileResolver,
+    type MachineRunProfile,
+    type MachineRunProfileHandlerOptions,
+} from './machineRunProfile';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -402,10 +408,53 @@ export type RecoverSessionResult =
 /**
  * Register all RPC handlers with the session
  */
-export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string) {
+export interface CommonHandlerOptions {
+    machineRun?: {
+        profiles: readonly MachineRunProfile[];
+        extensionDataDirectory?: string;
+        tempDirectory?: string;
+        environment?: NodeJS.ProcessEnv;
+        platform?: NodeJS.Platform;
+    };
+}
+
+export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
-    rpcHandlerManager.registerHandler('machine-run', createTypedMachineRunHandler(workingDirectory));
+    const rawMachineRunHandler = createTypedMachineRunHandler(workingDirectory);
+    const machineRunOptions = options.machineRun;
+    const profileHandlerOptions: MachineRunProfileHandlerOptions = machineRunOptions ? {
+        extensionDataDirectory: machineRunOptions.extensionDataDirectory,
+        tempDirectory: machineRunOptions.tempDirectory,
+        environment: machineRunOptions.environment,
+        platform: machineRunOptions.platform,
+    } : { platform: process.platform };
+    // `machine.run` is the profile-aware capability used by Desktop. Keep the
+    // hyphenated raw RPC above for older clients that already send executable
+    // and argv directly.
+    const profileMachineRunHandler = createProfileAwareMachineRunHandler(
+        workingDirectory,
+        createTrustedMachineRunProfileResolver(machineRunOptions?.profiles ?? []),
+        profileHandlerOptions,
+    );
+    const machineRunHandler = async (request: unknown) => {
+        const input = request && typeof request === 'object' && !Array.isArray(request) ? request as Record<string, unknown> : {};
+        if (input.action === 'capabilities' || (input.action === 'start' && 'profileId' in input)) return profileMachineRunHandler(request);
+        if (input.action === 'status' || input.action === 'cancel') {
+            try {
+                return await profileMachineRunHandler(request);
+            } catch (error) {
+                // Operation ids are shared by the two request shapes for
+                // compatibility. If the profile store does not own it, let
+                // the legacy handler answer for an older raw caller.
+                if (!(error instanceof Error) || !error.message.startsWith('MACHINE_RUN_NOT_FOUND:')) throw error;
+                return rawMachineRunHandler(request);
+            }
+        }
+        return rawMachineRunHandler(request);
+    };
+    rpcHandlerManager.registerHandler('machine-run', machineRunHandler);
+    rpcHandlerManager.registerHandler('machine.run', profileMachineRunHandler);
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {

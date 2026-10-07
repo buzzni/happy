@@ -4,13 +4,13 @@ import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
-import { registerCommonHandlers } from './registerCommonHandlers';
+import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
 const temporaryDirectories: string[] = [];
 
-async function createHandlers(workingDirectory?: string) {
+async function createHandlers(workingDirectory?: string, options?: CommonHandlerOptions) {
     if (!workingDirectory) {
         workingDirectory = await mkdtemp(join(tmpdir(), 'happy-read-chunk-'));
         temporaryDirectories.push(workingDirectory);
@@ -21,7 +21,7 @@ async function createHandlers(workingDirectory?: string) {
             handlers.set(method, handler);
         },
     } as unknown as RpcHandlerManager;
-    registerCommonHandlers(manager, workingDirectory);
+    registerCommonHandlers(manager, workingDirectory, options);
     return { handlers, workingDirectory };
 }
 
@@ -50,6 +50,23 @@ describe('registerCommonHandlers bash scheduling', () => {
             stdout: 'background',
             exitCode: 0,
         });
+    });
+});
+
+describe('registerCommonHandlers machine.run capability', () => {
+    it('keeps the raw RPC and exposes profile capability negotiation on both method names', async () => {
+        const { handlers } = await createHandlers(undefined, {
+            machineRun: {
+                profiles: [{
+                    id: 'buzzni.test.echo', executable: 'printf', argv: ['{{message}}'],
+                    parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
+                    envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
+                }],
+            },
+        });
+        await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
+        await expect(handlers.get('machine-run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
+        await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] })).resolves.toMatchObject({ action: 'start', state: 'accepted' });
     });
 });
 

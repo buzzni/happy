@@ -337,6 +337,10 @@ import { enforceLeaseRenewal } from './managedGenerationRearm';
 import { systemMonotonicNow } from '@/launcher/supervisor';
 import { createLauncherClient, createUnixSocketRequest } from './launch/launcherClient';
 import { defaultProvisioningDeps } from './managedRuntimeIdentity';
+import {
+  MACHINE_RUN_MAX_OUTPUT_BYTES,
+  MACHINE_RUN_MAX_TIMEOUT_MS,
+} from '@/modules/common/typedMachineRun';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -365,6 +369,14 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
+  machineRun: {
+    protocolVersion: 1,
+    supported: process.platform !== 'win32',
+    shell: false,
+    stdin: 'none',
+    maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
+    maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
+  },
   rpcBinding: RPC_BINDING_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
 };

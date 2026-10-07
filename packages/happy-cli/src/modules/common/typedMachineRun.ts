@@ -13,6 +13,19 @@ export type TypedMachineRunResponse =
     | { version: 1; action: 'status'; operationId: string; state: 'running' | 'passed' | 'failed' | 'cancelled'; stdout: string; stderr: string; exitCode: number | null; truncated: boolean; timedOut: boolean; remoteMayContinue: boolean; descendantsReaped: boolean; processGroupEvidence: ProcessGroupEvidence }
     | { version: 1; action: 'cancel'; operationId: string; state: 'cancelled' | 'already-terminal'; remoteMayContinue: boolean; descendantsReaped: boolean; processGroupEvidence: ProcessGroupEvidence };
 
+export interface TypedMachineRunHandlerOptions {
+    /** Override the platform in tests or an embedding host. */
+    platform?: NodeJS.Platform;
+    /** Environment owned by the adapter. Defaults to PATH only. */
+    baseEnvironment?: Record<string, string>;
+    /** Profile arguments are still argv, so shell syntax is data, not a shell. */
+    allowUnsafeArguments?: boolean;
+}
+
+export const MACHINE_RUN_MAX_OUTPUT_BYTES = 1024 * 1024;
+export const MACHINE_RUN_MAX_TIMEOUT_MS = 5 * 60 * 1000;
+export const MACHINE_RUN_MAX_TIMEOUT_GRACE_MS = 30_000;
+
 type Operation = {
     process: ChildProcess;
     state: 'running' | 'passed' | 'failed' | 'cancelled';
@@ -32,9 +45,9 @@ type Operation = {
     termination?: Promise<void>;
 };
 
-const MAX_OUTPUT_BYTES = 1024 * 1024;
-const MAX_TIMEOUT_MS = 5 * 60 * 1000;
-const MAX_TIMEOUT_GRACE_MS = 30_000;
+const MAX_OUTPUT_BYTES = MACHINE_RUN_MAX_OUTPUT_BYTES;
+const MAX_TIMEOUT_MS = MACHINE_RUN_MAX_TIMEOUT_MS;
+const MAX_TIMEOUT_GRACE_MS = MACHINE_RUN_MAX_TIMEOUT_GRACE_MS;
 const DEFAULT_TIMEOUT_GRACE_MS = 2_000;
 const MAX_ACTIVE_OPERATIONS = 32;
 const MAX_RETAINED_OPERATIONS = 128;
@@ -48,7 +61,7 @@ const DANGEROUS_ENV = /^(?:PATH|LD_PRELOAD|DYLD_|NODE_OPTIONS|BASH_ENV|GIT_SSH_C
 
 function invalid(message: string): Error { return new Error(`MACHINE_RUN_INVALID: ${message}`); }
 
-function assertRequest(value: unknown): asserts value is TypedMachineRunRequest {
+function assertRequest(value: unknown, options: TypedMachineRunHandlerOptions = {}): asserts value is TypedMachineRunRequest {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid('request must be an object');
     const request = value as Record<string, unknown>;
     if (request.version !== 1) throw invalid('unsupported version');
@@ -58,11 +71,12 @@ function assertRequest(value: unknown): asserts value is TypedMachineRunRequest 
         return;
     }
     if (typeof request.executable !== 'string' || !SAFE_EXECUTABLE.test(request.executable) || FORBIDDEN_EXECUTABLE.test(request.executable)) throw invalid('unsupported executable');
-    if (!Array.isArray(request.args) || request.args.length > MAX_ARGS || request.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || SHELL_SYNTAX.test(arg) || FORBIDDEN_FLAG.test(arg) || arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg))) throw invalid('unsafe args');
+    const unsafeArguments = !options.allowUnsafeArguments;
+    if (!Array.isArray(request.args) || request.args.length > MAX_ARGS || request.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || (unsafeArguments && (SHELL_SYNTAX.test(arg) || FORBIDDEN_FLAG.test(arg) || arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg))))) throw invalid('unsafe args');
     if (request.cwd !== undefined && typeof request.cwd !== 'string') throw invalid('cwd must be a string');
     if (request.env !== undefined && (!request.env || typeof request.env !== 'object' || Array.isArray(request.env))) throw invalid('env must be an object');
     const env = request.env as Record<string, unknown> | undefined;
-    if (env && Object.keys(env).some((key) => !/^[A-Z][A-Z0-9_]*$/.test(key) || DANGEROUS_ENV.test(key) || typeof env[key] !== 'string' || SHELL_SYNTAX.test(env[key] as string))) throw invalid('unsafe env');
+    if (env && Object.keys(env).some((key) => !/^[A-Z][A-Z0-9_]*$/.test(key) || DANGEROUS_ENV.test(key) || typeof env[key] !== 'string' || (unsafeArguments ? false : SHELL_SYNTAX.test(env[key] as string)))) throw invalid('unsafe env');
     if (request.timeoutMs !== undefined && (typeof request.timeoutMs !== 'number' || !Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1 || request.timeoutMs > MAX_TIMEOUT_MS)) throw invalid('invalid timeout');
     if (request.timeoutGraceMs !== undefined && (typeof request.timeoutGraceMs !== 'number' || !Number.isSafeInteger(request.timeoutGraceMs) || request.timeoutGraceMs < 1 || request.timeoutGraceMs > MAX_TIMEOUT_GRACE_MS)) throw invalid('invalid timeout grace');
     if (request.outputLimitBytes !== undefined && (typeof request.outputLimitBytes !== 'number' || !Number.isSafeInteger(request.outputLimitBytes) || request.outputLimitBytes < 1 || request.outputLimitBytes > MAX_OUTPUT_BYTES)) throw invalid('invalid output limit');
@@ -79,7 +93,7 @@ function signalGroup(child: ChildProcess, signal: NodeJS.Signals): SignalOutcome
     return signalProcessGroup(child.pid, signal);
 }
 
-export function createTypedMachineRunHandler(workingDirectory: string) {
+export function createTypedMachineRunHandler(workingDirectory: string, options: TypedMachineRunHandlerOptions = {}) {
     const operations = new Map<string, Operation>();
     const refreshEvidence = (operation: Operation) => {
         if (!operation.process.pid) operation.processGroupEvidence = { kind: 'indeterminate', detail: 'child has no pid' };
@@ -121,8 +135,8 @@ export function createTypedMachineRunHandler(workingDirectory: string) {
         return operation.termination;
     };
     return async (input: unknown): Promise<TypedMachineRunResponse> => {
-        assertRequest(input);
-        if (process.platform === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
+        assertRequest(input, options);
+        if ((options.platform ?? process.platform) === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
         reapExpired();
         if (input.action === 'status' || input.action === 'cancel') {
             const operation = operations.get(input.operationId);
@@ -140,7 +154,7 @@ export function createTypedMachineRunHandler(workingDirectory: string) {
         const cwd = input.cwd ? validatePath(input.cwd, workingDirectory) : { valid: true as const, resolvedPath: workingDirectory };
         if (!cwd.valid || !cwd.resolvedPath) throw new Error(`MACHINE_RUN_PATH_DENIED: ${cwd.error}`);
         const outputLimitBytes = input.outputLimitBytes ?? MAX_OUTPUT_BYTES;
-        const child = spawn(input.executable, input.args, { cwd: cwd.resolvedPath, shell: false, detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ...(input.env ?? {}) } });
+        const child = spawn(input.executable, input.args, { cwd: cwd.resolvedPath, shell: false, detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ...(options.baseEnvironment ?? {}), ...(input.env ?? {}) } });
         const operationId = randomUUID();
         const operation: Operation = { process: child, state: 'running', stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), outputLimitBytes, truncated: false, timedOut: false, exitCode: null, remoteMayContinue: true, descendantsReaped: false, processGroupEvidence: { kind: 'alive' }, childClosed: false, terminationSettled: false, finishedAt: Number.POSITIVE_INFINITY };
         operations.set(operationId, operation);
