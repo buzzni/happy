@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTypedMachineRunHandler } from './typedMachineRun';
+import { probeProcessGroup, signalProcessGroup } from '../../daemon/managedProcessGroup';
 
 describe('typed machine-run handler', () => {
     it('runs argv without a shell and returns bounded output through status', async () => {
@@ -15,8 +16,9 @@ describe('typed machine-run handler', () => {
             await new Promise((resolve) => setTimeout(resolve, 100));
             await expect(handler({ version: 1, action: 'status', operationId: started.operationId })).resolves.toMatchObject({ state: 'passed', stdout: 'typed', exitCode: 0 });
             const status = await handler({ version: 1, action: 'status', operationId: started.operationId });
-            expect(status.action === 'status' && status.descendantsReaped).toBe(true);
-            expect(status.action === 'status' && status.remoteMayContinue).toBe(false);
+            expect(status.action === 'status' && status.descendantsReaped).toBe(false);
+            expect(status.action === 'status' && status.remoteMayContinue).toBe(true);
+            expect(status.action === 'status' && status.processGroupEvidence.kind).toBe('no-local-trace');
         } finally {
             await rm(root, { recursive: true, force: true });
         }
@@ -46,20 +48,20 @@ describe('typed machine-run handler', () => {
             if (waiting.action !== 'start') return;
             await expect(handler({ version: 1, action: 'cancel', operationId: waiting.operationId })).resolves.toMatchObject({ action: 'cancel', state: 'cancelled' });
             await new Promise((resolve) => setTimeout(resolve, 100));
-            await expect(handler({ version: 1, action: 'status', operationId: waiting.operationId })).resolves.toMatchObject({ state: 'cancelled', descendantsReaped: true, remoteMayContinue: false });
+            await expect(handler({ version: 1, action: 'status', operationId: waiting.operationId })).resolves.toMatchObject({ state: 'cancelled', descendantsReaped: false, remoteMayContinue: true, processGroupEvidence: { kind: 'no-local-trace' } });
         } finally {
             await rm(root, { recursive: true, force: true });
         }
     });
 
-    it('escalates a timed out process group after the configured grace period', async () => {
+    it('escalates a SIGTERM-ignoring process group to SIGKILL after grace', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
         try {
             const handler = createTypedMachineRunHandler(root);
-            const started = await handler({ version: 1, action: 'start', executable: 'sleep', args: ['5'], cwd: root, timeoutMs: 20, timeoutGraceMs: 20 });
+            const started = await handler({ version: 1, action: 'start', executable: 'ruby', args: ['-e', 'Signal.trap(:TERM, "IGNORE").tap { sleep 5 }'], cwd: root, timeoutMs: 20, timeoutGraceMs: 20 });
             if (started.action !== 'start') return;
             await new Promise((resolve) => setTimeout(resolve, 150));
-            await expect(handler({ version: 1, action: 'status', operationId: started.operationId })).resolves.toMatchObject({ state: 'failed', timedOut: true, descendantsReaped: true, remoteMayContinue: false });
+            await expect(handler({ version: 1, action: 'status', operationId: started.operationId })).resolves.toMatchObject({ state: 'failed', timedOut: true, descendantsReaped: false, remoteMayContinue: true, processGroupEvidence: { kind: 'no-local-trace' } });
         } finally {
             await rm(root, { recursive: true, force: true });
         }
@@ -76,6 +78,8 @@ describe('typed machine-run handler', () => {
             }
             await expect(handler({ version: 1, action: 'start', executable: 'sleep', args: ['5'], cwd: root })).rejects.toThrow('MACHINE_RUN_QUOTA_EXCEEDED');
             for (const operationId of operationIds) await handler({ version: 1, action: 'cancel', operationId });
+            await expect(handler({ version: 1, action: 'start', executable: 'printf', args: ['blocked'], cwd: root })).rejects.toThrow('MACHINE_RUN_QUOTA_EXCEEDED');
+            await new Promise((resolve) => setTimeout(resolve, 150));
             const completed = await handler({ version: 1, action: 'start', executable: 'printf', args: ['retained'], cwd: root });
             expect(completed.action).toBe('start');
         } finally {
@@ -84,5 +88,16 @@ describe('typed machine-run handler', () => {
             }
             await rm(root, { recursive: true, force: true });
         }
+    });
+
+    it('keeps a surviving-leader observation as no-local-trace evidence', () => {
+        const deps = { kill: (target: number, signal: NodeJS.Signals | 0) => { if (signal === 0) throw Object.assign(new Error('gone leader'), { code: 'ESRCH' }); }, sleep: async () => {}, now: Date.now };
+        expect(probeProcessGroup(4242, deps)).toEqual({ kind: 'no-local-trace' });
+    });
+
+    it('keeps unknown signal failures indeterminate', () => {
+        const deps = { kill: () => { throw Object.assign(new Error('unexpected'), { code: 'EIO' }); }, sleep: async () => {}, now: Date.now };
+        expect(signalProcessGroup(4242, 'SIGTERM', deps)).toEqual({ kind: 'indeterminate', detail: 'EIO' });
+        expect(probeProcessGroup(4242, deps)).toEqual({ kind: 'indeterminate', detail: 'EIO' });
     });
 });
