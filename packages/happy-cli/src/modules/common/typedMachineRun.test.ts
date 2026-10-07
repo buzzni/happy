@@ -5,6 +5,15 @@ import { join } from 'node:path';
 import { createTypedMachineRunHandler } from './typedMachineRun';
 import { probeProcessGroup, signalProcessGroup } from '../../daemon/managedProcessGroup';
 
+async function waitForTerminal(handler: ReturnType<typeof createTypedMachineRunHandler>, operationId: string) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+        const status = await handler({ version: 1, action: 'status', operationId });
+        if (status.action === 'status' && status.state !== 'running') return status;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`operation did not reach a terminal state: ${operationId}`);
+}
+
 describe('typed machine-run handler', () => {
     it('runs argv without a shell and returns bounded output through status', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
@@ -46,7 +55,7 @@ describe('typed machine-run handler', () => {
             await expect(handler({ version: 1, action: 'status', operationId: started.operationId })).resolves.toMatchObject({ truncated: true, stdout: '1234' });
             const waiting = await handler({ version: 1, action: 'start', executable: 'sleep', args: ['2'], cwd: root, timeoutMs: 2_000 });
             if (waiting.action !== 'start') return;
-            await expect(handler({ version: 1, action: 'cancel', operationId: waiting.operationId })).resolves.toMatchObject({ action: 'cancel', state: 'cancelled' });
+            await expect(handler({ version: 1, action: 'cancel', operationId: waiting.operationId })).resolves.toMatchObject({ action: 'cancel', state: 'cancelled', descendantsReaped: false, remoteMayContinue: true });
             await new Promise((resolve) => setTimeout(resolve, 100));
             await expect(handler({ version: 1, action: 'status', operationId: waiting.operationId })).resolves.toMatchObject({ state: 'cancelled', descendantsReaped: false, remoteMayContinue: true, processGroupEvidence: { kind: 'no-local-trace' } });
         } finally {
@@ -86,6 +95,29 @@ describe('typed machine-run handler', () => {
             for (const operationId of operationIds) {
                 try { await handler({ version: 1, action: 'cancel', operationId }); } catch { /* already exited */ }
             }
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('bounds terminal retention even when remote continuation remains unresolved', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
+        const handler = createTypedMachineRunHandler(root);
+        const operationIds: string[] = [];
+        try {
+            for (let index = 0; index < 129; index++) {
+                const started = await handler({ version: 1, action: 'start', executable: 'printf', args: [String(index)], cwd: root, timeoutMs: 2_000 });
+                if (started.action !== 'start') throw new Error('machine-run start did not return an operation');
+                operationIds.push(started.operationId);
+                const terminal = await waitForTerminal(handler, started.operationId);
+                expect(terminal.remoteMayContinue).toBe(true);
+                expect(terminal.descendantsReaped).toBe(false);
+                expect(terminal.processGroupEvidence).toEqual({ kind: 'no-local-trace' });
+            }
+
+            // A status request runs retention before looking up the operation.
+            await expect(handler({ version: 1, action: 'status', operationId: operationIds.at(-1)! })).resolves.toMatchObject({ state: 'passed' });
+            await expect(handler({ version: 1, action: 'status', operationId: operationIds[0] })).rejects.toThrow('MACHINE_RUN_NOT_FOUND');
+        } finally {
             await rm(root, { recursive: true, force: true });
         }
     });

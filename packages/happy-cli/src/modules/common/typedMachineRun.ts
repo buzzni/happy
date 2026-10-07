@@ -106,6 +106,10 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
         operation.descendantsReaped = false;
         operation.remoteMayContinue = true;
     };
+    // A terminal operation with no local group trace can enter bounded
+    // retention, but that absence is still not proof that descendants were
+    // reaped. Keep `remoteMayContinue` true in its response. Positive or
+    // indeterminate group evidence remains unresolved for quota purposes.
     const unresolved = (operation: Operation) => operation.state === 'running' || !operation.childClosed || !operation.terminationSettled || operation.processGroupEvidence.kind !== 'no-local-trace';
     const reapExpired = () => {
         const cutoff = Date.now() - OPERATION_RETENTION_MS;
@@ -164,7 +168,15 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
         child.stdout?.on('data', (chunk: Buffer) => { const result = append(operation.stdout, chunk, Math.max(0, outputLimitBytes - operation.stderr.length)); operation.stdout = result.value; operation.truncated ||= result.truncated; });
         child.stderr?.on('data', (chunk: Buffer) => { const result = append(operation.stderr, chunk, Math.max(0, outputLimitBytes - operation.stdout.length)); operation.stderr = result.value; operation.truncated ||= result.truncated; });
         child.once('error', (error) => { operation.state = 'failed'; const result = append(operation.stderr, Buffer.from(error.message), Math.max(0, outputLimitBytes - operation.stdout.length)); operation.stderr = result.value; operation.truncated ||= result.truncated; });
-        child.once('close', (code) => { operation.childClosed = true; operation.exitCode = typeof code === 'number' ? code : null; if (operation.state === 'running') operation.state = code === 0 ? 'passed' : 'failed'; refreshEvidence(operation); operation.finishedAt = Date.now(); if (operation.processGroupEvidence.kind !== 'no-local-trace') void terminate(operation, DEFAULT_TIMEOUT_GRACE_MS); });
+        child.once('close', (code) => {
+            operation.childClosed = true;
+            operation.exitCode = typeof code === 'number' ? code : null;
+            if (operation.state === 'running') operation.state = code === 0 ? 'passed' : 'failed';
+            refreshEvidence(operation);
+            operation.finishedAt = Date.now();
+            if (operation.processGroupEvidence.kind !== 'no-local-trace') void terminate(operation, DEFAULT_TIMEOUT_GRACE_MS);
+            else if (!operation.termination) operation.terminationSettled = true;
+        });
         const timer = setTimeout(() => { if (operation.state !== 'running') return; operation.timedOut = true; operation.state = 'failed'; operation.finishedAt = Date.now(); void terminate(operation, input.timeoutGraceMs ?? DEFAULT_TIMEOUT_GRACE_MS); }, input.timeoutMs ?? 30_000);
         child.once('close', () => clearTimeout(timer));
         return { version: 1, action: 'start', operationId, state: 'accepted' };
