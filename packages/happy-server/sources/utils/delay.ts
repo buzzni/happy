@@ -10,12 +10,16 @@ export async function delay(ms: number, signal?: AbortSignal): Promise<void> {
     }
     
     await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, ms);
-        
+        let timeout: ReturnType<typeof setTimeout>;
         const abortHandler = () => {
             clearTimeout(timeout);
+            signal.removeEventListener('abort', abortHandler);
             resolve();
         };
+        timeout = setTimeout(() => {
+            signal.removeEventListener('abort', abortHandler);
+            resolve();
+        }, ms);
         
         if (signal.aborted) {
             clearTimeout(timeout);
