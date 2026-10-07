@@ -3545,6 +3545,11 @@ export async function startDaemon(): Promise<void> {
     // Prepare/migrate the token before exposing the helper manifest. Chrome
     // can launch the helper as soon as the manifest exists, and must not race
     // legacy-token migration by creating a different machine-wide token.
+    const nativeMessagingHelperPath = process.platform === 'win32'
+      && typeof process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER === 'string'
+      && process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER.toLowerCase().endsWith('.exe')
+      ? process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER
+      : join(projectPath(), 'bin', 'happy-browser-native-host.mjs');
     const nativeMessaging = await prepareBrowserNativeMessaging({
       readToken: () => readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile
@@ -3553,7 +3558,7 @@ export async function startDaemon(): Promise<void> {
         platform: process.platform,
         homeDir: os.homedir(),
         extensionId: resolveExtensionId(resolveExtensionDir()),
-        helperPath: join(projectPath(), 'bin', 'happy-browser-native-host.mjs'),
+        helperPath: nativeMessagingHelperPath,
       }),
       // Browser control can still be paired manually through `happy browser`.
       // A registration failure must not take the whole daemon down.

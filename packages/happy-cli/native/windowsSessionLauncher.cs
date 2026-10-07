@@ -2,6 +2,7 @@
 // This helper stays outside its unnamed, non-kill-on-close Job for the entire drain.
 // (The --pty-host mode is the exception: see PtyHost.)
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -65,6 +66,36 @@ class WindowsSessionLauncher {
             if(creation==0) { Frame(prefix+",\"status\":\"unknown\",\"nativeError\":-1}"); return 125; }
             Frame(prefix+",\"status\":\"present\",\"creationFileTime\":\""+creation.ToString(System.Globalization.CultureInfo.InvariantCulture)+"\"}"); return 0;
         } finally { CloseHandle(handle); }
+    }
+    // Chrome requires a real Windows executable in the native-messaging manifest.
+    // The browser cannot execute the bundled .mjs entrypoint directly. The launcher
+    // is placed under resources/standalone-drain-runtime; walk up to the resources
+    // root, then run the bundled Node runtime with the Happy host entrypoint while
+    // inheriting Chrome's stdio pipes unchanged.
+    static int BrowserNativeHost(string[] args) {
+        string self=Process.GetCurrentProcess().MainModule.FileName;
+        DirectoryInfo directory=new DirectoryInfo(Path.GetDirectoryName(self));
+        string node=null,script=null;
+        for(DirectoryInfo current=directory;current!=null;current=current.Parent) {
+            string candidateNode=Path.Combine(current.FullName,"node-runtime","node.exe");
+            string candidateScript=Path.Combine(current.FullName,"happy-cli-runtime","node_modules","@buzzni","happy-cli","bin","happy-browser-native-host.mjs");
+            if(File.Exists(candidateNode) && File.Exists(candidateScript)) { node=candidateNode; script=candidateScript; break; }
+        }
+        if(node==null || script==null) return 125;
+        var arguments=new StringBuilder(Quote(script));
+        for(int i=1;i<args.Length;i++) arguments.Append(' ').Append(Quote(args[i]));
+        var start=new ProcessStartInfo {
+            FileName=node,
+            Arguments=arguments.ToString(),
+            WorkingDirectory=Path.GetDirectoryName(script),
+            UseShellExecute=false,
+            CreateNoWindow=true,
+        };
+        using(Process child=Process.Start(start)) {
+            if(child==null) return 125;
+            child.WaitForExit();
+            return child.ExitCode;
+        }
     }
     static void Check(bool ok) { if(!ok) throw new Win32Exception(Marshal.GetLastWin32Error()); }
     static bool Empty(IntPtr job) {
@@ -181,6 +212,7 @@ class WindowsSessionLauncher {
     }
     static int Main(string[] args) {
         if(args.Length>0 && args[0]=="--process-identity") return ProcessIdentity(args);
+        if(args.Length>0 && (args[0]=="--browser-native-host" || args[0].StartsWith("--parent-window="))) return BrowserNativeHost(args);
         if(args.Length>0 && args[0]=="--pty-host") return PtyHost(args);
         IntPtr job=IntPtr.Zero,process=IntPtr.Zero,thread=IntPtr.Zero,attrs=IntPtr.Zero,jobValue=IntPtr.Zero,list=IntPtr.Zero,nul=new IntPtr(-1);
         bool initialized=false,launched=false,resumed=false,empty=false,forced=false,ownerTerminated=false,rootDone=false;
