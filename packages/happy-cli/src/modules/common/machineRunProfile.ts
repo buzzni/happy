@@ -24,6 +24,8 @@ export interface MachineRunProfile {
     timeoutMs: number;
     outputLimitBytes: number;
     stdin: 'none';
+    writeScope?: 'none' | 'moai' | 'project';
+    descendantAllowlist?: string[];
 }
 
 export interface MachineRunProfileResolver {
@@ -88,7 +90,7 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
     }
     if (!Array.isArray(raw.argv) || raw.argv.length === 0 || raw.argv.length > 32) throw profileError(`invalid argv for ${raw.id}`);
     for (const arg of raw.argv) {
-        if (typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || FORBIDDEN_FLAG.test(arg) || arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg)) {
+        if (typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || FORBIDDEN_FLAG.test(arg) || (arg.includes('{{workspaceRoot}}') && arg !== '{{workspaceRoot}}') || (arg !== '{{workspaceRoot}}' && (arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg)))) {
             throw profileError(`unsafe argument template for ${raw.id}`);
         }
     }
@@ -122,7 +124,7 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
     // declaration immutable after the trusted host has accepted it.
     const names = new Set(Object.keys(parameters));
     for (const arg of raw.argv) {
-        for (const match of arg.matchAll(PLACEHOLDER)) if (!names.has(match[1])) throw profileError(`unknown parameter ${match[1]} in ${raw.id}`);
+        for (const match of arg.matchAll(PLACEHOLDER)) if (match[1] !== 'workspaceRoot' && !names.has(match[1])) throw profileError(`unknown parameter ${match[1]} in ${raw.id}`);
         if (arg.includes('{{') && !arg.match(PLACEHOLDER)) throw profileError(`malformed parameter template in ${raw.id}`);
     }
     const profile: MachineRunProfile = {
@@ -135,6 +137,8 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
         timeoutMs: raw.timeoutMs,
         outputLimitBytes: raw.outputLimitBytes,
         stdin: 'none',
+        ...(raw.writeScope ? { writeScope: raw.writeScope } : {}),
+        ...(raw.descendantAllowlist ? { descendantAllowlist: [...raw.descendantAllowlist] } : {}),
     };
     return Object.freeze({
         ...profile,
@@ -187,7 +191,7 @@ function assertCapabilityRequest(value: unknown): asserts value is MachineRunCap
 
 function parameterValue(parameter: MachineRunParameter, value: unknown, name: string): string {
     if (parameter.type === 'string') {
-        if (typeof value !== 'string' || value.length > parameter.maxLength || value.includes('\0')) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
+        if (typeof value !== 'string' || value.length === 0 || value.length > parameter.maxLength || value.includes('\0') || /[\x00-\x1f;&|`$<>]/.test(value) || value.startsWith('-') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.split('/').includes('..')) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
         if (parameter.values && !parameter.values.includes(value)) throw new Error(`MACHINE_RUN_INVALID: invalid parameter ${name}`);
         return value;
     }
@@ -202,6 +206,7 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
     for (const [name, value] of Object.entries(supplied)) values.set(name, parameterValue(profile.parameters[name], value, name));
     const used = new Set<string>();
     const args = profile.argv.map((template) => template.replace(PLACEHOLDER, (_match, name: string) => {
+        if (name === 'workspaceRoot') return '__WORKSPACE_ROOT__';
         used.add(name);
         const value = values.get(name);
         if (value === undefined) throw new Error(`MACHINE_RUN_INVALID: missing parameter ${name}`);
@@ -249,7 +254,7 @@ export function createProfileAwareMachineRunHandler(
     const legacyHandler = options.typedHandler ?? createTypedMachineRunHandler(workingDirectory, {
         platform,
         baseEnvironment,
-        allowUnsafeArguments: true,
+        allowAbsoluteArguments: true,
     });
 
     return async (input: unknown) => {
@@ -271,11 +276,12 @@ export function createProfileAwareMachineRunHandler(
             const value = environment[name];
             if (value !== undefined) env[name] = value;
         }
+        const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? resolve(workingDirectory) : arg);
         const result = await legacyHandler({
             version: 1,
             action: 'start',
             executable: profile.executable,
-            args: buildArguments(profile, input.parameters),
+            args,
             cwd: resolve(cwd),
             env,
             timeoutMs: profile.timeoutMs,

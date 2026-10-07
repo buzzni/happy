@@ -18,8 +18,8 @@ export interface TypedMachineRunHandlerOptions {
     platform?: NodeJS.Platform;
     /** Environment owned by the adapter. Defaults to PATH only. */
     baseEnvironment?: Record<string, string>;
-    /** Profile arguments are still argv, so shell syntax is data, not a shell. */
-    allowUnsafeArguments?: boolean;
+    /** A trusted profile may render its workspace root as an absolute argv value. */
+    allowAbsoluteArguments?: boolean;
 }
 
 export const MACHINE_RUN_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -57,7 +57,7 @@ const SAFE_EXECUTABLE = /^[a-z][a-z0-9._-]*$/;
 const FORBIDDEN_EXECUTABLE = /^(?:sh|bash|zsh|fish|cmd|powershell|pwsh|node|python|python3|npm|npx|env|xargs|ssh|tmux)$/i;
 const FORBIDDEN_FLAG = /^(?:--from|--wake|--interactive|--tty|--tui|-i)$/;
 const SHELL_SYNTAX = /[\x00-\x1f;&|`$<>]/;
-const DANGEROUS_ENV = /^(?:PATH|LD_PRELOAD|DYLD_|NODE_OPTIONS|BASH_ENV|GIT_SSH_COMMAND|PYTHONSTARTUP)/;
+const DANGEROUS_ENV = /^(?:PATH|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_|NODE_OPTIONS|BASH_ENV|GIT_SSH_COMMAND|GIT_CONFIG_|PYTHONSTARTUP)/;
 
 function invalid(message: string): Error { return new Error(`MACHINE_RUN_INVALID: ${message}`); }
 
@@ -71,12 +71,12 @@ function assertRequest(value: unknown, options: TypedMachineRunHandlerOptions = 
         return;
     }
     if (typeof request.executable !== 'string' || !SAFE_EXECUTABLE.test(request.executable) || FORBIDDEN_EXECUTABLE.test(request.executable)) throw invalid('unsupported executable');
-    const unsafeArguments = !options.allowUnsafeArguments;
-    if (!Array.isArray(request.args) || request.args.length > MAX_ARGS || request.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || (unsafeArguments && (SHELL_SYNTAX.test(arg) || FORBIDDEN_FLAG.test(arg) || arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg))))) throw invalid('unsafe args');
+    const allowAbsoluteArguments = options.allowAbsoluteArguments === true;
+    if (!Array.isArray(request.args) || request.args.length > MAX_ARGS || request.args.some((arg) => typeof arg !== 'string' || arg.length > 4096 || arg.includes('\0') || SHELL_SYNTAX.test(arg) || FORBIDDEN_FLAG.test(arg) || (!allowAbsoluteArguments && (arg.startsWith('/') || /^[A-Za-z]:[\\/]/.test(arg))))) throw invalid('unsafe args');
     if (request.cwd !== undefined && typeof request.cwd !== 'string') throw invalid('cwd must be a string');
     if (request.env !== undefined && (!request.env || typeof request.env !== 'object' || Array.isArray(request.env))) throw invalid('env must be an object');
     const env = request.env as Record<string, unknown> | undefined;
-    if (env && Object.keys(env).some((key) => !/^[A-Z][A-Z0-9_]*$/.test(key) || DANGEROUS_ENV.test(key) || typeof env[key] !== 'string' || (unsafeArguments ? false : SHELL_SYNTAX.test(env[key] as string)))) throw invalid('unsafe env');
+    if (env && Object.keys(env).some((key) => !/^[A-Z][A-Z0-9_]*$/.test(key) || DANGEROUS_ENV.test(key) || typeof env[key] !== 'string' || SHELL_SYNTAX.test(env[key] as string))) throw invalid('unsafe env');
     if (request.timeoutMs !== undefined && (typeof request.timeoutMs !== 'number' || !Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1 || request.timeoutMs > MAX_TIMEOUT_MS)) throw invalid('invalid timeout');
     if (request.timeoutGraceMs !== undefined && (typeof request.timeoutGraceMs !== 'number' || !Number.isSafeInteger(request.timeoutGraceMs) || request.timeoutGraceMs < 1 || request.timeoutGraceMs > MAX_TIMEOUT_GRACE_MS)) throw invalid('invalid timeout grace');
     if (request.outputLimitBytes !== undefined && (typeof request.outputLimitBytes !== 'number' || !Number.isSafeInteger(request.outputLimitBytes) || request.outputLimitBytes < 1 || request.outputLimitBytes > MAX_OUTPUT_BYTES)) throw invalid('invalid output limit');
