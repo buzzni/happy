@@ -78,7 +78,7 @@ describe('registerCommonHandlers machine.run capability', () => {
             reason: 'MACHINE_RUN_PROFILE_REGISTRY_UNAVAILABLE: no trusted profiles are registered',
         });
         await expect(handlers.get('machine.run')?.({
-            action: 'start', profileId: 'extension.arbitrary', parameters: {},
+            action: 'start', profileId: 'extension.arbitrary', profileDigest: 'a'.repeat(64), workspaceRoot: '/tmp', parameters: {},
         })).rejects.toThrow('MACHINE_RUN_PROFILE_NOT_FOUND');
     });
 });

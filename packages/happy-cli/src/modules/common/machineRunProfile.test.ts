@@ -62,13 +62,15 @@ describe('profile-aware machine.run adapter', () => {
                 envAllowlist: ['SAFE'],
                 outputLimitBytes: 128,
             })], { environment: { PATH: process.env.PATH, SAFE: 'allowed', SECRET: 'hidden' } });
-            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({
+            const capabilities = await handler({ action: 'capabilities' });
+            await expect(capabilities).toMatchObject({
                 supported: true,
                 shell: false,
                 stdin: 'none',
-                profiles: [{ id: 'buzzni.test.echo', timeoutMs: 2_000, outputLimitBytes: 128 }],
+                profiles: [{ id: 'buzzni.test.echo', timeoutMs: 2_000, outputLimitBytes: 128, profileDigest: expect.stringMatching(/^[a-f0-9]{64}$/) }],
             });
-            const started = await handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { message: 'value;${HOME}' } });
+            const profileDigest = capabilities.action === 'capabilities' ? capabilities.profiles[0].profileDigest : '';
+            const started = await handler({ action: 'start', profileId: 'buzzni.test.echo', profileDigest, workspaceRoot: root, parameters: { message: 'value;${HOME}' } });
             expect(started).toMatchObject({ action: 'start', state: 'accepted' });
             if (started.action !== 'start') return;
             await expect(waitForStatus(handler, started.operationId)).resolves.toMatchObject({
@@ -83,10 +85,12 @@ describe('profile-aware machine.run adapter', () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
             const handler = createProfileAwareMachineRunHandler(root, [profile()]);
-            await expect(handler({ action: 'start', profileId: 'missing.profile', parameters: {} })).rejects.toThrow('MACHINE_RUN_PROFILE_NOT_FOUND');
-            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { unknown: 'x' } })).rejects.toThrow('unknown parameter');
-            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: {} })).rejects.toThrow('missing parameter');
-            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { message: 'x'.repeat(129) } })).rejects.toThrow('invalid parameter');
+            const digest = (await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>).profiles[0].profileDigest;
+            const request = (parameters: Record<string, unknown>) => ({ action: 'start', profileId: 'buzzni.test.echo', profileDigest: digest, workspaceRoot: root, parameters });
+            await expect(handler({ ...request({ message: 'x' }), profileId: 'missing.profile' })).rejects.toThrow('MACHINE_RUN_PROFILE_NOT_FOUND');
+            await expect(handler(request({ unknown: 'x' }))).rejects.toThrow('unknown parameter');
+            await expect(handler(request({}))).rejects.toThrow('missing parameter');
+            await expect(handler(request({ message: 'x'.repeat(129) }))).rejects.toThrow('invalid parameter');
         } finally {
             await rm(root, { recursive: true, force: true });
         }
@@ -101,7 +105,7 @@ describe('profile-aware machine.run adapter', () => {
                 reason: 'MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required',
                 profiles: [],
             });
-            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_UNSUPPORTED_PLATFORM');
+            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', profileDigest: 'a'.repeat(64), workspaceRoot: root, parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_UNSUPPORTED_PLATFORM');
         } finally {
             await rm(root, { recursive: true, force: true });
         }
@@ -125,7 +129,36 @@ describe('profile-aware machine.run adapter', () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
             const handler = createProfileAwareMachineRunHandler(root, [profile({ writeScope: 'project', descendantAllowlist: ['git'] })]);
-            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED');
+            const digest = (await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>).profiles[0].profileDigest;
+            await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', profileDigest: digest, workspaceRoot: root, parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('requires the trusted digest and daemon workspace root at the RPC boundary', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const handler = createProfileAwareMachineRunHandler(root, [profile()]);
+            const capabilities = await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>;
+            const profileDigest = capabilities.profiles[0].profileDigest;
+            const base = { action: 'start', profileId: 'buzzni.test.echo', profileDigest, workspaceRoot: root, parameters: { message: 'x' } };
+            await expect(handler({ ...base, profileDigest: 'b'.repeat(64) })).rejects.toThrow('MACHINE_RUN_PROFILE_DIGEST_MISMATCH');
+            await expect(handler({ ...base, workspaceRoot: '.' })).rejects.toThrow('workspaceRoot must be absolute');
+            await expect(handler({ ...base, workspaceRoot: join(root, '..') })).rejects.toThrow('MACHINE_RUN_WORKSPACE_ROOT_DENIED');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('rejects renderer-supplied resolved profiles and unknown authority fields', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const handler = createProfileAwareMachineRunHandler(root, [profile()]);
+            const capabilities = await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>;
+            const request = { action: 'start', profileId: 'buzzni.test.echo', profileDigest: capabilities.profiles[0].profileDigest, workspaceRoot: root, parameters: { message: 'x' } };
+            await expect(handler({ ...request, profile: { executable: 'printf', argv: ['x'] } })).rejects.toThrow('unknown field profile');
+            await expect(handler({ ...request, authority: 'renderer' })).rejects.toThrow('unknown field authority');
         } finally {
             await rm(root, { recursive: true, force: true });
         }

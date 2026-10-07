@@ -1,5 +1,6 @@
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
+import { hashObject } from '../../utils/deterministicJson';
 import {
     createTypedMachineRunHandler,
     MACHINE_RUN_MAX_OUTPUT_BYTES,
@@ -7,6 +8,7 @@ import {
     type TypedMachineRunRequest,
     type TypedMachineRunResponse,
 } from './typedMachineRun';
+import { validatePath } from './pathSecurity';
 
 export type MachineRunJsonValue = string | number | boolean | null | MachineRunJsonValue[] | { [key: string]: MachineRunJsonValue };
 
@@ -28,9 +30,14 @@ export interface MachineRunProfile {
     descendantAllowlist?: string[];
 }
 
+/** A profile after the daemon has validated and sealed its host-owned identity. */
+export interface TrustedMachineRunProfile extends MachineRunProfile {
+    profileDigest: string;
+}
+
 export interface MachineRunProfileResolver {
-    resolve(profileId: string): MachineRunProfile | undefined;
-    list(): readonly MachineRunProfile[];
+    resolve(profileId: string): TrustedMachineRunProfile | undefined;
+    list(): readonly TrustedMachineRunProfile[];
 }
 
 /**
@@ -41,7 +48,7 @@ export type TrustedMachineRunProfileRegistry = MachineRunProfileResolver;
 
 export type MachineRunCapabilityRequest =
     | { action: 'capabilities'; version?: 1 }
-    | { action: 'start'; profileId: string; parameters: Record<string, MachineRunJsonValue> }
+    | { action: 'start'; profileId: string; profileDigest: string; workspaceRoot: string; parameters: Record<string, MachineRunJsonValue> }
     | { action: 'status'; operationId: string }
     | { action: 'cancel'; operationId: string };
 
@@ -55,7 +62,7 @@ export type MachineRunCapabilityResponse =
         stdin: 'none';
         maxTimeoutMs: number;
         maxOutputLimitBytes: number;
-        profiles: Array<Pick<MachineRunProfile, 'id' | 'cwd' | 'parameters' | 'timeoutMs' | 'outputLimitBytes'>>;
+        profiles: Array<Pick<TrustedMachineRunProfile, 'id' | 'cwd' | 'parameters' | 'timeoutMs' | 'outputLimitBytes' | 'profileDigest'>>;
         reason?: string;
     }
     | Omit<TypedMachineRunResponse, 'version'>;
@@ -88,7 +95,7 @@ function cloneParameter(parameter: MachineRunParameter): MachineRunParameter {
         : { type: 'integer', min: parameter.min, max: parameter.max };
 }
 
-function validateProfile(raw: MachineRunProfile): MachineRunProfile {
+function validateProfile(raw: MachineRunProfile): TrustedMachineRunProfile {
     if (!raw || typeof raw !== 'object') throw profileError('profile must be an object');
     if (typeof raw.id !== 'string' || !PROFILE_ID.test(raw.id)) throw profileError('invalid profile id');
     if (typeof raw.executable !== 'string' || !EXECUTABLE.test(raw.executable) || FORBIDDEN_EXECUTABLE.test(raw.executable)) {
@@ -148,7 +155,7 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
         ...(raw.writeScope ? { writeScope: raw.writeScope } : {}),
         ...(raw.descendantAllowlist ? { descendantAllowlist: [...raw.descendantAllowlist] } : {}),
     };
-    return Object.freeze({
+    const sealedProfile = {
         ...profile,
         argv: Object.freeze(profile.argv) as unknown as string[],
         parameters: Object.freeze(Object.fromEntries(Object.entries(parameters).map(([name, parameter]) => [
@@ -161,11 +168,13 @@ function validateProfile(raw: MachineRunProfile): MachineRunProfile {
         ...(profile.descendantAllowlist
             ? { descendantAllowlist: Object.freeze([...profile.descendantAllowlist]) as unknown as string[] }
             : {}),
-    });
+    } as TrustedMachineRunProfile;
+    sealedProfile.profileDigest = hashObject(sealedProfile);
+    return Object.freeze(sealedProfile);
 }
 
 export function createTrustedMachineRunProfileResolver(profiles: readonly MachineRunProfile[]): MachineRunProfileResolver {
-    const byId = new Map<string, MachineRunProfile>();
+    const byId = new Map<string, TrustedMachineRunProfile>();
     for (const profile of profiles) {
         const validated = validateProfile(profile);
         if (byId.has(validated.id)) throw profileError(`duplicate profile id ${validated.id}`);
@@ -198,19 +207,30 @@ function assertCapabilityRequest(value: unknown): asserts value is MachineRunCap
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('MACHINE_RUN_INVALID: request must be an object');
     const request = value as Record<string, unknown>;
     if (request.action === 'capabilities') {
+        assertKnownFields(request, ['action', 'version']);
         if (request.version !== undefined && request.version !== 1) throw new Error('MACHINE_RUN_INVALID: unsupported version');
         return;
     }
     if (request.action === 'start') {
+        assertKnownFields(request, ['action', 'profileId', 'profileDigest', 'workspaceRoot', 'parameters']);
         if (typeof request.profileId !== 'string' || request.profileId.length === 0 || request.profileId.length > 256) throw new Error('MACHINE_RUN_INVALID: profileId is required');
+        if (typeof request.profileDigest !== 'string' || request.profileDigest.length !== 64 || !/^[a-f0-9]{64}$/.test(request.profileDigest)) throw new Error('MACHINE_RUN_INVALID: profileDigest is required');
+        if (typeof request.workspaceRoot !== 'string' || request.workspaceRoot.length === 0 || !isAbsolute(request.workspaceRoot)) throw new Error('MACHINE_RUN_INVALID: workspaceRoot must be absolute');
         if (!request.parameters || typeof request.parameters !== 'object' || Array.isArray(request.parameters)) throw new Error('MACHINE_RUN_INVALID: parameters must be an object');
         return;
     }
     if (request.action === 'status' || request.action === 'cancel') {
+        assertKnownFields(request, ['action', 'operationId']);
         if (typeof request.operationId !== 'string' || request.operationId.length === 0 || request.operationId.length > 256) throw new Error('MACHINE_RUN_INVALID: operationId is required');
         return;
     }
     throw new Error('MACHINE_RUN_INVALID: unsupported action');
+}
+
+function assertKnownFields(request: Record<string, unknown>, allowed: readonly string[]): void {
+    const allowedFields = new Set(allowed);
+    const unknown = Object.keys(request).find((key) => !allowedFields.has(key));
+    if (unknown) throw new Error(`MACHINE_RUN_INVALID: unknown field ${unknown}`);
 }
 
 function parameterValue(parameter: MachineRunParameter, value: unknown, name: string): string {
@@ -254,8 +274,8 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
         stdin: 'none',
         maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
         maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
-        profiles: supported ? resolver.list().map(({ id, cwd, parameters, timeoutMs, outputLimitBytes }) => ({
-            id, cwd, parameters, timeoutMs, outputLimitBytes,
+        profiles: supported ? resolver.list().map(({ id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest }) => ({
+            id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest,
         })) : [],
         ...(platform === 'win32'
             ? { reason: 'MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required' }
@@ -294,9 +314,13 @@ export function createProfileAwareMachineRunHandler(
 
         const profile = resolver.resolve(input.profileId);
         if (!profile) throw new Error(`MACHINE_RUN_PROFILE_NOT_FOUND: ${input.profileId}`);
+        if (profile.profileDigest !== input.profileDigest) throw new Error(`MACHINE_RUN_PROFILE_DIGEST_MISMATCH: ${input.profileId}`);
+        const workspace = validatePath(input.workspaceRoot, workingDirectory);
+        if (!workspace.valid || !workspace.resolvedPath) throw new Error(`MACHINE_RUN_WORKSPACE_ROOT_DENIED: ${workspace.error ?? 'workspaceRoot is outside the daemon root'}`);
+        const requestedWorkspaceRoot = workspace.resolvedPath;
         if ((profile.writeScope ?? 'none') !== 'none') throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
         const cwd = profile.cwd === 'workspaceRoot'
-            ? workingDirectory
+            ? requestedWorkspaceRoot
             : profile.cwd === 'extensionData'
                 ? options.extensionDataDirectory
                 : options.tempDirectory ?? tmpdir();
@@ -306,7 +330,7 @@ export function createProfileAwareMachineRunHandler(
             const value = environment[name];
             if (value !== undefined) env[name] = value;
         }
-        const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? resolve(workingDirectory) : arg);
+        const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? requestedWorkspaceRoot : arg);
         const result = await legacyHandler({
             version: 1,
             action: 'start',
