@@ -566,15 +566,15 @@ function startDifficultyRoutingMetadataPoll(input: {
  * than the tick, which is what keeps `prepare` and `recover` from running and
  * leaves the automation protocol advertised at its legacy version.
  *
- * BYOS is unchanged: without the managed marker this is the same feature flag
- * it has always been.
+ * BYOS runs it by default: an unset flag counts as on, so chat automations work
+ * without extra setup. Any other value (`0`, `false`, ...) opts out.
  */
 export function shouldRunScriptAutomations(input: {
     managedRuntimeActive: boolean;
     enabled: string | undefined;
 }): boolean {
     if (input.managedRuntimeActive) return false;
-    return input.enabled === '1';
+    return input.enabled === undefined || input.enabled === '1';
 }
 
 export async function startDaemon(): Promise<void> {

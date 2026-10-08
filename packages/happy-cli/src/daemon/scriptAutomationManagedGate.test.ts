@@ -19,9 +19,9 @@ describe('script automations in a managed runtime', () => {
         expect(shouldRunScriptAutomations({ managedRuntimeActive: true, enabled: '0' })).toBe(false);
     });
 
-    it('keeps the BYOS behaviour exactly as it was', () => {
+    it('is on by default for BYOS and only an explicit opt-out turns it off', () => {
         expect(shouldRunScriptAutomations({ managedRuntimeActive: false, enabled: '1' })).toBe(true);
-        expect(shouldRunScriptAutomations({ managedRuntimeActive: false, enabled: undefined })).toBe(false);
+        expect(shouldRunScriptAutomations({ managedRuntimeActive: false, enabled: undefined })).toBe(true);
         expect(shouldRunScriptAutomations({ managedRuntimeActive: false, enabled: '0' })).toBe(false);
         expect(shouldRunScriptAutomations({ managedRuntimeActive: false, enabled: 'true' })).toBe(false);
     });
