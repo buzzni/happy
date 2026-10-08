@@ -101,7 +101,7 @@ describe('registerCommonHandlers machine.run capability', () => {
     });
 
     it('fails closed when the daemon has no host-owned profile registry', async () => {
-        const { handlers } = await createHandlers();
+        const { handlers } = await createHandlers(undefined, { machineRun: { profileRegistry: createTrustedMachineRunProfileResolver([]) } });
         await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
             supported: false,
             profiles: [],

@@ -12,6 +12,7 @@ import {
     type TypedMachineRunResponse,
 } from './typedMachineRun';
 import { validatePath } from './pathSecurity';
+import { MOAI_V080_MACHINE_RUN_PROFILES } from './moaiMachineRunProfiles';
 import packageJson from '../../../package.json';
 
 export type MachineRunJsonValue = string | number | boolean | null | MachineRunJsonValue[] | { [key: string]: MachineRunJsonValue };
@@ -246,9 +247,9 @@ export function createTrustedMachineRunProfileResolver(profiles: readonly Machin
     });
 }
 
-/** No host-owned profiles are currently shipped by the daemon. */
+/** Host-owned profiles shipped by this daemon build. */
 export const TRUSTED_MACHINE_RUN_PROFILE_REGISTRY: TrustedMachineRunProfileRegistry =
-    createTrustedMachineRunProfileResolver([]);
+    createTrustedMachineRunProfileResolver(MOAI_V080_MACHINE_RUN_PROFILES);
 
 /**
  * A profile is enforceable when its descendants are confined to a restricted
