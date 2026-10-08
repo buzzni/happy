@@ -281,6 +281,24 @@ process.send?.('ready');
         });
     }
 
+    /**
+     * Waits for the descriptor count to come back to `expected`.
+     *
+     * A failed launch answers once the helper's status pipe reports `end`;
+     * the two spawn pipes (status and release) are closed by libuv a moment
+     * later. Counting the instant the answer arrives races those closes on a
+     * loaded runner. A real leak never closes, so it still fails here.
+     */
+    async function fdsSettleTo(expected: number): Promise<number> {
+        const deadline = Date.now() + 2_000;
+        let fds = (await fdReport()).fds;
+        while (fds !== expected && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            fds = (await fdReport()).fds;
+        }
+        return fds;
+    }
+
     it('refuses a descriptor conflict without opening either document', async () => {
         /*
          * `bootstrapFd` is configurable, so it can be pointed at a slot that
@@ -344,7 +362,7 @@ process.send?.('ready');
          * both documents were staged.
          */
         expect(prepared).toEqual({ prepared: false, detail: 'launch-failed' });
-        expect((await fdReport()).fds).toBe(before);
+        expect(await fdsSettleTo(before)).toBe(before);
     }, 30_000);
 
     it('a release handle that was never issued is refused', async () => {
