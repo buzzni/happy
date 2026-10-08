@@ -10,6 +10,7 @@ import {
     type TypedMachineRunResponse,
 } from './typedMachineRun';
 import { validatePath } from './pathSecurity';
+import packageJson from '../../../package.json';
 
 export type MachineRunJsonValue = string | number | boolean | null | MachineRunJsonValue[] | { [key: string]: MachineRunJsonValue };
 
@@ -58,6 +59,13 @@ export type MachineRunCapabilityResponse =
         version: 1;
         action: 'capabilities';
         protocolVersion: 1;
+        /** Runtime identity lets a host verify that the RPC came from its pinned artifact. */
+        runtime: {
+            packageName: string;
+            packageVersion: string;
+            protocolVersion: 1;
+        };
+        capabilities: readonly ['machine.run.v1'];
         supported: boolean;
         shell: false;
         stdin: 'none';
@@ -287,6 +295,12 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
         version: 1,
         action: 'capabilities',
         protocolVersion: 1,
+        runtime: {
+            packageName: packageJson.name,
+            packageVersion: packageJson.version,
+            protocolVersion: 1,
+        },
+        capabilities: ['machine.run.v1'],
         supported,
         shell: false,
         stdin: 'none',

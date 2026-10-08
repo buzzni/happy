@@ -65,7 +65,13 @@ describe('registerCommonHandlers machine.run capability', () => {
                 }]),
             },
         });
-        await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
+        await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
+            supported: true,
+            protocolVersion: 1,
+            runtime: { packageName: '@buzzni/happy-cli', packageVersion: expect.any(String), protocolVersion: 1 },
+            capabilities: ['machine.run.v1'],
+            profiles: [{ id: 'buzzni.test.echo' }],
+        });
         await expect(handlers.get('machine-run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
         await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] })).resolves.toMatchObject({ action: 'start', state: 'accepted' });
     });
