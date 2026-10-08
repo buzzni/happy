@@ -444,6 +444,14 @@ describe('ApiMachineClient socket reconnection', () => {
         });
     });
 
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2.
+    it('registers the sealed env spawn as a customer-bound machine method', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+            'spawn-with-sealed-env', expect.any(Function), { customerBound: true },
+        );
+    });
+
     it('registers dependency reclaim on the authenticated machine RPC surface', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
