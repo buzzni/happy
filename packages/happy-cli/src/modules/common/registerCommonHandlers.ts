@@ -416,6 +416,8 @@ export interface CommonHandlerOptions {
         tempDirectory?: string;
         environment?: NodeJS.ProcessEnv;
         platform?: NodeJS.Platform;
+        /** Explicit internal compatibility escape hatch; never enabled for extension RPCs. */
+        allowLegacyRaw?: boolean;
     };
 }
 
@@ -430,9 +432,9 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         environment: machineRunOptions.environment,
         platform: machineRunOptions.platform,
     } : { platform: process.platform };
-    // `machine.run` is the profile-aware capability used by Desktop. Keep the
-    // hyphenated raw RPC above for older clients that already send executable
-    // and argv directly.
+    // `machine.run` is the profile-aware capability used by Desktop. The
+    // hyphenated alias is profile-only by default; raw executable/argv is an
+    // explicit internal compatibility mode and is never an extension default.
     const profileMachineRunHandler = createProfileAwareMachineRunHandler(
         workingDirectory,
         machineRunOptions?.profileRegistry ?? TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
@@ -449,9 +451,11 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 // compatibility. If the profile store does not own it, let
                 // the legacy handler answer for an older raw caller.
                 if (!(error instanceof Error) || !error.message.startsWith('MACHINE_RUN_NOT_FOUND:')) throw error;
+                if (!machineRunOptions?.allowLegacyRaw) throw new Error('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
                 return rawMachineRunHandler(request);
             }
         }
+        if (!machineRunOptions?.allowLegacyRaw) throw new Error('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
         return rawMachineRunHandler(request);
     };
     rpcHandlerManager.registerHandler('machine-run', machineRunHandler);

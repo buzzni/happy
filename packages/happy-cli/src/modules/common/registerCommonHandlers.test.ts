@@ -58,6 +58,7 @@ describe('registerCommonHandlers machine.run capability', () => {
     it('keeps the raw RPC and exposes profile capability negotiation on both method names', async () => {
         const { handlers } = await createHandlers(undefined, {
             machineRun: {
+                allowLegacyRaw: true,
                 profileRegistry: createTrustedMachineRunProfileResolver([{
                     id: 'buzzni.test.echo', executable: 'printf', argv: ['{{message}}'],
                     parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
@@ -74,6 +75,16 @@ describe('registerCommonHandlers machine.run capability', () => {
         });
         await expect(handlers.get('machine-run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
         await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] })).resolves.toMatchObject({ action: 'start', state: 'accepted' });
+    });
+
+    it('does not expose the raw executable alias without an explicit internal gate', async () => {
+        const { handlers } = await createHandlers(undefined, {
+            machineRun: {
+                profileRegistry: createTrustedMachineRunProfileResolver([]),
+            },
+        });
+        await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] }))
+            .rejects.toThrow('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
     });
 
     it('fails closed when the daemon has no host-owned profile registry', async () => {
