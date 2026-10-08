@@ -137,14 +137,14 @@ describe('ApiMachineClient machine RPC server lane', () => {
         expect(rpcManagerConfigs.at(-1)?.serverLane).toBeUndefined();
     });
 
-    it('registers machine.run with the daemon-owned trusted profile registry', () => {
+    it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {
         registeredCommonHandlers.mockClear();
         new ApiMachineClient('fake-token', makeMachine());
 
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             expect.any(String),
-            { machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } },
+            { machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, writeScopePolicy: { acquire: expect.any(Function) } } },
         );
     });
 

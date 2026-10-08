@@ -372,7 +372,8 @@ export const initialMachineMetadata: MachineMetadata = {
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
-    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY),
+    // The machine-scope handler installs the managed write policy (apiMachine).
+    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, process.platform, true),
     shell: false,
     stdin: 'none',
     maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,

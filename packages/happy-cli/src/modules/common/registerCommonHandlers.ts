@@ -32,6 +32,7 @@ import {
     createProfileAwareMachineRunHandler,
     TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
     type MachineRunProfileHandlerOptions,
+    type MachineRunWriteScopePolicy,
     type TrustedMachineRunProfileRegistry,
 } from './machineRunProfile';
 
@@ -418,6 +419,8 @@ export interface CommonHandlerOptions {
         platform?: NodeJS.Platform;
         /** Explicit internal compatibility escape hatch; never enabled for extension RPCs. */
         allowLegacyRaw?: boolean;
+        /** Host-owned write policy. Without it, write profiles are neither advertised nor run. */
+        writeScopePolicy?: MachineRunWriteScopePolicy;
     };
 }
 
@@ -431,6 +434,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         tempDirectory: machineRunOptions.tempDirectory,
         environment: machineRunOptions.environment,
         platform: machineRunOptions.platform,
+        writeScopePolicy: machineRunOptions.writeScopePolicy,
     } : { platform: process.platform };
     // `machine.run` is the profile-aware capability used by Desktop. The
     // hyphenated alias is profile-only by default; raw executable/argv is an

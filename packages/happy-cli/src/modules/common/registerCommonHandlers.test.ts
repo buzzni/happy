@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
-import { createTrustedMachineRunProfileResolver } from './machineRunProfile';
+import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileResolver } from './machineRunProfile';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -85,6 +85,19 @@ describe('registerCommonHandlers machine.run capability', () => {
         });
         await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] }))
             .rejects.toThrow('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
+    });
+
+    it('advertises a write profile only where the host installed a write policy', async () => {
+        const registry = createTrustedMachineRunProfileResolver([{
+            id: 'buzzni.test.write', executable: 'printf', argv: ['x'], parameters: {}, cwd: 'workspaceRoot',
+            envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none', writeScope: 'moai', descendantAllowlist: ['git'],
+        }]);
+        const machine = await createHandlers(undefined, { machineRun: { profileRegistry: registry, writeScopePolicy: createManagedProjectWriteScopePolicy() } });
+        await expect(machine.handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
+            supported: true, profiles: [{ id: 'buzzni.test.write', writeScope: 'moai', descendantAllowlist: ['git'] }],
+        });
+        const session = await createHandlers(undefined, { machineRun: { profileRegistry: registry } });
+        await expect(session.handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: false, profiles: [] });
     });
 
     it('fails closed when the daemon has no host-owned profile registry', async () => {

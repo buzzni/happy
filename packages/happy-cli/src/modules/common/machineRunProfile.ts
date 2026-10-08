@@ -1,11 +1,13 @@
 import { tmpdir } from 'node:os';
-import { lstat, realpath, stat } from 'node:fs/promises';
-import { isAbsolute, resolve, sep } from 'node:path';
+import { constants } from 'node:fs';
+import { access, lstat, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
 import { hashObject } from '../../utils/deterministicJson';
 import {
     createTypedMachineRunHandler,
     MACHINE_RUN_MAX_OUTPUT_BYTES,
     MACHINE_RUN_MAX_TIMEOUT_MS,
+    type TrustedMachineRunSpawn,
     type TypedMachineRunRequest,
     type TypedMachineRunResponse,
 } from './typedMachineRun';
@@ -71,7 +73,11 @@ export type MachineRunCapabilityResponse =
         stdin: 'none';
         maxTimeoutMs: number;
         maxOutputLimitBytes: number;
-        profiles: Array<Pick<TrustedMachineRunProfile, 'id' | 'cwd' | 'parameters' | 'timeoutMs' | 'outputLimitBytes' | 'profileDigest'>>;
+        /** Only profiles whose write scope and descendants this daemon enforces. */
+        profiles: Array<Pick<TrustedMachineRunProfile, 'id' | 'cwd' | 'parameters' | 'timeoutMs' | 'outputLimitBytes' | 'profileDigest'> & {
+            writeScope: 'none' | 'moai' | 'project';
+            descendantAllowlist: string[];
+        }>;
         reason?: string;
     }
     | Omit<TypedMachineRunResponse, 'version'>;
@@ -83,7 +89,7 @@ export interface MachineRunProfileHandlerOptions {
     extensionDataDirectory?: string;
     tempDirectory?: string;
     /** Reuse the legacy lifecycle store when both RPC shapes share a method. */
-    typedHandler?: (input: TypedMachineRunRequest) => Promise<TypedMachineRunResponse>;
+    typedHandler?: (input: TypedMachineRunRequest, trusted?: TrustedMachineRunSpawn) => Promise<TypedMachineRunResponse>;
     /** Host-owned policy required before any profile with a write scope can run. */
     writeScopePolicy?: MachineRunWriteScopePolicy;
 }
@@ -244,11 +250,21 @@ export function createTrustedMachineRunProfileResolver(profiles: readonly Machin
 export const TRUSTED_MACHINE_RUN_PROFILE_REGISTRY: TrustedMachineRunProfileRegistry =
     createTrustedMachineRunProfileResolver([]);
 
+/**
+ * A profile is enforceable when its descendants are confined to a restricted
+ * PATH (POSIX) and, for a write scope, the host installed a write policy.
+ */
+function profileEnforceable(profile: TrustedMachineRunProfile, platform: NodeJS.Platform, writeEnabled: boolean): boolean {
+    if (platform === 'win32') return false;
+    return (profile.writeScope ?? 'none') === 'none' || writeEnabled;
+}
+
 export function machineRunCapabilitySupported(
     registry: TrustedMachineRunProfileRegistry,
     platform: NodeJS.Platform = process.platform,
+    writeEnabled = false,
 ): boolean {
-    return platform !== 'win32' && registry.list().some((profile) => (profile.writeScope ?? 'none') === 'none' && (profile.descendantAllowlist?.length ?? 0) === 0);
+    return registry.list().some((profile) => profileEnforceable(profile, platform, writeEnabled));
 }
 
 function resolverFor(source: MachineRunProfileResolver | readonly MachineRunProfile[]): MachineRunProfileResolver {
@@ -333,9 +349,9 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
     return args;
 }
 
-function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform): Extract<MachineRunCapabilityResponse, { action: 'capabilities' }> {
-    const supported = machineRunCapabilitySupported(resolver, platform);
-    const profiles = resolver.list().filter((profile) => (profile.writeScope ?? 'none') === 'none' && (profile.descendantAllowlist?.length ?? 0) === 0);
+function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform, writeEnabled: boolean): Extract<MachineRunCapabilityResponse, { action: 'capabilities' }> {
+    const supported = machineRunCapabilitySupported(resolver, platform, writeEnabled);
+    const profiles = resolver.list().filter((profile) => profileEnforceable(profile, platform, writeEnabled));
     return {
         version: 1,
         action: 'capabilities',
@@ -351,8 +367,10 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
         stdin: 'none',
         maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
         maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
-        profiles: supported ? profiles.map(({ id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest }) => ({
+        profiles: supported ? profiles.map(({ id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest, writeScope, descendantAllowlist }) => ({
             id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest,
+            writeScope: writeScope ?? 'none',
+            descendantAllowlist: [...(descendantAllowlist ?? [])],
         })) : [],
         ...(platform === 'win32'
             ? { reason: 'MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required' }
@@ -360,6 +378,59 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
                 ? {}
                 : { reason: 'MACHINE_RUN_PROFILE_REGISTRY_UNAVAILABLE: no trusted profiles are registered' }),
     };
+}
+
+/**
+ * Git launched by a managed tool must not run workspace hooks, page output or
+ * prompt for credentials: none of that is in the approved profile.
+ */
+const GIT_DESCENDANT_ENVIRONMENT: Record<string, string> = {
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'core.hooksPath',
+    GIT_CONFIG_VALUE_0: '/dev/null',
+    GIT_PAGER: 'cat',
+    GIT_EDITOR: 'false',
+};
+
+async function findExecutable(name: string, searchPath: string): Promise<string | null> {
+    for (const directory of searchPath.split(delimiter)) {
+        if (!directory || !isAbsolute(directory)) continue;
+        const candidate = join(directory, name);
+        const info = await stat(candidate).catch(() => null);
+        if (!info?.isFile() || !(await access(candidate, constants.X_OK).then(() => true, () => false))) continue;
+        return realpath(candidate).catch(() => null);
+    }
+    return null;
+}
+
+function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Build a PATH that names only the profile executable and its allowlisted
+ * descendants. Each entry is a host-written wrapper that execs the absolute
+ * binary, so tools that locate helpers from their own path keep working.
+ * This confines name lookup; it is not a sandbox against absolute exec.
+ */
+async function createRestrictedPath(profile: TrustedMachineRunProfile, searchPath: string, tempRoot: string): Promise<string> {
+    const directory = await mkdtemp(join(tempRoot, 'saycode-machine-run-path-'));
+    try {
+        const names = [profile.executable, ...(profile.descendantAllowlist ?? [])];
+        for (const [index, name] of names.entries()) {
+            const target = await findExecutable(name, searchPath);
+            if (!target) {
+                if (index === 0) throw new Error(`MACHINE_RUN_EXECUTABLE_NOT_FOUND: ${name}`);
+                continue;
+            }
+            await writeFile(join(directory, name), `#!/bin/sh\nexec ${shellQuote(target)} "$@"\n`, { mode: 0o700 });
+        }
+        return directory;
+    } catch (error) {
+        await rm(directory, { recursive: true, force: true });
+        throw error;
+    }
 }
 
 function withoutVersion(response: TypedMachineRunResponse): Omit<TypedMachineRunResponse, 'version'> {
@@ -375,7 +446,6 @@ export function createProfileAwareMachineRunHandler(
     const resolver = resolverFor(source);
     const platform = options.platform ?? process.platform;
     const environment = options.environment ?? process.env;
-    const writeReleases = new Map<string, () => void>();
     const baseEnvironment: Record<string, string> = { PATH: environment.PATH ?? '' };
     const legacyHandler = options.typedHandler ?? createTypedMachineRunHandler(workingDirectory, {
         platform,
@@ -386,15 +456,10 @@ export function createProfileAwareMachineRunHandler(
 
     return async (input: unknown) => {
         assertCapabilityRequest(input);
-        if (input.action === 'capabilities') return capabilityResponse(resolver, platform);
+        if (input.action === 'capabilities') return capabilityResponse(resolver, platform, Boolean(options.writeScopePolicy));
         if (platform === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
         if (input.action === 'status' || input.action === 'cancel') {
-            const result = await legacyHandler({ version: 1, action: input.action, operationId: input.operationId });
-            if (result.action === 'status' && result.state !== 'running' || result.action === 'cancel') {
-                writeReleases.get(input.operationId)?.();
-                writeReleases.delete(input.operationId);
-            }
-            return withoutVersion(result);
+            return withoutVersion(await legacyHandler({ version: 1, action: input.action, operationId: input.operationId }));
         }
 
         const profile = resolver.resolve(input.profileId);
@@ -402,17 +467,19 @@ export function createProfileAwareMachineRunHandler(
         if (profile.profileDigest !== input.profileDigest) throw new Error(`MACHINE_RUN_PROFILE_DIGEST_MISMATCH: ${input.profileId}`);
         const requestedWorkspaceRoot = await resolveWorkspaceRoot(input.workspaceRoot, workingDirectory);
         let releaseWrite: (() => void) | undefined;
+        let pathDirectory: string | undefined;
+        let cleaned = false;
+        const cleanup = () => {
+            if (cleaned) return;
+            cleaned = true;
+            releaseWrite?.();
+            if (pathDirectory) void rm(pathDirectory, { recursive: true, force: true });
+        };
         try {
             if ((profile.writeScope ?? 'none') !== 'none') {
                 if (!options.writeScopePolicy) throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
                 releaseWrite = await options.writeScopePolicy.acquire({ profile, workspaceRoot: requestedWorkspaceRoot });
             }
-            if ((profile.descendantAllowlist?.length ?? 0) > 0) throw new Error(`MACHINE_RUN_DESCENDANT_POLICY_UNSUPPORTED: ${input.profileId}`);
-        } catch (error) {
-            releaseWrite?.();
-            throw error;
-        }
-        try {
             const cwd = profile.cwd === 'workspaceRoot'
                 ? requestedWorkspaceRoot
                 : profile.cwd === 'extensionData'
@@ -425,6 +492,11 @@ export function createProfileAwareMachineRunHandler(
                 if (value !== undefined) env[name] = value;
             }
             const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? requestedWorkspaceRoot : arg);
+            pathDirectory = await createRestrictedPath(profile, environment.PATH ?? '', options.tempDirectory ?? tmpdir());
+            const trustedEnv: Record<string, string> = {
+                PATH: pathDirectory,
+                ...(profile.descendantAllowlist?.includes('git') ? GIT_DESCENDANT_ENVIRONMENT : {}),
+            };
             const result = await legacyHandler({
                 version: 1,
                 action: 'start',
@@ -434,11 +506,10 @@ export function createProfileAwareMachineRunHandler(
                 env,
                 timeoutMs: profile.timeoutMs,
                 outputLimitBytes: profile.outputLimitBytes,
-            });
-            if (releaseWrite) writeReleases.set(result.operationId, releaseWrite);
+            }, { env: trustedEnv, onSettled: cleanup });
             return withoutVersion(result);
         } catch (error) {
-            releaseWrite?.();
+            cleanup();
             throw error;
         }
     };

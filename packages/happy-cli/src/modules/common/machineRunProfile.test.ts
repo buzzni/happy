@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
     createManagedProjectWriteScopePolicy,
     createProfileAwareMachineRunHandler,
@@ -26,7 +27,7 @@ function profile(overrides: Partial<MachineRunProfile> = {}): MachineRunProfile 
 }
 
 async function waitForStatus(handler: (input: unknown) => Promise<any>, operationId: string) {
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 120; attempt++) {
         const status = await handler({ action: 'status', operationId });
         if (status.state !== 'running') return status;
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -217,14 +218,90 @@ describe('profile-aware machine.run adapter', () => {
         }
     });
 
-    it('does not advertise or execute profiles with unenforced descendant policy', async () => {
+    it('lets a profile resolve only its executable and allowlisted descendants by name', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
-            const resolver = createTrustedMachineRunProfileResolver([profile({ descendantAllowlist: ['git'] })]);
+            const finder = (descendantAllowlist: string[]) => profile({
+                id: 'buzzni.test.find', executable: 'find', parameters: {}, outputLimitBytes: 4096, descendantAllowlist,
+                argv: ['{{workspaceRoot}}', '-maxdepth', '0', '-exec', 'ls', '-d', '{}', '+'],
+            });
+            const run = async (descendantAllowlist: string[]) => {
+                const resolver = createTrustedMachineRunProfileResolver([finder(descendantAllowlist)]);
+                const handler = createProfileAwareMachineRunHandler(root, resolver);
+                const started = await handler({ action: 'start', profileId: 'buzzni.test.find', profileDigest: resolver.list()[0].profileDigest, workspaceRoot: root, parameters: {} });
+                if (started.action !== 'start') throw new Error('not started');
+                return { handler, status: await waitForStatus(handler, started.operationId) };
+            };
+            await expect(run([])).resolves.toMatchObject({ status: { state: 'failed' } });
+            const allowed = await run(['ls']);
+            expect(allowed.status).toMatchObject({ state: 'passed', exitCode: 0, stdout: expect.stringContaining(await realpath(root)) });
+            await expect(allowed.handler({ action: 'capabilities' })).resolves.toMatchObject({
+                supported: true,
+                profiles: [{ id: 'buzzni.test.find', writeScope: 'none', descendantAllowlist: ['ls'] }],
+            });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('runs an allowlisted git descendant without hooks, pager or credential prompts', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            expect(spawnSync('git', ['init', '-q', root]).status).toBe(0);
+            const resolver = createTrustedMachineRunProfileResolver([
+                profile({ id: 'buzzni.test.env', executable: 'printenv', outputLimitBytes: 4096, descendantAllowlist: ['git'], argv: ['{{name}}'],
+                    parameters: { name: { type: 'string', maxLength: 32, values: ['GIT_TERMINAL_PROMPT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_PAGER'] } } }),
+                profile({ id: 'buzzni.test.git', executable: 'find', parameters: {}, outputLimitBytes: 4096, descendantAllowlist: ['git'],
+                    argv: ['{{workspaceRoot}}', '-maxdepth', '0', '-exec', 'git', 'status', '--porcelain', '{}', '+'] }),
+            ]);
             const handler = createProfileAwareMachineRunHandler(root, resolver);
-            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({ supported: false, profiles: [] });
-            const digest = resolver.list()[0].profileDigest;
-            await expect(handler({ action: 'start', profileId: profile().id, profileDigest: digest, workspaceRoot: root, parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_DESCENDANT_POLICY_UNSUPPORTED');
+            const runProfile = async (index: number, parameters: Record<string, string> = {}) => {
+                const target = resolver.list()[index];
+                const started = await handler({ action: 'start', profileId: target.id, profileDigest: target.profileDigest, workspaceRoot: root, parameters });
+                if (started.action !== 'start') throw new Error('not started');
+                return waitForStatus(handler, started.operationId);
+            };
+            const expected = { GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null', GIT_PAGER: 'cat' };
+            for (const [name, value] of Object.entries(expected)) {
+                await expect(runProfile(0, { name })).resolves.toMatchObject({ state: 'passed', stdout: `${value}\n` });
+            }
+            await expect(runProfile(1)).resolves.toMatchObject({ state: 'passed', exitCode: 0 });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('holds a project write lock until the process exits, not until a status poll', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const resolver = createTrustedMachineRunProfileResolver([profile({
+                id: 'buzzni.test.sleep', executable: 'sleep', argv: ['0.4'], parameters: {}, writeScope: 'project', descendantAllowlist: ['git'],
+            })]);
+            const handler = createProfileAwareMachineRunHandler(root, resolver, { writeScopePolicy: createManagedProjectWriteScopePolicy() });
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({
+                supported: true, profiles: [{ id: 'buzzni.test.sleep', writeScope: 'project' }],
+            });
+            const request = { action: 'start', profileId: 'buzzni.test.sleep', profileDigest: resolver.list()[0].profileDigest, workspaceRoot: root, parameters: {} };
+            const started = await handler(request);
+            if (started.action !== 'start') throw new Error('not started');
+            await expect(handler({ action: 'status', operationId: started.operationId })).resolves.toMatchObject({ state: 'running' });
+            await expect(handler(request)).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_BUSY');
+            await expect(waitForStatus(handler, started.operationId)).resolves.toMatchObject({ state: 'passed' });
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            await expect(handler(request)).resolves.toMatchObject({ state: 'accepted' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('does not advertise write profiles when the host installed no write policy', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const handler = createProfileAwareMachineRunHandler(root, [
+                profile(),
+                profile({ id: 'buzzni.test.write', writeScope: 'moai', descendantAllowlist: ['git'] }),
+            ]);
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
         } finally {
             await rm(root, { recursive: true, force: true });
         }

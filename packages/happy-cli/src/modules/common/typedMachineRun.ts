@@ -25,6 +25,18 @@ export interface TypedMachineRunHandlerOptions {
     allowStructuredArguments?: boolean;
 }
 
+/**
+ * Host-owned spawn inputs. This is a second argument on purpose: the RPC
+ * manager calls handlers with one request value, so a remote caller can never
+ * supply it, and it may therefore carry values the request validator forbids.
+ */
+export interface TrustedMachineRunSpawn {
+    /** Applied last, after the validated request env (e.g. a restricted PATH). */
+    env?: Record<string, string>;
+    /** Called once the child has closed and any group termination has finished. */
+    onSettled?: () => void;
+}
+
 export const MACHINE_RUN_MAX_OUTPUT_BYTES = 1024 * 1024;
 export const MACHINE_RUN_MAX_TIMEOUT_MS = 5 * 60 * 1000;
 export const MACHINE_RUN_MAX_TIMEOUT_GRACE_MS = 30_000;
@@ -143,7 +155,7 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
         })();
         return operation.termination;
     };
-    return async (input: unknown): Promise<TypedMachineRunResponse> => {
+    return async (input: unknown, trusted?: TrustedMachineRunSpawn): Promise<TypedMachineRunResponse> => {
         assertRequest(input, options);
         if ((options.platform ?? process.platform) === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
         reapExpired();
@@ -171,10 +183,12 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
         const cwd = input.cwd ? validatePath(requestedCwd, allowedWorkingDirectory) : { valid: true as const, resolvedPath: allowedWorkingDirectory };
         if (!cwd.valid || !cwd.resolvedPath) throw new Error(`MACHINE_RUN_PATH_DENIED: ${cwd.error}`);
         const outputLimitBytes = input.outputLimitBytes ?? MAX_OUTPUT_BYTES;
-        const child = spawn(input.executable, input.args, { cwd: cwd.resolvedPath, shell: false, detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ...(options.baseEnvironment ?? {}), ...(input.env ?? {}) } });
+        const child = spawn(input.executable, input.args, { cwd: cwd.resolvedPath, shell: false, detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ...(options.baseEnvironment ?? {}), ...(input.env ?? {}), ...(trusted?.env ?? {}) } });
         const operationId = randomUUID();
         const operation: Operation = { process: child, state: 'running', stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), outputLimitBytes, truncated: false, timedOut: false, exitCode: null, remoteMayContinue: true, descendantsReaped: false, processGroupEvidence: { kind: 'alive' }, childClosed: false, terminationSettled: false, finishedAt: Number.POSITIVE_INFINITY };
         operations.set(operationId, operation);
+        let settled = false;
+        const settle = () => { if (settled) return; settled = true; trusted?.onSettled?.(); };
         child.stdout?.on('data', (chunk: Buffer) => { const result = append(operation.stdout, chunk, Math.max(0, outputLimitBytes - operation.stderr.length)); operation.stdout = result.value; operation.truncated ||= result.truncated; });
         child.stderr?.on('data', (chunk: Buffer) => { const result = append(operation.stderr, chunk, Math.max(0, outputLimitBytes - operation.stdout.length)); operation.stderr = result.value; operation.truncated ||= result.truncated; });
         child.once('error', (error) => { operation.state = 'failed'; const result = append(operation.stderr, Buffer.from(error.message), Math.max(0, outputLimitBytes - operation.stdout.length)); operation.stderr = result.value; operation.truncated ||= result.truncated; });
@@ -184,12 +198,16 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
             if (operation.state === 'running') operation.state = code === 0 ? 'passed' : 'failed';
             refreshEvidence(operation);
             operation.finishedAt = Date.now();
-            if (operation.processGroupEvidence.kind !== 'no-local-trace') void terminate(operation, DEFAULT_TIMEOUT_GRACE_MS);
+            if (operation.processGroupEvidence.kind !== 'no-local-trace') void terminate(operation, DEFAULT_TIMEOUT_GRACE_MS).then(settle);
             // A spawn error has no PID and therefore no process group to drain. It is
             // terminal lifecycle evidence; retain the failure without consuming an
             // active-operation slot forever. A no-local-trace close is likewise settled,
             // while alive/indeterminate evidence remains unresolved conservatively.
-            else if (!operation.process.pid || !operation.termination) operation.terminationSettled = true;
+            else {
+                if (!operation.process.pid || !operation.termination) operation.terminationSettled = true;
+                // A timeout or cancel may still be draining the group; wait for it.
+                void (operation.termination ?? Promise.resolve()).then(settle);
+            }
         });
         const timer = setTimeout(() => { if (operation.state !== 'running') return; operation.timedOut = true; operation.state = 'failed'; operation.finishedAt = Date.now(); void terminate(operation, input.timeoutGraceMs ?? DEFAULT_TIMEOUT_GRACE_MS); }, input.timeoutMs ?? 30_000);
         child.once('close', () => clearTimeout(timer));
