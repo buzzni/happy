@@ -6,7 +6,6 @@ import {
     buildBrowserNativeHostManifest,
     prepareBrowserNativeMessaging,
     registerBrowserNativeHost,
-    resolveBrowserNativeHostHelperPath,
     resolveBrowserNativeHostManifestPath,
 } from './browserNativeHostRegistration'
 
@@ -19,15 +18,6 @@ afterEach(async () => {
 })
 
 describe('browser native host registration', () => {
-    it('uses the verified Windows launcher for native messaging and keeps the script fallback elsewhere', () => {
-        expect(resolveBrowserNativeHostHelperPath({ platform: 'win32', standaloneLauncher: 'C:\\runtime\\session-launcher.exe', fallback: 'C:\\cli\\host.mjs' }))
-            .toBe('C:\\runtime\\session-launcher.exe')
-        expect(resolveBrowserNativeHostHelperPath({ platform: 'win32', standaloneLauncher: 'C:\\cli\\host.mjs', fallback: 'C:\\cli\\host.mjs' }))
-            .toBe('C:\\cli\\host.mjs')
-        expect(resolveBrowserNativeHostHelperPath({ platform: 'darwin', standaloneLauncher: '/runtime/session-launcher.exe', fallback: '/cli/host.mjs' }))
-            .toBe('/cli/host.mjs')
-    })
-
     it('prepares or migrates the bridge token before exposing the native host manifest', async () => {
         const events: string[] = []
 
@@ -126,7 +116,7 @@ describe('browser native host registration', () => {
         ])
     })
 
-    it('registers the Windows manifest in HKCU without replacing sibling hosts', async () => {
+    it('registers a Windows batch wrapper in HKCU because Chrome cannot run a .mjs host directly', async () => {
         const homeDir = await mkdtemp(join(tmpdir(), 'happy-native-host-win-'))
         tempDirs.push(homeDir)
         const registrations: Array<{ name: string; manifestPath: string }> = []
@@ -135,14 +125,35 @@ describe('browser native host registration', () => {
             platform: 'win32',
             homeDir,
             extensionId: EXTENSION_ID,
-            helperPath: 'C:\\Program Files\\Saycode\\happy-browser-native-host.mjs',
+            helperPath: 'C:\\Program Files\\Saycode\\bin\\happy-browser-native-host.mjs',
+            nodePath: 'C:\\Program Files\\Saycode\\node-runtime\\node.exe',
             registry: {
                 setManifestPath: async (name, path) => { registrations.push({ name, manifestPath: path }) },
             },
         })
 
+        const wrapperPath = join(homeDir, 'AppData', 'Local', 'Saycode', 'NativeMessagingHosts', 'ai.saycode.happy_browser.cmd')
         expect(manifestPath).toBe(join(homeDir, 'AppData', 'Local', 'Saycode', 'NativeMessagingHosts', HOST_FILE))
         expect(registrations).toEqual([{ name: 'ai.saycode.happy_browser', manifestPath }])
-        expect(JSON.parse(await readFile(manifestPath!, 'utf8')).path).toBe('C:\\Program Files\\Saycode\\happy-browser-native-host.mjs')
+        expect(JSON.parse(await readFile(manifestPath!, 'utf8')).path).toBe(wrapperPath)
+        expect(await readFile(wrapperPath, 'utf8')).toBe(
+            '@echo off\r\nchcp 65001 >nul\r\n"C:\\Program Files\\Saycode\\node-runtime\\node.exe" "C:\\Program Files\\Saycode\\bin\\happy-browser-native-host.mjs" %*\r\n',
+        )
+    })
+
+    it('escapes percent signs and refuses quotes in the Windows batch wrapper paths', async () => {
+        const homeDir = await mkdtemp(join(tmpdir(), 'happy-native-host-win-'))
+        tempDirs.push(homeDir)
+        const base = {
+            platform: 'win32' as const,
+            homeDir,
+            extensionId: EXTENSION_ID,
+            registry: { setManifestPath: async () => {} },
+        }
+
+        await registerBrowserNativeHost({ ...base, helperPath: 'C:\\100%\\host.mjs', nodePath: 'C:\\node.exe' })
+        const wrapper = await readFile(join(homeDir, 'AppData', 'Local', 'Saycode', 'NativeMessagingHosts', 'ai.saycode.happy_browser.cmd'), 'utf8')
+        expect(wrapper).toContain('"C:\\100%%\\host.mjs"')
+        await expect(registerBrowserNativeHost({ ...base, helperPath: 'C:\\a"b\\host.mjs', nodePath: 'C:\\node.exe' })).rejects.toThrow('cannot be quoted')
     })
 })

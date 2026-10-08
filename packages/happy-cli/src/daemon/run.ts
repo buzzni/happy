@@ -64,7 +64,7 @@ import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
-import { prepareBrowserNativeMessaging, registerBrowserNativeHost, resolveBrowserNativeHostHelperPath } from './browserNativeHostRegistration';
+import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
@@ -3550,11 +3550,7 @@ export async function startDaemon(): Promise<void> {
     // Prepare/migrate the token before exposing the helper manifest. Chrome
     // can launch the helper as soon as the manifest exists, and must not race
     // legacy-token migration by creating a different machine-wide token.
-    const nativeMessagingHelperPath = resolveBrowserNativeHostHelperPath({
-      platform: process.platform,
-      standaloneLauncher: process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER,
-      fallback: join(projectPath(), 'bin', 'happy-browser-native-host.mjs'),
-    });
+    const nativeMessagingHelperPath = join(projectPath(), 'bin', 'happy-browser-native-host.mjs');
     const nativeMessaging = await prepareBrowserNativeMessaging({
       readToken: () => readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile
