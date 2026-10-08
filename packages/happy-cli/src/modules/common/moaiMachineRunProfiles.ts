@@ -1,4 +1,6 @@
-import type { MachineRunParameter, MachineRunProfile } from './machineRunProfile';
+import { join } from 'node:path';
+import type { MachineRunManagedTools, MachineRunParameter, MachineRunProfile } from './machineRunProfile';
+import type { ManagedMachineTool } from './managedMachineTool';
 
 /**
  * Host-owned machine.run catalog for Moai v0.8.0 (buzzni/moai tag commit
@@ -49,3 +51,32 @@ export const MOAI_V080_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
     write('link', ['link', '{{id}}', '--blocks', '{{blocks}}'], { id: text(128), blocks: text(2048) }),
     write('backlog', ['backlog', 'add', '{{title}}'], { title: text(512) }),
 ];
+
+/**
+ * The pinned v0.8.0 release artifacts. Archive and extracted-executable
+ * digests were checked against the public release assets.
+ */
+export const MOAI_V080_MANAGED_TOOL: ManagedMachineTool = {
+    id: 'buzzni.moai',
+    version: '0.8.0',
+    executable: 'moai',
+    artifacts: {
+        'darwin-arm64': {
+            url: 'https://github.com/buzzni/moai/releases/download/v0.8.0/moai-v0.8.0-aarch64-apple-darwin.tar.gz',
+            sha256: 'c79200aa0b10b5949efa19a1c280465a1db5c3d6163f4e8b27f979b7403edeb2',
+            archiveRoot: 'moai-v0.8.0-aarch64-apple-darwin',
+            executableSha256: '81c2102d4326d1be8b622ec66dd191596fe38d54aae78bf9b8eec58b247b5e6e',
+        },
+        'linux-x64': {
+            url: 'https://github.com/buzzni/moai/releases/download/v0.8.0/moai-v0.8.0-x86_64-unknown-linux-musl.tar.gz',
+            sha256: '9c1db13a9a589c9dfcdc5645f757734e2fbc2eda7674a9f2d8662b2fb8d4c3e5',
+            archiveRoot: 'moai-v0.8.0-x86_64-unknown-linux-musl',
+            executableSha256: '7cb0ee09e1159ab2b19d1102db7bb3d5c41ddca0d4781707944c3781747d15e6',
+        },
+    },
+};
+
+/** Managed tools this daemon build installs under `<happyHome>/managed-tools`. */
+export function hostManagedMachineTools(happyHomeDir: string): MachineRunManagedTools {
+    return { root: join(happyHomeDir, 'managed-tools'), tools: [MOAI_V080_MANAGED_TOOL] };
+}

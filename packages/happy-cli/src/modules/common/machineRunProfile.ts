@@ -13,6 +13,14 @@ import {
 } from './typedMachineRun';
 import { validatePath } from './pathSecurity';
 import { MOAI_V080_MACHINE_RUN_PROFILES } from './moaiMachineRunProfiles';
+import {
+    managedMachineToolPlatform,
+    managedMachineToolStatus,
+    resolveManagedMachineToolExecutable,
+    type ManagedMachineTool,
+    type ManagedMachineToolPlatform,
+    type ManagedMachineToolStatus,
+} from './managedMachineTool';
 import packageJson from '../../../package.json';
 
 export type MachineRunJsonValue = string | number | boolean | null | MachineRunJsonValue[] | { [key: string]: MachineRunJsonValue };
@@ -78,7 +86,11 @@ export type MachineRunCapabilityResponse =
         profiles: Array<Pick<TrustedMachineRunProfile, 'id' | 'cwd' | 'parameters' | 'timeoutMs' | 'outputLimitBytes' | 'profileDigest'> & {
             writeScope: 'none' | 'moai' | 'project';
             descendantAllowlist: string[];
+            /** Managed tool this profile runs; it must be installed before a start succeeds. */
+            tool?: string;
         }>;
+        /** Install state of the managed tools behind the advertised profiles. */
+        tools: ManagedMachineToolStatus[];
         reason?: string;
     }
     | Omit<TypedMachineRunResponse, 'version'>;
@@ -93,6 +105,15 @@ export interface MachineRunProfileHandlerOptions {
     typedHandler?: (input: TypedMachineRunRequest, trusted?: TrustedMachineRunSpawn) => Promise<TypedMachineRunResponse>;
     /** Host-owned policy required before any profile with a write scope can run. */
     writeScopePolicy?: MachineRunWriteScopePolicy;
+    /** A profile whose executable names one of these tools runs only its verified install. */
+    managedTools?: MachineRunManagedTools;
+}
+
+export interface MachineRunManagedTools {
+    root: string;
+    tools: readonly ManagedMachineTool[];
+    /** Defaults to the daemon's own platform and architecture. */
+    platform?: ManagedMachineToolPlatform | null;
 }
 
 export interface MachineRunWriteScopePolicy {
@@ -253,19 +274,34 @@ export const TRUSTED_MACHINE_RUN_PROFILE_REGISTRY: TrustedMachineRunProfileRegis
 
 /**
  * A profile is enforceable when its descendants are confined to a restricted
- * PATH (POSIX) and, for a write scope, the host installed a write policy.
+ * PATH (POSIX), a write scope has a host write policy, and a managed tool has a
+ * pinned artifact for this machine.
  */
-function profileEnforceable(profile: TrustedMachineRunProfile, platform: NodeJS.Platform, writeEnabled: boolean): boolean {
+function profileEnforceable(profile: TrustedMachineRunProfile, platform: NodeJS.Platform, writeEnabled: boolean, managedTools?: MachineRunManagedTools): boolean {
     if (platform === 'win32') return false;
+    const tool = managedToolFor(profile, managedTools);
+    if (tool) {
+        const toolPlatform = managedToolPlatform(platform, managedTools);
+        if (!toolPlatform || !tool.artifacts[toolPlatform]) return false;
+    }
     return (profile.writeScope ?? 'none') === 'none' || writeEnabled;
+}
+
+function managedToolFor(profile: MachineRunProfile, managedTools?: MachineRunManagedTools): ManagedMachineTool | undefined {
+    return managedTools?.tools.find((tool) => tool.executable === profile.executable);
+}
+
+function managedToolPlatform(platform: NodeJS.Platform, managedTools?: MachineRunManagedTools): ManagedMachineToolPlatform | null {
+    return managedTools?.platform !== undefined ? managedTools.platform : managedMachineToolPlatform(platform);
 }
 
 export function machineRunCapabilitySupported(
     registry: TrustedMachineRunProfileRegistry,
     platform: NodeJS.Platform = process.platform,
     writeEnabled = false,
+    managedTools?: MachineRunManagedTools,
 ): boolean {
-    return registry.list().some((profile) => profileEnforceable(profile, platform, writeEnabled));
+    return registry.list().some((profile) => profileEnforceable(profile, platform, writeEnabled, managedTools));
 }
 
 function resolverFor(source: MachineRunProfileResolver | readonly MachineRunProfile[]): MachineRunProfileResolver {
@@ -350,9 +386,13 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
     return args;
 }
 
-function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform, writeEnabled: boolean): Extract<MachineRunCapabilityResponse, { action: 'capabilities' }> {
-    const supported = machineRunCapabilitySupported(resolver, platform, writeEnabled);
-    const profiles = resolver.list().filter((profile) => profileEnforceable(profile, platform, writeEnabled));
+async function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform, writeEnabled: boolean, managedTools?: MachineRunManagedTools): Promise<Extract<MachineRunCapabilityResponse, { action: 'capabilities' }>> {
+    const supported = machineRunCapabilitySupported(resolver, platform, writeEnabled, managedTools);
+    const profiles = resolver.list().filter((profile) => profileEnforceable(profile, platform, writeEnabled, managedTools));
+    const usedTools = [...new Set(profiles.map((profile) => managedToolFor(profile, managedTools)).filter((tool): tool is ManagedMachineTool => Boolean(tool)))];
+    const tools = supported && managedTools
+        ? await Promise.all(usedTools.map((tool) => managedMachineToolStatus(tool, managedTools.root, managedToolPlatform(platform, managedTools))))
+        : [];
     return {
         version: 1,
         action: 'capabilities',
@@ -368,11 +408,17 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
         stdin: 'none',
         maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
         maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
-        profiles: supported ? profiles.map(({ id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest, writeScope, descendantAllowlist }) => ({
-            id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest,
-            writeScope: writeScope ?? 'none',
-            descendantAllowlist: [...(descendantAllowlist ?? [])],
-        })) : [],
+        profiles: supported ? profiles.map((profile) => {
+            const tool = managedToolFor(profile, managedTools);
+            return {
+                id: profile.id, cwd: profile.cwd, parameters: profile.parameters, timeoutMs: profile.timeoutMs,
+                outputLimitBytes: profile.outputLimitBytes, profileDigest: profile.profileDigest,
+                writeScope: profile.writeScope ?? 'none',
+                descendantAllowlist: [...(profile.descendantAllowlist ?? [])],
+                ...(tool ? { tool: tool.id } : {}),
+            };
+        }) : [],
+        tools,
         ...(platform === 'win32'
             ? { reason: 'MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required' }
             : supported
@@ -415,12 +461,12 @@ function shellQuote(value: string): string {
  * binary, so tools that locate helpers from their own path keep working.
  * This confines name lookup; it is not a sandbox against absolute exec.
  */
-async function createRestrictedPath(profile: TrustedMachineRunProfile, searchPath: string, tempRoot: string): Promise<string> {
+async function createRestrictedPath(profile: TrustedMachineRunProfile, searchPath: string, tempRoot: string, executableTarget?: string): Promise<string> {
     const directory = await mkdtemp(join(tempRoot, 'saycode-machine-run-path-'));
     try {
         const names = [profile.executable, ...(profile.descendantAllowlist ?? [])];
         for (const [index, name] of names.entries()) {
-            const target = await findExecutable(name, searchPath);
+            const target = index === 0 && executableTarget ? executableTarget : await findExecutable(name, searchPath);
             if (!target) {
                 if (index === 0) throw new Error(`MACHINE_RUN_EXECUTABLE_NOT_FOUND: ${name}`);
                 continue;
@@ -457,7 +503,7 @@ export function createProfileAwareMachineRunHandler(
 
     return async (input: unknown) => {
         assertCapabilityRequest(input);
-        if (input.action === 'capabilities') return capabilityResponse(resolver, platform, Boolean(options.writeScopePolicy));
+        if (input.action === 'capabilities') return capabilityResponse(resolver, platform, Boolean(options.writeScopePolicy), options.managedTools);
         if (platform === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
         if (input.action === 'status' || input.action === 'cancel') {
             return withoutVersion(await legacyHandler({ version: 1, action: input.action, operationId: input.operationId }));
@@ -493,7 +539,11 @@ export function createProfileAwareMachineRunHandler(
                 if (value !== undefined) env[name] = value;
             }
             const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? requestedWorkspaceRoot : arg);
-            pathDirectory = await createRestrictedPath(profile, environment.PATH ?? '', options.tempDirectory ?? tmpdir());
+            const tool = managedToolFor(profile, options.managedTools);
+            const executableTarget = tool && options.managedTools
+                ? await resolveManagedMachineToolExecutable(tool, options.managedTools.root, managedToolPlatform(platform, options.managedTools))
+                : undefined;
+            pathDirectory = await createRestrictedPath(profile, environment.PATH ?? '', options.tempDirectory ?? tmpdir(), executableTarget);
             const trustedEnv: Record<string, string> = {
                 PATH: pathDirectory,
                 ...(profile.descendantAllowlist?.includes('git') ? GIT_DESCENDANT_ENVIRONMENT : {}),

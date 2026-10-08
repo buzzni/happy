@@ -31,10 +31,12 @@ import { createTypedMachineRunHandler } from './typedMachineRun';
 import {
     createProfileAwareMachineRunHandler,
     TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+    type MachineRunManagedTools,
     type MachineRunProfileHandlerOptions,
     type MachineRunWriteScopePolicy,
     type TrustedMachineRunProfileRegistry,
 } from './machineRunProfile';
+import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -421,6 +423,10 @@ export interface CommonHandlerOptions {
         allowLegacyRaw?: boolean;
         /** Host-owned write policy. Without it, write profiles are neither advertised nor run. */
         writeScopePolicy?: MachineRunWriteScopePolicy;
+        /** Host-owned pinned tools; their profiles run only the verified install. */
+        managedTools?: MachineRunManagedTools;
+        /** Only the machine scope downloads and installs managed tools. */
+        allowToolInstall?: boolean;
     };
 }
 
@@ -435,6 +441,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         environment: machineRunOptions.environment,
         platform: machineRunOptions.platform,
         writeScopePolicy: machineRunOptions.writeScopePolicy,
+        managedTools: machineRunOptions.managedTools,
     } : { platform: process.platform };
     // `machine.run` is the profile-aware capability used by Desktop. The
     // hyphenated alias is profile-only by default; raw executable/argv is an
@@ -464,6 +471,24 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     };
     rpcHandlerManager.registerHandler('machine-run', machineRunHandler);
     rpcHandlerManager.registerHandler('machine.run', profileMachineRunHandler);
+    const managedTools = machineRunOptions?.managedTools;
+    if (managedTools) {
+        rpcHandlerManager.registerHandler('machine.tool', async (request: unknown) => {
+            const input = request && typeof request === 'object' && !Array.isArray(request) ? request as Record<string, unknown> : null;
+            if (!input || Object.keys(input).sort().join(',') !== 'action,toolId,version' || input.version !== 1
+                || (input.action !== 'status' && input.action !== 'install') || typeof input.toolId !== 'string') {
+                throw new Error('MANAGED_TOOL_INVALID: expected { version: 1, action: status|install, toolId }');
+            }
+            const tool = managedTools.tools.find((candidate) => candidate.id === input.toolId);
+            if (!tool) throw new Error(`MANAGED_TOOL_NOT_FOUND: ${input.toolId}`);
+            const platform = managedTools.platform !== undefined ? managedTools.platform : managedMachineToolPlatform();
+            if (input.action === 'install') {
+                if (!machineRunOptions?.allowToolInstall) throw new Error('MANAGED_TOOL_INSTALL_UNAVAILABLE');
+                return { version: 1, action: 'install', tool: await installManagedMachineTool(tool, { root: managedTools.root, platform }) };
+            }
+            return { version: 1, action: 'status', tool: await managedMachineToolStatus(tool, managedTools.root, platform) };
+        });
+    }
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {

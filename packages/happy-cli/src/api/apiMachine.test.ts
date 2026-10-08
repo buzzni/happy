@@ -144,7 +144,12 @@ describe('ApiMachineClient machine RPC server lane', () => {
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             expect.any(String),
-            { machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, writeScopePolicy: { acquire: expect.any(Function) } } },
+            { machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                writeScopePolicy: { acquire: expect.any(Function) },
+                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [expect.objectContaining({ id: 'buzzni.moai', version: '0.8.0' })] },
+                allowToolInstall: true,
+            } },
         );
     });
 

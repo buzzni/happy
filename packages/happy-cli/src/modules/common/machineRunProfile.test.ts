@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import * as tar from 'tar';
+import { installManagedMachineTool, managedMachineToolPlatform } from './managedMachineTool';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -302,6 +305,63 @@ describe('profile-aware machine.run adapter', () => {
                 profile({ id: 'buzzni.test.write', writeScope: 'moai', descendantAllowlist: ['git'] }),
             ]);
             await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('runs a managed tool only from its verified install, never from PATH', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const script = '#!/bin/sh\necho managed\n';
+            const source = join(root, 'src');
+            await mkdir(join(source, 'fake-tool-v1'), { recursive: true });
+            await writeFile(join(source, 'fake-tool-v1', 'fake-tool'), script, { mode: 0o755 });
+            await tar.c({ gzip: true, file: join(root, 'a.tar.gz'), cwd: source, portable: true }, ['fake-tool-v1']);
+            const bytes = await readFile(join(root, 'a.tar.gz'));
+            const artifact = {
+                url: 'https://github.com/buzzni/fake/releases/download/v1/fake-tool-v1.tar.gz',
+                sha256: createHash('sha256').update(bytes).digest('hex'),
+                archiveRoot: 'fake-tool-v1',
+                executableSha256: createHash('sha256').update(script).digest('hex'),
+            };
+            const fakeTool = { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: { 'darwin-arm64': artifact, 'linux-x64': artifact } };
+            const decoys = join(root, 'decoys');
+            await mkdir(decoys);
+            await writeFile(join(decoys, 'fake-tool'), '#!/bin/sh\necho from-path\n', { mode: 0o755 });
+            const toolsRoot = join(root, 'tools');
+            const resolver = createTrustedMachineRunProfileResolver([profile({ id: 'buzzni.fake.run', executable: 'fake-tool', argv: ['x'], parameters: {} })]);
+            const handler = createProfileAwareMachineRunHandler(root, resolver, {
+                environment: { PATH: `${decoys}:/usr/bin:/bin` },
+                managedTools: { root: toolsRoot, tools: [fakeTool] },
+            });
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({
+                profiles: [{ id: 'buzzni.fake.run', tool: 'buzzni.fake' }],
+                tools: [{ toolId: 'buzzni.fake', version: '1.0.0', supported: true, installed: false }],
+            });
+            const request = { action: 'start', profileId: 'buzzni.fake.run', profileDigest: resolver.list()[0].profileDigest, workspaceRoot: root, parameters: {} };
+            await expect(handler(request)).rejects.toThrow('MACHINE_RUN_TOOL_NOT_INSTALLED');
+
+            await installManagedMachineTool(fakeTool, {
+                root: toolsRoot, platform: managedMachineToolPlatform(),
+                fetch: async () => ({ ok: true, status: 200, url: artifact.url, headers: new Headers(), arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer }),
+            });
+            const started = await handler(request);
+            if (started.action !== 'start') throw new Error('not started');
+            await expect(waitForStatus(handler, started.operationId)).resolves.toMatchObject({ state: 'passed', stdout: 'managed\n' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('does not advertise a managed-tool profile on a platform without a pinned artifact', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const fakeTool = { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: {} };
+            const handler = createProfileAwareMachineRunHandler(root, [profile({ id: 'buzzni.fake.run', executable: 'fake-tool', argv: ['x'], parameters: {} })], {
+                managedTools: { root: join(root, 'tools'), tools: [fakeTool] },
+            });
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({ supported: false, profiles: [] });
         } finally {
             await rm(root, { recursive: true, force: true });
         }

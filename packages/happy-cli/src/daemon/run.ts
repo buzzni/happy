@@ -342,6 +342,7 @@ import {
   MACHINE_RUN_MAX_TIMEOUT_MS,
 } from '@/modules/common/typedMachineRun';
 import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
+import { hostManagedMachineTools } from '@/modules/common/moaiMachineRunProfiles';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -373,7 +374,7 @@ export const initialMachineMetadata: MachineMetadata = {
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).
-    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, process.platform, true),
+    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, process.platform, true, hostManagedMachineTools(configuration.happyHomeDir)),
     shell: false,
     stdin: 'none',
     maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,

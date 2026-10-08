@@ -6,6 +6,7 @@ import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
 import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
 import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileResolver } from './machineRunProfile';
+import { managedMachineToolPlatform } from './managedMachineTool';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -98,6 +99,25 @@ describe('registerCommonHandlers machine.run capability', () => {
         });
         const session = await createHandlers(undefined, { machineRun: { profileRegistry: registry } });
         await expect(session.handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: false, profiles: [] });
+    });
+
+    it('exposes managed tool status everywhere but install only where the host allows it', async () => {
+        const toolsRoot = await mkdtemp(join(tmpdir(), 'happy-tools-'));
+        temporaryDirectories.push(toolsRoot);
+        const fakeTool = { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: {} };
+        const managedTools = { root: toolsRoot, tools: [fakeTool] };
+        const registry = createTrustedMachineRunProfileResolver([]);
+        const machine = await createHandlers(undefined, { machineRun: { profileRegistry: registry, managedTools, allowToolInstall: true } });
+        const tool = machine.handlers.get('machine.tool');
+        await expect(tool?.({ version: 1, action: 'status', toolId: 'buzzni.fake' })).resolves.toEqual({
+            version: 1, action: 'status', tool: { toolId: 'buzzni.fake', version: '1.0.0', platform: managedMachineToolPlatform(), supported: false, installed: false },
+        });
+        await expect(tool?.({ version: 1, action: 'install', toolId: 'buzzni.fake' })).rejects.toThrow('MANAGED_TOOL_UNSUPPORTED_PLATFORM');
+        await expect(tool?.({ version: 1, action: 'status', toolId: 'buzzni.unknown' })).rejects.toThrow('MANAGED_TOOL_NOT_FOUND');
+        await expect(tool?.({ version: 1, action: 'install', toolId: 'buzzni.fake', url: 'https://example.com' })).rejects.toThrow('MANAGED_TOOL_INVALID');
+
+        const session = await createHandlers(undefined, { machineRun: { profileRegistry: registry, managedTools } });
+        await expect(session.handlers.get('machine.tool')?.({ version: 1, action: 'install', toolId: 'buzzni.fake' })).rejects.toThrow('MANAGED_TOOL_INSTALL_UNAVAILABLE');
     });
 
     it('fails closed when the daemon has no host-owned profile registry', async () => {
