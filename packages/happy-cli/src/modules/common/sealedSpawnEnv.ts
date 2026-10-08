@@ -8,11 +8,10 @@
  * env or a 0600 file, never as command text, and is never logged or returned.
  */
 import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'node:crypto';
-import { exec, type ExecOptions } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import {
     SEALED_SPAWN_ENV_FILE_VARIABLE,
     SEALED_SPAWN_ENV_KEY_LABEL,
@@ -25,9 +24,58 @@ import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
 import { logger } from '@/ui/logger';
 import { validatePath } from './pathSecurity';
 
-const execAsync = promisify(exec);
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 5 * 60_000;
+
+function terminateProcessTree(child: ChildProcess): void {
+    if (!child.pid) return;
+    if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true }).unref();
+        return;
+    }
+    try {
+        process.kill(-child.pid, 'SIGKILL');
+    } catch {
+        try { child.kill('SIGKILL'); } catch { /* already exited */ }
+    }
+}
+
+function spawnWithProcessTreeTimeout(command: string, options: { cwd: string; env: NodeJS.ProcessEnv; windowsHide: boolean }, timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        let timedOut = false;
+        const child = spawn(command, {
+            ...options,
+            shell: true,
+            ...(process.platform === 'win32' ? {} : { detached: true }),
+        });
+        const stdout: Buffer[] = [];
+        const stderr: Buffer[] = [];
+        child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
+        child.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk));
+        child.on('error', (error) => reject(Object.assign(error, {
+            stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), killed: timedOut,
+            ...(timedOut ? { code: 'ETIMEDOUT' } : {}),
+        })));
+        child.on('close', (code, signal) => {
+            clearTimeout(timer);
+            const output = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+            if (timedOut) {
+                reject(Object.assign(new Error('Command timed out'), output, { code: 'ETIMEDOUT', killed: true }));
+            } else if (code === 0) {
+                resolve(output);
+            } else {
+                reject(Object.assign(new Error(`Command exited with ${signal ?? code}`), output, { code: code ?? 1, signal }));
+            }
+        });
+        const timer = setTimeout(() => {
+            timedOut = true;
+            terminateProcessTree(child);
+        }, timeoutMs);
+        timer.unref?.();
+    });
+}
 
 function sealKey(laneKey: Uint8Array): Buffer {
     return createHmac('sha256', laneKey).update(SEALED_SPAWN_ENV_KEY_LABEL).digest();
@@ -139,9 +187,10 @@ export function createSealedSpawnEnvHandler(deps: {
                 await writeFile(file, envFileContent(payload.env), { mode: 0o600 });
                 env[SEALED_SPAWN_ENV_FILE_VARIABLE] = file;
             }
-            const options: ExecOptions = { cwd: cwd.resolvedPath, timeout: request.timeout ?? 30_000, windowsHide: true, env };
+            const timeout = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+            const options = { cwd: cwd.resolvedPath, windowsHide: true, env };
             logger.debug('[sealed-spawn-env] running', { cwd: options.cwd, delivery: request.envDelivery, names: Object.keys(payload.env).length });
-            const { stdout, stderr } = await execAsync(request.command, options);
+            const { stdout, stderr } = await spawnWithProcessTreeTimeout(request.command, options, timeout);
             return { success: true, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), exitCode: 0 };
         } catch (error) {
             const execError = error as { stdout?: unknown; stderr?: unknown; code?: unknown; killed?: boolean; message?: string };

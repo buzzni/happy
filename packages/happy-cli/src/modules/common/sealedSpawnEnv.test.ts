@@ -61,6 +61,16 @@ describe('spawn-with-sealed-env', () => {
     expect(existsSync(file!)).toBe(false);
   });
 
+  it('kills descendants when a command times out', async () => {
+    const result = await handler()({
+      command: 'sleep 20 & echo $!; wait', cwd: root, sealedEnv: sealed(), envDelivery: 'process', timeout: 100,
+    });
+    expect(result).toMatchObject({ success: false, error: 'Command timed out' });
+    const pid = Number(String(result.stdout).trim().split(/\s+/)[0]);
+    expect(pid).toBeGreaterThan(0);
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
   it('refuses a reserved name and runs nothing', async () => {
     const result = await handler()({
       command: 'echo ran', cwd: root, envDelivery: 'process',
