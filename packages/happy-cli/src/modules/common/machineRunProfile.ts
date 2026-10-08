@@ -195,7 +195,7 @@ export function machineRunCapabilitySupported(
     registry: TrustedMachineRunProfileRegistry,
     platform: NodeJS.Platform = process.platform,
 ): boolean {
-    return platform !== 'win32' && registry.list().some((profile) => (profile.writeScope ?? 'none') === 'none');
+    return platform !== 'win32' && registry.list().some((profile) => (profile.writeScope ?? 'none') === 'none' && (profile.descendantAllowlist?.length ?? 0) === 0);
 }
 
 function resolverFor(source: MachineRunProfileResolver | readonly MachineRunProfile[]): MachineRunProfileResolver {
@@ -282,7 +282,7 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
 
 function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform): Extract<MachineRunCapabilityResponse, { action: 'capabilities' }> {
     const supported = machineRunCapabilitySupported(resolver, platform);
-    const profiles = resolver.list().filter((profile) => (profile.writeScope ?? 'none') === 'none');
+    const profiles = resolver.list().filter((profile) => (profile.writeScope ?? 'none') === 'none' && (profile.descendantAllowlist?.length ?? 0) === 0);
     return {
         version: 1,
         action: 'capabilities',
@@ -335,6 +335,7 @@ export function createProfileAwareMachineRunHandler(
         if (profile.profileDigest !== input.profileDigest) throw new Error(`MACHINE_RUN_PROFILE_DIGEST_MISMATCH: ${input.profileId}`);
         const requestedWorkspaceRoot = await resolveWorkspaceRoot(input.workspaceRoot, workingDirectory);
         if ((profile.writeScope ?? 'none') !== 'none') throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
+        if ((profile.descendantAllowlist?.length ?? 0) > 0) throw new Error(`MACHINE_RUN_DESCENDANT_POLICY_UNSUPPORTED: ${input.profileId}`);
         const cwd = profile.cwd === 'workspaceRoot'
             ? requestedWorkspaceRoot
             : profile.cwd === 'extensionData'

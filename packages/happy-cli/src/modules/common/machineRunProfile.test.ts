@@ -162,6 +162,19 @@ describe('profile-aware machine.run adapter', () => {
         }
     });
 
+    it('does not advertise or execute profiles with unenforced descendant policy', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const resolver = createTrustedMachineRunProfileResolver([profile({ descendantAllowlist: ['git'] })]);
+            const handler = createProfileAwareMachineRunHandler(root, resolver);
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({ supported: false, profiles: [] });
+            const digest = resolver.list()[0].profileDigest;
+            await expect(handler({ action: 'start', profileId: profile().id, profileDigest: digest, workspaceRoot: root, parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_DESCENDANT_POLICY_UNSUPPORTED');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
     it('requires the trusted digest and daemon workspace root at the RPC boundary', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
