@@ -40,6 +40,7 @@ describe('typed machine-run handler', () => {
             await expect(handler({ version: 1, action: 'start', executable: 'sh', args: ['-c', 'id'] })).rejects.toThrow('MACHINE_RUN_INVALID');
             await expect(handler({ version: 1, action: 'start', executable: 'printf', args: ['ok;id'] })).rejects.toThrow('MACHINE_RUN_INVALID');
             await expect(handler({ version: 1, action: 'start', executable: 'printf', args: ['ok'], cwd: '/' })).rejects.toThrow('MACHINE_RUN_PATH_DENIED');
+            await expect(handler({ version: 1, action: 'start', executable: 'printf', args: ['ok'], cwd: join(root, 'missing') })).rejects.toThrow('MACHINE_RUN_PATH_DENIED');
         } finally {
             await rm(root, { recursive: true, force: true });
         }

@@ -160,7 +160,14 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
             return { version: 1, action: 'status', operationId: input.operationId, state: operation.state, stdout: operation.stdout.toString('utf8'), stderr: operation.stderr.toString('utf8'), exitCode: operation.exitCode, truncated: operation.truncated, timedOut: operation.timedOut, remoteMayContinue: operation.remoteMayContinue, descendantsReaped: operation.descendantsReaped, processGroupEvidence: operation.processGroupEvidence };
         }
         if ([...operations.values()].filter(unresolved).length >= MAX_ACTIVE_OPERATIONS) throw new Error('MACHINE_RUN_QUOTA_EXCEEDED: too many active operations');
-        const requestedCwd = input.cwd ? (realpathSync(input.cwd) as string) : allowedWorkingDirectory;
+        let requestedCwd = allowedWorkingDirectory;
+        if (input.cwd) {
+            try {
+                requestedCwd = realpathSync(input.cwd);
+            } catch {
+                throw new Error('MACHINE_RUN_PATH_DENIED: cwd does not exist');
+            }
+        }
         const cwd = input.cwd ? validatePath(requestedCwd, allowedWorkingDirectory) : { valid: true as const, resolvedPath: allowedWorkingDirectory };
         if (!cwd.valid || !cwd.resolvedPath) throw new Error(`MACHINE_RUN_PATH_DENIED: ${cwd.error}`);
         const outputLimitBytes = input.outputLimitBytes ?? MAX_OUTPUT_BYTES;

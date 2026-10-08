@@ -80,9 +80,9 @@ export interface MachineRunProfileHandlerOptions {
 
 const PROFILE_ID = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
 const EXECUTABLE = /^[a-z][a-z0-9._-]*$/;
-const FORBIDDEN_EXECUTABLE = /^(?:sh|bash|zsh|fish|cmd|powershell|pwsh|node|python|python3|npm|npx|env|xargs|ssh|tmux)$/i;
+const FORBIDDEN_EXECUTABLE = /^(?:sh|bash|zsh|fish|cmd|powershell|pwsh|node|nodejs|deno|bun|python|python2|python3|ruby|perl|php|java|awk|gawk|osascript|npm|npx|env|xargs|ssh|tmux|make|cargo)$/i;
 const FORBIDDEN_FLAG = /^(?:--from|--wake|--interactive|--tty|--tui|-i)$/;
-const DANGEROUS_ENV = /^(?:PATH|LD_PRELOAD|DYLD_|NODE_OPTIONS|BASH_ENV|GIT_SSH_COMMAND|PYTHONSTARTUP)/;
+const DANGEROUS_ENV = /^(?:PATH|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_|NODE_OPTIONS|BASH_ENV|GIT_SSH_COMMAND|GIT_CONFIG_|PYTHONSTARTUP)/;
 const PARAMETER_NAME = /^[a-z][a-zA-Z0-9_]{0,63}$/;
 const PLACEHOLDER = /\{\{([a-z][a-zA-Z0-9_]{0,63})\}\}/g;
 
@@ -195,7 +195,7 @@ export function machineRunCapabilitySupported(
     registry: TrustedMachineRunProfileRegistry,
     platform: NodeJS.Platform = process.platform,
 ): boolean {
-    return platform !== 'win32' && registry.list().length > 0;
+    return platform !== 'win32' && registry.list().some((profile) => (profile.writeScope ?? 'none') === 'none');
 }
 
 function resolverFor(source: MachineRunProfileResolver | readonly MachineRunProfile[]): MachineRunProfileResolver {
@@ -261,7 +261,10 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
     const known = new Set(Object.keys(profile.parameters));
     for (const name of Object.keys(supplied)) if (!known.has(name)) throw new Error(`MACHINE_RUN_INVALID: unknown parameter ${name}`);
     const values = new Map<string, string>();
-    for (const [name, value] of Object.entries(supplied)) values.set(name, parameterValue(profile.parameters[name], value, name));
+    for (const [name, parameter] of Object.entries(profile.parameters)) {
+        if (!(name in supplied)) throw new Error(`MACHINE_RUN_INVALID: missing parameter ${name}`);
+        values.set(name, parameterValue(parameter, supplied[name], name));
+    }
     const used = new Set<string>();
     const args = profile.argv.map((template) => template.replace(PLACEHOLDER, (_match, name: string) => {
         if (name === 'workspaceRoot') return '__WORKSPACE_ROOT__';
@@ -279,6 +282,7 @@ function buildArguments(profile: MachineRunProfile, supplied: Record<string, Mac
 
 function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJS.Platform): Extract<MachineRunCapabilityResponse, { action: 'capabilities' }> {
     const supported = machineRunCapabilitySupported(resolver, platform);
+    const profiles = resolver.list().filter((profile) => (profile.writeScope ?? 'none') === 'none');
     return {
         version: 1,
         action: 'capabilities',
@@ -288,7 +292,7 @@ function capabilityResponse(resolver: MachineRunProfileResolver, platform: NodeJ
         stdin: 'none',
         maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
         maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
-        profiles: supported ? resolver.list().map(({ id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest }) => ({
+        profiles: supported ? profiles.map(({ id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest }) => ({
             id, cwd, parameters, timeoutMs, outputLimitBytes, profileDigest,
         })) : [],
         ...(platform === 'win32'

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -51,14 +51,17 @@ describe('profile-aware machine.run adapter', () => {
         expect(() => createTrustedMachineRunProfileResolver([profile(), profile({ id: 'buzzni.test.echo' })])).toThrow('duplicate profile id');
         expect(() => createTrustedMachineRunProfileResolver([profile({ executable: 'sh' })])).toThrow('unsupported executable');
         expect(() => createTrustedMachineRunProfileResolver([profile({ argv: ['/tmp/tool'] })])).toThrow('unsafe argument');
+        for (const key of ['PATH', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'GIT_CONFIG_COUNT']) {
+            expect(() => createTrustedMachineRunProfileResolver([profile({ envAllowlist: [key] })])).toThrow('unsafe environment allowlist');
+        }
     });
 
     it('resolves a profile to argv with bounded parameters and a minimal environment', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
             const handler = createProfileAwareMachineRunHandler(root, [profile({
-                executable: 'ruby',
-                argv: ['-e', 'print "#{ENV.fetch("SAFE", "missing")}:#{ENV.fetch("SECRET", "missing")}:#{ARGV.fetch(0)}"'],
+                executable: 'printf',
+                argv: ['%s', '{{message}}'],
                 envAllowlist: ['SAFE'],
                 outputLimitBytes: 128,
             })], { environment: { PATH: process.env.PATH, SAFE: 'allowed', SECRET: 'hidden' } });
@@ -74,7 +77,7 @@ describe('profile-aware machine.run adapter', () => {
             expect(started).toMatchObject({ action: 'start', state: 'accepted' });
             if (started.action !== 'start') return;
             await expect(waitForStatus(handler, started.operationId)).resolves.toMatchObject({
-                state: 'passed', stdout: 'allowed:missing:value;${HOME}', exitCode: 0,
+                state: 'passed', stdout: 'value;${HOME}', exitCode: 0,
             });
         } finally {
             await rm(root, { recursive: true, force: true });
@@ -91,6 +94,26 @@ describe('profile-aware machine.run adapter', () => {
             await expect(handler(request({ unknown: 'x' }))).rejects.toThrow('unknown parameter');
             await expect(handler(request({}))).rejects.toThrow('missing parameter');
             await expect(handler(request({ message: 'x'.repeat(129) }))).rejects.toThrow('invalid parameter');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('renders partial placeholders and appends unused parameters in declaration order', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const handler = createProfileAwareMachineRunHandler(root, [profile({
+                argv: ['%s:%s:%s', '{{message}}', '{{suffix}}'],
+                parameters: {
+                    message: { type: 'string', maxLength: 32 },
+                    suffix: { type: 'string', maxLength: 32 },
+                    count: { type: 'integer', min: 1, max: 9 },
+                },
+            })]);
+            const capabilities = await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>;
+            const started = await handler({ action: 'start', profileId: 'buzzni.test.echo', profileDigest: capabilities.profiles[0].profileDigest, workspaceRoot: root, parameters: { count: 3, suffix: 'b', message: 'a' } });
+            if (started.action !== 'start') return;
+            await expect(waitForStatus(handler, started.operationId)).resolves.toMatchObject({ state: 'passed', stdout: 'a:b:3', exitCode: 0 });
         } finally {
             await rm(root, { recursive: true, force: true });
         }
@@ -129,7 +152,10 @@ describe('profile-aware machine.run adapter', () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
             const handler = createProfileAwareMachineRunHandler(root, [profile({ writeScope: 'project', descendantAllowlist: ['git'] })]);
-            const digest = (await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>).profiles[0].profileDigest;
+            const capabilities = await handler({ action: 'capabilities' }) as Extract<Awaited<ReturnType<typeof handler>>, { action: 'capabilities' }>;
+            expect(capabilities.supported).toBe(false);
+            expect(capabilities.profiles).toEqual([]);
+            const digest = createTrustedMachineRunProfileResolver([profile({ writeScope: 'project', descendantAllowlist: ['git'] })]).list()[0].profileDigest;
             await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', profileDigest: digest, workspaceRoot: root, parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED');
         } finally {
             await rm(root, { recursive: true, force: true });
@@ -146,6 +172,11 @@ describe('profile-aware machine.run adapter', () => {
             await expect(handler({ ...base, profileDigest: 'b'.repeat(64) })).rejects.toThrow('MACHINE_RUN_PROFILE_DIGEST_MISMATCH');
             await expect(handler({ ...base, workspaceRoot: '.' })).rejects.toThrow('workspaceRoot must be absolute');
             await expect(handler({ ...base, workspaceRoot: join(root, '..') })).rejects.toThrow('MACHINE_RUN_WORKSPACE_ROOT_DENIED');
+            const outside = await mkdtemp(join(tmpdir(), 'happy-machine-profile-outside-'));
+            const link = join(root, 'linked');
+            await symlink(outside, link);
+            await expect(handler({ ...base, workspaceRoot: link })).rejects.toThrow('MACHINE_RUN_WORKSPACE_ROOT_DENIED');
+            await rm(outside, { recursive: true, force: true });
         } finally {
             await rm(root, { recursive: true, force: true });
         }
