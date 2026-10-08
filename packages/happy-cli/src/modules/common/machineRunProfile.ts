@@ -1,6 +1,6 @@
 import { tmpdir } from 'node:os';
-import { realpath, stat } from 'node:fs/promises';
-import { isAbsolute, resolve } from 'node:path';
+import { lstat, realpath, stat } from 'node:fs/promises';
+import { isAbsolute, resolve, sep } from 'node:path';
 import { hashObject } from '../../utils/deterministicJson';
 import {
     createTypedMachineRunHandler,
@@ -84,6 +84,51 @@ export interface MachineRunProfileHandlerOptions {
     tempDirectory?: string;
     /** Reuse the legacy lifecycle store when both RPC shapes share a method. */
     typedHandler?: (input: TypedMachineRunRequest) => Promise<TypedMachineRunResponse>;
+    /** Host-owned policy required before any profile with a write scope can run. */
+    writeScopePolicy?: MachineRunWriteScopePolicy;
+}
+
+export interface MachineRunWriteScopePolicy {
+    /** Validate the resolved workspace and reserve it for one active operation. */
+    acquire(input: { profile: TrustedMachineRunProfile; workspaceRoot: string }): Promise<() => void>;
+}
+
+/**
+ * Conservative default policy for managed project writes. It validates the
+ * workspace identity and rejects protected control-plane entries. The caller
+ * must still explicitly install it in the daemon; no write profile is enabled
+ * by default.
+ */
+export function createManagedProjectWriteScopePolicy(): MachineRunWriteScopePolicy {
+    const locks = new Set<string>();
+    return {
+        async acquire({ profile, workspaceRoot }) {
+            if (profile.writeScope !== 'project' && profile.writeScope !== 'moai') throw new Error('MACHINE_RUN_WRITE_SCOPE_DENIED: unsupported write scope');
+            const root = await realpath(workspaceRoot).catch(() => null);
+            if (!root) throw new Error('MACHINE_RUN_WRITE_SCOPE_DENIED: workspace root is unavailable');
+            const metadata = resolve(root, '.moai');
+            const metadataInfo = await lstat(metadata).catch(() => null);
+            if (metadataInfo?.isSymbolicLink()) throw new Error('MACHINE_RUN_WRITE_SCOPE_DENIED: .moai must not be a symlink');
+            if (metadataInfo) {
+                const metadataReal = await realpath(metadata).catch(() => null);
+                if (!metadataReal || (metadataReal !== root && !metadataReal.startsWith(`${root}${sep}`))) {
+                    throw new Error('MACHINE_RUN_WRITE_SCOPE_DENIED: .moai escapes workspace');
+                }
+            }
+            const protectedNames = new Set(['.git', '.claude', '.aplus', 'AGENTS.md', 'CLAUDE.md']);
+            for (const name of protectedNames) {
+                const entry = resolve(root, name);
+                const info = await lstat(entry).catch(() => null);
+                if (info?.isSymbolicLink()) throw new Error(`MACHINE_RUN_WRITE_SCOPE_DENIED: protected symlink ${name}`);
+            }
+            // One lock per workspace: a project write covers .moai, so the two scopes must not overlap.
+            const key = root;
+            if (locks.has(key)) throw new Error('MACHINE_RUN_WRITE_SCOPE_BUSY: workspace has an active write operation');
+            locks.add(key);
+            let released = false;
+            return () => { if (!released) { released = true; locks.delete(key); } };
+        },
+    };
 }
 
 const PROFILE_ID = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
@@ -330,6 +375,7 @@ export function createProfileAwareMachineRunHandler(
     const resolver = resolverFor(source);
     const platform = options.platform ?? process.platform;
     const environment = options.environment ?? process.env;
+    const writeReleases = new Map<string, () => void>();
     const baseEnvironment: Record<string, string> = { PATH: environment.PATH ?? '' };
     const legacyHandler = options.typedHandler ?? createTypedMachineRunHandler(workingDirectory, {
         platform,
@@ -342,37 +388,59 @@ export function createProfileAwareMachineRunHandler(
         assertCapabilityRequest(input);
         if (input.action === 'capabilities') return capabilityResponse(resolver, platform);
         if (platform === 'win32') throw new Error('MACHINE_RUN_UNSUPPORTED_PLATFORM: Windows Job backend is required');
-        if (input.action === 'status' || input.action === 'cancel') return withoutVersion(await legacyHandler({ version: 1, action: input.action, operationId: input.operationId }));
+        if (input.action === 'status' || input.action === 'cancel') {
+            const result = await legacyHandler({ version: 1, action: input.action, operationId: input.operationId });
+            if (result.action === 'status' && result.state !== 'running' || result.action === 'cancel') {
+                writeReleases.get(input.operationId)?.();
+                writeReleases.delete(input.operationId);
+            }
+            return withoutVersion(result);
+        }
 
         const profile = resolver.resolve(input.profileId);
         if (!profile) throw new Error(`MACHINE_RUN_PROFILE_NOT_FOUND: ${input.profileId}`);
         if (profile.profileDigest !== input.profileDigest) throw new Error(`MACHINE_RUN_PROFILE_DIGEST_MISMATCH: ${input.profileId}`);
         const requestedWorkspaceRoot = await resolveWorkspaceRoot(input.workspaceRoot, workingDirectory);
-        if ((profile.writeScope ?? 'none') !== 'none') throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
-        if ((profile.descendantAllowlist?.length ?? 0) > 0) throw new Error(`MACHINE_RUN_DESCENDANT_POLICY_UNSUPPORTED: ${input.profileId}`);
-        const cwd = profile.cwd === 'workspaceRoot'
-            ? requestedWorkspaceRoot
-            : profile.cwd === 'extensionData'
-                ? options.extensionDataDirectory
-                : options.tempDirectory ?? tmpdir();
-        if (!cwd) throw new Error(`MACHINE_RUN_PROFILE_ROOT_UNAVAILABLE: ${profile.cwd}`);
-        const env: Record<string, string> = {};
-        for (const name of profile.envAllowlist) {
-            const value = environment[name];
-            if (value !== undefined) env[name] = value;
+        let releaseWrite: (() => void) | undefined;
+        try {
+            if ((profile.writeScope ?? 'none') !== 'none') {
+                if (!options.writeScopePolicy) throw new Error(`MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED: ${input.profileId}`);
+                releaseWrite = await options.writeScopePolicy.acquire({ profile, workspaceRoot: requestedWorkspaceRoot });
+            }
+            if ((profile.descendantAllowlist?.length ?? 0) > 0) throw new Error(`MACHINE_RUN_DESCENDANT_POLICY_UNSUPPORTED: ${input.profileId}`);
+        } catch (error) {
+            releaseWrite?.();
+            throw error;
         }
-        const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? requestedWorkspaceRoot : arg);
-        const result = await legacyHandler({
-            version: 1,
-            action: 'start',
-            executable: profile.executable,
-            args,
-            cwd: resolve(cwd),
-            env,
-            timeoutMs: profile.timeoutMs,
-            outputLimitBytes: profile.outputLimitBytes,
-        });
-        return withoutVersion(result);
+        try {
+            const cwd = profile.cwd === 'workspaceRoot'
+                ? requestedWorkspaceRoot
+                : profile.cwd === 'extensionData'
+                    ? options.extensionDataDirectory
+                    : options.tempDirectory ?? tmpdir();
+            if (!cwd) throw new Error(`MACHINE_RUN_PROFILE_ROOT_UNAVAILABLE: ${profile.cwd}`);
+            const env: Record<string, string> = {};
+            for (const name of profile.envAllowlist) {
+                const value = environment[name];
+                if (value !== undefined) env[name] = value;
+            }
+            const args = buildArguments(profile, input.parameters).map((arg) => arg === '__WORKSPACE_ROOT__' ? requestedWorkspaceRoot : arg);
+            const result = await legacyHandler({
+                version: 1,
+                action: 'start',
+                executable: profile.executable,
+                args,
+                cwd: resolve(cwd),
+                env,
+                timeoutMs: profile.timeoutMs,
+                outputLimitBytes: profile.outputLimitBytes,
+            });
+            if (releaseWrite) writeReleases.set(result.operationId, releaseWrite);
+            return withoutVersion(result);
+        } catch (error) {
+            releaseWrite?.();
+            throw error;
+        }
     };
 }
 

@@ -1,12 +1,14 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm, symlink } from 'node:fs/promises';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+    createManagedProjectWriteScopePolicy,
     createProfileAwareMachineRunHandler,
     createTrustedMachineRunProfileResolver,
     type MachineRunProfile,
 } from './machineRunProfile';
+import type { TypedMachineRunRequest, TypedMachineRunResponse } from './typedMachineRun';
 
 function profile(overrides: Partial<MachineRunProfile> = {}): MachineRunProfile {
     return {
@@ -159,6 +161,59 @@ describe('profile-aware machine.run adapter', () => {
             await expect(handler({ action: 'start', profileId: 'buzzni.test.echo', profileDigest: digest, workspaceRoot: root, parameters: { message: 'x' } })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_UNSUPPORTED');
         } finally {
             await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('executes a project write only with an explicit host policy and releases its workspace lock', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const resolver = createTrustedMachineRunProfileResolver([profile({ writeScope: 'project' })]);
+            const policy = {
+                acquire: vi.fn(async () => {
+                    let released = false;
+                    return () => { released = true; };
+                }),
+            };
+            const handler = createProfileAwareMachineRunHandler(root, resolver, {
+                writeScopePolicy: policy,
+                typedHandler: vi.fn(async (request: TypedMachineRunRequest): Promise<TypedMachineRunResponse> => request.action === 'start'
+                    ? { version: 1, action: 'start', operationId: 'write-op', state: 'accepted' }
+                    : { version: 1, action: 'status', operationId: 'write-op', state: 'passed', stdout: '', stderr: '', exitCode: 0, truncated: false, timedOut: false, remoteMayContinue: false, descendantsReaped: true, processGroupEvidence: { kind: 'no-local-trace' } }),
+            });
+            const digest = resolver.list()[0].profileDigest;
+            await expect(handler({ action: 'start', profileId: profile().id, profileDigest: digest, workspaceRoot: root, parameters: { message: 'x' } })).resolves.toMatchObject({ operationId: 'write-op' });
+            expect(policy.acquire).toHaveBeenCalledWith(expect.objectContaining({ workspaceRoot: await realpath(root) }));
+            await handler({ action: 'status', operationId: 'write-op' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it('serializes project and .moai writes on one workspace and rejects escaping metadata', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        const outside = await mkdtemp(join(tmpdir(), 'happy-machine-outside-'));
+        try {
+            const resolver = createTrustedMachineRunProfileResolver([
+                profile({ id: 'buzzni.moai.project', writeScope: 'project' }),
+                profile({ id: 'buzzni.moai.meta', writeScope: 'moai' }),
+            ]);
+            const [projectProfile, moaiProfile] = resolver.list();
+            const policy = createManagedProjectWriteScopePolicy();
+            const release = await policy.acquire({ profile: projectProfile, workspaceRoot: root });
+            await expect(policy.acquire({ profile: moaiProfile, workspaceRoot: root })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_BUSY');
+            release();
+            const again = await policy.acquire({ profile: moaiProfile, workspaceRoot: root });
+            again();
+
+            await symlink(outside, join(root, '.moai'));
+            await expect(policy.acquire({ profile: moaiProfile, workspaceRoot: root })).rejects.toThrow('MACHINE_RUN_WRITE_SCOPE_DENIED');
+            await rm(join(root, '.moai'));
+            await mkdir(join(root, '.moai'));
+            await symlink(outside, join(root, '.git'));
+            await expect(policy.acquire({ profile: projectProfile, workspaceRoot: root })).rejects.toThrow('protected symlink .git');
+        } finally {
+            await rm(root, { recursive: true, force: true });
+            await rm(outside, { recursive: true, force: true });
         }
     });
 
