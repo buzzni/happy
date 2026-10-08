@@ -21,10 +21,11 @@
 #   abp-firewall check-egress   exit 0 only if they are live and first in their parent chains
 #   abp-firewall remove-egress  delete them
 set -euo pipefail
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+export PATH="${ABP_FIREWALL_BIN_DIR:-/usr/sbin:/usr/bin:/sbin:/bin}" LC_ALL=C
 RULES_DIR=${ABP_FIREWALL_RULES_DIR:-/etc/abp}
 
-rules() { grep '^-A OUTPUT ' "$RULES_DIR/firewall.rules$1"; }
+rules() { grep '^-A OUTPUT ' "$RULES_DIR/firewall.rules$1" || [ "$?" -eq 1 ]; }
+allows_empty() { [ "$1" = 6 ] && grep -qx '# abp: no-ipv6-owner-rules' "$RULES_DIR/firewall.rules6"; }
 tool() { if [ "$1" = 4 ]; then echo iptables; else echo ip6tables; fi; }
 
 # Every copy of one rule ("-A OUTPUT <spec>"), for remove.
@@ -50,7 +51,11 @@ apply() {
     for family in 4 6; do
         mapfile -t list < <(rules "$family")
         count=${#list[@]}
-        [ "$count" -gt 0 ] || { echo "abp-firewall: no rules in $RULES_DIR/firewall.rules$family" >&2; exit 1; }
+        if [ "$count" -eq 0 ] && allows_empty "$family"; then
+            # Browser-only mode has no host owner rules on IPv6; the browser bridges are
+            # IPv4-only and egress isolation is enforced by the separate IPv6 egress chain.
+            continue
+        fi
         mapfile -t live < <(live_rules "$family")
         if [ "$(printf '%s\n' "${live[@]:0:count}")" != "$(printf '%s\n' "${list[@]}")" ]; then
             position=1
@@ -77,6 +82,12 @@ check() {
     local family expected live failed=0
     for family in 4 6; do
         expected=$(rules "$family")
+        if [ -z "$expected" ]; then
+            if allows_empty "$family"; then continue; fi
+            echo "abp-firewall: IPv$family owner rules are empty" >&2
+            failed=1
+            continue
+        fi
         # Same normalization as the session preflight (sandboxPreflight.assertFirewallRules).
         live=$("$(tool "$family")-save" -t filter | grep '^-A OUTPUT ' \
             | sed -E 's/ --reject-with (icmp-port-unreachable|icmp6-port-unreachable)$//' \

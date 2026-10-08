@@ -245,7 +245,7 @@ export const MachineMetadataSchema = z.object({
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
    */
-  agentBrowser: z.object({ protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']) }).optional(),
+  agentBrowser: z.object({ protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']), hostMode: z.enum(['browser-only', 'dedicated-host']).optional() }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>

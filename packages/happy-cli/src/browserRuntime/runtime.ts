@@ -117,6 +117,38 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.recovery = this.cleanup.then(() => this.recoverExistingTasks().catch(() => undefined))
         this.recovery.catch(() => undefined)
     }
+    listSpaces: BrowserRuntimeApi['listSpaces'] = async (auth, req) => {
+        await this.recovery
+        this.checkCredential(auth, 'listSpaces', req.profileId)
+        const owner = identity(auth)
+        return { spaces: this.options.store.listSpaces(req.profileId).filter((space) => !space.owner || (space.owner.principalId === owner.principalId && space.owner.workspaceId === owner.workspaceId && space.owner.machineId === owner.machineId)).map((space) => ({
+            taskSpaceId: space.taskSpaceId, profileId: space.profileId, createdAtMs: space.createdAtMs, closed: Boolean(space.closed), tabs: [...space.tabs], memberSessionIds: [...(space.memberSessionIds ?? [])], membershipEvents: [...(space.membershipEvents ?? [])],
+        })) }
+    }
+    joinSpace: BrowserRuntimeApi['joinSpace'] = (auth, req) => this.withRequestFlight(auth, req.requestId, { operation: 'joinSpace', ...req }, async () => {
+        await this.recovery
+        const space = this.requireSpace(req.taskSpaceId)
+        this.checkCredential(auth, 'joinSpace', space.profileId, space.taskSpaceId)
+        if (!space.owner || space.owner.principalId !== auth.credential.principalId || space.owner.workspaceId !== auth.credential.workspaceId || space.owner.machineId !== auth.credential.machineId)
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Only the same principal may join this task space')
+        if (space.closed || space.reclaimingSinceMs !== undefined) throw new BrowserRuntimeError('CONFLICT', 'Task space is closed')
+        const sessionId = auth.credential.kind === 'agent-grant' ? auth.credential.agentSessionId : undefined
+        if (!sessionId) throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent session required to join a task space')
+        let members: string[] = []
+        await this.options.store.mutateSpace(space.taskSpaceId, (current) => {
+            const currentMembers = current.memberSessionIds ?? [current.agentSessionId].filter(Boolean) as string[]
+            members = [...new Set([...currentMembers, sessionId])]
+            const alreadyMember = currentMembers.includes(sessionId)
+            return {
+                memberSessionIds: members,
+                ...(current.endedSessionIds?.includes(sessionId) ? { endedSessionIds: current.endedSessionIds.filter((id) => id !== sessionId) } : {}),
+                ...(alreadyMember ? {} : {
+                    membershipEvents: [...(current.membershipEvents ?? []), { type: 'joined' as const, agentSessionId: sessionId, atMs: this.clock.now() }],
+                }),
+            }
+        })
+        return { taskSpaceId: space.taskSpaceId, memberSessionIds: members }
+    })
     createSpace: BrowserRuntimeApi['createSpace'] = (auth, req) =>
         this.withRequestFlight(auth, req.requestId, { operation: 'createSpace', ...req }, () => this.createSpaceImpl(auth, req))
     createTask: BrowserRuntimeApi['createTask'] = (auth, req) =>
@@ -161,7 +193,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         await this.options.store.createSpace({ taskSpaceId, profileId: req.profileId, createdAtMs: this.clock.now(), tabs: [],
             tabTargets: {}, tabLeaseEpochs: {},
             owner: identity(auth), requestKey: requestKeyValue, requestHash: payloadHash({ operation: 'createSpace', ...req }),
-                dedupe: {}, ...(auth.credential.kind === 'agent-grant' ? { agentSessionId: auth.credential.agentSessionId } : {}),
+            dedupe: {}, ...(auth.credential.kind === 'agent-grant' ? { agentSessionId: auth.credential.agentSessionId } : {}),
+            ...(auth.credential.kind === 'agent-grant' ? { memberSessionIds: [auth.credential.agentSessionId] } : {}),
+            ...(auth.credential.kind === 'agent-grant' ? { membershipEvents: [{ type: 'created' as const, agentSessionId: auth.credential.agentSessionId, atMs: this.clock.now() }] } : {}),
                 ...(this.options.profileAssignments?.has(req.profileId) ? { assignmentId: this.options.profileAssignments.get(req.profileId) } : {}) },
             this.options.maxSpacesPerProfile)
         return { taskSpaceId }
@@ -171,9 +205,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         requestId: RequestId
     }): Promise<TaskView> {
         await this.recovery
-        const space = this.requireSpace(req.taskSpaceId)
+        let space = this.requireSpace(req.taskSpaceId)
         this.checkCredential(auth, 'createTask', space.profileId, req.taskSpaceId)
-        this.authorizeSpace(auth, space)
+        await this.authorizeSpace(auth, space)
+        space = this.requireSpace(req.taskSpaceId)
         const duplicate = this.findRequest(req.requestId, auth)
         if (duplicate) {
             if (duplicate.hash !== payloadHash({ operation: 'createTask', ...req }))
@@ -404,9 +439,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         handoff?: 'beforeunload'
     }> {
         await this.recovery
-        const space = this.requireSpace(req.taskSpaceId)
+        let space = this.requireSpace(req.taskSpaceId)
         this.checkCredential(auth, 'closePage', space.profileId, req.taskSpaceId)
-        this.authorizeSpace(auth, space)
+        await this.authorizeSpace(auth, space)
+        space = this.requireSpace(req.taskSpaceId)
         const duplicate = this.spaceRequest(space, auth, req.requestId, { operation: 'closePage', ...req })
         if (duplicate)
             return duplicate as {
@@ -852,10 +888,17 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     async endSession(agentSessionId: string): Promise<void> {
         await this.recovery
         const tasks = this.options.store.listTasks().filter((task) => task.agentSessionId === agentSessionId)
-        const spaceIds = new Set([...this.options.store.listSpaces().filter((space) => space.agentSessionId === agentSessionId).map((space) => space.taskSpaceId),
-            ...tasks.map((task) => task.taskSpaceId)])
-        for (const taskSpaceId of spaceIds)
-            await this.markReclaiming(taskSpaceId, 'session-ended')
+        const spaceIds = new Set([...this.options.store.listSpaces().filter((space) => {
+            const members = space.memberSessionIds ?? [space.agentSessionId].filter(Boolean) as string[]
+            return members.includes(agentSessionId)
+        }).map((space) => space.taskSpaceId), ...tasks.map((task) => task.taskSpaceId)])
+        for (const taskSpaceId of spaceIds) {
+            await this.options.store.mutateSpace(taskSpaceId, (current) => ({ endedSessionIds: [...new Set([...(current.endedSessionIds ?? []), agentSessionId])] }))
+            const current = this.requireSpace(taskSpaceId)
+            const members = current.memberSessionIds ?? [current.agentSessionId].filter(Boolean) as string[]
+            if (members.length > 0 && members.every((member) => (current.endedSessionIds ?? []).includes(member)))
+                await this.markReclaiming(taskSpaceId, 'session-ended')
+        }
         for (const task of tasks) {
             if (!FINISHED_STATUSES.has(task.status))
                 await this.cancelTask(this.requireTask(task.taskId))
@@ -1578,9 +1621,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         closedTabs: TabId[]
     }> {
         await this.recovery
-        const space = this.requireSpace(req.taskSpaceId)
+        let space = this.requireSpace(req.taskSpaceId)
         this.checkCredential(auth, 'closeSpace', space.profileId, req.taskSpaceId)
-        this.authorizeSpace(auth, space)
+        await this.authorizeSpace(auth, space)
+        space = this.requireSpace(req.taskSpaceId)
         const duplicate = this.spaceRequest(space, auth, req.requestId, { operation: 'closeSpace', ...req })
         if (duplicate)
             return duplicate as {
@@ -1678,7 +1722,7 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (typeof payload.taskSpaceId === 'string') {
             const space = this.requireSpace(payload.taskSpaceId as TaskSpaceId)
             this.checkCredential(auth, operation, space.profileId, space.taskSpaceId)
-            this.authorizeSpace(auth, space)
+            if (operation !== 'joinSpace') await this.authorizeSpace(auth, space)
             return
         }
         if (typeof payload.profileId === 'string') {
@@ -2701,6 +2745,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Agent session does not own task')
         if (auth.credential.kind === 'agent-grant') {
             const grant = auth.credential
+            await this.options.store.mutateSpace(task.taskSpaceId, (current) => {
+                if (!current.endedSessionIds?.includes(grant.agentSessionId)) return null
+                return { endedSessionIds: current.endedSessionIds.filter((id) => id !== grant.agentSessionId) }
+            })
             // A logical session outlives its process. Persist the replacement grant before
             // returning, without changing the caller's optimistic task version. Never
             // rewrite an in-flight batch's grant: its old dispatch must remain fenced.
@@ -2824,10 +2872,18 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         const key = requestKey(auth, requestId)
         return this.options.store.listTasks().map((task) => task.dedupe[key]).find(Boolean)
     }
-    private authorizeSpace(auth: AuthContext, space: NonNullable<ReturnType<TaskStore['getSpace']>>): void { if (space.owner
-        && (space.owner.principalId !== auth.credential.principalId || space.owner.workspaceId !== auth.credential.workspaceId
+    private async authorizeSpace(auth: AuthContext, space: NonNullable<ReturnType<TaskStore['getSpace']>>): Promise<void> {
+        if (space.owner && (space.owner.principalId !== auth.credential.principalId || space.owner.workspaceId !== auth.credential.workspaceId
             || space.owner.machineId !== auth.credential.machineId))
-        throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space owner does not match credential'); }
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Task space owner does not match credential')
+        if (auth.credential.kind === 'agent-grant') {
+            const agentSessionId = auth.credential.agentSessionId
+            if (!(space.memberSessionIds ?? [space.agentSessionId].filter(Boolean) as string[]).includes(agentSessionId))
+                throw new BrowserRuntimeError('SCOPE_DENIED', 'Session has not joined this task space')
+            await this.options.store.mutateSpace(space.taskSpaceId, (current) => current.endedSessionIds?.includes(agentSessionId)
+                ? { endedSessionIds: current.endedSessionIds.filter((id) => id !== agentSessionId) } : null)
+        }
+    }
 }
 function identity(auth: AuthContext): {
     principalId: string

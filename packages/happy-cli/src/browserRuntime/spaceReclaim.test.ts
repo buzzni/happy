@@ -32,7 +32,7 @@ async function start(dir: string, driver = new FakeBrowserDriver(), options: { m
     const runtime = new BrowserRuntime({ store, drivers: new Map([[profileId, driver]]), clock, sites: SITES, ...options })
     const agent = (agentSessionId = 'session-a') => ({ verifiedAtMs: clock.now(), credential: {
         kind: 'agent-grant', grantId: `grant-${agentSessionId}`, principalId: 'p', workspaceId: 'w', machineId: 'm', agentSessionId, profileId,
-        allowedOrigins: [ORIGIN], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'observe', 'finishTask', 'cancel'],
+        allowedOrigins: [ORIGIN], operations: ['createSpace', 'createTask', 'joinSpace', 'openPage', 'submitBatch', 'getTask', 'observe', 'finishTask', 'cancel'],
         taskSpaceIds: [], issuedAtMs: 0, expiresAtMs: 10 * 24 * 60 * MINUTE } as unknown as AgentGrant })
     /** A space with one task and one open tab, owned by `agentSessionId`. */
     const openSpace = async (agentSessionId = 'session-a') => {
@@ -108,6 +108,34 @@ describe('session-end reclamation', () => {
         // The freed slot is usable; the closed space takes no new work.
         await h.runtime.createSpace(h.agent('session-c'), { profileId, requestId: rid('space') })
         await expect(h.runtime.createTask(ended.auth, { taskSpaceId: ended.taskSpaceId, requestId: rid('task') })).rejects.toMatchObject({ code: 'CONFLICT' })
+        await h.store.close()
+    })
+
+    it('keeps a joined space until every member session has ended', async () => {
+        const h = await start(await tempDir(), undefined, { maxSpacesPerProfile: 1 })
+        const owner = await h.openSpace('session-a')
+        const joinedAuth = h.agent('session-b')
+        await h.runtime.joinSpace(joinedAuth, { taskSpaceId: owner.taskSpaceId, requestId: rid('join') })
+        await h.runtime.endSession('session-a')
+        expect(h.store.getSpace(owner.taskSpaceId)?.closed).not.toBe(true)
+        expect(await h.runtime.reclaimSpaces()).toEqual([])
+        await h.runtime.endSession('session-b')
+        expect(await h.runtime.reclaimSpaces()).toEqual([expect.objectContaining({ taskSpaceId: owner.taskSpaceId, closed: true })])
+        const saved = h.store.getSpace(owner.taskSpaceId)
+        expect(saved?.endedSessionIds).toEqual(expect.arrayContaining(['session-a', 'session-b']))
+        expect(saved?.membershipEvents?.some((event) => event.type === 'joined' && event.agentSessionId === 'session-b')).toBe(true)
+        await h.store.close()
+    })
+
+    it('revives a session that reconnects before the remaining member ends', async () => {
+        const h = await start(await tempDir(), undefined, { maxSpacesPerProfile: 1 })
+        const owner = await h.openSpace('session-a')
+        await h.runtime.joinSpace(h.agent('session-b'), { taskSpaceId: owner.taskSpaceId, requestId: rid('join') })
+        await h.runtime.endSession('session-a')
+        await h.runtime.getTask(h.agent('session-a'), { taskId: owner.taskId })
+        await h.runtime.endSession('session-b')
+        expect(await h.runtime.reclaimSpaces()).toEqual([])
+        expect(h.store.getSpace(owner.taskSpaceId)?.closed).not.toBe(true)
         await h.store.close()
     })
 

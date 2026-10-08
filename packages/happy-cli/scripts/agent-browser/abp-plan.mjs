@@ -21,7 +21,7 @@ function readJson(path, what) {
 }
 
 /** Install option keys a --config file may set: what the flags set, in install.json's shape. Test-only keys stay flags. */
-const CONFIG_KEYS = new Set(["machineId", "tenancyMode", "workspaceId", "profiles", "agentProfileId", "issuers", "sites", "runtimePort",
+const CONFIG_KEYS = new Set(["machineId", "tenancyMode", "workspaceId", "profiles", "agentProfileId", "issuers", "sites", "runtimePort", "hostMode", "daemonUser",
   "maxAgentWindows", "retentionDays", "viewerOrigins", "egressDomains", "happyPrefix", "serverUrl", "browserSubnetPool", "denyCidrs", "browserDns"]);
 
 /** --config <file>: the install options as one JSON object (the Studio install script writes it). mergeInstallOptions validates the values. */
@@ -47,6 +47,8 @@ export function parseOptionFlags(argv) {
     switch (name) {
       case "--machine-id": flags.machineId = value; break;
       case "--tenancy": flags.tenancyMode = value; break;
+      case "--host-mode": flags.hostMode = value; break;
+      case "--daemon-user": flags.daemonUser = value; break;
       case "--workspace-id": flags.workspaceId = value; break;
       case "--profile": { const [profileId, principalId] = pair(value, name); list("profiles", { profileId, principalId }); break; }
       case "--agent-profile": flags.agentProfileId = value; break;
@@ -156,16 +158,29 @@ export function main(argv, out = (text) => process.stdout.write(text)) {
       const { egressDomains } = readJson(option(args, "--install"), "install options");
       return egressDomains.length ? out(`${JSON.stringify({ allowedDomains: egressDomains }, null, 2)}\n`) : undefined;
     }
-    case "firewall": return out(firewallRulesFile(Number(option(args, "--family")), Number(option(args, "--sbx-uid")), Number(option(args, "--proxy-uid"))));
+    case "firewall": {
+      const installPath = args.indexOf("--install") >= 0 ? option(args, "--install") : undefined;
+      const install = installPath ? readJson(installPath, "install options") : undefined;
+      return out(firewallRulesFile(Number(option(args, "--family")), Number(option(args, "--sbx-uid")), Number(option(args, "--proxy-uid")), install));
+    }
     case "egress": {
       const install = readJson(option(args, "--install"), "install options");
       return out(egressRulesFile(egressRules(stackLayout(install), install)[Number(option(args, "--family"))]));
     }
-    case "permissions": return out(permissionTable().map((row) => [row.path, row.type, row.owner, row.group, row.mode].join("\t")).join("\n") + "\n");
+    case "permissions": {
+      const installPath = args.indexOf("--install") >= 0 ? option(args, "--install") : undefined;
+      const install = installPath ? readJson(installPath, "install options") : undefined;
+      return out(permissionTable(install).map((row) => [row.path, row.type, row.owner, row.group, row.mode].join("\t")).join("\n") + "\n");
+    }
     case "sudoers": return out(sudoersDropIn());
-    case "tmpfiles": return out(tmpfilesConf());
+    case "tmpfiles": {
+      const installPath = args.indexOf("--install") >= 0 ? option(args, "--install") : undefined;
+      const install = installPath ? readJson(installPath, "install options") : undefined;
+      return out(tmpfilesConf(install));
+    }
     case "unit": {
-      const unit = systemdUnits({ happyPrefix: readJson(option(args, "--install"), "install options").happyPrefix })[option(args, "--name")];
+      const install = readJson(option(args, "--install"), "install options");
+      const unit = systemdUnits({ happyPrefix: install.happyPrefix, install })[option(args, "--name")];
       if (!unit) throw new Error("unknown unit");
       return out(unit);
     }

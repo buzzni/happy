@@ -68,6 +68,9 @@ const SECRET_FILES = {
   browserVnc: { path: `${PATHS.browserSecrets}/vnc-password`, mode: 0o400, owner: "abp-browser", group: "abp-browser" },
   daemonToken: { path: PATHS.daemonToken, mode: 0o400, owner: "agent", group: "agent" },
 };
+const secretFiles = (options) => options?.hostMode === "browser-only"
+  ? { ...SECRET_FILES, daemonToken: { ...SECRET_FILES.daemonToken, owner: options.daemonUser, group: options.daemonGroup ?? options.daemonUser } }
+  : SECRET_FILES;
 
 /** Real host: docker/systemctl through spawnSync, atomic root-owned writes, loopback readiness. */
 function unixJson(socketPath, path, headers, body) {
@@ -221,7 +224,8 @@ export function createStack(deps) {
     const existing = deps.exists(PATHS.runtimeConfig) ? readJson(PATHS.runtimeConfig) : {};
     const machineId = options.machineId !== "auto" ? options.machineId : existing.machineId;
     if (!machineId) throw new Error("machineId is unresolved; run abp-install after the agent's Happy login");
-    const config = runtimeConfig({ ...options, machineId }, { sessionGid: deps.groupId("abp-session"), daemonTokenSha256: daemonTokenSha256 ?? existing.daemonTokenSha256 });
+    const sessionGroup = options.hostMode === "browser-only" ? (options.daemonGroup ?? options.daemonUser) : "abp-session";
+    const config = runtimeConfig({ ...options, machineId }, { sessionGid: deps.groupId(sessionGroup), daemonTokenSha256: daemonTokenSha256 ?? existing.daemonTokenSha256 });
     deps.writeFileAtomic(PATHS.runtimeConfig, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, owner: "root", group: "root" });
   }
 
@@ -239,6 +243,7 @@ export function createStack(deps) {
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const writeInstall = (options) => deps.writeFileAtomic(PATHS.installConfig, `${JSON.stringify(options, null, 2)}\n`, { mode: 0o600, owner: "root", group: "root" });
   function assertPackageContract(options) {
+    if (options?.hostMode === "browser-only") return;
     const marker = join(options.happyPrefix ?? PATHS.happyPrefix, "lib/node_modules/@buzzni/happy-cli/scripts/agent-browser/contract.json");
     let contract;
     try { contract = readJson(marker); } catch {}
@@ -1102,12 +1107,12 @@ export function createStack(deps) {
           if (daemonToken) {
             token = deps.secret("daemon-token");
             writeRuntimeConfig(install(), createHash("sha256").update(token).digest("hex"));
-            deps.writeFileAtomic(SECRET_FILES.daemonToken.path, token, SECRET_FILES.daemonToken);
+            deps.writeFileAtomic(secretFiles(install()).daemonToken.path, token, secretFiles(install()).daemonToken);
           }
           if (vncPassword) {
             const password = deps.secret("vnc-password");
-            deps.writeFileAtomic(SECRET_FILES.runtimeVnc.path, password, SECRET_FILES.runtimeVnc);
-            deps.writeFileAtomic(SECRET_FILES.browserVnc.path, password, SECRET_FILES.browserVnc);
+            deps.writeFileAtomic(secretFiles(install()).runtimeVnc.path, password, secretFiles(install()).runtimeVnc);
+            deps.writeFileAtomic(secretFiles(install()).browserVnc.path, password, secretFiles(install()).browserVnc);
             for (const browser of layout().browsers) docker(["exec", browser.container, "pkill", "-x", "x11vnc"], { allowFail: true });
           }
           await restartQuiescedRuntime();
@@ -1121,10 +1126,12 @@ export function createStack(deps) {
               if (!back) throw new Error(`x11vnc did not restart in ${browser.container}`);
             }
           }
-          if (daemonToken) {
+          if (daemonToken && install().hostMode !== "browser-only") {
             if (await deps.brokerProbe(token) !== 200) throw new Error("the Runtime broker does not accept the new daemon token");
             systemctl(["restart", DAEMON_SERVICE]);
             if (systemctl(["is-active", DAEMON_SERVICE], { allowFail: true }).status !== 0) throw new Error("the Happy daemon is not active after the restart");
+          } else if (daemonToken) {
+            deps.log("rotate-keys: daemon token rotated; restart the existing Happy daemon manually");
           }
           writeState(record(readState(), { action: "rotate-keys", result: done, quiesce: quiesced }));
           deps.log(`rotated ${done}`);
@@ -1474,4 +1481,3 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(error?.exitCode === 78 ? 78 : 1);
   });
 }
-

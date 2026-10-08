@@ -239,6 +239,21 @@ describe('abp-install --dry-run', () => {
         expect(other.stderr).toMatch(/exactly one profile named main/)
         expect(other.stdout).not.toMatch(/useradd/)
     })
+
+    it('browser-only mode keeps the existing daemon and avoids dedicated-machine files', () => {
+        const result = bash('abp-install', ['--dry-run', 'install', '--browser-only', '--daemon-user', 'walter', '--machine-id', 'machine-1', '--workspace-id', 'ws-1', '--profile', 'main=user-1',
+            '--issuer', `k1=${pemFile}`, '--sites', sitesFile, '--images', join(dir, 'images')])
+        expect(result.status, result.stderr).toBe(0)
+        expect(result.stdout).toContain('+ write /etc/abp/browser-only.env')
+        expect(result.stdout).toContain('HAPPY_BROWSER_TASK_HOST_MODE=browser-only')
+        expect(result.stdout).toContain('+ secret /var/lib/abp/daemon-token (walter:walter 0400) if missing')
+        expect(result.stdout).toContain('    | -A OUTPUT -j ABP-FENCE')
+        expect(result.stdout).not.toContain('sandbox-policy.json')
+        expect(result.stdout).not.toContain('abp-happy-daemon.service')
+        expect(result.stdout).not.toContain('abp-egress-proxy.service')
+        expect(result.stdout).not.toContain('agent-sbx')
+        expect(result.stdout).not.toContain('abp-proxy')
+    })
 })
 
 /**

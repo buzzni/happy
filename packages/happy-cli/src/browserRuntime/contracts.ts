@@ -96,12 +96,12 @@ export class BrowserRuntimeError extends Error {
 export type Operation =
     | 'createSpace' | 'createTask' | 'openPage' | 'closePage' | 'observe' | 'screenshot'
     | 'submitBatch' | 'finishTask' | 'getTask' | 'subscribe' | 'approve' | 'takeOver'
-    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks'
+    | 'releaseControl' | 'resume' | 'cancel' | 'closeSpace' | 'viewerTicket' | 'listTasks' | 'listSpaces' | 'joinSpace'
 
 /** Operations an agent task grant may carry. approve/takeOver/releaseControl never. */
 export const AGENT_OPERATIONS: readonly Operation[] = [
     'createSpace', 'createTask', 'openPage', 'closePage', 'observe', 'screenshot',
-    'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace',
+    'submitBatch', 'finishTask', 'getTask', 'resume', 'cancel', 'closeSpace', 'listSpaces', 'joinSpace',
 ]
 /** Operations that require an interactive (human UI) capability. */
 export const INTERACTIVE_OPERATIONS: readonly Operation[] = ['approve', 'takeOver', 'releaseControl', 'viewerTicket']
@@ -532,6 +532,8 @@ export type InputOwner =
     | { kind: 'none' }
 
 export interface BrowserRuntimeApi {
+    listSpaces(auth: AuthContext, req: { profileId: ProfileId }): Promise<{ spaces: Array<{ taskSpaceId: TaskSpaceId; profileId: ProfileId; createdAtMs: number; closed: boolean; tabs: TabId[]; memberSessionIds: string[]; membershipEvents: Array<{ type: 'created' | 'joined'; agentSessionId: string; atMs: number }> }> }>
+    joinSpace(auth: AuthContext, req: { taskSpaceId: TaskSpaceId; requestId: RequestId }): Promise<{ taskSpaceId: TaskSpaceId; memberSessionIds: string[] }>
     createSpace(auth: AuthContext, req: CreateSpaceRequest): Promise<{ taskSpaceId: TaskSpaceId }>
     createTask(auth: AuthContext, req: CreateTaskRequest): Promise<TaskView>
     openPage(auth: AuthContext, req: OpenPageRequest): Promise<OpenPageResult>

@@ -167,9 +167,9 @@ function writeQueueFileDurably(file: string, data: string): void {
  * accepts Studio's session-user attestation at spawn; tenancyMode lets Studio refuse a machine it thinks is
  * of the other mode. Absent elsewhere and on older daemons, which Studio sends no attestation to.
  */
-export function agentBrowserMachineCapability(env: NodeJS.ProcessEnv = process.env): { protocol: 2; tenancyMode: 'dedicated' | 'shared' } | undefined {
+export function agentBrowserMachineCapability(env: NodeJS.ProcessEnv = process.env): { protocol: 2; tenancyMode: 'dedicated' | 'shared'; hostMode: 'browser-only' | 'dedicated-host' } | undefined {
     if (!env.HAPPY_BROWSER_TASK_RUNTIME_URL) return undefined
-    return { protocol: 2, tenancyMode: env.HAPPY_BROWSER_TASK_TENANCY === 'shared' ? 'shared' : 'dedicated' }
+    return { protocol: 2, tenancyMode: env.HAPPY_BROWSER_TASK_TENANCY === 'shared' ? 'shared' : 'dedicated', hostMode: env.HAPPY_BROWSER_TASK_HOST_MODE === 'browser-only' ? 'browser-only' : 'dedicated-host' }
 }
 
 /**
@@ -192,7 +192,7 @@ export function readBrowserTaskBrokerConfig(env: NodeJS.ProcessEnv = process.env
     try {
         daemonToken = readFileSync(env.HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE || DEFAULT_DAEMON_TOKEN_FILE, 'utf8').trim()
     } catch {
-        logger.debug('[DAEMON RUN] Browser task broker configured but the daemon token is unreadable; browser grants disabled')
+        logger.warn('[DAEMON RUN] Browser task broker configured but the daemon token is unreadable; browser grants disabled')
         return undefined
     }
     if (!daemonToken) return undefined

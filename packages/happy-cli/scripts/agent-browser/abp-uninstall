@@ -28,6 +28,8 @@ PURGE=0
 LABEL=ai.saycode.abp=stack
 LIBEXEC=/usr/local/libexec/abp
 SESSION_USERS="agent-sbx agent"
+HOST_MODE=dedicated-host
+DAEMON_USER=agent
 TERM_WAIT_S=${ABP_UNINSTALL_TERM_WAIT_S:-10}
 
 # Stable across bash versions: plain words as they are, anything else single-quoted.
@@ -99,9 +101,9 @@ remove_files() {
         /etc/systemd/system/abp-stack.service /etc/systemd/system/abp-happy-daemon.service \
         /etc/systemd/system/abp-profile-prune.service /etc/systemd/system/abp-profile-prune.timer
     try systemctl daemon-reload
-    try rm -f /etc/tmpfiles.d/abp.conf /usr/local/sbin/abp-stack /run/abp-stack-start-request
+    try rm -f /etc/tmpfiles.d/abp.conf /usr/local/sbin/abp-stack /run/abp-stack-start-request /etc/abp/browser-only.env
     try rm -rf "$LIBEXEC"
-    if [ "$DRY_RUN" = 1 ] || [ -L /usr/local/bin/happy ]; then try rm -f /usr/local/bin/happy; fi
+    if [ "$HOST_MODE" != browser-only ] && { [ "$DRY_RUN" = 1 ] || [ -L /usr/local/bin/happy ]; }; then try rm -f /usr/local/bin/happy; fi
 }
 
 purge() {
@@ -149,9 +151,16 @@ stop_profile_pruning() {
 }
 
 main_uninstall() {
+    if [ -r /etc/abp/install.json ]; then
+        HOST_MODE=$(/usr/bin/node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.hostMode||"dedicated-host")' /etc/abp/install.json 2>/dev/null || echo dedicated-host)
+        DAEMON_USER=$(/usr/bin/node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.daemonUser||"agent")' /etc/abp/install.json 2>/dev/null || echo agent)
+    fi
     stop_profile_pruning
-    fence_sessions
-    if ! terminate_sessions; then
+    if [ "$HOST_MODE" != browser-only ]; then fence_sessions; fi
+    if [ "$HOST_MODE" != browser-only ]; then
+        SESSION_USERS="agent-sbx agent"
+    fi
+    if [ "$HOST_MODE" != browser-only ] && ! terminate_sessions; then
         say "KEPT the owner firewall rules and everything else: stop the remaining processes, then run abp-uninstall again"
         return 1
     fi
