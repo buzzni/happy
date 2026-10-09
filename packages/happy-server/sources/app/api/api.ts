@@ -53,7 +53,7 @@ import { isLocalStorage, getLocalFilesDir, getManagedFilesDir } from "@/storage/
 import * as path from "path";
 import * as fs from "fs";
 import { startUsageOutboxWorker } from "@/app/usage/usageOutbox";
-import { fastifyCorsOrigin } from "./cors";
+import { fastifyCorsDelegate } from "./cors";
 
 export interface StartApiOptions {
     port?: number;
@@ -102,11 +102,7 @@ export async function startApi(opts: StartApiOptions = {}) {
             return `/v1/preview/${parsed.machineId}/${parsed.port}/${trimmed}${search}`;
         },
     });
-    app.register(import('@fastify/cors'), {
-        origin: fastifyCorsOrigin,
-        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        credentials: true,
-    });
+    app.register(import('@fastify/cors'), () => fastifyCorsDelegate);
 
     // Required for local-mode attachment uploads (PUT /v1/sessions/:id/attachments/:file).
     // Fastify v5 rejects unknown media types with 415 before reaching the handler.
