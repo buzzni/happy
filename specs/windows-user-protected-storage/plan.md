@@ -22,7 +22,7 @@ Core. 로그인·비밀정보 custody·머신 authoritative state이며 Extensio
 3. Desktop seed/connection/auth와 bootstrap/standalone/direct daemon reader 연결. 원본 보존·전환 중 crash·재실행 검증.
 4. 두 소비자의 capability 확인 후 자동 저장소 준비를 활성화하고 동의 모달/낮은 보호 모드 연결 제거. 실패는 기존 상세 진단과 수동 재시도 제공.
 5. 관련 테스트·타입·빌드·PR 검증북·native Windows/실제 UI 녹화 검수. 기존 머신과 공용 AI 응답은 별도 실제 수락.
-현재 1~4단계 저장 연결과 5단계의 소스·패키지·Windows native/실제 GUI 검증을 완료했다. 최신 main 통합, 새 서명 설치판/기존 실제 대화·AI 수락과 paired package pin은 남아 있다. 상세 증거는 context.md, 미완료 범위는 tasks.md를 따른다.
+현재 1~4단계 저장 연결과 5단계의 소스·패키지·Windows native/실제 GUI 검증을 완료했다. 최신 main 통합과 관련 검증도 완료했다. 새 서명 설치판/기존 실제 대화·AI 수락과 paired package pin은 남아 있다. 상세 증거는 context.md, 미완료 범위는 tasks.md를 따른다.
 
 ## 복구·호환성
 읽기 지원을 먼저 제공하고 새 형식 활성화는 양쪽 지원 확인 뒤 수행한다. migration은 검증된 원본을 덮기 전에 암호문 왕복·atomic 게시를 확인한다. 데이터/키 삭제·재발급은 하지 않는다. 구버전은 새 암호문을 읽지 못하므로 rollback은 새 쓰기만 중지하고 암호문 reader를 유지하는 패치다. 기존 실행 daemon과 혼용해 파일을 바꾸지 않는다.
