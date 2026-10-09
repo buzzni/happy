@@ -53,6 +53,7 @@ import { isLocalStorage, getLocalFilesDir, getManagedFilesDir } from "@/storage/
 import * as path from "path";
 import * as fs from "fs";
 import { startUsageOutboxWorker } from "@/app/usage/usageOutbox";
+import { fastifyCorsOrigin } from "./cors";
 
 export interface StartApiOptions {
     port?: number;
@@ -102,9 +103,9 @@ export async function startApi(opts: StartApiOptions = {}) {
         },
     });
     app.register(import('@fastify/cors'), {
-        origin: '*',
-        allowedHeaders: '*',
-        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+        origin: fastifyCorsOrigin,
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        credentials: true,
     });
 
     // Required for local-mode attachment uploads (PUT /v1/sessions/:id/attachments/:file).
