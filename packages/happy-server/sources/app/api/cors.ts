@@ -46,11 +46,28 @@ export function isAllowedCorsOrigin(origin: string | undefined): boolean {
         || isPreviewOrigin(url);
 }
 
-export function fastifyCorsOrigin(
-    origin: string | undefined,
-    callback: (error: Error | null, value: string | boolean) => void,
+const API_CORS_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
+
+/**
+ * Per-request CORS options for the HTTP API.
+ *
+ * Allowed studio origins get credentialed CORS. `Origin: null` is the packaged desktop renderer,
+ * which runs from file://: it gets CORS without credentials. The API authenticates with Bearer
+ * tokens, so a response read through that origin carries no ambient authority. Everything else
+ * gets no CORS headers.
+ */
+export function fastifyCorsDelegate(
+    request: { headers: { origin?: string | string[] } },
+    callback: (error: Error | null, options: { origin: string | boolean; credentials?: boolean; methods: string[] }) => void,
 ): void {
-    callback(null, isAllowedCorsOrigin(origin) && origin ? origin : false);
+    const origin = typeof request.headers.origin === 'string' ? request.headers.origin : undefined;
+    if (origin && isAllowedCorsOrigin(origin)) {
+        callback(null, { origin, credentials: true, methods: API_CORS_METHODS });
+    } else if (origin === 'null') {
+        callback(null, { origin: 'null', credentials: false, methods: API_CORS_METHODS });
+    } else {
+        callback(null, { origin: false, methods: API_CORS_METHODS });
+    }
 }
 
 export function socketCorsOrigin(

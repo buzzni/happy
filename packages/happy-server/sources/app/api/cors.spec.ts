@@ -3,7 +3,7 @@ import fastify from 'fastify';
 import { Server } from 'socket.io';
 import { describe, expect, it } from 'vitest';
 import {
-    fastifyCorsOrigin,
+    fastifyCorsDelegate,
     isAllowedCorsOrigin,
     socketCorsOrigin,
 } from '@/app/api/cors';
@@ -36,12 +36,15 @@ describe('isAllowedCorsOrigin', () => {
         expect(isAllowedCorsOrigin(origin)).toBe(false);
     });
 
-    it('echoes an allowed origin for Fastify without reflecting a rejected origin', () => {
-        const allowed: unknown[] = [];
-        fastifyCorsOrigin('https://saycode.ai', (_error, value) => allowed.push(value));
-        fastifyCorsOrigin('https://evil.example.com', (_error, value) => allowed.push(value));
+    it('gives allowed origins credentialed CORS and rejected origins none', () => {
+        const decided: unknown[] = [];
+        const record = (_error: Error | null, options: { origin: string | boolean; credentials?: boolean }) =>
+            decided.push([options.origin, options.credentials ?? false]);
+        fastifyCorsDelegate({ headers: { origin: 'https://saycode.ai' } }, record);
+        fastifyCorsDelegate({ headers: { origin: 'https://evil.example.com' } }, record);
+        fastifyCorsDelegate({ headers: {} }, record);
 
-        expect(allowed).toEqual(['https://saycode.ai', false]);
+        expect(decided).toEqual([['https://saycode.ai', true], [false, false], [false, false]]);
     });
 
     it('returns a boolean decision for Socket.IO', () => {
@@ -55,11 +58,7 @@ describe('isAllowedCorsOrigin', () => {
     it('restricts Fastify simple requests and preflight responses', async () => {
         const app = fastify();
         const cors = (await import('@fastify/cors')).default;
-        await app.register(cors, {
-            origin: fastifyCorsOrigin,
-            methods: ['GET', 'OPTIONS'],
-            credentials: true,
-        });
+        await app.register(cors, () => fastifyCorsDelegate);
         app.get('/v1/sessions', async () => ({ ok: true }));
         await app.ready();
 
@@ -94,6 +93,53 @@ describe('isAllowedCorsOrigin', () => {
         });
         expect(allowedPreflight.headers['access-control-allow-origin']).toBe('https://saycode.ai');
         expect(allowedPreflight.headers['access-control-allow-headers']).toBe('authorization');
+
+        await app.close();
+    });
+
+    it('lets the packaged desktop renderer (Origin: null) call the API without credentials', async () => {
+        // The packaged desktop renderer runs from file://, so its fetches carry `Origin: null`.
+        // The API authenticates with Bearer tokens, so this origin gets CORS without credentials:
+        // no ambient cookie can be read through it.
+        const app = fastify();
+        const cors = (await import('@fastify/cors')).default;
+        await app.register(cors, () => fastifyCorsDelegate);
+        app.get('/v1/account/settings', async () => ({ ok: true }));
+        await app.ready();
+
+        const preflight = await app.inject({
+            method: 'OPTIONS',
+            url: '/v1/account/settings',
+            headers: {
+                origin: 'null',
+                'access-control-request-method': 'GET',
+                'access-control-request-headers': 'authorization',
+            },
+        });
+        expect(preflight.statusCode).toBe(204);
+        expect(preflight.headers['access-control-allow-origin']).toBe('null');
+        expect(preflight.headers['access-control-allow-credentials']).toBeUndefined();
+        expect(preflight.headers['access-control-allow-headers']).toBe('authorization');
+
+        const simple = await app.inject({ method: 'GET', url: '/v1/account/settings', headers: { origin: 'null' } });
+        expect(simple.headers['access-control-allow-origin']).toBe('null');
+        expect(simple.headers['access-control-allow-credentials']).toBeUndefined();
+
+        const studio = await app.inject({ method: 'GET', url: '/v1/account/settings', headers: { origin: 'https://saycode.ai' } });
+        expect(studio.headers['access-control-allow-origin']).toBe('https://saycode.ai');
+        expect(studio.headers['access-control-allow-credentials']).toBe('true');
+
+        const evil = await app.inject({
+            method: 'OPTIONS',
+            url: '/v1/account/settings',
+            headers: {
+                origin: 'https://evil.example.com',
+                'access-control-request-method': 'GET',
+                'access-control-request-headers': 'authorization',
+            },
+        });
+        expect(evil.headers['access-control-allow-origin']).toBeUndefined();
+        expect(evil.headers['access-control-allow-credentials']).toBeUndefined();
 
         await app.close();
     });
