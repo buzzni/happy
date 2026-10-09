@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
@@ -1179,6 +1179,35 @@ describe('ApiMachineClient socket reconnection', () => {
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
+
+        client.shutdown();
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — the web starts a strict machine's
+    // preview with a sealed env only on a daemon that says it opens one. An existing machine keeps
+    // its first metadata, so the advertisement has to be republished; only a machine key opens it.
+    it.each([
+        { variant: 'dataKey' as const, expected: SEALED_SPAWN_ENV_CAPABILITY },
+        { variant: 'legacy' as const, expected: undefined },
+    ])('advertises sealed env spawns on a registered $variant machine only when it has a machine key', async ({ variant, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: variant };
+        machine.metadata = { ...machine.metadata!, sealedSpawnEnv: variant === 'legacy' ? SEALED_SPAWN_ENV_CAPABILITY : undefined };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
+        expect(machine.metadata?.sealedSpawnEnv).toEqual(expected);
 
         client.shutdown();
     });
