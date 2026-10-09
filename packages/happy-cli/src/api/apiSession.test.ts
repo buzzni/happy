@@ -7,6 +7,7 @@ import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './enc
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
+import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 
 const {
     mockIo,
@@ -17,7 +18,8 @@ const {
     mockDelay,
     mockShouldReconnect,
     mockNotifyDaemonSessionRuntime,
-    sessionRpcConfigs
+    sessionRpcConfigs,
+    registeredCommonHandlers,
 } = vi.hoisted(() => ({
     mockIo: vi.fn(),
     mockAxiosGet: vi.fn(),
@@ -37,7 +39,8 @@ const {
     mockDelay: vi.fn(async () => undefined),
     mockShouldReconnect: vi.fn(() => true),
     mockNotifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
-    sessionRpcConfigs: [] as Array<{ requireBoundRequests?: boolean }>
+    sessionRpcConfigs: [] as Array<{ requireBoundRequests?: boolean }>,
+    registeredCommonHandlers: vi.fn(),
 }));
 
 vi.mock('socket.io-client', () => ({
@@ -54,7 +57,8 @@ vi.mock('axios', () => ({
 
 vi.mock('@/configuration', () => ({
     configuration: {
-        serverUrl: 'https://server.test'
+        serverUrl: 'https://server.test',
+        happyHomeDir: '/tmp/happy-test-home',
     }
 }));
 
@@ -78,7 +82,7 @@ vi.mock('@/api/rpc/RpcHandlerManager', () => ({
 }));
 
 vi.mock('@/modules/common/registerCommonHandlers', () => ({
-    registerCommonHandlers: vi.fn()
+    registerCommonHandlers: registeredCommonHandlers,
 }));
 
 vi.mock('@/utils/time', () => ({
@@ -198,6 +202,21 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
 
         mockIo.mockReturnValue(mockSocket);
+    });
+
+    it('registers machine.run with the daemon-owned trusted profile registry', () => {
+        registeredCommonHandlers.mockClear();
+        new ApiSessionClient('fake-token', session);
+
+        expect(registeredCommonHandlers).toHaveBeenCalledWith(
+            expect.anything(),
+            '/tmp',
+            { machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                // Session scope may run installed tools but never installs them or writes.
+                managedTools: { root: '/tmp/happy-test-home/managed-tools', tools: [expect.objectContaining({ id: 'buzzni.moai' })] },
+            } },
+        );
     });
 
     afterEach(() => {

@@ -916,6 +916,8 @@ const mintViewerBody = {
 
 const mintErrorBody = z.object({ error: z.string(), code: z.string().optional() });
 
+const PREVIEW_RELAY_HEADER = 'x-saycode-preview-relay';
+
 export function previewRoutes(app: Fastify) {
     // Mint a short-lived ptoken that binds (userId, machineId, port) under HMAC.
     app.post('/v1/preview-token', {
@@ -1184,6 +1186,16 @@ export function previewRoutes(app: Fastify) {
                     return reply.code(403).send({ error: 'Token does not match requested machine/port' });
                 }
 
+                // A local tunnel/app proxy can return the daemon request to this
+                // relay. Stop the second hop before it fans out into more RPCs.
+                if (request.headers[PREVIEW_RELAY_HEADER] !== undefined) {
+                    log({ module: 'preview', level: 'warn' }, 'preview relay refused reason=relay-loop');
+                    return reply.code(508).send({
+                        code: 'PREVIEW_RELAY_LOOP',
+                        error: 'Preview upstream routed the request back to the preview relay',
+                    });
+                }
+
                 // specs/runtime-isolation-hardening (H3) — from here on the
                 // token's runtime binding decides whether this request may be
                 // relayed at all, and the studio ACL is re-checked while we
@@ -1328,6 +1340,7 @@ export function previewRoutes(app: Fastify) {
                 const bodyB64 = bodyBuf && bodyBuf.length > 0 ? bodyBuf.toString('base64') : null;
 
                 const forwardHeaders = filterForwardedHeaders(request.headers);
+                forwardHeaders[PREVIEW_RELAY_HEADER] = '1';
 
                 // Relay via the daemon's plain `proxy-http-request` socket event
                 // — deliberately outside the encrypted rpc-request pipeline

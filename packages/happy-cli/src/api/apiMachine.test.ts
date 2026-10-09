@@ -11,16 +11,19 @@ import type { RpcHandlerConfig } from './rpc/types';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
 import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
+import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { join } from 'node:path';
 
 const {
     mockIo,
     mockShouldReconnect,
-    rpcManagerConfigs
+    rpcManagerConfigs,
+    registeredCommonHandlers,
 } = vi.hoisted(() => ({
     mockIo: vi.fn(),
     mockShouldReconnect: vi.fn(() => true),
-    rpcManagerConfigs: [] as RpcHandlerConfig[]
+    rpcManagerConfigs: [] as RpcHandlerConfig[],
+    registeredCommonHandlers: vi.fn(),
 }));
 
 vi.mock('socket.io-client', () => ({
@@ -43,7 +46,7 @@ vi.mock('@/ui/logger', () => ({
 }));
 
 vi.mock('@/modules/common/registerCommonHandlers', () => ({
-    registerCommonHandlers: vi.fn()
+    registerCommonHandlers: registeredCommonHandlers,
 }));
 
 vi.mock('@/api/rpc/RpcHandlerManager', () => ({
@@ -132,6 +135,22 @@ describe('ApiMachineClient machine RPC server lane', () => {
 
         expect(rpcManagerConfigs.at(-1)).toBeDefined();
         expect(rpcManagerConfigs.at(-1)?.serverLane).toBeUndefined();
+    });
+
+    it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {
+        registeredCommonHandlers.mockClear();
+        new ApiMachineClient('fake-token', makeMachine());
+
+        expect(registeredCommonHandlers).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.any(String),
+            { machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                writeScopePolicy: { acquire: expect.any(Function) },
+                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [expect.objectContaining({ id: 'buzzni.moai', version: '0.8.0' })] },
+                allowToolInstall: true,
+            } },
+        );
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary R19

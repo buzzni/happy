@@ -19,6 +19,8 @@ import {
     type SpawnSessionOptions,
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
+import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
+import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
 import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
@@ -908,7 +910,16 @@ export class ApiMachineClient {
         // project's workspaceDir.
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
-        registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
+        registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
+            // Machine scope is the Desktop machine.run path and the only one that
+            // may run managed writes; its lock is per daemon process.
+            machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                writeScopePolicy: createManagedProjectWriteScopePolicy(),
+                managedTools: hostManagedMachineTools(configuration.happyHomeDir),
+                allowToolInstall: true,
+            },
+        });
         this.rpcHandlerManager.registerHandler(
             'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
         );

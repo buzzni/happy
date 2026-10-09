@@ -337,6 +337,12 @@ import { enforceLeaseRenewal } from './managedGenerationRearm';
 import { systemMonotonicNow } from '@/launcher/supervisor';
 import { createLauncherClient, createUnixSocketRequest } from './launch/launcherClient';
 import { defaultProvisioningDeps } from './managedRuntimeIdentity';
+import {
+  MACHINE_RUN_MAX_OUTPUT_BYTES,
+  MACHINE_RUN_MAX_TIMEOUT_MS,
+} from '@/modules/common/typedMachineRun';
+import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
+import { hostManagedMachineTools } from '@/modules/common/moaiMachineRunProfiles';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -365,6 +371,15 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
+  machineRun: {
+    protocolVersion: 1,
+    // The machine-scope handler installs the managed write policy (apiMachine).
+    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, process.platform, true, hostManagedMachineTools(configuration.happyHomeDir)),
+    shell: false,
+    stdin: 'none',
+    maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
+    maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
+  },
   rpcBinding: RPC_BINDING_CAPABILITY,
   sealedSpawnEnv: SEALED_SPAWN_ENV_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
