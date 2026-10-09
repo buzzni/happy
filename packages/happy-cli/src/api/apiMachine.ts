@@ -114,7 +114,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -4041,6 +4041,13 @@ export class ApiMachineClient {
             const advertisedRpcBinding = this.managedHandlers ? undefined : RPC_BINDING_CAPABILITY;
             const rpcBindingStale = JSON.stringify(this.machine.metadata?.rpcBinding)
                 !== JSON.stringify(advertisedRpcBinding);
+            // aplus 4b-3: `spawn-with-sealed-env` opens with the machine key, so only a dataKey
+            // machine runs it; a legacy machine's stored copy (from its first registration) is cleared.
+            const advertisedSealedSpawnEnv = this.managedHandlers || this.machine.encryptionVariant !== 'dataKey'
+                ? undefined
+                : SEALED_SPAWN_ENV_CAPABILITY;
+            const sealedSpawnEnvStale = JSON.stringify(this.machine.metadata?.sealedSpawnEnv)
+                !== JSON.stringify(advertisedSealedSpawnEnv);
 
             this.syncResumeSessionRpcRegistration();
 
@@ -4051,7 +4058,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4081,6 +4088,7 @@ export class ApiMachineClient {
                     aiAuthSelection: advertisedAiAuthSelection,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
+                    sealedSpawnEnv: advertisedSealedSpawnEnv,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
