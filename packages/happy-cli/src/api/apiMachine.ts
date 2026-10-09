@@ -1,5 +1,6 @@
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
+import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
 /**
  * WebSocket client for machine/daemon communication with Happy server
  * Similar to ApiSessionClient but for machine-scoped connections
@@ -910,6 +911,13 @@ export class ApiMachineClient {
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
         this.rpcHandlerManager.registerHandler(
             'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
+        );
+        // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2: a preview the
+        // browser starts with the env the server sealed for this machine. Customer lane only.
+        this.rpcHandlerManager.registerHandler(
+            'spawn-with-sealed-env',
+            createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot }),
+            { customerBound: true },
         );
         // Registered, not exempted: on a managed runtime the manager's own
         // dispatch allowlist still refuses this method, which is the intended

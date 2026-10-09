@@ -12,7 +12,7 @@ import { machineServerLane, SERVER_LANE_METHODS } from './serverLane';
 const CONTENT_CAPABLE = [
     'bash', 'readFile', 'readFileChunk', 'writeFile', 'deleteFile', 'renameFile', 'copyFile', 'ensureDirectory',
     'listDirectory', 'getDirectoryTree', 'listWorkspaceDirectory', 'readWorkspaceFile', 'ripgrep', 'difftastic',
-    'file-discovery', 'worktree-dependencies:reclaim',
+    'file-discovery', 'worktree-dependencies:reclaim', 'spawn-with-sealed-env',
     'spawn-happy-session', 'resume-happy-session', 'recover-happy-session', 'stop-daemon',
     'claude-session-transfer', 'codex-thread-transfer', 'claude-fork-session', 'claude-list-rewind-points',
     'claude-duplicate-session', 'codex-fork-thread', 'codex-list-rewind-points', 'codex-duplicate-thread',
