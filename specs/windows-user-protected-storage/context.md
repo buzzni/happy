@@ -11,7 +11,7 @@
 
 ## 작업 위치
 - Desktop: `codex/windows-credential-storage-recovery`, Draft [#1568](https://github.com/buzzni/aplus-dev-studio-desktop/pull/1568). 저장 변경 `f03245746`과 통합 `a02ebcdb6`에 최신 main `6c210d760`(#1571 스크롤/#1573 Windows 제어)을 반영했다. localDirectDiscovery의 중복 읽기 제거와 private ABI reader를 함께 유지했다.
-- Happy: `codex/windows-user-protected-storage`, 저장 변경 `5ea45ad19`, 통합 `b891dd29d`. 최신 main `837928368`(1.1.10-aplus.304)을 통합했다. 새 공개 버전은 아직 정하지 않았다. 2026-10-09 확인한 npm latest는 .303이므로 main 버전과 공개 배포 완료를 동일시하지 않는다.
+- Happy: Draft [#755](https://github.com/buzzni/happy/pull/755), `codex/windows-user-protected-storage`, 저장 변경 `5ea45ad19`, 통합 `b891dd29d`. 최신 main `837928368`(1.1.10-aplus.304)을 통합했다. 새 공개 버전은 아직 정하지 않았다. 2026-10-09 확인한 npm latest는 .303이므로 main 버전과 공개 배포 완료를 동일시하지 않는다.
 - 테스트 의존성은 루트 저장소 node_modules의 심볼릭 링크를 사용한다. Happy CLI의 wire는 현재 worktree 빌드, ajv는 Desktop의 기존 의존성, saycode-cli는 package에 선언된 0.8.1을 격리 경로로 연결했다. 루트 사용자 변경과 기존 release-300 worktree는 수정하지 않는다.
 
 ## 구현과 보존 계약
@@ -21,7 +21,7 @@
 - Windows 로그인은 디스크 저장에 성공해야 완료된다. 실패 시 `finalizeCloudLogin`의 임시 창 계정도 이전 값 또는 null로 복구한다. 동의 저장/accept/revoke와 낮은 보호 모드를 제거했고 실패에는 진단·재시도를 제공한다. macOS/Linux 저장 계약은 유지한다.
 - 기존 루트/신원을 재사용하고 검증된 평문은 호환 읽기 후 다음 쓰기부터 암호화한다. 귀속 미확인 평문은 보존·거부한다. 별도 auth 복구만 Local State DPAPI+AES-GCM 증명 후 후보로 이전한다. 키를 잃었다고 새 key를 발급해 같은 machineId처럼 쓰지 않는다.
 - bootstrap은 기존 daemon 중지를 확인한 뒤 키를 바꾼다. daemon state 읽기 실패는 중지 성공/신규 설치로 처리하지 않는다. 개발용 global install guard도 같은 ABI로 확인한다. 별도 Windows home으로 암호문을 단순 복사할 수 없으므로 격리 설치 안내에서는 새 인증을 사용한다.
-- helper 빌드/Windows CI native smoke/package ABI/export/배포 guard를 추가했다. Desktop staging은 ABI·PE x64·helper hash를 검증하고 서명 후 manifest hash를 갱신한다. **현재 Desktop pin에는 새 ABI가 없어 새 Happy 배포 후 pin/Windows lock 갱신이 필요하다. 이 상태로 main 병합·공식 앱 빌드 수락을 주장하지 않는다.**
+- helper 빌드/Windows CI native smoke/package ABI/export/배포 guard를 추가했다. PR smoke(Linux/Windows)와 정기 SDK 패키지 검사도 공통 Windows helper 빌드 artifact를 받도록 연결했다. 배포 경로에만 artifact가 있고 기존 PR guard에는 없던 누락을 수정했으며 4개 workflow YAML/각 guard의 의존성을 검증했다. Desktop staging은 ABI·PE x64·helper hash를 검증하고 서명 후 manifest hash를 갱신한다. **현재 Desktop pin에는 새 ABI가 없어 새 Happy 배포 후 pin/Windows lock 갱신이 필요하다. 이 상태로 main 병합·공식 앱 빌드 수락을 주장하지 않는다.**
 
 ## 검증 결과
 - Happy: 17개 파일 152개 관련 테스트 통과. 표준 `npm run build`(tsc+pkgroll), prepare-publish-package 및 guard-publish-artifact `--install-smoke` 통과. 통합 전 .303 및 최신 main 통합 후 .304 소스의 로컬 검증 tarball이며 공개 배포하지 않았다. 통합 후 wire/CLI 표준 빌드와 package guard/install smoke도 다시 통과했다. 초기 임시 타입 alias의 AJV 런타임 오류는 실제 의존성 링크와 표준 빌드로 수정했다.
