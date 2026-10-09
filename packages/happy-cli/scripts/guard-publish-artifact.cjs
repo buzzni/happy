@@ -13,6 +13,9 @@ const DEPENDENCY_FIELDS = [
 ];
 
 const EXPECTED_BUNDLED_FILES = [
+    'package/dist/windowsPrivateStorage.cjs',
+    'package/native/windows-x64/user-protection.exe',
+    'package/native/windows-x64/user-protection.json',
     'package/bin/happy-browser-native-host.mjs',
     'package/dist/browserNativeMessagingHost.mjs',
     'package/browser-extension/src/nativePairing.js',

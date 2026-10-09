@@ -4,7 +4,7 @@ import { join } from 'node:path';
 const GUARD_SCRIPT = join(__dirname, '..', 'globalInstallGuard.cjs');
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { decideGlobalInstall } = require(GUARD_SCRIPT);
+const { decideGlobalInstall, readInstallDaemonState } = require(GUARD_SCRIPT);
 
 const liveState = {
     pid: 74338,
@@ -71,5 +71,23 @@ describe('decideGlobalInstall', () => {
         const decision = decideGlobalInstall({ state: liveState, isPidAlive: () => true, override: '' });
 
         expect(decision.blocked).toBe(true);
+    });
+});
+
+describe('global install with Windows private state', () => {
+    it('protects sessions after decrypting the daemon state', () => {
+        const state = readInstallDaemonState({ filePath: 'C:\\fixture\\daemon.state.json', isWindows: true,
+            fs: { lstatSync: () => ({}) }, loadWindowsStorage: () => ({ read: () => JSON.stringify(liveState) }) });
+        expect(decideGlobalInstall({ state, isPidAlive: () => true }).blocked).toBe(true);
+    });
+    it('allows a genuinely absent state without loading a helper', () => {
+        expect(readInstallDaemonState({ filePath: 'missing', isWindows: true,
+            fs: { lstatSync: () => { throw Object.assign(new Error(), { code: 'ENOENT' }); } },
+            loadWindowsStorage: () => { throw new Error('must not load'); } })).toBeNull();
+    });
+    it('refuses replacement when state cannot be authenticated', () => {
+        expect(() => readInstallDaemonState({ filePath: 'existing', isWindows: true,
+            fs: { lstatSync: () => ({}) }, loadWindowsStorage: () => ({ read: () => { throw new Error('private content'); } }) }))
+            .toThrow('WINDOWS_SECRET_READ_FAILED');
     });
 });

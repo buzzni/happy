@@ -25,6 +25,16 @@
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.cts",
   "exports": {
+    "./windowsPrivateStorage": {
+      "require": {
+        "types": "./dist/windowsPrivateStorage.d.cts",
+        "default": "./dist/windowsPrivateStorage.cjs"
+      },
+      "import": {
+        "types": "./dist/windowsPrivateStorage.d.mts",
+        "default": "./dist/windowsPrivateStorage.mjs"
+      }
+    },
     ".": {
       "require": {
         "types": "./dist/index.d.cts",
@@ -84,6 +94,11 @@
     "scripts",
     "scripts/build-windows-session-launcher.cjs",
     "native/windowsSessionLauncher.cs",
+    "native/windowsUserProtection.cs",
+    "native/windowsPrivateFileRead.cs",
+    "native/windowsPrivateFilePublish.cs",
+    "native/windows-x64/user-protection.exe",
+    "native/windows-x64/user-protection.json",
     "browser-extension",
     "browser-session-image",
     "tools/archives",

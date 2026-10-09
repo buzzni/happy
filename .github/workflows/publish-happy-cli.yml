@@ -32,8 +32,27 @@ permissions:
     contents: read
 
 jobs:
+    windows-user-protection:
+        if: github.event_name == 'push'
+        runs-on: windows-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+            - name: Build Windows user-protected storage helper
+              run: node packages/happy-cli/scripts/build-windows-user-protection.cjs
+            - name: Validate native storage contract
+              run: node packages/happy-cli/scripts/test-windows-user-protection.cjs
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: windows-user-protection
+                  path: packages/happy-cli/native/windows-x64/user-protection.*
+                  if-no-files-found: error
     publish:
         if: github.event_name == 'push'
+        needs: windows-user-protection
         runs-on: ubuntu-latest
         # The arm64 browser image builds under QEMU emulation (Chromium apt install), which takes a while.
         timeout-minutes: 75
@@ -111,6 +130,12 @@ jobs:
               run: node packages/happy-cli/scripts/agent-browser/publish-images.mjs --repo namsangboy --version "${{ steps.release_version.outputs.version }}" --out packages/happy-cli/scripts/agent-browser/abp-images.json
 
             - name: Prepare publish artifact
+              uses: actions/download-artifact@v4
+              with:
+                  name: windows-user-protection
+                  path: packages/happy-cli/native/windows-x64
+
+            - name: Prepare publish package
               run: node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"
 
             - name: Pack publish artifact

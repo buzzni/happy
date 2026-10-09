@@ -1,6 +1,8 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 import tweetnacl from 'tweetnacl'
+import { readPrivateFileSync, replacePrivateFileSync } from '@/persistence'
+import { WindowsPrivateFileError } from '@/utils/windowsPrivateFile'
 
 export interface MachineAutomationKey {
   version: 1
@@ -38,20 +40,18 @@ function parse(raw: string): MachineAutomationKey {
 
 function persist(filePath: string, key: MachineAutomationKey): void {
   mkdirSync(path.dirname(filePath), { recursive: true })
-  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
-  writeFileSync(tmp, JSON.stringify({
+  replacePrivateFileSync(filePath, JSON.stringify({
     version: key.version,
     publicKey: Buffer.from(key.publicKey).toString('base64'),
     secretKey: Buffer.from(key.secretKey).toString('base64'),
     registeredKeyVersion: key.registeredKeyVersion,
-  }), { encoding: 'utf8', mode: 0o600 })
-  renameSync(tmp, filePath)
+  }))
   chmodSync(filePath, 0o600)
 }
 
 export function loadOrCreateMachineAutomationKey(filePath: string): MachineAutomationKey {
   try {
-    const key = parse(readFileSync(filePath, 'utf8'))
+    const key = parse(readPrivateFileSync(filePath))
     chmodSync(filePath, 0o600)
     return key
   } catch (error) {
@@ -75,8 +75,9 @@ export function loadOrCreateMachineAutomationKey(filePath: string): MachineAutom
  */
 export function readMachineAutomationKey(filePath: string): MachineAutomationKey | null {
   try {
-    return parse(readFileSync(filePath, 'utf8'))
-  } catch {
+    return parse(readPrivateFileSync(filePath))
+  } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error
     return null
   }
 }
@@ -93,7 +94,7 @@ export function readMachineAutomationKey(filePath: string): MachineAutomationKey
 export function rotateMachineAutomationKey(filePath: string): 'rotated' | 'absent' {
   let current: MachineAutomationKey
   try {
-    current = parse(readFileSync(filePath, 'utf8'))
+    current = parse(readPrivateFileSync(filePath))
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent'
     throw error

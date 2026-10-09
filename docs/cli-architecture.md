@@ -122,6 +122,12 @@ Configuration lives in `src/configuration.ts`:
 - `HAPPY_SERVER_URL` and `HAPPY_WEBAPP_URL` override defaults.
 - `HAPPY_VARIANT`, `HAPPY_EXPERIMENTAL`, `HAPPY_DISABLE_CAFFEINATE` control behavior.
 
+## Windows private storage
+
+`utils/windowsPrivateFile.ts` owns private file I/O for credentials and copies, machine identity, settings, session/automation keys and daemon control state. `windowsPrivateStorage` exposes the same small versioned ABI to Desktop without starting configuration or the daemon. Windows always uses the bundled, hash-checked CurrentUser DPAPI helper. Input/output are bounded private pipes, failures use fixed codes, and missing files are distinguished from unreadable or corrupt identities.
+
+The native helper pins parent handles, rejects reparse points/hardlinks/open writers, verifies legacy plaintext ownership/DACL, and publishes encrypted bytes atomically. Parent ACLs are not rewritten. Backups and staged sessions are read and re-encrypted for their destination binding, rather than copied as ciphertext. A damaged identity is not permission to create a new machine. Desktop and Happy readers must ship together; an old daemon cannot safely share this new representation. Rollback must retain the encrypted reader. Administrator/same-user compromise, deletion and old-ciphertext replay are outside this storage guarantee. Revisit when adding private consumers, changing helper ABI, or moving bound paths.
+
 ## API client architecture
 
 ```mermaid
