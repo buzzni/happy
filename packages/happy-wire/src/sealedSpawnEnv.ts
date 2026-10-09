@@ -23,6 +23,12 @@ export const SEALED_SPAWN_ENV_VERSION = 1;
 export const SEALED_SPAWN_ENV_KEY_LABEL = 'happy sealed spawn env v1';
 /** How far a payload's issue time may be from the daemon's clock, either way. */
 export const SEALED_SPAWN_ENV_WINDOW_MS = 5 * 60_000;
+/**
+ * The longest a `spawn-with-sealed-env` command may run before the daemon kills its process group.
+ * A preview start installs dependencies or pulls an image first; the web waits up to 15 minutes for
+ * a container start.
+ */
+export const SEALED_SPAWN_ENV_MAX_TIMEOUT_MS = 20 * 60_000;
 /** The variable that names the env file of an `envDelivery: 'file'` spawn. */
 export const SEALED_SPAWN_ENV_FILE_VARIABLE = 'APLUS_SEALED_ENV_FILE';
 
@@ -40,6 +46,8 @@ const RESERVED_NAMES = new Set([
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'COMSPEC', 'PATHEXT', 'PSMODULEPATH', 'SYSTEMROOT', 'WINDIR',
 ]);
+// Names under a reserved prefix that only select a mode and load nothing.
+const ALLOWED_NAMES = new Set(['NODE_ENV']);
 const RESERVED_PREFIXES = [
   'NODE_', 'LD_', 'DYLD_', 'HAPPY_', 'SAYCODE_', 'SCRIPT_', 'APLUS_',
   'NPM_CONFIG_', 'YARN_', 'PNPM_', 'BUN_', 'DENO_', 'COREPACK_', 'PIP_', 'UV_', 'CARGO_', 'RUSTUP_',
@@ -51,6 +59,7 @@ export function rejectedSealedSpawnEnvNames(names: readonly string[]): string[] 
   return names.filter((name) => {
     if (!ENV_NAME.test(name)) return true;
     const upper = name.toUpperCase();
+    if (ALLOWED_NAMES.has(upper)) return false;
     return RESERVED_NAMES.has(upper) || RESERVED_PREFIXES.some((prefix) => upper.startsWith(prefix));
   });
 }
