@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTypedMachineRunHandler } from './typedMachineRun';
@@ -74,11 +74,21 @@ describe('typed machine-run handler', () => {
     it('escalates a SIGTERM-ignoring process group to SIGKILL after grace', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
         try {
-            const handler = createTypedMachineRunHandler(root);
-            const started = await handler({ version: 1, action: 'start', executable: 'ruby', args: ['-e', 'Signal.trap(:TERM, "IGNORE").tap { sleep 5 }'], cwd: root, timeoutMs: 20, timeoutGraceMs: 20 });
+            // A SIGTERM-ignoring child built on the Node running this test, so no other runtime
+            // (Ruby, Python) has to be installed. `node` itself is not an allowed executable name.
+            const bin = join(root, 'bin');
+            await mkdir(bin);
+            await writeFile(join(bin, 'ignore-term'), `#!${process.execPath}\nprocess.on('SIGTERM', () => {});\nsetTimeout(() => {}, 5000);\n`, { mode: 0o755 });
+            const handler = createTypedMachineRunHandler(root, { baseEnvironment: { PATH: `${bin}:${process.env.PATH ?? ''}` } });
+            const started = await handler({ version: 1, action: 'start', executable: 'ignore-term', args: [], cwd: root, timeoutMs: 200, timeoutGraceMs: 20 });
             if (started.action !== 'start') return;
-            await new Promise((resolve) => setTimeout(resolve, 150));
-            await expect(handler({ version: 1, action: 'status', operationId: started.operationId })).resolves.toMatchObject({ state: 'failed', timedOut: true, descendantsReaped: false, remoteMayContinue: true, processGroupEvidence: { kind: 'no-local-trace' } });
+            // The state turns terminal at the timeout; the SIGKILL escalation lands after the grace period.
+            let status: Awaited<ReturnType<typeof handler>> = await waitForTerminal(handler, started.operationId);
+            for (let attempt = 0; attempt < 100 && status.action === 'status' && status.processGroupEvidence.kind !== 'no-local-trace'; attempt++) {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                status = await handler({ version: 1, action: 'status', operationId: started.operationId });
+            }
+            expect(status).toMatchObject({ state: 'failed', timedOut: true, descendantsReaped: false, remoteMayContinue: true, processGroupEvidence: { kind: 'no-local-trace' } });
         } finally {
             await rm(root, { recursive: true, force: true });
         }
