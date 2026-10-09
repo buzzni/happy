@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
     SEALED_SPAWN_ENV_FILE_VARIABLE,
+    SEALED_SPAWN_ENV_MAX_TIMEOUT_MS,
     SEALED_SPAWN_ENV_KEY_LABEL,
     SEALED_SPAWN_ENV_WINDOW_MS,
     readSealedSpawnEnvPayload,
@@ -27,7 +28,6 @@ import { validatePath } from './pathSecurity';
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_TIMEOUT_MS = 5 * 60_000;
 
 function terminateProcessTree(child: ChildProcess): void {
     if (!child.pid) return;
@@ -187,7 +187,7 @@ export function createSealedSpawnEnvHandler(deps: {
                 await writeFile(file, envFileContent(payload.env), { mode: 0o600 });
                 env[SEALED_SPAWN_ENV_FILE_VARIABLE] = file;
             }
-            const timeout = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+            const timeout = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, SEALED_SPAWN_ENV_MAX_TIMEOUT_MS);
             const options = { cwd: cwd.resolvedPath, windowsHide: true, env };
             logger.debug('[sealed-spawn-env] running', { cwd: options.cwd, delivery: request.envDelivery, names: Object.keys(payload.env).length });
             const { stdout, stderr } = await spawnWithProcessTreeTimeout(request.command, options, timeout);

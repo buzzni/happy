@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   SEALED_SPAWN_ENV_CAPABILITY,
+  SEALED_SPAWN_ENV_MAX_TIMEOUT_MS,
   SEALED_SPAWN_ENV_WINDOW_MS,
   readSealedSpawnEnvPayload,
   rejectedSealedSpawnEnvNames,
@@ -41,6 +42,11 @@ describe('rejectedSealedSpawnEnvNames', () => {
       'APLUS_SEALED_ENV_FILE', 'ComSpec', 'PathExt',
     ];
     expect(rejectedSealedSpawnEnvNames(names)).toEqual(names);
+  });
+
+  it('lets NODE_ENV through: it selects a mode, it loads nothing', () => {
+    expect(rejectedSealedSpawnEnvNames(['NODE_ENV', 'node_env'])).toEqual([]);
+    expect(rejectedSealedSpawnEnvNames(['NODE_OPTIONS', 'NODE_ENV_FILE'])).toEqual(['NODE_OPTIONS', 'NODE_ENV_FILE']);
   });
 
   it('compares without case, as Windows does', () => {
@@ -87,5 +93,11 @@ describe('sealedSpawnEnvCapabilitySchema', () => {
   it('reads the capability the daemon advertises', () => {
     expect(sealedSpawnEnvCapabilitySchema.parse(SEALED_SPAWN_ENV_CAPABILITY)).toEqual({ version: 1 });
     expect(sealedSpawnEnvCapabilitySchema.safeParse({ version: 2 }).success).toBe(false);
+  });
+});
+
+describe('SEALED_SPAWN_ENV_MAX_TIMEOUT_MS', () => {
+  it('covers the longest preview start the web sends: a container start with a cold image pull (15 minutes)', () => {
+    expect(SEALED_SPAWN_ENV_MAX_TIMEOUT_MS).toBeGreaterThanOrEqual(15 * 60_000);
   });
 });
