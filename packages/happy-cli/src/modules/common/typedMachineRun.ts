@@ -111,7 +111,15 @@ function signalGroup(child: ChildProcess, signal: NodeJS.Signals): SignalOutcome
 
 export function createTypedMachineRunHandler(workingDirectory: string, options: TypedMachineRunHandlerOptions = {}) {
     const operations = new Map<string, Operation>();
-    const allowedWorkingDirectory = realpathSync(workingDirectory);
+    // Resolved per start, not at registration: a session whose folder is gone must still start,
+    // and a run there fails closed below.
+    const allowedWorkingDirectory = () => {
+        try {
+            return realpathSync(workingDirectory);
+        } catch {
+            throw new Error('MACHINE_RUN_PATH_DENIED: working directory does not exist');
+        }
+    };
     const refreshEvidence = (operation: Operation) => {
         if (!operation.process.pid) operation.processGroupEvidence = { kind: 'indeterminate', detail: 'child has no pid' };
         else operation.processGroupEvidence = probeProcessGroup(operation.process.pid);
@@ -172,7 +180,8 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
             return { version: 1, action: 'status', operationId: input.operationId, state: operation.state, stdout: operation.stdout.toString('utf8'), stderr: operation.stderr.toString('utf8'), exitCode: operation.exitCode, truncated: operation.truncated, timedOut: operation.timedOut, remoteMayContinue: operation.remoteMayContinue, descendantsReaped: operation.descendantsReaped, processGroupEvidence: operation.processGroupEvidence };
         }
         if ([...operations.values()].filter(unresolved).length >= MAX_ACTIVE_OPERATIONS) throw new Error('MACHINE_RUN_QUOTA_EXCEEDED: too many active operations');
-        let requestedCwd = allowedWorkingDirectory;
+        const allowedRoot = allowedWorkingDirectory();
+        let requestedCwd = allowedRoot;
         if (input.cwd) {
             try {
                 requestedCwd = realpathSync(input.cwd);
@@ -180,7 +189,7 @@ export function createTypedMachineRunHandler(workingDirectory: string, options: 
                 throw new Error('MACHINE_RUN_PATH_DENIED: cwd does not exist');
             }
         }
-        const cwd = input.cwd ? validatePath(requestedCwd, allowedWorkingDirectory) : { valid: true as const, resolvedPath: allowedWorkingDirectory };
+        const cwd = input.cwd ? validatePath(requestedCwd, allowedRoot) : { valid: true as const, resolvedPath: allowedRoot };
         if (!cwd.valid || !cwd.resolvedPath) throw new Error(`MACHINE_RUN_PATH_DENIED: ${cwd.error}`);
         const outputLimitBytes = input.outputLimitBytes ?? MAX_OUTPUT_BYTES;
         const child = spawn(input.executable, input.args, { cwd: cwd.resolvedPath, shell: false, detached: true, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ...(options.baseEnvironment ?? {}), ...(input.env ?? {}), ...(trusted?.env ?? {}) } });

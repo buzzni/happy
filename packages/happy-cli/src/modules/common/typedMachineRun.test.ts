@@ -15,6 +15,13 @@ async function waitForTerminal(handler: ReturnType<typeof createTypedMachineRunH
 }
 
 describe('typed machine-run handler', () => {
+    // A session whose folder was moved or deleted must still start; only a run there fails.
+    it('registers for a missing working directory and fails closed only when a run starts', async () => {
+        const missing = join(tmpdir(), `happy-machine-run-missing-${process.pid}-${Date.now()}`);
+        const handler = createTypedMachineRunHandler(missing);
+        await expect(handler({ version: 1, action: 'start', executable: 'printf', args: ['x'] })).rejects.toThrow('MACHINE_RUN_PATH_DENIED');
+    });
+
     it('runs argv without a shell and returns bounded output through status', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
         try {

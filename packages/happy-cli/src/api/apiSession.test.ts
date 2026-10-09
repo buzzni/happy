@@ -57,7 +57,8 @@ vi.mock('axios', () => ({
 
 vi.mock('@/configuration', () => ({
     configuration: {
-        serverUrl: 'https://server.test'
+        serverUrl: 'https://server.test',
+        happyHomeDir: '/tmp/happy-test-home',
     }
 }));
 
@@ -210,7 +211,11 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             '/tmp',
-            { machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } },
+            { machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                // Session scope may run installed tools but never installs them or writes.
+                managedTools: { root: '/tmp/happy-test-home/managed-tools', tools: [expect.objectContaining({ id: 'buzzni.moai' })] },
+            } },
         );
     });
 

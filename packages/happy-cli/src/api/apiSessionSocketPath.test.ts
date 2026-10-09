@@ -23,6 +23,7 @@ vi.mock('@/configuration', () => ({
     configuration: {
         get serverUrl() { return serverUrl; },
         currentCliVersion: '0.0.0-test',
+        happyHomeDir: '/tmp/happy-test-home',
     },
 }));
 vi.mock('@/ui/logger', () => ({
