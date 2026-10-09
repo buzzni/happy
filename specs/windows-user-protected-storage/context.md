@@ -49,3 +49,8 @@ Desktop worktree `artifacts/windows-user-protection/native-ui-evidence/`에 Wind
 5. test-only sessionWriteScopeFixture/browserRuntime realAgentHarness의 raw 파일 접근은 해당 Windows 실서버 fixture를 사용할 때 ABI reader로 전환해야 한다. 제품 reader와 구분해 남긴다.
 
 DPAPI는 directory-wide snapshot/CAS, 동일 사용자 악성 프로세스·관리자·삭제·과거 암호문 replay를 해결하지 않는다. 회사형 ACL fixture 성공이 고객의 모든 보안 프로그램 환경을 증명하지 않는다.
+
+## 트라이얼 준비 중 CI 실패 수정 (2026-10-09)
+- Windows CI guard의 spawnSync(npm)은 실제 테스트 PC에서도 ENOENT가 발생했다. Windows에서는 npm-cli.js를 현재 Node로 직접 실행하며 shell을 사용하지 않는다. install smoke의 전역 node_modules 위치도 Windows prefix 규칙에 맞췄다.
+- 기존 guard fixture에 새 필수 native/ABI 파일을 추가하고, 준비 디렉터리 → npm pack → 전역 격리 설치 → 실행 검사를 추가했다. Mac 12개 통과, 실제 Windows 11개 통과·POSIX 실행 비트 검사 1개 제외. 관련 표준 CLI 빌드/타입 검사는 Vitest global setup에서 통과했다.
+- 사용자 요청으로 공개 publish 없이 Desktop+Happy 수정 커밋을 묶은 Windows 트라이얼을 준비한다. 공개 태그/버전은 변경하지 않는다.
