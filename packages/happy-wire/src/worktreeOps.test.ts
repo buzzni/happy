@@ -16,6 +16,8 @@ import {
   resolveWorktreeRepoRoot,
   sanitizeWorktreeName,
   worktreeAttestationPayload,
+  worktreeOpMethod,
+  worktreeOpResultSchemas,
   worktreeOpsCapabilitySchema,
 } from './worktreeOps';
 
@@ -104,7 +106,23 @@ describe('worktree operation ticket', () => {
     expect(readWorktreeTicket(ticket({ params: { ...ticket().params, workspaceDir: '/root/./work' } })).ok).toBe(false);
     expect(readWorktreeTicket(ticket({ params: { ...ticket().params, workspaceDir: 'C:\\work\\..\\x' } })).ok).toBe(false);
     expect(readWorktreeTicket(ticket({ params: { ...ticket().params, baseRef: 'main\u001b[2J' } })).ok).toBe(false);
-    expect(readWorktreeTicket(ticket({ params: { ...ticket().params, workspaceDir: 'C:\\work\\p1', baseRef: 'origin/main' } })).ok).toBe(true);
+    expect(readWorktreeTicket(ticket({ params: { ...ticket().params, workspaceDir: 'C:\\work\\p1', baseRef: 'origin/main', snapshotCurrent: false } })).ok).toBe(true);
+  });
+
+  it('refuses a ticket that lives longer than ten minutes', () => {
+    expect(readWorktreeTicket(ticket({ expiresAt: 1_790_000_600_001 })).ok).toBe(false);
+  });
+
+  it('refuses create params the server never combines', () => {
+    const create = ticket().params;
+    expect(readWorktreeTicket(ticket({ params: { ...create, snapshotCurrent: true, baseRef: 'main' } })).ok).toBe(false);
+    expect(readWorktreeTicket(ticket({ params: { ...create, snapshotCurrent: false, baseSource: 'origin', baseRef: null } })).ok).toBe(false);
+    expect(readWorktreeTicket(ticket({ params: { ...create, snapshotCurrent: false, baseSource: 'origin', baseRef: 'main' } })).ok).toBe(true);
+  });
+
+  it('reads remove params for a worktree without a branch, and a dry run', () => {
+    const params = { worktreePath: '/repo/.aplus/worktrees/p1/x', branch: null, force: false, dryRun: true };
+    expect(readWorktreeTicket(ticket({ op: 'remove', params })).ok).toBe(true);
   });
 
   it('types params by operation', () => {
@@ -145,6 +163,24 @@ describe('worktree result attestation', () => {
       result: { path: '/repo/.aplus/worktrees/p1/bright-fox-1a2b' },
       finishedAt: 1_790_000_001_000,
     });
+  });
+});
+
+describe('worktree operation results', () => {
+  it('names each operation\'s daemon method', () => {
+    expect(worktreeOpMethod('create')).toBe('worktree:create');
+  });
+
+  it('reads the result of each operation strictly', () => {
+    const created = {
+      path: '/repo/.aplus/worktrees/p1/x', branch: 'x', baseBranch: 'main', baseRevision: null,
+      repoRelativeDir: '', repoRoot: '/repo',
+    };
+    expect(worktreeOpResultSchemas.create.parse(created)).toEqual(created);
+    expect(worktreeOpResultSchemas.create.safeParse({ ...created, extra: 1 }).success).toBe(false);
+    expect(worktreeOpResultSchemas.status.parse({ dirty: true, behind: 0, ahead: 2 })).toEqual({ dirty: true, behind: 0, ahead: 2 });
+    expect(worktreeOpResultSchemas.remove.safeParse({ outcome: 'gone' }).success).toBe(false);
+    expect(worktreeOpResultSchemas.capability.parse({ capable: false, reason: 'not-git', branch: null, branches: [] }).reason).toBe('not-git');
   });
 });
 

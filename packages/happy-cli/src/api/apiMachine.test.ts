@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
@@ -469,6 +469,16 @@ describe('ApiMachineClient socket reconnection', () => {
         expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
             'spawn-with-sealed-env', expect.any(Function), { customerBound: true },
         );
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree.
+    it('registers each worktree operation as a customer-bound machine method', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        for (const method of ['worktree:capability', 'worktree:prepare', 'worktree:create', 'worktree:status', 'worktree:remove']) {
+            expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+                method, expect.any(Function), { customerBound: true },
+            );
+        }
     });
 
     it('registers dependency reclaim on the authenticated machine RPC surface', () => {
@@ -1208,6 +1218,34 @@ describe('ApiMachineClient socket reconnection', () => {
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
         expect(machine.metadata?.sealedSpawnEnv).toEqual(expected);
+
+        client.shutdown();
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree — the result signature is keyed
+    // from the machine key, so only a dataKey machine advertises worktree operations.
+    it.each([
+        { variant: 'dataKey' as const, expected: WORKTREE_OPS_CAPABILITY },
+        { variant: 'legacy' as const, expected: undefined },
+    ])('advertises worktree operations on a registered $variant machine only when it has a machine key', async ({ variant, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: variant };
+        machine.metadata = { ...machine.metadata!, worktreeOps: variant === 'legacy' ? WORKTREE_OPS_CAPABILITY : undefined };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
+        expect(machine.metadata?.worktreeOps).toEqual(expected);
 
         client.shutdown();
     });

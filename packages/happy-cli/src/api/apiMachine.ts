@@ -1,6 +1,7 @@
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
+import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 /**
  * WebSocket client for machine/daemon communication with Happy server
  * Similar to ApiSessionClient but for machine-scoped connections
@@ -114,7 +115,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -933,6 +934,12 @@ export class ApiMachineClient {
             createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot }),
             { customerBound: true },
         );
+        // aplus 4b-3 worktree: worktrees on a strict machine, run here from a server-issued ticket
+        // and signed for the server. Customer lane only.
+        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir });
+        for (const [method, handler] of Object.entries(worktreeOps)) {
+            this.rpcHandlerManager.registerHandler(method, handler, { customerBound: true });
+        }
         // Registered, not exempted: on a managed runtime the manager's own
         // dispatch allowlist still refuses this method, which is the intended
         // answer there rather than something to work around.
@@ -4075,6 +4082,12 @@ export class ApiMachineClient {
                 : SEALED_SPAWN_ENV_CAPABILITY;
             const sealedSpawnEnvStale = JSON.stringify(this.machine.metadata?.sealedSpawnEnv)
                 !== JSON.stringify(advertisedSealedSpawnEnv);
+            // aplus 4b-3 worktree: results are signed with a key from the machine key, likewise dataKey only.
+            const advertisedWorktreeOps = this.managedHandlers || this.machine.encryptionVariant !== 'dataKey'
+                ? undefined
+                : WORKTREE_OPS_CAPABILITY;
+            const worktreeOpsStale = JSON.stringify(this.machine.metadata?.worktreeOps)
+                !== JSON.stringify(advertisedWorktreeOps);
 
             this.syncResumeSessionRpcRegistration();
 
@@ -4085,7 +4098,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4118,6 +4131,7 @@ export class ApiMachineClient {
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
+                    worktreeOps: advertisedWorktreeOps,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {
