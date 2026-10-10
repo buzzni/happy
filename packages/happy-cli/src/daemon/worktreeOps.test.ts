@@ -376,10 +376,14 @@ describe('worktree:apply', () => {
         expect(readFileSync(join(repo, 'unsaved.txt'), 'utf8')).toBe('u');
     });
 
-    it('applies nothing when the default version moved to another branch', async () => {
+    it('applies nothing, and saves nothing, when the default version moved to another branch', async () => {
         const path = await worktree();
         git(repo, 'switch', '--quiet', '-c', 'other');
+        write(repo, 'wip.txt', 'w');
+        const head = git(repo, 'rev-parse', 'HEAD');
         expect(await call('apply', apply(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_BASE_BRANCH_MISMATCH', currentBranch: 'other' });
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(git(repo, 'status', '--porcelain')).toBe('?? wip.txt');
     });
 
     it('leaves both sides as they were on a conflict', async () => {
@@ -418,6 +422,18 @@ describe('worktree:update', () => {
         expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('mine\n');
         expect((await call('update', update(path, { conflictChoice: 'base' }))).success).toBe(true);
         expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('base\n');
+    });
+
+    it('saves nothing in the default version when it moved to another branch', async () => {
+        const path = await worktree();
+        git(repo, 'switch', '--quiet', '-c', 'other');
+        write(repo, 'wip.txt', 'w');
+        const head = git(repo, 'rev-parse', 'HEAD');
+        expect(await call('update', update(path))).toMatchObject({
+            success: false, errorCode: 'WORKTREE_BASE_BRANCH_MISMATCH', baseBranch: 'main', currentBranch: 'other',
+        });
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(git(repo, 'status', '--porcelain')).toBe('?? wip.txt');
     });
 
     it('refuses when the worktree is on another branch', async () => {

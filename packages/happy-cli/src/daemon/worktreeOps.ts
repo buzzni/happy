@@ -623,10 +623,12 @@ async function applyWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 'a
     const params: WorktreeOpParams<'apply'> = ticket.params;
     const target = await registeredTarget(guard, params.worktreePath, ticket.projectId);
     return serialized(target.repoRoot, async () => {
-        const saved = await snapshotCurrent(target.repoRoot);
-        if (params.baseBranch && saved.branch !== params.baseBranch) {
-            throw new OpFailure('WORKTREE_BASE_BRANCH_MISMATCH', `이 작업 트리는 ${params.baseBranch} 브랜치에서 시작되었습니다.`, { currentBranch: saved.branch });
+        // Checked before the snapshot: a refusal must leave the default version untouched.
+        const current = await currentBranch(target.repoRoot);
+        if (params.baseBranch && current !== params.baseBranch) {
+            throw new OpFailure('WORKTREE_BASE_BRANCH_MISMATCH', `이 작업 트리는 ${params.baseBranch} 브랜치에서 시작되었습니다.`, { currentBranch: current });
         }
+        const saved = await snapshotCurrent(target.repoRoot);
         await checkpoint(target.path, 'A+ Studio: 별도 작업 버전 저장');
         const merged = await runGit(target.repoRoot, [...STUDIO_AUTHOR, 'merge', '--no-ff', '--no-edit', params.branch]);
         if (merged.code !== 0) {
@@ -642,13 +644,15 @@ async function updateWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     const params: WorktreeOpParams<'update'> = ticket.params;
     const target = await registeredTarget(guard, params.worktreePath, ticket.projectId);
     return serialized(target.repoRoot, async () => {
-        const saved = await snapshotCurrent(target.repoRoot);
-        if (saved.branch !== params.baseBranch) {
+        // Both branches are checked before anything is saved: a refusal leaves both sides untouched.
+        const current = await currentBranch(target.repoRoot);
+        if (current !== params.baseBranch) {
             throw new OpFailure('WORKTREE_BASE_BRANCH_MISMATCH', `이 작업 트리는 ${params.baseBranch} 브랜치에서 시작되었습니다.`, {
-                baseBranch: params.baseBranch, currentBranch: saved.branch,
+                baseBranch: params.baseBranch, currentBranch: current,
             });
         }
         await requireBranch(target.path, params.branch);
+        await snapshotCurrent(target.repoRoot);
         await checkpoint(target.path, 'A+ Studio: 최신 내용 반영 전 저장');
         let merged = await runGit(target.path, [...STUDIO_AUTHOR, 'merge', '--no-edit', params.baseBranch]);
         if (merged.code !== 0 && params.conflictChoice) {
