@@ -226,7 +226,7 @@ function ownsWorktreeName(parts: string[], projectId: string): boolean {
     return parts.length === 3 && sanitized(parts[2]!);
 }
 
-type WorktreeTarget = { repoRoot: string; path: string; exists: boolean };
+type WorktreeTarget = { repoRoot: string; path: string; registered: boolean };
 
 /** The worktrees git has registered for this repository, by real '/'-separated path. */
 async function registeredWorktrees(repoRoot: string): Promise<Set<string>> {
@@ -253,12 +253,12 @@ async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: 
             // A dangling link is not a missing worktree.
             const linked = await lstat(path).then(() => true, () => false);
             if (linked) throw denied;
-            return { repoRoot, path, exists: false };
+            return { repoRoot, path, registered: false };
         }
         throw denied;
     }
     if (!inside(repoRoot, real) || !ownsWorktreeName(relative(repoRoot, real).split(sep), projectId)) throw denied;
-    return { repoRoot, path: real, exists: (await registeredWorktrees(repoRoot)).has(slashed(real)) };
+    return { repoRoot, path: real, registered: (await registeredWorktrees(repoRoot)).has(slashed(real)) };
 }
 
 // ── Serialization ──────────────────────────────────────────────────────────────────────────────
@@ -325,14 +325,19 @@ async function excludeLines(repo: string, lines: string[]): Promise<void> {
     await appendFile(file, `${separator}${missing.join('\n')}\n`);
 }
 
+/** Stages everything but private env files, keeping managed worktrees and `.next` out (the server's hygiene). */
+async function stageNonPrivate(dir: string, errorCode: string): Promise<void> {
+    await excludeLines(dir, ['/.aplus/worktrees/', '.next/']);
+    await runGit(dir, ['rm', '-r', '-f', '--cached', '--ignore-unmatch', '--', ':(glob)**/.next/**']);
+    await gitOk(dir, ['add', '-A'], errorCode);
+    await runGit(dir, ['reset', '--quiet', '--', ...PRIVATE_ENV_PATHS]);
+}
+
 /** The server's snapshot: everything but private env files, committed so the new worktree starts from it. */
 async function snapshotCurrent(dir: string): Promise<{ revision: string; branch: string | null }> {
     const repo = await repositoryRoot(dir);
     if (!repo) throw new OpFailure('WORKTREE_SNAPSHOT_FAILED', 'git repository root not found');
-    await excludeLines(repo, ['/.aplus/worktrees/', '.next/']);
-    await runGit(dir, ['rm', '-r', '-f', '--cached', '--ignore-unmatch', '--', ':(glob)**/.next/**']);
-    await gitOk(dir, ['add', '-A'], 'WORKTREE_SNAPSHOT_FAILED');
-    await runGit(dir, ['reset', '--quiet', '--', ...PRIVATE_ENV_PATHS]);
+    await stageNonPrivate(dir, 'WORKTREE_SNAPSHOT_FAILED');
     const unchanged = (await runGit(dir, ['diff', '--cached', '--quiet'])).code === 0;
     const hasHead = (await runGit(dir, ['rev-parse', '--verify', 'HEAD'])).code === 0;
     if (!unchanged || !hasHead) {
@@ -464,7 +469,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
 async function worktreeStatus(guard: PathGuard, ticket: WorktreeTicket & { op: 'status' }): Promise<WorktreeOpResult<'status'>> {
     const params: WorktreeOpParams<'status'> = ticket.params;
     const target = await resolveWorktreeTarget(guard, params.worktreePath, ticket.projectId);
-    if (!target.exists) throw new OpFailure('WORKTREE_PATH_MISSING', '작업 환경 경로를 찾을 수 없습니다.');
+    if (!target.registered) throw new OpFailure('WORKTREE_PATH_MISSING', '작업 환경 경로를 찾을 수 없습니다.');
     const status = await gitOk(target.path, ['status', '--porcelain'], 'WORKTREE_STATUS_FAILED', { readOnly: true });
     const counts = (await gitOk(target.path, ['rev-list', '--left-right', '--count', `${params.baseBranch ?? 'HEAD'}...${params.branch}`], 'WORKTREE_STATUS_FAILED', { readOnly: true }))
         .trim().split(/\s+/).map((value) => Number.parseInt(value, 10));
@@ -475,7 +480,7 @@ async function worktreeStatus(guard: PathGuard, ticket: WorktreeTicket & { op: '
 async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 'remove' }): Promise<WorktreeOpResult<'remove'>> {
     const params: WorktreeOpParams<'remove'> = ticket.params;
     const target = await resolveWorktreeTarget(guard, params.worktreePath, ticket.projectId);
-    if (!target.exists) return { outcome: 'missing' };
+    if (!target.registered) return { outcome: 'missing' };
     return serialized(target.repoRoot, async () => {
         // Checked before anything is stopped or removed: a refusal leaves everything as it was.
         const status = await runGit(target.path, ['status', '--porcelain'], { readOnly: true });
