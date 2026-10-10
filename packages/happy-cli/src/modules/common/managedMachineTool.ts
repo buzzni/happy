@@ -198,10 +198,20 @@ async function installVersion(tool: ManagedMachineTool, artifact: ManagedMachine
  * omits `executablePath`.
  */
 async function refreshStableLink(tool: ManagedMachineTool, root: string, executable: string): Promise<void> {
+    const toolDirectory = join(root, tool.id);
     const bin = join(root, tool.id, 'bin');
     const link = stableExecutablePath(tool, root);
     const staging = join(bin, `.${tool.executable}.${randomBytes(6).toString('hex')}.link`);
     try {
+        const [rootInfo, toolDirectoryInfo] = await Promise.all([lstat(root), lstat(toolDirectory)]);
+        if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || !toolDirectoryInfo.isDirectory() || toolDirectoryInfo.isSymbolicLink()) {
+            fail('managed tool path is not a real directory');
+        }
+        const [resolvedRoot, resolvedToolDirectory] = await Promise.all([realpath(root), realpath(toolDirectory)]);
+        const relativeToolDirectory = relative(resolvedRoot, resolvedToolDirectory);
+        if (relativeToolDirectory.startsWith('..') || posix.isAbsolute(relativeToolDirectory)) {
+            fail('managed tool path escapes its root');
+        }
         await mkdir(bin, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
         const binInfo = await lstat(bin);
         if (!binInfo.isDirectory() || binInfo.isSymbolicLink() || (process.getuid && binInfo.uid !== process.getuid())) fail('bin is not a directory owned by this user');
