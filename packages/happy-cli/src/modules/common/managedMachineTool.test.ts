@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as tar from 'tar';
@@ -195,6 +195,24 @@ describe('managed machine tool stable executable link', () => {
         await symlink(elsewhere, join(dirRoot, 'buzzni.fake', 'bin'));
         await expect(installManagedMachineTool(tool(bytes), { root: dirRoot, platform: 'darwin-arm64', fetch: serve(bytes) })).resolves.toMatchObject({ installed: true });
         expect(await readdir(elsewhere)).toEqual([]);
+    });
+
+    it('does not refresh the stable link through a replaced tool directory symlink', async () => {
+        const root = await temporary('managed-tool-root-');
+        const bytes = await goodArchive();
+        const definition = tool(bytes);
+        await installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch: serve(bytes) });
+
+        const toolDirectory = join(root, 'buzzni.fake');
+        const outside = await temporary('managed-tool-outside-');
+        const outsideToolDirectory = join(outside, 'buzzni.fake');
+        await rename(toolDirectory, outsideToolDirectory);
+        await rm(join(outsideToolDirectory, 'bin'), { recursive: true, force: true });
+        await symlink(outsideToolDirectory, toolDirectory);
+
+        await expect(installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch: serve(bytes) }))
+            .resolves.toMatchObject({ installed: true });
+        await expect(lstat(join(outsideToolDirectory, 'bin'))).rejects.toThrow();
     });
 
     it('reports the stable path, version and pinned digest only for a verified install', async () => {
