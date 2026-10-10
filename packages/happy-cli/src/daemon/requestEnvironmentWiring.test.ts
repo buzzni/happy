@@ -28,7 +28,10 @@ describe('request environment wiring', () => {
 
   it('remembers what clients send through every machine RPC and control server start', async () => {
     const source = await runSource()
-    expect(source).toContain('spawnSession: requestEnvironments.rememberSpawn(spawnSession),\n      resumeSession: requestEnvironments.rememberResume(resumeSession),\n      recoverSession: requestEnvironments.rememberResume(recoverSession),')
+    expect(source).toContain('spawnSession: requestEnvironments.rememberSpawn(spawnSession),')
+    expect(source).toContain('resumeSession: requestEnvironments.rememberResume(')
+    expect(source).toContain('recoverSession: requestEnvironments.rememberResume(')
+    expect(source).toContain('!resumeInFlight.has(sessionId)')
     expect(source.match(/spawnSession: requestEnvironments\.rememberSpawn\(spawnSession\),/g)).toHaveLength(2)
   })
 })

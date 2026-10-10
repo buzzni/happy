@@ -32,10 +32,14 @@ export function createRequestEnvironmentMemory(limit = 500) {
       }
     },
     /** Resume and recovery: a new-session recovery answers with the id the conversation continues under. */
-    rememberResume<O extends WithEnvironment | undefined, R extends Started>(resume: (sessionId: string, options: O) => Promise<R>) {
+    rememberResume<O extends WithEnvironment | undefined, R extends Started>(
+      resume: (sessionId: string, options: O) => Promise<R>,
+      shouldRemember: (sessionId: string, options: O) => boolean = () => true,
+    ) {
       return async (sessionId: string, options: O): Promise<R> => {
+        const rememberThis = shouldRemember(sessionId, options)
         const result = await resume(sessionId, options)
-        remember(startedId(result) ?? undefined, options?.environmentVariables)
+        if (rememberThis) remember(startedId(result) ?? undefined, options?.environmentVariables)
         return result
       }
     },

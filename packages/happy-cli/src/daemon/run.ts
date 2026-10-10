@@ -4756,8 +4756,15 @@ export async function startDaemon(): Promise<void> {
       difficultyRouting: difficultyRoutingHost,
       ...(channelHost ? { channelHostCall: channelHost.call } : {}),
       spawnSession: requestEnvironments.rememberSpawn(spawnSession),
-      resumeSession: requestEnvironments.rememberResume(resumeSession),
-      recoverSession: requestEnvironments.rememberResume(recoverSession),
+      resumeSession: requestEnvironments.rememberResume(
+        resumeSession,
+        sessionId => !resumeInFlight.has(sessionId)
+          && !hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
+      ),
+      recoverSession: requestEnvironments.rememberResume(
+        recoverSession,
+        sessionId => !recoveryInFlight.has(sessionId),
+      ),
       stopSession,
       stopSessionWithExitVerification,
       requestShutdown: () => {
