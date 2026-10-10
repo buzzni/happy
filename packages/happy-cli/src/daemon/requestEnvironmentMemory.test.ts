@@ -47,4 +47,27 @@ describe('createRequestEnvironmentMemory', () => {
     expect(memory.recall('a')).toEqual({ K: 'a2' })
     expect(memory.recall('c')).toEqual({ K: 'c' })
   })
+
+  it('does not remember a concurrent caller environment when the operation is shared', async () => {
+    const memory = createRequestEnvironmentMemory()
+    const inflight = new Map<string, Promise<{ type: 'success'; sessionId: string }>>()
+    let release!: () => void
+    const resume = memory.rememberResume(async (sessionId, options) => {
+      const existing = inflight.get(sessionId)
+      if (existing) return existing
+      const shared = new Promise<{ type: 'success'; sessionId: string }>(resolve => {
+        release = () => resolve({ type: 'success', sessionId })
+      })
+      inflight.set(sessionId, shared)
+      void shared.finally(() => inflight.delete(sessionId))
+      return shared
+    }, sessionId => !inflight.has(sessionId))
+
+    const first = resume('session-1', { environmentVariables: { ORG: 'A' } })
+    const second = resume('session-1', { environmentVariables: { ORG: 'B' } })
+    release()
+    await Promise.all([first, second])
+
+    expect(memory.recall('session-1')).toEqual({ ORG: 'A' })
+  })
 })
