@@ -1,7 +1,8 @@
-import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { join, posix } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { join, posix, relative } from 'node:path';
 import * as tar from 'tar';
+import { logger } from '@/ui/logger';
 
 /**
  * Host-owned tools a machine.run profile may execute. The daemon downloads a
@@ -36,6 +37,16 @@ export interface ManagedMachineToolStatus {
     platform: ManagedMachineToolPlatform | null;
     supported: boolean;
     installed: boolean;
+    /**
+     * Stable user-facing link `<root>/<toolId>/bin/<executable>`, present only
+     * while it resolves to the verified executable. machine.run never executes
+     * through it; runs resolve and re-hash the versioned file.
+     */
+    executablePath?: string;
+    /** Present only for a verified install. */
+    resolvedVersion?: string;
+    /** Pinned digest of the verified executable; present only for a verified install. */
+    executableSha256?: string;
 }
 
 export type ManagedMachineToolFetch = (url: string, init: { redirect: 'follow' }) => Promise<Pick<Response, 'ok' | 'status' | 'url' | 'headers' | 'arrayBuffer'>>;
@@ -70,6 +81,10 @@ function versionDirectory(tool: ManagedMachineTool, root: string): string {
     return join(root, tool.id, tool.version);
 }
 
+function stableExecutablePath(tool: ManagedMachineTool, root: string): string {
+    return join(root, tool.id, 'bin', tool.executable);
+}
+
 function assertReleaseUrl(raw: string, initial: boolean): void {
     let url: URL;
     try { url = new URL(raw); } catch { fail('MANAGED_TOOL_UNSAFE_URL'); }
@@ -90,8 +105,18 @@ async function verifiedExecutable(tool: ManagedMachineTool, root: string, platfo
 }
 
 export async function managedMachineToolStatus(tool: ManagedMachineTool, root: string, platform: ManagedMachineToolPlatform | null): Promise<ManagedMachineToolStatus> {
-    const supported = Boolean(platform && tool.artifacts[platform]);
-    return { toolId: tool.id, version: tool.version, platform, supported, installed: supported && Boolean(await verifiedExecutable(tool, root, platform)) };
+    const artifact = platform ? tool.artifacts[platform] : undefined;
+    const executable = artifact ? await verifiedExecutable(tool, root, platform) : null;
+    const status = { toolId: tool.id, version: tool.version, platform, supported: Boolean(artifact), installed: Boolean(executable) };
+    if (!artifact || !executable) return status;
+    const link = stableExecutablePath(tool, root);
+    const [linkTarget, executableTarget] = await Promise.all([realpath(link).catch(() => null), realpath(executable).catch(() => null)]);
+    return {
+        ...status,
+        ...(linkTarget && linkTarget === executableTarget ? { executablePath: link } : {}),
+        resolvedVersion: tool.version,
+        executableSha256: artifact.executableSha256,
+    };
 }
 
 export async function resolveManagedMachineToolExecutable(tool: ManagedMachineTool, root: string, platform: ManagedMachineToolPlatform | null): Promise<string> {
@@ -159,12 +184,44 @@ async function installVersion(tool: ManagedMachineTool, artifact: ManagedMachine
     }
 }
 
+/**
+ * Point `<root>/<toolId>/bin/<executable>` at a verified versioned executable
+ * so users and agents get one path that survives upgrades. It is a convenience
+ * only: the daemon never runs a tool through it.
+ *
+ * The link is swapped in with a same-directory rename, so readers see the old
+ * or the new target, never a missing one. A `bin` that is not our own real
+ * directory, or a link path held by anything but a symlink, is left untouched
+ * and the install still succeeds: the verified tool already works for
+ * machine.run, while overwriting a user's file or writing through a redirected
+ * directory would not be recoverable. The skip is logged, and the status then
+ * omits `executablePath`.
+ */
+async function refreshStableLink(tool: ManagedMachineTool, root: string, executable: string): Promise<void> {
+    const bin = join(root, tool.id, 'bin');
+    const link = stableExecutablePath(tool, root);
+    const staging = join(bin, `.${tool.executable}.${randomBytes(6).toString('hex')}.link`);
+    try {
+        await mkdir(bin, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
+        const binInfo = await lstat(bin);
+        if (!binInfo.isDirectory() || binInfo.isSymbolicLink() || (process.getuid && binInfo.uid !== process.getuid())) fail('bin is not a directory owned by this user');
+        const existing = await lstat(link).catch(() => null);
+        if (existing && !existing.isSymbolicLink()) fail('link path is occupied by a non-symlink');
+        await symlink(relative(bin, executable), staging);
+        await rename(staging, link);
+    } catch (error) {
+        await rm(staging, { force: true });
+        logger.debug(`[managed-tool] skipped stable link for ${tool.id}@${tool.version}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
 async function install(tool: ManagedMachineTool, options: ManagedMachineToolInstallOptions): Promise<ManagedMachineToolStatus> {
     const artifact = options.platform ? tool.artifacts[options.platform] : undefined;
     if (!artifact) fail('MANAGED_TOOL_UNSUPPORTED_PLATFORM');
-    const current = await managedMachineToolStatus(tool, options.root, options.platform);
-    if (current.installed) return current;
-    await installVersion(tool, artifact, options);
+    if (!await verifiedExecutable(tool, options.root, options.platform)) await installVersion(tool, artifact, options);
+    // Only an executable that just passed the digest check is linked.
+    const executable = await verifiedExecutable(tool, options.root, options.platform);
+    if (executable) await refreshStableLink(tool, options.root, executable);
     return await managedMachineToolStatus(tool, options.root, options.platform);
 }
 

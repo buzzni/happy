@@ -354,6 +354,58 @@ describe('profile-aware machine.run adapter', () => {
         }
     });
 
+    it('advertises the stable link for an installed tool but executes only the re-verified versioned binary', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const script = '#!/bin/sh\necho managed\n';
+            const source = join(root, 'src');
+            await mkdir(join(source, 'fake-tool-v1'), { recursive: true });
+            await writeFile(join(source, 'fake-tool-v1', 'fake-tool'), script, { mode: 0o755 });
+            await tar.c({ gzip: true, file: join(root, 'a.tar.gz'), cwd: source, portable: true }, ['fake-tool-v1']);
+            const bytes = await readFile(join(root, 'a.tar.gz'));
+            const artifact = {
+                url: 'https://github.com/buzzni/fake/releases/download/v1/fake-tool-v1.tar.gz',
+                sha256: createHash('sha256').update(bytes).digest('hex'),
+                archiveRoot: 'fake-tool-v1',
+                executableSha256: createHash('sha256').update(script).digest('hex'),
+            };
+            const fakeTool = { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: { 'darwin-arm64': artifact, 'linux-x64': artifact } };
+            const toolsRoot = join(root, 'tools');
+            const stablePath = join(toolsRoot, 'buzzni.fake', 'bin', 'fake-tool');
+            const versionedPath = join(toolsRoot, 'buzzni.fake', '1.0.0', 'fake-tool');
+            const resolver = createTrustedMachineRunProfileResolver([profile({ id: 'buzzni.fake.run', executable: 'fake-tool', argv: ['x'], parameters: {} })]);
+            let wrapper = '';
+            const handler = createProfileAwareMachineRunHandler(root, resolver, {
+                platform: 'darwin',
+                tempDirectory: root,
+                environment: { PATH: '/usr/bin:/bin' },
+                managedTools: { root: toolsRoot, tools: [fakeTool], platform: 'darwin-arm64' },
+                typedHandler: vi.fn(async (request: TypedMachineRunRequest, trusted): Promise<TypedMachineRunResponse> => {
+                    if (request.action !== 'start' || !trusted?.env.PATH) throw new Error('unexpected request');
+                    wrapper = await readFile(join(trusted.env.PATH, 'fake-tool'), 'utf8');
+                    return { version: 1, action: 'start', operationId: 'op-1', state: 'accepted' };
+                }),
+            });
+            const before = await handler({ action: 'capabilities' });
+            if (before.action !== 'capabilities') throw new Error('not capabilities');
+            for (const field of ['executablePath', 'resolvedVersion', 'executableSha256']) expect(before.tools[0]).not.toHaveProperty(field);
+
+            await installManagedMachineTool(fakeTool, {
+                root: toolsRoot, platform: 'darwin-arm64',
+                fetch: async () => ({ ok: true, status: 200, url: artifact.url, headers: new Headers(), arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer }),
+            });
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({
+                tools: [{ toolId: 'buzzni.fake', version: '1.0.0', supported: true, installed: true, executablePath: stablePath, resolvedVersion: '1.0.0', executableSha256: artifact.executableSha256 }],
+            });
+
+            await handler({ action: 'start', profileId: 'buzzni.fake.run', profileDigest: resolver.list()[0].profileDigest, workspaceRoot: root, parameters: {} });
+            expect(wrapper).toContain(`exec '${versionedPath}'`);
+            expect(wrapper).not.toContain(stablePath);
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
     it('does not advertise a managed-tool profile on a platform without a pinned artifact', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
