@@ -23,9 +23,14 @@ export async function recoverManagedScriptContainers(input: Owner) {
   }
 }
 
+/** The cheap part of the preflight: a reachable Linux engine. Also used to notice a lost engine while ready. */
+export async function probeManagedScriptEngine() {
+  if ((await docker(['info', '--format', '{{.OSType}}'])).stdout.trim() !== 'linux') throw new Error('SCRIPT_LINUX_RUNTIME_REQUIRED');
+}
+
 export async function prepareManagedScriptRuntime(input: Owner & { image: string }) {
   if (!/^(?:sha256:|[\w./:-]+@sha256:)[a-f0-9]{64}$/.test(input.image)) throw new Error('IMMUTABLE_IMAGE_REQUIRED');
-  if ((await docker(['info', '--format', '{{.OSType}}'])).stdout.trim() !== 'linux') throw new Error('SCRIPT_LINUX_RUNTIME_REQUIRED');
+  await probeManagedScriptEngine();
   await recoverManagedScriptContainers(input);
   const source = `import fs from 'node:fs';
 const [major,minor]=process.versions.node.split('.').map(Number);

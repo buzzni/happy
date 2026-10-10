@@ -1468,6 +1468,70 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // Desktop explains why script automations are unavailable from this field; without it a
+    // machine that stayed on protocol 4 only shows up as SCRIPT_RUNNER_UNSUPPORTED.
+    it.each([
+        { readiness: { state: 'unavailable' as const, code: 'DOCKER_UNAVAILABLE' as const, checkedAt: 1_700_000_000_000 } },
+        { readiness: { state: 'ready' as const, checkedAt: 1_700_000_000_000, imageSource: 'release' as const, imageFingerprint: 'd32cdf619f63' } },
+        { readiness: undefined },
+    ])('publishes script runtime readiness with server-backed automations (%#)', async ({ readiness }) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        if (readiness) client.updateScriptRuntime(readiness, 4);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
+        expect(machine.metadata?.automationSupport?.scriptRuntime).toEqual(readiness);
+        client.shutdown();
+    });
+
+    // Docker can come up after the daemon (or go away): the protocol follows the runtime, and the server
+    // learns it by re-registering the same key with the new protocol (targetChanged, no key bump).
+    it('re-registers the same key with the new protocol when the script runtime changes after connect', async () => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.updateScriptRuntime({ state: 'unavailable', code: 'DOCKER_UNAVAILABLE', checkedAt: 1 }, 4);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.connect();
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.scriptRuntime?.code).toBe('DOCKER_UNAVAILABLE'));
+        expect(machine.metadata?.automationSupport?.protocolVersion).toBe(4);
+
+        mockSocket.emitWithAck.mockClear();
+        mockSocket.connected = true;
+        client.updateScriptRuntime({ state: 'ready', checkedAt: 2 }, 5);
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.protocolVersion).toBe(5));
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.objectContaining({ protocolVersion: 5 }));
+        expect(machine.metadata?.automationSupport?.scriptRuntime).toEqual({ state: 'ready', checkedAt: 2 });
+        client.shutdown();
+    });
+
     // aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — a client seals for this
     // daemon with a sender only when it says so, and only to the automation key it publishes.
     it.each([

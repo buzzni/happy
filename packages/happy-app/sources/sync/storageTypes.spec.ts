@@ -77,6 +77,20 @@ describe('MachineMetadataSchema', () => {
 
         expect(metadata.automationSupport?.hostCommands).toBe(false);
     });
+
+    it('keeps the script runtime readiness, including a code this client does not know', () => {
+        const scriptRuntime = { state: 'unavailable', code: 'SOME_FUTURE_CODE', checkedAt: 1_700_000_000_000, imageSource: 'release', imageFingerprint: 'd32cdf619f63' };
+        const metadata = MachineMetadataSchema.parse({
+            host: 'mac-host',
+            platform: 'darwin',
+            happyCliVersion: '1.2.3',
+            happyHomeDir: '/Users/u/.happy',
+            homeDir: '/Users/u',
+            automationSupport: { rpcAvailable: true, serverBacked: true, keyVersion: 1, protocolVersion: 4, scriptRuntime },
+        });
+
+        expect(metadata.automationSupport?.scriptRuntime).toEqual(scriptRuntime);
+    });
 });
 
 describe('AgentGoalStatusSchema', () => {

@@ -221,6 +221,7 @@ import {
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
 import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
+import { scriptRuntimeReadinessKey, type ScriptRuntimeReadiness } from '@/daemon/automations/scriptRuntimeReadiness';
 import { LESSON_HOST_RPC_METHOD } from '@/memory/lessonHostRuntime';
 import type { LessonHostSupervisor } from '@/memory/lessonHostSupervisor';
 import type { ServerAutomationCache } from '@/daemon/automations/serverAutomationCache';
@@ -736,6 +737,8 @@ export class ApiMachineClient {
     /** Set once the daemon can resolve projects to workspaces. */
     private lessonHosts: LessonHostSupervisor | null = null;
     private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    private scriptRuntimeReadiness: ScriptRuntimeReadiness | null = null;
+    private lastKnownScriptRuntimeKey: string | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -2344,6 +2347,27 @@ export class ApiMachineClient {
         if (previous && previous !== hosts) await previous.close();
     }
 
+    /**
+     * Published under automationSupport.scriptRuntime. Before the socket is up this only records the
+     * values; afterwards a change re-registers the same automation key with the new protocol (the
+     * server updates the target without bumping the key) and republishes the metadata.
+     */
+    updateScriptRuntime(readiness: ScriptRuntimeReadiness, protocolVersion: number): void {
+        const changed = this.automationProtocolVersion !== protocolVersion
+            || (this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null) !== scriptRuntimeReadinessKey(readiness);
+        this.scriptRuntimeReadiness = readiness;
+        this.automationProtocolVersion = protocolVersion;
+        if (changed && this.automationKey && this.socket?.connected) {
+            void this.registerAutomationKey().catch((error) => {
+                logger.debug(`[API MACHINE] Failed to republish script runtime: ${error}`);
+            });
+        }
+    }
+
+    private scriptRuntimeField(): { scriptRuntime?: ScriptRuntimeReadiness } {
+        return this.scriptRuntimeReadiness ? { scriptRuntime: this.scriptRuntimeReadiness } : {};
+    }
+
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
         this.automationProtocolVersion = protocolVersion;
@@ -3202,6 +3226,7 @@ export class ApiMachineClient {
                 protocolVersion: this.automationProtocolVersion,
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
+                ...this.scriptRuntimeField(),
             },
         }));
     }
@@ -4016,7 +4041,9 @@ export class ApiMachineClient {
                 || prevResume.rpcAvailable !== newResumeSupport.rpcAvailable
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
-            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
+            const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
+            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
+                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4063,6 +4090,7 @@ export class ApiMachineClient {
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
+                this.lastKnownScriptRuntimeKey = scriptRuntimeKey;
                 this.lastKnownAutonomousQualityGateRpcAvailable = this.autonomousQualityGateRpcAvailable;
                 this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
                 const inFlight = { startedAt: Date.now() };
@@ -4078,6 +4106,7 @@ export class ApiMachineClient {
                         protocolVersion: this.automationProtocolVersion,
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
+                        ...this.scriptRuntimeField(),
                     },
                     autonomousQualityGateSupport: {
                         apiVersion: 1,

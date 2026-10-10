@@ -168,6 +168,15 @@ export const MachineMetadataSchema = z.object({
     hostCommands: z.boolean().optional(),
     /** aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — seal with this sender, to this key. */
     authenticatedEnvelopes: authenticatedEnvelopesCapabilitySchema.optional(),
+    /** Why this machine does or does not run script automations. Enums and a short fingerprint only (specs/script-runtime-readiness). */
+    scriptRuntime: z.object({
+      state: z.enum(['ready', 'unavailable', 'disabled']),
+      // Plain string so a newer daemon's code never makes an older client drop the whole field.
+      code: z.string().max(40).optional(),
+      checkedAt: z.number(),
+      imageSource: z.enum(['env', 'release']).optional(),
+      imageFingerprint: z.string().regex(/^[a-f0-9]{12}$/).optional(),
+    }).optional(),
   }).optional(),
   /**
    * External messenger channel support (Saycode specs/desktop-messenger-channels).
