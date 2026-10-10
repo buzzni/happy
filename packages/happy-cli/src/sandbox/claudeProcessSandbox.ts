@@ -8,7 +8,7 @@ import { configuration } from '@/configuration';
 import { MandatorySandboxError } from './sandboxPolicy';
 import { checkSandboxPrerequisites, checkProxyReachable, SANDBOX_LAUNCHER } from './sandboxPreflight';
 
-const CLAUDE_ENV = new Set(['LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_ENTRYPOINT', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS', 'SAYCODE_MCP_SOCKET', 'SAYCODE_MCP_TOKEN']);
+const CLAUDE_ENV = new Set(['LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS', 'SAYCODE_MCP_SOCKET', 'SAYCODE_MCP_TOKEN']);
 export function filterClaudeProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return { ...Object.fromEntries(Object.entries(env).filter(([key, value]) => CLAUDE_ENV.has(key) && value !== undefined)),
         PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/home/agent-sbx', USER: 'agent-sbx', CLAUDE_CONFIG_DIR: '/home/agent-sbx/.claude', TMPDIR: '/tmp',

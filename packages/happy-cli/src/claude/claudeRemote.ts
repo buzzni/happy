@@ -505,6 +505,7 @@ async function runClaudeRemote(
         abort: opts.signal,
         settingsPath: processSandbox ? undefined : opts.hookSettingsPath,
         promptSuggestions: true,
+        emitSessionStateEvents: opts.exitAfterFirstTurn || undefined,
         // The outer UID and OS boundary already covers Bash and every other tool.
         sandbox: processSandbox ? { enabled: false } : providerSandbox,
         permissionsDeny: opts.permissionsDeny,
@@ -807,6 +808,15 @@ function readTurnText(content: unknown): string {
      */
     let heldResult: SDKMessage | null = null;
     let backgroundWaitExpiry: Promise<SDKMessage> | null = null;
+    /*
+     * The CLI's own turn-over signal, when it sends one. The task ids above
+     * cannot tell whether a report that lands mid-turn was answered in that
+     * turn or is still owed one of its own — both happen, and the stream is
+     * identical up to the result — so an idle CLI is what ends the run.
+     * `null` until the CLI reports a state: older CLIs never do, and the
+     * fixed sandbox launcher's env allowlist drops the flag that asks for it.
+     */
+    let providerIdle: boolean | null = null;
     let backgroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
     const aiAuthObservation = opts.onAiAuthObservationReady && opts.managedRun !== true
         ? observeClaudeQueryAuth(response)
@@ -879,6 +889,14 @@ function readTurnText(content: unknown): string {
                 continue;
             }
 
+            if (message.type === 'system' && message.subtype === 'session_state_changed') {
+                providerIdle = message.state === 'idle';
+                if (providerIdle && heldResult && backgroundWaitExpiry) {
+                    backgroundWaitExpiry = Promise.resolve(heldResult);
+                }
+                continue;
+            }
+
             // Handle messages. During /compact, Claude emits the generated
             // summary as a normal assistant text message before the result.
             // Mark it so downstream UI/protocol mapping can treat it as
@@ -948,10 +966,13 @@ function readTurnText(content: unknown): string {
             // Handle result messages
             if (message.type === 'result') {
                 finishTurnLatency('no-text');
-                if (opts.exitAfterFirstTurn && awaitedBackgroundTaskIds.size > 0 && !released) {
+                const awaitsProvider = providerIdle === null
+                    ? awaitedBackgroundTaskIds.size > 0
+                    : !providerIdle;
+                if (opts.exitAfterFirstTurn && awaitsProvider && !released) {
                     // The provider starts the next turn itself when that work
                     // reports back; the run ends at the result after it.
-                    logger.debug(`[claudeRemote] Run-once result deferred: ${awaitedBackgroundTaskIds.size} background task(s) still running`);
+                    logger.debug(`[claudeRemote] Run-once result deferred: ${awaitedBackgroundTaskIds.size} background task(s) still running, provider idle=${providerIdle}`);
                     heldResult = message;
                     backgroundWaitExpiry ??= new Promise((resolve) => {
                         backgroundWaitTimer = setTimeout(
@@ -961,7 +982,7 @@ function readTurnText(content: unknown): string {
                     });
                     continue;
                 }
-                if (released) {
+                if (released && !providerIdle) {
                     logger.debug(`[claudeRemote] Run-once background wait ran out with ${awaitedBackgroundTaskIds.size} task(s) still running`);
                 }
                 acceptsPromptSuggestion = true;
