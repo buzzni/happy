@@ -35,6 +35,7 @@ import {
     type AiAuthSource,
 } from '@/usage/aiAuthSource'
 import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
+import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
@@ -337,10 +338,16 @@ export function buildResumedSessionSpawnEnvironment(input: {
     // A session keeps its own policy; explicit updates still take precedence.
     const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
         ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
+    const runtime = expandEnvironmentVariables(
+        scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(input.runtime ?? {})),
+    )
+    const automation = expandEnvironmentVariables(
+        scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
+    )
     return buildSessionSpawnEnvironment({ ...input.inherited, [policyKey]: undefined }, {
         // runtime (the resume request) and automation environments are request-supplied too.
-        ...scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(input.runtime ?? {})),
-        ...scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
+        ...runtime,
+        ...automation,
         ...input.explicit,
         ...(input.agentEnvironment ?? {}),
         ...(policy !== undefined ? { [policyKey]: policy } : {}),

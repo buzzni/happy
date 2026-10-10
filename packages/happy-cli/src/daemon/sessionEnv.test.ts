@@ -761,6 +761,22 @@ describe('request-supplied environment cannot run code outside the agent sandbox
         expect(resumed).toEqual({ PATH: '/usr/bin', HOME: '/home/agent', PROJECT_TOKEN: 'runtime-token', AUTOMATION_FLAG: '1', APLUS_SESSION_ID: 'session-3' })
     })
 
+    it('expands daemon environment references in resumed request variables', () => {
+        const previous = process.env.Z_AI_AUTH_TOKEN
+        process.env.Z_AI_AUTH_TOKEN = 'resolved-token'
+        try {
+            expect(buildResumedSessionSpawnEnvironment({
+                inherited: {},
+                explicit: {},
+                runtime: { ANTHROPIC_AUTH_TOKEN: '${Z_AI_AUTH_TOKEN}' },
+                sessionId: 'session-4',
+            })).toMatchObject({ ANTHROPIC_AUTH_TOKEN: 'resolved-token' })
+        } finally {
+            if (previous === undefined) delete process.env.Z_AI_AUTH_TOKEN
+            else process.env.Z_AI_AUTH_TOKEN = previous
+        }
+    })
+
     it('admits the PoC browser-task variables only when the daemon itself opted in (isolated PoC daemon)', () => {
         const poc = { HAPPY_BROWSER_TASK_RUNTIME_URL: 'http://127.0.0.1:18787', HAPPY_BROWSER_TASK_GRANT_FILE: '/home/u/grants/a.token' }
         expect(buildSpawnRequestEnvironment({}, poc)).toEqual({})
