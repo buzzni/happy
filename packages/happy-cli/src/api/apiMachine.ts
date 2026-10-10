@@ -221,6 +221,7 @@ import {
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
 import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
+import { scriptRuntimeReadinessKey, type ScriptRuntimeReadiness } from '@/daemon/automations/scriptRuntimeReadiness';
 import { LESSON_HOST_RPC_METHOD } from '@/memory/lessonHostRuntime';
 import type { LessonHostSupervisor } from '@/memory/lessonHostSupervisor';
 import type { ServerAutomationCache } from '@/daemon/automations/serverAutomationCache';
@@ -736,6 +737,8 @@ export class ApiMachineClient {
     /** Set once the daemon can resolve projects to workspaces. */
     private lessonHosts: LessonHostSupervisor | null = null;
     private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    private scriptRuntimeReadiness: ScriptRuntimeReadiness | null = null;
+    private lastKnownScriptRuntimeKey: string | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -2344,6 +2347,15 @@ export class ApiMachineClient {
         if (previous && previous !== hosts) await previous.close();
     }
 
+    /** Published under automationSupport.scriptRuntime; republished by the periodic metadata check only when it changes. */
+    setScriptRuntimeReadiness(readiness: ScriptRuntimeReadiness): void {
+        this.scriptRuntimeReadiness = readiness;
+    }
+
+    private scriptRuntimeField(): { scriptRuntime?: ScriptRuntimeReadiness } {
+        return this.scriptRuntimeReadiness ? { scriptRuntime: this.scriptRuntimeReadiness } : {};
+    }
+
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
         this.automationProtocolVersion = protocolVersion;
@@ -3202,6 +3214,7 @@ export class ApiMachineClient {
                 protocolVersion: this.automationProtocolVersion,
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
+                ...this.scriptRuntimeField(),
             },
         }));
     }
@@ -4016,7 +4029,9 @@ export class ApiMachineClient {
                 || prevResume.rpcAvailable !== newResumeSupport.rpcAvailable
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
-            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
+            const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
+            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
+                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4063,6 +4078,7 @@ export class ApiMachineClient {
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
+                this.lastKnownScriptRuntimeKey = scriptRuntimeKey;
                 this.lastKnownAutonomousQualityGateRpcAvailable = this.autonomousQualityGateRpcAvailable;
                 this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
                 const inFlight = { startedAt: Date.now() };
@@ -4078,6 +4094,7 @@ export class ApiMachineClient {
                         protocolVersion: this.automationProtocolVersion,
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
+                        ...this.scriptRuntimeField(),
                     },
                     autonomousQualityGateSupport: {
                         apiVersion: 1,

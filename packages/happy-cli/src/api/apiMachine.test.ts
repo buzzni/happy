@@ -1468,6 +1468,37 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // Desktop explains why script automations are unavailable from this field; without it a
+    // machine that stayed on protocol 4 only shows up as SCRIPT_RUNNER_UNSUPPORTED.
+    it.each([
+        { readiness: { state: 'unavailable' as const, code: 'DOCKER_UNAVAILABLE' as const, checkedAt: 1_700_000_000_000 } },
+        { readiness: { state: 'ready' as const, checkedAt: 1_700_000_000_000, imageSource: 'release' as const, imageFingerprint: 'd32cdf619f63' } },
+        { readiness: undefined },
+    ])('publishes script runtime readiness with server-backed automations (%#)', async ({ readiness }) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        if (readiness) client.setScriptRuntimeReadiness(readiness);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
+        expect(machine.metadata?.automationSupport?.scriptRuntime).toEqual(readiness);
+        client.shutdown();
+    });
+
     // aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — a client seals for this
     // daemon with a sender only when it says so, and only to the automation key it publishes.
     it.each([

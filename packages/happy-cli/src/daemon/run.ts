@@ -254,6 +254,10 @@ import {
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
+import {
+  classifyScriptRuntimeFailure, resolveScriptRuntimeImage, scriptRuntimeReadiness,
+  type ScriptRuntimeImageSource, type ScriptRuntimeReadiness,
+} from './automations/scriptRuntimeReadiness';
 import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -4247,13 +4251,17 @@ export async function startDaemon(): Promise<void> {
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     let activeServerAutomationLeaseCount = 0;
     let scriptWorker: ReturnType<typeof createScriptAutomationWorker> | null = null;
+    let scriptRuntimeState: ScriptRuntimeReadiness | null = null;
     if (!standaloneWindows && shouldRunScriptAutomations({
         managedRuntimeActive: managedIdentity.status === 'active',
         enabled: process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED,
     })) {
+      let resolvedImage: { image: string; source: ScriptRuntimeImageSource } | undefined;
       try {
-        const image = process.env.HAPPY_SCRIPT_RUNTIME_IMAGE;
-        if (!image) throw new Error('SCRIPT_RUNTIME_IMAGE_REQUIRED');
+        const resolved = resolveScriptRuntimeImage(process.env);
+        if (!resolved.ok) throw new Error('IMMUTABLE_IMAGE_REQUIRED');
+        resolvedImage = resolved;
+        const image = resolved.image;
         const studioConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
         if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
         const studioUrl = new URL(studioConfigUrl);
@@ -4300,14 +4308,24 @@ export async function startDaemon(): Promise<void> {
         await worker.recover();
         scriptWorker = worker;
         stopScriptWorker = () => worker.stop();
+        scriptRuntimeState = scriptRuntimeReadiness({ state: 'ready', now: Date.now(), image: resolvedImage });
       } catch (error) {
-        logger.debug(`[script-automations] Script runtime unavailable; capability remains disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
+        const code = classifyScriptRuntimeFailure(error);
+        scriptRuntimeState = scriptRuntimeReadiness({ state: 'unavailable', code, now: Date.now(), image: resolvedImage });
+        logger.debug(`[script-automations] Script runtime unavailable (${code}); capability remains disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
       }
+    } else if (!standaloneWindows) {
+      scriptRuntimeState = scriptRuntimeReadiness({
+        state: 'disabled',
+        code: managedIdentity.status === 'active' ? 'MANAGED_RUNTIME' : 'DISABLED',
+        now: Date.now(),
+      });
     }
     const scriptAutomationTickRunner = createAutomationTickRunner({
       runTick: async () => { await scriptWorker?.tick(); },
       logDebug: (message) => logger.debug(`[script-automations] ${message}`),
     });
+    if (scriptRuntimeState) apiMachine.setScriptRuntimeReadiness(scriptRuntimeState);
     apiMachine.setAuthenticatedEnvelopeSender(payloadTrust.customerPublicKey, { required: payloadTrust.mode === 'strict' });
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(

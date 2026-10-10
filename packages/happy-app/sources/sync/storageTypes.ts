@@ -232,6 +232,15 @@ export const MachineMetadataSchema = z.object({
         sessionFollowup: z.literal(true).optional(),
         protocolVersion: z.number().int().min(1).optional(),
         hostCommands: z.boolean().optional(),
+        // Why script automations are or are not available (specs/script-runtime-readiness). `code` stays a
+        // string so a newer daemon's enum value never makes this client drop the whole field.
+        scriptRuntime: z.object({
+            state: z.enum(['ready', 'unavailable', 'disabled']),
+            code: z.string().max(40).optional(),
+            checkedAt: z.number(),
+            imageSource: z.enum(['env', 'release']).optional(),
+            imageFingerprint: z.string().regex(/^[a-f0-9]{12}$/).optional(),
+        }).optional(),
     }).optional(),
 });
 
