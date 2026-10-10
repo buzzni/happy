@@ -582,7 +582,7 @@ describe('claudeRemote', () => {
         expect(onReady).toHaveBeenCalledOnce();
     });
 
-    it('asks the provider for its turn-over state only for an automation run', async () => {
+    it('asks the provider for its turn-over state for an automation run', async () => {
         const { running } = runOnceWithProviderMessages([{ type: 'result', subtype: 'success', result: 'answered' }]);
         await running;
         expect(vi.mocked(query).mock.calls.at(-1)![0].options?.emitSessionStateEvents).toBe(true);

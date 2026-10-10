@@ -813,7 +813,8 @@ function readTurnText(content: unknown): string {
      * cannot tell whether a report that lands mid-turn was answered in that
      * turn or is still owed one of its own — both happen, and the stream is
      * identical up to the result — so an idle CLI is what ends the run.
-     * `null` until the CLI reports a state: older CLIs never do.
+     * `null` until the CLI reports a state: older CLIs never do, and the
+     * fixed sandbox launcher's env allowlist drops the flag that asks for it.
      */
     let providerIdle: boolean | null = null;
     let backgroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
@@ -888,10 +889,6 @@ function readTurnText(content: unknown): string {
                 continue;
             }
 
-            // Handle messages. During /compact, Claude emits the generated
-            // summary as a normal assistant text message before the result.
-            // Mark it so downstream UI/protocol mapping can treat it as
-            // housekeeping instead of a real assistant response.
             if (message.type === 'system' && message.subtype === 'session_state_changed') {
                 providerIdle = message.state === 'idle';
                 if (providerIdle && heldResult && backgroundWaitExpiry) {
@@ -900,6 +897,10 @@ function readTurnText(content: unknown): string {
                 continue;
             }
 
+            // Handle messages. During /compact, Claude emits the generated
+            // summary as a normal assistant text message before the result.
+            // Mark it so downstream UI/protocol mapping can treat it as
+            // housekeeping instead of a real assistant response.
             const outboundMessage = isCompactCommand && message.type === 'assistant'
                 ? { ...message, isCompactSummary: true } as SDKMessage
                 : message;
