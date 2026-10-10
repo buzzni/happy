@@ -41,7 +41,9 @@ export function sanitizeWorktreeName(raw: string): string {
     .replace(/-{2,}/g, '-')
     .replace(/^[-/]+|[-/]+$/g, '')
     .replace(/\.+/g, '.')
-    .slice(0, 60);
+    .slice(0, 60)
+    // The cut can leave a separator at the end, which the name check would then refuse.
+    .replace(/[-/]+$/, '');
 }
 
 export function generateWorktreeName(random: () => number = Math.random): string {
@@ -110,14 +112,18 @@ export function isProjectWorktreePath(path: string, repoRoot: string, projectId:
 
 // ── Operation ticket ───────────────────────────────────────────────────────────────────────────
 
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 const opIdSchema = z.string().regex(/^[A-Za-z0-9+/]{22}==$/);
 const absolutePath = z.string().min(1).max(4096).refine(
-  (value) => !value.includes('\0') && (value.startsWith('/') || isWindowsWorktreePath(value)),
+  (value) => (value.startsWith('/') || isWindowsWorktreePath(value))
+    && !CONTROL_CHARACTER.test(value)
+    && slashSeparated(value).split('/').every((part) => part !== '.' && part !== '..'),
   'absolute path',
 );
 const worktreeNameSchema = z.string().min(1).max(60).refine((value) => sanitizeWorktreeName(value) === value, 'worktree name');
 // A ref the daemon passes to git as an argument: never read as an option, never empty.
-const refSchema = z.string().min(1).max(255).refine((value) => !value.startsWith('-') && !/[\0\s]/.test(value), 'git ref');
+// The daemon still runs `git check-ref-format` on it.
+const refSchema = z.string().min(1).max(255).refine((value) => !value.startsWith('-') && !/\s/.test(value) && !CONTROL_CHARACTER.test(value), 'git ref');
 
 export const worktreeOpParamsSchemas = {
   capability: z.object({ workspaceDir: absolutePath }).strict(),
@@ -148,9 +154,12 @@ const ticketBase = z.object({
   issuedAt: z.number().int().nonnegative(),
   expiresAt: z.number().int().nonnegative(),
   params: z.unknown(),
-}).strict();
+}).strict().refine((ticket) => ticket.expiresAt > ticket.issuedAt, 'ticket expires before it was issued');
 
-export type WorktreeTicket = Omit<z.infer<typeof ticketBase>, 'params'> & { params: Record<string, unknown> };
+/** A ticket narrowed by `op`: its params are that operation's params. */
+export type WorktreeTicket = {
+  [Op in WorktreeOp]: Omit<z.infer<typeof ticketBase>, 'op' | 'params'> & { op: Op; params: WorktreeOpParams<Op> };
+}[WorktreeOp];
 
 /** A ticket the server issued, with params of its operation. The server alone checks its signature. */
 export function readWorktreeTicket(value: unknown): { ok: true; ticket: WorktreeTicket } | { ok: false; error: string } {
@@ -158,7 +167,7 @@ export function readWorktreeTicket(value: unknown): { ok: true; ticket: Worktree
   if (!base.success) return { ok: false, error: 'malformed ticket' };
   const params = worktreeOpParamsSchemas[base.data.op].safeParse(base.data.params);
   if (!params.success) return { ok: false, error: `malformed ${base.data.op} params` };
-  return { ok: true, ticket: { ...base.data, params: params.data as Record<string, unknown> } };
+  return { ok: true, ticket: { ...base.data, params: params.data } as WorktreeTicket };
 }
 
 // ── Attested result ────────────────────────────────────────────────────────────────────────────
@@ -170,7 +179,7 @@ export interface WorktreeAttestationPayload {
   op: WorktreeOp;
   machineId: string;
   projectId: string;
-  params: Record<string, unknown>;
+  params: WorktreeTicket['params'];
   result: Record<string, unknown>;
   finishedAt: number;
 }
@@ -194,10 +203,22 @@ export function worktreeAttestationPayload(
   };
 }
 
-/** JSON with sorted object keys, so both sides HMAC the same bytes. */
+/**
+ * JSON with sorted object keys, so both sides HMAC the same bytes. Throws on a value JSON would
+ * change or drop (undefined outside an object, non-finite numbers, bigint, class instances), so a
+ * signer never signs something the verifier reads back differently.
+ */
 export function canonicalWorktreeJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('canonicalWorktreeJson: non-finite number');
+    return JSON.stringify(value);
+  }
   if (Array.isArray(value)) return `[${value.map((item) => canonicalWorktreeJson(item)).join(',')}]`;
+  const prototype = typeof value === 'object' ? Object.getPrototypeOf(value) : undefined;
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`canonicalWorktreeJson: not a JSON value (${typeof value})`);
+  }
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, item]) => item !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
