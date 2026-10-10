@@ -278,6 +278,21 @@ describe('worktree:create', () => {
         expect(existsSync(join(outside, 'local.json'))).toBe(false);
     });
 
+    it('creates nothing through a linked .aplus or project folder', async () => {
+        const outside = join(root, 'outside');
+        mkdirSync(outside);
+        symlinkSync(outside, join(repo, '.aplus'));
+        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+        expect(existsSync(join(outside, 'worktrees'))).toBe(false);
+        rmSync(join(repo, '.aplus'));
+        mkdirSync(join(repo, '.aplus/worktrees'), { recursive: true });
+        const elsewhere = join(repo, 'elsewhere');
+        mkdirSync(elsewhere);
+        symlinkSync(elsewhere, join(repo, '.aplus/worktrees/p1'));
+        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+        expect(existsSync(join(elsewhere, 'bright-fox'))).toBe(false);
+    });
+
     it('reports a name already taken', async () => {
         git(repo, 'branch', 'bright-fox');
         expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_NAME_CONFLICT' });
@@ -450,6 +465,18 @@ describe('worktree:recover', () => {
         expect((await call('recover', { worktreePath: path, branch: 'bright-fox' })).result).toEqual({ recovered: true });
         expect(git(path, 'branch', '--show-current')).toBe('bright-fox');
         expect((await call('recover', { worktreePath: path, branch: 'bright-fox' })).result).toEqual({ recovered: false });
+    });
+
+    it('adds nothing back through a linked project folder', async () => {
+        const path = await worktree();
+        rmSync(path, { recursive: true, force: true });
+        git(repo, 'worktree', 'prune');
+        const outside = join(root, 'outside');
+        mkdirSync(outside);
+        rmSync(join(repo, '.aplus/worktrees/p1'), { recursive: true, force: true });
+        symlinkSync(outside, join(repo, '.aplus/worktrees/p1'));
+        expect(await call('recover', { worktreePath: path, branch: 'bright-fox' })).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+        expect(existsSync(join(outside, 'bright-fox'))).toBe(false);
     });
 
     it('refuses a missing branch or a path taken by something else', async () => {
@@ -636,5 +663,45 @@ describe('sealed git credentials', () => {
         expect(readFileSync(askpass, 'utf8')).not.toContain('ghs_secret_value');
         await prepared.dispose();
         expect(existsSync(askpass)).toBe(false);
+    });
+});
+
+describe.skipIf(process.platform === 'win32')('git before 2.36 (no worktree list -z)', () => {
+    let savedPath: string | undefined;
+    beforeEach(() => {
+        const bin = join(root, 'old-git-bin');
+        mkdirSync(bin);
+        const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+        writeFileSync(join(bin, 'git'), [
+            '#!/bin/sh',
+            'for arg in "$@"; do if [ "$arg" = "-z" ]; then echo "error: unknown switch \\`z\'" >&2; exit 129; fi; done',
+            `exec ${realGit} "$@"`,
+            '',
+        ].join('\n'), { mode: 0o755 });
+        savedPath = process.env.PATH;
+        process.env.PATH = `${bin}:${savedPath}`;
+    });
+    afterEach(() => {
+        process.env.PATH = savedPath;
+    });
+
+    it('still finds registered worktrees for status and remove', async () => {
+        const path = await worktree();
+        expect((await call('status', { worktreePath: path, branch: 'bright-fox', baseBranch: 'main' })).result)
+            .toEqual({ dirty: false, behind: 0, ahead: 0 });
+        expect((await call('remove', { worktreePath: path, branch: 'bright-fox', force: false, dryRun: false })).result)
+            .toEqual({ outcome: 'removed' });
+    });
+
+    it('matches a repository path with non-ASCII characters', async () => {
+        const named = join(root, '저장소');
+        mkdirSync(named);
+        git(named, 'init', '--quiet', '--initial-branch=main');
+        write(named, 'README.md', 'x');
+        commitAll(named, 'init');
+        const created = await call('create', create({ workspaceDir: named }));
+        expect(created.success).toBe(true);
+        expect((await call('status', { worktreePath: created.result.path, branch: 'bright-fox', baseBranch: 'main' })).result)
+            .toEqual({ dirty: false, behind: 0, ahead: 0 });
     });
 });
