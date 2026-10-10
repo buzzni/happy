@@ -2347,9 +2347,21 @@ export class ApiMachineClient {
         if (previous && previous !== hosts) await previous.close();
     }
 
-    /** Published under automationSupport.scriptRuntime; republished by the periodic metadata check only when it changes. */
-    setScriptRuntimeReadiness(readiness: ScriptRuntimeReadiness): void {
+    /**
+     * Published under automationSupport.scriptRuntime. Before the socket is up this only records the
+     * values; afterwards a change re-registers the same automation key with the new protocol (the
+     * server updates the target without bumping the key) and republishes the metadata.
+     */
+    updateScriptRuntime(readiness: ScriptRuntimeReadiness, protocolVersion: number): void {
+        const changed = this.automationProtocolVersion !== protocolVersion
+            || (this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null) !== scriptRuntimeReadinessKey(readiness);
         this.scriptRuntimeReadiness = readiness;
+        this.automationProtocolVersion = protocolVersion;
+        if (changed && this.automationKey && this.socket?.connected) {
+            void this.registerAutomationKey().catch((error) => {
+                logger.debug(`[API MACHINE] Failed to republish script runtime: ${error}`);
+            });
+        }
     }
 
     private scriptRuntimeField(): { scriptRuntime?: ScriptRuntimeReadiness } {

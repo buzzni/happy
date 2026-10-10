@@ -11,10 +11,10 @@ import os from 'os';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SCRIPT_AUTOMATION_PROTOCOL_VERSION, SEALED_SPAWN_ENV_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
-import { prepareManagedScriptRuntime, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
+import { prepareManagedScriptRuntime, probeManagedScriptEngine, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
 import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
@@ -254,10 +254,8 @@ import {
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
-import {
-  classifyScriptRuntimeFailure, resolveScriptRuntimeImage, scriptRuntimeReadiness,
-  type ScriptRuntimeImageSource, type ScriptRuntimeReadiness,
-} from './automations/scriptRuntimeReadiness';
+import { resolveScriptRuntimeImage, scriptRuntimeReadiness, type ScriptRuntimeReadiness } from './automations/scriptRuntimeReadiness';
+import { createScriptRuntimeSupervisor } from './automations/scriptRuntimeSupervisor';
 import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -4250,82 +4248,93 @@ export async function startDaemon(): Promise<void> {
     resolveManagedAiCredentialEnvironment = (agent, selection, recorded) => aiCredentialRuntime.sessionEnvironment(agent, selection, recorded);
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     let activeServerAutomationLeaseCount = 0;
-    let scriptWorker: ReturnType<typeof createScriptAutomationWorker> | null = null;
-    let scriptRuntimeState: ScriptRuntimeReadiness | null = null;
+    let scriptRuntime: ReturnType<typeof createScriptRuntimeSupervisor> | null = null;
+    let scriptProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    const publishScriptRuntime = (readiness: ScriptRuntimeReadiness, protocolVersion: number) => {
+      scriptProtocolVersion = protocolVersion;
+      apiMachine.updateScriptRuntime(readiness, protocolVersion);
+    };
     if (!standaloneWindows && shouldRunScriptAutomations({
         managedRuntimeActive: managedIdentity.status === 'active',
         enabled: process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED,
     })) {
-      let resolvedImage: { image: string; source: ScriptRuntimeImageSource } | undefined;
-      try {
-        const resolved = resolveScriptRuntimeImage(process.env);
-        if (!resolved.ok) throw new Error('IMMUTABLE_IMAGE_REQUIRED');
-        resolvedImage = resolved;
-        const image = resolved.image;
-        const studioConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
-        if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
-        const studioUrl = new URL(studioConfigUrl);
-        if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
-        const request = async (method: string, path: string, body?: unknown, baseUrl = configuration.serverUrl): Promise<unknown> => {
-          try {
-            const response = await axios.request({ method, url: new URL(path, baseUrl).href,
-              headers: { Authorization: `Bearer ${credentials.token}` }, data: body, timeout: 10000,
-              maxContentLength: 16 * 1024 * 1024, maxBodyLength: 12 * 1024 * 1024, proxy: false });
-            return response.data;
-          } catch (error) {
-            if (axios.isAxiosError(error) && error.response) {
-              const code = error.response.data?.error;
-              throw new ScriptRequestError(error.response.status, typeof code === 'string' && /^[A-Z0-9_]{1,100}$/.test(code) ? code : 'SCRIPT_REQUEST_FAILED');
-            }
-            throw error;
+      const request = async (method: string, path: string, body?: unknown, baseUrl = configuration.serverUrl): Promise<unknown> => {
+        try {
+          const response = await axios.request({ method, url: new URL(path, baseUrl).href,
+            headers: { Authorization: `Bearer ${credentials.token}` }, data: body, timeout: 10000,
+            maxContentLength: 16 * 1024 * 1024, maxBodyLength: 12 * 1024 * 1024, proxy: false });
+          return response.data;
+        } catch (error) {
+          if (axios.isAxiosError(error) && error.response) {
+            const code = error.response.data?.error;
+            throw new ScriptRequestError(error.response.status, typeof code === 'string' && /^[A-Z0-9_]{1,100}$/.test(code) ? code : 'SCRIPT_REQUEST_FAILED');
           }
-        };
-        const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
-        if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
-        const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
-        const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
-        const temporaryRoot = join(directory, 'work');
-        await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image });
-        await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
-        const authorize = async (runId: string, claimToken: string, secretRefs?: { [name: string]: string }) => {
-          const response = await request('POST', '/api/automation/script-execution', { machineId, runId, claimToken,
-            ...(secretRefs ? { secretRefs } : {}) }, studioUrl.origin);
-          return z.object({ executionProof: z.string().min(1), secrets: z.record(z.string(), z.string()),
-            approvedPrivateOrigins: z.array(z.string()) }).parse(response);
-        };
-        const worker = createScriptAutomationWorker({ machineId, accountId: profile.id,
-          machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust,
-          onUnauthenticated: (what) => recordUnauthenticated(what),
-          image, directory: join(directory, 'outbox'), request,
-          recoverContainers: () => recoverManagedScriptContainers({ ownerId, directory: temporaryRoot }),
-          execute: (input) => runManagedScript({ ...input, ownerId, temporaryRoot }),
-          authorizeStart: async (_record, runId, token) => (await authorize(runId, token)).executionProof,
-          resolveSecrets: async (_record, refs, runId, token) => {
-            const { secrets, approvedPrivateOrigins } = await authorize(runId, token, refs);
-            return { secrets, approvedPrivateOrigins };
-          },
-          log: (message) => logger.debug(`[script-automations] ${message}`) });
-        await worker.recover();
-        scriptWorker = worker;
-        stopScriptWorker = () => worker.stop();
-        scriptRuntimeState = scriptRuntimeReadiness({ state: 'ready', now: Date.now(), image: resolvedImage });
-      } catch (error) {
-        const code = classifyScriptRuntimeFailure(error);
-        scriptRuntimeState = scriptRuntimeReadiness({ state: 'unavailable', code, now: Date.now(), image: resolvedImage });
-        logger.debug(`[script-automations] Script runtime unavailable (${code}); capability remains disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
-      }
+          throw error;
+        }
+      };
+      // Shared by one preflight and the worker created after the first successful one.
+      let runtime: { image: string; accountId: string; ownerId: string; directory: string; temporaryRoot: string; studioOrigin: string } | null = null;
+      scriptRuntime = createScriptRuntimeSupervisor({
+        preflight: async () => {
+          const resolved = resolveScriptRuntimeImage(process.env);
+          if (!resolved.ok) throw new Error('IMMUTABLE_IMAGE_REQUIRED');
+          const studioConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+          if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
+          const studioUrl = new URL(studioConfigUrl);
+          if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
+          const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
+          if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
+          const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
+          const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
+          const temporaryRoot = join(directory, 'work');
+          await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image: resolved.image });
+          await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
+          runtime = { image: resolved.image, accountId: profile.id, ownerId, directory, temporaryRoot, studioOrigin: studioUrl.origin };
+          return resolved;
+        },
+        createWorker: async () => {
+          const ready = runtime;
+          if (!ready) throw new Error('SCRIPT_RUNTIME_PREFLIGHT_FAILED');
+          const { image, accountId, ownerId, directory, temporaryRoot, studioOrigin } = ready;
+          const authorize = async (runId: string, claimToken: string, secretRefs?: { [name: string]: string }) => {
+            const response = await request('POST', '/api/automation/script-execution', { machineId, runId, claimToken,
+              ...(secretRefs ? { secretRefs } : {}) }, studioOrigin);
+            return z.object({ executionProof: z.string().min(1), secrets: z.record(z.string(), z.string()),
+              approvedPrivateOrigins: z.array(z.string()) }).parse(response);
+          };
+          const worker = createScriptAutomationWorker({ machineId, accountId,
+            machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust,
+            onUnauthenticated: (what) => recordUnauthenticated(what),
+            image, directory: join(directory, 'outbox'), request,
+            recoverContainers: () => recoverManagedScriptContainers({ ownerId, directory: temporaryRoot }),
+            execute: (input) => runManagedScript({ ...input, ownerId, temporaryRoot }),
+            authorizeStart: async (_record, runId, token) => (await authorize(runId, token)).executionProof,
+            resolveSecrets: async (_record, refs, runId, token) => {
+              const { secrets, approvedPrivateOrigins } = await authorize(runId, token, refs);
+              return { secrets, approvedPrivateOrigins };
+            },
+            log: (message) => logger.debug(`[script-automations] ${message}`) });
+          await worker.recover();
+          return worker;
+        },
+        probe: probeManagedScriptEngine,
+        publish: publishScriptRuntime,
+        now: () => Date.now(),
+        log: (message) => logger.debug(`[script-automations] ${message}`),
+      });
+      stopScriptWorker = () => scriptRuntime!.stop();
+      await scriptRuntime.start();
     } else if (!standaloneWindows) {
-      scriptRuntimeState = scriptRuntimeReadiness({
+      publishScriptRuntime(scriptRuntimeReadiness({
         state: 'disabled',
         code: managedIdentity.status === 'active' ? 'MANAGED_RUNTIME' : 'DISABLED',
         now: Date.now(),
-      });
+      }), AUTOMATION_PROTOCOL_VERSION);
     }
     const scriptAutomationTickRunner = createAutomationTickRunner({
-      runTick: async () => { await scriptWorker?.tick(); },
+      runTick: async () => { await scriptRuntime?.tick(); },
       logDebug: (message) => logger.debug(`[script-automations] ${message}`),
     });
-    if (scriptRuntimeState) apiMachine.setScriptRuntimeReadiness(scriptRuntimeState);
     apiMachine.setAuthenticatedEnvelopeSender(payloadTrust.customerPublicKey, { required: payloadTrust.mode === 'strict' });
     apiMachine.setAutomationKey(machineAutomationKey, (keyVersion) => {
       machineAutomationKey = updateMachineAutomationKeyRegistration(
@@ -4333,7 +4342,7 @@ export async function startDaemon(): Promise<void> {
         machineAutomationKey,
         keyVersion,
       );
-    }, scriptWorker ? SCRIPT_AUTOMATION_PROTOCOL_VERSION : AUTOMATION_PROTOCOL_VERSION);
+    }, scriptProtocolVersion);
     /*
      * The lesson host. The studio origin is the daemon's own configured value
      * — the same one the MCP config uses — never anything from a request, and
