@@ -7,7 +7,6 @@
  * handler opens it, checks it and runs the command with it. The env reaches the process as process
  * env or a 0600 file, never as command text, and is never logged or returned.
  */
-import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -20,13 +19,11 @@ import {
     readSealedSpawnEnvPayload,
     type SealedSpawnEnvPayload,
 } from '@slopus/happy-wire';
-import { deriveServerRpcKey } from '@/api/encryption';
 import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
+import { openSealedForMachine, sealForMachine } from './machineSeal';
 import { logger } from '@/ui/logger';
 import { validatePath } from './pathSecurity';
 
-const NONCE_BYTES = 12;
-const TAG_BYTES = 16;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 function terminateProcessTree(child: ChildProcess): void {
@@ -77,31 +74,14 @@ function spawnWithProcessTreeTimeout(command: string, options: { cwd: string; en
     });
 }
 
-function sealKey(laneKey: Uint8Array): Buffer {
-    return createHmac('sha256', laneKey).update(SEALED_SPAWN_ENV_KEY_LABEL).digest();
-}
-
 /** The server's side of the seal, here so the format has one reference next to its reader. */
 export function sealSpawnEnv(laneKey: Uint8Array, payload: SealedSpawnEnvPayload): string {
-    const nonce = randomBytes(NONCE_BYTES);
-    const cipher = createCipheriv('aes-256-gcm', sealKey(laneKey), nonce);
-    const ciphertext = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
-    return Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]).toString('base64');
+    return sealForMachine(laneKey, SEALED_SPAWN_ENV_KEY_LABEL, payload);
 }
 
 /** The opened JSON, or null when it was not sealed for this machine key. */
 export function openSealedSpawnEnv(machineKey: Uint8Array, sealedBase64: string): unknown | null {
-    try {
-        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(sealedBase64)) return null;
-        const bytes = Buffer.from(sealedBase64, 'base64');
-        if (bytes.length <= NONCE_BYTES + TAG_BYTES) return null;
-        const decipher = createDecipheriv('aes-256-gcm', sealKey(deriveServerRpcKey(machineKey)), bytes.subarray(0, NONCE_BYTES));
-        decipher.setAuthTag(bytes.subarray(bytes.length - TAG_BYTES));
-        const plaintext = Buffer.concat([decipher.update(bytes.subarray(NONCE_BYTES, bytes.length - TAG_BYTES)), decipher.final()]);
-        return JSON.parse(plaintext.toString('utf8'));
-    } catch {
-        return null;
-    }
+    return openSealedForMachine(machineKey, SEALED_SPAWN_ENV_KEY_LABEL, sealedBase64);
 }
 
 export type SealedSpawnEnvRequest = {
