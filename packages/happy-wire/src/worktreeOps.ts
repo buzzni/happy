@@ -15,6 +15,8 @@ import * as z from 'zod';
 export const WORKTREE_OPS_VERSION = 1;
 export const WORKTREE_RESULT_ATTESTATION_KEY_LABEL = 'happy worktree result attestation v1';
 export const WORKTREE_DIR_SEGMENT = '.aplus/worktrees';
+/** A ticket covers one browser → daemon → server round trip, not a session. */
+export const WORKTREE_TICKET_MAX_TTL_MS = 10 * 60_000;
 const PROJECT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export const worktreeOpsCapabilitySchema = z.object({ version: z.literal(WORKTREE_OPS_VERSION) });
@@ -134,11 +136,15 @@ export const worktreeOpParamsSchemas = {
     name: worktreeNameSchema,
     baseRef: refSchema.nullable(),
     baseSource: z.enum(['local', 'origin']),
+    // The current work is saved and used as the base only when no base was chosen.
     snapshotCurrent: z.boolean(),
     copyOwnerRuntimeFiles: z.boolean(),
     expectedRepoRoot: absolutePath.nullable(),
-  }).strict(),
-  remove: z.object({ worktreePath: absolutePath, branch: refSchema, force: z.boolean() }).strict(),
+  }).strict()
+    .refine((params) => !params.snapshotCurrent || (params.baseRef === null && params.baseSource === 'local'), 'snapshot with a chosen base')
+    .refine((params) => params.baseSource !== 'origin' || params.baseRef !== null, 'origin base without a branch'),
+  // `dryRun` answers whether a removal would go through, so the preview is stopped only then.
+  remove: z.object({ worktreePath: absolutePath, branch: refSchema.nullable(), force: z.boolean(), dryRun: z.boolean() }).strict(),
 } as const;
 
 export type WorktreeOp = keyof typeof worktreeOpParamsSchemas;
@@ -154,7 +160,9 @@ const ticketBase = z.object({
   issuedAt: z.number().int().nonnegative(),
   expiresAt: z.number().int().nonnegative(),
   params: z.unknown(),
-}).strict().refine((ticket) => ticket.expiresAt > ticket.issuedAt, 'ticket expires before it was issued');
+}).strict()
+  .refine((ticket) => ticket.expiresAt > ticket.issuedAt, 'ticket expires before it was issued')
+  .refine((ticket) => ticket.expiresAt - ticket.issuedAt <= WORKTREE_TICKET_MAX_TTL_MS, 'ticket lives too long');
 
 /** A ticket narrowed by `op`: its params are that operation's params. */
 export type WorktreeTicket = {
@@ -169,6 +177,39 @@ export function readWorktreeTicket(value: unknown): { ok: true; ticket: Worktree
   if (!params.success) return { ok: false, error: `malformed ${base.data.op} params` };
   return { ok: true, ticket: { ...base.data, params: params.data } as WorktreeTicket };
 }
+
+export function worktreeOpMethod<Op extends WorktreeOp>(op: Op): `worktree:${Op}` {
+  return `worktree:${op}`;
+}
+
+// ── Operation results ──────────────────────────────────────────────────────────────────────────
+
+const capabilityResult = z.object({
+  capable: z.boolean(),
+  reason: z.enum(['ready', 'not-git', 'unavailable']),
+  branch: z.string().nullable(),
+  branches: z.array(z.string()),
+}).strict();
+
+/** What the daemon answers, and attests, for each operation. */
+export const worktreeOpResultSchemas = {
+  capability: capabilityResult,
+  prepare: capabilityResult,
+  status: z.object({ dirty: z.boolean(), behind: z.number().int().nonnegative(), ahead: z.number().int().nonnegative() }).strict(),
+  create: z.object({
+    path: absolutePath,
+    branch: z.string().min(1),
+    baseBranch: z.string().min(1),
+    baseRevision: z.string().nullable(),
+    /** The workspace directory relative to the repository root, '/'-separated; '' at the root. */
+    repoRelativeDir: z.string(),
+    repoRoot: absolutePath,
+  }).strict(),
+  // removed: git removed it; missing: it was already gone; removable: a dry run that would remove it.
+  remove: z.object({ outcome: z.enum(['removed', 'missing', 'removable']) }).strict(),
+} as const satisfies Record<WorktreeOp, z.ZodType>;
+
+export type WorktreeOpResult<Op extends WorktreeOp> = z.infer<(typeof worktreeOpResultSchemas)[Op]>;
 
 // ── Attested result ────────────────────────────────────────────────────────────────────────────
 
