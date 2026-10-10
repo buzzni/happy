@@ -13,6 +13,9 @@ describe('installed fixed launcher', () => {
         const env = { HOME: '/secret', PATH: '/work', BASH_ENV: '/work/evil', NODE_OPTIONS: '--inspect', LD_PRELOAD: '/work/evil', HAPPY_TOKEN: 'synthetic', SAYCODE_MCP_TOKEN: 'synthetic', CLAUDE_CONFIG_DIR: '/secret', ANTHROPIC_API_KEY: 'synthetic', LANG: 'C' };
         expect(launcher.filterEnv(env)).toEqual(filterClaudeProcessEnv(env));
     });
+    it('preserves the session state event flag for idle detection', () => {
+        expect(launcher.filterEnv({ CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe('1');
+    });
     it('drops source binds covered by read masks before statting inaccessible descendants', () => {
         expect(launcher.normalizeRestrictions(['/home/agent', '/home/agent/.happy', '/work/secret'],
             ['/home/agent/.happy', '/home/agent/.happy-staging/key', '/work/secret', '/work/secret/child', '/work/secrets']))
