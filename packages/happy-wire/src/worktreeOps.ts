@@ -15,6 +15,7 @@ import * as z from 'zod';
 export const WORKTREE_OPS_VERSION = 1;
 export const WORKTREE_RESULT_ATTESTATION_KEY_LABEL = 'happy worktree result attestation v1';
 export const WORKTREE_DIR_SEGMENT = '.aplus/worktrees';
+const PROJECT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export const worktreeOpsCapabilitySchema = z.object({ version: z.literal(WORKTREE_OPS_VERSION) });
 export type WorktreeOpsCapability = z.infer<typeof worktreeOpsCapabilitySchema>;
@@ -109,7 +110,6 @@ export function isProjectWorktreePath(path: string, repoRoot: string, projectId:
 
 // ── Operation ticket ───────────────────────────────────────────────────────────────────────────
 
-const PROJECT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const opIdSchema = z.string().regex(/^[A-Za-z0-9+/]{22}==$/);
 const absolutePath = z.string().min(1).max(4096).refine(
   (value) => !value.includes('\0') && (value.startsWith('/') || isWindowsWorktreePath(value)),
