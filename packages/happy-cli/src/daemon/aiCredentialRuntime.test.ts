@@ -10,10 +10,23 @@ import {
   createAiCredentialRuntime,
   runAiCredentialCommand,
   selectLeastRemainingCodexAccounts,
+  syncDirectoryForDurability,
   withUvToolBinOnPath,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
+
+describe('syncDirectoryForDurability', () => {
+  it('skips directory fsync on Windows, where it fails with EPERM and would refuse every setup-token spawn', async () => {
+    // A missing path proves nothing is opened: opening it would reject with ENOENT.
+    await expect(syncDirectoryForDurability(join(tmpdir(), 'happy-missing-dir-fsync-probe'), 'win32')).resolves.toBeUndefined()
+  })
+  it('syncs a real directory on the current platform', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'happy-dir-fsync-'))
+    try { await expect(syncDirectoryForDurability(directory)).resolves.toBeUndefined() }
+    finally { await removeTestDirectory(directory, { recursive: true, force: true }) }
+  })
+})
 
 const configuredClaudeList = JSON.stringify({
   schemaVersion: 1,

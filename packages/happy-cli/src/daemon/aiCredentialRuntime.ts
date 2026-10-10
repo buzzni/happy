@@ -2569,6 +2569,16 @@ function maskEmail(email: string): string {
   return `${email[0]}***${email.slice(at)}`
 }
 
+/**
+ * Persists a directory entry after a rename. Windows cannot fsync a directory (EPERM), and
+ * its rename is already metadata-journaled, so the step is skipped there like claudeCollector.
+ */
+export async function syncDirectoryForDurability(path: string, platform: NodeJS.Platform = process.platform): Promise<void> {
+  if (platform === 'win32') return
+  const directory = await open(path, 'r')
+  try { await directory.sync() } finally { await directory.close() }
+}
+
 export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
@@ -2584,7 +2594,7 @@ export function createNodeAiCredentialRuntime(
     readFile: (path) => readFile(path, 'utf8'),
     readdir: (path) => readdir(path),
     syncFile: async (path) => { const file = await open(path, 'r+'); try { await file.sync() } finally { await file.close() } },
-    syncDirectory: async (path) => { const directory = await open(path, 'r'); try { await directory.sync() } finally { await directory.close() } },
+    syncDirectory: path => syncDirectoryForDurability(path),
     writeFile: async (path, content, options) => { await writeFile(path, content, options) },
     mkdir,
     rename,
