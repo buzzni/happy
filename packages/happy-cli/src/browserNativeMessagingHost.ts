@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './daemon/browserBridgeConfig'
 import { runBrowserNativeMessagingHost } from './daemon/browserNativeMessagingHost'
 import { readOrCreateBrowserBridgeToken, resolveBrowserBridgeTokenFile } from './daemon/browserBridgeToken'
-import { readFile } from 'node:fs/promises'
+import { readPrivateFile } from './persistence'
 
 const userHome = homedir()
 const happyHomeDir = process.env.HAPPY_HOME_DIR?.replace(/^~/, userHome) ?? join(userHome, '.happy')
@@ -24,7 +24,7 @@ void runBrowserNativeMessagingHost({
         // with that home's own control secret and accepts its own nonce only.
         for (const home of new Set([happyHomeDir, join(userHome, '.happy_local'), join(userHome, '.happy_local_dev')])) {
             try {
-                const state = JSON.parse(await readFile(join(home, 'daemon.state.json'), 'utf8'))
+                const state = JSON.parse(await readPrivateFile(join(home, 'daemon.state.json')))
                 if (!Number.isInteger(state.httpPort) || state.httpPort < 1 || state.httpPort > 65535 || typeof state.controlSecret !== 'string') continue
                 const response = await fetch(`http://127.0.0.1:${state.httpPort}/browser/local-setup/consume`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.controlSecret}` },

@@ -6,6 +6,8 @@ import { z } from 'zod';
 
 import { decodeBase64 } from '@/api/encryption';
 import { configuration } from '@/configuration';
+import { readPrivateFileSync } from '@/persistence';
+import { WindowsPrivateFileError } from '@/utils/windowsPrivateFile';
 
 const AgentCredentialsSchema = z.object({
     token: z.string().min(1),
@@ -84,14 +86,15 @@ function readCredentialFile(path: string): LocalHappyAgentCredentials | null {
     }
 
     try {
-        const parsed = AgentCredentialsSchema.parse(JSON.parse(readFileSync(path, 'utf8')));
+        const parsed = AgentCredentialsSchema.parse(JSON.parse(readPrivateFileSync(path)));
         const secret = decodeBase64(parsed.secret);
         return {
             token: parsed.token,
             secret,
             contentKeyPair: deriveContentKeyPair(secret),
         };
-    } catch {
+    } catch (error) {
+        if (error instanceof WindowsPrivateFileError) throw error;
         return null;
     }
 }

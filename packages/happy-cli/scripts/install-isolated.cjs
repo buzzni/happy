@@ -152,9 +152,11 @@ production settings and dies on an invalid token):
       HAPPY_HOME_DIR="${home}" \\
       "${happy}" daemon start
 
-Authenticate it, or copy an existing credential in:
+${IS_WINDOWS
+    ? 'Authenticate the isolated home separately. Windows protected credentials are bound to their original path and must not be copied into another home.'
+    : `Authenticate it, or copy an existing credential in:
 
-  cp <authenticated>/access.key "${home}/access.key"
+  cp <authenticated>/access.key "${home}/access.key"`}
 
 Tear it down (the credential copy is why this matters):
 

@@ -79,6 +79,9 @@ function createPublishTarball(
     writeFixtureFile(packageRoot, 'bin/happy-browser-native-host.mjs', '#!/usr/bin/env node\n')
     chmodSync(nativeHelper, options.nativeHelperExecutable === false ? 0o644 : 0o755)
     writeFixtureFile(packageRoot, 'dist/browserNativeMessagingHost.mjs', 'export {}\n')
+    writeFixtureFile(packageRoot, 'dist/windowsPrivateStorage.cjs', 'module.exports = {}\n')
+    writeFixtureFile(packageRoot, 'native/windows-x64/user-protection.exe', 'fixture')
+    writeFixtureFile(packageRoot, 'native/windows-x64/user-protection.json', '{}')
     if (!options.omitSaycodeAgent) {
         writeFixtureFile(packageRoot, 'node_modules/@buzzni/saycode-cli/package.json', JSON.stringify({
             name: '@buzzni/saycode-cli',
@@ -99,7 +102,7 @@ function createPublishTarball(
         writeFixtureFile(packageRoot, 'node_modules/tweetnacl/package.json', JSON.stringify({ name: 'tweetnacl', version: '0.0.0-test', main: 'nacl-fast.js' }))
         writeFixtureFile(packageRoot, 'node_modules/tweetnacl/nacl-fast.js', 'module.exports = {}\n')
     }
-    writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/package.json', JSON.stringify({ name: '@paralleldrive/cuid2', version: '0.0.0-test' }))
+    writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/package.json', JSON.stringify({ name: '@paralleldrive/cuid2', version: '0.0.0-test', dependencies: { '@noble/hashes': '0.0.0-test' } }))
     writeFixtureFile(packageRoot, 'node_modules/@paralleldrive/cuid2/node_modules/@noble/hashes/package.json', JSON.stringify({ name: '@noble/hashes', version: '0.0.0-test' }))
     writeFixtureFile(packageRoot, 'browser-extension/manifest.json', JSON.stringify({
         permissions: options.omitNativeMessagingPermission ? [] : ['nativeMessaging']
@@ -151,6 +154,16 @@ afterEach(() => {
 })
 
 describe('guard-publish-artifact', () => {
+    it('packs a prepared directory and smoke installs it through npm on the host platform', () => {
+        const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56')
+        const directory = join(tarball, '..', 'package')
+        const result = spawnSync(process.execPath, [GUARD_SCRIPT, directory, '--install-smoke'], {
+            encoding: 'utf8', timeout: 30_000
+        })
+        expect(result.status, result.stderr).toBe(0)
+        expect(result.stdout).toContain('Smoke install: OK')
+    }, 40_000)
+
     it('rejects a tarball missing the wire crypto runtime dependency', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', { omitTweetnacl: true })
         const result = spawnSync(process.execPath, [GUARD_SCRIPT, tarball], { encoding: 'utf8', timeout: 30_000 })
@@ -273,7 +286,7 @@ describe('guard-publish-artifact', () => {
         expect(result.stderr).toContain('abstract-logging')
     }, 40_000)
 
-    it('rejects a native messaging helper that is not executable after installation', () => {
+    it.skipIf(process.platform === 'win32')('rejects a native messaging helper that is not executable after installation', () => {
         const tarball = createPublishTarball('1.1.10-aplus.56', '1.1.10-aplus.56', {
             nativeHelperExecutable: false
         })

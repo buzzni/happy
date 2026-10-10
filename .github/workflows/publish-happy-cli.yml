@@ -32,8 +32,12 @@ permissions:
     contents: read
 
 jobs:
+    windows-user-protection:
+        if: github.event_name == 'push'
+        uses: ./.github/workflows/windows-user-protection.yml
     publish:
         if: github.event_name == 'push'
+        needs: windows-user-protection
         runs-on: ubuntu-latest
         # The arm64 browser image builds under QEMU emulation (Chromium apt install), which takes a while.
         timeout-minutes: 75
@@ -111,6 +115,12 @@ jobs:
               run: node packages/happy-cli/scripts/agent-browser/publish-images.mjs --repo namsangboy --version "${{ steps.release_version.outputs.version }}" --out packages/happy-cli/scripts/agent-browser/abp-images.json
 
             - name: Prepare publish artifact
+              uses: actions/download-artifact@v4
+              with:
+                  name: windows-user-protection
+                  path: packages/happy-cli/native/windows-x64
+
+            - name: Prepare publish package
               run: node packages/happy-cli/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-cli-publish"
 
             - name: Pack publish artifact
