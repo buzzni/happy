@@ -245,8 +245,9 @@ async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: 
 
 const repositoryQueues = new Map<string, Promise<unknown>>();
 
-/** One operation at a time per repository, so git's own locks never race. */
-async function serialized<T>(key: string, run: () => Promise<T>): Promise<T> {
+/** One operation at a time per repository, so git's own locks never race. Keyed '/'-separated, as git prints the root. */
+async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
+    const key = slashed(path);
     const previous = repositoryQueues.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(run);
     repositoryQueues.set(key, next);
