@@ -1,7 +1,7 @@
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -261,6 +261,8 @@ export const MachineMetadataSchema = z.object({
   rpcBinding: rpcBindingCapabilitySchema.optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — runs `spawn-with-sealed-env`. */
   sealedSpawnEnv: sealedSpawnEnvCapabilitySchema.optional(),
+  /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree — runs `worktree:*` and signs the results. */
+  worktreeOps: worktreeOpsCapabilitySchema.optional(),
   /**
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
