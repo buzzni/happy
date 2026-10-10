@@ -282,11 +282,45 @@ function ownsWorktreeName(parts: string[], projectId: string): boolean {
 
 type WorktreeTarget = { repoRoot: string; path: string; registered: boolean; onDisk: boolean };
 
-/** The worktrees git has registered for this repository, by real '/'-separated path. */
+/**
+ * The worktrees git has registered for this repository, by real '/'-separated path. `-z` came
+ * with git 2.36; an older git refuses it and prints one unquoted entry per line instead. A path
+ * with a line break does not match there, so it reads as not registered: refused, never touched.
+ */
 async function registeredWorktrees(repoRoot: string): Promise<Set<string>> {
-    const listed = await gitOk(repoRoot, ['worktree', 'list', '--porcelain', '-z'], 'WORKTREE_LIST_FAILED', { readOnly: true });
-    const paths = listed.split('\0').filter((field) => field.startsWith('worktree ')).map((field) => field.slice('worktree '.length));
+    const separated = await runGit(repoRoot, ['worktree', 'list', '--porcelain', '-z'], { readOnly: true });
+    const paths = separated.code === 0
+        ? separated.stdout.split('\0').filter((field) => field.startsWith('worktree ')).map((field) => field.slice('worktree '.length))
+        : (await gitOk(repoRoot, ['worktree', 'list', '--porcelain'], 'WORKTREE_LIST_FAILED', { readOnly: true }))
+            .split('\n').filter((line) => line.startsWith('worktree ')).map((line) => line.slice('worktree '.length));
     return new Set(await Promise.all(paths.map((path) => realpath(path).then(slashed, () => slashed(path)))));
+}
+
+/**
+ * Before `git worktree add` makes `path` (and the folders above it): no part of it below the
+ * repository may be a link, or the worktree would land wherever the link points. Parts that do
+ * not exist yet are made by git as plain folders.
+ */
+async function requireUnlinkedLanding(repoRoot: string, path: string): Promise<void> {
+    const real = await realpath(repoRoot);
+    const parts = relative(repoRoot, path).split(/[\\/]/).filter(Boolean);
+    if (parts.length === 0 || parts.includes('..')) throw new OpFailure('PATH_DENIED', 'Not a worktree path of this repository');
+    let current = real;
+    for (const part of parts) {
+        current = join(current, part);
+        const info = await lstat(current).catch(() => null);
+        if (!info) return;
+        if (info.isSymbolicLink() || !info.isDirectory()) throw new OpFailure('PATH_DENIED', 'A folder on the worktree path is a link or a file');
+    }
+}
+
+/** After git made it: the worktree is where it was asked to be, or it is removed again. */
+async function requireLandedAt(repoRoot: string, path: string): Promise<void> {
+    const expected = join(await realpath(repoRoot), ...relative(repoRoot, path).split(/[\\/]/).filter(Boolean));
+    const landed = await realpath(path).catch(() => null);
+    if (landed === expected) return;
+    await runGit(repoRoot, ['worktree', 'remove', '--force', '--', path]);
+    throw new OpFailure('PATH_DENIED', 'The worktree did not land on its path');
 }
 
 /**
@@ -500,11 +534,13 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
 
         await excludeLines(repo, ['/.aplus/worktrees/']);
         const path = managedWorktreePath(repo, ticket.projectId, params.name);
+        await requireUnlinkedLanding(repo, path);
         const added = await runGit(repo, ['worktree', 'add', '-b', params.name, '--', path, baseRevision], { timeoutMs: CHECKOUT_TIMEOUT_MS });
         if (added.code !== 0) {
             const error = gitError(added);
             throw new OpFailure(NAME_CONFLICT.test(error) ? 'WORKTREE_NAME_CONFLICT' : 'WORKTREE_ADD_FAILED', error);
         }
+        await requireLandedAt(repo, path);
         if (params.copyOwnerRuntimeFiles) {
             await copyIncludes(repo, path, '');
             if (repoRelativeDir) await copyIncludes(repo, path, repoRelativeDir);
@@ -692,7 +728,9 @@ async function recoverWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 
             throw new OpFailure('WORKTREE_RECOVERY_BRANCH_MISSING', '복구할 작업 브랜치를 찾을 수 없습니다.');
         }
         await runGit(target.repoRoot, ['worktree', 'prune']);
+        await requireUnlinkedLanding(target.repoRoot, target.path);
         await gitOk(target.repoRoot, ['worktree', 'add', '--', target.path, params.branch], 'WORKTREE_RECOVERY_FAILED', { timeoutMs: CHECKOUT_TIMEOUT_MS });
+        await requireLandedAt(target.repoRoot, target.path);
         return { recovered: true };
     });
 }
