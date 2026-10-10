@@ -14,6 +14,8 @@ const CONTENT_CAPABLE = [
     'listDirectory', 'getDirectoryTree', 'listWorkspaceDirectory', 'readWorkspaceFile', 'ripgrep', 'difftastic',
     'file-discovery', 'worktree-dependencies:reclaim', 'spawn-with-sealed-env',
     'worktree:capability', 'worktree:prepare', 'worktree:create', 'worktree:status', 'worktree:remove',
+    'worktree:apply', 'worktree:update', 'worktree:recover', 'worktree:adopt-check', 'worktree:publish', 'worktree:reconcile',
+    'worktree:create-branch', 'worktree:prepare-conversation',
     'spawn-happy-session', 'resume-happy-session', 'recover-happy-session', 'stop-daemon',
     'claude-session-transfer', 'codex-thread-transfer', 'claude-fork-session', 'claude-list-rewind-points',
     'claude-duplicate-session', 'codex-fork-thread', 'codex-list-rewind-points', 'codex-duplicate-thread',

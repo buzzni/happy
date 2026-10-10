@@ -7,6 +7,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   WORKTREE_OPS_CAPABILITY,
   canonicalWorktreeJson,
+  readSealedGitCredential,
   isManagedWorktreePath,
   isProjectWorktreePath,
   isSameWorktreePath,
@@ -38,6 +39,7 @@ const ticket = (over: Record<string, unknown> = {}) => ({
     snapshotCurrent: true,
     copyOwnerRuntimeFiles: true,
     expectedRepoRoot: null,
+    remoteUrl: null,
   },
   ...over,
 });
@@ -87,6 +89,14 @@ describe('managed worktree paths', () => {
 describe('worktree operation ticket', () => {
   it('reads a ticket for a known operation with its params', () => {
     expect(readWorktreeTicket(ticket())).toMatchObject({ ok: true, ticket: { op: 'create', params: { name: 'bright-fox-1a2b' } } });
+  });
+
+  it('accepts version-1 create tickets issued before remoteUrl was added', () => {
+    const { remoteUrl: _remoteUrl, ...legacyParams } = ticket().params;
+    expect(readWorktreeTicket(ticket({ params: legacyParams }))).toMatchObject({
+      ok: true,
+      ticket: { params: { remoteUrl: null } },
+    });
   });
 
   it('refuses a ticket with unknown fields, an unknown operation or params of another operation', () => {
@@ -166,6 +176,69 @@ describe('worktree result attestation', () => {
   });
 });
 
+describe('worktree operations that change, publish or switch work', () => {
+  const read = (op: string, params: Record<string, unknown>) => readWorktreeTicket(ticket({ op, params })).ok;
+  const path = '/repo/.aplus/worktrees/p1/x';
+
+  it('reads the params of each operation', () => {
+    expect(read('apply', { worktreePath: path, branch: 'x', baseBranch: 'main' })).toBe(true);
+    expect(read('update', { worktreePath: path, branch: 'x', baseBranch: 'main', conflictChoice: 'base' })).toBe(true);
+    expect(read('update', { worktreePath: path, branch: 'x', baseBranch: 'main', conflictChoice: 'mine' })).toBe(false);
+    expect(read('recover', { worktreePath: path, branch: 'x' })).toBe(true);
+    expect(read('adopt-check', { workspaceDir: '/repo', worktreePath: path, expectedRepoRoot: null })).toBe(true);
+    expect(read('publish', { worktreePath: path, branch: 'x', remoteUrl: 'https://github.com/o/r.git' })).toBe(true);
+    expect(read('reconcile', { worktreePath: path, branch: 'x', baseBranch: 'main', expectedHead: 'a'.repeat(40) })).toBe(true);
+    expect(read('reconcile', { worktreePath: path, branch: 'x', baseBranch: 'main', expectedHead: 'HEAD' })).toBe(false);
+    expect(read('create-branch', { workspaceDir: '/repo', branchName: 'feature/a' })).toBe(true);
+    expect(read('prepare-conversation', {
+      workspaceDir: '/repo', baseBranch: 'main', source: 'origin', allowCurrentBranchDirty: true,
+      remoteUrl: null, statusPathspecs: ['.', ':(exclude,glob)**/.env*'],
+    })).toBe(true);
+  });
+
+  it('takes only a plain http(s) remote without credentials in it', () => {
+    const publish = (remoteUrl: string) => read('publish', { worktreePath: path, branch: 'x', remoteUrl });
+    expect(publish('https://gitlab.example.com:8443/group/project.git')).toBe(true);
+    expect(publish('https://user:token@github.com/o/r.git')).toBe(false);
+    expect(publish('file:///etc/passwd')).toBe(false);
+    expect(publish('ext::sh -c touch% /tmp/x')).toBe(false);
+    expect(publish('https://github.com/o/r.git\n')).toBe(false);
+  });
+
+  it('fetches a create base from a remote url only for an origin base', () => {
+    expect(readWorktreeTicket(ticket({ params: { ...ticket().params, remoteUrl: 'https://github.com/o/r.git' } })).ok).toBe(false);
+    expect(readWorktreeTicket(ticket({
+      params: { ...ticket().params, snapshotCurrent: false, baseSource: 'origin', baseRef: 'main', remoteUrl: 'https://github.com/o/r.git' },
+    })).ok).toBe(true);
+  });
+
+  it('bounds the status pathspecs the server passes', () => {
+    const prepare = (statusPathspecs: unknown) => read('prepare-conversation', {
+      workspaceDir: '/repo', baseBranch: 'main', source: 'local', allowCurrentBranchDirty: false, remoteUrl: null, statusPathspecs,
+    });
+    expect(prepare(['bad\u0000'])).toBe(false);
+    expect(prepare(Array.from({ length: 101 }, () => '.'))).toBe(false);
+  });
+});
+
+describe('sealed git credential', () => {
+  const credential = (over: Record<string, unknown> = {}) => ({
+    v: 1, purpose: 'git-credential', machineId: 'm1', opId, username: 'x-access-token', token: 'ghs_secret', ...over,
+  });
+
+  it('reads a credential sealed for this machine and this operation', () => {
+    expect(readSealedGitCredential(credential(), { machineId: 'm1', opId })).toEqual({ ok: true, username: 'x-access-token', token: 'ghs_secret' });
+  });
+
+  it('refuses one sealed for another machine or operation, or with a line break', () => {
+    expect(readSealedGitCredential(credential(), { machineId: 'm2', opId }).ok).toBe(false);
+    expect(readSealedGitCredential(credential({ opId: Buffer.alloc(16, 9).toString('base64') }), { machineId: 'm1', opId }).ok).toBe(false);
+    expect(readSealedGitCredential(credential({ token: 'a\nb' }), { machineId: 'm1', opId }).ok).toBe(false);
+    expect(readSealedGitCredential(credential({ extra: 1 }), { machineId: 'm1', opId }).ok).toBe(false);
+    expect(readSealedGitCredential(credential({ purpose: 'spawn-env' }), { machineId: 'm1', opId }).ok).toBe(false);
+  });
+});
+
 describe('worktree operation results', () => {
   it('names each operation\'s daemon method', () => {
     expect(worktreeOpMethod('create')).toBe('worktree:create');
@@ -181,6 +254,9 @@ describe('worktree operation results', () => {
     expect(worktreeOpResultSchemas.status.parse({ dirty: true, behind: 0, ahead: 2 })).toEqual({ dirty: true, behind: 0, ahead: 2 });
     expect(worktreeOpResultSchemas.remove.safeParse({ outcome: 'gone' }).success).toBe(false);
     expect(worktreeOpResultSchemas.capability.parse({ capable: false, reason: 'not-git', branch: null, branches: [] }).reason).toBe('not-git');
+    expect(worktreeOpResultSchemas.apply.parse({ appliedToBranch: 'main' })).toEqual({ appliedToBranch: 'main' });
+    expect(worktreeOpResultSchemas.publish.safeParse({ commit: 'HEAD' }).success).toBe(false);
+    expect(worktreeOpResultSchemas['prepare-conversation'].parse({ branch: 'main' })).toEqual({ branch: 'main' });
   });
 });
 
