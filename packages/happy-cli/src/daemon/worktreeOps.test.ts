@@ -6,10 +6,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+    GIT_CREDENTIAL_SEAL_KEY_LABEL,
     WORKTREE_RESULT_ATTESTATION_KEY_LABEL,
     canonicalWorktreeJson,
     readWorktreeTicket,
@@ -17,7 +18,8 @@ import {
     type WorktreeOp,
 } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
-import { createWorktreeOpsHandlers, WORKTREE_OPS_METHODS } from './worktreeOps';
+import { sealForMachine } from '@/modules/common/machineSeal';
+import { createWorktreeOpsHandlers, prepareGitCredential, WORKTREE_OPS_METHODS } from './worktreeOps';
 
 const machineKey = new Uint8Array(32).fill(7);
 const machine = { id: 'm1', encryptionKey: machineKey, encryptionVariant: 'dataKey' as 'dataKey' | 'legacy' };
@@ -51,10 +53,36 @@ async function call(op: WorktreeOp, params: Record<string, unknown>, over: Recor
     return set[`worktree:${op}`]({ ticket: ticket(op, params, over) }) as Promise<any>;
 }
 
+function write(dir: string, file: string, content: string) {
+    writeFileSync(join(dir, file), content);
+}
+
+function commitAll(dir: string, message: string) {
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '--quiet', '-m', message);
+}
+
+/** A bare `origin` with main pushed, and a second clone standing in for someone else online. */
+function withOrigin(): { bare: string; other: string } {
+    const bare = join(root, 'origin.git');
+    execFileSync('git', ['init', '--quiet', '--bare', '--initial-branch=main', bare]);
+    git(repo, 'remote', 'add', 'origin', bare);
+    git(repo, 'push', '--quiet', 'origin', 'main');
+    const other = join(root, 'other');
+    execFileSync('git', ['clone', '--quiet', bare, other]);
+    return { bare, other };
+}
+
 const create = (over: Record<string, unknown> = {}) => ({
     workspaceDir: repo, name: 'bright-fox', baseRef: null, baseSource: 'local',
-    snapshotCurrent: false, copyOwnerRuntimeFiles: true, expectedRepoRoot: null, ...over,
+    snapshotCurrent: false, copyOwnerRuntimeFiles: true, expectedRepoRoot: null, remoteUrl: null, ...over,
 });
+
+async function worktree(name = 'bright-fox'): Promise<string> {
+    const answer = await call('create', create({ name }));
+    if (!answer.success) throw new Error(answer.error);
+    return answer.result.path;
+}
 
 beforeEach(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), 'worktree-ops-')));
@@ -332,5 +360,265 @@ describe('worktree:remove', () => {
         expect(await call('remove', remove(`${repo}/.aplus/worktrees/p1/linked`, { force: true })))
             .toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
         expect(existsSync(outside)).toBe(true);
+    });
+});
+
+describe('worktree:apply', () => {
+    const apply = (path: string, over: Record<string, unknown> = {}) => ({ worktreePath: path, branch: 'bright-fox', baseBranch: 'main', ...over });
+
+    it('saves the worktree\'s work and merges it into the default version', async () => {
+        const path = await worktree();
+        write(path, 'feature.txt', 'f');
+        commitAll(path, 'feature');
+        write(path, 'unsaved.txt', 'u');
+        expect((await call('apply', apply(path))).result).toEqual({ appliedToBranch: 'main' });
+        expect(readFileSync(join(repo, 'feature.txt'), 'utf8')).toBe('f');
+        expect(readFileSync(join(repo, 'unsaved.txt'), 'utf8')).toBe('u');
+    });
+
+    it('applies nothing when the default version moved to another branch', async () => {
+        const path = await worktree();
+        git(repo, 'switch', '--quiet', '-c', 'other');
+        expect(await call('apply', apply(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_BASE_BRANCH_MISMATCH', currentBranch: 'other' });
+    });
+
+    it('leaves both sides as they were on a conflict', async () => {
+        const path = await worktree();
+        write(path, 'README.md', 'worktree\n');
+        commitAll(path, 'w');
+        write(repo, 'README.md', 'main\n');
+        commitAll(repo, 'm');
+        expect(await call('apply', apply(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_APPLY_CONFLICT' });
+        expect(existsSync(join(repo, '.git/MERGE_HEAD'))).toBe(false);
+        expect(readFileSync(join(repo, 'README.md'), 'utf8')).toBe('main\n');
+    });
+});
+
+describe('worktree:update', () => {
+    const update = (path: string, over: Record<string, unknown> = {}) => ({
+        worktreePath: path, branch: 'bright-fox', baseBranch: 'main', conflictChoice: null, ...over,
+    });
+
+    it('merges the base branch into the worktree', async () => {
+        const path = await worktree();
+        write(repo, 'new.txt', 'n');
+        commitAll(repo, 'n');
+        const answer = await call('update', update(path));
+        expect(answer.result).toEqual({ head: git(path, 'rev-parse', 'HEAD') });
+        expect(existsSync(join(path, 'new.txt'))).toBe(true);
+    });
+
+    it('reports conflicts and keeps the worktree as it was, or settles them one way when asked', async () => {
+        const path = await worktree();
+        write(path, 'README.md', 'mine\n');
+        commitAll(path, 'w');
+        write(repo, 'README.md', 'base\n');
+        commitAll(repo, 'm');
+        expect(await call('update', update(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_UPDATE_CONFLICT', conflicts: ['README.md'] });
+        expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('mine\n');
+        expect((await call('update', update(path, { conflictChoice: 'base' }))).success).toBe(true);
+        expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('base\n');
+    });
+
+    it('refuses when the worktree is on another branch', async () => {
+        const path = await worktree();
+        git(path, 'switch', '--quiet', '-c', 'elsewhere');
+        expect(await call('update', update(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_BRANCH_MISMATCH' });
+    });
+});
+
+describe('worktree:recover', () => {
+    it('adds a worktree back on its branch after its folder was lost', async () => {
+        const path = await worktree();
+        rmSync(path, { recursive: true, force: true });
+        expect((await call('recover', { worktreePath: path, branch: 'bright-fox' })).result).toEqual({ recovered: true });
+        expect(git(path, 'branch', '--show-current')).toBe('bright-fox');
+        expect((await call('recover', { worktreePath: path, branch: 'bright-fox' })).result).toEqual({ recovered: false });
+    });
+
+    it('refuses a missing branch or a path taken by something else', async () => {
+        expect(await call('recover', { worktreePath: `${repo}/.aplus/worktrees/p1/gone`, branch: 'gone' }))
+            .toMatchObject({ success: false, errorCode: 'WORKTREE_RECOVERY_BRANCH_MISSING' });
+        const taken = join(repo, '.aplus/worktrees/p1/taken');
+        mkdirSync(taken, { recursive: true });
+        git(repo, 'branch', 'taken');
+        expect(await call('recover', { worktreePath: taken, branch: 'taken' }))
+            .toMatchObject({ success: false, errorCode: 'WORKTREE_RECOVERY_PATH_OCCUPIED' });
+    });
+});
+
+describe('worktree:adopt-check', () => {
+    it('confirms a registered worktree of this repository with its branch', async () => {
+        const path = await worktree();
+        expect((await call('adopt-check', { workspaceDir: repo, worktreePath: path, expectedRepoRoot: null })).result)
+            .toEqual({ path, branch: 'bright-fox', repoRoot: repo });
+    });
+
+    it('refuses a folder git does not know as a worktree', async () => {
+        const stray = join(repo, '.aplus/worktrees/p1/stray');
+        mkdirSync(stray, { recursive: true });
+        expect(await call('adopt-check', { workspaceDir: repo, worktreePath: stray, expectedRepoRoot: null }))
+            .toMatchObject({ success: false, errorCode: 'WORKTREE_NOT_REGISTERED' });
+    });
+});
+
+describe('worktree:create-branch', () => {
+    it('creates and switches to a new branch in the default version', async () => {
+        expect((await call('create-branch', { workspaceDir: repo, branchName: 'feature/a' })).result).toEqual({ branch: 'feature/a' });
+        expect(git(repo, 'branch', '--show-current')).toBe('feature/a');
+    });
+
+    it('refuses a name git rejects or one already used', async () => {
+        expect(await call('create-branch', { workspaceDir: repo, branchName: 'a..b' })).toMatchObject({ errorCode: 'WORKSPACE_BRANCH_INVALID' });
+        expect(await call('create-branch', { workspaceDir: repo, branchName: 'main' })).toMatchObject({ errorCode: 'WORKSPACE_BRANCH_EXISTS' });
+    });
+
+    it('starts a repository first when the folder is not one', async () => {
+        const plain = join(root, 'plain');
+        mkdirSync(plain);
+        expect((await call('create-branch', { workspaceDir: plain, branchName: 'start' })).result).toEqual({ branch: 'start' });
+    });
+});
+
+describe('worktree:prepare-conversation', () => {
+    const prepare = (over: Record<string, unknown> = {}) => ({
+        workspaceDir: repo, baseBranch: 'main', source: 'local', allowCurrentBranchDirty: true, remoteUrl: null,
+        statusPathspecs: ['.', ':(exclude,glob)**/.env*'], ...over,
+    });
+
+    it('switches to a local branch when the work is saved', async () => {
+        git(repo, 'branch', 'develop');
+        expect((await call('prepare-conversation', prepare({ baseBranch: 'develop' }))).result).toEqual({ branch: 'develop' });
+        expect(git(repo, 'branch', '--show-current')).toBe('develop');
+    });
+
+    it('stays on the current branch with unsaved work only when allowed, and ignores excluded paths', async () => {
+        write(repo, 'wip.txt', 'w');
+        expect((await call('prepare-conversation', prepare())).result).toEqual({ branch: 'main' });
+        expect(await call('prepare-conversation', prepare({ allowCurrentBranchDirty: false }))).toMatchObject({
+            success: false, errorCode: 'WORKSPACE_DIRTY', currentBranch: 'main', dirtyStatus: expect.stringContaining('wip.txt'),
+        });
+        rmSync(join(repo, 'wip.txt'));
+        write(repo, '.env', 'A=1');
+        git(repo, 'branch', 'develop');
+        expect((await call('prepare-conversation', prepare({ baseBranch: 'develop', allowCurrentBranchDirty: false }))).result).toEqual({ branch: 'develop' });
+    });
+
+    it('brings the default version up to the online branch, creating it locally when needed', async () => {
+        const { other } = withOrigin();
+        write(other, 'online.txt', 'o');
+        commitAll(other, 'online');
+        git(other, 'push', '--quiet', 'origin', 'main');
+        git(other, 'switch', '--quiet', '-c', 'release');
+        git(other, 'push', '--quiet', 'origin', 'release');
+        expect((await call('prepare-conversation', prepare({ source: 'origin' }))).result).toEqual({ branch: 'main' });
+        expect(existsSync(join(repo, 'online.txt'))).toBe(true);
+        expect((await call('prepare-conversation', prepare({ source: 'origin', baseBranch: 'release' }))).result).toEqual({ branch: 'release' });
+        expect(git(repo, 'rev-parse', '--abbrev-ref', 'release@{upstream}')).toBe('origin/release');
+    });
+
+    it('refuses a local branch that went its own way from the online one', async () => {
+        const { other } = withOrigin();
+        write(other, 'online.txt', 'o');
+        commitAll(other, 'online');
+        git(other, 'push', '--quiet', 'origin', 'main');
+        write(repo, 'local.txt', 'l');
+        commitAll(repo, 'local');
+        expect(await call('prepare-conversation', prepare({ source: 'origin' }))).toMatchObject({ success: false, errorCode: 'WORKSPACE_BASE_DIVERGED' });
+    });
+});
+
+describe('worktree:publish', () => {
+    const publish = (path: string, over: Record<string, unknown> = {}) => ({ worktreePath: path, branch: 'bright-fox', remoteUrl: null, ...over });
+
+    it('saves and pushes the worktree branch, merging what is already online first', async () => {
+        const { bare, other } = withOrigin();
+        const path = await worktree();
+        write(path, 'a.txt', 'a');
+        commitAll(path, 'a');
+        expect((await call('publish', publish(path))).success).toBe(true);
+        git(other, 'fetch', '--quiet', 'origin');
+        git(other, 'switch', '--quiet', 'bright-fox');
+        write(other, 'b.txt', 'b');
+        commitAll(other, 'b');
+        git(other, 'push', '--quiet', 'origin', 'bright-fox');
+        write(path, 'unsaved.txt', 'u');
+        const answer = await call('publish', publish(path));
+        expect(answer.result).toEqual({ commit: git(path, 'rev-parse', 'HEAD') });
+        expect(execFileSync('git', ['--git-dir', bare, 'rev-parse', 'bright-fox'], { encoding: 'utf8' }).trim()).toBe(answer.result.commit);
+        expect(existsSync(join(path, 'b.txt'))).toBe(true);
+    });
+
+    it('refuses without a remote', async () => {
+        const path = await worktree();
+        expect(await call('publish', publish(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_PUBLISH_NO_REMOTE' });
+    });
+});
+
+describe('worktree:reconcile', () => {
+    async function mergedOnline() {
+        const { other } = withOrigin();
+        const path = await worktree();
+        write(path, 'reviewed.txt', 'r');
+        commitAll(path, 'reviewed');
+        git(path, 'push', '--quiet', 'origin', 'bright-fox');
+        git(other, 'fetch', '--quiet', 'origin');
+        git(other, 'merge', '--quiet', '--no-ff', '-m', 'merge review', 'origin/bright-fox');
+        git(other, 'push', '--quiet', 'origin', 'main');
+        return { path, head: git(path, 'rev-parse', 'HEAD') };
+    }
+    const reconcile = (path: string, head: string) => ({ worktreePath: path, branch: 'bright-fox', baseBranch: 'main', expectedHead: head });
+
+    it('merges the reviewed and merged base into the default version', async () => {
+        const { path, head } = await mergedOnline();
+        expect((await call('reconcile', reconcile(path, head))).result).toEqual({ appliedToBranch: 'main' });
+        expect(existsSync(join(repo, 'reviewed.txt'))).toBe(true);
+    });
+
+    it('keeps everything when the worktree changed after the review', async () => {
+        const { path, head } = await mergedOnline();
+        write(path, 'later.txt', 'l');
+        expect(await call('reconcile', reconcile(path, head))).toMatchObject({ success: false, errorCode: 'WORKTREE_REVIEW_OUTDATED' });
+        rmSync(join(path, 'later.txt'));
+        expect(await call('reconcile', reconcile(path, 'f'.repeat(40)))).toMatchObject({ success: false, errorCode: 'WORKTREE_REVIEW_OUTDATED' });
+        expect(existsSync(join(repo, 'reviewed.txt'))).toBe(false);
+    });
+});
+
+describe('sealed git credentials', () => {
+    const seal = (over: Record<string, unknown>) => sealForMachine(deriveServerRpcKey(machineKey), GIT_CREDENTIAL_SEAL_KEY_LABEL, {
+        v: 1, purpose: 'git-credential', machineId: 'm1', username: 'x-access-token', token: 'ghs_secret_value', ...over,
+    });
+
+    it('uses a credential sealed for this ticket and never returns it', async () => {
+        withOrigin();
+        const path = await worktree();
+        const sent = ticket('publish', { worktreePath: path, branch: 'bright-fox', remoteUrl: null });
+        const answer = await handlers()['worktree:publish']({ ticket: sent, sealedCredential: seal({ opId: sent.opId }) });
+        expect(answer.success).toBe(true);
+        expect(JSON.stringify(answer)).not.toContain('ghs_secret_value');
+    });
+
+    it('refuses a credential sealed for another ticket, or one for an operation without a remote', async () => {
+        const path = await worktree();
+        const sent = ticket('publish', { worktreePath: path, branch: 'bright-fox', remoteUrl: null });
+        expect(await handlers()['worktree:publish']({ ticket: sent, sealedCredential: seal({ opId: randomBytes(16).toString('base64') }) }))
+            .toMatchObject({ success: false, errorCode: 'GIT_CREDENTIAL_INVALID' });
+        const status = ticket('status', { worktreePath: path, branch: 'bright-fox', baseBranch: 'main' });
+        expect(await handlers()['worktree:status']({ ticket: status, sealedCredential: seal({ opId: status.opId }) }))
+            .toMatchObject({ success: false, errorCode: 'GIT_CREDENTIAL_UNEXPECTED' });
+    });
+
+    it.skipIf(process.platform === 'win32')('answers git\'s prompts from a private askpass and removes it afterwards', async () => {
+        const prepared = await prepareGitCredential({ username: 'x-access-token', token: 'ghs_secret_value' });
+        const askpass = prepared.env.GIT_ASKPASS!;
+        expect(statSync(askpass).mode & 0o777).toBe(0o700);
+        const ask = (prompt: string) => execFileSync(askpass, [prompt], { env: { ...process.env, ...prepared.env }, encoding: 'utf8' }).trim();
+        expect(ask("Username for 'https://github.com': ")).toBe('x-access-token');
+        expect(ask("Password for 'https://x-access-token@github.com': ")).toBe('ghs_secret_value');
+        expect(prepared.config).toEqual(['-c', 'credential.helper=']);
+        expect(readFileSync(askpass, 'utf8')).not.toContain('ghs_secret_value');
+        await prepared.dispose();
+        expect(existsSync(askpass)).toBe(false);
     });
 });

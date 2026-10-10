@@ -14,6 +14,8 @@ import * as z from 'zod';
 
 export const WORKTREE_OPS_VERSION = 1;
 export const WORKTREE_RESULT_ATTESTATION_KEY_LABEL = 'happy worktree result attestation v1';
+/** Seals a git credential for one machine, as `sealedSpawnEnv` seals an env, under its own label. */
+export const GIT_CREDENTIAL_SEAL_KEY_LABEL = 'happy git credential seal v1';
 export const WORKTREE_DIR_SEGMENT = '.aplus/worktrees';
 /** A ticket covers one browser → daemon → server round trip, not a session. */
 export const WORKTREE_TICKET_MAX_TTL_MS = 10 * 60_000;
@@ -126,6 +128,15 @@ const worktreeNameSchema = z.string().min(1).max(60).refine((value) => sanitizeW
 // A ref the daemon passes to git as an argument: never read as an option, never empty.
 // The daemon still runs `git check-ref-format` on it.
 const refSchema = z.string().min(1).max(255).refine((value) => !value.startsWith('-') && !/\s/.test(value) && !CONTROL_CHARACTER.test(value), 'git ref');
+// The repository's own address: plain http(s), no credentials in it (those come sealed), nothing
+// git would read as another transport (`file://`, `ext::`).
+const remoteUrlSchema = z.string().max(2048).refine(
+  (value) => /^https?:\/\/[^\s/@]+\/\S+$/.test(value) && !CONTROL_CHARACTER.test(value),
+  'remote url',
+);
+const commitSchema = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/);
+// Pathspecs the server decides (its dirty-check exclusions), passed after `--`.
+const pathspecSchema = z.string().min(1).max(512).refine((value) => !CONTROL_CHARACTER.test(value), 'pathspec');
 
 export const worktreeOpParamsSchemas = {
   capability: z.object({ workspaceDir: absolutePath }).strict(),
@@ -140,11 +151,37 @@ export const worktreeOpParamsSchemas = {
     snapshotCurrent: z.boolean(),
     copyOwnerRuntimeFiles: z.boolean(),
     expectedRepoRoot: absolutePath.nullable(),
+    /** Fetch an origin base from this address (with a sealed credential) instead of the `origin` remote. */
+    remoteUrl: remoteUrlSchema.nullable(),
   }).strict()
     .refine((params) => !params.snapshotCurrent || (params.baseRef === null && params.baseSource === 'local'), 'snapshot with a chosen base')
-    .refine((params) => params.baseSource !== 'origin' || params.baseRef !== null, 'origin base without a branch'),
+    .refine((params) => params.baseSource !== 'origin' || params.baseRef !== null, 'origin base without a branch')
+    .refine((params) => params.remoteUrl === null || params.baseSource === 'origin', 'remote url without an origin base'),
   // `dryRun` answers whether a removal would go through, so the preview is stopped only then.
   remove: z.object({ worktreePath: absolutePath, branch: refSchema.nullable(), force: z.boolean(), dryRun: z.boolean() }).strict(),
+  /** Merges the worktree into the default version, whose branch must still be `baseBranch`. */
+  apply: z.object({ worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema.nullable() }).strict(),
+  /** Merges the base branch into the worktree; `conflictChoice` settles every conflict one way. */
+  update: z.object({
+    worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema, conflictChoice: z.enum(['current', 'base']).nullable(),
+  }).strict(),
+  recover: z.object({ worktreePath: absolutePath, branch: refSchema }).strict(),
+  'adopt-check': z.object({ workspaceDir: absolutePath, worktreePath: absolutePath, expectedRepoRoot: absolutePath.nullable() }).strict(),
+  /** Pushes the worktree branch; `remoteUrl` becomes `origin` first, as the server sets it today. */
+  publish: z.object({ worktreePath: absolutePath, branch: refSchema, remoteUrl: remoteUrlSchema.nullable() }).strict(),
+  /** After a review merged online: the worktree is still at `expectedHead`, so the online base is merged locally. */
+  reconcile: z.object({ worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema, expectedHead: commitSchema }).strict(),
+  /** A new branch in the default version. */
+  'create-branch': z.object({ workspaceDir: absolutePath, branchName: refSchema }).strict(),
+  /** The default version on `baseBranch` for a new conversation, from origin or a local branch. */
+  'prepare-conversation': z.object({
+    workspaceDir: absolutePath,
+    baseBranch: refSchema,
+    source: z.enum(['origin', 'local']),
+    allowCurrentBranchDirty: z.boolean(),
+    remoteUrl: remoteUrlSchema.nullable(),
+    statusPathspecs: z.array(pathspecSchema).min(1).max(100),
+  }).strict(),
 } as const;
 
 export type WorktreeOp = keyof typeof worktreeOpParamsSchemas;
@@ -207,9 +244,42 @@ export const worktreeOpResultSchemas = {
   }).strict(),
   // removed: git removed it; missing: it was already gone; removable: a dry run that would remove it.
   remove: z.object({ outcome: z.enum(['removed', 'missing', 'removable']) }).strict(),
+  apply: z.object({ appliedToBranch: z.string().nullable() }).strict(),
+  update: z.object({ head: commitSchema }).strict(),
+  /** recovered: added back; false: it was already there on its branch. */
+  recover: z.object({ recovered: z.boolean() }).strict(),
+  'adopt-check': z.object({ path: absolutePath, branch: z.string().nullable(), repoRoot: absolutePath }).strict(),
+  publish: z.object({ commit: commitSchema }).strict(),
+  reconcile: z.object({ appliedToBranch: z.string().min(1) }).strict(),
+  'create-branch': z.object({ branch: z.string().min(1) }).strict(),
+  'prepare-conversation': z.object({ branch: z.string().min(1) }).strict(),
 } as const satisfies Record<WorktreeOp, z.ZodType>;
 
 export type WorktreeOpResult<Op extends WorktreeOp> = z.infer<(typeof worktreeOpResultSchemas)[Op]>;
+
+// ── Sealed git credential ──────────────────────────────────────────────────────────────────────
+
+const sealedGitCredentialSchema = z.object({
+  v: z.literal(1),
+  purpose: z.literal('git-credential'),
+  machineId: z.string().min(1).max(256),
+  /** The ticket it was sealed for: used once, with that operation only. */
+  opId: opIdSchema,
+  username: z.string().min(1).max(256).refine((value) => !CONTROL_CHARACTER.test(value)),
+  token: z.string().min(1).max(4096).refine((value) => !CONTROL_CHARACTER.test(value)),
+}).strict();
+
+export type SealedGitCredentialPayload = z.infer<typeof sealedGitCredentialSchema>;
+
+/** An opened credential, if it was sealed for this machine and this ticket. */
+export function readSealedGitCredential(
+  value: unknown,
+  expected: { machineId: string; opId: string },
+): { ok: true; username: string; token: string } | { ok: false } {
+  const parsed = sealedGitCredentialSchema.safeParse(value);
+  if (!parsed.success || parsed.data.machineId !== expected.machineId || parsed.data.opId !== expected.opId) return { ok: false };
+  return { ok: true, username: parsed.data.username, token: parsed.data.token };
+}
 
 // ── Attested result ────────────────────────────────────────────────────────────────────────────
 

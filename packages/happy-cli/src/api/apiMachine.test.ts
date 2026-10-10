@@ -474,7 +474,11 @@ describe('ApiMachineClient socket reconnection', () => {
     // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree.
     it('registers each worktree operation as a customer-bound machine method', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
-        for (const method of ['worktree:capability', 'worktree:prepare', 'worktree:create', 'worktree:status', 'worktree:remove']) {
+        for (const method of [
+            'worktree:capability', 'worktree:prepare', 'worktree:create', 'worktree:status', 'worktree:remove', 'worktree:apply',
+            'worktree:update', 'worktree:recover', 'worktree:adopt-check', 'worktree:publish', 'worktree:reconcile',
+            'worktree:create-branch', 'worktree:prepare-conversation',
+        ]) {
             expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
                 method, expect.any(Function), { customerBound: true },
             );
