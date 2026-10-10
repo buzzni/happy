@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as tar from 'tar';
@@ -30,13 +30,13 @@ async function archive(entries: (root: string) => Promise<void>): Promise<Buffer
     return readFile(file);
 }
 
-const goodArchive = () => archive(async (root) => {
-    await writeFile(join(root, 'fake-tool'), SCRIPT);
+const goodArchive = (script = SCRIPT) => archive(async (root) => {
+    await writeFile(join(root, 'fake-tool'), script);
     await chmod(join(root, 'fake-tool'), 0o755);
     await writeFile(join(root, 'README.md'), 'readme');
 });
 
-function tool(bytes: Buffer, overrides: Partial<ManagedMachineTool['artifacts']['darwin-arm64']> = {}): ManagedMachineTool {
+function tool(bytes: Buffer, overrides: Partial<ManagedMachineTool['artifacts']['darwin-arm64']> = {}, version = '1.0.0'): ManagedMachineTool {
     const artifact = {
         url: 'https://github.com/buzzni/fake/releases/download/v1.0.0/fake-tool-v1.tar.gz',
         sha256: sha256(bytes),
@@ -44,7 +44,7 @@ function tool(bytes: Buffer, overrides: Partial<ManagedMachineTool['artifacts'][
         executableSha256: sha256(SCRIPT),
         ...overrides,
     };
-    return { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: { 'darwin-arm64': artifact, 'linux-x64': artifact } };
+    return { id: 'buzzni.fake', version, executable: 'fake-tool', artifacts: { 'darwin-arm64': artifact, 'linux-x64': artifact } };
 }
 
 function serve(bytes: Buffer, finalUrl?: string) {
@@ -132,5 +132,105 @@ describe('managed machine tool installer', () => {
         const definition = tool(bytes);
         await Promise.all([1, 2, 3].map(() => installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch })));
         expect(fetch).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('managed machine tool stable executable link', () => {
+    const SCRIPT_V2 = '#!/bin/sh\necho managed-v2\n';
+    const linkPath = (root: string) => join(root, 'buzzni.fake', 'bin', 'fake-tool');
+    const versioned = (root: string, version: string) => join(root, 'buzzni.fake', version, 'fake-tool');
+
+    it('links bin/<executable> to the verified versioned executable after install and on verified reuse', async () => {
+        const root = await temporary('managed-tool-root-');
+        const bytes = await goodArchive();
+        const fetch = serve(bytes);
+        const definition = tool(bytes);
+        await installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch });
+        expect((await lstat(linkPath(root))).isSymbolicLink()).toBe(true);
+        expect(await realpath(linkPath(root))).toBe(await realpath(versioned(root, '1.0.0')));
+
+        await unlink(linkPath(root));
+        await installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch });
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(await realpath(linkPath(root))).toBe(await realpath(versioned(root, '1.0.0')));
+        expect((await readdir(join(root, 'buzzni.fake', 'bin'))).filter((name) => name.startsWith('.'))).toEqual([]);
+    });
+
+    it('moves the link to a newly installed version', async () => {
+        const root = await temporary('managed-tool-root-');
+        const v1 = await goodArchive();
+        const v2 = await goodArchive(SCRIPT_V2);
+        await installManagedMachineTool(tool(v1), { root, platform: 'darwin-arm64', fetch: serve(v1) });
+        await installManagedMachineTool(tool(v2, { executableSha256: sha256(SCRIPT_V2) }, '2.0.0'), { root, platform: 'darwin-arm64', fetch: serve(v2) });
+        expect(await realpath(linkPath(root))).toBe(await realpath(versioned(root, '2.0.0')));
+        await expect(readFile(linkPath(root), 'utf8')).resolves.toBe(SCRIPT_V2);
+    });
+
+    it('never creates or moves the link when executable verification fails', async () => {
+        const root = await temporary('managed-tool-root-');
+        const v1 = await goodArchive();
+        const v2 = await goodArchive(SCRIPT_V2);
+        await expect(installManagedMachineTool(tool(v1, { executableSha256: 'b'.repeat(64) }), { root, platform: 'darwin-arm64', fetch: serve(v1) }))
+            .rejects.toThrow('MANAGED_TOOL_EXECUTABLE_HASH_MISMATCH');
+        await expect(lstat(linkPath(root))).rejects.toThrow();
+
+        await installManagedMachineTool(tool(v1), { root, platform: 'darwin-arm64', fetch: serve(v1) });
+        await expect(installManagedMachineTool(tool(v2, { executableSha256: 'c'.repeat(64) }, '2.0.0'), { root, platform: 'darwin-arm64', fetch: serve(v2) }))
+            .rejects.toThrow('MANAGED_TOOL_EXECUTABLE_HASH_MISMATCH');
+        expect(await realpath(linkPath(root))).toBe(await realpath(versioned(root, '1.0.0')));
+    });
+
+    it('keeps the install but leaves a foreign file or linked bin directory untouched', async () => {
+        const fileRoot = await temporary('managed-tool-root-');
+        const bytes = await goodArchive();
+        await mkdir(join(fileRoot, 'buzzni.fake', 'bin'), { recursive: true });
+        await writeFile(linkPath(fileRoot), 'user file');
+        await expect(installManagedMachineTool(tool(bytes), { root: fileRoot, platform: 'darwin-arm64', fetch: serve(bytes) })).resolves.toMatchObject({ installed: true });
+        await expect(readFile(linkPath(fileRoot), 'utf8')).resolves.toBe('user file');
+        expect(await managedMachineToolStatus(tool(bytes), fileRoot, 'darwin-arm64')).not.toHaveProperty('executablePath');
+
+        const dirRoot = await temporary('managed-tool-root-');
+        const elsewhere = await temporary('managed-tool-elsewhere-');
+        await mkdir(join(dirRoot, 'buzzni.fake'), { recursive: true });
+        await symlink(elsewhere, join(dirRoot, 'buzzni.fake', 'bin'));
+        await expect(installManagedMachineTool(tool(bytes), { root: dirRoot, platform: 'darwin-arm64', fetch: serve(bytes) })).resolves.toMatchObject({ installed: true });
+        expect(await readdir(elsewhere)).toEqual([]);
+    });
+
+    it('does not refresh the stable link through a replaced tool directory symlink', async () => {
+        const root = await temporary('managed-tool-root-');
+        const bytes = await goodArchive();
+        const definition = tool(bytes);
+        await installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch: serve(bytes) });
+
+        const toolDirectory = join(root, 'buzzni.fake');
+        const outside = await temporary('managed-tool-outside-');
+        const outsideToolDirectory = join(outside, 'buzzni.fake');
+        await rename(toolDirectory, outsideToolDirectory);
+        await rm(join(outsideToolDirectory, 'bin'), { recursive: true, force: true });
+        await symlink(outsideToolDirectory, toolDirectory);
+
+        await expect(installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch: serve(bytes) }))
+            .resolves.toMatchObject({ installed: true });
+        await expect(lstat(join(outsideToolDirectory, 'bin'))).rejects.toThrow();
+    });
+
+    it('reports the stable path, version and pinned digest only for a verified install', async () => {
+        const root = await temporary('managed-tool-root-');
+        const bytes = await goodArchive();
+        const definition = tool(bytes);
+        const before = await managedMachineToolStatus(definition, root, 'darwin-arm64');
+        for (const field of ['executablePath', 'resolvedVersion', 'executableSha256']) expect(before).not.toHaveProperty(field);
+
+        await installManagedMachineTool(definition, { root, platform: 'darwin-arm64', fetch: serve(bytes) });
+        await expect(managedMachineToolStatus(definition, root, 'darwin-arm64')).resolves.toEqual({
+            toolId: 'buzzni.fake', version: '1.0.0', platform: 'darwin-arm64', supported: true, installed: true,
+            executablePath: linkPath(root), resolvedVersion: '1.0.0', executableSha256: sha256(SCRIPT),
+        });
+
+        await writeFile(versioned(root, '1.0.0'), '#!/bin/sh\necho tampered\n');
+        const tampered = await managedMachineToolStatus(definition, root, 'darwin-arm64');
+        expect(tampered).toMatchObject({ installed: false });
+        for (const field of ['executablePath', 'resolvedVersion', 'executableSha256']) expect(tampered).not.toHaveProperty(field);
     });
 });

@@ -10,6 +10,7 @@ import {
     createManagedProjectWriteScopePolicy,
     createProfileAwareMachineRunHandler,
     createTrustedMachineRunProfileResolver,
+    TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
     type MachineRunProfile,
 } from './machineRunProfile';
 import type { TypedMachineRunRequest, TypedMachineRunResponse } from './typedMachineRun';
@@ -354,6 +355,58 @@ describe('profile-aware machine.run adapter', () => {
         }
     });
 
+    it('advertises the stable link for an installed tool but executes only the re-verified versioned binary', async () => {
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const script = '#!/bin/sh\necho managed\n';
+            const source = join(root, 'src');
+            await mkdir(join(source, 'fake-tool-v1'), { recursive: true });
+            await writeFile(join(source, 'fake-tool-v1', 'fake-tool'), script, { mode: 0o755 });
+            await tar.c({ gzip: true, file: join(root, 'a.tar.gz'), cwd: source, portable: true }, ['fake-tool-v1']);
+            const bytes = await readFile(join(root, 'a.tar.gz'));
+            const artifact = {
+                url: 'https://github.com/buzzni/fake/releases/download/v1/fake-tool-v1.tar.gz',
+                sha256: createHash('sha256').update(bytes).digest('hex'),
+                archiveRoot: 'fake-tool-v1',
+                executableSha256: createHash('sha256').update(script).digest('hex'),
+            };
+            const fakeTool = { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: { 'darwin-arm64': artifact, 'linux-x64': artifact } };
+            const toolsRoot = join(root, 'tools');
+            const stablePath = join(toolsRoot, 'buzzni.fake', 'bin', 'fake-tool');
+            const versionedPath = join(toolsRoot, 'buzzni.fake', '1.0.0', 'fake-tool');
+            const resolver = createTrustedMachineRunProfileResolver([profile({ id: 'buzzni.fake.run', executable: 'fake-tool', argv: ['x'], parameters: {} })]);
+            let wrapper = '';
+            const handler = createProfileAwareMachineRunHandler(root, resolver, {
+                platform: 'darwin',
+                tempDirectory: root,
+                environment: { PATH: '/usr/bin:/bin' },
+                managedTools: { root: toolsRoot, tools: [fakeTool], platform: 'darwin-arm64' },
+                typedHandler: vi.fn(async (request: TypedMachineRunRequest, trusted): Promise<TypedMachineRunResponse> => {
+                    if (request.action !== 'start' || !trusted?.env.PATH) throw new Error('unexpected request');
+                    wrapper = await readFile(join(trusted.env.PATH, 'fake-tool'), 'utf8');
+                    return { version: 1, action: 'start', operationId: 'op-1', state: 'accepted' };
+                }),
+            });
+            const before = await handler({ action: 'capabilities' });
+            if (before.action !== 'capabilities') throw new Error('not capabilities');
+            for (const field of ['executablePath', 'resolvedVersion', 'executableSha256']) expect(before.tools[0]).not.toHaveProperty(field);
+
+            await installManagedMachineTool(fakeTool, {
+                root: toolsRoot, platform: 'darwin-arm64',
+                fetch: async () => ({ ok: true, status: 200, url: artifact.url, headers: new Headers(), arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer }),
+            });
+            await expect(handler({ action: 'capabilities' })).resolves.toMatchObject({
+                tools: [{ toolId: 'buzzni.fake', version: '1.0.0', supported: true, installed: true, executablePath: stablePath, resolvedVersion: '1.0.0', executableSha256: artifact.executableSha256 }],
+            });
+
+            await handler({ action: 'start', profileId: 'buzzni.fake.run', profileDigest: resolver.list()[0].profileDigest, workspaceRoot: root, parameters: {} });
+            expect(wrapper).toContain(`exec '${versionedPath}'`);
+            expect(wrapper).not.toContain(stablePath);
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
     it('does not advertise a managed-tool profile on a platform without a pinned artifact', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
         try {
@@ -400,3 +453,46 @@ describe('profile-aware machine.run adapter', () => {
         }
     });
 });
+
+/**
+ * Desktop keeps the same fixture under its `tests/` and asserts it sends exactly
+ * these shapes. Both copies must change together, or Desktop and the daemon
+ * drift into requests one side rejects.
+ */
+describe('Desktop machine.run request conformance (v1 fixture)', () => {
+    type FixtureRequests = Record<'capabilities' | 'start' | 'status' | 'cancel', Record<string, unknown>>;
+    const fixture = (): Promise<FixtureRequests> => readFile(join(__dirname, '__fixtures__', 'desktop-machine-run-requests.v1.json'), 'utf8').then((raw) => JSON.parse(raw) as FixtureRequests);
+    const handler = (root: string) => createProfileAwareMachineRunHandler(root, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, {
+        platform: 'darwin',
+        typedHandler: vi.fn(async (request: TypedMachineRunRequest): Promise<TypedMachineRunResponse> => {
+            if (request.action === 'cancel') return { version: 1, action: 'cancel', operationId: request.operationId, state: 'already-terminal', remoteMayContinue: false, descendantsReaped: true, processGroupEvidence: { kind: 'no-local-trace' } };
+            if (request.action === 'status') return { version: 1, action: 'status', operationId: request.operationId, state: 'passed', stdout: '', stderr: '', exitCode: 0, truncated: false, timedOut: false, remoteMayContinue: false, descendantsReaped: true, processGroupEvidence: { kind: 'no-local-trace' } };
+            throw new Error('unexpected start');
+        }),
+    });
+
+    it('accepts every Desktop request shape at the daemon boundary', async () => {
+        const requests = await fixture();
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const machineRun = handler(root);
+            await expect(machineRun(requests.capabilities)).resolves.toMatchObject({ action: 'capabilities', version: 1 });
+            // Shape, profile id and pinned digest all pass; only the fixture's
+            // workspace (outside this daemon's root) stops it. A digest drift
+            // fails here with MACHINE_RUN_PROFILE_DIGEST_MISMATCH instead.
+            await expect(machineRun(requests.start)).rejects.toThrow('MACHINE_RUN_WORKSPACE_ROOT_DENIED');
+            await expect(machineRun(requests.status)).resolves.toMatchObject({ action: 'status', operationId: 'op-1' });
+            await expect(machineRun(requests.cancel)).resolves.toMatchObject({ action: 'cancel', operationId: 'op-1' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it.each(['status', 'cancel'] as const)('rejects a %s request carrying start-only fields', async (action) => {
+        const requests = await fixture();
+        const machineRun = handler(tmpdir());
+        await expect(machineRun({ ...requests[action], workspaceRoot: '/workspace/project' })).rejects.toThrow('MACHINE_RUN_INVALID: unknown field workspaceRoot');
+        await expect(machineRun({ ...requests[action], profileDigest: requests.start.profileDigest })).rejects.toThrow('MACHINE_RUN_INVALID: unknown field profileDigest');
+    });
+});
+

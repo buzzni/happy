@@ -1,0 +1,6 @@
+{
+  "capabilities": { "action": "capabilities", "version": 1 },
+  "start": { "action": "start", "profileId": "buzzni.moai.status", "profileDigest": "24dea4a121c0527eaacdb5d24e88085d31b4402d08437c49a0157b9f824e3672", "workspaceRoot": "/workspace/project", "parameters": {} },
+  "status": { "action": "status", "operationId": "op-1" },
+  "cancel": { "action": "cancel", "operationId": "op-1" }
+}
