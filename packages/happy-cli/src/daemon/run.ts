@@ -306,6 +306,7 @@ import {
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
 import { createCheckpointRestartQueue, restartCheckpointProtectedSession } from './checkpointProtectedRestart';
+import { createRequestEnvironmentMemory } from './requestEnvironmentMemory';
 import { stopServerProcess } from './stopServer';
 import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
 import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
@@ -2951,6 +2952,8 @@ export async function startDaemon(): Promise<void> {
     // two RPCs 6.7s apart double-spawned a session; both children were later
     // empty-reaped together).
     const resumeInFlight = new Map<string, Promise<ResumeSessionResult>>();
+    // Client-sent env per session, memory only; daemon-started resumes re-send it (Chat org env).
+    const requestEnvironments = createRequestEnvironmentMemory();
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
 
@@ -3092,6 +3095,8 @@ export async function startDaemon(): Promise<void> {
         const result = await spawnResumedSession(serverSession.id, {
           model: options.model,
           permissionMode: options.permissionMode,
+          // The new-session branch below passes it too; dropping it here started the child without it.
+          environmentVariables: options.environmentVariables,
           mcpCallerGrantEnvelope: options.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options.mcpConfigProjectId,
           expectedConnectors: options.expectedConnectors,
@@ -3408,6 +3413,7 @@ export async function startDaemon(): Promise<void> {
       // A concurrent resume owns a different prompt; retry attention after its webhook.
       if (resumeInFlight.has(sessionId)) throw new Error('Attention session resume is already in progress');
       const result = await resumeSession(sessionId, {
+        environmentVariables: requestEnvironments.recall(sessionId),
         automation: { directory, initialPrompt: text, exitAfterFirstTurn: true,
           environmentVariables: { HAPPY_INITIAL_PROMPT_LOCAL_ID: localId } },
       });
@@ -3666,7 +3672,7 @@ export async function startDaemon(): Promise<void> {
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
       stopSession,
-      spawnSession,
+      spawnSession: requestEnvironments.rememberSpawn(spawnSession),
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
       onHappySessionRuntime,
@@ -4749,9 +4755,9 @@ export async function startDaemon(): Promise<void> {
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
       ...(channelHost ? { channelHostCall: channelHost.call } : {}),
-      spawnSession,
-      resumeSession,
-      recoverSession,
+      spawnSession: requestEnvironments.rememberSpawn(spawnSession),
+      resumeSession: requestEnvironments.rememberResume(resumeSession),
+      recoverSession: requestEnvironments.rememberResume(recoverSession),
       stopSession,
       stopSessionWithExitVerification,
       requestShutdown: () => {
