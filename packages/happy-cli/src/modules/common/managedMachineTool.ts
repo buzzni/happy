@@ -129,12 +129,8 @@ async function extract(archivePath: string, artifact: ManagedMachineToolArtifact
     await tar.x({ file: archivePath, cwd: destination, strict: true, preservePaths: false, filter: (path, entry) => allowed(path, (entry as tar.ReadEntry).type) });
 }
 
-async function install(tool: ManagedMachineTool, options: ManagedMachineToolInstallOptions): Promise<ManagedMachineToolStatus> {
-    const artifact = options.platform ? tool.artifacts[options.platform] : undefined;
-    if (!artifact) fail('MANAGED_TOOL_UNSUPPORTED_PLATFORM');
-    const current = await managedMachineToolStatus(tool, options.root, options.platform);
-    if (current.installed) return current;
-
+/** Download, verify and atomically commit one version directory. */
+async function installVersion(tool: ManagedMachineTool, artifact: ManagedMachineToolArtifact, options: ManagedMachineToolInstallOptions): Promise<void> {
     const parent = join(options.root, tool.id);
     await mkdir(parent, { recursive: true, mode: 0o700 });
     const parentInfo = await lstat(parent);
@@ -158,10 +154,18 @@ async function install(tool: ManagedMachineTool, options: ManagedMachineToolInst
         const target = versionDirectory(tool, options.root);
         if (await lstat(target).catch(() => null)) await rename(target, join(stage, 'replaced'));
         await rename(staged, target);
-        return await managedMachineToolStatus(tool, options.root, options.platform);
     } finally {
         await rm(stage, { recursive: true, force: true });
     }
+}
+
+async function install(tool: ManagedMachineTool, options: ManagedMachineToolInstallOptions): Promise<ManagedMachineToolStatus> {
+    const artifact = options.platform ? tool.artifacts[options.platform] : undefined;
+    if (!artifact) fail('MANAGED_TOOL_UNSUPPORTED_PLATFORM');
+    const current = await managedMachineToolStatus(tool, options.root, options.platform);
+    if (current.installed) return current;
+    await installVersion(tool, artifact, options);
+    return await managedMachineToolStatus(tool, options.root, options.platform);
 }
 
 /** Idempotent; concurrent installs of one tool version share a single download. */
