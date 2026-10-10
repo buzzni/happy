@@ -10,6 +10,7 @@ import {
     createManagedProjectWriteScopePolicy,
     createProfileAwareMachineRunHandler,
     createTrustedMachineRunProfileResolver,
+    TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
     type MachineRunProfile,
 } from './machineRunProfile';
 import type { TypedMachineRunRequest, TypedMachineRunResponse } from './typedMachineRun';
@@ -452,3 +453,46 @@ describe('profile-aware machine.run adapter', () => {
         }
     });
 });
+
+/**
+ * Desktop keeps the same fixture under its `tests/` and asserts it sends exactly
+ * these shapes. Both copies must change together, or Desktop and the daemon
+ * drift into requests one side rejects.
+ */
+describe('Desktop machine.run request conformance (v1 fixture)', () => {
+    type FixtureRequests = Record<'capabilities' | 'start' | 'status' | 'cancel', Record<string, unknown>>;
+    const fixture = (): Promise<FixtureRequests> => readFile(join(__dirname, '__fixtures__', 'desktop-machine-run-requests.v1.json'), 'utf8').then((raw) => JSON.parse(raw) as FixtureRequests);
+    const handler = (root: string) => createProfileAwareMachineRunHandler(root, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, {
+        platform: 'darwin',
+        typedHandler: vi.fn(async (request: TypedMachineRunRequest): Promise<TypedMachineRunResponse> => {
+            if (request.action === 'cancel') return { version: 1, action: 'cancel', operationId: request.operationId, state: 'already-terminal', remoteMayContinue: false, descendantsReaped: true, processGroupEvidence: { kind: 'no-local-trace' } };
+            if (request.action === 'status') return { version: 1, action: 'status', operationId: request.operationId, state: 'passed', stdout: '', stderr: '', exitCode: 0, truncated: false, timedOut: false, remoteMayContinue: false, descendantsReaped: true, processGroupEvidence: { kind: 'no-local-trace' } };
+            throw new Error('unexpected start');
+        }),
+    });
+
+    it('accepts every Desktop request shape at the daemon boundary', async () => {
+        const requests = await fixture();
+        const root = await mkdtemp(join(tmpdir(), 'happy-machine-profile-'));
+        try {
+            const machineRun = handler(root);
+            await expect(machineRun(requests.capabilities)).resolves.toMatchObject({ action: 'capabilities', version: 1 });
+            // Shape, profile id and pinned digest all pass; only the fixture's
+            // workspace (outside this daemon's root) stops it. A digest drift
+            // fails here with MACHINE_RUN_PROFILE_DIGEST_MISMATCH instead.
+            await expect(machineRun(requests.start)).rejects.toThrow('MACHINE_RUN_WORKSPACE_ROOT_DENIED');
+            await expect(machineRun(requests.status)).resolves.toMatchObject({ action: 'status', operationId: 'op-1' });
+            await expect(machineRun(requests.cancel)).resolves.toMatchObject({ action: 'cancel', operationId: 'op-1' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it.each(['status', 'cancel'] as const)('rejects a %s request carrying start-only fields', async (action) => {
+        const requests = await fixture();
+        const machineRun = handler(tmpdir());
+        await expect(machineRun({ ...requests[action], workspaceRoot: '/workspace/project' })).rejects.toThrow('MACHINE_RUN_INVALID: unknown field workspaceRoot');
+        await expect(machineRun({ ...requests[action], profileDigest: requests.start.profileDigest })).rejects.toThrow('MACHINE_RUN_INVALID: unknown field profileDigest');
+    });
+});
+
