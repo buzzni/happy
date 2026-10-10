@@ -14,3 +14,4 @@ export * from './rpcLatency';
 export * from './rpcBinding';
 export * from './machineKeyAttestation';
 export * from './sealedSpawnEnv';
+export * from './worktreeOps';
