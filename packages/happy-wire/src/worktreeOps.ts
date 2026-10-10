@@ -152,7 +152,7 @@ export const worktreeOpParamsSchemas = {
     copyOwnerRuntimeFiles: z.boolean(),
     expectedRepoRoot: absolutePath.nullable(),
     /** Fetch an origin base from this address (with a sealed credential) instead of the `origin` remote. */
-    remoteUrl: remoteUrlSchema.nullable(),
+    remoteUrl: remoteUrlSchema.nullable().default(null),
   }).strict()
     .refine((params) => !params.snapshotCurrent || (params.baseRef === null && params.baseSource === 'local'), 'snapshot with a chosen base')
     .refine((params) => params.baseSource !== 'origin' || params.baseRef !== null, 'origin base without a branch')

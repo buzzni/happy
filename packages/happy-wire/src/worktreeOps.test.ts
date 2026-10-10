@@ -91,6 +91,14 @@ describe('worktree operation ticket', () => {
     expect(readWorktreeTicket(ticket())).toMatchObject({ ok: true, ticket: { op: 'create', params: { name: 'bright-fox-1a2b' } } });
   });
 
+  it('accepts version-1 create tickets issued before remoteUrl was added', () => {
+    const { remoteUrl: _remoteUrl, ...legacyParams } = ticket().params;
+    expect(readWorktreeTicket(ticket({ params: legacyParams }))).toMatchObject({
+      ok: true,
+      ticket: { params: { remoteUrl: null } },
+    });
+  });
+
   it('refuses a ticket with unknown fields, an unknown operation or params of another operation', () => {
     expect(readWorktreeTicket(ticket({ extra: 1 })).ok).toBe(false);
     expect(readWorktreeTicket(ticket({ op: 'format-disk' })).ok).toBe(false);
