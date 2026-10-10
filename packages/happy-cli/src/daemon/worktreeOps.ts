@@ -118,11 +118,18 @@ function terminateProcessTree(child: ChildProcess): void {
     }
 }
 
-function runGit(cwd: string, args: string[], options: { timeoutMs?: number; network?: boolean } = {}): Promise<GitResult> {
+type GitOptions = {
+    timeoutMs?: number;
+    network?: boolean;
+    /** A read: no optional index refresh, so a `git commit` running in the worktree never meets our lock. */
+    readOnly?: boolean;
+};
+
+function runGit(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
     return new Promise((resolvePromise) => {
         const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], {
             cwd,
-            env: options.network ? networkGitEnv() : localGitEnv(),
+            env: { ...(options.network ? networkGitEnv() : localGitEnv()), ...(options.readOnly ? { GIT_OPTIONAL_LOCKS: '0' } : {}) },
             windowsHide: true,
             stdio: ['ignore', 'pipe', 'pipe'],
             ...(process.platform === 'win32' ? {} : { detached: true }),
@@ -162,7 +169,7 @@ function gitError(result: GitResult): string {
 }
 
 /** Output of a git command that must succeed. */
-async function gitOk(cwd: string, args: string[], errorCode: string, options?: { timeoutMs?: number; network?: boolean }): Promise<string> {
+async function gitOk(cwd: string, args: string[], errorCode: string, options?: GitOptions): Promise<string> {
     const result = await runGit(cwd, args, options);
     if (result.code !== 0) throw new OpFailure(errorCode, gitError(result));
     return result.stdout;
@@ -189,6 +196,8 @@ function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
     let allowed: Promise<string> | null = null;
     return {
         async directory(path) {
+            // A path only another platform calls absolute would resolve against the daemon's cwd.
+            if (!isAbsolute(path)) throw new OpFailure('PATH_DENIED', 'Not an absolute path on this machine');
             allowed ??= realpath(allowedRoot);
             let real: string;
             try {
@@ -219,7 +228,18 @@ function ownsWorktreeName(parts: string[], projectId: string): boolean {
 
 type WorktreeTarget = { repoRoot: string; path: string; exists: boolean };
 
-/** A worktree this project's ticket may touch: managed, in an allowed repository, landing where it says. */
+/** The worktrees git has registered for this repository, by real '/'-separated path. */
+async function registeredWorktrees(repoRoot: string): Promise<Set<string>> {
+    const listed = await gitOk(repoRoot, ['worktree', 'list', '--porcelain', '-z'], 'WORKTREE_LIST_FAILED', { readOnly: true });
+    const paths = listed.split('\0').filter((field) => field.startsWith('worktree ')).map((field) => field.slice('worktree '.length));
+    return new Set(await Promise.all(paths.map((path) => realpath(path).then(slashed, () => slashed(path)))));
+}
+
+/**
+ * A worktree this project's ticket may touch: managed, in an allowed repository, landing where it
+ * says. A folder git has not registered as a worktree counts as missing, as the server's
+ * "not a working tree" does: git run inside it would read the repository around it.
+ */
 async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: string): Promise<WorktreeTarget> {
     const denied = new OpFailure('PATH_DENIED', 'Not a worktree of this project');
     const lexicalRoot = isManagedWorktreePath(path) ? resolveWorktreeRepoRoot(path) : null;
@@ -238,7 +258,7 @@ async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: 
         throw denied;
     }
     if (!inside(repoRoot, real) || !ownsWorktreeName(relative(repoRoot, real).split(sep), projectId)) throw denied;
-    return { repoRoot, path: real, exists: true };
+    return { repoRoot, path: real, exists: (await registeredWorktrees(repoRoot)).has(slashed(real)) };
 }
 
 // ── Serialization ──────────────────────────────────────────────────────────────────────────────
@@ -266,12 +286,12 @@ async function repositoryRoot(dir: string): Promise<string | null> {
 // ── Operations ─────────────────────────────────────────────────────────────────────────────────
 
 async function readCapability(dir: string): Promise<WorktreeOpResult<'capability'>> {
-    const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree']);
+    const inside = await runGit(dir, ['rev-parse', '--is-inside-work-tree'], { readOnly: true });
     if (inside.code !== 0 || inside.stdout.trim() !== 'true') return { capable: false, reason: 'not-git', branch: null, branches: [] };
     const [head, refs, list] = await Promise.all([
-        runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
-        runGit(dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']),
-        runGit(dir, ['worktree', 'list', '--porcelain']),
+        runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { readOnly: true }),
+        runGit(dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], { readOnly: true }),
+        runGit(dir, ['worktree', 'list', '--porcelain'], { readOnly: true }),
     ]);
     const branch = head.code === 0 ? head.stdout.trim() || null : null;
     const branches = Array.from(new Set(refs.stdout.split('\n').map((line) => line.trim()).filter(Boolean)));
@@ -323,8 +343,24 @@ async function snapshotCurrent(dir: string): Promise<{ revision: string; branch:
     return { revision, branch: head.code === 0 ? head.stdout.trim() || null : null };
 }
 
-/** `.env` files and `.worktreeinclude` entries, copied only from inside the repository. */
+/** The nearest existing folder at or above `path`, by its real path, is inside `root`. */
+async function landsInside(root: string, path: string): Promise<boolean> {
+    for (let current = path; ; current = dirname(current)) {
+        try {
+            return inside(root, await realpath(current));
+        } catch {
+            if (dirname(current) === current) return false;
+        }
+    }
+}
+
+/**
+ * `.env` files and `.worktreeinclude` entries. Read only from inside the repository and written
+ * only inside the new worktree, judged by real paths: a link on either side (an untracked one in
+ * the owner's checkout, a committed one in the worktree) must not carry a copy out.
+ */
 async function copyIncludes(repo: string, worktree: string, prefix: string): Promise<void> {
+    const [realRepo, realWorktree] = await Promise.all([realpath(repo), realpath(worktree)]);
     const from = join(repo, prefix);
     const listed = await readFile(join(from, '.worktreeinclude'), 'utf8').catch(() => '');
     const entries = [
@@ -337,12 +373,15 @@ async function copyIncludes(repo: string, worktree: string, prefix: string): Pro
         const target = join(worktree, prefix, entry);
         if (!inside(repo, source) || !inside(worktree, target)) continue;
         try {
-            await lstat(source);
+            if (!inside(realRepo, await realpath(source))) continue;
         } catch {
             continue;
         }
         try {
+            if (!await landsInside(realWorktree, dirname(target))) continue;
             await mkdir(dirname(target), { recursive: true });
+            if (!inside(realWorktree, await realpath(dirname(target)))) continue;
+            if ((await lstat(target).catch(() => null))?.isSymbolicLink()) continue;
             await cp(source, target, { recursive: true, force: true, verbatimSymlinks: true });
         } catch (error) {
             logger.debug('[worktree-ops] include not copied', { entry, error: error instanceof Error ? error.message : String(error) });
@@ -426,8 +465,8 @@ async function worktreeStatus(guard: PathGuard, ticket: WorktreeTicket & { op: '
     const params: WorktreeOpParams<'status'> = ticket.params;
     const target = await resolveWorktreeTarget(guard, params.worktreePath, ticket.projectId);
     if (!target.exists) throw new OpFailure('WORKTREE_PATH_MISSING', '작업 환경 경로를 찾을 수 없습니다.');
-    const status = await gitOk(target.path, ['status', '--porcelain'], 'WORKTREE_STATUS_FAILED');
-    const counts = (await gitOk(target.path, ['rev-list', '--left-right', '--count', `${params.baseBranch ?? 'HEAD'}...${params.branch}`], 'WORKTREE_STATUS_FAILED'))
+    const status = await gitOk(target.path, ['status', '--porcelain'], 'WORKTREE_STATUS_FAILED', { readOnly: true });
+    const counts = (await gitOk(target.path, ['rev-list', '--left-right', '--count', `${params.baseBranch ?? 'HEAD'}...${params.branch}`], 'WORKTREE_STATUS_FAILED', { readOnly: true }))
         .trim().split(/\s+/).map((value) => Number.parseInt(value, 10));
     const count = (value: number | undefined) => (Number.isFinite(value) && value! >= 0 ? value! : 0);
     return { dirty: status.trim() !== '', behind: count(counts[0]), ahead: count(counts[1]) };
@@ -439,11 +478,11 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     if (!target.exists) return { outcome: 'missing' };
     return serialized(target.repoRoot, async () => {
         // Checked before anything is stopped or removed: a refusal leaves everything as it was.
-        const status = await runGit(target.path, ['status', '--porcelain']);
+        const status = await runGit(target.path, ['status', '--porcelain'], { readOnly: true });
         if (!params.force) {
             if (status.code !== 0) throw new OpFailure('WORKTREE_REMOVE_FAILED', gitError(status));
             if (status.stdout.trim()) throw new OpFailure('WORKTREE_DIRTY', 'contains modified or untracked files');
-            if (params.branch && (await runGit(target.repoRoot, ['merge-base', '--is-ancestor', params.branch, 'HEAD'])).code !== 0) {
+            if (params.branch && (await runGit(target.repoRoot, ['merge-base', '--is-ancestor', params.branch, 'HEAD'], { readOnly: true })).code !== 0) {
                 throw new OpFailure('WORKTREE_DIRTY', 'contains changes not applied to the default version');
             }
         }
@@ -462,10 +501,12 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
 
 // ── Handlers ───────────────────────────────────────────────────────────────────────────────────
 
+// Process-wide: a daemon that reconnects builds new handlers, and a used ticket must stay used.
+const usedTickets = new RpcNonceGuard({ windowMs: WORKTREE_TICKET_MAX_TTL_MS + ISSUE_SKEW_MS, maxEntries: 10_000, whenFull: 'refuse' });
+
 export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<WorktreeOpsMethod, (request: unknown) => Promise<WorktreeOpAnswer>> {
     const now = deps.now ?? Date.now;
     const guard = pathGuard(deps.allowedRoot, deps.happyHomeDir);
-    const tickets = new RpcNonceGuard({ windowMs: WORKTREE_TICKET_MAX_TTL_MS + ISSUE_SKEW_MS, maxEntries: 10_000, whenFull: 'refuse' });
 
     const run = (ticket: WorktreeTicket): Promise<Record<string, unknown>> => {
         switch (ticket.op) {
@@ -487,7 +528,7 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
         if (ticket.machineId !== machine.id) return refused('TICKET_WRONG_MACHINE', 'This ticket is for another machine');
         const at = now();
         if (at > ticket.expiresAt || ticket.issuedAt > at + ISSUE_SKEW_MS) return refused('TICKET_EXPIRED', 'This ticket is not valid now');
-        const admission = tickets.admit(ticket.opId, ticket.issuedAt, at);
+        const admission = usedTickets.admit(ticket.opId, ticket.issuedAt, at);
         if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
         if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
 

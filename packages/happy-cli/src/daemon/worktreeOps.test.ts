@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,7 +26,6 @@ const NOW = 1_790_000_000_000;
 let root: string;
 let home: string;
 let repo: string;
-let seq = 0;
 
 function git(cwd: string, ...args: string[]): string {
     return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' }).trim();
@@ -42,9 +41,8 @@ function handlers(overrides: { allowedRoot?: string; machine?: typeof machine } 
 }
 
 function ticket(op: WorktreeOp, params: Record<string, unknown>, over: Record<string, unknown> = {}) {
-    seq += 1;
     return {
-        v: 1, opId: Buffer.alloc(16, seq).toString('base64'), op, projectId: 'p1', machineId: 'm1',
+        v: 1, opId: randomBytes(16).toString('base64'), op, projectId: 'p1', machineId: 'm1',
         issuedAt: NOW - 1000, expiresAt: NOW + 60_000, params, ...over,
     };
 }
@@ -102,6 +100,12 @@ describe('worktree ops tickets', () => {
         expect(await set['worktree:capability']({ ticket: once })).toMatchObject({ success: false, errorCode: 'TICKET_REPLAYED' });
     });
 
+    it('remembers used tickets across handler sets, as a reconnect makes a new one', async () => {
+        const once = ticket('capability', { workspaceDir: repo });
+        expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: true });
+        expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: false, errorCode: 'TICKET_REPLAYED' });
+    });
+
     it('needs a machine key to sign with', async () => {
         expect(await call('capability', { workspaceDir: repo }, {}, handlers({ machine: { ...machine, encryptionVariant: 'legacy' } })))
             .toMatchObject({ success: false, errorCode: 'WORKTREE_OPS_UNSUPPORTED' });
@@ -147,6 +151,10 @@ describe('worktree:capability and worktree:prepare', () => {
         expect(await call('capability', { workspaceDir: home })).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
         expect(await call('prepare', { workspaceDir: tmpdir() })).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
         expect(await call('capability', { workspaceDir: join(root, 'missing') })).toMatchObject({ success: false, errorCode: 'WORKSPACE_MISSING' });
+    });
+
+    it.skipIf(process.platform === 'win32')('refuses a path another platform would call absolute', async () => {
+        expect(await call('capability', { workspaceDir: 'C:/repo' })).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
     });
 });
 
@@ -215,6 +223,33 @@ describe('worktree:create', () => {
         expect(existsSync(join(answer.result.path, '../outside.txt'))).toBe(false);
     });
 
+    it('copies nothing read through a link that leaves the repository', async () => {
+        const outside = join(root, 'outside');
+        mkdirSync(outside);
+        writeFileSync(join(outside, 'secret.txt'), 'no');
+        symlinkSync(outside, join(repo, 'linked'));
+        writeFileSync(join(repo, '.worktreeinclude'), 'linked/secret.txt\n');
+        const answer = await call('create', create());
+        expect(answer.success).toBe(true);
+        expect(existsSync(join(answer.result.path, 'linked/secret.txt'))).toBe(false);
+    });
+
+    it('writes nothing through a link in the new worktree that leaves it', async () => {
+        const outside = join(root, 'outside');
+        mkdirSync(outside);
+        symlinkSync(outside, join(repo, 'cfg'));
+        git(repo, 'add', '-A');
+        git(repo, 'commit', '--quiet', '-m', 'link');
+        // The owner's checkout has a real folder where the committed tree has the link.
+        rmSync(join(repo, 'cfg'));
+        mkdirSync(join(repo, 'cfg'));
+        writeFileSync(join(repo, 'cfg/local.json'), '{}');
+        writeFileSync(join(repo, '.worktreeinclude'), 'cfg/local.json\n');
+        const answer = await call('create', create());
+        expect(answer.success).toBe(true);
+        expect(existsSync(join(outside, 'local.json'))).toBe(false);
+    });
+
     it('reports a name already taken', async () => {
         git(repo, 'branch', 'bright-fox');
         expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_NAME_CONFLICT' });
@@ -239,6 +274,16 @@ describe('worktree:status', () => {
         writeFileSync(join(result.path, 'dirty.txt'), 'x');
         expect((await call('status', { worktreePath: result.path, branch: 'bright-fox', baseBranch: 'main' })).result)
             .toEqual({ dirty: true, behind: 0, ahead: 1 });
+    });
+
+    it('treats a folder git does not know as a worktree as missing, never reading the repository around it', async () => {
+        const stray = join(repo, '.aplus/worktrees/p1/stray');
+        mkdirSync(stray, { recursive: true });
+        writeFileSync(join(repo, 'dirty.txt'), 'x');
+        expect(await call('status', { worktreePath: stray, branch: 'stray', baseBranch: 'main' }))
+            .toMatchObject({ success: false, errorCode: 'WORKTREE_PATH_MISSING' });
+        expect((await call('remove', { worktreePath: stray, branch: 'stray', force: false, dryRun: false })).result).toEqual({ outcome: 'missing' });
+        expect(existsSync(stray)).toBe(true);
     });
 
     it('reports a missing worktree path', async () => {
