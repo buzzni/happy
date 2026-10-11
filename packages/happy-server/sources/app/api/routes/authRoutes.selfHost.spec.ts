@@ -223,3 +223,47 @@ describe("authRoutes with self-host hardening", () => {
         expect((await app.inject({ method: "POST", url: "/v1/auth", payload: body })).statusCode).toBe(400);
     });
 });
+
+// specs/headless-standalone-server R26 (T32): bad input on a public auth route is a client error, not a 500
+// with a stack in the log. Applies with and without the self-host env (approval 8).
+describe.each([
+    ["without self-host hardening", () => undefined],
+    ["with self-host hardening", hardened],
+])("authRoutes input errors %s", (_label, policy) => {
+    const unpadded = (bytes: Uint8Array) => b64(bytes).replace(/=+$/, "");
+
+    it("answers 400 to undecodable or wrong-length signing fields, and keeps 401 for a bad signature", async () => {
+        const app = await createApp(policy());
+        const good = signedBody(owner);
+        for (const body of [
+            { ...good, challenge: "x" },
+            { ...good, signature: "y" },
+            { ...good, publicKey: "AAAA" },
+            { ...good, signature: b64(new Uint8Array(10)) },
+        ]) {
+            const res = await app.inject({ method: "POST", url: "/v1/auth", payload: body });
+            expect(res.statusCode).toBe(400);
+        }
+        const wrongSignature = { ...good, signature: b64(new Uint8Array(64)) };
+        expect((await app.inject({ method: "POST", url: "/v1/auth", payload: wrongSignature })).statusCode).toBe(401);
+    });
+
+    it("still accepts base64 without padding", async () => {
+        const app = await createApp(policy());
+        const challenge = tweetnacl.randomBytes(31);
+        const body = { publicKey: unpadded(owner.publicKey), challenge: unpadded(challenge), signature: unpadded(tweetnacl.sign.detached(challenge, owner.secretKey)) };
+        expect((await app.inject({ method: "POST", url: "/v1/auth", payload: body })).statusCode).toBe(200);
+    });
+
+    it("answers 400 to an undecodable pairing key on every pairing route", async () => {
+        const app = await createApp(policy());
+        const calls = [
+            { method: "POST" as const, url: "/v1/auth/request", payload: { publicKey: "x" } },
+            { method: "GET" as const, url: "/v1/auth/request/status?publicKey=x" },
+            { method: "POST" as const, url: "/v1/auth/response", payload: { publicKey: "x", response: "sealed" } },
+            { method: "POST" as const, url: "/v1/auth/account/request", payload: { publicKey: "x" } },
+            { method: "POST" as const, url: "/v1/auth/account/response", payload: { publicKey: "x", response: "sealed" } },
+        ];
+        for (const call of calls) expect((await app.inject(call)).statusCode, call.url).toBe(400);
+    });
+});

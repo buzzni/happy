@@ -7,6 +7,7 @@
  */
 
 
+import { rootDaemonWarning } from '@/daemon/rootDaemonWarning'
 import { takeStandaloneLaunchBootstrap } from '@/daemon/standaloneLaunchProtocol'
 import { configuration } from '@/configuration'
 import chalk from 'chalk'
@@ -638,6 +639,8 @@ Conversation history is preserved on the server, but in-flight tool calls are in
 
       if (started) {
         console.log('Daemon started successfully');
+        const rootWarning = rootDaemonWarning(process.getuid?.());
+        if (rootWarning) console.warn(rootWarning);
       } else {
         console.error('Failed to start daemon');
         process.exit(1);

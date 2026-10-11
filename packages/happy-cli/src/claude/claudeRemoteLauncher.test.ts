@@ -121,6 +121,48 @@ describe('Claude model changes across provider restarts', () => {
         expect(client.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'Process exited unexpectedly' }));
     });
 
+    it('fails the turn of a launch that dies before its first message, after flushing, and keeps the session', async () => {
+        // Desktop specs/headless-standalone-server R21: root makes Claude Code exit at once; clients
+        // stayed on "responding" because no turn was open to close.
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const order: string[] = [];
+        const client = {
+            sessionId: 'launch-failure-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(),
+            closeClaudeSessionTurn: vi.fn((status: string) => order.push(`close:${status}`)),
+            failClaudeLaunchTurn: vi.fn(() => order.push('fail-turn')),
+            sendSessionEvent: vi.fn((event: { message?: string }) => order.push(`event:${event.message}`)),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const response = (async function* () {
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    throw new Error('Claude Code process exited with code 1. stderr: --dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons');
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'bypassPermissions', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        const running = claudeRemoteLauncher(session);
+        await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalledOnce());
+        // Still waiting for the next prompt rather than exiting.
+        void handlers.get('switch')!();
+        await running;
+        expect(order).toEqual([expect.stringMatching(/^event:Claude Code could not start: .*root/), 'fail-turn']);
+        expect(client.closeClaudeSessionTurn).not.toHaveBeenCalledWith('failed');
+    });
+
     it('records turn latency for a turn held back behind a provider restart', async () => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();

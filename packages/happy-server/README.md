@@ -65,6 +65,7 @@ Data persists in the `happy-data` Docker volume across container restarts.
 | `HAPPY_SELF_HOST_HARDENING` | No | unset | `1` for an internet-facing single-owner server: single-use signed challenges, single-use and expiring pairing codes, per-address/per-key request limits on unauthenticated auth routes. Requires `HAPPY_AUTH_ALLOWED_PUBLIC_KEYS` |
 | `HAPPY_AUTH_PAIRING_TTL_MS` | No | `600000` | How long an unapproved pairing code stays valid under hardening |
 | `HAPPY_TRUST_PROXY` | No | unset | `1` to take the client address from `X-Forwarded-For` for request limits. Only behind a proxy that overwrites that header |
+| `HAPPY_SESSION_IDLE_REAPER` | No | unset | `absolute` answers daemons' `/api/daemon/session-idle-reaper/candidates` for their own machines: sessions with no activity, open tool call, pending input or background job for 24 hours (or the daemon's `idleAfterMs`) become stop candidates, and the daemon re-checks each before stopping. `off` answers with no candidates. Unset: the route is not registered |
 
 ### Optional: External Services
 

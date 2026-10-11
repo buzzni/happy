@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { createId, isCuid } from '@paralleldrive/cuid2';
 import {
     closeClaudeTurnWithStatus,
+    failClaudeLaunchTurn,
     mapClaudeLogMessageToSessionEnvelopes,
 } from './sessionProtocolMapper';
 import { SDKToLogConverter } from './sdkToLogConverter';
@@ -646,6 +647,32 @@ describe('closeClaudeTurnWithStatus', () => {
         expect(result.currentTurnId).toBeNull();
         expect(result.envelopes).toHaveLength(1);
         expect(result.envelopes[0].ev).toEqual({ t: 'turn-end', status: 'cancelled' });
+    });
+});
+
+describe('failClaudeLaunchTurn', () => {
+    // Desktop specs/headless-standalone-server R21: a launch that dies before its first SDK message
+    // opened no turn, so the ordinary close was a no-op and every client stayed on "responding".
+    it('opens and fails a turn when the launch produced nothing', () => {
+        const state = { currentTurnId: null };
+        const result = failClaudeLaunchTurn(state);
+        expect(result.envelopes.map((envelope: { ev: unknown }) => envelope.ev)).toEqual([{ t: 'turn-start' }, { t: 'turn-end', status: 'failed' }]);
+        expect(result.envelopes[0].turn).toBe(result.envelopes[1].turn);
+        expect(result.currentTurnId).toBeNull();
+    });
+
+    it('fails the turn that is already open, once', () => {
+        const result = failClaudeLaunchTurn({ currentTurnId: 'turn-1' });
+        expect(result.envelopes.map((envelope: { ev: unknown }) => envelope.ev)).toEqual([{ t: 'turn-end', status: 'failed' }]);
+    });
+
+    it('answers a waiting channel request with its id', () => {
+        const result = failClaudeLaunchTurn({ currentTurnId: null, pendingRequestId: 'core-req-9' });
+        expect(result.envelopes.at(-1)?.ev).toEqual({ t: 'turn-end', status: 'failed', requestId: 'core-req-9' });
+    });
+
+    it('leaves the ordinary close a no-op for a run with nothing open', () => {
+        expect(closeClaudeTurnWithStatus({ currentTurnId: null }, 'failed').envelopes).toEqual([]);
     });
 });
 

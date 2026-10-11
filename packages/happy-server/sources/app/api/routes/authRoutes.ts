@@ -21,6 +21,21 @@ const AUTH_LIMITS = {
     global: { limit: 600, windowMs: 60_000 },
 };
 
+/**
+ * Decodes a client-supplied base64 field without letting a malformed value become a 500.
+ * Keeps privacy-kit's accepted spellings (padding is optional).
+ */
+function decodeAuthField(value: string): ReturnType<typeof privacyKit.decodeBase64> | null {
+    try {
+        return privacyKit.decodeBase64(value);
+    } catch {
+        return null;
+    }
+}
+
+const SIGN_PUBLIC_KEY_BYTES = 32;
+const SIGNATURE_BYTES = 64;
+
 export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy; now?: () => number } = {}) {
     // Read once at registration so a broken self-host config fails startup instead of serving open sign-up.
     const policy = options.policy ?? readSelfHostAuthPolicy(process.env);
@@ -69,9 +84,12 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
     }, async (request, reply) => {
         if (refuseUnauthenticated(request, reply, request.body)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
-        const publicKey = privacyKit.decodeBase64(request.body.publicKey);
-        const challenge = privacyKit.decodeBase64(request.body.challenge);
-        const signature = privacyKit.decodeBase64(request.body.signature);
+        const publicKey = decodeAuthField(request.body.publicKey);
+        const challenge = decodeAuthField(request.body.challenge);
+        const signature = decodeAuthField(request.body.signature);
+        if (!publicKey || !challenge || !signature || publicKey.length !== SIGN_PUBLIC_KEY_BYTES || signature.length !== SIGNATURE_BYTES) {
+            return reply.code(400).send({ error: 'Invalid request' });
+        }
         const isValid = tweetnacl.sign.detached.verify(challenge, signature, publicKey);
         if (!isValid) {
             return reply.code(401).send({ error: 'Invalid signature' });
@@ -106,6 +124,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
                 supportsV2: z.boolean().nullish()
             }),
             response: {
+                400: z.object({ error: z.literal('Invalid request') }),
                 200: z.union([z.object({
                     state: z.literal('requested'),
                 }), z.object({
@@ -124,7 +143,10 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
     }, async (request, reply) => {
         if (refuseUnauthenticated(request, reply, request.body)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
-        const publicKey = privacyKit.decodeBase64(request.body.publicKey);
+        const publicKey = decodeAuthField(request.body.publicKey);
+        if (!publicKey) {
+            return reply.code(400).send({ error: 'Invalid request' });
+        }
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
         if (!isValid) {
             return reply.code(401).send({ error: 'Invalid public key' });
@@ -172,6 +194,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
                 publicKey: z.string(),
             }),
             response: {
+                400: z.object({ error: z.literal('Invalid request') }),
                 200: z.object({
                     status: z.enum(['not_found', 'pending', 'authorized']),
                     supportsV2: z.boolean()
@@ -181,7 +204,10 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
     }, async (request, reply) => {
         if (refuseUnauthenticated(request, reply, request.query)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
-        const publicKey = privacyKit.decodeBase64(request.query.publicKey);
+        const publicKey = decodeAuthField(request.query.publicKey);
+        if (!publicKey) {
+            return reply.code(400).send({ error: 'Invalid request' });
+        }
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
         if (!isValid) {
             return reply.send({ status: 'not_found', supportsV2: false });
@@ -221,7 +247,10 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
     }, async (request, reply) => {
         log({ module: 'auth-response' }, `Auth response endpoint hit - user: ${request.userId}`);
         const tweetnacl = (await import("tweetnacl")).default;
-        const publicKey = privacyKit.decodeBase64(request.body.publicKey);
+        const publicKey = decodeAuthField(request.body.publicKey);
+        if (!publicKey) {
+            return reply.code(400).send({ error: 'Invalid request' });
+        }
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
         if (!isValid) {
             log({ module: 'auth-response' }, `Invalid public key length: ${publicKey.length}`);
@@ -267,6 +296,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
                 publicKey: z.string(),
             }),
             response: {
+                400: z.object({ error: z.literal('Invalid request') }),
                 200: z.union([z.object({
                     state: z.literal('requested'),
                 }), z.object({
@@ -285,7 +315,10 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
     }, async (request, reply) => {
         if (refuseUnauthenticated(request, reply, request.body)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
-        const publicKey = privacyKit.decodeBase64(request.body.publicKey);
+        const publicKey = decodeAuthField(request.body.publicKey);
+        if (!publicKey) {
+            return reply.code(400).send({ error: 'Invalid request' });
+        }
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
         if (!isValid) {
             return reply.code(401).send({ error: 'Invalid public key' });
@@ -335,7 +368,10 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
         }
     }, async (request, reply) => {
         const tweetnacl = (await import("tweetnacl")).default;
-        const publicKey = privacyKit.decodeBase64(request.body.publicKey);
+        const publicKey = decodeAuthField(request.body.publicKey);
+        if (!publicKey) {
+            return reply.code(400).send({ error: 'Invalid request' });
+        }
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
         if (!isValid) {
             return reply.code(401).send({ error: 'Invalid public key' });

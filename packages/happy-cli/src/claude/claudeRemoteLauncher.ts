@@ -42,6 +42,7 @@ import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -102,6 +103,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // Handle abort
     let exitReason: 'switch' | 'exit' | null = null;
     let abortController: AbortController | null = null;
+    let launchFailure: string | null = null;
     let abortFuture: Future<void> | null = null;
     let activeInputSender: ClaudeActiveInputSender | null = null;
 
@@ -1009,11 +1011,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 if (e instanceof MandatorySandboxError) throw e;
                 logger.debug('[remote]: launch error', e);
                 if (!exitReason) {
-                    session.client.closeClaudeSessionTurn('failed');
-                    session.client.sendSessionEvent({
-                        type: 'message',
-                        message: describeCheckpointFailure(e) ?? 'Process exited unexpectedly',
-                    });
+                    // Reported after `finally` has flushed what the run already produced, so the
+                    // failure is the last thing in the turn and closes it exactly once.
+                    launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     continue;
                 }
             } finally {
@@ -1046,6 +1046,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 await messageQueue.flush();
                 messageQueue.destroy();
                 logger.debug('[remote]: message queue flushed');
+                if (launchFailure) {
+                    session.client.sendSessionEvent({ type: 'message', message: launchFailure });
+                    // A launch that died before its first message opened no turn; this opens one if needed.
+                    session.client.failClaudeLaunchTurn();
+                    launchFailure = null;
+                }
 
                 // Reset abort controller and future
                 abortController = null;

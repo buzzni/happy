@@ -4,6 +4,7 @@ import { serializerCompiler, validatorCompiler, ZodTypeProvider } from "fastify-
 import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
 import { authRoutes } from "./routes/authRoutes";
+import { readSessionIdleReaperMode, sessionIdleReaperRoutes } from "./routes/sessionIdleReaperRoutes";
 import { pushRoutes } from "./routes/pushRoutes";
 import { sessionRoutes } from "./routes/sessionRoutes";
 import { connectRoutes } from "./routes/connectRoutes";
@@ -170,6 +171,9 @@ export async function startApi(opts: StartApiOptions = {}) {
     managedApprovalRoutes(typed);
     managedFollowUpRoutes(typed);
     authRoutes(typed);
+    // Self-host / Desktop-embedded only: the cloud serves this path from web-ui.
+    const idleReaperMode = readSessionIdleReaperMode(process.env);
+    if (idleReaperMode) sessionIdleReaperRoutes(typed, { mode: idleReaperMode });
     pushRoutes(typed);
     sessionRoutes(typed);
     accountRoutes(typed);

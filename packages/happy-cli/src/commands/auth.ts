@@ -133,8 +133,10 @@ async function handleAuthLogin(args: string[]): Promise<void> {
   // Perform authentication and machine setup
   // "Finally we'll run the auth and setup machine if needed"
   try {
+    // A new sign-in announces success inside the auth flow; only the machine-id repair is silent.
+    const repairingMachineId = !!(await readCredentials());
     const result = await authAndSetupMachineIfNeeded();
-    console.log(chalk.green('\n✓ Authentication successful'));
+    if (repairingMachineId) console.log(chalk.green('\n✓ Authentication successful'));
     console.log(chalk.gray(`  Machine ID: ${result.machineId}`));
   } catch (error) {
     console.error(chalk.red('Authentication failed:'), error instanceof Error ? error.message : 'Unknown error');
