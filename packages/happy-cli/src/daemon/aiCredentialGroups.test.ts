@@ -149,3 +149,25 @@ it('preserves assignment generation and the new lease when reusing a complete lo
   const next = { ...first, generation: 2, assignmentGeneration: 2, leaseId: 'lease-next' }
   await expect(sync.sync(next)).resolves.toMatchObject({ generation: 2, assignmentGeneration: 2, leaseId: 'lease-next', reconciled: true })
 })
+
+describe('several Saycode PC identities on one Windows profile', () => {
+  // Studio counts generation per PC; one profile's journal is shared by every daemon identity on it.
+  // Windows field report 2026-10-11: a new PC's generation 13 was refused against another PC's 23.
+  it('lets another PC replace the slot but keeps rollback protection within the same PC', async () => {
+    const { deps, installed, input } = setup()
+    const pcA = createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' })
+    const pcB = createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' })
+    await pcA.sync({ ...input(23, '["shared-a"]'), userId: 'alice' })
+    await expect(pcB.sync({ ...input(13, '["shared-b"]'), userId: 'bob' })).resolves.toMatchObject({ userId: 'bob', generation: 13, reconciled: true })
+    expect(installed.has('shared-a')).toBe(false)
+    expect(await pcB.assignment('company', 'claude')).toMatchObject({ userId: 'bob', desired: ['shared-b'] })
+    await expect(pcB.sync({ ...input(12, '["shared-a"]'), userId: 'bob' })).rejects.toThrow('AI_GROUP_GENERATION_STALE')
+  })
+
+  it('treats an entry written before PCs were recorded as replaceable by a PC that records itself', async () => {
+    const { deps, input } = setup()
+    await createCredentialGroupSync(deps).sync({ ...input(23, '["shared-a"]'), userId: 'alice' })
+    await expect(createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' }).sync({ ...input(13, '["shared-b"]'), userId: 'bob' }))
+      .resolves.toMatchObject({ generation: 13 })
+  })
+})
