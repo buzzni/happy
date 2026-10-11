@@ -178,9 +178,14 @@ jobs:
             - name: Install smoke from the registry
               run: |
                   mkdir -p registry
-                  # npm may need a moment before a fresh version is visible.
-                  for attempt in 1 2 3 4 5 6; do
-                      npm pack "@buzzni/happy-server@$RELEASE_VERSION" --pack-destination registry && break
-                      sleep 20
+                  # A fresh version can take minutes to become visible (0.1.0 took about 5), so wait up
+                  # to 10 minutes. --prefer-online skips npm's cached packument between attempts.
+                  for attempt in $(seq 1 20); do
+                      if npm pack "@buzzni/happy-server@$RELEASE_VERSION" --pack-destination registry --prefer-online; then break; fi
+                      if [ "$attempt" = 20 ]; then
+                          echo "::error::@buzzni/happy-server@$RELEASE_VERSION is still not visible on the registry after 10 minutes. Check whether the publish job succeeded and look the version up on npmjs.com; once it is visible, run this workflow manually with version=$RELEASE_VERSION (verify only, no publication)."
+                          exit 1
+                      fi
+                      sleep 30
                   done
                   node packages/happy-server/scripts/guard-publish-artifact.cjs registry/buzzni-happy-server-*.tgz --install-smoke
