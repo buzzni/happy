@@ -1,0 +1,175 @@
+name: Publish @buzzni/happy-server
+
+# The self-host server runtime used by `saycode server`
+# (aplus-dev-studio-desktop specs/headless-standalone-server T8).
+#
+# Triggered by a tag `happy-server-v<version>` whose version matches
+# packages/happy-server/package.json. GitHub Actions is the only publisher:
+# never `npm publish` this package locally.
+#
+# Order: build one tarball -> install-smoke that exact tarball on every supported
+# Linux/Node -> publish it -> install-smoke it again from the registry.
+# Needs the NPM_TOKEN repository secret (same @buzzni automation token as happy-cli).
+
+on:
+    push:
+        tags:
+            - 'happy-server-v*'
+    workflow_dispatch:
+        inputs:
+            version:
+                description: 'Already published @buzzni/happy-server version to verify (no publication)'
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        if: github.event_name == 'push'
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        outputs:
+            version: ${{ steps.release_version.outputs.version }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Setup pnpm
+              uses: pnpm/action-setup@v4
+              with:
+                  version: 10.11.0
+
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: pnpm
+
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+
+            - name: Install server dependencies
+              run: pnpm install --frozen-lockfile --filter "happy-server-self-host..."
+
+            - name: Verify tag matches package version
+              id: release_version
+              run: |
+                  VERSION=$(node -p "require('./packages/happy-server/package.json').version")
+                  TAG="${GITHUB_REF#refs/tags/happy-server-v}"
+                  if [ "$VERSION" != "$TAG" ]; then
+                      echo "::error::tag/version mismatch — tag=$TAG package.json=$VERSION"
+                      exit 1
+                  fi
+                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+            - name: Unit tests for the auth hardening and packaging
+              working-directory: packages/happy-server
+              run: npx vitest run sources/app/api/routes/authRoutes.selfHost.spec.ts scripts/
+
+            - name: Build runtime bundle
+              run: node packages/happy-server/scripts/build-runtime.cjs
+
+            - name: Prepare and pack publish artifact
+              run: |
+                  node packages/happy-server/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-server-publish"
+                  mkdir -p "$RUNNER_TEMP/happy-server-pack"
+                  (cd "$RUNNER_TEMP/happy-server-publish" && npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/happy-server-pack")
+                  cp packages/happy-server/scripts/guard-publish-artifact.cjs "$RUNNER_TEMP/happy-server-pack/"
+
+            - name: Upload tarball
+              uses: actions/upload-artifact@v4
+              with:
+                  name: happy-server-tarball
+                  path: ${{ runner.temp }}/happy-server-pack/
+
+    smoke:
+        needs: build
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - { runner: ubuntu-22.04, node: 20 }
+                    - { runner: ubuntu-22.04, node: 22 }
+                    - { runner: ubuntu-24.04, node: 20 }
+                    - { runner: ubuntu-24.04, node: 22 }
+                    - { runner: ubuntu-22.04-arm, node: 22 }
+                    - { runner: ubuntu-24.04-arm, node: 20 }
+                    - { runner: ubuntu-24.04-arm, node: 22 }
+                    - { runner: ubuntu-24.04, node: 22, container: 'node:22-bookworm-slim' }
+                    - { runner: ubuntu-24.04-arm, node: 20, container: 'node:20-bookworm-slim' }
+        runs-on: ${{ matrix.runner }}
+        container: ${{ matrix.container }}
+        timeout-minutes: 20
+        steps:
+            - name: Setup Node
+              if: ${{ !matrix.container }}
+              uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ matrix.node }}
+
+            - name: Prisma needs openssl to pick its engine
+              if: ${{ matrix.container }}
+              run: apt-get update -qq && apt-get install -y -qq openssl
+
+            - name: Download tarball
+              uses: actions/download-artifact@v4
+              with:
+                  name: happy-server-tarball
+                  path: pack
+
+            - name: Install smoke
+              run: node pack/guard-publish-artifact.cjs pack/buzzni-happy-server-*.tgz --install-smoke
+
+    publish:
+        needs: [build, smoke]
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            id-token: write  # npm provenance
+        steps:
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  registry-url: https://registry.npmjs.org
+
+            - name: Download tarball
+              uses: actions/download-artifact@v4
+              with:
+                  name: happy-server-tarball
+                  path: pack
+
+            - name: Publish the smoke-tested tarball
+              run: npm publish pack/buzzni-happy-server-*.tgz --access public --tag latest --ignore-scripts
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+                  NPM_CONFIG_PROVENANCE: 'true'
+
+    verify:
+        needs: [build, publish]
+        if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        env:
+            RELEASE_VERSION: ${{ inputs.version || needs.build.outputs.version }}
+        steps:
+            - name: Checkout verifier
+              uses: actions/checkout@v4
+
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+
+            - name: Install smoke from the registry
+              run: |
+                  mkdir -p registry
+                  # npm may need a moment before a fresh version is visible.
+                  for attempt in 1 2 3 4 5 6; do
+                      npm pack "@buzzni/happy-server@$RELEASE_VERSION" --pack-destination registry && break
+                      sleep 20
+                  done
+                  node packages/happy-server/scripts/guard-publish-artifact.cjs registry/buzzni-happy-server-*.tgz --install-smoke
