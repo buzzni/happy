@@ -325,7 +325,9 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
         const plan = planDataKeyOnboarding({
             credentials,
             accountPublicKey: settings.accountPublicKey ?? null,
-            hasLocalSessions: Object.keys(readPersistedSessions()).length > 0,
+            // 같은 폴더에서 재등록된 이전 PC 신원의 세션은 이 신원의 키와 무관하다 (2026-10-11 hmrepo). 출처를 모르는 세션은 센다.
+            hasLocalSessions: Object.values(readPersistedSessions())
+                .some(session => !session.metadata?.machineId || session.metadata.machineId === settings.machineId),
         });
         if (plan.ok) {
             const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
