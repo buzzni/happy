@@ -15,6 +15,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const PUBLISHED_NAME = '@buzzni/happy-server';
+// npm provenance rejects a package whose repository.url differs from the repository that
+// built it; package.json keeps upstream's slopus/happy so upstream merges stay clean.
+const PUBLISHED_REPOSITORY = {
+  repository: { type: 'git', url: 'git+https://github.com/buzzni/happy.git', directory: 'packages/happy-server' },
+  homepage: 'https://github.com/buzzni/happy',
+  bugs: 'https://github.com/buzzni/happy/issues',
+};
 // Workspace packages the runtime bundle inlines (scripts/build-runtime.cjs) and the marker
 // esbuild/bun leaves in dist/standalone.mjs proving it did.
 const BUNDLED_WORKSPACE_DEPENDENCIES = { '@slopus/happy-wire': '../happy-wire/dist/' };
@@ -35,7 +42,7 @@ function publishManifest(source, distContents, version = source.version) {
     dependencies[name] = spec;
   }
   const scripts = source.scripts?.postinstall ? { postinstall: source.scripts.postinstall } : undefined;
-  const manifest = { ...source, name: PUBLISHED_NAME, version, dependencies, publishConfig: { access: 'public' } };
+  const manifest = { ...source, ...PUBLISHED_REPOSITORY, name: PUBLISHED_NAME, version, dependencies, publishConfig: { access: 'public' } };
   delete manifest.devDependencies;
   delete manifest.scripts;
   if (scripts) manifest.scripts = scripts;
