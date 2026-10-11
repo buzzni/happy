@@ -9,6 +9,7 @@ import {
     AUTH_FIELD_MAX_LENGTH,
     createRateLimiter,
     createReplayGuard,
+    createUsedPairings,
     keyFingerprint,
     readSelfHostAuthPolicy,
     type SelfHostAuthPolicy,
@@ -25,6 +26,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
     const policy = options.policy ?? readSelfHostAuthPolicy(process.env);
     const now = options.now ?? Date.now;
     const replayGuard = createReplayGuard(policy.pairingTtlMs);
+    const usedPairings = createUsedPairings();
     const limiter = createRateLimiter(AUTH_LIMITS);
     const clientAddress = (request: any): string => {
         const forwarded = policy.trustProxy ? String(request.headers['x-forwarded-for'] ?? '').split(',')[0].trim() : '';
@@ -128,6 +130,9 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
 
         const publicKeyHex = privacyKit.encodeHex(publicKey);
         log({ module: 'auth-request' }, `Terminal auth request - publicKey: ${logKey(publicKeyHex)}`);
+        if (policy.hardened && usedPairings.has(`terminal:${publicKeyHex}`, now())) {
+            return reply.code(410).send({ error: 'Request expired' });
+        }
 
         const answer = await db.terminalAuthRequest.upsert({
             where: { publicKey: publicKeyHex },
@@ -145,6 +150,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             if (policy.hardened) {
                 const consumed = await db.terminalAuthRequest.deleteMany({ where: { id: answer.id, response: { not: null } } });
                 if (consumed.count !== 1) return reply.send({ state: 'requested' });
+                usedPairings.add(`terminal:${publicKeyHex}`, now());
             }
             const token = await auth.createToken(answer.responseAccountId!, { session: answer.id });
             return reply.send({
@@ -283,6 +289,9 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             return reply.code(401).send({ error: 'Invalid public key' });
         }
 
+        if (policy.hardened && usedPairings.has(`account:${privacyKit.encodeHex(publicKey)}`, now())) {
+            return reply.code(410).send({ error: 'Request expired' });
+        }
         const answer = await db.accountAuthRequest.upsert({
             where: { publicKey: privacyKit.encodeHex(publicKey) },
             update: {},
@@ -297,6 +306,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             if (policy.hardened) {
                 const consumed = await db.accountAuthRequest.deleteMany({ where: { id: answer.id, response: { not: null } } });
                 if (consumed.count !== 1) return reply.send({ state: 'requested' });
+                usedPairings.add(`account:${answer.publicKey}`, now());
             }
             const token = await auth.createToken(answer.responseAccountId!);
             return reply.send({

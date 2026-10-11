@@ -142,7 +142,23 @@ describe("authRoutes with self-host hardening", () => {
         const first = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
         expect(first.json()).toEqual(expect.objectContaining({ state: "authorized", response: "sealed" }));
         const second = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
-        expect(second.json()).toEqual({ state: "requested" });
+        expect(second.statusCode).toBe(410);
+        expect(state.terminal.size).toBe(0);
+    });
+
+    it("does not let a used pairing code be requested and approved a second time", async () => {
+        const app = await createApp(hardened());
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        await app.inject({ method: "POST", url: "/v1/auth/response", payload: { publicKey: pairing, response: "sealed" } });
+        expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } })).json().state).toBe("authorized");
+
+        // Someone who saw the code asks again and hopes the owner approves it twice.
+        expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } })).statusCode).toBe(410);
+        expect((await app.inject({ method: "POST", url: "/v1/auth/response", payload: { publicKey: pairing, response: "again" } })).statusCode).toBe(404);
+        const poll = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        expect(poll.statusCode).toBe(410);
+        expect(poll.json().token).toBeUndefined();
     });
 
     it("expires a pairing code that was not approved in time", async () => {
@@ -176,7 +192,8 @@ describe("authRoutes with self-host hardening", () => {
         await app.inject({ method: "POST", url: "/v1/auth/account/request", payload: { publicKey: pairing } });
         await app.inject({ method: "POST", url: "/v1/auth/account/response", payload: { publicKey: pairing, response: "sealed" } });
         expect((await app.inject({ method: "POST", url: "/v1/auth/account/request", payload: { publicKey: pairing } })).json().state).toBe("authorized");
-        expect((await app.inject({ method: "POST", url: "/v1/auth/account/request", payload: { publicKey: pairing } })).json()).toEqual({ state: "requested" });
+        expect((await app.inject({ method: "POST", url: "/v1/auth/account/request", payload: { publicKey: pairing } })).statusCode).toBe(410);
+        expect(state.account.size).toBe(0);
     });
 
     it("throttles unauthenticated auth calls per address with Retry-After", async () => {

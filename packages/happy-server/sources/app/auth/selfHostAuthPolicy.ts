@@ -67,6 +67,26 @@ export function createReplayGuard(ttlMs: number, maxEntries = 10_000) {
     };
 }
 
+/**
+ * Pairing keys that already handed out a token. A used code must not become a fresh
+ * request the owner could approve again, so it is refused for a day — far past the
+ * code's own TTL. In memory like the replay guard; each entry needs an owner approval,
+ * so the map stays small.
+ */
+export function createUsedPairings(rememberMs = 24 * 60 * 60_000, maxEntries = 10_000) {
+    const used = new Map<string, number>();
+    return {
+        has: (key: string, now: number): boolean => (used.get(key) ?? 0) > now,
+        add: (key: string, now: number): void => {
+            for (const [entry, expiresAt] of used) {
+                if (expiresAt > now && used.size < maxEntries) break;
+                used.delete(entry);
+            }
+            used.set(key, now + rememberMs);
+        },
+    };
+}
+
 /** Fixed-window counters per key. Returns seconds to wait, or 0 when allowed. */
 export function createRateLimiter(limits: Record<string, { limit: number; windowMs: number }>) {
     const windows = new Map<string, { start: number; count: number }>();
