@@ -133,6 +133,17 @@ describe("authRoutes with self-host hardening", () => {
         expect(replay.json().token).toBeUndefined();
     });
 
+    it("rejects equivalent base64 spellings of a replayed challenge", async () => {
+        const app = await createApp(hardened());
+        const body = signedBody(owner);
+        expect(body.challenge.endsWith("=")).toBe(true);
+        expect((await app.inject({ method: "POST", url: "/v1/auth", payload: body })).statusCode).toBe(200);
+        const alternate = { ...body, challenge: body.challenge.replace(/=+$/, "") };
+        const replay = await app.inject({ method: "POST", url: "/v1/auth", payload: alternate });
+        expect(replay.statusCode).toBe(401);
+        expect(replay.json().token).toBeUndefined();
+    });
+
     it("hands out an approved pairing token once, then never again", async () => {
         const app = await createApp(hardened());
         const pairing = b64(tweetnacl.box.keyPair().publicKey);

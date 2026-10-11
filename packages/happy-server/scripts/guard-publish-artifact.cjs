@@ -16,7 +16,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
-const REQUIRED_ENTRIES = ['package/package.json', 'package/bin/happy-server.cjs', 'package/index.cjs', 'package/dist/standalone.mjs', 'package/prisma/schema.prisma'];
+const REQUIRED_ENTRIES = ['package/package.json', 'package/bin/happy-server.cjs', 'package/index.cjs', 'package/dist/standalone.mjs', 'package/prisma/schema.prisma', 'package/webapp/index.html'];
 
 function fail(message) {
   throw new Error(`guard: ${message}`);

@@ -80,7 +80,9 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
         if (policy.allowedPublicKeysHex && !policy.allowedPublicKeysHex.has(publicKeyHex.toLowerCase())) {
             return reply.code(403).send({ error: 'Account not allowed' });
         }
-        if (policy.hardened && !replayGuard(publicKeyHex, request.body.challenge, now())) {
+        // Track the decoded challenge so equivalent base64 spellings cannot bypass replay protection.
+        const canonicalChallenge = privacyKit.encodeBase64(challenge);
+        if (policy.hardened && !replayGuard(publicKeyHex, canonicalChallenge, now())) {
             return reply.code(401).send({ error: 'Challenge already used' });
         }
         const user = await db.account.upsert({
