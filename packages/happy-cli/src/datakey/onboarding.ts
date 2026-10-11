@@ -21,6 +21,7 @@ export type OnboardingSkipReason =
   | 'already-datakey'
   | 'has-local-sessions'
   | 'account-key-mismatch'
+  | 'previously-deactivated'
 
 export type SerializedDataKeyCredentials = {
   token: string
@@ -35,6 +36,8 @@ export function planDataKeyOnboarding(input: {
   credentials: Credentials
   accountPublicKey: string | null
   hasLocalSessions: boolean
+  /** `access.key.legacy-backup` exists: a switch was made and `datakey deactivate` (which keeps the backup) undid it. */
+  hasLegacyBackup?: boolean
 }): OnboardingResult {
   const enc = input.credentials.encryption
   if (enc.type === 'dataKey') return { ok: false, reason: 'already-datakey' }
@@ -43,6 +46,9 @@ export function planDataKeyOnboarding(input: {
   // 기존 세션이 있는 머신은 전환하지 않는다 — 그 세션들은 legacy 로
   // 만들어졌고, 활성 키가 갈라지면 혼동이 생긴다(전환 spec D1 의 위험).
   if (input.hasLocalSessions) return { ok: false, reason: 'has-local-sessions' }
+  // 사용자가 되돌린 전환을 daemon 재시작마다 다시 하지 않는다 — 되돌림은 백업을 남기므로 그것이 표지다
+  // (2026-10-11 hmrepo: 손으로 deactivate 한 신규 머신이 다음 시작에 다시 승격됐다). 수동 activate 는 그대로 된다.
+  if (input.hasLegacyBackup) return { ok: false, reason: 'previously-deactivated' }
   // settings 의 accountPublicKey 와 병기 재료의 공개키가 어긋나면 승격하지
   // 않는다 — 재인증/계정 교체 잔재로 엉뚱한 수신자에게 wrap 되는 것 방지.
   if (encodeBase64(enc.provisioned.publicKey) !== input.accountPublicKey) {

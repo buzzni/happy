@@ -323,13 +323,14 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     // 못 본다. 기존 세션이 있는 머신은 승격하지 않는다(planDataKeyOnboarding
     // 의 has-local-sessions 게이트). best-effort — 실패는 legacy 로 계속.
     try {
+        const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
         const plan = planDataKeyOnboarding({
             credentials,
             accountPublicKey: settings.accountPublicKey ?? null,
             hasLocalSessions: Object.keys(readPersistedSessions()).length > 0,
+            hasLegacyBackup: existsSync(backupPath),
         });
         if (plan.ok) {
-            const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
             if (!existsSync(backupPath)) {
                 writePrivateFileSync(backupPath, JSON.stringify(plan.backup, null, 2));
             }
