@@ -8,7 +8,7 @@ import { delay } from "@/utils/time";
 import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey, readPersistedSessions, readMachineIdentity, writeMachineIdentity, writePrivateFileSync } from "@/persistence";
 import { buildMachineIdentity, reusableDataKeyMachineKey, reusableMachineId } from "@/machineIdentity";
 import { planDataKeyOnboarding } from "@/datakey/onboarding";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
@@ -324,18 +324,20 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     // 의 has-local-sessions 게이트). best-effort — 실패는 legacy 로 계속.
     try {
         const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
+        // 되돌림은 원본을 바이트 그대로 복원하므로, 백업의 secret 이 지금 것과 같을 때만 이 신원이 되돌린 흔적이다.
+        // 재등록은 이전 신원의 백업을 남긴다 — 그것은 낡은 파일이고 승격 시 이 신원의 원본으로 덮어쓴다.
+        const ownBackup = credentials.encryption.type === 'legacy'
+            && readBackupSecret(backupPath) === encodeBase64(credentials.encryption.secret);
         const plan = planDataKeyOnboarding({
             credentials,
             accountPublicKey: settings.accountPublicKey ?? null,
             // 같은 폴더에서 재등록된 이전 PC 신원의 세션은 이 신원의 키와 무관하다 (2026-10-11 hmrepo). 출처를 모르는 세션은 센다.
             hasLocalSessions: Object.values(readPersistedSessions())
                 .some(session => !session.metadata?.machineId || session.metadata.machineId === settings.machineId),
-            hasLegacyBackup: existsSync(backupPath),
+            hasLegacyBackup: ownBackup,
         });
         if (plan.ok) {
-            if (!existsSync(backupPath)) {
-                writePrivateFileSync(backupPath, JSON.stringify(plan.backup, null, 2));
-            }
+            writePrivateFileSync(backupPath, JSON.stringify(plan.backup, null, 2));
             writePrivateFileSync(configuration.privateKeyFile, JSON.stringify(plan.serialized, null, 2));
             credentials = (await readCredentials())!;
             logger.debug('[AUTH] Onboarded fresh machine to dataKey-active');
@@ -354,4 +356,13 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     }
 
     return { credentials, machineId: settings.machineId!, serverPublicKey: settings.serverPublicKey ?? null };
+}
+
+function readBackupSecret(path: string): string | null {
+    try {
+        const secret = (JSON.parse(readFileSync(path, 'utf8')) as { secret?: unknown }).secret;
+        return typeof secret === 'string' ? secret : null;
+    } catch {
+        return null;
+    }
 }

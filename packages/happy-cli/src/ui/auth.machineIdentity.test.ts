@@ -121,6 +121,22 @@ describe('authAndSetupMachineIfNeeded end-to-end encryption start', () => {
     expect((await readCredentials())?.encryption.type).toBe('dataKey')
   })
 
+  // Desktop re-registration rewrites access.key but leaves the earlier identity's legacy backup behind.
+  it('starts encrypted over a backup an earlier identity left, and keeps this identity in the backup', async () => {
+    const backupPath = join(home, 'access.key.legacy-backup')
+    writeFileSync(backupPath, JSON.stringify({ token: 'earlier', secret: encodeBase64(new Uint8Array(32).fill(9)) }))
+    sessionsFrom('earlier-identity')
+    await authAndSetupMachineIfNeeded()
+    expect((await readCredentials())?.encryption.type).toBe('dataKey')
+    expect(JSON.parse(readFileSync(backupPath, 'utf8')).secret).toBe(encodeBase64(secret))
+  })
+
+  it('does not switch again after this identity undid the switch', async () => {
+    writeFileSync(join(home, 'access.key.legacy-backup'), JSON.stringify({ token: 't', secret: encodeBase64(secret) }))
+    await authAndSetupMachineIfNeeded()
+    expect((await readCredentials())?.encryption.type).toBe('legacy')
+  })
+
   it('stays as it is while this identity, or a session that names no machine, has local sessions', async () => {
     for (const machineId of ['this-pc', undefined, '']) {
       sessionsFrom('earlier-identity', machineId)
