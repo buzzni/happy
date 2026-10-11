@@ -3,9 +3,10 @@ name: Publish @buzzni/happy-server
 # The self-host server runtime used by `saycode server`
 # (aplus-dev-studio-desktop specs/headless-standalone-server T8).
 #
-# Triggered by a tag `happy-server-v<version>` whose version matches
-# packages/happy-server/package.json. GitHub Actions is the only publisher:
-# never `npm publish` this package locally.
+# Triggered by a tag `happy-server-v<version>`. The tag is the npm version: this package
+# has its own version line (0.1.0 first), while packages/happy-server/package.json keeps
+# the upstream happy version. GitHub Actions is the only publisher: never `npm publish`
+# this package locally.
 #
 # Order: build one tarball -> install-smoke that exact tarball on every supported
 # Linux/Node -> publish it -> install-smoke it again from the registry.
@@ -56,13 +57,16 @@ jobs:
             - name: Build shared wire package
               run: pnpm --filter @slopus/happy-wire build
 
-            - name: Verify tag matches package version
+            - name: Read the release version from the tag
               id: release_version
               run: |
-                  VERSION=$(node -p "require('./packages/happy-server/package.json').version")
-                  TAG="${GITHUB_REF#refs/tags/happy-server-v}"
-                  if [ "$VERSION" != "$TAG" ]; then
-                      echo "::error::tag/version mismatch — tag=$TAG package.json=$VERSION"
+                  VERSION="${GITHUB_REF#refs/tags/happy-server-v}"
+                  if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+                      echo "::error::tag must be happy-server-v<semver>, got $GITHUB_REF"
+                      exit 1
+                  fi
+                  if npm view "@buzzni/happy-server@$VERSION" version >/dev/null 2>&1; then
+                      echo "::error::@buzzni/happy-server@$VERSION is already published"
                       exit 1
                   fi
                   echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -79,7 +83,7 @@ jobs:
 
             - name: Prepare and pack publish artifact
               run: |
-                  node packages/happy-server/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-server-publish"
+                  node packages/happy-server/scripts/prepare-publish-package.cjs --out "$RUNNER_TEMP/happy-server-publish" --version "${{ steps.release_version.outputs.version }}"
                   mkdir -p "$RUNNER_TEMP/happy-server-pack"
                   (cd "$RUNNER_TEMP/happy-server-publish" && npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/happy-server-pack")
                   cp packages/happy-server/scripts/guard-publish-artifact.cjs "$RUNNER_TEMP/happy-server-pack/"
