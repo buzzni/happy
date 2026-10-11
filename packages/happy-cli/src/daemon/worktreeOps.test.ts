@@ -363,6 +363,29 @@ describe('worktree:remove', () => {
         expect((await call('remove', remove(`${repo}/.aplus/worktrees/p1/gone`))).result).toEqual({ outcome: 'missing' });
     });
 
+    // aplus-dev-studio strict-followup-plan F0-b (daemon 3): the server names the branch, and the
+    // server may be hostile. Unapplied commits are judged from the worktree itself.
+    it('keeps unapplied work whatever branch the ticket names, unless forced', async () => {
+        const { result } = await call('create', create());
+        git(result.path, 'commit', '--quiet', '--allow-empty', '-m', 'work');
+        expect(await call('remove', remove(result.path, { branch: null }))).toMatchObject({ success: false, errorCode: 'WORKTREE_DIRTY' });
+        // An already merged branch named instead of the worktree's own.
+        expect(await call('remove', remove(result.path, { branch: 'main' }))).toMatchObject({ success: false });
+        git(result.path, 'switch', '--quiet', '--detach');
+        expect(await call('remove', remove(result.path, { branch: null }))).toMatchObject({ success: false, errorCode: 'WORKTREE_DIRTY' });
+        expect(existsSync(result.path)).toBe(true);
+        expect(git(repo, 'branch', '--list', 'main')).toContain('main');
+    });
+
+    it('deletes only the worktree\'s own branch, even when forced', async () => {
+        git(repo, 'switch', '--quiet', '-c', 'keep-me');
+        git(repo, 'commit', '--quiet', '--allow-empty', '-m', 'unmerged');
+        git(repo, 'switch', '--quiet', 'main');
+        const { result } = await call('create', create());
+        expect((await call('remove', remove(result.path, { force: true, branch: 'keep-me' }))).result).toEqual({ outcome: 'removed' });
+        expect(git(repo, 'branch', '--list', 'keep-me')).toContain('keep-me');
+    });
+
     it('refuses a path outside this project\'s managed worktrees', async () => {
         const other = join(repo, '.aplus/worktrees/p2/x');
         mkdirSync(other, { recursive: true });

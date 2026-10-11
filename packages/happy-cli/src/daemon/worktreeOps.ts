@@ -574,10 +574,15 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     return serialized(target.repoRoot, async () => {
         // Checked before anything is stopped or removed: a refusal leaves everything as it was.
         const status = await runGit(target.path, ['status', '--porcelain'], { readOnly: true });
+        const ownBranch = await currentBranch(target.path);
         if (!params.force) {
             if (status.code !== 0) throw new OpFailure('WORKTREE_REMOVE_FAILED', gitError(status));
             if (status.stdout.trim()) throw new OpFailure('WORKTREE_DIRTY', 'contains modified or untracked files');
-            if (params.branch && (await runGit(target.repoRoot, ['merge-base', '--is-ancestor', params.branch, 'HEAD'], { readOnly: true })).code !== 0) {
+            // aplus-dev-studio strict-followup-plan F0-b — judged from the worktree itself, not the
+            // branch the ticket names: a detached or renamed checkout must not lose its commits.
+            if (params.branch) await requireBranch(target.path, params.branch);
+            const head = (await gitOk(target.path, ['rev-parse', '--verify', 'HEAD^{commit}'], 'WORKTREE_REMOVE_FAILED', { readOnly: true })).trim();
+            if ((await runGit(target.repoRoot, ['merge-base', '--is-ancestor', head, 'HEAD'], { readOnly: true })).code !== 0) {
                 throw new OpFailure('WORKTREE_DIRTY', 'contains changes not applied to the default version');
             }
         }
@@ -588,8 +593,9 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             throw new OpFailure(!params.force && /contains modified or untracked files/i.test(error) ? 'WORKTREE_DIRTY' : 'WORKTREE_REMOVE_FAILED', error);
         }
         await runGit(target.repoRoot, ['worktree', 'prune']);
-        // A non-forced `-d` keeps a branch whose commits are not merged.
-        if (params.branch) await runGit(target.repoRoot, ['branch', params.force ? '-D' : '-d', params.branch]);
+        // A non-forced `-d` keeps a branch whose commits are not merged. Only the worktree's own
+        // branch goes, whatever the ticket names (aplus-dev-studio strict-followup-plan F0-b).
+        if (params.branch && params.branch === ownBranch) await runGit(target.repoRoot, ['branch', params.force ? '-D' : '-d', ownBranch]);
         return { outcome: 'removed' as const };
     });
 }
