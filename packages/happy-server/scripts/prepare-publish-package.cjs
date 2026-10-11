@@ -5,7 +5,11 @@
 // (aplus-dev-studio-desktop specs/headless-standalone-server T8). GitHub Actions is the only
 // publisher; run locally only to inspect or smoke-test the artifact.
 //
-//   node scripts/prepare-publish-package.cjs --out <dir>
+//   node scripts/prepare-publish-package.cjs --out <dir> [--version <semver>]
+//
+// @buzzni/happy-server has its own version line (first release 0.1.0): package.json keeps
+// the upstream happy version so upstream merges stay clean. The release tag supplies
+// --version; without it the artifact carries package.json's version, for local inspection.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -15,8 +19,10 @@ const PUBLISHED_NAME = '@buzzni/happy-server';
 // esbuild/bun leaves in dist/standalone.mjs proving it did.
 const BUNDLED_WORKSPACE_DEPENDENCIES = { '@slopus/happy-wire': '../happy-wire/dist/' };
 const UNPUBLISHABLE_SPEC = /^(workspace:|file:|link:|portal:)/;
+const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 
-function publishManifest(source, distContents) {
+function publishManifest(source, distContents, version = source.version) {
+  if (!SEMVER.test(String(version))) throw new Error(`publish version must be semver like 0.1.0, got ${version}`);
   const dependencies = {};
   for (const [name, spec] of Object.entries(source.dependencies ?? {})) {
     if (name in BUNDLED_WORKSPACE_DEPENDENCIES) {
@@ -29,7 +35,7 @@ function publishManifest(source, distContents) {
     dependencies[name] = spec;
   }
   const scripts = source.scripts?.postinstall ? { postinstall: source.scripts.postinstall } : undefined;
-  const manifest = { ...source, name: PUBLISHED_NAME, dependencies, publishConfig: { access: 'public' } };
+  const manifest = { ...source, name: PUBLISHED_NAME, version, dependencies, publishConfig: { access: 'public' } };
   delete manifest.devDependencies;
   delete manifest.scripts;
   if (scripts) manifest.scripts = scripts;
@@ -39,12 +45,14 @@ function publishManifest(source, distContents) {
 function main() {
   const outIndex = process.argv.indexOf('--out');
   const out = outIndex >= 0 ? path.resolve(process.argv[outIndex + 1] ?? '') : '';
-  if (!out) throw new Error('usage: prepare-publish-package.cjs --out <dir>');
+  if (!out) throw new Error('usage: prepare-publish-package.cjs --out <dir> [--version <semver>]');
+  const versionIndex = process.argv.indexOf('--version');
+  const version = versionIndex >= 0 ? process.argv[versionIndex + 1] ?? '' : undefined;
   const root = path.resolve(__dirname, '..');
   const source = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const dist = path.join(root, 'dist', 'standalone.mjs');
   if (!fs.existsSync(dist)) throw new Error('dist/standalone.mjs is missing; run scripts/build-runtime.cjs first');
-  const manifest = publishManifest(source, fs.readFileSync(dist, 'utf8'));
+  const manifest = publishManifest(source, fs.readFileSync(dist, 'utf8'), version);
 
   fs.rmSync(out, { recursive: true, force: true });
   fs.mkdirSync(out, { recursive: true });

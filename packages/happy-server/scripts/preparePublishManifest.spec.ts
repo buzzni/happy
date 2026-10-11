@@ -27,6 +27,16 @@ describe("publishManifest", () => {
         expect(manifest.publishConfig).toEqual({ access: "public" });
     });
 
+    it("publishes under its own version line, independent of the upstream package version", () => {
+        expect(publishManifest(source, bundledDist, "0.1.0").version).toBe("0.1.0");
+        expect(publishManifest(source, bundledDist, "0.2.0-rc.1").version).toBe("0.2.0-rc.1");
+    });
+
+    it("refuses a publish version that is not semver", () => {
+        expect(() => publishManifest(source, bundledDist, "v0.1.0")).toThrow(/version/);
+        expect(() => publishManifest(source, bundledDist, "0.1")).toThrow(/version/);
+    });
+
     it("refuses when the workspace dependency is not actually bundled", () => {
         expect(() => publishManifest(source, "export {}")).toThrow(/happy-wire/);
     });
