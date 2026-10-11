@@ -25,6 +25,7 @@ describe('authAndSetupMachineIfNeeded machine identity', () => {
     override('happyHomeDir', home)
     override('privateKeyFile', join(home, 'access.key'))
     override('settingsFile', join(home, 'settings.json'))
+    override('sessionsFile', join(home, 'sessions.json'))
     await writeCredentialsDataKey({ token: 't', publicKey: accountKey, machineKey })
   })
 
@@ -80,5 +81,67 @@ describe('authAndSetupMachineIfNeeded machine identity', () => {
     const result = await authAndSetupMachineIfNeeded()
     expect(result.machineId).toBe('legacy-machine')
     expect(readMachineIdentity()).toEqual(provisioned)
+  })
+})
+
+describe('authAndSetupMachineIfNeeded end-to-end encryption start', () => {
+  let home: string
+  const original: Record<string, unknown> = {}
+  const override = (key: string, value: string) => {
+    original[key] = (configuration as unknown as Record<string, unknown>)[key]
+    Object.defineProperty(configuration, key, { value, configurable: true })
+  }
+  const secret = new Uint8Array(32).fill(4)
+  const sessionsFrom = (...machineIds: Array<string | undefined>) => writeFileSync(join(home, 'sessions.json'), JSON.stringify({
+    sessions: Object.fromEntries(machineIds.map((machineId, i) => [`s${i}`, { encryptionKey: 'k', encryptionVariant: 'legacy', seq: 0, metadataVersion: 0, agentStateVersion: 0, savedAt: 0, metadata: { path: '/', host: 'h', machineId } }])),
+  }))
+
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), 'happy-datakey-start-'))
+    override('happyHomeDir', home)
+    override('privateKeyFile', join(home, 'access.key'))
+    override('settingsFile', join(home, 'settings.json'))
+    override('sessionsFile', join(home, 'sessions.json'))
+    await writeCredentialsLegacy({ token: 't', secret })
+    await updateSettings(async s => ({ ...s, accountPublicKey: encodeBase64(accountKey) }))
+    writeMachineIdentity(buildMachineIdentity('this-pc', {
+      token: 't', encryption: { type: 'legacy', secret, provisioned: { publicKey: accountKey, machineKey } },
+    }))
+  })
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(original)) Object.defineProperty(configuration, key, { value, configurable: true })
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  // 2026-10-11 hmrepo: Desktop re-registered the PC in the same folder, and the previous identity's session kept the new one in legacy.
+  it('starts encrypted when the only local sessions belong to an earlier identity of this PC', async () => {
+    sessionsFrom('earlier-identity')
+    await authAndSetupMachineIfNeeded()
+    expect((await readCredentials())?.encryption.type).toBe('dataKey')
+  })
+
+  // Desktop re-registration rewrites access.key but leaves the earlier identity's legacy backup behind.
+  it('starts encrypted over a backup an earlier identity left, and keeps this identity in the backup', async () => {
+    const backupPath = join(home, 'access.key.legacy-backup')
+    writeFileSync(backupPath, JSON.stringify({ token: 'earlier', secret: encodeBase64(new Uint8Array(32).fill(9)) }))
+    sessionsFrom('earlier-identity')
+    await authAndSetupMachineIfNeeded()
+    expect((await readCredentials())?.encryption.type).toBe('dataKey')
+    expect(JSON.parse(readFileSync(backupPath, 'utf8')).secret).toBe(encodeBase64(secret))
+  })
+
+  it('does not switch again after this identity undid the switch', async () => {
+    writeFileSync(join(home, 'access.key.legacy-backup'), JSON.stringify({ token: 't', secret: encodeBase64(secret) }))
+    await authAndSetupMachineIfNeeded()
+    expect((await readCredentials())?.encryption.type).toBe('legacy')
+  })
+
+  it('stays as it is while this identity, or a session that names no machine, has local sessions', async () => {
+    for (const machineId of ['this-pc', undefined, '']) {
+      sessionsFrom('earlier-identity', machineId)
+      await authAndSetupMachineIfNeeded()
+      expect((await readCredentials())?.encryption.type).toBe('legacy')
+    }
   })
 })
