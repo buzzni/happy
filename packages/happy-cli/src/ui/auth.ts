@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
+import { authMethodWithoutPrompt } from "./authMethodChoice";
 import { render } from 'ink';
 import React from 'react';
 import { randomUUID } from 'node:crypto';
@@ -20,8 +21,8 @@ import { logger } from './logger';
 export async function doAuth(): Promise<Credentials | null> {
     console.clear();
 
-    // Show authentication method selector
-    const authMethod = await selectAuthenticationMethod();
+    // Show authentication method selector (non-interactive sessions go straight to the pairing code)
+    const authMethod = authMethodWithoutPrompt(process.stdin.isTTY) ?? await selectAuthenticationMethod();
     if (!authMethod) {
         console.log('\nAuthentication cancelled.\n');
         process.exit(0);
