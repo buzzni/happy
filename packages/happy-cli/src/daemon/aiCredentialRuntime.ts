@@ -135,6 +135,8 @@ export type AiCredentialRuntimeDependencies = {
 export class AiCredentialRuntimeError extends Error {
   /** 프로브 실패 진단(종료 코드, stderr 마지막 줄). 데몬 로그의 오류 객체에 함께 찍힌다. */
   readonly probe?: { exitCode: number | undefined; stderrTail: string }
+  /** 예상하지 못한 실패의 종류만(오류 이름·errno). 메시지는 경로·비밀이 섞일 수 있어 남기지 않는다. */
+  failureCause?: string
 
   constructor(
     public readonly kind: string,
@@ -1536,7 +1538,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   const groups = createCredentialGroupSync({
     read: async () => { try { return await deps.readFile(groupJournalPath) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error } },
     write: async content => { await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 }); await deps.chmod(join(deps.homeDir, '.happy'), 0o700); await writeAtomicFile(deps, groupJournalPath, content) },
-    snapshot: groupAdapters.snapshot, incoming: groupPayloadIdentities, remove: groupAdapters.remove,
+    snapshot: groupAdapters.snapshot, incoming: groupPayloadIdentities, remove: groupAdapters.remove, appliedMachineId: deps.machineId,
     managedIdentities: (selected, payload) => selected !== 'claude' ? [] : (JSON.parse(payload).accounts as Array<Record<string, unknown>>)
       .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string')
       .map(account => setupTokenGroupIdentity(account.managedAccountId as string)),
@@ -2537,13 +2539,25 @@ async function writeAtomicFile(
   }
 }
 
+// Group journal and provider adapters throw their own fixed codes as plain Errors; those name the real failure.
+const GROUP_FAILURE_CODE = /^AI_GROUP_[A-Z0-9_]{1,64}$/
+
 async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
   try {
     return await operation()
   } catch (error) {
     if (error instanceof AiCredentialRuntimeError) throw error
-    throw new AiCredentialRuntimeError(kind)
+    if (error instanceof Error && GROUP_FAILURE_CODE.test(error.message)) throw new AiCredentialRuntimeError(error.message)
+    const failure = new AiCredentialRuntimeError(kind)
+    failure.failureCause = safeFailureCause(error)
+    throw failure
   }
+}
+
+function safeFailureCause(error: unknown): string {
+  const name = error instanceof Error && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : typeof error
+  const code = (error as { code?: unknown } | null)?.code
+  return typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code) ? `${name}:${code}` : name
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

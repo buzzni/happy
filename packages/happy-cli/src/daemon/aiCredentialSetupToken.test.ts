@@ -168,13 +168,13 @@ describe('sealed setup-token group assignment', () => {
     expect(first).toMatchObject({ reconciled: true, assignmentGeneration: 2, leaseId: 'lease-1', appliedCredentials: [{ managedAccountId: A, credentialGeneration: 1 }] })
     // Same snapshot, same lease: Desktop may retry after a lost response.
     expect(await relay(assignment(2, 'lease-1'))).toMatchObject({ reconciled: true, assignmentGeneration: 2, leaseId: 'lease-1' })
-    // The runtime masks journal-specific codes as a generic sync failure, so prove the refusal
-    // happened at the journal: neither attempt may import or rewrite a cswap credential.
+    // The journal's own code reaches Desktop (no longer masked as AI_GROUP_SYNC_FAILED), and
+    // neither attempt may import or rewrite a cswap credential.
     const cswapWrites = () => machine.calls.filter(call => call.command === 'cswap' && !['--version', 'token-runtime', 'list', 'export'].includes(call.args[0]!)).length
     const writesBefore = cswapWrites()
     expect(writesBefore).toBeGreaterThan(0) // the first relay really imported, so the counter can see a write
-    await expect(relay(assignment(2, 'lease-2'))).rejects.toThrow('AI_GROUP_SYNC_FAILED')
-    await expect(relay(assignment(1, 'lease-0'))).rejects.toThrow('AI_GROUP_SYNC_FAILED')
+    await expect(relay(assignment(2, 'lease-2'))).rejects.toThrow('AI_GROUP_LEASE_CONFLICT')
+    await expect(relay(assignment(1, 'lease-0'))).rejects.toThrow('AI_GROUP_GENERATION_STALE')
     expect(cswapWrites()).toBe(writesBefore)
     // The daemon's recorded receipt is still the first lease's, so Studio's status check cannot be satisfied by a stale lease.
     expect(await machine.runtime.groupReceipt('company-1', 'claude')).toMatchObject({ assignmentGeneration: 2, leaseId: 'lease-1' })
