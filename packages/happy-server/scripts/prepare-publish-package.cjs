@@ -53,7 +53,7 @@ function main() {
     const from = path.join(root, entry);
     if (fs.existsSync(from)) fs.cpSync(from, path.join(out, entry), { recursive: true });
   }
-  for (const required of ['bin/happy-server.cjs', 'index.cjs', 'dist/standalone.mjs', 'prisma/schema.prisma', 'prisma/migrations']) {
+  for (const required of ['bin/happy-server.cjs', 'index.cjs', 'dist/standalone.mjs', 'prisma/schema.prisma', 'prisma/migrations', 'webapp/index.html']) {
     if (!fs.existsSync(path.join(out, required))) throw new Error(`publish artifact is missing ${required}`);
   }
   fs.writeFileSync(path.join(out, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
