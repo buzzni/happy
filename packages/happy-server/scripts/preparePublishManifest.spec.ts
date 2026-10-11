@@ -8,6 +8,9 @@ const { publishManifest } = createRequire(import.meta.url)("./prepare-publish-pa
 const source = {
     name: "happy-server-self-host",
     version: "1.1.11",
+    repository: { type: "git", url: "https://github.com/slopus/happy" },
+    homepage: "https://happy.engineering",
+    bugs: "https://github.com/slopus/happy/issues",
     bin: { "happy-server": "./bin/happy-server.cjs" },
     files: ["bin", "index.cjs", "dist", "prisma", "webapp", "package.json", "README.md"],
     scripts: { build: "x", test: "vitest run", postinstall: "prisma generate --schema=prisma/schema.prisma", prepublishOnly: "y" },
@@ -30,6 +33,13 @@ describe("publishManifest", () => {
     it("publishes under its own version line, independent of the upstream package version", () => {
         expect(publishManifest(source, bundledDist, "0.1.0").version).toBe("0.1.0");
         expect(publishManifest(source, bundledDist, "0.2.0-rc.1").version).toBe("0.2.0-rc.1");
+    });
+
+    it("points at the repository that builds it, which npm provenance requires", () => {
+        const manifest = publishManifest(source, bundledDist, "0.1.0");
+        expect(manifest.repository).toEqual({ type: "git", url: "git+https://github.com/buzzni/happy.git", directory: "packages/happy-server" });
+        expect(manifest.bugs).toBe("https://github.com/buzzni/happy/issues");
+        expect(manifest.homepage).toBe("https://github.com/buzzni/happy");
     });
 
     it("refuses a publish version that is not semver", () => {
