@@ -253,6 +253,78 @@ describe("authRoutes with self-host hardening", () => {
         expect(last.statusCode).toBe(429);
     });
 
+    const pairingRoutes = [
+        ["POST", "/v1/auth/request", "terminal"],
+        ["GET", "/v1/auth/request/status", "terminal"],
+        ["POST", "/v1/auth/account/request", "account"],
+    ] as const;
+    const pairingCall = (route: readonly ["GET" | "POST", string, "terminal" | "account"], publicKey: string, remoteAddress = "127.0.0.1") =>
+        route[0] === "GET"
+            ? { method: route[0], url: `${route[1]}?publicKey=${encodeURIComponent(publicKey)}`, remoteAddress }
+            : { method: route[0], url: route[1], payload: { publicKey }, remoteAddress };
+
+    it.each(pairingRoutes)("shares the decoded polling key on %s %s", async (method, url, table) => {
+        let clock = Date.now();
+        const app = await createApp(hardened(), () => clock);
+        const publicKey = b64(tweetnacl.box.keyPair().publicKey);
+        const route = [method, url, table] as const;
+        const createUrl = table === "terminal" ? "/v1/auth/request" : "/v1/auth/account/request";
+        expect((await app.inject({ method: "POST", url: createUrl, payload: { publicKey } })).statusCode).toBe(200);
+        // A fresh window allows the ingress guard's 121st request; the poll bucket must stop it.
+        clock += 60_000;
+        const alternate = publicKey.replace(/=+$/, "");
+        for (let i = 0; i < 120; i++) {
+            expect((await app.inject(pairingCall(route, i % 2 ? alternate : publicKey))).statusCode).toBe(200);
+        }
+        const rejected = await app.inject(pairingCall(route, alternate));
+        expect(rejected.statusCode).toBe(429);
+        expect(rejected.headers["retry-after"]).toBe("60");
+    });
+
+    it.each(pairingRoutes)("stops pending-key database work before classification on %s %s", async (method, url, table) => {
+        const clock = Date.now();
+        const app = await createApp(hardened(), () => clock);
+        const publicKey = b64(tweetnacl.box.keyPair().publicKey);
+        const createUrl = table === "terminal" ? "/v1/auth/request" : "/v1/auth/account/request";
+        await app.inject({ method: "POST", url: createUrl, payload: { publicKey } });
+        const route = [method, url, table] as const;
+        for (let i = 0; i < 120; i++) {
+            expect((await app.inject(pairingCall(route, publicKey))).statusCode).toBe(200);
+        }
+        vi.clearAllMocks();
+        for (let i = 0; i < 50; i++) {
+            const spelling = i % 2 ? publicKey.replace(/=+$/, "") : publicKey;
+            expect((await app.inject(pairingCall(route, spelling, `10.0.0.${i + 1}`))).statusCode).toBe(429);
+        }
+        expect(db.terminalAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.terminalAuthRequest.upsert).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.upsert).not.toHaveBeenCalled();
+    });
+
+    it.each(["ip", "global"] as const)("bounds classification of unknown keys by %s across pairing routes", async (bucket) => {
+        const app = await createApp(hardened(), () => 1_000_000);
+        const publicKey = (i: number) => {
+            const key = Buffer.alloc(32);
+            key.writeUInt32LE(i);
+            return key.toString("base64");
+        };
+        const limit = bucket === "ip" ? 150 : 600;
+        for (let i = 0; i < limit; i++) {
+            await app.inject(pairingCall(pairingRoutes[i % 3], publicKey(i), bucket === "ip" ? "127.0.0.1" : `10.0.${Math.floor(i / 250)}.${i % 250 + 1}`));
+        }
+        vi.clearAllMocks();
+        for (let i = 0; i < 50; i++) {
+            const rejected = await app.inject(pairingCall(pairingRoutes[i % 3], publicKey(limit + i), bucket === "ip" ? "127.0.0.1" : `10.1.0.${i + 1}`));
+            expect(rejected.statusCode).toBe(429);
+            expect(rejected.headers["retry-after"]).toBe("60");
+        }
+        expect(db.terminalAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.terminalAuthRequest.upsert).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.upsert).not.toHaveBeenCalled();
+    });
+
     it("rejects oversized auth fields before verifying them", async () => {
         const app = await createApp(hardened());
         const body = { ...signedBody(owner), challenge: "A".repeat(4096) };
