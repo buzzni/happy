@@ -4004,16 +4004,35 @@ export class ApiMachineClient {
                 // Handle machine metadata or daemon state updates from other clients (e.g., mobile app)
                 const update = data.body as UpdateMachineBody;
 
+                // aplus-dev-studio strict-followup-plan F0-b (daemon 6) — an update the machine key
+                // cannot open came from someone without that key; it must not blank what we hold.
+                const open = (value: string): unknown => {
+                    try {
+                        return decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(value));
+                    } catch {
+                        return null;
+                    }
+                };
                 if (update.metadata) {
                     logger.debug('[API MACHINE] Received external metadata update');
-                    this.machine.metadata = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(update.metadata.value));
-                    this.machine.metadataVersion = update.metadata.version;
+                    const metadata = open(update.metadata.value);
+                    if (metadata === null) {
+                        logger.debug('[API MACHINE] Ignored a metadata update this machine key cannot open');
+                    } else {
+                        this.machine.metadata = metadata as Machine['metadata'];
+                        this.machine.metadataVersion = update.metadata.version;
+                    }
                 }
 
                 if (update.daemonState) {
                     logger.debug('[API MACHINE] Received external daemon state update');
-                    this.machine.daemonState = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(update.daemonState.value));
-                    this.machine.daemonStateVersion = update.daemonState.version;
+                    const daemonState = open(update.daemonState.value);
+                    if (daemonState === null) {
+                        logger.debug('[API MACHINE] Ignored a daemon state update this machine key cannot open');
+                    } else {
+                        this.machine.daemonState = daemonState as Machine['daemonState'];
+                        this.machine.daemonStateVersion = update.daemonState.version;
+                    }
                 }
             } else {
                 logger.debug(`[API MACHINE] Received unknown update type: ${(data.body as any).t}`);
