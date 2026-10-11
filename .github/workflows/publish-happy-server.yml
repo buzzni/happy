@@ -153,7 +153,8 @@ jobs:
                   path: pack
 
             - name: Publish the smoke-tested tarball
-              run: npm publish pack/buzzni-happy-server-*.tgz --access public --tag latest --ignore-scripts
+              # `./` is required: npm reads a bare `pack/x.tgz` as the GitHub shorthand `user/repo`.
+              run: npm publish ./pack/buzzni-happy-server-*.tgz --access public --tag latest --ignore-scripts
               env:
                   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
                   NPM_CONFIG_PROVENANCE: 'true'
