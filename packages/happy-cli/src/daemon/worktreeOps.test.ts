@@ -3,7 +3,7 @@
  * operations for a strict machine itself, from a ticket the server issued, and signs what it did.
  * Real git in temporary repositories.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -132,6 +132,16 @@ describe('worktree ops tickets', () => {
         const once = ticket('capability', { workspaceDir: repo });
         expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: true });
         expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: false, errorCode: 'TICKET_REPLAYED' });
+    });
+
+    // aplus-dev-studio strict-followup-plan F0-b (Q12 a): a restart used to forget every used ticket.
+    it('remembers used tickets across a daemon restart', async () => {
+        const once = ticket('capability', { workspaceDir: repo });
+        expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: true });
+        vi.resetModules();
+        const restarted = await import('./worktreeOps');
+        const fresh = restarted.createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW });
+        expect(await fresh['worktree:capability']({ ticket: once })).toMatchObject({ success: false, errorCode: 'TICKET_REPLAYED' });
     });
 
     it('needs a machine key to sign with', async () => {

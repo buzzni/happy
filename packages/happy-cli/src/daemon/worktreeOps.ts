@@ -38,7 +38,7 @@ import {
     type WorktreeTicket,
 } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
-import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
+import { DurableTicketGuard } from './usedWorktreeTickets';
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
 import { logger } from '@/ui/logger';
@@ -927,8 +927,18 @@ async function prepareConversation(
 
 // ── Handlers ───────────────────────────────────────────────────────────────────────────────────
 
-// Process-wide: a daemon that reconnects builds new handlers, and a used ticket must stay used.
-const usedTickets = new RpcNonceGuard({ windowMs: WORKTREE_TICKET_MAX_TTL_MS + ISSUE_SKEW_MS, maxEntries: 10_000, whenFull: 'refuse' });
+// Process-wide, and on disk: a daemon that reconnects builds new handlers, one that restarts starts
+// a new process, and a used ticket must stay used through both (strict-followup-plan F0-b, Q12 a).
+const usedTicketGuards = new Map<string, DurableTicketGuard>();
+function usedTickets(happyHomeDir: string): DurableTicketGuard {
+    const file = join(happyHomeDir, 'worktree-used-tickets.json');
+    let guard = usedTicketGuards.get(file);
+    if (!guard) {
+        guard = new DurableTicketGuard({ file, windowMs: WORKTREE_TICKET_MAX_TTL_MS + ISSUE_SKEW_MS, maxEntries: 10_000 });
+        usedTicketGuards.set(file, guard);
+    }
+    return guard;
+}
 
 export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<WorktreeOpsMethod, (request: unknown) => Promise<WorktreeOpAnswer>> {
     const now = deps.now ?? Date.now;
@@ -971,7 +981,7 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             if (!read.ok) return refused('GIT_CREDENTIAL_INVALID', 'The credential was not sealed for this machine and ticket');
             credential = { username: read.username, token: read.token };
         }
-        const admission = usedTickets.admit(ticket.opId, ticket.issuedAt, at);
+        const admission = await usedTickets(deps.happyHomeDir).admit(ticket.opId, ticket.issuedAt, at);
         if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
         if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
 
