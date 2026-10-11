@@ -507,6 +507,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
         let base: string;
         let baseRevision: string;
         if (originBase) {
+            if (params.remoteUrl) await requireSameRepository(repo, params.remoteUrl);
             base = `refs/remotes/origin/${originBase}`;
             const fetchRef = `refs/aplus/fetch/${process.pid}-${Date.now()}`;
             try {
@@ -654,11 +655,64 @@ async function fetchBranch(dir: string, remote: string, branch: string, credenti
     }
 }
 
-/** Points `origin` at the address the server chose, as its scripts do before fetching. */
+/**
+ * The repository an address names — host and owner/name, lowercased, without scheme, credentials or
+ * `.git` — so an https and an ssh address of one repository compare equal. Null when unreadable.
+ */
+export function repositoryIdentity(address: string): string | null {
+    const value = address.trim();
+    const scp = /^[^@/\s]+@([^:/\s]+):(.+)$/.exec(value);
+    let host: string;
+    let path: string;
+    if (scp) {
+        host = scp[1]!;
+        path = scp[2]!;
+    } else {
+        let url: URL;
+        try {
+            url = new URL(value);
+        } catch {
+            return null;
+        }
+        if (!['https:', 'http:', 'ssh:', 'git:'].includes(url.protocol)) return null;
+        host = url.hostname;
+        path = url.pathname;
+    }
+    const name = path.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+    if (!host || !name || name.split('/').some((part) => !part || part === '.' || part === '..')) return null;
+    return `${host.toLowerCase()}/${name.toLowerCase()}`;
+}
+
+/** Every address `origin` actually uses (fetch and push, after `insteadOf` rewrites); empty without it. */
+async function originAddresses(dir: string): Promise<string[]> {
+    const fetchUrls = await runGit(dir, ['remote', 'get-url', '--all', 'origin'], { readOnly: true });
+    if (fetchUrls.code !== 0) return [];
+    const pushUrls = await runGit(dir, ['remote', 'get-url', '--push', '--all', 'origin'], { readOnly: true });
+    return [...fetchUrls.stdout.split('\n'), ...(pushUrls.code === 0 ? pushUrls.stdout.split('\n') : [])]
+        .map((line) => line.trim())
+        .filter(Boolean);
+}
+
+/**
+ * aplus-dev-studio strict-followup-plan F0-b — the address comes from the server, so it must name
+ * the repository `origin` already fetches from and pushes to, checked before anything is changed or
+ * sent. Without an `origin`, the first one is the server's (as its scripts set it today).
+ */
+async function requireSameRepository(dir: string, remoteUrl: string): Promise<'same' | 'no-origin'> {
+    const wanted = repositoryIdentity(remoteUrl);
+    const current = await originAddresses(dir);
+    if (current.length === 0) return 'no-origin';
+    if (!wanted || current.some((address) => repositoryIdentity(address) !== wanted)) {
+        throw new OpFailure('WORKTREE_REMOTE_MISMATCH', '연결된 온라인 저장소가 이 작업 공간의 origin과 다른 저장소입니다.');
+    }
+    return 'same';
+}
+
+/** Points `origin` at the address the server chose, as its scripts do before fetching — one repository only. */
 async function setOrigin(dir: string, remoteUrl: string | null): Promise<void> {
     if (!remoteUrl) return;
-    const existing = await runGit(dir, ['remote', 'get-url', 'origin'], { readOnly: true });
-    await gitOk(dir, existing.code === 0 ? ['remote', 'set-url', 'origin', remoteUrl] : ['remote', 'add', 'origin', remoteUrl], 'WORKTREE_REMOTE_FAILED');
+    const origin = await requireSameRepository(dir, remoteUrl);
+    await gitOk(dir, origin === 'same' ? ['remote', 'set-url', 'origin', remoteUrl] : ['remote', 'add', 'origin', remoteUrl], 'WORKTREE_REMOTE_FAILED');
 }
 
 async function applyWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 'apply' }): Promise<WorktreeOpResult<'apply'>> {

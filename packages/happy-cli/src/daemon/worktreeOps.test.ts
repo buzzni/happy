@@ -619,6 +619,47 @@ describe('worktree:publish', () => {
         const path = await worktree();
         expect(await call('publish', publish(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_PUBLISH_NO_REMOTE' });
     });
+
+    // aplus-dev-studio strict-followup-plan F0-b (daemon 4): the address comes from the server, so it
+    // must name the repository this workspace already pushes to, before anything is changed or sent.
+    describe('pins the address to the repository origin already names', () => {
+        const ONLINE = 'https://github.com/acme/app.git';
+        const ELSEWHERE = 'https://evil.example/acme/app.git';
+
+        it('refuses another repository, and leaves origin as it was', async () => {
+            git(repo, 'remote', 'add', 'origin', ONLINE);
+            const path = await worktree();
+            expect(await call('publish', publish(path, { remoteUrl: ELSEWHERE }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+            expect(await call('publish', publish(path, { remoteUrl: 'https://github.com/acme/other.git' }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+            expect(git(repo, 'remote', 'get-url', 'origin')).toBe(ONLINE);
+        });
+
+        it('refuses when origin pushes, or is rewritten, somewhere else', async () => {
+            git(repo, 'remote', 'add', 'origin', ONLINE);
+            git(repo, 'remote', 'set-url', '--push', 'origin', ELSEWHERE);
+            const path = await worktree();
+            expect(await call('publish', publish(path, { remoteUrl: ONLINE }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+            git(repo, 'config', '--unset', 'remote.origin.pushurl');
+            git(repo, 'config', 'url.https://evil.example/.insteadOf', 'https://github.com/');
+            expect(await call('publish', publish(path, { remoteUrl: ONLINE }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        });
+
+        it('accepts the same repository over another transport', async () => {
+            git(repo, 'remote', 'add', 'origin', 'git@github.com:Acme/app.git');
+            git(repo, 'switch', '--quiet', '-c', 'side');
+            const answer = await call('prepare-conversation', {
+                workspaceDir: repo, baseBranch: 'main', source: 'origin', allowCurrentBranchDirty: true, remoteUrl: ONLINE, statusPathspecs: ['.'],
+            });
+            expect(answer.errorCode).not.toBe('WORKTREE_REMOTE_MISMATCH');
+            expect(git(repo, 'remote', 'get-url', 'origin')).toBe(ONLINE);
+        });
+
+        it('does not fetch a base from another repository', async () => {
+            git(repo, 'remote', 'add', 'origin', ONLINE);
+            expect(await call('create', create({ baseSource: 'origin', baseRef: 'main', remoteUrl: ELSEWHERE })))
+                .toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        });
+    });
 });
 
 describe('worktree:reconcile', () => {
