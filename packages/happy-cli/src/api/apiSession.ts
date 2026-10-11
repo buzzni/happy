@@ -24,6 +24,7 @@ import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayM
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
+    failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
     mapClaudeLogMessageToSessionEnvelopes,
     toolCallTurnFor,
@@ -1600,6 +1601,13 @@ export class ApiSessionClient extends EventEmitter {
             this.sendSync.invalidate();
         }
         this.applyClaudeSessionMessageSideEffects(body);
+    }
+
+    /** A launch that died before its first message: fail its turn, opening one if none is open. */
+    failClaudeLaunchTurn() {
+        const mapped = failClaudeLaunchTurn(this.claudeSessionProtocolState);
+        this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
+        this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
     closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
