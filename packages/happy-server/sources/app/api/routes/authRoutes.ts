@@ -5,8 +5,57 @@ import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
 import { requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
 import { log } from "@/utils/log";
+import {
+    AUTH_FIELD_MAX_LENGTH,
+    createRateLimiter,
+    createReplayGuard,
+    keyFingerprint,
+    readSelfHostAuthPolicy,
+    type SelfHostAuthPolicy,
+} from "@/app/auth/selfHostAuthPolicy";
 
-export function authRoutes(app: Fastify) {
+const AUTH_LIMITS = {
+    ip: { limit: 30, windowMs: 60_000 },
+    key: { limit: 20, windowMs: 60_000 },
+    global: { limit: 600, windowMs: 60_000 },
+};
+
+export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy; now?: () => number } = {}) {
+    // Read once at registration so a broken self-host config fails startup instead of serving open sign-up.
+    const policy = options.policy ?? readSelfHostAuthPolicy(process.env);
+    const now = options.now ?? Date.now;
+    const replayGuard = createReplayGuard(policy.pairingTtlMs);
+    const limiter = createRateLimiter(AUTH_LIMITS);
+    const clientAddress = (request: any): string => {
+        const forwarded = policy.trustProxy ? String(request.headers['x-forwarded-for'] ?? '').split(',')[0].trim() : '';
+        return forwarded || request.socket?.remoteAddress || 'unknown';
+    };
+    /** Self-host only: true when the request was answered with 400/429. */
+    const refuseUnauthenticated = (request: any, reply: any, fields: Record<string, unknown>): boolean => {
+        if (!policy.hardened) return false;
+        for (const [name, value] of Object.entries(fields)) {
+            const max = AUTH_FIELD_MAX_LENGTH[name as keyof typeof AUTH_FIELD_MAX_LENGTH];
+            if (typeof value === 'string' && max !== undefined && value.length > max) {
+                reply.code(400).send({ error: 'Field too long' });
+                return true;
+            }
+        }
+        const at = now();
+        const waits = [
+            limiter('ip', clientAddress(request), at),
+            limiter('global', 'all', at),
+            typeof fields.publicKey === 'string' ? limiter('key', fields.publicKey, at) : 0,
+        ];
+        const wait = Math.max(...waits);
+        if (wait > 0) {
+            reply.code(429).header('Retry-After', String(wait)).send({ error: 'Too many requests' });
+            return true;
+        }
+        return false;
+    };
+    const pairingExpired = (row: { createdAt: Date }) => policy.hardened && now() - row.createdAt.getTime() > policy.pairingTtlMs;
+    const logKey = (publicKeyHex: string) => policy.hardened ? `fp:${keyFingerprint(publicKeyHex)}` : publicKeyHex;
+
     app.post('/v1/auth', {
         schema: {
             body: z.object({
@@ -16,6 +65,7 @@ export function authRoutes(app: Fastify) {
             })
         }
     }, async (request, reply) => {
+        if (refuseUnauthenticated(request, reply, request.body)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = privacyKit.decodeBase64(request.body.publicKey);
         const challenge = privacyKit.decodeBase64(request.body.challenge);
@@ -27,6 +77,12 @@ export function authRoutes(app: Fastify) {
 
         // Create or update user in database
         const publicKeyHex = privacyKit.encodeHex(publicKey);
+        if (policy.allowedPublicKeysHex && !policy.allowedPublicKeysHex.has(publicKeyHex.toLowerCase())) {
+            return reply.code(403).send({ error: 'Account not allowed' });
+        }
+        if (policy.hardened && !replayGuard(publicKeyHex, request.body.challenge, now())) {
+            return reply.code(401).send({ error: 'Challenge already used' });
+        }
         const user = await db.account.upsert({
             where: { publicKey: publicKeyHex },
             update: { updatedAt: new Date() },
@@ -55,10 +111,14 @@ export function authRoutes(app: Fastify) {
                 })]),
                 401: z.object({
                     error: z.literal('Invalid public key')
+                }),
+                410: z.object({
+                    error: z.literal('Request expired')
                 })
             }
         }
     }, async (request, reply) => {
+        if (refuseUnauthenticated(request, reply, request.body)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = privacyKit.decodeBase64(request.body.publicKey);
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
@@ -67,15 +127,25 @@ export function authRoutes(app: Fastify) {
         }
 
         const publicKeyHex = privacyKit.encodeHex(publicKey);
-        log({ module: 'auth-request' }, `Terminal auth request - publicKey hex: ${publicKeyHex}`);
+        log({ module: 'auth-request' }, `Terminal auth request - publicKey: ${logKey(publicKeyHex)}`);
 
         const answer = await db.terminalAuthRequest.upsert({
             where: { publicKey: publicKeyHex },
             update: {},
             create: { publicKey: publicKeyHex, supportsV2: request.body.supportsV2 ?? false }
         });
+        if (pairingExpired(answer)) {
+            await db.terminalAuthRequest.deleteMany({ where: { id: answer.id } });
+            return reply.code(410).send({ error: 'Request expired' });
+        }
 
         if (answer.response && answer.responseAccountId) {
+            // Self-host: the pairing code is shown on screen, so whoever polls it after
+            // approval would get the owner's token. Hand it out to the first poll only.
+            if (policy.hardened) {
+                const consumed = await db.terminalAuthRequest.deleteMany({ where: { id: answer.id, response: { not: null } } });
+                if (consumed.count !== 1) return reply.send({ state: 'requested' });
+            }
             const token = await auth.createToken(answer.responseAccountId!, { session: answer.id });
             return reply.send({
                 state: 'authorized',
@@ -101,6 +171,7 @@ export function authRoutes(app: Fastify) {
             }
         }
     }, async (request, reply) => {
+        if (refuseUnauthenticated(request, reply, request.query)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = privacyKit.decodeBase64(request.query.publicKey);
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
@@ -113,7 +184,7 @@ export function authRoutes(app: Fastify) {
             where: { publicKey: publicKeyHex }
         });
 
-        if (!authRequest) {
+        if (!authRequest || pairingExpired(authRequest)) {
             return reply.send({ status: 'not_found', supportsV2: false });
         }
 
@@ -140,7 +211,7 @@ export function authRoutes(app: Fastify) {
             })
         }
     }, async (request, reply) => {
-        log({ module: 'auth-response' }, `Auth response endpoint hit - user: ${request.userId}, publicKey: ${request.body.publicKey.substring(0, 20)}...`);
+        log({ module: 'auth-response' }, `Auth response endpoint hit - user: ${request.userId}`);
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = privacyKit.decodeBase64(request.body.publicKey);
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
@@ -149,10 +220,17 @@ export function authRoutes(app: Fastify) {
             return reply.code(401).send({ error: 'Invalid public key' });
         }
         const publicKeyHex = privacyKit.encodeHex(publicKey);
-        log({ module: 'auth-response' }, `Looking for auth request with publicKey hex: ${publicKeyHex}`);
+        log({ module: 'auth-response' }, `Looking for auth request with publicKey: ${logKey(publicKeyHex)}`);
         const authRequest = await db.terminalAuthRequest.findUnique({
             where: { publicKey: publicKeyHex }
         });
+        if (authRequest && pairingExpired(authRequest)) {
+            // Left in place: the polling CLI sees 410 and stops, and that poll removes it.
+            return reply.code(410).send({ error: 'Request expired' });
+        }
+        if (!authRequest && policy.hardened) {
+            return reply.code(404).send({ error: 'Request not found' });
+        }
         if (!authRequest) {
             log({ module: 'auth-response' }, `Auth request not found for publicKey: ${publicKeyHex}`);
             // Let's also check what auth requests exist
@@ -168,6 +246,8 @@ export function authRoutes(app: Fastify) {
                 where: { id: authRequest.id },
                 data: { response: request.body.response, responseAccountId: request.userId }
             });
+        } else if (policy.hardened) {
+            return reply.send({ success: true, alreadyApproved: true });
         }
         return reply.send({ success: true });
     });
@@ -188,10 +268,14 @@ export function authRoutes(app: Fastify) {
                 })]),
                 401: z.object({
                     error: z.literal('Invalid public key')
+                }),
+                410: z.object({
+                    error: z.literal('Request expired')
                 })
             }
         }
     }, async (request, reply) => {
+        if (refuseUnauthenticated(request, reply, request.body)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = privacyKit.decodeBase64(request.body.publicKey);
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
@@ -204,8 +288,16 @@ export function authRoutes(app: Fastify) {
             update: {},
             create: { publicKey: privacyKit.encodeHex(publicKey) }
         });
+        if (pairingExpired(answer)) {
+            await db.accountAuthRequest.deleteMany({ where: { id: answer.id } });
+            return reply.code(410).send({ error: 'Request expired' });
+        }
 
         if (answer.response && answer.responseAccountId) {
+            if (policy.hardened) {
+                const consumed = await db.accountAuthRequest.deleteMany({ where: { id: answer.id, response: { not: null } } });
+                if (consumed.count !== 1) return reply.send({ state: 'requested' });
+            }
             const token = await auth.createToken(answer.responseAccountId!);
             return reply.send({
                 state: 'authorized',

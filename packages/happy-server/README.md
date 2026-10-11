@@ -61,6 +61,10 @@ Data persists in the `happy-data` Docker volume across container restarts.
 | `PORT` | No | `3005` | Server port |
 | `DATA_DIR` | No | `/data` | Base data directory |
 | `PGLITE_DIR` | No | `/data/pglite` | PGlite database directory |
+| `HAPPY_AUTH_ALLOWED_PUBLIC_KEYS` | No | unset (anyone may sign in) | Comma-separated base64 Ed25519 public keys allowed to sign in via `/v1/auth`. Set but empty or malformed fails startup |
+| `HAPPY_SELF_HOST_HARDENING` | No | unset | `1` for an internet-facing single-owner server: single-use signed challenges, single-use and expiring pairing codes, per-address/per-key request limits on unauthenticated auth routes. Requires `HAPPY_AUTH_ALLOWED_PUBLIC_KEYS` |
+| `HAPPY_AUTH_PAIRING_TTL_MS` | No | `600000` | How long an unapproved pairing code stays valid under hardening |
+| `HAPPY_TRUST_PROXY` | No | unset | `1` to take the client address from `X-Forwarded-For` for request limits. Only behind a proxy that overwrites that header |
 
 ### Optional: External Services
 
