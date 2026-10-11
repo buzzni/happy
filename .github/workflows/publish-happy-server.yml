@@ -50,8 +50,11 @@ jobs:
             - name: Setup Bun
               uses: oven-sh/setup-bun@v2
 
-            - name: Install server dependencies
-              run: pnpm install --frozen-lockfile --filter "happy-server-self-host..."
+            - name: Install server and web app dependencies
+              run: pnpm install --frozen-lockfile --filter "happy-server-self-host..." --filter "happy-app..."
+
+            - name: Build shared wire package
+              run: pnpm --filter @slopus/happy-wire build
 
             - name: Verify tag matches package version
               id: release_version
@@ -70,6 +73,9 @@ jobs:
 
             - name: Build runtime bundle
               run: node packages/happy-server/scripts/build-runtime.cjs
+
+            - name: Bundle web app
+              run: pnpm --filter happy-server-self-host run bundle:webapp
 
             - name: Prepare and pack publish artifact
               run: |
