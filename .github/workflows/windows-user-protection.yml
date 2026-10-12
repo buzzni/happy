@@ -1,0 +1,26 @@
+name: Windows user-protected storage helper
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build Windows user-protected storage helper
+        run: node packages/happy-cli/scripts/build-windows-user-protection.cjs
+      - name: Validate native storage contract
+        run: node packages/happy-cli/scripts/test-windows-user-protection.cjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-user-protection
+          path: packages/happy-cli/native/windows-x64/user-protection.*
+          if-no-files-found: error

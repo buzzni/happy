@@ -8,6 +8,7 @@ on:
       - 'packages/happy-browser-extension/**'
       - 'packages/happy-server/**'
       - '.github/workflows/cli-smoke-test.yml'
+      - '.github/workflows/windows-user-protection.yml'
   pull_request:
     branches: [ main ]
     paths:
@@ -15,10 +16,15 @@ on:
       - 'packages/happy-browser-extension/**'
       - 'packages/happy-server/**'
       - '.github/workflows/cli-smoke-test.yml'
+      - '.github/workflows/windows-user-protection.yml'
   workflow_dispatch:
 
 jobs:
+  windows-user-protection:
+    uses: ./.github/workflows/windows-user-protection.yml
+
   smoke-test-linux:
+    needs: windows-user-protection
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -50,6 +56,12 @@ jobs:
       run: |
         pnpm --filter happy-server-self-host generate
         pnpm --filter happy-server-self-host run bundle:webapp
+
+    - name: Download Windows user-protected storage helper
+      uses: actions/download-artifact@v4
+      with:
+        name: windows-user-protection
+        path: packages/happy-cli/native/windows-x64
 
     - name: Pack packages
       run: |
@@ -121,6 +133,7 @@ jobs:
         echo "happy server smoke test passed (booted + Prisma query engine OK)"
 
   smoke-test-windows:
+    needs: windows-user-protection
     runs-on: windows-latest
     strategy:
       matrix:
@@ -145,10 +158,19 @@ jobs:
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
 
+    - name: Download Windows user-protected storage helper
+      uses: actions/download-artifact@v4
+      with:
+        name: windows-user-protection
+        path: packages/happy-cli/native/windows-x64
+
     - name: Pack package
       run: |
         $publishDir = Join-Path $env:RUNNER_TEMP "happy-cli-publish"
         node packages/happy-cli/scripts/prepare-publish-package.cjs --out $publishDir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node packages/happy-cli/scripts/guard-publish-artifact.cjs $publishDir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         npm pack $publishDir --ignore-scripts --pack-destination packages/happy-cli
 
     - name: Install packed package globally

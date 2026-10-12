@@ -30,4 +30,18 @@ function decideGlobalInstall({ state, isPidAlive, override }) {
     return { blocked: true, overridden: false, sessionCount, pid };
 }
 
-module.exports = { decideGlobalInstall };
+// An unreadable Windows state may still belong to a live daemon. Never treat
+// failed custody/decryption as absence and replace the bundle it is running.
+function readInstallDaemonState({ filePath, isWindows, fs = require('node:fs'), loadWindowsStorage }) {
+    try {
+        if (isWindows) {
+            fs.lstatSync(filePath); // permits a new install without an existing helper
+            return JSON.parse(loadWindowsStorage().read(filePath));
+        }
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch (error) {
+        if (!isWindows || error.code === 'ENOENT') return null;
+        throw new Error('WINDOWS_SECRET_READ_FAILED: build the paired Windows storage helper before verifying a global install');
+    }
+}
+module.exports = { decideGlobalInstall, readInstallDaemonState };

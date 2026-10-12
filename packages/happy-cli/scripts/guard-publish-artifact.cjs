@@ -13,6 +13,9 @@ const DEPENDENCY_FIELDS = [
 ];
 
 const EXPECTED_BUNDLED_FILES = [
+    'package/dist/windowsPrivateStorage.cjs',
+    'package/native/windows-x64/user-protection.exe',
+    'package/native/windows-x64/user-protection.json',
     'package/bin/happy-browser-native-host.mjs',
     'package/dist/browserNativeMessagingHost.mjs',
     'package/browser-extension/src/nativePairing.js',
@@ -59,8 +62,23 @@ function parseArgs(argv) {
     return args;
 }
 
+// Windows npm is a .cmd shim, which spawnSync cannot execute without a shell.
+// Run its JS entrypoint with this Node; keep paths/arguments out of shell parsing.
+function spawnNpm(args, options = {}) {
+    if (process.platform !== 'win32') return childProcess.spawnSync('npm', args, options);
+    const candidates = [
+        process.env.npm_execpath,
+        path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js'),
+        ...(process.env.PATH || '').split(path.delimiter).filter(Boolean)
+            .map(directory => path.join(directory, 'node_modules/npm/bin/npm-cli.js'))
+    ];
+    const cli = candidates.find(file => file && path.basename(file).toLowerCase() === 'npm-cli.js' && fs.existsSync(file));
+    if (!cli) throw new Error('npm CLI entrypoint not found for Windows artifact verification');
+    return childProcess.spawnSync(process.execPath, [cli, ...args], options);
+}
+
 function run(command, args, options = {}) {
-    const result = childProcess.spawnSync(command, args, {
+    const result = (command === 'npm' ? spawnNpm : (argv, opts) => childProcess.spawnSync(command, argv, opts))(args, {
         encoding: 'utf8',
         ...options
     });
@@ -68,6 +86,7 @@ function run(command, args, options = {}) {
     if (result.status !== 0) {
         throw new Error([
             `Command failed: ${command} ${args.join(' ')}`,
+            result.error && `${result.error.code}: ${result.error.message}`,
             result.stdout,
             result.stderr
         ].filter(Boolean).join('\n'));
@@ -191,7 +210,7 @@ function collectTarErrors(entries) {
 }
 
 function assertProductionDependencyClosure(prefix) {
-    const result = childProcess.spawnSync('npm', [
+    const result = spawnNpm([
         'ls',
         '--global',
         '--prefix',
@@ -218,7 +237,7 @@ function assertProductionDependencyClosure(prefix) {
 
     const details = problems.length > 0
         ? formatErrors(problems)
-        : [result.stderr, result.stdout]
+        : [result.error?.message, result.stderr, result.stdout]
             .filter(Boolean)
             .join('\n')
             .split('\n')
@@ -272,7 +291,7 @@ function runInstallSmoke(tarball, packageJson) {
 
         const installedRoot = path.join(
             prefix,
-            'lib',
+            ...(process.platform === 'win32' ? [] : ['lib']),
             'node_modules',
             ...packageJson.name.split('/')
         );
@@ -341,7 +360,7 @@ function runInstallSmoke(tarball, packageJson) {
             throw new Error('Saycode agent facade did not return the bundled CLI help');
         }
 
-        if (fs.existsSync(path.join(prefix, 'bin', 'saycode'))) {
+        if (fs.existsSync(path.join(prefix, ...(process.platform === 'win32' ? ['saycode.cmd'] : ['bin', 'saycode'])))) {
             throw new Error('Happy CLI install unexpectedly created a global saycode bin');
         }
 

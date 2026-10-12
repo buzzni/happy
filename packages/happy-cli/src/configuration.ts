@@ -10,6 +10,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import packageJson from '../package.json'
 import { resolveBrowserBridgeTokenFile } from './daemon/browserBridgeToken'
+import { windowsPrivateFile, WindowsPrivateFileError } from './utils/windowsPrivateFile'
 
 class Configuration {
   // serverUrl/webappUrl 은 생성 시 env>settings>default 로 정해지지만,
@@ -143,11 +144,14 @@ class Configuration {
 
 function readSettingsStringSync(settingsFile: string, key: 'serverUrl' | 'webappUrl' | 'machineControl'): string | undefined {
   try {
-    if (!existsSync(settingsFile)) return undefined
-    const raw = JSON.parse(readFileSync(settingsFile, 'utf8'))
+    const raw = JSON.parse(process.platform === 'win32'
+      ? windowsPrivateFile.read(settingsFile)
+      : windowsPrivateFile.decode(readFileSync(settingsFile, 'utf8'), settingsFile))
     const value = raw?.[key]
     return typeof value === 'string' && value.length > 0 ? value : undefined
-  } catch {
+  } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error
+    if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED')
     return undefined
   }
 }
