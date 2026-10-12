@@ -599,7 +599,13 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const changed = managedExisting.filter(account => !sameManagedSetupToken(local.find(slot => slot.email === account.email), account))
       for (const account of changed) {
         const stored = local.find(slot => slot.email === account.email)
-        if (!owns(account) || !stored || stored.managedAccountId !== account.managedAccountId) throw new AiCredentialRuntimeError('AI_GROUP_CREDENTIAL_CONFLICT')
+        if (!owns(account) || !stored || stored.managedAccountId !== account.managedAccountId) {
+          // Which check refused, without any account detail: the daemon log otherwise cannot tell a takeover attempt
+          // from a slot missing in cswap or a changed managed id (2026-10-12 hmrepo).
+          const conflict = new AiCredentialRuntimeError('AI_GROUP_CREDENTIAL_CONFLICT')
+          conflict.failureCause = !owns(account) ? 'not-owned' : !stored ? 'slot-missing' : 'managed-id-mismatch'
+          throw conflict
+        }
         const storedGeneration = Number(stored.credentialGeneration)
         if (storedGeneration > Number(account.credentialGeneration)) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_STALE')
         if (storedGeneration === account.credentialGeneration) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_CONFLICT')

@@ -355,7 +355,8 @@ describe('managed Claude setup-token runtime', () => {
 
   it('never takes over a personally imported slot with the same synthetic email', async () => {
     const { runtime, state, calls } = fakeMachine([stored(A, 1, fakeToken('personal'))], 2)
-    await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')))))).rejects.toThrow('AI_GROUP_CREDENTIAL_CONFLICT')
+    // 2026-10-12 hmrepo: the conflict did not say which check refused, so the daemon log could not tell a takeover from a stale journal.
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')))))).rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
     expect(state.slots[0]!.credentials).toEqual(managed(A, 1, fakeToken('personal')).credentials)
     expect(calls.some(call => call.args[0] === 'import')).toBe(false)
   })
@@ -745,7 +746,7 @@ describe('managed Claude setup-token runtime', () => {
     const { runtime, state } = fakeMachine([], null)
     await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
     const other = { ...sync(1, payload(managed(A, 2, fakeToken('b')))), scope: 'company-2' }
-    await expect(runtime.groupSync(other)).rejects.toThrow('AI_GROUP_CREDENTIAL_CONFLICT')
+    await expect(runtime.groupSync(other)).rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
     // Unassigning the second scope leaves the first scope's slot in place.
     await runtime.groupSync({ ...sync(2, null as never), scope: 'company-2', payload: null })
     expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A])
