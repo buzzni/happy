@@ -52,6 +52,7 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
     return { ...original, MessageQueue2: Recorded };
 });
 
+const protocolMessages: { ev?: { t?: string; requestId?: string; nonce?: string; text?: string; status?: string } }[] = [];
 type Outcome = 'overloaded' | 'ok';
 let script: { outcome: Outcome; after?: () => void | Promise<void> }[] = [];
 let turnsSent: string[] = [];
@@ -82,6 +83,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
             turnsSent.push(String(input));
             const step = script.shift() ?? { outcome: 'ok' as const };
             eventHandler?.({ type: 'task_started', turn_id: `turn-${turnsSent.length}` });
+            if (step.outcome === 'ok') eventHandler?.({ type: 'agent_message', phase: 'final_answer', message: 'fixed', turn_id: `turn-${turnsSent.length}` });
             eventHandler?.(step.outcome === 'overloaded'
                 ? { ...OVERLOADED, turn_id: `turn-${turnsSent.length}` }
                 : { type: 'task_complete', status: 'completed', turn_id: `turn-${turnsSent.length}` });
@@ -89,7 +91,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
             return { aborted: false };
         }
         abortPreparedTurn = vi.fn();
-        abortTurnWithFallback = vi.fn(async () => {});
+        abortTurnWithFallback = vi.fn(async () => ({ forcedRestart: false }));
         interruptTurn = vi.fn(async () => {});
         prepareProtectedTurn = vi.fn(() => ({ release: vi.fn() }));
         endInputAndAwaitExit = vi.fn(async () => {});
@@ -102,6 +104,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
 }));
 
 let onConnect: (() => Promise<void>) | null = null;
+let onUserMessage: ((message: { content: { type: 'text'; text: string } }) => unknown) | null = null;
 const rpc = new Map<string, (params: unknown) => unknown>();
 const sessionEvents: { message?: string }[] = [];
 let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', codexThreadId: 'thread-1' };
@@ -112,7 +115,13 @@ function sessionStub() {
         runtimeId: 'runtime-test',
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
         sendSessionEvent: vi.fn((event: { message?: string }) => { sessionEvents.push(event); }),
-        sendSessionProtocolMessage: vi.fn(),
+        sendSessionProtocolMessage: vi.fn((envelope: typeof protocolMessages[number]) => {
+            protocolMessages.push(envelope);
+            const ev = envelope.ev;
+            if (ev?.t === 'channel-ready') queueMicrotask(() => {
+                void rpc.get('channel-authorize')?.({ requestId: ev.requestId, expectedRuntimeId: 'runtime-test', nonce: ev.nonce, decision: 'allow' });
+            });
+        }),
         sendStreamDelta: vi.fn(),
         sendProviderUsageEvent: vi.fn(),
         uploadLocalImageAttachmentEnvelope: vi.fn(),
@@ -121,7 +130,7 @@ function sessionStub() {
         }),
         getMetadata: vi.fn(() => sessionMetadata),
         updateAgentState: vi.fn(),
-        onUserMessage: vi.fn(),
+        onUserMessage: vi.fn((handler: NonNullable<typeof onUserMessage>) => { onUserMessage = handler; }),
         onFileEvent: vi.fn(),
         on: vi.fn(),
         hasTitle: vi.fn(() => true),
@@ -145,15 +154,15 @@ const closeQueue = () => { queues[0]!.close(); };
 
 describe('automatic continuation after a capacity failure', () => {
     beforeEach(() => {
-        queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null;
+        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null; onUserMessage = null;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-1' };
         // Run from inside a Saycode session, the runner would otherwise pick up that
         // session's own lesson host, reconnect target and sandbox settings, and never exit.
         for (const key of Object.keys(process.env)) {
-            if (/^(HAPPY|SAYCODE|APLUS|CODEX)_/.test(key)) vi.stubEnv(key, undefined);
+            if (key !== 'HAPPY_HOME_DIR' && /^(HAPPY|SAYCODE|APLUS|CODEX)_/.test(key)) vi.stubEnv(key, undefined);
         }
     });
-    afterEach(() => { vi.unstubAllEnvs(); });
+    afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
     async function run(seed: () => Promise<void>) {
         const { runCodex } = await import('@/codex/runCodex');
@@ -242,4 +251,103 @@ describe('automatic continuation after a capacity failure', () => {
         expect(notices()).toHaveLength(1);
         expect(continuations()).toHaveLength(0);
     }, 60_000);
+    it('does not resume work stopped between terminal notification and cleanup completion', async () => {
+        script = [{
+            outcome: 'overloaded',
+            after: async () => {
+                await rpc.get('abort')?.({});
+                setTimeout(closeQueue, 150);
+            },
+        }];
+        await run(async () => {
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+        });
+        expect(continuations()).toHaveLength(0);
+        expect(notices()).toHaveLength(0);
+    }, 60_000);
+
+    it('leaves a failed channel request terminal without an uncorrelated continuation', async () => {
+        script = [{ outcome: 'overloaded', after: () => { setTimeout(closeQueue, 150); } }];
+        await run(async () => {
+            const accepted = await rpc.get('channel-prompt')?.({ text: 'fix the bug', requestId: 'request-1', expectedRuntimeId: 'runtime-test' });
+            expect(accepted).toMatchObject({ ok: true, accepted: true });
+        });
+        expect(protocolMessages.filter(e => e.ev?.t === 'channel-ready')).toHaveLength(1);
+        expect(protocolMessages.filter(e => e.ev?.t === 'turn-end')).toContainEqual(expect.objectContaining({ ev: expect.objectContaining({ requestId: 'request-1', status: 'failed' }) }));
+        expect(continuations()).toHaveLength(0);
+        expect(notices()).toHaveLength(0);
+        expect(turnsSent).toHaveLength(1);
+    }, 60_000);
+
+    it('still delivers a correlated final answer for a successful channel request', async () => {
+        script = [{ outcome: 'ok', after: closeQueue }];
+        await run(async () => {
+            const accepted = await rpc.get('channel-prompt')?.({ text: 'fix the bug', requestId: 'request-control', expectedRuntimeId: 'runtime-test' });
+            expect(accepted).toMatchObject({ ok: true, accepted: true });
+        });
+        expect(protocolMessages.filter(e => e.ev?.t === 'final-answer')).toContainEqual(expect.objectContaining({ ev: expect.objectContaining({ requestId: 'request-control', text: 'fixed' }) }));
+        expect(turnsSent).toHaveLength(1);
+    }, 60_000);
+
+    it('removes a continuation when Stop arrives immediately after enqueue', async () => {
+        script = [{ outcome: 'overloaded' }];
+        let queued = false;
+        await run(async () => {
+            const queue = queues[0]!;
+            const unshift = queue.unshiftIsolated.bind(queue);
+            vi.spyOn(queue, 'unshiftIsolated').mockImplementation((...args) => {
+                unshift(...args);
+                queued = true;
+                void rpc.get('abort')?.({});
+                setTimeout(closeQueue, 150);
+            });
+            queue.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+        });
+        expect(queued).toBe(true);
+        expect(continuations()).toHaveLength(0);
+    }, 60_000);
+
+    it('does not dispatch a continuation stopped after dequeue', async () => {
+        script = [{ outcome: 'overloaded' }];
+        let collected = false;
+        await run(async () => {
+            const queue = queues[0]!;
+            const collect = queue.waitForMessagesAndGetAsString.bind(queue);
+            vi.spyOn(queue, 'waitForMessagesAndGetAsString').mockImplementation(async (...args) => {
+                const batch = await collect(...args);
+                if (batch?.message === CODEX_CAPACITY_CONTINUE_PROMPT) {
+                    collected = true;
+                    await rpc.get('abort')?.({});
+                    setTimeout(closeQueue, 150);
+                }
+                return batch;
+            });
+            queue.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+        });
+        expect(collected).toBe(true);
+        expect(continuations()).toHaveLength(0);
+    }, 60_000);
+
+    it('lets accepted user input replace an already dequeued continuation', async () => {
+        script = [{ outcome: 'overloaded' }, { outcome: 'ok', after: closeQueue }];
+        let collected = false;
+        await run(async () => {
+            const queue = queues[0]!;
+            const collect = queue.waitForMessagesAndGetAsString.bind(queue);
+            vi.spyOn(queue, 'waitForMessagesAndGetAsString').mockImplementation(async (...args) => {
+                const batch = await collect(...args);
+                if (batch?.message === CODEX_CAPACITY_CONTINUE_PROMPT) {
+                    collected = true;
+                    await onUserMessage!({ content: { type: 'text', text: 'try another approach' } });
+                }
+                return batch;
+            });
+            queue.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+        });
+        expect(collected).toBe(true);
+        expect(turnsSent).toHaveLength(2);
+        expect(turnsSent[1]).toContain('try another approach');
+        expect(continuations()).toHaveLength(0);
+    }, 60_000);
+
 });
