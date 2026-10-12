@@ -67,7 +67,8 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       return { stdout: options.capabilities ? JSON.stringify(options.capabilities) : MARKER, stderr: '' }
     }
     if (command === 'cswap' && args[0] === 'list' && options.listFails) throw Object.assign(new Error('list failed'), { kind: 'COMMAND_FAILED' })
-    if (command === 'cswap' && args[0] === 'list') return { stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber: state.active,
+    // cswap keeps activeAccountNumber when the active slot is removed; it reads as active again once that number exists.
+    if (command === 'cswap' && args[0] === 'list') return { stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber: state.slots.some(slot => slot.number === state.active) ? state.active : null,
       accounts: state.slots.map(({ credentials: _c, config: _f, ...row }) => ({ ...row, active: row.number === state.active })) }), stderr: '' }
     if (command === 'cswap' && args[0] === 'export' && options.clock && options.advanceOnExport) options.clock.now += options.advanceOnExport
     if (command === 'cswap' && args[0] === 'export') return { stdout: JSON.stringify({ version: 1, encrypted: false, accounts: state.slots }), stderr: '' }
@@ -76,7 +77,11 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       for (const account of envelope.accounts) {
         const index = state.slots.findIndex(slot => slot.email === account.email)
         const metadata = kind === 'marked' ? Object.fromEntries(MANAGED_FIELDS.filter(key => key in account).map(key => [key, account[key]])) : {}
-        const slot = { number: index >= 0 ? state.slots[index]!.number : state.slots.length + 1, email: account.email, organizationUuid: '',
+        // Like cswap (transfer.py), --force included: an import never changes whether a slot of that email is managed.
+        if (kind === 'marked' && index >= 0 && state.slots[index]!.managedAccountId !== metadata.managedAccountId
+          && (state.slots[index]!.managedAccountId || metadata.managedAccountId)) throw Object.assign(new Error('managed identity conflict'), { kind: 'COMMAND_FAILED' })
+        const free = (n: number) => !state.slots.some(slot => slot.number === n)
+        const slot = { number: index >= 0 ? state.slots[index]!.number : free(account.number) ? account.number : Math.max(0, ...state.slots.map(row => row.number)) + 1, email: account.email, organizationUuid: '',
           usageStatus: 'unavailable', credentials: account.credentials, config: account.config, ...metadata }
         // Like cswap, --force rewrites the account record and so drops its disabled flag.
         if (index < 0) state.slots.push(slot); else if (args.includes('--force') && !options.ignoreForce) state.slots[index] = slot
@@ -85,7 +90,6 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
     }
     if (command === 'cswap' && args[0] === 'remove') {
       state.slots = state.slots.filter(slot => slot.number !== Number(args[1]))
-      if (state.active === Number(args[1])) state.active = null
       return { stdout: '', stderr: '' }
     }
     if (command === 'cswap' && args[0] === 'disable') { state.slots.find(slot => slot.number === Number(args[1]))!.disabled = true; return { stdout: '', stderr: '' } }
@@ -372,6 +376,26 @@ describe('managed Claude setup-token runtime', () => {
     await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('b')))))
     expect(state.slots[0]).toMatchObject({ email: managedSetupTokenEmail(A), managedAccountId: A, credentialGeneration: 2,
       credentials: { claudeAiOauth: { accessToken: fakeToken('b') } } })
+  })
+
+  // 2026-10-12 hmrepo: the restore above used `import --force`, which cswap refuses for a bare slot of a managed email
+  // ('managed identity conflict') — COMMAND_FAILED on every apply. The bare slot is removed and imported again.
+  it('restores the active bare slot of its own managed account by removing and importing it, and keeps it active', async () => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { runtime, state, calls } = fakeMachine([personal], 1)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    state.active = 2
+    state.slots[1]!.disabled = true
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = state.slots[1]!
+    state.slots[1] = bare as typeof state.slots[1]
+    calls.length = 0
+    await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('b')))))
+    const restoredSlot = state.slots.find(slot => slot.email === managedSetupTokenEmail(A))!
+    expect(restoredSlot).toMatchObject({ managedAccountId: A, credentialGeneration: 2, disabled: true, credentials: { claudeAiOauth: { accessToken: fakeToken('b') } } })
+    expect(state.active).toBe(restoredSlot.number)
+    expect(state.slots.find(slot => slot.number === 1)).toEqual(personal)
+    expect(calls.filter(call => call.command === 'cswap' && ['remove', 'import'].includes(call.args[0]!)).map(call => [call.args[0], call.args.includes('--force')]))
+      .toEqual([['remove', false], ['import', false]])
   })
 
   it('never takes over a personally imported slot with the same synthetic email', async () => {

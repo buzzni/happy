@@ -597,13 +597,17 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     const owns = (account: Record<string, unknown> & { email: string }) => groupOwned.has(setupTokenGroupIdentity(account.managedAccountId as string))
       || [...knownCompanyIdentities].some(identity => JSON.parse(identity)[0] === account.email)
     const managedExisting = managed.filter(account => existing.has(claudeListAccountIdentity(account)))
+    // Slots removed and imported again to restore their managed metadata: prior slot number -> current one.
+    const renumbered = new Map<number, number>()
+    const expectedNumber = (number: number) => renumbered.get(number) ?? number
     if (managedExisting.length > 0) {
       const local = await exportedAccounts()
       const changed = managedExisting.filter(account => !sameManagedSetupToken(local.find(slot => slot.email === account.email), account))
+      const restored: typeof changed = []
       for (const account of changed) {
         const stored = local.find(slot => slot.email === account.email)
         // This scope installed that managed account (owned) and the slot only lost its managed metadata: restore it.
-        if (stored && stored.managedAccountId === undefined && owns(account)) continue
+        if (stored && stored.managedAccountId === undefined && owns(account)) { restored.push(account); continue }
         if (!owns(account) || !stored || stored.managedAccountId !== account.managedAccountId) {
           // Which check refused, without any account detail: the daemon log otherwise cannot tell a takeover attempt
           // from a slot missing in cswap or a changed managed id (2026-10-12 hmrepo).
@@ -615,22 +619,43 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         if (storedGeneration > Number(account.credentialGeneration)) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_STALE')
         if (storedGeneration === account.credentialGeneration) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_CONFLICT')
       }
-      if (changed.length > 0) {
+      const importAccounts = async (accounts: typeof changed, force: boolean) => {
         const tempDir = await deps.makeTempDir()
         const file = join(tempDir, 'claude-swap.json')
         try {
-          await deps.writeFile(file, JSON.stringify({ ...envelope, accounts: changed }), { mode: 0o600 })
+          await deps.writeFile(file, JSON.stringify({ ...envelope, accounts }), { mode: 0o600 })
           await deps.chmod(file, 0o600)
-          await deps.execFile('cswap', ['import', file, '--force'])
+          await deps.execFile('cswap', ['import', file, ...(force ? ['--force'] : [])])
         } finally {
           await deps.rm(tempDir, { recursive: true, force: true })
         }
+      }
+      const replaced = changed.filter(account => !restored.includes(account))
+      if (replaced.length > 0) await importAccounts(replaced, true)
+      if (restored.length > 0) {
+        // cswap refuses any import that would make a bare slot of that email managed, --force included ('managed
+        // identity conflict', 2026-10-12 hmrepo: every apply failed as COMMAND_FAILED). Remove the bare slot, import it again.
+        for (const account of restored) {
+          const prior = before.accounts.find(slot => claudeListAccountIdentity(slot) === claudeListAccountIdentity(account))
+          if (prior) await deps.execFile('cswap', ['remove', String(prior.number)], { input: 'y\n', timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        }
+        await importAccounts(restored, false)
+      }
+      if (changed.length > 0) {
         const current = await list()
         for (const account of changed) {
           const prior = before.accounts.find(slot => claudeListAccountIdentity(slot) === claudeListAccountIdentity(account))
-          if (prior?.disabled === true && current.accounts.find(slot => slot.number === prior.number)?.disabled !== true) {
-            await deps.execFile('cswap', ['disable', String(prior.number)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+          const slot = current.accounts.find(candidate => claudeListAccountIdentity(candidate) === claudeListAccountIdentity(account))
+          if (!prior || !slot) continue
+          if (prior.number !== slot.number) renumbered.set(prior.number, slot.number)
+          if (prior.disabled === true && slot.disabled !== true) {
+            await deps.execFile('cswap', ['disable', String(slot.number)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
           }
+        }
+        // A restored slot that was active stays active under whatever number the import gave it.
+        if (before.activeAccountNumber !== null && restored.some(account => before.accounts.find(slot => slot.number === before.activeAccountNumber
+          && claudeListAccountIdentity(slot) === claudeListAccountIdentity(account))) && current.activeAccountNumber !== expectedNumber(before.activeAccountNumber)) {
+          await deps.execFile('cswap', ['switch', String(expectedNumber(before.activeAccountNumber)), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         }
       }
       for (const account of managedExisting.filter(owns)) knownCompanyIdentities.add(JSON.stringify([account.email, '', '']))
@@ -650,10 +675,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if ([...existing, ...incoming].some(identity => !present.has(identity))
       || before.accounts.some(account => {
         const retained = after.accounts.find(candidate => claudeListAccountIdentity(candidate) === claudeListAccountIdentity(account))
-        return retained?.number !== account.number || retained?.disabled !== account.disabled
+        return retained?.number !== expectedNumber(account.number) || retained?.disabled !== account.disabled
       })) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
     if (before.activeAccountNumber !== null) {
-      if (after.activeAccountNumber !== before.activeAccountNumber) {
+      if (after.activeAccountNumber !== expectedNumber(before.activeAccountNumber)) {
         throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
       }
     } else {
