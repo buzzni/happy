@@ -282,6 +282,15 @@ describe('managed Claude setup-token runtime', () => {
     await expect(runtime.sessionEnvironment('claude')).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
   })
 
+  it('does not refuse an unbound launch for a setup-token another daemon on the same OS home applied', async () => {
+    const files = new Map<string, string>()
+    const other = fakeMachine([], null, { files, machineId: 'other-pc' })
+    await other.runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('other')))))
+    const { runtime } = fakeMachine([], null, { files, machineId: 'machine-1' })
+    await expect(runtime.sessionEnvironment('claude')).resolves.toEqual({})
+    await expect(other.runtime.sessionEnvironment('claude')).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
+  })
+
   it('preserves machine-personal, non-Claude and prepared ZAI bypasses at final launch', async () => {
     const { runtime, files } = fakeMachine([], null)
     // The production machine-personal path intentionally skips sessionEnvironment.

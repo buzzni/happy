@@ -164,6 +164,26 @@ describe('several Saycode PC identities on one Windows profile', () => {
     await expect(pcB.sync({ ...input(12, '["shared-a"]'), userId: 'bob' })).rejects.toThrow('AI_GROUP_GENERATION_STALE')
   })
 
+  // 2026-10-12: another daemon on the same OS home wrote a managed setup-token entry for its own
+  // assignment, and every daemon there refused unbound Claude launches with SELECTION_REQUIRED.
+  it('decides launches only from entries this PC applied, keeping unrecorded entries as its own', async () => {
+    const { deps, input } = setup()
+    const managed = { ...deps, managedIdentities: (_provider: string, payload: string) => JSON.parse(payload) as string[] }
+    const pcA = createCredentialGroupSync({ ...managed, appliedMachineId: 'pc-a' })
+    const pcB = createCredentialGroupSync({ ...managed, appliedMachineId: 'pc-b' })
+    await pcA.sync({ ...input(1, '["managed-a"]', 'company-a'), userId: 'alice' })
+
+    expect(await pcA.hasManagedDesired('claude')).toBe(true)
+    expect(await pcB.hasManagedDesired('claude')).toBe(false)
+    expect(await pcB.assignment('company-a', 'claude')).toBeNull()
+    expect(await pcB.authorize('company-a', 'alice', 'managed-a')).toBe(false)
+    expect(await pcA.authorize('company-a', 'alice', 'managed-a')).toBe(true)
+
+    // An entry from before PCs were recorded may be this PC's own: it still decides.
+    await createCredentialGroupSync(managed).sync({ ...input(1, '["managed-legacy"]', 'company-legacy'), userId: 'carol' })
+    expect(await pcB.hasManagedDesired('claude')).toBe(true)
+  })
+
   it('treats an entry written before PCs were recorded as replaceable by a PC that records itself', async () => {
     const { deps, input } = setup()
     await createCredentialGroupSync(deps).sync({ ...input(23, '["shared-a"]'), userId: 'alice' })
