@@ -7,6 +7,7 @@ import { createGroupProviderAdapters, groupAccountIdentity, groupPayloadIdentiti
 import { spawn as crossSpawn } from 'cross-spawn'
 import { verifyLocalAiAccounts, type VerificationIdentity } from './aiCredentialVerification'
 import { mergeCodexAccounts } from './aiCredentialAdditive'
+import { probeHappyCodex, type CodexRecoveryProbeResult } from './codexRecoveryProbe'
 import { CODEX_MULTI_AUTH_VERSION, isSupportedCodexMultiAuthVersion, SUPPORTED_CODEX_MULTI_AUTH_VERSION_RANGE } from '../utils/codexMultiAuthVersions'
 import { stagingParent } from './stagedCredentialRoot'
 import { spawn } from 'node:child_process'
@@ -107,6 +108,7 @@ type Supervisor = {
 }
 
 export type AiCredentialRuntimeDependencies = {
+  probeCodex?: (cwd: string) => Promise<CodexRecoveryProbeResult>
   homeDir: string
   /** Happy machine identity used to bind server-side machine principal mutations. */
   machineId?: string
@@ -391,7 +393,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     } catch {}
   }
 
-  async function capture(input: { provider: AiCredentialProvider }) {
+  async function capture(input: { provider: AiCredentialProvider; codexRecovery?: boolean }) {
     const selected = provider(input?.provider)
     return serialize(() => withSafeErrors(`${selected.toUpperCase()}_CAPTURE_FAILED`, async () => {
       if (selected === 'zai') {
@@ -430,8 +432,114 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           settings,
         })
       }
+      if (selected === 'codex' && input.codexRecovery === true) {
+        const bundle = parseCodexMultiAuthBundle(payload)
+        if (!bundle) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+        const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+        const raw = await deps.readFile(livePath)
+        const live = JSON.parse(raw)
+        const tokens = live?.tokens
+        if (!isObject(tokens) || ['account_id', 'access_token', 'refresh_token', 'id_token'].some(key => typeof tokens[key] !== 'string' || !tokens[key])) {
+          throw new AiCredentialRuntimeError('CODEX_REAUTH_REQUIRED')
+        }
+        const indexes = bundle.accounts.accounts.map((account, index) => ({ account, index }))
+          .filter(({ account }) => account.accountId === tokens.account_id)
+        const sameUser = bundle.accounts.accounts.map((account, index) => ({ account, index }))
+          .filter(({ account }) => tokenSubject(account.accessToken) !== null && tokenSubject(account.accessToken) === tokenSubject(tokens.access_token))
+        const match = indexes.length === 1 ? indexes[0] : sameUser.length === 1 ? sameUser[0] : undefined
+        if (!match) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
+        const claims = JSON.parse(Buffer.from(String(tokens.access_token).split('.')[1] || '', 'base64url').toString())
+        const active: CodexMultiAuthAccount = { ...match.account, accountId: String(tokens.account_id), accessToken: String(tokens.access_token),
+          refreshToken: String(tokens.refresh_token), ...(typeof claims.exp === 'number' ? { expiresAt: claims.exp * 1000 } : {}),
+          accountIdSource: 'token', workspaces: undefined, currentWorkspaceIndex: undefined }
+        const verified = await verifyLocalAiAccounts(deps, 'codex', [{ accountId: tokens.account_id as string }], [active], { budgetMs: 60_000 })
+        if (!verified.accounts[0]?.ok) throw new AiCredentialRuntimeError(
+          verified.accounts[0]?.errorKind === 'AUTHENTICATION_FAILED' ? 'CODEX_AUTHENTICATION_FAILED' : 'CODEX_SOURCE_VERIFICATION_FAILED')
+        if (await deps.readFile(livePath) !== raw) throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
+        bundle.accounts.accounts[match.index] = active
+        bundle.accounts.activeIndex = match.index
+        payload = JSON.stringify({ ...bundle, recoveryAuth: {
+          auth_mode: 'chatgpt', OPENAI_API_KEY: null, last_refresh: live.last_refresh,
+          tokens: { account_id: tokens.account_id, access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token },
+        } })
+      }
       assertPayloadSize(payload)
       return { provider: selected, payload }
+    }))
+  }
+
+  function tokenSubject(token: unknown): string | null {
+    try {
+      const claims = JSON.parse(Buffer.from(String(token).split('.')[1] || '', 'base64url').toString())
+      return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
+    } catch { return null }
+  }
+
+  async function repairCodex(input: { provider: 'codex'; payload: string }) {
+    if (input?.provider !== 'codex' || typeof input.payload !== 'string') throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
+    assertPayloadSize(input.payload)
+    return serialize(() => withSafeErrors('CODEX_RECOVERY_FAILED', async () => {
+      const bundle = parseCodexMultiAuthBundle(input.payload)
+      const auth = JSON.parse(input.payload).recoveryAuth
+      const selected = bundle?.accounts.accounts[bundle.accounts.activeIndex]
+      if (!bundle || !selected || selected.enabled === false || !isObject(auth) || !isObject(auth.tokens)
+        || typeof auth.tokens.id_token !== 'string' || !auth.tokens.id_token
+        || typeof selected.accountId !== 'string' || typeof selected.accessToken !== 'string'
+        || auth.tokens.account_id !== selected.accountId || auth.tokens.access_token !== selected.accessToken
+        || auth.tokens.refresh_token !== selected.refreshToken) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
+      if ((await readTrialMarker()).leases.codex) throw new AiCredentialRuntimeError('AI_CREDENTIAL_MERGE_UNSUPPORTED')
+      await ensureCodexMultiAuth()
+      const root = codexMultiAuthDir()
+      await deps.mkdir(root, { recursive: true, mode: 0o700 })
+      const accountsPath = join(root, 'openai-codex-accounts.json')
+      const settingsPath = join(root, 'settings.json')
+      const authPath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+      let current = bundle.accounts
+      const saved = await readOptionalJson(accountsPath)
+      if (saved) {
+        const local = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: saved }))
+        if (!local) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+        current = local.accounts
+      }
+      if (!current.accounts.some(account => account.accountId === selected.accountId)) {
+        const subject = tokenSubject(selected.accessToken)
+        const sameUser = current.accounts.map((account, index) => ({ account, index }))
+          .filter(({ account }) => subject !== null && tokenSubject(account.accessToken) === subject)
+        if (sameUser.length > 1) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
+        if (sameUser.length === 1) current = { ...current, accounts: current.accounts.map((account, index) => index === sameUser[0]!.index ? { ...selected } : account) }
+      }
+      const merged = mergeCodexAccounts(current, bundle.accounts)
+      const activeIndex = merged.accounts.findIndex(account => account.accountId === selected.accountId)
+      if (activeIndex < 0) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
+      merged.accounts[activeIndex] = { ...selected }
+      merged.activeIndex = activeIndex
+      merged.pinnedAccountIndex = undefined
+      merged.activeIndexByFamily = Object.fromEntries(Object.keys(merged.activeIndexByFamily ?? {}).map(family => [family, activeIndex]))
+      const previousAuth = await readOptionalJson(authPath)
+      const previousSettings = await readOptionalJson(settingsPath)
+      const settings = enforceCodexRotationSettings(isObject(previousSettings) && previousSettings.version === 1 && isObject(previousSettings.pluginConfig)
+        ? previousSettings as CodexMultiAuthBundle['settings'] : bundle.settings)
+      const applyGeneration = await reserveApplyGeneration('codex')
+      await replaceCodexMultiAuthFiles(deps, [
+        { path: accountsPath, content: JSON.stringify(merged) },
+        { path: settingsPath, content: JSON.stringify(settings) },
+        { path: authPath, content: JSON.stringify(auth) },
+      ], async () => { await assertCodexLiveAccount(selected) })
+      const cwd = await deps.makeTempDir()
+      let probe: CodexRecoveryProbeResult
+      try { probe = await (deps.probeCodex ?? probeHappyCodex)(cwd) }
+      finally { await deps.rm(cwd, { recursive: true, force: true }) }
+      const liveAfterProbe = await readOptionalJson(authPath)
+      if (!isObject(liveAfterProbe?.tokens) || liveAfterProbe.tokens.account_id !== selected.accountId
+        || liveAfterProbe.tokens.access_token !== selected.accessToken || liveAfterProbe.tokens.refresh_token !== selected.refreshToken) {
+        throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
+      }
+      return { provider: 'codex' as const, configured: probe.ok, applyGeneration,
+        runtime: { transport: 'happy-app-server' as const, attempts: probe.attempts,
+          authChanged: JSON.stringify(previousAuth) !== JSON.stringify(auth),
+          rotationChanged: JSON.stringify(previousSettings) !== JSON.stringify(settings) },
+        verification: { checkedAt: deps.now(), accounts: [{ account: 1, ok: probe.ok,
+          ...(probe.ok ? { model: probe.model } : { errorKind: probe.errorKind }) }] } }
     }))
   }
 
@@ -2216,7 +2324,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
-  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
