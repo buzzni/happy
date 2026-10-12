@@ -51,7 +51,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -60,7 +60,11 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
   const execFile = vi.fn(async (command: string, args: string[]): Promise<AiCredentialCommandResult> => {
     calls.push({ command, args })
     if (command === 'cswap' && kind === 'missing') throw Object.assign(new Error('not found'), { kind: 'COMMAND_NOT_AVAILABLE' })
-    if (command === 'cswap' && args[0] === '--version') return { stdout: 'cswap 0.27.0b1', stderr: '' }
+    if (command === 'cswap' && args[0] === '--version') return { stdout: `cswap ${options.cswapVersion ?? '0.27.0b1'}`, stderr: '' }
+    if (command === 'uv' && args[0] === 'python' && options.noUvPython) {
+      if (args[1] === 'dir') return { stdout: 'C:\\Users\\operator\\AppData\\Roaming\\uv\\python\r\n', stderr: '' }
+      throw Object.assign(new Error('No interpreter found for Python >=3.12'), { kind: 'COMMAND_FAILED' })
+    }
     if (command === 'cswap' && args[0] === 'token-runtime') {
       if (kind !== 'marked') throw Object.assign(new Error('unknown command'), { kind: 'COMMAND_FAILED' })
       if (args[1] === 'status') return { stdout: options.tokenRuntimeStatus ?? JSON.stringify({ version: 1, artifact: 'saycode-setup-token-runtime-v1', accounts: [] }), stderr: '' }
@@ -108,7 +112,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       if (path.includes('setup-token-binding-nonces') && options.clock && options.advanceOnNonceWrite) options.clock.now += options.advanceOnNonceWrite
       files.set(path, content)
     }),
-    readdir: vi.fn(async () => []), mkdir: vi.fn(async () => undefined),
+    readdir: vi.fn(async () => { if (options.noUvPython) throw Object.assign(new Error('ENOENT: no such file or directory, scandir'), { code: 'ENOENT' }); return [] }), mkdir: vi.fn(async () => undefined),
     rename: vi.fn(async (from: string, to: string) => { if (to.includes('setup-token-binding-nonces')) syncEvents.push('rename:' + to); files.set(to, files.get(from)!); files.delete(from) }),
     chmod: vi.fn(async () => undefined), rm: vi.fn(async (path: string) => { files.delete(path) }),
     makeTempDir: vi.fn(async () => '/tmp/happy-setup-token-fixed'),
@@ -396,6 +400,22 @@ describe('managed Claude setup-token runtime', () => {
     expect(state.slots.find(slot => slot.number === 1)).toEqual(personal)
     expect(calls.filter(call => call.command === 'cswap' && ['remove', 'import'].includes(call.args[0]!)).map(call => [call.args[0], call.args.includes('--force')]))
       .toEqual([['remove', false], ['import', false]])
+  })
+
+  // 2026-10-12 hmrepo: Desktop installed cswap on its own pinned Python, which uv cannot discover. The daemon still looked
+  // for a uv Python before every apply and failed on the missing uv python folder (AI_GROUP_SYNC_FAILED, Error:ENOENT).
+  it('applies with an installed current claude-swap without needing a Python that uv can find', async () => {
+    const { runtime, state, calls } = fakeMachine([], null, { cswapVersion: '0.27.0b2', noUvPython: true })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    expect(state.slots).toEqual([expect.objectContaining({ managedAccountId: A, credentialGeneration: 1 })])
+    expect(installs(calls)).toEqual([])
+    expect(calls.some(call => call.command === 'uv' && call.args[0] === 'python')).toBe(false)
+  })
+
+  it('reports a missing uv Python folder as the original lookup failure when claude-swap must be installed', async () => {
+    const { runtime, calls } = fakeMachine([], null, { cswapVersion: '0.26.0', noUvPython: true })
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))).rejects.not.toMatchObject({ failureCause: 'Error:ENOENT' })
+    expect(installs(calls)).toEqual([])
   })
 
   it('never takes over a personally imported slot with the same synthetic email', async () => {

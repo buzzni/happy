@@ -451,7 +451,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function physicalUvPython(): Promise<string | null> {
     const root = (await deps.execFile('uv', ['python', 'dir'])).stdout.trim()
     if (!root) return null
-    const installs = (await deps.readdir(root))
+    // uv reports its python folder even before it ever installed one there.
+    const names = await deps.readdir(root).catch((error: NodeJS.ErrnoException) => { if (error?.code === 'ENOENT') return null; throw error })
+    if (!names) return null
+    const installs = names
       .map((name) => ({ name, version: /^cpython-3\.(\d+)\.(\d+)-/.exec(name) }))
       .filter((entry) => entry.version && Number(entry.version[1]) >= 12)
       .sort((a, b) => Number(b.version![1]) - Number(a.version![1]) || Number(b.version![2]) - Number(a.version![2]))
@@ -474,9 +477,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   async function ensureClaudeSwap(preserveSettings = false): Promise<void> {
     await deps.execFile('uv', ['--version'])
-    const python = await claudeSwapPython()
     // A newer installed build is kept: replacing it with the pin would be a silent downgrade.
     if (!cswapAtLeastPinned(await installedClaudeSwapVersion())) {
+      // Only an install needs a Python. Desktop installs cswap on its own pinned Windows Python, which uv cannot discover;
+      // looking for one before every apply failed every group sync there (2026-10-12 hmrepo, Error:ENOENT).
+      const python = await claudeSwapPython()
       await deps.execFile('uv', [
         'tool', 'install', `${CLAUDE_SWAP_PACKAGE}==${CLAUDE_SWAP_VERSION}`,
         '--python', python, '--force',
