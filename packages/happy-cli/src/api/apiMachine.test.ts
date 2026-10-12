@@ -743,7 +743,7 @@ describe('ApiMachineClient socket reconnection', () => {
         };
         const first = await makeClient()();
         const second = await makeClient()();
-        expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
+        expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, sharedMachineSetupTokenVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect(second).toMatchObject({ setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect((first.setupTokenRecipient as { keyId: string }).keyId).not.toBe((second.setupTokenRecipient as { keyId: string }).keyId);
     });

@@ -38,6 +38,8 @@ export type SetupTokenAssignmentContext = {
   leaseId: string
   expiresAt: number
   payload: string
+  /** A shared machine's assignment names the machine itself as principal (userId === machineId). */
+  principalType?: 'machine'
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -100,7 +102,9 @@ export function openSetupTokenAssignment(
   try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plaintext)) } catch { throw new Error('SETUP_TOKEN_SEALED_PAYLOAD_INVALID') }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('SETUP_TOKEN_SEALED_CONTEXT_INVALID')
   const context = value as Record<string, unknown>
-  if (!exactKeys(context, ['version', 'scope', 'userId', 'machineId', 'provider', 'generation', 'fingerprint', 'leaseId', 'expiresAt', 'payload'])
+  const keys = ['version', 'scope', 'userId', 'machineId', 'provider', 'generation', 'fingerprint', 'leaseId', 'expiresAt', 'payload']
+  if (!exactKeys(context, 'principalType' in context ? [...keys, 'principalType'] : keys)
+    || ('principalType' in context && (context.principalType !== 'machine' || context.userId !== context.machineId))
     || context.version !== 1 || context.provider !== 'claude'
     || ![context.scope, context.userId, context.machineId, context.leaseId].every(item => typeof item === 'string' && item.length >= 1 && item.length <= 128)
     || !Number.isSafeInteger(context.generation) || Number(context.generation) < 1
