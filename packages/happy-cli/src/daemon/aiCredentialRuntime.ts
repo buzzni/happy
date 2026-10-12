@@ -32,7 +32,7 @@ import {
   serializeAppliedClaudeProvenance,
   serializeInvalidatedClaudeProvenance,
 } from './aiCredentialProvenance'
-import { SETUP_TOKEN_BINDING_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding } from './sessionEnv'
+import { SHARED_MACHINE_TOKEN_ENV, SETUP_TOKEN_BINDING_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding } from './sessionEnv'
 import { readTrustedStudioOrigin, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
@@ -500,13 +500,6 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         const local = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: saved }))
         if (!local) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
         current = local.accounts
-      }
-      if (!current.accounts.some(account => account.accountId === selected.accountId)) {
-        const subject = tokenSubject(selected.accessToken)
-        const sameUser = current.accounts.map((account, index) => ({ account, index }))
-          .filter(({ account }) => subject !== null && tokenSubject(account.accessToken) === subject)
-        if (sameUser.length > 1) throw new AiCredentialRuntimeError('CODEX_ACTIVE_CREDENTIAL_MISMATCH')
-        if (sameUser.length === 1) current = { ...current, accounts: current.accounts.map((account, index) => index === sameUser[0]!.index ? { ...selected } : account) }
       }
       const merged = mergeCodexAccounts(current, bundle.accounts)
       const activeIndex = merged.accounts.findIndex(account => account.accountId === selected.accountId)
@@ -2128,7 +2121,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       }).find((value): value is string => value !== null)
       if (!token) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
       const cleared = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']))
-      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle' }
+      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: token, [SHARED_MACHINE_TOKEN_ENV]: '1', [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle' }
     })
   }
 

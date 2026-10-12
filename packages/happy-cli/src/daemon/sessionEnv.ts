@@ -68,6 +68,8 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  * requested environments, so neither can forge or carry it to another session.
  */
 export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
+/** Daemon-owned custody marker for the shared machine's child-only bearer. */
+export const SHARED_MACHINE_TOKEN_ENV = 'HAPPY_AI_AUTH_SHARED_MACHINE_TOKEN'
 type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
@@ -81,9 +83,9 @@ export function scrubSessionLineageEnv(env: NodeJS.ProcessEnv): Record<string, s
     const scrubbed: Record<string, string> = {}
     for (const [key, value] of Object.entries(env)) {
         if (value === undefined || isLineageKey(key)) continue
-        // A child can restart the daemon. Drop its bound bearer before losing
-        // the marker, including malformed markers; unbound personal auth stays.
-        if (env[SETUP_TOKEN_BINDING_ENV] !== undefined && key === 'CLAUDE_CODE_OAUTH_TOKEN') continue
+        // A child can restart the daemon. Drop its managed bearer before losing
+        // either custody marker, including malformed markers; personal auth stays.
+        if ((env[SETUP_TOKEN_BINDING_ENV] !== undefined || env[SHARED_MACHINE_TOKEN_ENV] !== undefined) && key === 'CLAUDE_CODE_OAUTH_TOKEN') continue
         scrubbed[key] = value
     }
     return scrubbed

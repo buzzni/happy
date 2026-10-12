@@ -266,6 +266,29 @@ describe('managed Claude setup-token runtime', () => {
     expect(spawn).toHaveBeenCalledTimes(1)
   })
 
+  it('scrubs the shared bearer when a child restarts the daemon and the assignment is then revoked', async () => {
+    const machine = fakeMachine([], null, { machineId: 'machine-1' })
+    const assignment = { version: 1 as const, scope: 'company-1', principalType: 'machine' as const, machineId: 'machine-1',
+      provider: 'claude' as const, generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('shared'))) }
+    await machine.runtime.groupSync(assignment)
+    const managedEnv = await machine.runtime.sessionEnvironment('claude')
+    const child = buildManagedSessionSpawnEnvironment({ SAFE: 'kept' }, {}, managedEnv)
+    expect(child.CLAUDE_CODE_OAUTH_TOKEN).toBe(fakeToken('shared'))
+    spawnHappyCLI(['daemon', 'start-sync'], { env: child })
+    const daemonEnv = vi.mocked(crossSpawn).mock.lastCall![2]!.env! as Record<string, string>
+    const restarted = fakeMachine(machine.state.slots, null, { machineId: 'machine-1', files: machine.files, env: daemonEnv })
+    await restarted.runtime.groupSync({ ...assignment, generation: 2, fingerprint: '2'.padStart(64, '0'), payload: null })
+    const defaultEnv = await restarted.runtime.sessionEnvironment('claude')
+    expect(defaultEnv).toEqual({})
+    const next = buildManagedSessionSpawnEnvironment(daemonEnv, {}, defaultEnv)
+    expect(next).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN')
+    expect(next).not.toHaveProperty('HAPPY_AI_AUTH_SHARED_MACHINE_TOKEN')
+    expect(next.SAFE).toBe('kept')
+    const launch = vi.fn()
+    await expect(machine.runtime.launchSession(managedEnv, launch)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_STALE')
+    expect(launch).not.toHaveBeenCalled()
+  })
+
   it('keeps refusing an unbound session while a user assignment desires a setup-token, even on a shared machine', async () => {
     const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
     await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',

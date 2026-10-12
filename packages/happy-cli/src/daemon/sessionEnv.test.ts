@@ -32,6 +32,14 @@ describe('scrubSessionLineageEnv', () => {
         expect(child.CLAUDE_CODE_OAUTH_TOKEN).toBe('synthetic-bound')
     })
 
+    it.each(['1', '', '{malformed'])('scrubs a shared machine bearer for any custody marker (%s)', (marker) => {
+        const daemon = scrubSessionLineageEnv({ HAPPY_AI_AUTH_SHARED_MACHINE_TOKEN: marker,
+            CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-shared', SAFE: 'kept' })
+        expect(buildManagedSessionSpawnEnvironment(daemon, {}, {})).toEqual({ SAFE: 'kept' })
+        expect(scrubSessionLineageEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-personal' }))
+            .toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-personal' })
+    })
+
     it('removes reconnect and fork lineage variables while keeping everything else', () => {
         // 2026-07-19 incident: a resumed child restarted the daemon, the daemon
         // inherited HAPPY_RECONNECT_* from that child, and every subsequently

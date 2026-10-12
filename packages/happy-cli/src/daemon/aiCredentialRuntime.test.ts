@@ -250,21 +250,24 @@ describe('AI credential machine runtime', () => {
     expect(configured.writeFile).not.toHaveBeenCalled()
   })
 
-  it('replaces the same users stale workspace slot instead of leaving a second broken rotation candidate', async () => {
+  it.each([1, 2])('preserves %i distinct same-sub workspaces when repairing a different source workspace', async (workspaceCount) => {
+    const token = `header.${Buffer.from(JSON.stringify({ sub: 'same-user', exp: 9999999999 })).toString('base64url')}.signature`
     const source = codexMultiAuthBundle()
-    const token = `header.${Buffer.from(JSON.stringify({ sub: 'same-user' })).toString('base64url')}.signature`
     source.accounts.accounts[0] = { ...source.accounts.accounts[0]!, accountId: 'working-workspace', accessToken: token }
     const recoveryAuth = { tokens: { account_id: 'working-workspace', access_token: token, refresh_token: 'refresh-a', id_token: 'id-a' } }
     const configured = setup({ probeCodex: vi.fn(async () => ({ ok: true as const, model: 'gpt-6.1-sol' as const, attempts: 1 })) })
-    const old = codexMultiAuthBundle().accounts
-    old.accounts[0] = { ...old.accounts[0]!, accountId: 'old-workspace', accessToken: token }
-    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(old))
-    await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    const local = codexMultiAuthBundle().accounts
+    local.accounts[0] = { ...local.accounts[0]!, accountId: 'personal-workspace', accessToken: token }
+    if (workspaceCount === 2) local.accounts.push({ ...local.accounts[0]!, accountId: 'another-workspace' })
+    const preserved = local.accounts.filter(account => account.accessToken === token)
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(local))
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) }))
+      .resolves.toMatchObject({ configured: true })
     const pool = JSON.parse(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')!)
-    expect(pool.accounts).toHaveLength(3)
-    expect(pool.activeIndex).toBe(0)
-    expect(pool.accounts[0].accountId).toBe('working-workspace')
-    expect(pool.accounts.some((account: { accountId: string }) => account.accountId === 'old-workspace')).toBe(false)
+    expect(pool.accounts).toHaveLength(local.accounts.length + 1)
+    for (const account of preserved) expect(pool.accounts.find((row: { accountId: string }) => row.accountId === account.accountId)).toEqual(account)
+    expect(pool.accounts[pool.activeIndex]).toEqual(source.accounts.accounts[0])
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/auth.json')!).tokens).toEqual(recoveryAuth.tokens)
   })
   it.each([
     ['ok', 'usage-readable', 1, 1],

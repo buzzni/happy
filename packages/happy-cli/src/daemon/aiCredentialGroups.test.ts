@@ -164,6 +164,67 @@ describe('several Saycode PC identities on one Windows profile', () => {
     await expect(pcB.sync({ ...input(12, '["shared-a"]'), userId: 'bob' })).rejects.toThrow('AI_GROUP_GENERATION_STALE')
   })
 
+  it('rejects a PC rollback after another PC writes and after restarting either daemon', async () => {
+    const { deps, installed, input } = setup()
+    const pcA = () => createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' })
+    const pcB = () => createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' })
+    const first = { ...input(23, '["shared-a"]'), userId: 'alice', leaseId: 'lease-a' }
+    const second = { ...input(13, '["shared-b"]'), userId: 'bob', leaseId: 'lease-b' }
+    await pcA().sync(first)
+    await pcB().sync(second)
+    const writes = deps.write.mock.calls.length
+    const applies = deps.apply.mock.calls.length
+    await expect(pcA().sync({ ...first, generation: 22 })).rejects.toThrow('AI_GROUP_GENERATION_STALE')
+    expect(deps.write).toHaveBeenCalledTimes(writes)
+    expect(deps.apply).toHaveBeenCalledTimes(applies)
+    expect([...installed]).toEqual(['personal', 'shared-b'])
+    expect(await pcB().receipt('company', 'claude')).toMatchObject({ userId: 'bob', generation: 13 })
+    await expect(pcA().sync(first)).resolves.toMatchObject({ userId: 'alice', generation: 23, reconciled: true })
+    expect([...installed]).toEqual(['personal', 'shared-a'])
+    await expect(pcB().sync({ ...second, generation: 12 })).rejects.toThrow('AI_GROUP_GENERATION_STALE')
+  })
+
+  it.each([
+    [{ fingerprint: 'b'.repeat(64) }, 'AI_GROUP_GENERATION_CONFLICT'],
+    [{ userId: 'other-user' }, 'AI_GROUP_GENERATION_CONFLICT'],
+    [{ leaseId: 'other-lease' }, 'AI_GROUP_LEASE_CONFLICT'],
+    [{ payload: '["other-account"]' }, 'AI_GROUP_PAYLOAD_CONFLICT'],
+  ] as const)('retains conflict metadata across intervening PC writes (%j)', async (change, error) => {
+    const { deps, installed, input } = setup()
+    const first = { ...input(23, '["shared-a"]'), userId: 'alice', leaseId: 'lease-a' }
+    await createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' }).sync(first)
+    await createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' }).sync(input(13, '["shared-b"]'))
+    const writes = deps.write.mock.calls.length
+    const applies = deps.apply.mock.calls.length
+    await expect(createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' }).sync({ ...first, ...change })).rejects.toThrow(error)
+    expect(deps.write).toHaveBeenCalledTimes(writes)
+    expect(deps.apply).toHaveBeenCalledTimes(applies)
+    expect([...installed]).toEqual(['personal', 'shared-b'])
+  })
+
+  it('retains a higher generation accepted without reimport after another PC takes custody', async () => {
+    const { deps, input } = setup()
+    const pcA = createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' })
+    const first = input(23, '["shared-a"]')
+    await pcA.sync(first)
+    await pcA.sync({ ...first, generation: 24 })
+    expect(deps.apply).toHaveBeenCalledTimes(1)
+    await createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' }).sync(input(13, '["shared-b"]'))
+    await expect(createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' }).sync(first)).rejects.toThrow('AI_GROUP_GENERATION_STALE')
+    expect(deps.apply).toHaveBeenCalledTimes(2)
+  })
+
+  it('migrates a recorded PC generation from an older journal before another PC overwrites the slot', async () => {
+    const { deps, input } = setup()
+    await createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' }).sync(input(23, '["shared-a"]'))
+    const legacy = JSON.parse((await deps.read())!)
+    delete legacy.generationGuards
+    await deps.write(JSON.stringify(legacy))
+    await createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' }).sync(input(13, '["shared-b"]'))
+    await expect(createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-a' }).sync(input(22, '["shared-a"]')))
+      .rejects.toThrow('AI_GROUP_GENERATION_STALE')
+  })
+
   it('treats an entry written before PCs were recorded as replaceable by a PC that records itself', async () => {
     const { deps, input } = setup()
     await createCredentialGroupSync(deps).sync({ ...input(23, '["shared-a"]'), userId: 'alice' })

@@ -16,8 +16,9 @@ type NormalizedRequest = { version:1; scope:string; principalType:'user'|'machin
 export type AppliedCredentialReceipt = { managedAccountId:string; credentialGeneration:number }
 /** `managed`: the desired identities that are org-managed setup-tokens (absent in older journals). */
 /** `appliedMachineId`: the daemon's PC identity that wrote the entry (absent in older journals). */
-type Entry = Omit<NormalizedRequest,'version'|'payload'> & { desired:string[]; owned:string[]; pending:boolean; payloadDigest:string|null; managed?:string[]; appliedCredentials?:AppliedCredentialReceipt[]; appliedMachineId?:string }
-type Journal = { version:1; entries:Entry[] }
+type GenerationGuard = Omit<NormalizedRequest,'version'|'payload'> & { payloadDigest:string|null; appliedMachineId?:string }
+type Entry = GenerationGuard & { desired:string[]; owned:string[]; pending:boolean; managed?:string[]; appliedCredentials?:AppliedCredentialReceipt[] }
+type Journal = { version:1; entries:Entry[]; generationGuards?:GenerationGuard[] }
 export type CredentialGroupDeps = {
   read():Promise<string|null>; write(value:string):Promise<void>
   snapshot(provider:GroupProvider):Promise<string[]>
@@ -53,6 +54,11 @@ const principalType=(entry:Pick<Entry,'principalType'>)=>entry.principalType??'u
 const samePrincipal=(entry:Pick<Entry,'principalType'|'userId'|'machineId'>, request:Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) => principalType(entry)===request.principalType && (request.principalType==='machine' ? entry.machineId===request.machineId : entry.userId===request.userId)
 /** One user assignment per scope and provider (a new userId replaces it); machine assignments are kept per machine. */
 const sameSlot=(entry:Pick<Entry,'principalType'|'machineId'>, request:Pick<NormalizedRequest,'principalType'|'machineId'>) => principalType(entry)===request.principalType && (request.principalType!=='machine' || entry.machineId===request.machineId)
+const generationStreamKey=(entry:GenerationGuard)=>JSON.stringify([entry.scope,entry.provider,principalType(entry),principalType(entry)==='machine'?entry.machineId:null,entry.appliedMachineId??null])
+function generationGuard(entry:Entry):GenerationGuard {
+  const {desired:_desired,owned:_owned,pending:_pending,managed:_managed,appliedCredentials:_credentials,...guard}=entry
+  return guard
+}
 function validAppliedCredentials(values:unknown):values is AppliedCredentialReceipt[] {
   return Array.isArray(values)&&values.length<=500
     &&values.every(value=>value&&id(value.managedAccountId)&&Number.isSafeInteger(value.credentialGeneration)&&value.credentialGeneration>=1)
@@ -72,6 +78,16 @@ function parse(raw:string|null):Journal {
       if(entry.appliedCredentials!==undefined&&!validAppliedCredentials(entry.appliedCredentials))fail('AI_GROUP_JOURNAL_INVALID')
       if(entry.appliedMachineId!==undefined&&!id(entry.appliedMachineId))fail('AI_GROUP_JOURNAL_INVALID')
     }
+    if(value.generationGuards!==undefined){
+      if(!Array.isArray(value.generationGuards)||value.generationGuards.length>1000)fail('AI_GROUP_JOURNAL_INVALID')
+      for(const guard of value.generationGuards){
+        const candidate=principalType(guard)==='machine'?{...guard,userId:undefined}:guard
+        request({...candidate,version:1,payload:null} as CredentialGroupRequest)
+        if(!(guard.payloadDigest===null||typeof guard.payloadDigest==='string'&&/^[a-f0-9]{64}$/.test(guard.payloadDigest))
+          ||guard.appliedMachineId!==undefined&&!id(guard.appliedMachineId))fail('AI_GROUP_JOURNAL_INVALID')
+      }
+      if(new Set(value.generationGuards.map(generationStreamKey)).size!==value.generationGuards.length)fail('AI_GROUP_JOURNAL_INVALID')
+    }
     if(new Set(value.entries.map(e=>JSON.stringify([e.scope,e.provider,principalType(e),principalType(e)==='machine'?e.machineId:null]))).size!==value.entries.length)fail('AI_GROUP_JOURNAL_INVALID')
     return value
   }catch{ return fail('AI_GROUP_JOURNAL_INVALID') }
@@ -86,17 +102,25 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     const normalized=request(input)
     const journal=parse(await deps.read())
     const slot=journal.entries.find(e=>e.scope===normalized.scope&&e.provider===normalized.provider&&sameSlot(e,normalized))
-    // Generations are only ordered within one PC's assignment stream: another PC's (or an unrecorded) entry is replaced, not compared.
-    const prior=slot&&(slot.appliedMachineId??null)===(deps.appliedMachineId??null)?slot:undefined
+    // Custody has one slot, but each PC's generation history must survive other PCs' writes.
+    journal.generationGuards??=journal.entries.map(generationGuard)
+    const stream=generationStreamKey({...normalized,payloadDigest:null,appliedMachineId:deps.appliedMachineId})
+    const prior=journal.generationGuards.find(guard=>generationStreamKey(guard)===stream)
+    const current=slot&&(slot.appliedMachineId??null)===(deps.appliedMachineId??null)?slot:undefined
+    const recordGeneration=(entry:Entry)=>{
+      journal.generationGuards=journal.generationGuards!.filter(guard=>generationStreamKey(guard)!==stream)
+      journal.generationGuards.push(generationGuard(entry))
+      if(journal.generationGuards.length>1000)fail('AI_GROUP_JOURNAL_INVALID')
+    }
     if(prior&&normalized.generation<prior.generation)fail('AI_GROUP_GENERATION_STALE')
     if(prior&&normalized.generation===prior.generation&&(normalized.fingerprint!==prior.fingerprint||!samePrincipal(effectivePrincipal(prior),normalized)))fail('AI_GROUP_GENERATION_CONFLICT')
     if(prior&&normalized.generation===prior.generation&&normalized.fingerprint===prior.fingerprint&&(normalized.leaseId??null)!==(prior.leaseId??null))fail('AI_GROUP_LEASE_CONFLICT')
     if(prior&&normalized.fingerprint===prior.fingerprint&&(normalized.payload===null?null:createHash('sha256').update(normalized.payload).digest('hex'))!==prior.payloadDigest)fail('AI_GROUP_PAYLOAD_CONFLICT')
-    if(prior&&!prior.pending&&normalized.fingerprint===prior.fingerprint&&samePrincipal(effectivePrincipal(prior),normalized)){
+    if(current&&!current.pending&&normalized.fingerprint===current.fingerprint&&samePrincipal(effectivePrincipal(current),normalized)){
       // A reinstall can preserve the journal while losing the account manager's pool.
       // Reuse the receipt only when its desired accounts still exist locally.
-      const installed=new Set(prior.desired.length?await deps.snapshot(normalized.provider):[])
-      if(prior.desired.every(identity=>installed.has(identity))){prior.generation=normalized.generation;prior.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;prior.leaseId=normalized.leaseId;await deps.write(JSON.stringify(journal));return receipt(prior)}
+      const installed=new Set(current.desired.length?await deps.snapshot(normalized.provider):[])
+      if(current.desired.every(identity=>installed.has(identity))){current.generation=normalized.generation;current.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;current.leaseId=normalized.leaseId;recordGeneration(current);await deps.write(JSON.stringify(journal));return receipt(current)}
     }
     const payloadDigest=normalized.payload===null?null:createHash('sha256').update(normalized.payload).digest('hex')
     if(prior&&normalized.fingerprint===prior.fingerprint&&payloadDigest!==prior.payloadDigest)fail('AI_GROUP_PAYLOAD_CONFLICT')
@@ -108,6 +132,7 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
       owned:[...new Set([...(slot?.owned??[]),...desired.filter(value=>!before.has(value))])],pending:true,...(deps.appliedMachineId?{appliedMachineId:deps.appliedMachineId}:{})}
     journal.entries=journal.entries.filter(e=>!(e.scope===normalized.scope&&e.provider===normalized.provider&&sameSlot(e,normalized)))
     journal.entries.push(entry)
+    recordGeneration(entry)
     await deps.write(JSON.stringify(journal))
     if(normalized.payload!==null) {
       const applied=await deps.apply(normalized.provider,normalized.payload,slot?.owned??[])
