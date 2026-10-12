@@ -2,7 +2,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
-const { resolveServerArtifact } = require('../index.cjs');
+const { forwardTerminationSignals, resolveRuntimeEnv, resolveServerArtifact } = require('../index.cjs');
 
 const artifact = resolveServerArtifact();
 if (!artifact) {
@@ -10,7 +10,7 @@ if (!artifact) {
   process.exit(1);
 }
 
-const env = { ...process.env };
+const env = resolveRuntimeEnv(process.env, process.cwd());
 if (artifact.webappDir && !env.HAPPY_STATIC_DIR) {
   env.HAPPY_STATIC_DIR = artifact.webappDir;
 }
@@ -20,6 +20,8 @@ const child = spawn(artifact.command, [...artifact.prefixArgs, ...process.argv.s
   env,
   stdio: 'inherit',
 });
+
+forwardTerminationSignals(process, child);
 
 child.on('error', error => {
   console.error(error.message);

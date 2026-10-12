@@ -20,7 +20,7 @@ const PRISMA_QUERY_ENGINE_FILES: Record<string, string> = {
     'x64-linux': 'libquery_engine-debian-openssl-3.0.x.so.node',
     'x64-win32': 'query_engine-windows.dll.node',
 };
-const SERVER_PACKAGE_NAME = 'happy-server-self-host';
+const SERVER_PACKAGE_NAME = '@buzzni/happy-server';
 const SETTINGS_WRITE_CONFIRM_FLAG = '--i-understand-this-will-modify-default-happy-settings';
 
 interface ServerOptions {
@@ -355,7 +355,7 @@ function serverArtifactMode(artifacts: ServerArtifacts): string {
  * Resolves the artifacts needed to spawn happy-server.
  *
  * Order:
- *   1. happy-server-self-host package (npm-installed local server artifact)
+ *   1. @buzzni/happy-server package (npm-installed local server artifact)
  *   2. Legacy bundled binary at tools/server/<platform>/happy-server
  *   3. Source-mode fallback for monorepo dev: ../happy-server/sources/standalone.ts via tsx
  */

@@ -77,7 +77,7 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     expect(text).toMatch(/\}, tmuxEnv, start => launchManagedAiCredentialSession\(managedAiCredentialEnvironment, start\)\)/)
     expect(text).toMatch(/env: spawnEnvironment,\s*managedAiCredentialEnvironment,/)
     expect(text).toMatch(/launchManagedAiCredentialSession = aiCredentialRuntime\.launchSession/)
-    expect(text).toMatch(/await launchManagedAiCredentialSession\(managedAiCredentialEnvironment,\s*\(\) => spawnHappyCLI\(/)
+    expect(text).toMatch(/await launchManagedAiCredentialSession\(managedAiCredentialEnvironment,\s*\(\) => \{[^;]*;\s*try \{ return spawnHappyCLI\(/)
     expect(text).toMatch(/await launchManagedAiCredentialSession\(managedAiCredentialEnvironment, \(\) => prepared\.resume\(\)\)/)
     expect(text).toMatch(/resumeTargetSessionId: happySessionId,\s*managedAiCredentialEnvironment,/)
   })

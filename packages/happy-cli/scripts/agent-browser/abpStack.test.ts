@@ -627,6 +627,20 @@ describe('abp-stack pull', () => {
 })
 
 describe('abp-stack rotate-keys', () => {
+    it('rotates a browser-only token for the daemon user without restarting the existing daemon', async () => {
+        const host = fakeHost()
+        const install = JSON.parse(host.files.get(PATHS.installConfig)!.data)
+        install.hostMode = 'browser-only'
+        install.daemonUser = 'walter'
+        host.files.set(PATHS.installConfig, { data: JSON.stringify(install), mode: 0o600, owner: 'root', group: 'root' })
+        await createStack(host.deps).rotateKeys({ daemonToken: true, vncPassword: false })
+        const token = host.files.get(PATHS.daemonToken)!
+        expect(token).toMatchObject({ mode: 0o400, owner: 'walter', group: 'walter' })
+        expect(JSON.parse(host.files.get(PATHS.runtimeConfig)!.data).brokerSocketGid).toBe(1)
+        expect(host.calls).not.toContain('systemctl restart abp-happy-daemon.service')
+        expect(host.logs.join('\n')).toContain('restart the existing Happy daemon manually')
+    })
+
     it('rotates the daemon token: new 0400 agent file, matching hash, fenced Runtime restart, broker accepts it, daemon restarted', async () => {
         const host = fakeHost()
         await createStack(host.deps).rotateKeys({ daemonToken: true, vncPassword: false })

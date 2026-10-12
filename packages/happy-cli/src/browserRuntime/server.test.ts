@@ -30,7 +30,7 @@ function makeFake() {
         }
         return task()
     }
-    const ops = ['createSpace', 'createTask', 'openPage', 'closePage', 'observe', 'screenshot', 'submitBatch', 'finishTask', 'getTask',
+    const ops = ['createSpace', 'listSpaces', 'joinSpace', 'createTask', 'openPage', 'closePage', 'observe', 'screenshot', 'submitBatch', 'finishTask', 'getTask',
         'subscribe', 'approve', 'takeOver', 'releaseControl', 'resume', 'cancel', 'closeSpace']
     const api = Object.fromEntries(ops.map((op) => [op, record(op)])) as unknown as Omit<BrowserRuntimeApi, 'waitForEvents'> & {
         waitForEvents(taskId: string, afterSeq: number, waitMs: number): Promise<void>

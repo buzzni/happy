@@ -101,6 +101,12 @@ export interface SpaceRecord {
         workspaceId: string
         machineId: string
     }
+    /** Logical Happy sessions explicitly joined to this space. */
+    memberSessionIds?: string[]
+    /** Durable audit trail for space membership changes. */
+    membershipEvents?: Array<{ type: 'created' | 'joined'; agentSessionId: string; atMs: number }>
+    /** Sessions whose logical Happy connection has ended. */
+    endedSessionIds?: string[]
     requestKey?: string
     requestHash?: string
     dedupe?: Record<string, {

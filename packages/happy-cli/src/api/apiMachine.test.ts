@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
@@ -11,16 +11,19 @@ import type { RpcHandlerConfig } from './rpc/types';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
 import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
+import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { join } from 'node:path';
 
 const {
     mockIo,
     mockShouldReconnect,
-    rpcManagerConfigs
+    rpcManagerConfigs,
+    registeredCommonHandlers,
 } = vi.hoisted(() => ({
     mockIo: vi.fn(),
     mockShouldReconnect: vi.fn(() => true),
-    rpcManagerConfigs: [] as RpcHandlerConfig[]
+    rpcManagerConfigs: [] as RpcHandlerConfig[],
+    registeredCommonHandlers: vi.fn(),
 }));
 
 vi.mock('socket.io-client', () => ({
@@ -43,7 +46,7 @@ vi.mock('@/ui/logger', () => ({
 }));
 
 vi.mock('@/modules/common/registerCommonHandlers', () => ({
-    registerCommonHandlers: vi.fn()
+    registerCommonHandlers: registeredCommonHandlers,
 }));
 
 vi.mock('@/api/rpc/RpcHandlerManager', () => ({
@@ -132,6 +135,22 @@ describe('ApiMachineClient machine RPC server lane', () => {
 
         expect(rpcManagerConfigs.at(-1)).toBeDefined();
         expect(rpcManagerConfigs.at(-1)?.serverLane).toBeUndefined();
+    });
+
+    it('registers machine.run with the daemon-owned trusted profile registry and write policy', () => {
+        registeredCommonHandlers.mockClear();
+        new ApiMachineClient('fake-token', makeMachine());
+
+        expect(registeredCommonHandlers).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.any(String),
+            { machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                writeScopePolicy: { acquire: expect.any(Function) },
+                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [expect.objectContaining({ id: 'buzzni.moai', version: '0.8.0' })] },
+                allowToolInstall: true,
+            } },
+        );
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary R19
@@ -444,6 +463,28 @@ describe('ApiMachineClient socket reconnection', () => {
         });
     });
 
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2.
+    it('registers the sealed env spawn as a customer-bound machine method', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+            'spawn-with-sealed-env', expect.any(Function), { customerBound: true },
+        );
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree.
+    it('registers each worktree operation as a customer-bound machine method', () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        for (const method of [
+            'worktree:capability', 'worktree:prepare', 'worktree:create', 'worktree:status', 'worktree:remove', 'worktree:apply',
+            'worktree:update', 'worktree:recover', 'worktree:adopt-check', 'worktree:publish', 'worktree:reconcile',
+            'worktree:create-branch', 'worktree:prepare-conversation',
+        ]) {
+            expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
+                method, expect.any(Function), { customerBound: true },
+            );
+        }
+    });
+
     it('registers dependency reclaim on the authenticated machine RPC surface', () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         expect((client as any).rpcHandlerManager.registerHandler).toHaveBeenCalledWith(
@@ -716,7 +757,7 @@ describe('ApiMachineClient socket reconnection', () => {
         };
         const first = await makeClient()();
         const second = await makeClient()();
-        expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
+        expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, sharedMachineSetupTokenVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect(second).toMatchObject({ setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect((first.setupTokenRecipient as { keyId: string }).keyId).not.toBe((second.setupTokenRecipient as { keyId: string }).keyId);
     });
@@ -1170,6 +1211,63 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — the web starts a strict machine's
+    // preview with a sealed env only on a daemon that says it opens one. An existing machine keeps
+    // its first metadata, so the advertisement has to be republished; only a machine key opens it.
+    it.each([
+        { variant: 'dataKey' as const, expected: SEALED_SPAWN_ENV_CAPABILITY },
+        { variant: 'legacy' as const, expected: undefined },
+    ])('advertises sealed env spawns on a registered $variant machine only when it has a machine key', async ({ variant, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: variant };
+        machine.metadata = { ...machine.metadata!, sealedSpawnEnv: variant === 'legacy' ? SEALED_SPAWN_ENV_CAPABILITY : undefined };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
+        expect(machine.metadata?.sealedSpawnEnv).toEqual(expected);
+
+        client.shutdown();
+    });
+
+    // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree — the result signature is keyed
+    // from the machine key, so only a dataKey machine advertises worktree operations.
+    it.each([
+        { variant: 'dataKey' as const, expected: WORKTREE_OPS_CAPABILITY },
+        { variant: 'legacy' as const, expected: undefined },
+    ])('advertises worktree operations on a registered $variant machine only when it has a machine key', async ({ variant, expected }) => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = { ...makeMachine(), encryptionVariant: variant };
+        machine.metadata = { ...machine.metadata!, worktreeOps: variant === 'legacy' ? WORKTREE_OPS_CAPABILITY : undefined };
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.rpcBinding).toEqual(RPC_BINDING_CAPABILITY));
+        expect(machine.metadata?.worktreeOps).toEqual(expected);
+
+        client.shutdown();
+    });
+
     describe('channel host', () => {
         const advertisement = {
             protocolVersion: 1 as const,
@@ -1423,6 +1521,70 @@ describe('ApiMachineClient socket reconnection', () => {
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
         expect(machine.metadata?.automationSupport?.hostCommands).toBe(expected);
+        client.shutdown();
+    });
+
+    // Desktop explains why script automations are unavailable from this field; without it a
+    // machine that stayed on protocol 4 only shows up as SCRIPT_RUNNER_UNSUPPORTED.
+    it.each([
+        { readiness: { state: 'unavailable' as const, code: 'DOCKER_UNAVAILABLE' as const, checkedAt: 1_700_000_000_000 } },
+        { readiness: { state: 'ready' as const, checkedAt: 1_700_000_000_000, imageSource: 'release' as const, imageFingerprint: 'd32cdf619f63' } },
+        { readiness: undefined },
+    ])('publishes script runtime readiness with server-backed automations (%#)', async ({ readiness }) => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        if (readiness) client.updateScriptRuntime(readiness, 4);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
+        expect(machine.metadata?.automationSupport?.scriptRuntime).toEqual(readiness);
+        client.shutdown();
+    });
+
+    // Docker can come up after the daemon (or go away): the protocol follows the runtime, and the server
+    // learns it by re-registering the same key with the new protocol (targetChanged, no key bump).
+    it('re-registers the same key with the new protocol when the script runtime changes after connect', async () => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'automation-key-register') return { ok: true, value: { keyVersion: 4 } };
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.updateScriptRuntime({ state: 'unavailable', code: 'DOCKER_UNAVAILABLE', checkedAt: 1 }, 4);
+        (client as any).setAutomationKey({
+            version: 1,
+            publicKey: new Uint8Array(32).fill(7),
+            secretKey: new Uint8Array(32).fill(8),
+            registeredKeyVersion: 3,
+        }, vi.fn());
+        client.connect();
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.scriptRuntime?.code).toBe('DOCKER_UNAVAILABLE'));
+        expect(machine.metadata?.automationSupport?.protocolVersion).toBe(4);
+
+        mockSocket.emitWithAck.mockClear();
+        mockSocket.connected = true;
+        client.updateScriptRuntime({ state: 'ready', checkedAt: 2 }, 5);
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.protocolVersion).toBe(5));
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-key-register', expect.objectContaining({ protocolVersion: 5 }));
+        expect(machine.metadata?.automationSupport?.scriptRuntime).toEqual({ state: 'ready', checkedAt: 2 });
         client.shutdown();
     });
 

@@ -55,7 +55,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { projectPath } from '@/projectPath';
 import { logger } from '@/ui/logger';
-import { existsSync, openSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, statSync, writeSync } from 'node:fs';
 import { configuration } from '@/configuration';
 import { isBun } from './runtime';
 import { scrubSessionLineageEnv } from '@/daemon/sessionEnv';
@@ -203,6 +203,26 @@ export function captureSpawnOutputStdio(logFileName: string, marker: string): Sp
   } catch (error) {
     logger.debug(`[SPAWN HAPPY CLI] Could not open ${logFileName}; spawning without captured output: ${error}`)
     return 'ignore'
+  }
+}
+
+/** Release the parent copies of descriptors returned by captureSpawnOutputStdio after spawn. */
+export function closeCapturedSpawnOutputStdio(stdio: SpawnOptions['stdio']): void {
+  if (!Array.isArray(stdio)) return
+  for (const fd of new Set(stdio.filter((entry): entry is number => typeof entry === 'number'))) {
+    try { closeSync(fd) } catch { /* child already inherited it or it was already closed */ }
+  }
+}
+
+/** Read only the tail of a captured spawn log for an immediate startup error. */
+export function readCapturedSpawnOutputTail(logFileName: string, maxBytes = 4_000): string | undefined {
+  try {
+    const path = join(configuration.logsDir, logFileName)
+    const size = statSync(path).size
+    const raw = readFileSync(path, 'utf8')
+    return raw.slice(Math.max(0, raw.length - Math.min(maxBytes, size)))
+  } catch {
+    return undefined
   }
 }
 

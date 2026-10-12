@@ -137,6 +137,8 @@ export type AiCredentialRuntimeDependencies = {
 export class AiCredentialRuntimeError extends Error {
   /** 프로브 실패 진단(종료 코드, stderr 마지막 줄). 데몬 로그의 오류 객체에 함께 찍힌다. */
   readonly probe?: { exitCode: number | undefined; stderrTail: string }
+  /** 예상하지 못한 실패의 종류만(오류 이름·errno). 메시지는 경로·비밀이 섞일 수 있어 남기지 않는다. */
+  failureCause?: string
 
   constructor(
     public readonly kind: string,
@@ -1644,7 +1646,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   const groups = createCredentialGroupSync({
     read: async () => { try { return await deps.readFile(groupJournalPath) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error } },
     write: async content => { await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 }); await deps.chmod(join(deps.homeDir, '.happy'), 0o700); await writeAtomicFile(deps, groupJournalPath, content) },
-    snapshot: groupAdapters.snapshot, incoming: groupPayloadIdentities, remove: groupAdapters.remove,
+    snapshot: groupAdapters.snapshot, incoming: groupPayloadIdentities, remove: groupAdapters.remove, appliedMachineId: deps.machineId,
     managedIdentities: (selected, payload) => selected !== 'claude' ? [] : (JSON.parse(payload).accounts as Array<Record<string, unknown>>)
       .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string')
       .map(account => setupTokenGroupIdentity(account.managedAccountId as string)),
@@ -1709,17 +1711,24 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         }
         throw error
       }
-      if (context.scope !== value.scope || context.userId !== value.userId || context.machineId !== value.machineId
+      // A shared machine's assignment has no user: the sealed context names the machine as principal.
+      const machinePrincipal = context.principalType === 'machine'
+      if ((value.principalType ?? null) !== (machinePrincipal ? 'machine' : null)
+        || (machinePrincipal ? 'userId' in value : context.userId !== value.userId)
+        || context.scope !== value.scope || context.machineId !== value.machineId
         || context.provider !== value.provider || context.generation !== value.generation || context.fingerprint !== value.fingerprint
         || context.leaseId.length === 0
         || ('leaseId' in value && (typeof value.leaseId !== 'string' || value.leaseId !== context.leaseId))
         || ('assignmentGeneration' in value && (value.assignmentGeneration !== context.generation))) {
         throw new AiCredentialRuntimeError('AI_GROUP_CONTEXT_CONFLICT')
       }
-      return groupSync({
-        version: 1, scope: context.scope, userId: context.userId, provider: 'claude', generation: context.generation,
+      const assignment = {
+        version: 1 as const, scope: context.scope, provider: 'claude' as const, generation: context.generation,
         assignmentGeneration: context.generation, fingerprint: context.fingerprint, leaseId: context.leaseId, payload: context.payload,
-      })
+      }
+      return groupSync(machinePrincipal
+        ? { ...assignment, principalType: 'machine', machineId: context.machineId }
+        : { ...assignment, userId: context.userId })
     })
   }
 
@@ -1994,6 +2003,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   const bindingNoncePath = join(deps.homeDir, '.happy', 'setup-token-binding-nonces.json')
   // Only the exact daemon-created object can authorize a spawn; never an RPC DTO.
   const defaultSessionLaunches = new WeakSet<Record<string, string>>()
+  const sharedMachineLaunches = new WeakSet<Record<string, string>>()
   const sessionLaunches = new WeakMap<Record<string, string>, {
     agent: string | undefined; selection: Extract<AiAuthSelection, { kind: 'claude-setup-token' }>
     binding: SetupTokenBinding; expiresAt: number | null; started: boolean
@@ -2092,6 +2102,37 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   /**
+   * A shared machine's assigned setup-token is that machine's default credential: an
+   * unbound launch spends it through the child's environment only, like a bound one.
+   * Null when the machine has no such assignment, or a user assignment desires a
+   * setup-token (its refusal then decides). Never a substitute credential.
+   */
+  async function sharedMachineSessionEnvironment(): Promise<Record<string, string> | null> {
+    if (!deps.machineId || await groups.hasManagedDesired('claude', 'user')) return null
+    const entries = await groups.machineManaged('claude', deps.machineId)
+    if (entries.length === 0) return null
+    if (entries.some(entry => entry.pending)) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
+    if (!await setupTokenRuntimeSupported()) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_UNSUPPORTED')
+    const identities = new Set(entries.flatMap(entry => entry.managed))
+    return withSafeErrors('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE', async () => {
+      const listed = parseClaudeListDetails((await deps.execFile('cswap', ['list', '--json'], {
+        maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout).accounts
+      const exported = JSON.parse((await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })).stdout)
+      const slots: Array<Record<string, unknown>> = Array.isArray(exported?.accounts) ? exported.accounts : []
+      const token = slots.map(slot => {
+        const id = managedSetupTokenId(slot?.email)
+        const accessToken = (slot?.credentials as { claudeAiOauth?: { accessToken?: unknown } } | undefined)?.claudeAiOauth?.accessToken
+        const enabled = listed.some(account => account.email === slot.email && account.disabled !== true)
+        return id !== null && identities.has(setupTokenGroupIdentity(id)) && enabled && slot.credentialType === 'setup_token'
+          && slot.managedAccountId === id && typeof accessToken === 'string' && accessToken.startsWith('sk-ant-oat01-') ? accessToken : null
+      }).find((value): value is string => value !== null)
+      if (!token) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
+      const cleared = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']))
+      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle' }
+    })
+  }
+
+  /**
    * A launch or resume without a setup-token binding runs on the machine default.
    * While any current assignment desires an org-managed setup-token, that is
    * refused with an actionable code, even with a personal login active: group-sync
@@ -2155,6 +2196,11 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return serialize(async () => {
       const marker = await readTrialMarker()
       if (marker.leases.zai) return parseZaiEnvironment(await deps.readFile(zaiEnvironmentPath()))
+      const shared = await sharedMachineSessionEnvironment()
+      if (shared) {
+        sharedMachineLaunches.add(shared)
+        return shared
+      }
       await refuseUnboundManagedDefault()
       const environment = {}
       defaultSessionLaunches.add(environment)
@@ -2169,6 +2215,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       if (SETUP_TOKEN_BINDING_ENV in environment) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
       // Recognize only default Claude environments prepared by this runtime.
       // Explicit personal, other agents and ZAI environments retain their bypass.
+      // The shared machine's token is read again under the group-sync queue; a replaced one is stale.
+      if (sharedMachineLaunches.has(environment)) return serialize(async () => {
+        const current = await sharedMachineSessionEnvironment()
+        if (current?.CLAUDE_CODE_OAUTH_TOKEN !== environment.CLAUDE_CODE_OAUTH_TOKEN) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_STALE')
+        return await start()
+      })
       if (defaultSessionLaunches.has(environment)) return serialize(async () => {
         await refuseUnboundManagedDefault()
         return await start()
@@ -2645,13 +2697,25 @@ async function writeAtomicFile(
   }
 }
 
+// Group journal and provider adapters throw their own fixed codes as plain Errors; those name the real failure.
+const GROUP_FAILURE_CODE = /^AI_GROUP_[A-Z0-9_]{1,64}$/
+
 async function withSafeErrors<T>(kind: string, operation: () => Promise<T>): Promise<T> {
   try {
     return await operation()
   } catch (error) {
     if (error instanceof AiCredentialRuntimeError) throw error
-    throw new AiCredentialRuntimeError(kind)
+    if (error instanceof Error && GROUP_FAILURE_CODE.test(error.message)) throw new AiCredentialRuntimeError(error.message)
+    const failure = new AiCredentialRuntimeError(kind)
+    failure.failureCause = safeFailureCause(error)
+    throw failure
   }
+}
+
+function safeFailureCause(error: unknown): string {
+  const name = error instanceof Error && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : typeof error
+  const code = (error as { code?: unknown } | null)?.code
+  return typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code) ? `${name}:${code}` : name
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -2677,6 +2741,16 @@ function maskEmail(email: string): string {
   return `${email[0]}***${email.slice(at)}`
 }
 
+/**
+ * Persists a directory entry after a rename. Windows cannot fsync a directory (EPERM), and
+ * its rename is already metadata-journaled, so the step is skipped there like claudeCollector.
+ */
+export async function syncDirectoryForDurability(path: string, platform: NodeJS.Platform = process.platform): Promise<void> {
+  if (platform === 'win32') return
+  const directory = await open(path, 'r')
+  try { await directory.sync() } finally { await directory.close() }
+}
+
 export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
@@ -2692,7 +2766,7 @@ export function createNodeAiCredentialRuntime(
     readFile: (path) => readFile(path, 'utf8'),
     readdir: (path) => readdir(path),
     syncFile: async (path) => { const file = await open(path, 'r+'); try { await file.sync() } finally { await file.close() } },
-    syncDirectory: async (path) => { const directory = await open(path, 'r'); try { await directory.sync() } finally { await directory.close() } },
+    syncDirectory: path => syncDirectoryForDurability(path),
     writeFile: async (path, content, options) => { await writeFile(path, content, options) },
     mkdir,
     rename,

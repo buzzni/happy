@@ -47,6 +47,17 @@ describe('automation reads without interactive transaction expiry', () => {
     });
     afterEach(() => vi.unstubAllEnvs());
 
+    it('serves bounded cursor pages and rejects invalid input before reading protected rows', async () => {
+        const response = await app.inject({ method: 'POST', url: '/v1/automations/page', payload: { projectIds: ['chat:c'], limit: 20 } });
+        expect(response.statusCode).toBe(200); expect(response.json()).toEqual({ automations: [], nextCursor: null });
+        expect(db.automation.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 21 }));
+        db.automation.findMany.mockClear();
+        for (const body of [{ projectIds: ['chat:c'], limit: 51 }, { projectIds: ['chat:c'], cursor: 'broken' }]) {
+            expect((await app.inject({ method: 'POST', url: '/v1/automations/page', payload: body })).statusCode).toBe(400);
+        }
+        expect(db.automation.findMany).not.toHaveBeenCalled();
+    });
+
     it.each(paths)('serves %s for accepted viewers when interactive transactions expire', async (path) => {
         const response = await app.inject({ method: 'GET', url: `/v1/projects/project-1/${path}` });
         expect(response.statusCode).toBe(200);

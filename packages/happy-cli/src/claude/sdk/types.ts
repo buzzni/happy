@@ -93,6 +93,11 @@ export interface QueryOptions {
     spawnClaudeCodeProcess?: Options['spawnClaudeCodeProcess']
     /** False keeps a side query (e.g. off-turn titling) out of the session files and `--resume` list. */
     persistSession?: boolean
+    /**
+     * Have the CLI report `session_state_changed`, whose `idle` is its own
+     * signal that no turn is running or owed to queued background reports.
+     */
+    emitSessionStateEvents?: boolean
 }
 
 /**

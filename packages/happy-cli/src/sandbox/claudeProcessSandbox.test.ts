@@ -11,6 +11,9 @@ describe('separate UID sandbox', () => {
         for (const name of ['NODE_OPTIONS', 'BASH_ENV', 'HAPPY_BROWSER_TASK_SESSION_SECRET']) expect(env[name]).toBeUndefined();
         expect(env.ANTHROPIC_API_KEY).toBe('synthetic');
     });
+    it('preserves the session state event flag for idle detection', () => {
+        expect(filterClaudeProcessEnv({ CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe('1');
+    });
     it('frames arbitrary argv as data in a single bounded descriptor', () => {
         const args = ['', 'a\nb', '$(touch /work/evil)', '*'];
         expect(encodeLauncherInput({ command: '/usr/bin/node', args, cwd: '/work', env: {} }).toString()).toContain(args.join('\0'));

@@ -85,6 +85,33 @@ describe('spawn webhook wait', () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(logger.debug).not.toHaveBeenCalledWith(expect.stringContaining('timeout'));
   });
+
+  it('fails as soon as the child exits before reporting its webhook', async () => {
+    const awaiters = new Map<number, (s: any) => void>();
+    let exitListener: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+    const child = {
+      once: (_event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void) => { exitListener = listener },
+      removeListener: () => {},
+    } as any;
+    const result = waitForSessionWebhook({ pid: 123, pidToAwaiter: awaiters, logger: { debug: vi.fn() }, child,
+      startupErrorDetail: () => 'fatal startup error', timeouts: { softTimeoutMs: 15_000, finalTimeoutMs: 60_000 } });
+    exitListener?.(1, null);
+    await expect(result).resolves.toMatchObject({ type: 'error', errorMessage: expect.stringContaining('fatal startup error') });
+    expect(awaiters.has(123)).toBe(false);
+  });
+  it('fails immediately when the child emits a spawn error without an exit', async () => {
+    const awaiters = new Map<number, (s: any) => void>();
+    let errorListener: ((error: Error) => void) | undefined;
+    const child = {
+      once: (event: 'exit' | 'error', listener: (...args: any[]) => void) => { if (event === 'error') errorListener = listener as (error: Error) => void },
+      removeListener: () => {},
+    };
+    const result = waitForSessionWebhook({ pid: 123, pidToAwaiter: awaiters, logger: { debug: vi.fn() }, child,
+      timeouts: { softTimeoutMs: 15_000, finalTimeoutMs: 60_000 } });
+    errorListener?.(new Error('spawn ENOENT'));
+    await expect(result).resolves.toEqual({ type: 'error', errorMessage: 'Session process failed before webhook for PID 123: spawn ENOENT' });
+    expect(awaiters.has(123)).toBe(false);
+  });
   it('cancelling an old waiter does not delete a replacement waiter for the same PID', async () => {
     vi.useFakeTimers(); const awaiters = new Map<number, (s: any) => void>(); const cancellation = new AbortController();
     const result = waitForSessionWebhook({ pid: 123, pidToAwaiter: awaiters, logger: { debug: vi.fn() }, signal: cancellation.signal });

@@ -25,6 +25,7 @@ import {
     type AutomationServiceError,
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
+import { listAutomationPage } from '@/app/automation/automationPageService';
 import { inTx } from '@/storage/inTx';
 import { db } from '@/storage/db';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
@@ -202,6 +203,22 @@ export function automationRoutes(app: Fastify) {
             request.userId,
         );
         return reply.send(result.value);
+    });
+
+    // Read-only bulk scope discovery; the database still enforces project access.
+    app.post('/v1/automations/page', {
+        preHandler: app.authenticate,
+        schema: { body: z.object({ projectIds: z.array(z.string().min(1).max(256)).max(10000),
+            limit: z.number().int().min(1).max(50).default(20), cursor: z.string().min(1).max(1024).nullable().default(null) }) },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        try {
+            const page = await listAutomationPage(db, request.userId, request.body);
+            return reply.send({ automations: page.automations.map(row => ({ ...serializeAutomation(row), runs: row.runs.map(serializeRun) })), nextCursor: page.nextCursor });
+        } catch (error) {
+            if (error instanceof Error && error.message === 'invalid-automation-cursor') return reply.code(400).send({ error: error.message });
+            throw error;
+        }
     });
 
     app.get('/v1/projects/:projectId/automations', {

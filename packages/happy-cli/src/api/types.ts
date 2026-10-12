@@ -1,7 +1,7 @@
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, rpcBindingCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -168,6 +168,15 @@ export const MachineMetadataSchema = z.object({
     hostCommands: z.boolean().optional(),
     /** aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — seal with this sender, to this key. */
     authenticatedEnvelopes: authenticatedEnvelopesCapabilitySchema.optional(),
+    /** Why this machine does or does not run script automations. Enums and a short fingerprint only (specs/script-runtime-readiness). */
+    scriptRuntime: z.object({
+      state: z.enum(['ready', 'unavailable', 'disabled']),
+      // Plain string so a newer daemon's code never makes an older client drop the whole field.
+      code: z.string().max(40).optional(),
+      checkedAt: z.number(),
+      imageSource: z.enum(['env', 'release']).optional(),
+      imageFingerprint: z.string().regex(/^[a-f0-9]{12}$/).optional(),
+    }).optional(),
   }).optional(),
   /**
    * External messenger channel support (Saycode specs/desktop-messenger-channels).
@@ -237,15 +246,28 @@ export const MachineMetadataSchema = z.object({
    * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
+  /** Profile-based no-shell execution negotiated by Desktop extensions. */
+  machineRun: z.object({
+    protocolVersion: z.literal(1),
+    supported: z.boolean(),
+    shell: z.literal(false),
+    stdin: z.literal('none'),
+    maxTimeoutMs: z.number().int().positive(),
+    maxOutputLimitBytes: z.number().int().positive(),
+  }).optional(),
   /** Current tracked-child presence via encrypted machine RPC (BYOS only). */
   daemonSessionState: z.object({ version: z.literal(1) }).optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound machine-scope requests (BYOS only). */
   rpcBinding: rpcBindingCapabilitySchema.optional(),
+  /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — runs `spawn-with-sealed-env`. */
+  sealedSpawnEnv: sealedSpawnEnvCapabilitySchema.optional(),
+  /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree — runs `worktree:*` and signs the results. */
+  worktreeOps: worktreeOpsCapabilitySchema.optional(),
   /**
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
    */
-  agentBrowser: z.object({ protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']) }).optional(),
+  agentBrowser: z.object({ protocol: z.number().int().positive(), tenancyMode: z.enum(['dedicated', 'shared']), hostMode: z.enum(['browser-only', 'dedicated-host']).optional() }).optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>

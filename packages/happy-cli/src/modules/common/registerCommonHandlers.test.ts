@@ -4,13 +4,15 @@ import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
 import { configuration } from '@/configuration';
-import { registerCommonHandlers } from './registerCommonHandlers';
+import { registerCommonHandlers, type CommonHandlerOptions } from './registerCommonHandlers';
+import { createManagedProjectWriteScopePolicy, createTrustedMachineRunProfileResolver } from './machineRunProfile';
+import { managedMachineToolPlatform } from './managedMachineTool';
 
 type Handler = (data: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
 const temporaryDirectories: string[] = [];
 
-async function createHandlers(workingDirectory?: string) {
+async function createHandlers(workingDirectory?: string, options?: CommonHandlerOptions) {
     if (!workingDirectory) {
         workingDirectory = await mkdtemp(join(tmpdir(), 'happy-read-chunk-'));
         temporaryDirectories.push(workingDirectory);
@@ -21,7 +23,7 @@ async function createHandlers(workingDirectory?: string) {
             handlers.set(method, handler);
         },
     } as unknown as RpcHandlerManager;
-    registerCommonHandlers(manager, workingDirectory);
+    registerCommonHandlers(manager, workingDirectory, options);
     return { handlers, workingDirectory };
 }
 
@@ -50,6 +52,84 @@ describe('registerCommonHandlers bash scheduling', () => {
             stdout: 'background',
             exitCode: 0,
         });
+    });
+});
+
+describe('registerCommonHandlers machine.run capability', () => {
+    it('keeps the raw RPC and exposes profile capability negotiation on both method names', async () => {
+        const { handlers } = await createHandlers(undefined, {
+            machineRun: {
+                allowLegacyRaw: true,
+                profileRegistry: createTrustedMachineRunProfileResolver([{
+                    id: 'buzzni.test.echo', executable: 'printf', argv: ['{{message}}'],
+                    parameters: { message: { type: 'string', maxLength: 32 } }, cwd: 'workspaceRoot',
+                    envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none',
+                }]),
+            },
+        });
+        await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
+            supported: true,
+            protocolVersion: 1,
+            runtime: { packageName: '@buzzni/happy-cli', packageVersion: expect.any(String), protocolVersion: 1 },
+            capabilities: ['machine.run.v1'],
+            profiles: [{ id: 'buzzni.test.echo' }],
+        });
+        await expect(handlers.get('machine-run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: true, profiles: [{ id: 'buzzni.test.echo' }] });
+        await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] })).resolves.toMatchObject({ action: 'start', state: 'accepted' });
+    });
+
+    it('does not expose the raw executable alias without an explicit internal gate', async () => {
+        const { handlers } = await createHandlers(undefined, {
+            machineRun: {
+                profileRegistry: createTrustedMachineRunProfileResolver([]),
+            },
+        });
+        await expect(handlers.get('machine-run')?.({ version: 1, action: 'start', executable: 'printf', args: ['raw'] }))
+            .rejects.toThrow('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
+    });
+
+    it('advertises a write profile only where the host installed a write policy', async () => {
+        const registry = createTrustedMachineRunProfileResolver([{
+            id: 'buzzni.test.write', executable: 'printf', argv: ['x'], parameters: {}, cwd: 'workspaceRoot',
+            envAllowlist: [], timeoutMs: 1000, outputLimitBytes: 1024, stdin: 'none', writeScope: 'moai', descendantAllowlist: ['git'],
+        }]);
+        const machine = await createHandlers(undefined, { machineRun: { profileRegistry: registry, writeScopePolicy: createManagedProjectWriteScopePolicy() } });
+        await expect(machine.handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
+            supported: true, profiles: [{ id: 'buzzni.test.write', writeScope: 'moai', descendantAllowlist: ['git'] }],
+        });
+        const session = await createHandlers(undefined, { machineRun: { profileRegistry: registry } });
+        await expect(session.handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({ supported: false, profiles: [] });
+    });
+
+    it('exposes managed tool status everywhere but install only where the host allows it', async () => {
+        const toolsRoot = await mkdtemp(join(tmpdir(), 'happy-tools-'));
+        temporaryDirectories.push(toolsRoot);
+        const fakeTool = { id: 'buzzni.fake', version: '1.0.0', executable: 'fake-tool', artifacts: {} };
+        const managedTools = { root: toolsRoot, tools: [fakeTool] };
+        const registry = createTrustedMachineRunProfileResolver([]);
+        const machine = await createHandlers(undefined, { machineRun: { profileRegistry: registry, managedTools, allowToolInstall: true } });
+        const tool = machine.handlers.get('machine.tool');
+        await expect(tool?.({ version: 1, action: 'status', toolId: 'buzzni.fake' })).resolves.toEqual({
+            version: 1, action: 'status', tool: { toolId: 'buzzni.fake', version: '1.0.0', platform: managedMachineToolPlatform(), supported: false, installed: false },
+        });
+        await expect(tool?.({ version: 1, action: 'install', toolId: 'buzzni.fake' })).rejects.toThrow('MANAGED_TOOL_UNSUPPORTED_PLATFORM');
+        await expect(tool?.({ version: 1, action: 'status', toolId: 'buzzni.unknown' })).rejects.toThrow('MANAGED_TOOL_NOT_FOUND');
+        await expect(tool?.({ version: 1, action: 'install', toolId: 'buzzni.fake', url: 'https://example.com' })).rejects.toThrow('MANAGED_TOOL_INVALID');
+
+        const session = await createHandlers(undefined, { machineRun: { profileRegistry: registry, managedTools } });
+        await expect(session.handlers.get('machine.tool')?.({ version: 1, action: 'install', toolId: 'buzzni.fake' })).rejects.toThrow('MANAGED_TOOL_INSTALL_UNAVAILABLE');
+    });
+
+    it('fails closed when the daemon has no host-owned profile registry', async () => {
+        const { handlers } = await createHandlers(undefined, { machineRun: { profileRegistry: createTrustedMachineRunProfileResolver([]) } });
+        await expect(handlers.get('machine.run')?.({ action: 'capabilities' })).resolves.toMatchObject({
+            supported: false,
+            profiles: [],
+            reason: 'MACHINE_RUN_PROFILE_REGISTRY_UNAVAILABLE: no trusted profiles are registered',
+        });
+        await expect(handlers.get('machine.run')?.({
+            action: 'start', profileId: 'extension.arbitrary', profileDigest: 'a'.repeat(64), workspaceRoot: '/tmp', parameters: {},
+        })).rejects.toThrow('MACHINE_RUN_PROFILE_NOT_FOUND');
     });
 });
 

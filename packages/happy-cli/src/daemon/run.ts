@@ -11,10 +11,10 @@ import os from 'os';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SCRIPT_AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
-import { prepareManagedScriptRuntime, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
+import { prepareManagedScriptRuntime, probeManagedScriptEngine, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
 import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
@@ -36,7 +36,7 @@ import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
-import { captureSpawnOutputStdio, preflightInstalledHappyCLI, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
+import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
 import {
   writeDaemonState,
   writeDaemonStateDebounced,
@@ -64,7 +64,7 @@ import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
 import { getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
-import { prepareBrowserNativeMessaging, registerBrowserNativeHost, resolveBrowserNativeHostHelperPath } from './browserNativeHostRegistration';
+import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
@@ -254,6 +254,8 @@ import {
   type AutomationMcpSpawnContext,
 } from './automations/automationMcpCallerGrant';
 import { preflightAutomationConnectors } from './automations/automationConnectorPreflight';
+import { resolveScriptRuntimeImage, scriptRuntimeReadiness, type ScriptRuntimeReadiness } from './automations/scriptRuntimeReadiness';
+import { createScriptRuntimeSupervisor } from './automations/scriptRuntimeSupervisor';
 import { resolveDaemonAllowedRoot } from '@/modules/common/resolveAllowedRoot';
 import { getProcessStartedAt } from '@/utils/processStartTime';
 import { waitForSessionWebhook } from './spawnWebhookWait';
@@ -304,6 +306,7 @@ import {
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { resolveCheckpointSessionAuthority } from './checkpointSessionAuthority';
 import { createCheckpointRestartQueue, restartCheckpointProtectedSession } from './checkpointProtectedRestart';
+import { createRequestEnvironmentMemory } from './requestEnvironmentMemory';
 import { stopServerProcess } from './stopServer';
 import { AutonomousQualityGateRunStore } from './autonomousQualityGateStore';
 import { AutonomousQualityGateDaemonRegistry } from './autonomousQualityGateRegistry';
@@ -337,6 +340,12 @@ import { enforceLeaseRenewal } from './managedGenerationRearm';
 import { systemMonotonicNow } from '@/launcher/supervisor';
 import { createLauncherClient, createUnixSocketRequest } from './launch/launcherClient';
 import { defaultProvisioningDeps } from './managedRuntimeIdentity';
+import {
+  MACHINE_RUN_MAX_OUTPUT_BYTES,
+  MACHINE_RUN_MAX_TIMEOUT_MS,
+} from '@/modules/common/typedMachineRun';
+import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
+import { hostManagedMachineTools } from '@/modules/common/moaiMachineRunProfiles';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -365,7 +374,18 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
+  machineRun: {
+    protocolVersion: 1,
+    // The machine-scope handler installs the managed write policy (apiMachine).
+    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, process.platform, true, hostManagedMachineTools(configuration.happyHomeDir)),
+    shell: false,
+    stdin: 'none',
+    maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
+    maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
+  },
   rpcBinding: RPC_BINDING_CAPABILITY,
+  sealedSpawnEnv: SEALED_SPAWN_ENV_CAPABILITY,
+  worktreeOps: WORKTREE_OPS_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
 };
 
@@ -566,15 +586,15 @@ function startDifficultyRoutingMetadataPoll(input: {
  * than the tick, which is what keeps `prepare` and `recover` from running and
  * leaves the automation protocol advertised at its legacy version.
  *
- * BYOS is unchanged: without the managed marker this is the same feature flag
- * it has always been.
+ * BYOS runs it by default: an unset flag counts as on, so chat automations work
+ * without extra setup. Any other value (`0`, `false`, ...) opts out.
  */
 export function shouldRunScriptAutomations(input: {
     managedRuntimeActive: boolean;
     enabled: string | undefined;
 }): boolean {
     if (input.managedRuntimeActive) return false;
-    return input.enabled === '1';
+    return input.enabled === undefined || input.enabled === '1';
 }
 
 export async function startDaemon(): Promise<void> {
@@ -2389,10 +2409,14 @@ export async function startDaemon(): Promise<void> {
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
+      const startupLogFileName = 'daemon-session-startup.log';
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(managedAiCredentialEnvironment,
-        () => spawnHappyCLI(args, { cwd, detached: true,
-        stdio: scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe'] : 'ignore',
-        env: { ...env, ...scopeReports?.environment } }));
+        () => {
+          const stdio: import('child_process').SpawnOptions['stdio'] = scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
+            : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`);
+          try { return spawnHappyCLI(args, { cwd, detached: true, stdio, env: { ...env, ...scopeReports?.environment } }); }
+          finally { closeCapturedSpawnOutputStdio(stdio); }
+        });
       scopeReports?.attach(happyProcess);
       const rootPid = prepared?.pid ?? happyProcess.pid;
       if (!rootPid) return { type: 'error', errorMessage: 'Failed to spawn Happy process - no PID returned' };
@@ -2430,7 +2454,8 @@ export async function startDaemon(): Promise<void> {
         happyProcess.on('error', () => onChildExited(rootPid));
       }
       const webhookCancellation = new AbortController();
-      const webhook = waitForSessionWebhook({ pid: rootPid, pidToAwaiter, logger, signal: webhookCancellation.signal });
+      const webhook = waitForSessionWebhook({ pid: rootPid, pidToAwaiter, logger, signal: webhookCancellation.signal,
+        ...(!prepared && !scopeReports ? { child: happyProcess, startupErrorDetail: () => readCapturedSpawnOutputTail(startupLogFileName) } : {}) });
       if (prepared) {
         try {
           if (!standaloneWindows?.owner.acceptingLaunches) throw new Error('Standalone launch frozen before resume');
@@ -2927,6 +2952,8 @@ export async function startDaemon(): Promise<void> {
     // two RPCs 6.7s apart double-spawned a session; both children were later
     // empty-reaped together).
     const resumeInFlight = new Map<string, Promise<ResumeSessionResult>>();
+    // Client-sent env per session, memory only; daemon-started resumes re-send it (Chat org env).
+    const requestEnvironments = createRequestEnvironmentMemory();
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
 
@@ -3068,6 +3095,8 @@ export async function startDaemon(): Promise<void> {
         const result = await spawnResumedSession(serverSession.id, {
           model: options.model,
           permissionMode: options.permissionMode,
+          // The new-session branch below passes it too; dropping it here started the child without it.
+          environmentVariables: options.environmentVariables,
           mcpCallerGrantEnvelope: options.mcpCallerGrantEnvelope,
           mcpConfigProjectId: options.mcpConfigProjectId,
           expectedConnectors: options.expectedConnectors,
@@ -3384,6 +3413,7 @@ export async function startDaemon(): Promise<void> {
       // A concurrent resume owns a different prompt; retry attention after its webhook.
       if (resumeInFlight.has(sessionId)) throw new Error('Attention session resume is already in progress');
       const result = await resumeSession(sessionId, {
+        environmentVariables: requestEnvironments.recall(sessionId),
         automation: { directory, initialPrompt: text, exitAfterFirstTurn: true,
           environmentVariables: { HAPPY_INITIAL_PROMPT_LOCAL_ID: localId } },
       });
@@ -3545,11 +3575,7 @@ export async function startDaemon(): Promise<void> {
     // Prepare/migrate the token before exposing the helper manifest. Chrome
     // can launch the helper as soon as the manifest exists, and must not race
     // legacy-token migration by creating a different machine-wide token.
-    const nativeMessagingHelperPath = resolveBrowserNativeHostHelperPath({
-      platform: process.platform,
-      standaloneLauncher: process.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER,
-      fallback: join(projectPath(), 'bin', 'happy-browser-native-host.mjs'),
-    });
+    const nativeMessagingHelperPath = join(projectPath(), 'bin', 'happy-browser-native-host.mjs');
     const nativeMessaging = await prepareBrowserNativeMessaging({
       readToken: () => readOrCreateBrowserBridgeToken(configuration.browserBridgeTokenFile, {
         migrateFrom: configuration.legacyBrowserBridgeTokenFile
@@ -3646,7 +3672,7 @@ export async function startDaemon(): Promise<void> {
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
       stopSession,
-      spawnSession,
+      spawnSession: requestEnvironments.rememberSpawn(spawnSession),
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
       onHappySessionRuntime,
@@ -4229,66 +4255,91 @@ export async function startDaemon(): Promise<void> {
     resolveManagedAiCredentialEnvironment = (agent, selection, recorded) => aiCredentialRuntime.sessionEnvironment(agent, selection, recorded);
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     let activeServerAutomationLeaseCount = 0;
-    let scriptWorker: ReturnType<typeof createScriptAutomationWorker> | null = null;
+    let scriptRuntime: ReturnType<typeof createScriptRuntimeSupervisor> | null = null;
+    let scriptProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    const publishScriptRuntime = (readiness: ScriptRuntimeReadiness, protocolVersion: number) => {
+      scriptProtocolVersion = protocolVersion;
+      apiMachine.updateScriptRuntime(readiness, protocolVersion);
+    };
     if (!standaloneWindows && shouldRunScriptAutomations({
         managedRuntimeActive: managedIdentity.status === 'active',
         enabled: process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED,
     })) {
-      try {
-        const image = process.env.HAPPY_SCRIPT_RUNTIME_IMAGE;
-        if (!image) throw new Error('SCRIPT_RUNTIME_IMAGE_REQUIRED');
-        const studioConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
-        if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
-        const studioUrl = new URL(studioConfigUrl);
-        if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
-        const request = async (method: string, path: string, body?: unknown, baseUrl = configuration.serverUrl): Promise<unknown> => {
-          try {
-            const response = await axios.request({ method, url: new URL(path, baseUrl).href,
-              headers: { Authorization: `Bearer ${credentials.token}` }, data: body, timeout: 10000,
-              maxContentLength: 16 * 1024 * 1024, maxBodyLength: 12 * 1024 * 1024, proxy: false });
-            return response.data;
-          } catch (error) {
-            if (axios.isAxiosError(error) && error.response) {
-              const code = error.response.data?.error;
-              throw new ScriptRequestError(error.response.status, typeof code === 'string' && /^[A-Z0-9_]{1,100}$/.test(code) ? code : 'SCRIPT_REQUEST_FAILED');
-            }
-            throw error;
+      const request = async (method: string, path: string, body?: unknown, baseUrl = configuration.serverUrl): Promise<unknown> => {
+        try {
+          const response = await axios.request({ method, url: new URL(path, baseUrl).href,
+            headers: { Authorization: `Bearer ${credentials.token}` }, data: body, timeout: 10000,
+            maxContentLength: 16 * 1024 * 1024, maxBodyLength: 12 * 1024 * 1024, proxy: false });
+          return response.data;
+        } catch (error) {
+          if (axios.isAxiosError(error) && error.response) {
+            const code = error.response.data?.error;
+            throw new ScriptRequestError(error.response.status, typeof code === 'string' && /^[A-Z0-9_]{1,100}$/.test(code) ? code : 'SCRIPT_REQUEST_FAILED');
           }
-        };
-        const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
-        if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
-        const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
-        const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
-        const temporaryRoot = join(directory, 'work');
-        await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image });
-        await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
-        const authorize = async (runId: string, claimToken: string, secretRefs?: { [name: string]: string }) => {
-          const response = await request('POST', '/api/automation/script-execution', { machineId, runId, claimToken,
-            ...(secretRefs ? { secretRefs } : {}) }, studioUrl.origin);
-          return z.object({ executionProof: z.string().min(1), secrets: z.record(z.string(), z.string()),
-            approvedPrivateOrigins: z.array(z.string()) }).parse(response);
-        };
-        const worker = createScriptAutomationWorker({ machineId, accountId: profile.id,
-          machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust,
-          onUnauthenticated: (what) => recordUnauthenticated(what),
-          image, directory: join(directory, 'outbox'), request,
-          recoverContainers: () => recoverManagedScriptContainers({ ownerId, directory: temporaryRoot }),
-          execute: (input) => runManagedScript({ ...input, ownerId, temporaryRoot }),
-          authorizeStart: async (_record, runId, token) => (await authorize(runId, token)).executionProof,
-          resolveSecrets: async (_record, refs, runId, token) => {
-            const { secrets, approvedPrivateOrigins } = await authorize(runId, token, refs);
-            return { secrets, approvedPrivateOrigins };
-          },
-          log: (message) => logger.debug(`[script-automations] ${message}`) });
-        await worker.recover();
-        scriptWorker = worker;
-        stopScriptWorker = () => worker.stop();
-      } catch (error) {
-        logger.debug(`[script-automations] Script runtime unavailable; capability remains disabled: ${error instanceof Error ? error.message : 'unknown error'}`);
-      }
+          throw error;
+        }
+      };
+      // Shared by one preflight and the worker created after the first successful one.
+      let runtime: { image: string; accountId: string; ownerId: string; directory: string; temporaryRoot: string; studioOrigin: string } | null = null;
+      scriptRuntime = createScriptRuntimeSupervisor({
+        preflight: async () => {
+          const resolved = resolveScriptRuntimeImage(process.env);
+          if (!resolved.ok) throw new Error('IMMUTABLE_IMAGE_REQUIRED');
+          const studioConfigUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+          if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
+          const studioUrl = new URL(studioConfigUrl);
+          if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
+          const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
+          if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
+          const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
+          const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
+          const temporaryRoot = join(directory, 'work');
+          await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image: resolved.image });
+          await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
+          runtime = { image: resolved.image, accountId: profile.id, ownerId, directory, temporaryRoot, studioOrigin: studioUrl.origin };
+          return resolved;
+        },
+        createWorker: async () => {
+          const ready = runtime;
+          if (!ready) throw new Error('SCRIPT_RUNTIME_PREFLIGHT_FAILED');
+          const { image, accountId, ownerId, directory, temporaryRoot, studioOrigin } = ready;
+          const authorize = async (runId: string, claimToken: string, secretRefs?: { [name: string]: string }) => {
+            const response = await request('POST', '/api/automation/script-execution', { machineId, runId, claimToken,
+              ...(secretRefs ? { secretRefs } : {}) }, studioOrigin);
+            return z.object({ executionProof: z.string().min(1), secrets: z.record(z.string(), z.string()),
+              approvedPrivateOrigins: z.array(z.string()) }).parse(response);
+          };
+          const worker = createScriptAutomationWorker({ machineId, accountId,
+            machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust,
+            onUnauthenticated: (what) => recordUnauthenticated(what),
+            image, directory: join(directory, 'outbox'), request,
+            recoverContainers: () => recoverManagedScriptContainers({ ownerId, directory: temporaryRoot }),
+            execute: (input) => runManagedScript({ ...input, ownerId, temporaryRoot }),
+            authorizeStart: async (_record, runId, token) => (await authorize(runId, token)).executionProof,
+            resolveSecrets: async (_record, refs, runId, token) => {
+              const { secrets, approvedPrivateOrigins } = await authorize(runId, token, refs);
+              return { secrets, approvedPrivateOrigins };
+            },
+            log: (message) => logger.debug(`[script-automations] ${message}`) });
+          await worker.recover();
+          return worker;
+        },
+        probe: probeManagedScriptEngine,
+        publish: publishScriptRuntime,
+        now: () => Date.now(),
+        log: (message) => logger.debug(`[script-automations] ${message}`),
+      });
+      stopScriptWorker = () => scriptRuntime!.stop();
+      await scriptRuntime.start();
+    } else if (!standaloneWindows) {
+      publishScriptRuntime(scriptRuntimeReadiness({
+        state: 'disabled',
+        code: managedIdentity.status === 'active' ? 'MANAGED_RUNTIME' : 'DISABLED',
+        now: Date.now(),
+      }), AUTOMATION_PROTOCOL_VERSION);
     }
     const scriptAutomationTickRunner = createAutomationTickRunner({
-      runTick: async () => { await scriptWorker?.tick(); },
+      runTick: async () => { await scriptRuntime?.tick(); },
       logDebug: (message) => logger.debug(`[script-automations] ${message}`),
     });
     apiMachine.setAuthenticatedEnvelopeSender(payloadTrust.customerPublicKey, { required: payloadTrust.mode === 'strict' });
@@ -4298,7 +4349,7 @@ export async function startDaemon(): Promise<void> {
         machineAutomationKey,
         keyVersion,
       );
-    }, scriptWorker ? SCRIPT_AUTOMATION_PROTOCOL_VERSION : AUTOMATION_PROTOCOL_VERSION);
+    }, scriptProtocolVersion);
     /*
      * The lesson host. The studio origin is the daemon's own configured value
      * — the same one the MCP config uses — never anything from a request, and
@@ -4704,9 +4755,16 @@ export async function startDaemon(): Promise<void> {
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
       ...(channelHost ? { channelHostCall: channelHost.call } : {}),
-      spawnSession,
-      resumeSession,
-      recoverSession,
+      spawnSession: requestEnvironments.rememberSpawn(spawnSession),
+      resumeSession: requestEnvironments.rememberResume(
+        resumeSession,
+        sessionId => !resumeInFlight.has(sessionId)
+          && !hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
+      ),
+      recoverSession: requestEnvironments.rememberResume(
+        recoverSession,
+        sessionId => !recoveryInFlight.has(sessionId),
+      ),
       stopSession,
       stopSessionWithExitVerification,
       requestShutdown: () => {

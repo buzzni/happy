@@ -8,10 +8,11 @@ import { delay } from "@/utils/time";
 import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey, readPersistedSessions, readMachineIdentity, writeMachineIdentity, writePrivateFileSync } from "@/persistence";
 import { buildMachineIdentity, reusableDataKeyMachineKey, reusableMachineId } from "@/machineIdentity";
 import { planDataKeyOnboarding } from "@/datakey/onboarding";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
+import { authMethodWithoutPrompt } from "./authMethodChoice";
 import { render } from 'ink';
 import React from 'react';
 import { randomUUID } from 'node:crypto';
@@ -20,8 +21,8 @@ import { logger } from './logger';
 export async function doAuth(): Promise<Credentials | null> {
     console.clear();
 
-    // Show authentication method selector
-    const authMethod = await selectAuthenticationMethod();
+    // Show authentication method selector (non-interactive sessions go straight to the pairing code)
+    const authMethod = authMethodWithoutPrompt(process.stdin.isTTY) ?? await selectAuthenticationMethod();
     if (!authMethod) {
         console.log('\nAuthentication cancelled.\n');
         process.exit(0);
@@ -322,16 +323,24 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     // 못 본다. 기존 세션이 있는 머신은 승격하지 않는다(planDataKeyOnboarding
     // 의 has-local-sessions 게이트). best-effort — 실패는 legacy 로 계속.
     try {
+        const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
+        // 되돌림은 원본을 바이트 그대로 복원하므로, 백업의 secret 과 machineKey 가 모두 지금 것과 같을 때만 이 신원이
+        // 되돌린 흔적이다. 조직 PC 재등록은 계정의 같은 token·secret 에 새 machineKey 만 받는다(2026-10-12 hmrepo) —
+        // 이전 신원의 백업은 낡은 파일이고 승격 시 이 신원의 원본으로 덮어쓴다.
+        const backup = readBackupIdentity(backupPath);
+        const ownBackup = credentials.encryption.type === 'legacy' && !!credentials.encryption.provisioned
+            && backup.secret === encodeBase64(credentials.encryption.secret)
+            && backup.machineKey === encodeBase64(credentials.encryption.provisioned.machineKey);
         const plan = planDataKeyOnboarding({
             credentials,
             accountPublicKey: settings.accountPublicKey ?? null,
-            hasLocalSessions: Object.keys(readPersistedSessions()).length > 0,
+            // 같은 폴더에서 재등록된 이전 PC 신원의 세션은 이 신원의 키와 무관하다 (2026-10-11 hmrepo). 출처를 모르는 세션은 센다.
+            hasLocalSessions: Object.values(readPersistedSessions())
+                .some(session => !session.metadata?.machineId || session.metadata.machineId === settings.machineId),
+            hasLegacyBackup: ownBackup,
         });
         if (plan.ok) {
-            const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
-            if (!existsSync(backupPath)) {
-                writePrivateFileSync(backupPath, JSON.stringify(plan.backup, null, 2));
-            }
+            writePrivateFileSync(backupPath, JSON.stringify(plan.backup, null, 2));
             writePrivateFileSync(configuration.privateKeyFile, JSON.stringify(plan.serialized, null, 2));
             credentials = (await readCredentials())!;
             logger.debug('[AUTH] Onboarded fresh machine to dataKey-active');
@@ -350,4 +359,16 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     }
 
     return { credentials, machineId: settings.machineId!, serverPublicKey: settings.serverPublicKey ?? null };
+}
+
+function readBackupIdentity(path: string): { secret: string | null; machineKey: string | null } {
+    try {
+        const backup = JSON.parse(readFileSync(path, 'utf8')) as { secret?: unknown; encryption?: { machineKey?: unknown } };
+        return {
+            secret: typeof backup.secret === 'string' ? backup.secret : null,
+            machineKey: typeof backup.encryption?.machineKey === 'string' ? backup.encryption.machineKey : null,
+        };
+    } catch {
+        return { secret: null, machineKey: null };
+    }
 }

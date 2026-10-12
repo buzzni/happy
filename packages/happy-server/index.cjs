@@ -48,8 +48,30 @@ function resolveServerArtifact() {
   };
 }
 
+/**
+ * The runtime starts with cwd = package root (migrations and PGlite assets resolve from there),
+ * so data paths are pinned to the caller's directory first; otherwise the default `./data`
+ * would land inside node_modules and vanish on the next install.
+ */
+function resolveRuntimeEnv(env, callerCwd) {
+  const next = { ...env, DATA_DIR: path.resolve(callerCwd, env.DATA_DIR || 'data') };
+  if (env.PGLITE_DIR) next.PGLITE_DIR = path.resolve(callerCwd, env.PGLITE_DIR);
+  return next;
+}
+
+/** The bin wrapper is what a service manager signals; the server must stop with it. */
+function forwardTerminationSignals(parent, child) {
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    parent.on(signal, () => {
+      if (child.exitCode === null) child.kill(signal);
+    });
+  }
+}
+
 module.exports = {
   packageRoot,
+  forwardTerminationSignals,
+  resolveRuntimeEnv,
   getWebappDirectory,
   resolveServerArtifact,
 };

@@ -27,6 +27,16 @@ import {
     type BashRpcExecutionClass,
 } from './bashRpcScheduler';
 import type { PermissionMode } from '@/api/types';
+import { createTypedMachineRunHandler } from './typedMachineRun';
+import {
+    createProfileAwareMachineRunHandler,
+    TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+    type MachineRunManagedTools,
+    type MachineRunProfileHandlerOptions,
+    type MachineRunWriteScopePolicy,
+    type TrustedMachineRunProfileRegistry,
+} from './machineRunProfile';
+import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -401,9 +411,84 @@ export type RecoverSessionResult =
 /**
  * Register all RPC handlers with the session
  */
-export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string) {
+export interface CommonHandlerOptions {
+    machineRun?: {
+        /** Host-owned immutable registry. Extension input must never populate this. */
+        profileRegistry: TrustedMachineRunProfileRegistry;
+        extensionDataDirectory?: string;
+        tempDirectory?: string;
+        environment?: NodeJS.ProcessEnv;
+        platform?: NodeJS.Platform;
+        /** Explicit internal compatibility escape hatch; never enabled for extension RPCs. */
+        allowLegacyRaw?: boolean;
+        /** Host-owned write policy. Without it, write profiles are neither advertised nor run. */
+        writeScopePolicy?: MachineRunWriteScopePolicy;
+        /** Host-owned pinned tools; their profiles run only the verified install. */
+        managedTools?: MachineRunManagedTools;
+        /** Only the machine scope downloads and installs managed tools. */
+        allowToolInstall?: boolean;
+    };
+}
+
+export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
+    const rawMachineRunHandler = createTypedMachineRunHandler(workingDirectory);
+    const machineRunOptions = options.machineRun;
+    const profileHandlerOptions: MachineRunProfileHandlerOptions = machineRunOptions ? {
+        extensionDataDirectory: machineRunOptions.extensionDataDirectory,
+        tempDirectory: machineRunOptions.tempDirectory,
+        environment: machineRunOptions.environment,
+        platform: machineRunOptions.platform,
+        writeScopePolicy: machineRunOptions.writeScopePolicy,
+        managedTools: machineRunOptions.managedTools,
+    } : { platform: process.platform };
+    // `machine.run` is the profile-aware capability used by Desktop. The
+    // hyphenated alias is profile-only by default; raw executable/argv is an
+    // explicit internal compatibility mode and is never an extension default.
+    const profileMachineRunHandler = createProfileAwareMachineRunHandler(
+        workingDirectory,
+        machineRunOptions?.profileRegistry ?? TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+        profileHandlerOptions,
+    );
+    const machineRunHandler = async (request: unknown) => {
+        const input = request && typeof request === 'object' && !Array.isArray(request) ? request as Record<string, unknown> : {};
+        if (input.action === 'capabilities' || (input.action === 'start' && 'profileId' in input)) return profileMachineRunHandler(request);
+        if (input.action === 'status' || input.action === 'cancel') {
+            try {
+                return await profileMachineRunHandler(request);
+            } catch (error) {
+                // Operation ids are shared by the two request shapes for
+                // compatibility. If the profile store does not own it, let
+                // the legacy handler answer for an older raw caller.
+                if (!(error instanceof Error) || !error.message.startsWith('MACHINE_RUN_NOT_FOUND:')) throw error;
+                if (!machineRunOptions?.allowLegacyRaw) throw new Error('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
+                return rawMachineRunHandler(request);
+            }
+        }
+        if (!machineRunOptions?.allowLegacyRaw) throw new Error('MACHINE_RUN_LEGACY_RAW_UNAVAILABLE');
+        return rawMachineRunHandler(request);
+    };
+    rpcHandlerManager.registerHandler('machine-run', machineRunHandler);
+    rpcHandlerManager.registerHandler('machine.run', profileMachineRunHandler);
+    const managedTools = machineRunOptions?.managedTools;
+    if (managedTools) {
+        rpcHandlerManager.registerHandler('machine.tool', async (request: unknown) => {
+            const input = request && typeof request === 'object' && !Array.isArray(request) ? request as Record<string, unknown> : null;
+            if (!input || Object.keys(input).sort().join(',') !== 'action,toolId,version' || input.version !== 1
+                || (input.action !== 'status' && input.action !== 'install') || typeof input.toolId !== 'string') {
+                throw new Error('MANAGED_TOOL_INVALID: expected { version: 1, action: status|install, toolId }');
+            }
+            const tool = managedTools.tools.find((candidate) => candidate.id === input.toolId);
+            if (!tool) throw new Error(`MANAGED_TOOL_NOT_FOUND: ${input.toolId}`);
+            const platform = managedTools.platform !== undefined ? managedTools.platform : managedMachineToolPlatform();
+            if (input.action === 'install') {
+                if (!machineRunOptions?.allowToolInstall) throw new Error('MANAGED_TOOL_INSTALL_UNAVAILABLE');
+                return { version: 1, action: 'install', tool: await installManagedMachineTool(tool, { root: managedTools.root, platform }) };
+            }
+            return { version: 1, action: 'status', tool: await managedMachineToolStatus(tool, managedTools.root, platform) };
+        });
+    }
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {

@@ -37,7 +37,7 @@ export type SendModelOptionsResult = {
 
 export const USER_REQUEST_MODELS: Record<RoutableAgent, Record<Difficulty, RouteDecision>> = {
   claude: {
-    trivial: { model: 'claude-haiku-4-5', effort: 'low' },
+    trivial: { model: 'claude-haiku-5-5', effort: 'low' },
     routine: { model: 'claude-sonnet-5-5', effort: 'medium' },
     hard: { model: 'claude-opus-5-5', effort: 'high' },
     escalated: { model: 'claude-fable-5-1', effort: 'medium' },
@@ -84,6 +84,8 @@ export const KNOWN_ROUTE_TIERS: ReadonlyArray<{
   effort: string
   tier: Difficulty
 }> = [
+  // Haiku 5.5 is current; retain 4.5 below for stored routes during rollout.
+  { agent: 'claude', model: 'claude-haiku-5-5', effort: 'low', tier: 'trivial' },
   // --- claude, generation shipped by this CLI ---
   { agent: 'claude', model: 'claude-haiku-4-5', effort: 'low', tier: 'trivial' },
   { agent: 'claude', model: 'claude-sonnet-5', effort: 'high', tier: 'routine' },

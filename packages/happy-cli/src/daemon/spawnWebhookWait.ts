@@ -1,6 +1,13 @@
 import type { SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import type { TrackedSession } from './types';
 
+type SpawnedChild = {
+  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  once(event: 'error', listener: (error: Error) => void): unknown;
+  removeListener?(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  removeListener?(event: 'error', listener: (error: Error) => void): unknown;
+};
+
 export const DEFAULT_SESSION_START_SOFT_TIMEOUT_MS = 15_000;
 export const DEFAULT_SESSION_START_TIMEOUT_MS = 60_000;
 
@@ -30,6 +37,8 @@ export function waitForSessionWebhook({
   logger,
   timeouts = readSessionStartTimeoutConfig(),
   signal,
+  child,
+  startupErrorDetail,
 }: {
   pid: number;
   pidToAwaiter: Map<number, (session: TrackedSession) => void>;
@@ -37,6 +46,8 @@ export function waitForSessionWebhook({
   logger: { debug: (message: string, ...args: unknown[]) => void };
   timeouts?: { softTimeoutMs: number; finalTimeoutMs: number };
   signal?: AbortSignal;
+  child?: SpawnedChild;
+  startupErrorDetail?: () => string | undefined;
 }): Promise<SpawnSessionResult> {
   const suffix = label ? ` ${label}` : '';
   logger.debug(`[DAEMON RUN] Waiting for session webhook for PID ${pid}${suffix}`);
@@ -46,10 +57,22 @@ export function waitForSessionWebhook({
     let settled = false;
 
     let completed: (session: TrackedSession) => void;
+    const onChildExit = (code: number | null, signalName: NodeJS.Signals | null) => {
+      const detail = startupErrorDetail?.()?.trim();
+      const suffixDetail = detail ? `: ${detail.slice(-4_000)}` : '';
+      finish({ type: 'error', errorMessage: `Session process exited before webhook for PID ${pid}${suffix} (code=${code ?? 'null'}, signal=${signalName ?? 'none'})${suffixDetail}` });
+    };
+    const onChildError = (error: Error) => {
+      const detail = [error.message, startupErrorDetail?.()].filter(Boolean).join('\n').trim();
+      const suffixDetail = detail ? `: ${detail.slice(-4_000)}` : '';
+      finish({ type: 'error', errorMessage: `Session process failed before webhook for PID ${pid}${suffix}${suffixDetail}` });
+    };
     const finish = (result: SpawnSessionResult) => {
       if (settled) return;
       settled = true; clearTimeout(softTimeout); clearTimeout(finalTimeout);
       signal?.removeEventListener('abort', abort);
+      child?.removeListener?.('exit', onChildExit);
+      child?.removeListener?.('error', onChildError);
       if (pidToAwaiter.get(pid) === completed) pidToAwaiter.delete(pid);
       resolve(result);
     };
@@ -69,6 +92,8 @@ export function waitForSessionWebhook({
       finish({ type: 'success', sessionId: completedSession.happySessionId! });
     };
     pidToAwaiter.set(pid, completed);
+    child?.once('exit', onChildExit);
+    child?.once('error', onChildError);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
   });

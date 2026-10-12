@@ -12,7 +12,7 @@ export const DEFAULT_BATCH_WAIT_MS = 110_000
 const DEFAULT_STEP_TIMEOUT_MS = 30_000
 
 export const BROWSER_TASK_TOOL_NAMES = [
-    'browser_task_create_space', 'browser_task_create', 'browser_task_open_page', 'browser_task_observe',
+    'browser_task_create_space', 'browser_task_list_spaces', 'browser_task_join_space', 'browser_task_create', 'browser_task_open_page', 'browser_task_observe',
     'browser_task_screenshot', 'browser_task_submit_batch', 'browser_task_get', 'browser_task_finish',
     'browser_task_resume', 'browser_task_cancel', 'browser_task_close_page', 'browser_task_close_space',
 ] as const
@@ -119,6 +119,15 @@ export function registerBrowserTaskTools(mcp: McpServer, client: RuntimeClient, 
         description: 'Create an isolated task space (tab group) in the granted browser profile. profileId defaults to the session’s granted profile.' + sessionNote,
         inputSchema: { profileId: z.string().min(1).optional(), requestId: reqId },
     }, async (a) => { const r = id(a.requestId); return run(r, async () => client.createSpace({ profileId: ((brokerDecides ? undefined : a.profileId) ?? await grantedProfile()) as never, requestId: r as never })) })
+
+    mcp.registerTool('browser_task_list_spaces', {
+        title: 'List browser task spaces', description: 'List spaces created by this principal, including spaces another session explicitly joined. Other conversations’ spaces are joined only when the user requests it.' + sessionNote,
+        inputSchema: {},
+    }, async () => run(undefined, async () => client.listSpaces({ profileId: await grantedProfile() as never })))
+    mcp.registerTool('browser_task_join_space', {
+        title: 'Join browser task space', description: 'Explicitly join another conversation’s browser space. Only the same principal may join, and other conversations’ spaces are joined only when the user requests it.' + sessionNote,
+        inputSchema: { taskSpaceId: z.string().min(1), requestId: reqId },
+    }, async (a) => { const r = id(a.requestId); return run(r, () => client.joinSpace({ taskSpaceId: a.taskSpaceId as never, requestId: r as never })) })
 
     mcp.registerTool('browser_task_create', {
         title: 'Create browser task',

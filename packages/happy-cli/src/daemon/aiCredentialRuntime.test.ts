@@ -10,10 +10,23 @@ import {
   createAiCredentialRuntime,
   runAiCredentialCommand,
   selectLeastRemainingCodexAccounts,
+  syncDirectoryForDurability,
   withUvToolBinOnPath,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
+
+describe('syncDirectoryForDurability', () => {
+  it('skips directory fsync on Windows, where it fails with EPERM and would refuse every setup-token spawn', async () => {
+    // A missing path proves nothing is opened: opening it would reject with ENOENT.
+    await expect(syncDirectoryForDurability(join(tmpdir(), 'happy-missing-dir-fsync-probe'), 'win32')).resolves.toBeUndefined()
+  })
+  it('syncs a real directory on the current platform', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'happy-dir-fsync-'))
+    try { await expect(syncDirectoryForDurability(directory)).resolves.toBeUndefined() }
+    finally { await removeTestDirectory(directory, { recursive: true, force: true }) }
+  })
+})
 
 const configuredClaudeList = JSON.stringify({
   schemaVersion: 1,
@@ -3562,4 +3575,25 @@ it.skipIf(process.platform !== 'win32')('terminates a timed-out npm shim child o
     if (pid) { try { process.kill(pid, 'SIGKILL') } catch {} }
     await removeTestDirectory(directory, { recursive: true, force: true })
   }
+})
+
+describe('AI credential group sync failure codes', () => {
+  const journalPath = join('/home/operator', '.happy', 'ai-credential-groups.json')
+  const request = { version: 1 as const, scope: 'company-1', userId: 'user-1', provider: 'codex' as const, generation: 1, fingerprint: 'f'.repeat(64), payload: null }
+
+  it('keeps the group journal code instead of collapsing it into the catch-all sync failure', async () => {
+    // Windows field report 2026-10-11: every specific group failure reached Desktop as AI_GROUP_SYNC_FAILED.
+    const { runtime, files } = setup()
+    files.set(journalPath, '{"version":1,"entries":"not-a-list"}')
+    await expect(runtime.groupSync(request)).rejects.toMatchObject({ kind: 'AI_GROUP_JOURNAL_INVALID' })
+  })
+
+  it('still reports an unexpected failure as the catch-all, with only its type and errno for diagnosis', async () => {
+    const { runtime } = setup({
+      readFile: vi.fn(async () => { throw Object.assign(new Error('EACCES: permission denied, open C:\\Users\\secret-name\\.happy\\ai-credential-groups.json'), { code: 'EACCES' }) }),
+    })
+    const failure = await runtime.groupSync(request).catch((error: unknown) => error) as { kind?: string; failureCause?: string; message?: string }
+    expect(failure).toMatchObject({ kind: 'AI_GROUP_SYNC_FAILED', failureCause: 'Error:EACCES' })
+    expect(JSON.stringify(failure) + failure.message).not.toContain('secret-name')
+  })
 })

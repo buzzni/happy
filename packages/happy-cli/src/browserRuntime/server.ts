@@ -30,6 +30,8 @@ const version = z.number().int().nonnegative()
 
 export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
     createSpace: z.object({ profileId: id, requestId: id }).strict(),
+    listSpaces: z.object({ profileId: id }).strict(),
+    joinSpace: z.object({ taskSpaceId: id, requestId: id }).strict(),
     createTask: z.object({ taskSpaceId: id, requestId: id }).strict(),
     openPage: z.object({ taskId: id, url: z.string().min(1), requestId: id }).strict(),
     closePage: z.object({ taskSpaceId: id, tabId: id, requestId: id }).strict(),

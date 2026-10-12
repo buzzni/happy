@@ -33,6 +33,7 @@ import { installManagedDaemonSocketGuard } from "@/app/api/socket/managedDaemonS
 import { setManagedControlRuntime } from "@/app/api/socket/managedDaemonOutboundGuard";
 import { installManagedDaemonRpcExecutor } from "@/app/api/socket/managedDaemonRpcRelay";
 import type { ManagedDaemonClaims } from "@/app/auth/managedDaemonToken";
+import { socketCorsOrigin } from "./cors";
 
 export function startSocket(app: Fastify, managedControl: ManagedControlRuntime | null = null) {
     // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
@@ -43,10 +44,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     // specific requests never matched its path. See previewEngineIoGuard.ts.
     const io = new Server(wrapServerForPreviewSubdomainBypass(app.server), {
         cors: {
-            origin: "*",
+            origin: socketCorsOrigin,
             methods: ["GET", "POST", "OPTIONS"],
             credentials: true,
-            allowedHeaders: ["*"]
         },
         transports: ['websocket', 'polling'],
         pingTimeout: 45000,

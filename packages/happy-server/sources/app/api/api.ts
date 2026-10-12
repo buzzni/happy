@@ -4,6 +4,7 @@ import { serializerCompiler, validatorCompiler, ZodTypeProvider } from "fastify-
 import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
 import { authRoutes } from "./routes/authRoutes";
+import { readSessionIdleReaperMode, sessionIdleReaperRoutes } from "./routes/sessionIdleReaperRoutes";
 import { pushRoutes } from "./routes/pushRoutes";
 import { sessionRoutes } from "./routes/sessionRoutes";
 import { connectRoutes } from "./routes/connectRoutes";
@@ -53,6 +54,7 @@ import { isLocalStorage, getLocalFilesDir, getManagedFilesDir } from "@/storage/
 import * as path from "path";
 import * as fs from "fs";
 import { startUsageOutboxWorker } from "@/app/usage/usageOutbox";
+import { fastifyCorsDelegate } from "./cors";
 
 export interface StartApiOptions {
     port?: number;
@@ -101,11 +103,7 @@ export async function startApi(opts: StartApiOptions = {}) {
             return `/v1/preview/${parsed.machineId}/${parsed.port}/${trimmed}${search}`;
         },
     });
-    app.register(import('@fastify/cors'), {
-        origin: '*',
-        allowedHeaders: '*',
-        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
-    });
+    app.register(import('@fastify/cors'), () => fastifyCorsDelegate);
 
     // Required for local-mode attachment uploads (PUT /v1/sessions/:id/attachments/:file).
     // Fastify v5 rejects unknown media types with 415 before reaching the handler.
@@ -173,6 +171,9 @@ export async function startApi(opts: StartApiOptions = {}) {
     managedApprovalRoutes(typed);
     managedFollowUpRoutes(typed);
     authRoutes(typed);
+    // Self-host / Desktop-embedded only: the cloud serves this path from web-ui.
+    const idleReaperMode = readSessionIdleReaperMode(process.env);
+    if (idleReaperMode) sessionIdleReaperRoutes(typed, { mode: idleReaperMode });
     pushRoutes(typed);
     sessionRoutes(typed);
     accountRoutes(typed);

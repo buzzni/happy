@@ -546,6 +546,48 @@ describe('claudeRemote', () => {
         await expect(running).resolves.toBe('turn-complete');
     });
 
+    const sessionState = (state: 'idle' | 'running') => ({ type: 'system', subtype: 'session_state_changed', state });
+
+    it('keeps an automation run alive for a report that lands during the turn before its own', async () => {
+        // The last agent reports while an earlier report's turn is still answering:
+        // the level empties before that turn's result, yet the provider still owes
+        // the report a turn of its own (observed with a real CLI, 2026-10-10).
+        const lastAnswer = { type: 'result', subtype: 'success', result: 'got beta' };
+        const { running, onReady, onMessage } = runOnceWithProviderMessages([
+            sessionState('running'),
+            backgroundTasks([{ task_type: 'local_agent' }, { task_type: 'local_agent' }]),
+            { type: 'result', subtype: 'success', result: 'launched' },
+            { type: 'system', subtype: 'task_notification', task_id: 'task-0', status: 'completed', output_file: '', summary: 'done' },
+            { type: 'system', subtype: 'task_notification', task_id: 'task-1', status: 'completed', output_file: '', summary: 'done' },
+            backgroundTasks([]),
+            { type: 'result', subtype: 'success', result: 'got alpha' },
+            lastAnswer,
+            sessionState('idle'),
+        ], { staysOpen: true, backgroundWaitBudgetMs: 60_000 });
+
+        await expect(running).resolves.toBe('turn-complete');
+        expect(onMessage).toHaveBeenCalledWith(lastAnswer);
+        expect(onReady).toHaveBeenCalledOnce();
+        expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ subtype: 'session_state_changed' }));
+    });
+
+    it('ends an automation run when the provider goes idle with no background work', async () => {
+        const { running, onReady } = runOnceWithProviderMessages([
+            sessionState('running'),
+            { type: 'result', subtype: 'success', result: 'answered' },
+            sessionState('idle'),
+        ], { staysOpen: true, backgroundWaitBudgetMs: 60_000 });
+
+        await expect(running).resolves.toBe('turn-complete');
+        expect(onReady).toHaveBeenCalledOnce();
+    });
+
+    it('asks the provider for its turn-over state for an automation run', async () => {
+        const { running } = runOnceWithProviderMessages([{ type: 'result', subtype: 'success', result: 'answered' }]);
+        await running;
+        expect(vi.mocked(query).mock.calls.at(-1)![0].options?.emitSessionStateEvents).toBe(true);
+    });
+
     it.each([false, true])('routes stream_event partials even when diagnostics throw: %s', async (diagnosticThrows) => {
         const streamEvent = {
             type: 'stream_event',

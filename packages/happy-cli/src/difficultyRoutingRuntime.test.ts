@@ -120,7 +120,7 @@ describe('difficulty routing runtime', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(asDecision(decision).route).toMatchObject({
-      model: 'claude-haiku-4-5',
+      model: 'claude-haiku-5-5',
       effort: 'low',
       source: 'p1',
       difficulty: 'trivial',
@@ -673,12 +673,12 @@ describe('difficulty routing diagnostics', () => {
 
     const decision = await resolveDifficultyRouting(baseInput)
 
-    expect(asDecision(decision).route.model).toBe('claude-haiku-4-5')
+    expect(asDecision(decision).route.model).toBe('claude-haiku-5-5')
     const applied = lines.filter((line) => line.message.includes('[difficultyRouting]'))
     expect(applied.length, '결정이 로그에 남아야 한다').toBeGreaterThan(0)
     const dump = JSON.stringify(applied)
     expect(dump).toContain('p1-local')
-    expect(dump).toContain('claude-haiku-4-5')
+    expect(dump).toContain('claude-haiku-5-5')
   })
 
   it('never writes the prompt or the turn authorization into the log', async () => {

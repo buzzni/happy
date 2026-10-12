@@ -646,6 +646,19 @@ export function closeClaudeTurnWithStatus(
     };
 }
 
+/**
+ * Fails the turn of a launch that died, opening one first if the launch produced nothing — the
+ * ordinary close does nothing then, and clients would wait on "responding" forever (Desktop
+ * specs/headless-standalone-server R21). Only the launch-failure path uses this; an empty
+ * completion still closes nothing.
+ */
+export function failClaudeLaunchTurn(state: ClaudeSessionProtocolState): ClaudeMapperResult {
+    const envelopes: SessionEnvelope[] = [];
+    ensureTurn(state, envelopes);
+    closeTurn(state, 'failed', envelopes);
+    return { currentTurnId: state.currentTurnId, envelopes };
+}
+
 export function mapClaudeLogMessageToSessionEnvelopes(
     message: RawJSONLines,
     state: ClaudeSessionProtocolState,

@@ -214,6 +214,14 @@ describe('query adapter', () => {
         }));
     });
 
+    it('asks the CLI for its turn-over state only when the caller needs it', () => {
+        query({ prompt: 'continue', options: { emitSessionStateEvents: true } });
+        expect((lastOptions().env as Record<string, string>).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe('1');
+
+        query({ prompt: 'continue', options: {} });
+        expect((lastOptions().env as Record<string, string>).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBeUndefined();
+    });
+
     it('enables partial assistant message streaming so the app can render tokens before a block completes', () => {
         query({ prompt: 'continue', options: {} });
 

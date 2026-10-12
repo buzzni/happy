@@ -21,6 +21,7 @@ let serverUrl = '';
 vi.mock('@/configuration', () => ({
     configuration: {
         get serverUrl() { return serverUrl; },
+        happyHomeDir: '/tmp/happy-test-home',
     },
 }));
 

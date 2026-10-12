@@ -1,0 +1,337 @@
+import * as z from 'zod';
+
+/**
+ * aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 worktree (worktree-strict-design.md) —
+ * git worktrees on a strict machine. The server sends no command there, so the daemon runs each
+ * worktree operation itself (`worktree:*` customer-lane methods), the browser asks for it with a
+ * ticket the server issued, and the server records the result only after checking the daemon's
+ * attestation (an HMAC with a key derived from the server-lane key).
+ *
+ * This module holds what both sides must agree on: worktree names and managed paths (moved from the
+ * web server's `worktreeCommands.ts`, unchanged), the ticket, and the attested payload. Pure and
+ * browser-safe; the HMAC itself is computed with each side's own crypto.
+ */
+
+export const WORKTREE_OPS_VERSION = 1;
+export const WORKTREE_RESULT_ATTESTATION_KEY_LABEL = 'happy worktree result attestation v1';
+/** Seals a git credential for one machine, as `sealedSpawnEnv` seals an env, under its own label. */
+export const GIT_CREDENTIAL_SEAL_KEY_LABEL = 'happy git credential seal v1';
+export const WORKTREE_DIR_SEGMENT = '.aplus/worktrees';
+/** A ticket covers one browser → daemon → server round trip, not a session. */
+export const WORKTREE_TICKET_MAX_TTL_MS = 10 * 60_000;
+const PROJECT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+export const worktreeOpsCapabilitySchema = z.object({ version: z.literal(WORKTREE_OPS_VERSION) });
+export type WorktreeOpsCapability = z.infer<typeof worktreeOpsCapabilitySchema>;
+export const WORKTREE_OPS_CAPABILITY: WorktreeOpsCapability = { version: WORKTREE_OPS_VERSION };
+
+// ── Names and managed paths (the server's rules, moved here unchanged) ──────────────────────────
+
+const WORKTREE_NAME_ADJECTIVES = [
+  'bright', 'calm', 'eager', 'brave', 'swift', 'quiet', 'clever', 'lucky',
+  'gentle', 'bold', 'fresh', 'keen', 'merry', 'noble', 'proud', 'witty',
+];
+const WORKTREE_NAME_ANIMALS = [
+  'fox', 'otter', 'hawk', 'lynx', 'wolf', 'crane', 'koala', 'panda',
+  'tiger', 'whale', 'finch', 'gecko', 'moose', 'raven', 'seal', 'newt',
+];
+
+export function sanitizeWorktreeName(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9/_-]+/g, '-')
+    .replace(/\/{2,}/g, '/')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[-/]+|[-/]+$/g, '')
+    .replace(/\.+/g, '.')
+    .slice(0, 60)
+    // The cut can leave a separator at the end, which the name check would then refuse.
+    .replace(/[-/]+$/, '');
+}
+
+export function generateWorktreeName(random: () => number = Math.random): string {
+  const pick = <T,>(items: T[]): T => items[Math.floor(random() * items.length) % items.length]!;
+  const suffix = Math.floor(random() * 36 ** 4).toString(36).padStart(4, '0').slice(-4);
+  return `${pick(WORKTREE_NAME_ADJECTIVES)}-${pick(WORKTREE_NAME_ANIMALS)}-${suffix}`;
+}
+
+export function resolveWorktreeName(input: { requested?: string | null; random?: () => number }): string {
+  const sanitized = input.requested ? sanitizeWorktreeName(input.requested) : '';
+  return sanitized || generateWorktreeName(input.random);
+}
+
+/** A remote workspace path is read independently of the reader's OS. */
+export function isWindowsWorktreePath(value: string): boolean {
+  if (value.includes('\0')) return false;
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  const unc = /^(?:\\\\|\/\/)([^\\/]+)[\\/]([^\\/]+)(?:[\\/]|$)/.exec(value);
+  return Boolean(unc && [unc[1], unc[2]].every((part) => part !== '.' && part !== '..' && !/[?:]/.test(part!)));
+}
+
+/** Windows paths with `/` (git writes `C:/…`, the store keeps `C:\…`); POSIX paths unchanged. */
+function slashSeparated(path: string): string {
+  return isWindowsWorktreePath(path) ? path.replace(/\\/g, '/') : path;
+}
+
+/** The same worktree; Windows paths ignore separators and case. */
+export function isSameWorktreePath(a: string, b: string): boolean {
+  if (isWindowsWorktreePath(a) && isWindowsWorktreePath(b)) {
+    return slashSeparated(a).toLowerCase() === slashSeparated(b).toLowerCase();
+  }
+  return a === b;
+}
+
+export function worktreePathBaseName(path: string): string {
+  return slashSeparated(path).split('/').filter(Boolean).at(-1) ?? '';
+}
+
+export function isManagedWorktreePath(path: string): boolean {
+  return slashSeparated(path).includes(`/${WORKTREE_DIR_SEGMENT}/`);
+}
+
+/** The repository root of a managed worktree path (flat legacy or project namespace), else null. */
+export function resolveWorktreeRepoRoot(path: string): string | null {
+  const index = slashSeparated(path).lastIndexOf(`/${WORKTREE_DIR_SEGMENT}/`);
+  return index > 0 ? path.slice(0, index) : null;
+}
+
+/** `<repoRoot>/.aplus/worktrees/<projectId>/<name>`, with the repo root's own separator style. */
+export function managedWorktreePath(repoRoot: string, projectId: string, name: string): string {
+  const windows = isWindowsWorktreePath(repoRoot);
+  const root = windows ? slashSeparated(repoRoot).replace(/\/+$/, '') : repoRoot.replace(/\/+$/, '');
+  return `${root}/${WORKTREE_DIR_SEGMENT}/${projectId}/${name}`;
+}
+
+/** Exactly a worktree of this project under this repo: a sanitized name, no traversal. */
+export function isProjectWorktreePath(path: string, repoRoot: string, projectId: string): boolean {
+  if (!PROJECT_ID.test(projectId)) return false;
+  const prefix = managedWorktreePath(repoRoot, projectId, '');
+  const normalized = isWindowsWorktreePath(path) ? slashSeparated(path) : path;
+  const sameCase = isWindowsWorktreePath(path) ? normalized.toLowerCase().startsWith(prefix.toLowerCase()) : normalized.startsWith(prefix);
+  if (!sameCase) return false;
+  const name = normalized.slice(prefix.length);
+  return name !== '' && sanitizeWorktreeName(name) === name && name.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+// ── Operation ticket ───────────────────────────────────────────────────────────────────────────
+
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+const opIdSchema = z.string().regex(/^[A-Za-z0-9+/]{22}==$/);
+const absolutePath = z.string().min(1).max(4096).refine(
+  (value) => (value.startsWith('/') || isWindowsWorktreePath(value))
+    && !CONTROL_CHARACTER.test(value)
+    && slashSeparated(value).split('/').every((part) => part !== '.' && part !== '..'),
+  'absolute path',
+);
+const worktreeNameSchema = z.string().min(1).max(60).refine((value) => sanitizeWorktreeName(value) === value, 'worktree name');
+// A ref the daemon passes to git as an argument: never read as an option, never empty.
+// The daemon still runs `git check-ref-format` on it.
+const refSchema = z.string().min(1).max(255).refine((value) => !value.startsWith('-') && !/\s/.test(value) && !CONTROL_CHARACTER.test(value), 'git ref');
+// The repository's own address: plain http(s), no credentials in it (those come sealed), nothing
+// git would read as another transport (`file://`, `ext::`).
+const remoteUrlSchema = z.string().max(2048).refine(
+  (value) => /^https?:\/\/[^\s/@]+\/\S+$/.test(value) && !CONTROL_CHARACTER.test(value),
+  'remote url',
+);
+const commitSchema = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/);
+// Pathspecs the server decides (its dirty-check exclusions), passed after `--`.
+const pathspecSchema = z.string().min(1).max(512).refine((value) => !CONTROL_CHARACTER.test(value), 'pathspec');
+
+export const worktreeOpParamsSchemas = {
+  capability: z.object({ workspaceDir: absolutePath }).strict(),
+  prepare: z.object({ workspaceDir: absolutePath }).strict(),
+  status: z.object({ worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema.nullable() }).strict(),
+  create: z.object({
+    workspaceDir: absolutePath,
+    name: worktreeNameSchema,
+    baseRef: refSchema.nullable(),
+    baseSource: z.enum(['local', 'origin']),
+    // The current work is saved and used as the base only when no base was chosen.
+    snapshotCurrent: z.boolean(),
+    copyOwnerRuntimeFiles: z.boolean(),
+    expectedRepoRoot: absolutePath.nullable(),
+    /** Fetch an origin base from this address (with a sealed credential) instead of the `origin` remote. */
+    remoteUrl: remoteUrlSchema.nullable().default(null),
+  }).strict()
+    .refine((params) => !params.snapshotCurrent || (params.baseRef === null && params.baseSource === 'local'), 'snapshot with a chosen base')
+    .refine((params) => params.baseSource !== 'origin' || params.baseRef !== null, 'origin base without a branch')
+    .refine((params) => params.remoteUrl === null || params.baseSource === 'origin', 'remote url without an origin base'),
+  // `dryRun` answers whether a removal would go through, so the preview is stopped only then.
+  remove: z.object({ worktreePath: absolutePath, branch: refSchema.nullable(), force: z.boolean(), dryRun: z.boolean() }).strict(),
+  /** Merges the worktree into the default version, whose branch must still be `baseBranch`. */
+  apply: z.object({ worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema.nullable() }).strict(),
+  /** Merges the base branch into the worktree; `conflictChoice` settles every conflict one way. */
+  update: z.object({
+    worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema, conflictChoice: z.enum(['current', 'base']).nullable(),
+  }).strict(),
+  recover: z.object({ worktreePath: absolutePath, branch: refSchema }).strict(),
+  'adopt-check': z.object({ workspaceDir: absolutePath, worktreePath: absolutePath, expectedRepoRoot: absolutePath.nullable() }).strict(),
+  /** Pushes the worktree branch; `remoteUrl` becomes `origin` first, as the server sets it today. */
+  publish: z.object({ worktreePath: absolutePath, branch: refSchema, remoteUrl: remoteUrlSchema.nullable() }).strict(),
+  /** After a review merged online: the worktree is still at `expectedHead`, so the online base is merged locally. */
+  reconcile: z.object({ worktreePath: absolutePath, branch: refSchema, baseBranch: refSchema, expectedHead: commitSchema }).strict(),
+  /** A new branch in the default version. */
+  'create-branch': z.object({ workspaceDir: absolutePath, branchName: refSchema }).strict(),
+  /** The default version on `baseBranch` for a new conversation, from origin or a local branch. */
+  'prepare-conversation': z.object({
+    workspaceDir: absolutePath,
+    baseBranch: refSchema,
+    source: z.enum(['origin', 'local']),
+    allowCurrentBranchDirty: z.boolean(),
+    remoteUrl: remoteUrlSchema.nullable(),
+    statusPathspecs: z.array(pathspecSchema).min(1).max(100),
+  }).strict(),
+} as const;
+
+export type WorktreeOp = keyof typeof worktreeOpParamsSchemas;
+export const WORKTREE_OPS = Object.keys(worktreeOpParamsSchemas) as WorktreeOp[];
+export type WorktreeOpParams<Op extends WorktreeOp> = z.infer<(typeof worktreeOpParamsSchemas)[Op]>;
+
+const ticketBase = z.object({
+  v: z.literal(WORKTREE_OPS_VERSION),
+  opId: opIdSchema,
+  op: z.enum(WORKTREE_OPS as [WorktreeOp, ...WorktreeOp[]]),
+  projectId: z.string().regex(PROJECT_ID),
+  machineId: z.string().min(1).max(256),
+  issuedAt: z.number().int().nonnegative(),
+  expiresAt: z.number().int().nonnegative(),
+  params: z.unknown(),
+}).strict()
+  .refine((ticket) => ticket.expiresAt > ticket.issuedAt, 'ticket expires before it was issued')
+  .refine((ticket) => ticket.expiresAt - ticket.issuedAt <= WORKTREE_TICKET_MAX_TTL_MS, 'ticket lives too long');
+
+/** A ticket narrowed by `op`: its params are that operation's params. */
+export type WorktreeTicket = {
+  [Op in WorktreeOp]: Omit<z.infer<typeof ticketBase>, 'op' | 'params'> & { op: Op; params: WorktreeOpParams<Op> };
+}[WorktreeOp];
+
+/** A ticket the server issued, with params of its operation. The server alone checks its signature. */
+export function readWorktreeTicket(value: unknown): { ok: true; ticket: WorktreeTicket } | { ok: false; error: string } {
+  const base = ticketBase.safeParse(value);
+  if (!base.success) return { ok: false, error: 'malformed ticket' };
+  const params = worktreeOpParamsSchemas[base.data.op].safeParse(base.data.params);
+  if (!params.success) return { ok: false, error: `malformed ${base.data.op} params` };
+  return { ok: true, ticket: { ...base.data, params: params.data } as WorktreeTicket };
+}
+
+export function worktreeOpMethod<Op extends WorktreeOp>(op: Op): `worktree:${Op}` {
+  return `worktree:${op}`;
+}
+
+// ── Operation results ──────────────────────────────────────────────────────────────────────────
+
+const capabilityResult = z.object({
+  capable: z.boolean(),
+  reason: z.enum(['ready', 'not-git', 'unavailable']),
+  branch: z.string().nullable(),
+  branches: z.array(z.string()),
+}).strict();
+
+/** What the daemon answers, and attests, for each operation. */
+export const worktreeOpResultSchemas = {
+  capability: capabilityResult,
+  prepare: capabilityResult,
+  status: z.object({ dirty: z.boolean(), behind: z.number().int().nonnegative(), ahead: z.number().int().nonnegative() }).strict(),
+  create: z.object({
+    path: absolutePath,
+    branch: z.string().min(1),
+    baseBranch: z.string().min(1),
+    baseRevision: z.string().nullable(),
+    /** The workspace directory relative to the repository root, '/'-separated; '' at the root. */
+    repoRelativeDir: z.string(),
+    repoRoot: absolutePath,
+  }).strict(),
+  // removed: git removed it; missing: it was already gone; removable: a dry run that would remove it.
+  remove: z.object({ outcome: z.enum(['removed', 'missing', 'removable']) }).strict(),
+  apply: z.object({ appliedToBranch: z.string().nullable() }).strict(),
+  update: z.object({ head: commitSchema }).strict(),
+  /** recovered: added back; false: it was already there on its branch. */
+  recover: z.object({ recovered: z.boolean() }).strict(),
+  'adopt-check': z.object({ path: absolutePath, branch: z.string().nullable(), repoRoot: absolutePath }).strict(),
+  publish: z.object({ commit: commitSchema }).strict(),
+  reconcile: z.object({ appliedToBranch: z.string().min(1) }).strict(),
+  'create-branch': z.object({ branch: z.string().min(1) }).strict(),
+  'prepare-conversation': z.object({ branch: z.string().min(1) }).strict(),
+} as const satisfies Record<WorktreeOp, z.ZodType>;
+
+export type WorktreeOpResult<Op extends WorktreeOp> = z.infer<(typeof worktreeOpResultSchemas)[Op]>;
+
+// ── Sealed git credential ──────────────────────────────────────────────────────────────────────
+
+const sealedGitCredentialSchema = z.object({
+  v: z.literal(1),
+  purpose: z.literal('git-credential'),
+  machineId: z.string().min(1).max(256),
+  /** The ticket it was sealed for: used once, with that operation only. */
+  opId: opIdSchema,
+  username: z.string().min(1).max(256).refine((value) => !CONTROL_CHARACTER.test(value)),
+  token: z.string().min(1).max(4096).refine((value) => !CONTROL_CHARACTER.test(value)),
+}).strict();
+
+export type SealedGitCredentialPayload = z.infer<typeof sealedGitCredentialSchema>;
+
+/** An opened credential, if it was sealed for this machine and this ticket. */
+export function readSealedGitCredential(
+  value: unknown,
+  expected: { machineId: string; opId: string },
+): { ok: true; username: string; token: string } | { ok: false } {
+  const parsed = sealedGitCredentialSchema.safeParse(value);
+  if (!parsed.success || parsed.data.machineId !== expected.machineId || parsed.data.opId !== expected.opId) return { ok: false };
+  return { ok: true, username: parsed.data.username, token: parsed.data.token };
+}
+
+// ── Attested result ────────────────────────────────────────────────────────────────────────────
+
+export interface WorktreeAttestationPayload {
+  v: typeof WORKTREE_OPS_VERSION;
+  purpose: 'worktree-result';
+  opId: string;
+  op: WorktreeOp;
+  machineId: string;
+  projectId: string;
+  params: WorktreeTicket['params'];
+  result: Record<string, unknown>;
+  finishedAt: number;
+}
+
+/** What the daemon attests: the ticket's operation and params, with the result it produced. */
+export function worktreeAttestationPayload(
+  ticket: WorktreeTicket,
+  result: Record<string, unknown>,
+  finishedAt: number,
+): WorktreeAttestationPayload {
+  return {
+    v: WORKTREE_OPS_VERSION,
+    purpose: 'worktree-result',
+    opId: ticket.opId,
+    op: ticket.op,
+    machineId: ticket.machineId,
+    projectId: ticket.projectId,
+    params: ticket.params,
+    result,
+    finishedAt,
+  };
+}
+
+/**
+ * JSON with sorted object keys, so both sides HMAC the same bytes. Throws on a value JSON would
+ * change or drop (undefined outside an object, non-finite numbers, bigint, class instances), so a
+ * signer never signs something the verifier reads back differently.
+ */
+export function canonicalWorktreeJson(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('canonicalWorktreeJson: non-finite number');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalWorktreeJson(item)).join(',')}]`;
+  const prototype = typeof value === 'object' ? Object.getPrototypeOf(value) : undefined;
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`canonicalWorktreeJson: not a JSON value (${typeof value})`);
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalWorktreeJson(item)}`).join(',')}}`;
+}

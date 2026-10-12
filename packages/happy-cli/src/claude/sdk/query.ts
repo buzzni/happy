@@ -81,6 +81,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         if (typeof value === 'string') env[key] = value
     }
     env.CLAUDE_CODE_ENTRYPOINT = resolveHappyEntrypoint(process.env.CLAUDE_CODE_ENTRYPOINT)
+    if (opts?.emitSessionStateEvents) env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = '1'
     if (opts?.mcpServers && Object.keys(opts.mcpServers).length > 0) {
         ensureLocalProxyBypass(env)
     }

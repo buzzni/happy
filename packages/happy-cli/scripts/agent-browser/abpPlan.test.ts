@@ -139,6 +139,17 @@ describe('install options', () => {
         const secretish = '-----BEGIN PUBLIC KEY-----\nnot-a-key-SENTINEL\n-----END PUBLIC KEY-----\n'
         expect(() => mergeInstallOptions(base(), { issuers: [{ kid: 'k', publicKeyPem: secretish }] })).toThrow(/^(?![\s\S]*SENTINEL)/)
     })
+
+    it('accepts browser-only mode with the existing daemon user', () => {
+        const options = mergeInstallOptions(undefined, {
+            hostMode: 'browser-only', daemonUser: 'walter', machineId: 'machine-1', workspaceId: 'ws-1',
+            profiles: [{ profileId: 'main', principalId: 'user-1' }], issuers: [{ kid: 'k1', publicKeyPem: pem() }], sites: SITES,
+        })
+        expect(options).toMatchObject({ hostMode: 'browser-only', daemonUser: 'walter' })
+        expect(() => mergeInstallOptions({ ...options, hostMode: 'dedicated-host' }, { hostMode: 'browser-only', daemonUser: 'walter' })).toThrow(/fixed at install/)
+        expect(() => mergeInstallOptions(undefined, { hostMode: 'browser-only', machineId: 'm', workspaceId: 'w', profiles: [{ profileId: 'main', principalId: 'u' }], issuers: [{ kid: 'k', publicKeyPem: pem() }] })).toThrow(/daemonUser/)
+        expect(() => mergeInstallOptions(undefined, { hostMode: 'other', machineId: 'm', workspaceId: 'w', profiles: [{ profileId: 'main', principalId: 'u' }], issuers: [{ kid: 'k', publicKeyPem: pem() }] })).toThrow(/hostMode/)
+    })
 })
 
 describe('Happy server of the agent', () => {
@@ -243,6 +254,29 @@ describe('permissions', () => {
         expect(entry('/var/lib/abp/secrets/runtime/vnc-password')).toMatchObject({ owner: 'abp-runtime', group: 'root', mode: '0440' })
         expect(entry('/var/lib/abp/secrets/browser/vnc-password')).toMatchObject({ owner: 'abp-browser', mode: '0400' })
     })
+
+    it('uses the existing daemon user as the browser-only broker and token identity', () => {
+        const options = mergeInstallOptions(undefined, {
+            hostMode: 'browser-only', daemonUser: 'walter', machineId: 'machine-1', workspaceId: 'ws-1',
+            profiles: [{ profileId: 'main', principalId: 'user-1' }], issuers: [{ kid: 'k1', publicKeyPem: pem() }], sites: SITES,
+        })
+        const browserTable = permissionTable(options)
+        expect(browserTable.find((row: { path: string }) => row.path === PATHS.etc)).toMatchObject({ owner: 'root', group: 'root', mode: '0711' })
+        expect(browserTable.find((row: { path: string }) => row.path === PATHS.daemonToken)).toMatchObject({ owner: 'walter', group: 'walter', mode: '0400' })
+        expect(browserTable.find((row: { path: string }) => row.path === PATHS.run)).toMatchObject({ group: 'walter' })
+        expect(browserTable.some((row: { path: string }) => row.path === '/etc/aplus/sandbox-policy.json')).toBe(false)
+        expect(browserTable.some((row: { path: string }) => row.path === '/run/abp-mcp')).toBe(false)
+        expect(browserTable.some((row: { path: string }) => row.path === '/work')).toBe(false)
+    })
+
+    it('uses the resolved primary group when it differs from the daemon username', () => {
+        const options = mergeInstallOptions(undefined, {
+            hostMode: 'browser-only', daemonUser: 'walter', daemonGroup: 'staff', machineId: 'machine-1', workspaceId: 'ws-1',
+            profiles: [{ profileId: 'main', principalId: 'user-1' }], issuers: [{ kid: 'k1', publicKeyPem: pem() }], sites: SITES,
+        })
+        expect(permissionTable(options).find((row: { path: string }) => row.path === PATHS.daemonToken)).toMatchObject({ owner: 'walter', group: 'staff' })
+        expect(permissionTable(options).find((row: { path: string }) => row.path === PATHS.run)).toMatchObject({ group: 'staff' })
+    })
 })
 
 describe('firewall owner rules', () => {
@@ -340,6 +374,32 @@ describe('system files', () => {
         const value = line.slice('HAPPY_PROJECT_SANDBOX_CONFIG='.length)
         expect(value.startsWith("'") && value.endsWith("'")).toBe(true)
         expect(JSON.parse(value.slice(1, -1))).toMatchObject({ enabled: true, workspaceRoot: '/work', sessionIsolation: 'workspace', extraWritePaths: [] })
+    })
+
+    it('generates a browser-only environment and stack without the dedicated daemon or sandbox policy', () => {
+        const options = mergeInstallOptions(undefined, {
+            hostMode: 'browser-only', daemonUser: 'walter', machineId: 'machine-1', workspaceId: 'ws-1',
+            profiles: [{ profileId: 'main', principalId: 'user-1' }], issuers: [{ kid: 'k1', publicKeyPem: pem() }], sites: SITES,
+        })
+        const env = daemonEnv(options).split('\n').filter(Boolean)
+        expect(env).toEqual(expect.arrayContaining([
+            'HAPPY_BROWSER_TASK_RUNTIME_URL=http://127.0.0.1:38700',
+            'HAPPY_BROWSER_TASK_BROKER_SOCKET=/run/abp/broker.sock',
+            'HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE=/var/lib/abp/daemon-token',
+            'HAPPY_BROWSER_TASK_TENANCY=dedicated',
+            'HAPPY_BROWSER_TASK_PROFILE_ID=main',
+            'HAPPY_BROWSER_TASK_HOST_MODE=browser-only',
+        ]))
+        expect(env.some((line) => line.startsWith('HAPPY_PROJECT_SANDBOX_CONFIG'))).toBe(false)
+        const units = systemdUnits({ hostMode: 'browser-only', install: options })
+        expect(Object.keys(units).sort()).toEqual(['abp-egress.service', 'abp-firewall.service', 'abp-stack.service'])
+        expect(units['abp-firewall.service']).toContain('Before=network-pre.target abp-stack.service')
+    })
+
+    it('uses only the ABP-FENCE jump for browser-only owner firewall files', () => {
+        expect(firewallRulesFile(4, 1001, 1002, { hostMode: 'browser-only' })).toBe('-A OUTPUT -j ABP-FENCE\n')
+        expect(firewallRulesFile(6, 1001, 1002, { hostMode: 'browser-only' })).toBe('# abp: no-ipv6-owner-rules\n')
+        expect(tmpfilesConf({ hostMode: 'browser-only', daemonUser: 'walter' })).not.toContain('/run/abp-mcp')
     })
 })
 

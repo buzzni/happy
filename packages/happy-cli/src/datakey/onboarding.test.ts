@@ -72,3 +72,11 @@ describe('planDataKeyOnboarding — 게이트 (AC2/AC5)', () => {
     expect(back?.encryption.type).toBe('legacy')
   })
 })
+
+describe('planDataKeyOnboarding — a switch the user undid', () => {
+  it('does not promote again when a legacy backup is already kept (datakey deactivate leaves it in place)', () => {
+    // 2026-10-11 hmrepo: a fresh machine was deactivated by hand, and the next daemon start promoted it again.
+    const r = planDataKeyOnboarding({ credentials: provisioned, accountPublicKey: accountPub, hasLocalSessions: false, hasLegacyBackup: true })
+    expect(r).toEqual({ ok: false, reason: 'previously-deactivated' })
+  })
+})

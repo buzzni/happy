@@ -1,5 +1,7 @@
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
+import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
+import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 /**
  * WebSocket client for machine/daemon communication with Happy server
  * Similar to ApiSessionClient but for machine-scoped connections
@@ -18,6 +20,8 @@ import {
     type SpawnSessionOptions,
     type SpawnSessionResult,
 } from '../modules/common/registerCommonHandlers';
+import { createManagedProjectWriteScopePolicy, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '../modules/common/machineRunProfile';
+import { hostManagedMachineTools } from '../modules/common/moaiMachineRunProfiles';
 import { resolveDaemonAllowedRoot } from '../modules/common/resolveAllowedRoot';
 import { REMOTE_TERMINAL_DISABLED_ERROR, resolveMachineLockdownPolicy } from '../daemon/machineLockdownPolicy';
 import { homedir } from 'node:os';
@@ -111,7 +115,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -218,6 +222,7 @@ import {
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
 import type { MachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
+import { scriptRuntimeReadinessKey, type ScriptRuntimeReadiness } from '@/daemon/automations/scriptRuntimeReadiness';
 import { LESSON_HOST_RPC_METHOD } from '@/memory/lessonHostRuntime';
 import type { LessonHostSupervisor } from '@/memory/lessonHostSupervisor';
 import type { ServerAutomationCache } from '@/daemon/automations/serverAutomationCache';
@@ -733,6 +738,8 @@ export class ApiMachineClient {
     /** Set once the daemon can resolve projects to workspaces. */
     private lessonHosts: LessonHostSupervisor | null = null;
     private automationProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;
+    private scriptRuntimeReadiness: ScriptRuntimeReadiness | null = null;
+    private lastKnownScriptRuntimeKey: string | null = null;
     private persistAutomationKeyVersion: ((version: number) => void) | null = null;
     private automationServerKeyVersion: number | null = null;
     // Fail closed while server-backed ownership is unresolved. Legacy file ticks
@@ -907,10 +914,32 @@ export class ApiMachineClient {
         // project's workspaceDir.
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
-        registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
+        registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
+            // Machine scope is the Desktop machine.run path and the only one that
+            // may run managed writes; its lock is per daemon process.
+            machineRun: {
+                profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
+                writeScopePolicy: createManagedProjectWriteScopePolicy(),
+                managedTools: hostManagedMachineTools(configuration.happyHomeDir),
+                allowToolInstall: true,
+            },
+        });
         this.rpcHandlerManager.registerHandler(
             'worktree-dependencies:reclaim', createWorktreeReclaimHandler(allowedRoot),
         );
+        // aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 preview stage 2: a preview the
+        // browser starts with the env the server sealed for this machine. Customer lane only.
+        this.rpcHandlerManager.registerHandler(
+            'spawn-with-sealed-env',
+            createSealedSpawnEnvHandler({ machine: () => this.machine, allowedRoot }),
+            { customerBound: true },
+        );
+        // aplus 4b-3 worktree: worktrees on a strict machine, run here from a server-issued ticket
+        // and signed for the server. Customer lane only.
+        const worktreeOps = createWorktreeOpsHandlers({ machine: () => this.machine, allowedRoot, happyHomeDir: configuration.happyHomeDir });
+        for (const [method, handler] of Object.entries(worktreeOps)) {
+            this.rpcHandlerManager.registerHandler(method, handler, { customerBound: true });
+        }
         // Registered, not exempted: on a managed runtime the manager's own
         // dispatch allowlist still refuses this method, which is the intended
         // answer there rather than something to work around.
@@ -1091,6 +1120,8 @@ export class ApiMachineClient {
                     ...capabilities,
                     setupTokenAssignmentVersion: 1,
                     setupTokenSealedPayloadVersion: 1,
+                    // A shared machine's sealed assignment names the machine as principal.
+                    sharedMachineSetupTokenVersion: 1,
                     setupTokenRecipient: setupTokenRecipientCapability(this.setupTokenAssignmentRecipient),
                 };
             }
@@ -2328,6 +2359,27 @@ export class ApiMachineClient {
         if (previous && previous !== hosts) await previous.close();
     }
 
+    /**
+     * Published under automationSupport.scriptRuntime. Before the socket is up this only records the
+     * values; afterwards a change re-registers the same automation key with the new protocol (the
+     * server updates the target without bumping the key) and republishes the metadata.
+     */
+    updateScriptRuntime(readiness: ScriptRuntimeReadiness, protocolVersion: number): void {
+        const changed = this.automationProtocolVersion !== protocolVersion
+            || (this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null) !== scriptRuntimeReadinessKey(readiness);
+        this.scriptRuntimeReadiness = readiness;
+        this.automationProtocolVersion = protocolVersion;
+        if (changed && this.automationKey && this.socket?.connected) {
+            void this.registerAutomationKey().catch((error) => {
+                logger.debug(`[API MACHINE] Failed to republish script runtime: ${error}`);
+            });
+        }
+    }
+
+    private scriptRuntimeField(): { scriptRuntime?: ScriptRuntimeReadiness } {
+        return this.scriptRuntimeReadiness ? { scriptRuntime: this.scriptRuntimeReadiness } : {};
+    }
+
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
         this.automationKey = key;
         this.automationProtocolVersion = protocolVersion;
@@ -3186,6 +3238,7 @@ export class ApiMachineClient {
                 protocolVersion: this.automationProtocolVersion,
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
+                ...this.scriptRuntimeField(),
             },
         }));
     }
@@ -4000,7 +4053,9 @@ export class ApiMachineClient {
                 || prevResume.rpcAvailable !== newResumeSupport.rpcAvailable
                 || prevResume.happyAgentAuthenticated !== newResumeSupport.happyAgentAuthenticated;
             const cliVersionChanged = prevCliVersion !== newCliVersion;
-            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable;
+            const scriptRuntimeKey = this.scriptRuntimeReadiness ? scriptRuntimeReadinessKey(this.scriptRuntimeReadiness) : null;
+            const automationSupportChanged = this.lastKnownAutomationRpcAvailable !== this.automationRpcAvailable
+                || this.lastKnownScriptRuntimeKey !== scriptRuntimeKey;
             const autonomousQualityGateSupportChanged = this.lastKnownAutonomousQualityGateRpcAvailable !== this.autonomousQualityGateRpcAvailable;
             const automationServerKeyChanged = this.lastKnownAutomationServerKeyVersion !== this.automationServerKeyVersion;
             const daemonSessionStateAvailable = this.daemonSessionStateRpcAvailable && !this.managedHandlers;
@@ -4025,6 +4080,19 @@ export class ApiMachineClient {
             const advertisedRpcBinding = this.managedHandlers ? undefined : RPC_BINDING_CAPABILITY;
             const rpcBindingStale = JSON.stringify(this.machine.metadata?.rpcBinding)
                 !== JSON.stringify(advertisedRpcBinding);
+            // aplus 4b-3: `spawn-with-sealed-env` opens with the machine key, so only a dataKey
+            // machine runs it; a legacy machine's stored copy (from its first registration) is cleared.
+            const advertisedSealedSpawnEnv = this.managedHandlers || this.machine.encryptionVariant !== 'dataKey'
+                ? undefined
+                : SEALED_SPAWN_ENV_CAPABILITY;
+            const sealedSpawnEnvStale = JSON.stringify(this.machine.metadata?.sealedSpawnEnv)
+                !== JSON.stringify(advertisedSealedSpawnEnv);
+            // aplus 4b-3 worktree: results are signed with a key from the machine key, likewise dataKey only.
+            const advertisedWorktreeOps = this.managedHandlers || this.machine.encryptionVariant !== 'dataKey'
+                ? undefined
+                : WORKTREE_OPS_CAPABILITY;
+            const worktreeOpsStale = JSON.stringify(this.machine.metadata?.worktreeOps)
+                !== JSON.stringify(advertisedWorktreeOps);
 
             this.syncResumeSessionRpcRegistration();
 
@@ -4035,11 +4103,12 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
                 this.lastKnownAutomationRpcAvailable = this.automationRpcAvailable;
+                this.lastKnownScriptRuntimeKey = scriptRuntimeKey;
                 this.lastKnownAutonomousQualityGateRpcAvailable = this.autonomousQualityGateRpcAvailable;
                 this.lastKnownAutomationServerKeyVersion = this.automationServerKeyVersion;
                 const inFlight = { startedAt: Date.now() };
@@ -4055,6 +4124,7 @@ export class ApiMachineClient {
                         protocolVersion: this.automationProtocolVersion,
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
+                        ...this.scriptRuntimeField(),
                     },
                     autonomousQualityGateSupport: {
                         apiVersion: 1,
@@ -4065,6 +4135,8 @@ export class ApiMachineClient {
                     aiAuthSelection: advertisedAiAuthSelection,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
+                    sealedSpawnEnv: advertisedSealedSpawnEnv,
+                    worktreeOps: advertisedWorktreeOps,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
                 })).catch((err) => {

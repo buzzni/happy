@@ -117,6 +117,53 @@ describe('preview relay route credentials integration', () => {
         vi.clearAllMocks();
     });
 
+    it('marks the daemon request and stops a returned relay request before another daemon lookup', async () => {
+        const app = await buildApp();
+        const capturedPayload = { current: null as any };
+        const machineSocket = createFakeMachineSocket(capturedPayload);
+        vi.mocked(eventRouter.getConnections).mockReturnValue(new Set([
+            { connectionType: 'machine-scoped', machineId: MID, socket: machineSocket },
+        ]) as any);
+        const signed = signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT });
+        const url = `/v1/preview/${MID}/${PORT}/console?ptoken=${signed.token}`;
+
+        try {
+            const first = await app.inject({ method: 'GET', url });
+            expect(first.statusCode).toBe(200);
+            expect(capturedPayload.current.headers['x-saycode-preview-relay']).toBe('1');
+            const forwardedHeaders = { ...capturedPayload.current.headers };
+            vi.mocked(eventRouter.getConnections).mockClear();
+
+            const returned = await app.inject({ method: 'GET', url, headers: forwardedHeaders });
+            expect(returned.statusCode).toBe(508);
+            expect(returned.json()).toMatchObject({ code: 'PREVIEW_RELAY_LOOP' });
+            expect(eventRouter.getConnections).not.toHaveBeenCalled();
+            expect(machineSocket.timeout().emitWithAck).toHaveBeenCalledTimes(1);
+        } finally {
+            await app.close();
+        }
+    });
+
+    it.each(['1', '0', ''])('rejects a relayed request with marker %j in subdomain mode', async (marker) => {
+        const app = await buildApp();
+        const signed = signPreviewToken({ userId: USER_ID, machineId: MID, port: PORT });
+        try {
+            const res = await app.inject({
+                method: 'GET',
+                url: `/v1/preview/${MID}/${PORT}/console?ptoken=${signed.token}`,
+                headers: {
+                    host: `${MID}-${PORT}.preview.saycode.ai`,
+                    'x-saycode-preview-relay': marker,
+                },
+            });
+            expect(res.statusCode).toBe(508);
+            expect(res.json()).toMatchObject({ code: 'PREVIEW_RELAY_LOOP' });
+            expect(eventRouter.getConnections).not.toHaveBeenCalled();
+        } finally {
+            await app.close();
+        }
+    });
+
     it('forwards the app\'s Authorization header to the dev server', async () => {
         const app = await buildApp();
         const capturedPayload = { current: null as any };

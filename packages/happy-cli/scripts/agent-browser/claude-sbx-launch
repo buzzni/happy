@@ -5,7 +5,7 @@ const { spawn, execFileSync } = require('node:child_process');
 const { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } = require('node:fs');
 const path = require('node:path');
 
-const allowed = new Set(['LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_ENTRYPOINT', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS', 'SAYCODE_MCP_SOCKET', 'SAYCODE_MCP_TOKEN']);
+const allowed = new Set(['LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS', 'SAYCODE_MCP_SOCKET', 'SAYCODE_MCP_TOKEN']);
 function filterEnv(input) {
     return { ...Object.fromEntries(Object.entries(input).filter(([key, value]) => allowed.has(key) && typeof value === 'string' && !value.includes('\0'))),
         PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/home/agent-sbx', USER: 'agent-sbx',

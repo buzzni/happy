@@ -12,7 +12,7 @@ describe('difficulty routing policy parity snapshot', () => {
   it('matches Desktop USER_REQUEST_MODELS for routed user requests', () => {
     expect(USER_REQUEST_MODELS).toEqual({
       claude: {
-        trivial: { model: 'claude-haiku-4-5', effort: 'low' },
+        trivial: { model: 'claude-haiku-5-5', effort: 'low' },
         routine: { model: 'claude-sonnet-5-5', effort: 'medium' },
         hard: { model: 'claude-opus-5-5', effort: 'high' },
         escalated: { model: 'claude-fable-5-1', effort: 'medium' },
@@ -49,6 +49,11 @@ describe('difficulty routing policy parity snapshot', () => {
     expect(tierForKnownRoutePair('codex', 'gpt-6-sol', 'low')).toBe('routine')
     expect(tierForKnownRoutePair('codex', 'gpt-6-sol', 'high')).toBe('hard')
     expect(tierForKnownRoutePair('codex', 'gpt-6-astra', 'medium')).toBe('escalated')
+  })
+
+  it('recognizes both Haiku generations without rewriting historical floors', () => {
+    expect(tierForKnownRoutePair('claude', 'claude-haiku-5-5', 'low')).toBe('trivial')
+    expect(tierForKnownRoutePair('claude', 'claude-haiku-4-5', 'low')).toBe('trivial')
   })
 
   it('never maps one pair to two tiers', () => {

@@ -55,6 +55,9 @@ AGENT_WORKSPACE_LINK=/home/agent/workspace
 AGENT_HAPPY_SETTINGS=/home/agent/.happy/settings.json
 CHANGED=" "
 WORK=""
+HOST_MODE=dedicated-host
+DAEMON_USER=agent
+DAEMON_HOME=/home/agent
 
 say() { printf '== %s\n' "$*"; }
 warn() { printf 'abp-install: warning: %s\n' "$*" >&2; }
@@ -350,10 +353,13 @@ preflight() {
         run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
     fi
     local missing="" cmd
-    for cmd in docker bwrap sudo visudo iptables ip6tables iptables-save ip6tables-save ipset setfacl getfacl runuser cc flock getent useradd usermod groupadd gpasswd systemctl systemd-tmpfiles cmp; do
+    local required="docker iptables ip6tables iptables-save ip6tables-save ipset runuser flock getent useradd groupadd systemctl systemd-tmpfiles cmp"
+    [ "$HOST_MODE" = browser-only ] || required="$required bwrap sudo visudo setfacl getfacl cc usermod gpasswd"
+    for cmd in $required; do
         command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
-    for cmd in /usr/bin/node /usr/bin/bwrap /usr/bin/sudo; do [ -x "$cmd" ] || missing="$missing $cmd"; done
+    for cmd in /usr/bin/node; do [ -x "$cmd" ] || missing="$missing $cmd"; done
+    if [ "$HOST_MODE" != browser-only ]; then for cmd in /usr/bin/bwrap /usr/bin/sudo; do [ -x "$cmd" ] || missing="$missing $cmd"; done; fi
     if [ -n "$missing" ]; then
         if [ "$DRY_RUN" = 1 ]; then warn "missing on this host:$missing"; else die "missing:$missing (see README: prerequisites, or --install-packages)"; fi
     fi
@@ -362,12 +368,20 @@ preflight() {
         grep -Eq '^[@#]includedir[[:space:]]+/etc/sudoers.d' /etc/sudoers || die "/etc/sudoers does not include /etc/sudoers.d"
     fi
     # Sandbox stream (S1) pieces shipped next to this script.
-    require_file "$here/claude-sbx-launch" "the Claude sandbox launcher (S1)"
-    require_file "$here/abp-firewall-read.c" "the firewall reader source (S1)"
+    [ "$HOST_MODE" = browser-only ] || require_file "$here/claude-sbx-launch" "the Claude sandbox launcher (S1)"
 }
 
 ensure_accounts() {
     say "accounts"
+    if [ "$HOST_MODE" = browser-only ]; then
+        ensure_fixed_user abp-runtime 10870
+        ensure_fixed_user abp-browser 10871
+        if [ "$DRY_RUN" = 0 ]; then user_exists "$DAEMON_USER" || die "browser-only daemon user $DAEMON_USER does not exist"; fi
+        if [ "$DRY_RUN" = 0 ] && id -nG "$DAEMON_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+            warn "browser-only daemon user $DAEMON_USER is in the docker group; this grants container-root access (see README)"
+        fi
+        return 0
+    fi
     ensure_group abp-session
     ensure_group abp-work
     ensure_fixed_user abp-runtime 10870
@@ -472,11 +486,14 @@ install_tools() {
     ensure_dir "$LIBEXEC" root root 0755
     ensure_dir "$LIBEXEC/lib" root root 0755
     local target
-    for target in claude-sbx-launch abp-firewall-read abp-firewall abp-stack.mjs abp-plan.mjs lib/abpPlan.mjs lib/profileCopy.mjs; do safe_path "$LIBEXEC/$target" file root; done
-    run install -o root -g root -m 0755 "$here/claude-sbx-launch" "$LIBEXEC/claude-sbx-launch"
-    # setuid-root reader of the filter tables only (S1 contract addition), usable by abp-session (agent).
-    run cc -O2 -Wall -Wextra -Werror -o "$WORK/abp-firewall-read" "$here/abp-firewall-read.c"
-    run install -o root -g abp-session -m 4750 "$WORK/abp-firewall-read" "$LIBEXEC/abp-firewall-read"
+    local targets="abp-firewall abp-stack.mjs abp-plan.mjs lib/abpPlan.mjs lib/profileCopy.mjs"
+    [ "$HOST_MODE" = browser-only ] || targets="claude-sbx-launch abp-firewall-read $targets"
+    for target in $targets; do safe_path "$LIBEXEC/$target" file root; done
+    if [ "$HOST_MODE" != browser-only ]; then
+        run install -o root -g root -m 0755 "$here/claude-sbx-launch" "$LIBEXEC/claude-sbx-launch"
+        run cc -O2 -Wall -Wextra -Werror -o "$WORK/abp-firewall-read" "$here/abp-firewall-read.c"
+        run install -o root -g abp-session -m 4750 "$WORK/abp-firewall-read" "$LIBEXEC/abp-firewall-read"
+    fi
     run install -o root -g root -m 0755 "$here/abp-firewall" "$LIBEXEC/abp-firewall"
     run install -o root -g root -m 0644 "$here/abp-stack.mjs" "$LIBEXEC/abp-stack.mjs"
     run install -o root -g root -m 0644 "$here/abp-plan.mjs" "$LIBEXEC/abp-plan.mjs"
@@ -520,6 +537,8 @@ main_install() {
     local forward=()
     while [ $# -gt 0 ]; do
         case "$1" in
+            --browser-only) forward+=(--host-mode browser-only); shift ;;
+            --daemon-user) [ $# -ge 2 ] || die "$1 needs a value"; forward+=(--daemon-user "$2"); shift 2 ;;
             --happy-tarball) HAPPY_TARBALL=$2; shift 2 ;;
             --images) IMAGES_DIR=$2; shift 2 ;;
             --images-manifest) IMAGES_MANIFEST=$2; shift 2 ;;
@@ -545,6 +564,12 @@ main_install() {
     fi
     # Validate everything first: nothing is changed when the options are wrong.
     plan install-options --saved "$INSTALL_JSON" ${forward[@]+"${forward[@]}"} > "$WORK/install.json"
+    HOST_MODE=$("$NODE" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).hostMode)' "$WORK/install.json")
+    DAEMON_USER=$("$NODE" -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).daemonUser || "agent")' "$WORK/install.json")
+    [ "$HOST_MODE" = browser-only ] && [ -n "$AGENT_CREDENTIALS" ] && die "--agent-credentials is only for a new dedicated Happy host"
+    if [ "$DRY_RUN" = 1 ]; then DAEMON_HOME=/home/$DAEMON_USER; else DAEMON_HOME=$(getent passwd "$DAEMON_USER" | cut -d: -f6); [ -n "$DAEMON_HOME" ] || die "daemon user $DAEMON_USER does not exist"; fi
+    AGENT_HAPPY_SETTINGS=$DAEMON_HOME/.happy/settings.json
+    if [ "$HOST_MODE" = browser-only ]; then UNITS="abp-firewall.service abp-egress.service abp-stack.service"; fi
     # Browser DNS: the resolvers Docker's embedded DNS forwards to (the host's upstream servers), unless configured.
     if [ "$("$NODE" -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).browserDns.length))' "$WORK/install.json")" = 0 ]; then
         local resolv=/etc/resolv.conf dns dns_flags=()
@@ -565,59 +590,69 @@ main_install() {
     preflight
 
     ensure_accounts
-    install_happy
+    [ "$HOST_MODE" = browser-only ] || install_happy
 
     say "directories"
-    ensure_dir "$ETC" root root 0700
-    ensure_dir "$VARLIB" root abp-session 0710
+    ensure_dir "$ETC" root root "$([ "$HOST_MODE" = browser-only ] && echo 0711 || echo 0700)"
+    local daemon_group token_group
+    if [ "$HOST_MODE" = browser-only ]; then daemon_group=$(id -gn "$DAEMON_USER" 2>/dev/null || echo "$DAEMON_USER"); token_group=$daemon_group; else daemon_group=abp-session; token_group=agent; fi
+    if [ "$HOST_MODE" = browser-only ]; then
+        "$NODE" -e 'const fs=require("fs");const p=process.argv[1];const x=JSON.parse(fs.readFileSync(p,"utf8"));x.daemonGroup=process.argv[2];fs.writeFileSync(p,JSON.stringify(x,null,2)+"\n")' "$WORK/install.json" "$daemon_group"
+    fi
+    ensure_dir "$VARLIB" root "$daemon_group" 0710
     ensure_dir "$VARLIB/secrets" root root 0711
     ensure_dir "$VARLIB/secrets/runtime" abp-runtime root 0550
     ensure_dir "$VARLIB/secrets/browser" abp-browser abp-browser 0500
-    ensure_dir /etc/aplus root root 0755
-    ensure_dir /home/agent agent agent 0700
-    ensure_dir /home/agent-sbx agent-sbx agent-sbx 0700
-    ensure_dir /work agent abp-work 2770
-    say "agent workspace ($AGENT_WORKSPACE_LINK -> $AGENT_WORKSPACE, abp-work ACLs)"
-    ensure_agent_workspace_dir "$AGENT_WORKSPACE"
-    if [ "$DRY_RUN" = 0 ] && [ -d "$AGENT_WORKSPACE_LINK" ] && [ ! -L "$AGENT_WORKSPACE_LINK" ]; then
+    if [ "$HOST_MODE" != browser-only ]; then
+        ensure_dir /etc/aplus root root 0755
+        ensure_dir /home/agent agent agent 0700
+        ensure_dir /home/agent-sbx agent-sbx agent-sbx 0700
+        ensure_dir /work agent abp-work 2770
+        say "agent workspace ($AGENT_WORKSPACE_LINK -> $AGENT_WORKSPACE, abp-work ACLs)"
+        ensure_agent_workspace_dir "$AGENT_WORKSPACE"
+    fi
+    if [ "$HOST_MODE" != browser-only ] && [ "$DRY_RUN" = 0 ] && [ -d "$AGENT_WORKSPACE_LINK" ] && [ ! -L "$AGENT_WORKSPACE_LINK" ]; then
         # The start step below brings the daemon back.
         if systemctl is-active --quiet abp-happy-daemon.service 2>/dev/null; then run systemctl stop abp-happy-daemon.service; fi
         grant_legacy_workspace "$AGENT_WORKSPACE_LINK"
     fi
-    migrate_workspace "$AGENT_WORKSPACE_LINK" "$AGENT_WORKSPACE" agent
-    ensure_workspace_acls /work "$AGENT_WORKSPACE"
-    emit /etc/tmpfiles.d/abp.conf root root 0644 show tmpfiles
+    if [ "$HOST_MODE" != browser-only ]; then
+        migrate_workspace "$AGENT_WORKSPACE_LINK" "$AGENT_WORKSPACE" agent
+        ensure_workspace_acls /work "$AGENT_WORKSPACE"
+    fi
+    emit /etc/tmpfiles.d/abp.conf root root 0644 show tmpfiles --install "$WORK/install.json"
     run systemd-tmpfiles --create /etc/tmpfiles.d/abp.conf
 
     install_tools
-    ensure_resolver
+    [ "$HOST_MODE" = browser-only ] || ensure_resolver
 
-    say "sudoers, sandbox policy, egress policy"
-    plan sudoers > "$WORK/sudoers"
-    run visudo -cf "$WORK/sudoers"
-    write_file /etc/sudoers.d/abp-agent-sbx root root 0440 show < "$WORK/sudoers"
-    printf '{\n  "mode": "mandatory"\n}\n' > "$WORK/policy.json"
-    write_file /etc/aplus/sandbox-policy.json root root 0644 show < "$WORK/policy.json"
-    plan egress-policy --install "$WORK/install.json" > "$WORK/egress.json"
-    if [ -s "$WORK/egress.json" ]; then
+    say "egress policy"
+    if [ "$HOST_MODE" != browser-only ]; then
+        plan sudoers > "$WORK/sudoers"
+        run visudo -cf "$WORK/sudoers"
+        write_file /etc/sudoers.d/abp-agent-sbx root root 0440 show < "$WORK/sudoers"
+        printf '{\n  "mode": "mandatory"\n}\n' > "$WORK/policy.json"
+        write_file /etc/aplus/sandbox-policy.json root root 0644 show < "$WORK/policy.json"
+    fi
+    if [ "$HOST_MODE" = browser-only ]; then : > "$WORK/egress.json"; else plan egress-policy --install "$WORK/install.json" > "$WORK/egress.json"; fi
+    if [ "$HOST_MODE" != browser-only ] && [ -s "$WORK/egress.json" ]; then
         write_file /etc/aplus/claude-sandbox.json root root 0644 show < "$WORK/egress.json"
-    elif [ -e /etc/aplus/claude-sandbox.json ]; then
+    elif [ "$HOST_MODE" != browser-only ] && [ -e /etc/aplus/claude-sandbox.json ]; then
         run rm -f /etc/aplus/claude-sandbox.json
         CHANGED="$CHANGED/etc/aplus/claude-sandbox.json "
     fi
 
     say "owner firewall rules, browser egress rules and Chromium seccomp profile"
-    local sbx proxy family
-    sbx=$(uid_of agent-sbx 60001)
-    proxy=$(uid_of abp-proxy 60002)
+    local sbx=0 proxy=0 family
+    if [ "$HOST_MODE" != browser-only ]; then sbx=$(uid_of agent-sbx 60001); proxy=$(uid_of abp-proxy 60002); fi
     for family in 4 6; do
-        emit "$ETC/firewall.rules$family" root root 0644 show firewall --family "$family" --sbx-uid "$sbx" --proxy-uid "$proxy"
+        emit "$ETC/firewall.rules$family" root root 0644 show firewall --install "$WORK/install.json" --family "$family" --sbx-uid "$sbx" --proxy-uid "$proxy"
         emit "$ETC/egress.rules$family" root root 0644 show egress --install "$WORK/install.json" --family "$family"
     done
     emit "$ETC/seccomp-chromium.json" root root 0644 - seccomp --base "$here/seccomp/moby-default.json"
 
     say "secrets (generated only when missing)"
-    ensure_secret "$DAEMON_TOKEN" agent agent 0400 daemon-token
+    ensure_secret "$DAEMON_TOKEN" "$DAEMON_USER" "$token_group" 0400 daemon-token
     ensure_vnc_password
 
     say "machine identity and Runtime configuration"
@@ -625,15 +660,15 @@ main_install() {
     # --server-url: `happy auth login` and the daemon both read the server from the agent's settings.
     local credential_flags=()
     [ -n "$AGENT_CREDENTIALS" ] && credential_flags=(--credentials "$AGENT_CREDENTIALS")
-    plan happy-settings --install "$WORK/install.json" --settings "$AGENT_HAPPY_SETTINGS" ${credential_flags[@]+"${credential_flags[@]}"} > "$WORK/happy-settings.json"
+    if [ "$HOST_MODE" = browser-only ]; then : > "$WORK/happy-settings.json"; else plan happy-settings --install "$WORK/install.json" --settings "$AGENT_HAPPY_SETTINGS" ${credential_flags[@]+"${credential_flags[@]}"} > "$WORK/happy-settings.json"; fi
     if [ -s "$WORK/happy-settings.json" ]; then
-        ensure_dir /home/agent/.happy agent agent 0700
+        ensure_dir "$DAEMON_HOME/.happy" "$DAEMON_USER" "$token_group" 0700
         if [ -n "$AGENT_CREDENTIALS" ]; then
             # Never shown, also not in a dry run.
-            write_file /home/agent/.happy/access.key agent agent 0600 < "$WORK/access.key"
+            write_file "$DAEMON_HOME/.happy/access.key" "$DAEMON_USER" "$token_group" 0600 < "$WORK/access.key"
             rm -f "$WORK/access.key"
         fi
-        write_file "$AGENT_HAPPY_SETTINGS" agent agent 0600 show < "$WORK/happy-settings.json"
+        write_file "$AGENT_HAPPY_SETTINGS" "$DAEMON_USER" "$token_group" 0600 show < "$WORK/happy-settings.json"
         # The credentials file has done its job; a real run does not leave it behind.
         if [ -n "$AGENT_CREDENTIALS" ] && [ "$DRY_RUN" = 0 ]; then rm -f "$AGENT_CREDENTIALS"; fi
     fi
@@ -649,8 +684,14 @@ main_install() {
             printf '%s' "${ABP_DRY_RUN_SECRET:-dry-run-synthetic-daemon-token-0000000000}" > "$WORK/token"
             token_file=$WORK/token
         fi
+        local session_gid
+        if [ "$HOST_MODE" = browser-only ]; then
+            if [ "$DRY_RUN" = 1 ]; then session_gid=$(id -g "$DAEMON_USER" 2>/dev/null || printf '60003'); else session_gid=$(id -g "$DAEMON_USER" 2>/dev/null) || die "cannot resolve the primary gid of daemon user $DAEMON_USER"; fi
+        else
+            session_gid=$(gid_of abp-session 60003)
+        fi
         emit "$RUNTIME_JSON" root root 0600 show runtime-config --install "$WORK/install.json" --machine-id "$machine_id" \
-            --session-gid "$(gid_of abp-session 60003)" --daemon-token-file "$token_file"
+            --session-gid "$session_gid" --daemon-token-file "$token_file"
     else
         warn "machine id unresolved: log the agent in to Happy (sudo -iu agent happy auth login) and run abp-install again"
     fi
@@ -660,7 +701,7 @@ main_install() {
         "$NODE" -e 'const fs=require("fs");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));if(s.applied===undefined)process.exit(0);delete s.applied;s.history=[...(s.history??[]),{atMs:Date.now(),action:"fresh-install",result:"previous assignment identity cleared"}].slice(-50);fs.writeFileSync(p+".tmp",JSON.stringify(s,null,2)+"\n",{mode:0o600});fs.renameSync(p+".tmp",p)' "$VARLIB/stack-state.json"
     fi
     write_file "$INSTALL_JSON" root root 0600 show < "$WORK/install.json"
-    emit "$ETC/happy-daemon.env" root root 0644 show daemon-env --install "$WORK/install.json"
+    emit "$ETC/$([ "$HOST_MODE" = browser-only ] && echo browser-only.env || echo happy-daemon.env)" root root 0644 show daemon-env --install "$WORK/install.json"
 
     say "images"
     if [ -n "$IMAGES_MANIFEST" ]; then
@@ -675,7 +716,8 @@ main_install() {
 
     say "Happy package digest"
     local package=$HAPPY_PREFIX/lib/node_modules/@buzzni/happy-cli
-    if [ "$DRY_RUN" = 1 ]; then
+    if [ "$HOST_MODE" = browser-only ]; then :
+    elif [ "$DRY_RUN" = 1 ]; then
         printf '+ record the Happy package digest of %s in %s\n' "$package" "$HAPPY_DIGEST"
     else
         plan package-digest --dir "$package" > "$WORK/package-digest"
@@ -702,15 +744,15 @@ main_install() {
     run systemctl reload-or-restart abp-firewall.service
     run systemctl reload-or-restart abp-egress.service
     # A new Happy package (--happy-tarball) changes the digest: the proxy and the daemon then run the new code.
-    restart_or_start abp-egress-proxy.service /etc/systemd/system/abp-egress-proxy.service "$HAPPY_DIGEST" /etc/aplus/claude-sandbox.json
+    if [ "$HOST_MODE" != browser-only ]; then restart_or_start abp-egress-proxy.service /etc/systemd/system/abp-egress-proxy.service "$HAPPY_DIGEST" /etc/aplus/claude-sandbox.json; fi
     if [ -n "$machine_id" ] && { [ "$DRY_RUN" = 1 ] || [ -s "$VARLIB/stack-state.json" ]; }; then
         # A stack restart fences, drains and pauses running tasks; only do it when the stack's inputs changed.
         restart_or_start abp-stack.service "$RUNTIME_JSON" "$VARLIB/secrets/runtime/vnc-password" /etc/systemd/system/abp-stack.service \
             "$ETC/egress.rules4" "$ETC/seccomp-chromium.json"
         # Sessions outlive the daemon restart (KillMode=process).
-        restart_or_start abp-happy-daemon.service "$ETC/happy-daemon.env" /etc/systemd/system/abp-happy-daemon.service "$DAEMON_TOKEN" "$HAPPY_DIGEST" "$AGENT_HAPPY_SETTINGS"
+        if [ "$HOST_MODE" != browser-only ]; then restart_or_start abp-happy-daemon.service "$ETC/happy-daemon.env" /etc/systemd/system/abp-happy-daemon.service "$DAEMON_TOKEN" "$HAPPY_DIGEST" "$AGENT_HAPPY_SETTINGS"; fi
     fi
-    say "done. Next: see README (Claude login for agent-sbx), then: abp-install check"
+    if [ "$HOST_MODE" = browser-only ]; then say "done. Restart the existing Happy daemon, then: abp-install check"; else say "done. Next: see README (Claude login for agent-sbx), then: abp-install check"; fi
 }
 
 # ---- claude-login --------------------------------------------------------------------------------
@@ -802,6 +844,7 @@ workspace_shared() {
 }
 connect_unix() { as "$1" /usr/bin/node -e 'require("net").connect(process.argv[1]).on("connect",()=>process.exit(0)).on("error",()=>process.exit(1))' "$2"; }
 connect_tcp() { as "$1" /usr/bin/node -e 'const s=require("net").connect(Number(process.argv[2]),process.argv[1]);s.setTimeout(3000,()=>process.exit(1));s.on("connect",()=>process.exit(0)).on("error",()=>process.exit(1))' "$2" "$3"; }
+runtime_ready() { as "$1" /usr/bin/node -e 'const http=require("http");const req=http.get(`http://127.0.0.1:${process.argv[1]}/v1/ready`,res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1))});req.setTimeout(3000,()=>{req.destroy();process.exit(1)});req.on("error",()=>process.exit(1))' "$2"; }
 proxy_refuses_unlisted() {
     /usr/bin/node -e 'const s=require("net").connect(3128,"127.0.0.1",()=>s.write("CONNECT denied.invalid:443 HTTP/1.1\r\n\r\n"));let r="";s.setTimeout(3000,()=>process.exit(1));s.on("data",(d)=>{r+=d});s.on("end",()=>process.exit(r.startsWith("HTTP/1.1 403")?0:1));s.on("error",()=>process.exit(1))'
 }
@@ -809,6 +852,24 @@ proxy_refuses_unlisted() {
 main_check() {
     [ "$(id -u)" = 0 ] || die "run as root"
     local user path _type owner group mode actual port unit
+    if [ -r "$INSTALL_JSON" ] && [ "$(/usr/bin/node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.hostMode||"dedicated-host")' "$INSTALL_JSON" 2>/dev/null)" = browser-only ]; then
+        UNITS="abp-firewall.service abp-egress.service abp-stack.service"
+        user=$(/usr/bin/node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(x.daemonUser)' "$INSTALL_JSON")
+        while IFS="$(printf '\t')" read -r path _type owner group mode; do
+            actual=$(stat -c '%U %G %a' "$path" 2>/dev/null || echo missing)
+            expect "$path $owner:$group $mode" test "$actual" = "$owner $group $(printf '%o' "$((8#$mode))")"
+        done < <(plan permissions --install "$INSTALL_JSON")
+        expect "browser-only daemon user can read the token" as "$user" test -r "$DAEMON_TOKEN"
+        expect "browser-only daemon user can read browser task environment" as "$user" test -r /etc/abp/browser-only.env
+        expect "browser-only daemon user reaches the broker socket" connect_unix "$user" /run/abp/broker.sock
+        expect_not "sandbox policy is absent" test -e /etc/aplus/sandbox-policy.json
+        expect "browser egress rules are live (DOCKER-USER, INPUT, IPv6)" "$LIBEXEC/abp-firewall" check-egress
+        for unit in $UNITS; do expect "$unit enabled" systemctl is-enabled --quiet "$unit"; expect "$unit active" systemctl is-active --quiet "$unit"; done
+        port=$(/usr/bin/node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).runtimePort))' "$INSTALL_JSON" 2>/dev/null || echo 38700)
+        expect "Runtime /v1/ready" runtime_ready "$user" "$port"
+        if [ "$FAILS" -gt 0 ]; then printf '%d check(s) failed\n' "$FAILS"; exit 1; fi
+        printf 'all checks passed\n'; return 0
+    fi
     for user in agent agent-sbx abp-proxy abp-runtime abp-browser; do expect "user $user" id -u "$user"; done
     expect "abp-runtime has uid 10870" test "$(id -u abp-runtime)" = 10870
     expect "abp-browser has uid 10871" test "$(id -u abp-browser)" = 10871

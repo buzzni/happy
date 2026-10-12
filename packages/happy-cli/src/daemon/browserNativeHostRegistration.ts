@@ -80,16 +80,6 @@ export function resolveBrowserNativeHostManifestPath({ platform, homeDir }: {
 /** The same extension published on the Chrome Web Store; users install it there instead of loading the bundle unpacked. */
 export const CHROME_WEB_STORE_EXTENSION_ID = 'oonefemjapkafdiibkllemkjdlmmblbc'
 
-export function resolveBrowserNativeHostHelperPath({ platform, standaloneLauncher, fallback }: {
-    platform: NodeJS.Platform
-    standaloneLauncher?: string
-    fallback: string
-}): string {
-    return platform === 'win32' && standaloneLauncher?.toLowerCase().endsWith('.exe')
-        ? standaloneLauncher
-        : fallback
-}
-
 export function buildBrowserNativeHostManifest({ extensionId, helperPath }: {
     extensionId: string
     helperPath: string
@@ -106,18 +96,40 @@ export function buildBrowserNativeHostManifest({ extensionId, helperPath }: {
     }
 }
 
-export async function registerBrowserNativeHost({ platform, homeDir, extensionId, helperPath, registry }: {
+/**
+ * Chrome on Windows starts the manifest `path` as a process and cannot run a
+ * `.mjs` script (it opens the "choose an app" dialog instead), so the manifest
+ * points at a batch file that runs the host script with the daemon's own Node.
+ * Chrome appends the extension origin and `--parent-window=<n>`; `%*` forwards
+ * them, and stdio is inherited unchanged.
+ */
+export function buildWindowsNativeHostBatch({ nodePath, scriptPath }: { nodePath: string; scriptPath: string }): string {
+    for (const value of [nodePath, scriptPath]) {
+        if (/["\r\n]/.test(value)) throw new Error('Native Messaging host path cannot be quoted in a batch file')
+    }
+    const quote = (value: string) => `"${value.replace(/%/g, '%%')}"`
+    return `@echo off\r\nchcp 65001 >nul\r\n${quote(nodePath)} ${quote(scriptPath)} %*\r\n`
+}
+
+export async function registerBrowserNativeHost({ platform, homeDir, extensionId, helperPath, nodePath = process.execPath, registry }: {
     platform: NodeJS.Platform
     homeDir: string
     extensionId: string
     helperPath: string
+    /** Windows only: the Node that runs `helperPath` through the batch wrapper. */
+    nodePath?: string
     registry?: NativeMessagingHostRegistry
 }): Promise<string | null> {
     const manifestPath = resolveBrowserNativeHostManifestPath({ platform, homeDir })
     if (!manifestPath) return null
 
-    const manifest = buildBrowserNativeHostManifest({ extensionId, helperPath })
     await mkdir(dirname(manifestPath), { recursive: true })
+    let manifestHelperPath = helperPath
+    if (platform === 'win32') {
+        manifestHelperPath = manifestPath.replace(/\.json$/, '.cmd')
+        await writeFile(manifestHelperPath, buildWindowsNativeHostBatch({ nodePath, scriptPath: helperPath }), 'utf8')
+    }
+    const manifest = buildBrowserNativeHostManifest({ extensionId, helperPath: manifestHelperPath })
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
     if (platform === 'win32') {
         await (registry ?? windowsNativeMessagingHostRegistry).setManifestPath(BROWSER_NATIVE_HOST_NAME, manifestPath)

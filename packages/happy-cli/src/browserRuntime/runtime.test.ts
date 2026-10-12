@@ -23,7 +23,7 @@ async function createHarness(prefix: string, expiresAtMs = 3_600_000, sites: Sit
     const store = await TaskStore.open(dir); const clock = new FakeClock(100)
     const profileId = 'profile-1' as ProfileId; const driver = new FakeBrowserDriver()
     const runtime = new BrowserRuntime({ sites, store, drivers: new Map([[profileId, driver]]), clock })
-    const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'subscribe', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs }
+    const credential: AgentGrant = { kind: 'agent-grant', grantId: 'g' as never, principalId: 'p' as never, workspaceId: 'w' as never, machineId: 'm' as never, agentSessionId: 'a' as never, profileId, allowedOrigins: ['https://fixture.test'], operations: ['createSpace', 'listSpaces', 'joinSpace', 'createTask', 'openPage', 'submitBatch', 'getTask', 'subscribe', 'cancel', 'observe', 'screenshot', 'finishTask', 'resume', 'closePage', 'closeSpace'], taskSpaceIds: [], issuedAtMs: 0, expiresAtMs }
     const auth = { credential, verifiedAtMs: clock.now() }
     const space = await runtime.createSpace(auth, { profileId, requestId: 'space-req' as RequestId })
     const task = await runtime.createTask(auth, { taskSpaceId: space.taskSpaceId, requestId: 'task-req' as RequestId })
@@ -51,6 +51,32 @@ async function observeHarnessTab(h: Awaited<ReturnType<typeof createHarness>>) {
 }
 
 describe('BrowserRuntime durable request contract', () => {
+    it('requires explicit same-principal membership before another session can use a space', async () => {
+        const h = await createHarness('abp-runtime-space-membership-')
+        const other: AgentGrant = { ...h.auth.credential, grantId: 'g2' as never, agentSessionId: 'b' as never }
+        const otherAuth = { credential: other, verifiedAtMs: h.clock.now() }
+        expect((await h.runtime.listSpaces(otherAuth, { profileId: h.profileId })).spaces).toHaveLength(1)
+        await expect(h.runtime.createTask(otherAuth, { taskSpaceId: h.space.taskSpaceId, requestId: 'before-join' as RequestId })).rejects.toMatchObject({ code: 'SCOPE_DENIED' })
+        await h.runtime.joinSpace(otherAuth, { taskSpaceId: h.space.taskSpaceId, requestId: 'join' as RequestId })
+        await expect(h.runtime.createTask(otherAuth, { taskSpaceId: h.space.taskSpaceId, requestId: 'after-join' as RequestId })).resolves.toMatchObject({ taskSpaceId: h.space.taskSpaceId })
+        await h.store.close()
+    })
+
+    it('preserves concurrent joins and rejects a different principal', async () => {
+        const h = await createHarness('abp-runtime-space-joins-')
+        const second: AgentGrant = { ...h.auth.credential, grantId: 'g2' as never, agentSessionId: 'b' as never }
+        const third: AgentGrant = { ...h.auth.credential, grantId: 'g3' as never, agentSessionId: 'c' as never, principalId: 'other' as never }
+        const [joinedB, joinedC] = await Promise.all([
+            h.runtime.joinSpace({ credential: second, verifiedAtMs: h.clock.now() }, { taskSpaceId: h.space.taskSpaceId, requestId: 'join-b' as RequestId }),
+            h.runtime.joinSpace({ credential: { ...second, grantId: 'g4' as never, agentSessionId: 'c' as never }, verifiedAtMs: h.clock.now() }, { taskSpaceId: h.space.taskSpaceId, requestId: 'join-c' as RequestId }),
+        ])
+        expect(joinedB.memberSessionIds).toEqual(expect.arrayContaining(['a', 'b']))
+        expect(joinedC.memberSessionIds).toEqual(expect.arrayContaining(['a', 'c']))
+        await expect(h.runtime.joinSpace({ credential: third, verifiedAtMs: h.clock.now() }, { taskSpaceId: h.space.taskSpaceId, requestId: 'join-other' as RequestId })).rejects.toMatchObject({ code: 'SCOPE_DENIED' })
+        expect(h.store.getSpace(h.space.taskSpaceId)?.memberSessionIds).toEqual(expect.arrayContaining(['a', 'b', 'c']))
+        await h.store.close()
+    })
+
     it('returns a task version from openPage and submitBatch that the next call can use as expectedVersion', async () => {
         const h = await createHarness('abp-runtime-version-')
         expect(h.opened.task.stateVersion).toBe((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).stateVersion)

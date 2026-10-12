@@ -16,6 +16,7 @@ export const PATHS = {
   installConfig: "/etc/abp/install.json",
   runtimeConfig: "/etc/abp/runtime.json",
   daemonEnv: "/etc/abp/happy-daemon.env",
+  browserOnlyEnv: "/etc/abp/browser-only.env",
   seccompProfile: "/etc/abp/seccomp-chromium.json",
   firewallRules: { 4: "/etc/abp/firewall.rules4", 6: "/etc/abp/firewall.rules6" },
   egressRules: { 4: "/etc/abp/egress.rules4", 6: "/etc/abp/egress.rules6" },
@@ -131,6 +132,7 @@ export function mergeInstallOptions(saved, flags) {
     egressDomains: [],
     sites: [],
     happyPrefix: PATHS.happyPrefix,
+    hostMode: "dedicated-host",
     browserSubnetPool: DEFAULT_BROWSER_SUBNET_POOL,
     denyCidrs: [],
     browserDns: [],
@@ -141,6 +143,13 @@ export function mergeInstallOptions(saved, flags) {
     ...Object.fromEntries(Object.entries(flags).filter(([key, value]) => value !== undefined && key !== "issuers")),
   };
   if (flags.issuers !== undefined) merged.trustedIssuers = flags.issuers;
+  if (!["dedicated-host", "browser-only"].includes(merged.hostMode)) fail("hostMode", "must be dedicated-host or browser-only");
+  if (saved && (saved.hostMode ?? "dedicated-host") !== merged.hostMode) fail("hostMode", "is fixed at install; uninstall and install again to change it");
+  if (merged.hostMode === "browser-only") {
+    if (typeof merged.daemonUser !== "string" || !/^[a-z_][a-z0-9_-]{0,31}\$?$/.test(merged.daemonUser)) fail("daemonUser", "is required for browser-only mode");
+  } else {
+    delete merged.daemonUser;
+  }
   // Fixed at install: the broker ledger, profiles and networks differ between the modes.
   merged.tenancyMode ??= "dedicated";
   if (!["dedicated", "shared"].includes(merged.tenancyMode)) fail("tenancyMode", "must be dedicated or shared");
@@ -299,21 +308,25 @@ export function runtimeConfig(install, { sessionGid, daemonTokenSha256 }) {
  * and checks this table; `secret` rows are generated only when missing.
  * type: dir | file (content written by the installer) | secret | exec | tmpfs-dir (tmpfiles.d)
  */
-export function permissionTable() {
+export function permissionTable(install = {}) {
+  const browserOnly = install.hostMode === "browser-only";
+  const daemonUser = browserOnly ? install.daemonUser : "agent";
+  const daemonGroup = browserOnly ? (install.daemonGroup ?? daemonUser) : "abp-session";
+  const tokenGroup = browserOnly ? daemonGroup : "agent";
   const row = (path, type, owner, group, mode, extra = {}) => ({ path, type, owner, group, mode, ...extra });
-  return [
-    row(PATHS.etc, "dir", "root", "root", "0700"),
+  const rows = [
+    row(PATHS.etc, "dir", "root", "root", browserOnly ? "0711" : "0700"),
     row(PATHS.installConfig, "file", "root", "root", "0600"),
     row(PATHS.runtimeConfig, "file", "root", "root", "0600"),
-    row(PATHS.daemonEnv, "file", "root", "root", "0644"),
+    row(browserOnly ? PATHS.browserOnlyEnv : PATHS.daemonEnv, "file", "root", "root", "0644"),
     row(PATHS.seccompProfile, "file", "root", "root", "0644"),
     row(PATHS.firewallRules[4], "file", "root", "root", "0644"),
     row(PATHS.firewallRules[6], "file", "root", "root", "0644"),
     row(PATHS.egressRules[4], "file", "root", "root", "0644"),
     row(PATHS.egressRules[6], "file", "root", "root", "0644"),
     // agent traverses to its token (abp-session); agent-sbx cannot enter.
-    row(PATHS.varLib, "dir", "root", "abp-session", "0710"),
-    row(PATHS.daemonToken, "secret", "agent", "agent", "0400", { secret: true }),
+    row(PATHS.varLib, "dir", "root", daemonGroup, "0710"),
+    row(PATHS.daemonToken, "secret", daemonUser, tokenGroup, "0400", { secret: true }),
     row(PATHS.secrets, "dir", "root", "root", "0711"),
     // Readable by the Runtime both before (root, via group 0) and after it drops to uid 10870.
     row(PATHS.runtimeSecrets, "dir", "abp-runtime", "root", "0550"),
@@ -322,27 +335,32 @@ export function permissionTable() {
     row(`${PATHS.browserSecrets}/vnc-password`, "secret", "abp-browser", "abp-browser", "0400", { secret: true }),
     row(PATHS.stackState, "file", "root", "root", "0600"),
     row(PATHS.happyDigest, "file", "root", "root", "0600"),
-    row(PATHS.run, "tmpfs-dir", "root", "abp-session", "0750"),
-    row(PATHS.mcp, "tmpfs-dir", "agent", "agent-sbx", "0710"),
-    row("/home/agent", "dir", "agent", "agent", "0700"),
-    row("/home/agent-sbx", "dir", "agent-sbx", "agent-sbx", "0700"),
-    row(PATHS.work, "dir", "agent", "abp-work", "2770"),
+    row(PATHS.run, "tmpfs-dir", "root", daemonGroup, "0750"),
     row(PATHS.libexec, "dir", "root", "root", "0755"),
     row(PATHS.launcher, "exec", "root", "root", "0755"),
-    row(PATHS.firewallReader, "exec", "root", "abp-session", "4750"),
+    row(PATHS.firewallReader, "exec", "root", daemonGroup, "4750"),
     row(`${PATHS.libexec}/abp-firewall`, "exec", "root", "root", "0755"),
     row(`${PATHS.libexec}/abp-stack.mjs`, "exec", "root", "root", "0644"),
     row(`${PATHS.libexec}/lib/abpPlan.mjs`, "exec", "root", "root", "0644"),
     row(PATHS.stackBin, "exec", "root", "root", "0755"),
+    row(PATHS.tmpfiles, "file", "root", "root", "0644"),
+  ];
+  if (!browserOnly) rows.push(
+    row(PATHS.mcp, "tmpfs-dir", "agent", "agent-sbx", "0710"),
+    row("/home/agent", "dir", "agent", "agent", "0700"),
+    row("/home/agent-sbx", "dir", "agent-sbx", "agent-sbx", "0700"),
+    row(PATHS.work, "dir", "agent", "abp-work", "2770"),
     row(PATHS.aplus, "dir", "root", "root", "0755"),
     row(PATHS.sandboxPolicy, "file", "root", "root", "0644"),
     row(PATHS.sudoers, "file", "root", "root", "0440"),
-    row(PATHS.tmpfiles, "file", "root", "root", "0644"),
-  ];
+  );
+  if (browserOnly) return rows.filter((entry) => entry.path !== PATHS.happyDigest && entry.path !== PATHS.launcher && entry.path !== PATHS.firewallReader);
+  return rows;
 }
 
 /** Ordered OUTPUT prefix of src/sandbox/sandboxPreflight.ts firewallRules (S1): installed before every other OUTPUT rule. */
-export function firewallRules(family, sandboxUid, proxyUid) {
+export function firewallRules(family, sandboxUid, proxyUid, { hostMode = "dedicated-host" } = {}) {
+  if (hostMode === "browser-only") return family === 4 ? ["-A OUTPUT -j ABP-FENCE"] : [];
   const sbx = `-A OUTPUT -m owner --uid-owner ${sandboxUid}`;
   const proxy = `-A OUTPUT -m owner --uid-owner ${proxyUid}`;
   const rules = family === 4 ? [`-A OUTPUT -d 127.0.0.1/32 -p tcp -m owner --uid-owner ${sandboxUid} -m tcp --dport 3128 -j ACCEPT`] : [];
@@ -354,8 +372,9 @@ export function firewallRules(family, sandboxUid, proxyUid) {
 }
 
 /** firewall.rules4/6: the S1 owner prefix, then (IPv4) the jump to the stack's admission fence chain. */
-export function firewallRulesFile(family, sandboxUid, proxyUid) {
-  return `${[...firewallRules(family, sandboxUid, proxyUid), ...family === 4 ? ["-A OUTPUT -j ABP-FENCE"] : []].join("\n")}\n`;
+export function firewallRulesFile(family, sandboxUid, proxyUid, options = {}) {
+  if (options.hostMode === "browser-only" && family === 6) return "# abp: no-ipv6-owner-rules\n";
+  return `${[...firewallRules(family, sandboxUid, proxyUid, options), ...options.hostMode === "browser-only" || family !== 4 ? [] : ["-A OUTPUT -j ABP-FENCE"]].join("\n")}\n`;
 }
 
 /**
@@ -427,11 +446,11 @@ export function sudoersDropIn() {
   ].join("\n");
 }
 
-export function tmpfilesConf() {
+export function tmpfilesConf({ hostMode = "dedicated-host", daemonUser = "agent", daemonGroup } = {}) {
   return [
     "# Managed by abp-install: Runtime broker/admin sockets and per-session MCP sockets.",
-    `d ${PATHS.run} 0750 root abp-session -`,
-    `d ${PATHS.mcp} 0710 agent agent-sbx -`,
+    `d ${PATHS.run} 0750 root ${hostMode === "browser-only" ? (daemonGroup ?? daemonUser) : "abp-session"} -`,
+    ...(hostMode === "browser-only" ? [] : [`d ${PATHS.mcp} 0710 agent agent-sbx -`]),
     "",
   ].join("\n");
 }
@@ -475,6 +494,16 @@ export function agentCredentials(raw) {
 }
 
 export function daemonEnv(install) {
+  if (install.hostMode === "browser-only") return [
+    "# Managed by abp-install. Existing Happy daemon environment; no sandbox policy is installed.",
+    `HAPPY_BROWSER_TASK_RUNTIME_URL=http://127.0.0.1:${install.runtimePort}`,
+    `HAPPY_BROWSER_TASK_BROKER_SOCKET=${PATHS.brokerSocket}`,
+    `HAPPY_BROWSER_TASK_DAEMON_TOKEN_FILE=${PATHS.daemonToken}`,
+    `HAPPY_BROWSER_TASK_TENANCY=${install.tenancyMode ?? "dedicated"}`,
+    ...install.tenancyMode === "shared" ? [] : [`HAPPY_BROWSER_TASK_PROFILE_ID=${install.agentProfileId}`],
+    "HAPPY_BROWSER_TASK_HOST_MODE=browser-only",
+    "",
+  ].join("\n");
   return [
     "# Managed by abp-install. No secret here: the daemon reads its broker token from the file below.",
     `HAPPY_BROWSER_TASK_RUNTIME_URL=http://127.0.0.1:${install.runtimePort}`,
@@ -497,17 +526,19 @@ export function daemonEnv(install) {
   ].join("\n");
 }
 
-export function systemdUnits({ happyPrefix = PATHS.happyPrefix } = {}) {
+export function systemdUnits({ happyPrefix = PATHS.happyPrefix, hostMode = "dedicated-host", install } = {}) {
+  hostMode = install?.hostMode ?? hostMode;
+  const browserOnly = hostMode === "browser-only";
   const packageDir = `${happyPrefix}/lib/node_modules/${PACKAGE_NAME}`;
   const unit = (lines) => `# Managed by abp-install.\n${lines.join("\n")}\n`;
-  return {
+  const units = {
     "abp-firewall.service": unit([
       "[Unit]",
-      "Description=Agent Browser owner firewall rules (agent-sbx, abp-proxy)",
+      `Description=Agent Browser ${browserOnly ? "Runtime admission fence" : "owner firewall rules (agent-sbx, abp-proxy)"}`,
       "DefaultDependencies=no",
       "After=local-fs.target",
       "Wants=network-pre.target",
-      "Before=network-pre.target abp-egress-proxy.service abp-stack.service abp-happy-daemon.service",
+      `Before=network-pre.target${browserOnly ? " abp-stack.service" : " abp-egress-proxy.service abp-stack.service abp-happy-daemon.service"}`,
       "",
       "[Service]",
       "Type=oneshot",
@@ -608,6 +639,11 @@ export function systemdUnits({ happyPrefix = PATHS.happyPrefix } = {}) {
       "WantedBy=multi-user.target",
     ]),
   };
+  if (browserOnly) {
+    delete units["abp-egress-proxy.service"];
+    delete units["abp-happy-daemon.service"];
+  }
+  return units;
 }
 
 /**
