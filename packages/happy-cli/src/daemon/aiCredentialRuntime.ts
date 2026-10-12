@@ -8,6 +8,7 @@ import { spawn as crossSpawn } from 'cross-spawn'
 import { verifyLocalAiAccounts, type VerificationIdentity } from './aiCredentialVerification'
 import { mergeCodexAccounts } from './aiCredentialAdditive'
 import { probeHappyCodex, type CodexRecoveryProbeResult } from './codexRecoveryProbe'
+import { codexStateRecoveryRoot } from '../codex/codexStateRecovery'
 import { CODEX_MULTI_AUTH_VERSION, isSupportedCodexMultiAuthVersion, SUPPORTED_CODEX_MULTI_AUTH_VERSION_RANGE } from '../utils/codexMultiAuthVersions'
 import { stagingParent } from './stagedCredentialRoot'
 import { spawn } from 'node:child_process'
@@ -108,7 +109,7 @@ type Supervisor = {
 }
 
 export type AiCredentialRuntimeDependencies = {
-  probeCodex?: (cwd: string) => Promise<CodexRecoveryProbeResult>
+  probeCodex?: typeof probeHappyCodex
   homeDir: string
   /** Happy machine identity used to bind server-side machine principal mutations. */
   machineId?: string
@@ -527,15 +528,34 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       ], async () => { await assertCodexLiveAccount(selected) })
       const cwd = await deps.makeTempDir()
       let probe: CodexRecoveryProbeResult
-      try { probe = await (deps.probeCodex ?? probeHappyCodex)(cwd) }
+      let stateRecovered = false
+      const stateRoot = codexStateRecoveryRoot(codexHome())
+      const recoveredState = join(stateRoot, String(applyGeneration))
+      try {
+        probe = await (deps.probeCodex ?? probeHappyCodex)(cwd)
+        // Authentication failures never change state storage. Diagnose a startup timeout by
+        // varying only SQLite storage, and retain it only after an actual Happy inference.
+        if (!probe.ok && probe.errorKind === 'CODEX_INITIALIZE_TIMEOUT' && !deps.env.CODEX_SQLITE_HOME?.trim()) {
+          await deps.mkdir(recoveredState, { recursive: true, mode: 0o700 })
+          try {
+            probe = await (deps.probeCodex ?? probeHappyCodex)(cwd, undefined, { CODEX_SQLITE_HOME: recoveredState })
+            stateRecovered = probe.ok
+          } finally {
+            if (!stateRecovered) await deps.rm(recoveredState, { recursive: true, force: true })
+          }
+        }
+      }
       finally { await deps.rm(cwd, { recursive: true, force: true }) }
       const liveAfterProbe = await readOptionalJson(authPath)
       if (!isObject(liveAfterProbe?.tokens) || liveAfterProbe.tokens.account_id !== selected.accountId
         || liveAfterProbe.tokens.access_token !== selected.accessToken || liveAfterProbe.tokens.refresh_token !== selected.refreshToken) {
+        if (stateRecovered) await deps.rm(recoveredState, { recursive: true, force: true })
         throw new AiCredentialRuntimeError('ACTIVE_ACCOUNT_CHANGED')
       }
+      if (stateRecovered) await writeAtomicFile(deps, join(stateRoot, 'current.json'), JSON.stringify({ version: 1, generation: applyGeneration }))
       return { provider: 'codex' as const, configured: probe.ok, applyGeneration,
         runtime: { transport: 'happy-app-server' as const, attempts: probe.attempts,
+          stateRecovered,
           authChanged: JSON.stringify(previousAuth) !== JSON.stringify(auth),
           rotationChanged: JSON.stringify(previousSettings) !== JSON.stringify(settings) },
         verification: { checkedAt: deps.now(), accounts: [{ account: 1, ok: probe.ok,

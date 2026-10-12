@@ -20,19 +20,20 @@ export function codexRecoveryErrorKind(error: unknown): string {
   return 'CODEX_RESPONSE_NOT_VERIFIED'
 }
 
-async function createClient(): Promise<ProbeClient> {
+async function createClient(environment?: { CODEX_SQLITE_HOME: string }): Promise<ProbeClient> {
   const { CodexAppServerClient } = await import('../codex/codexAppServerClient')
-  return new CodexAppServerClient()
+  return new CodexAppServerClient(undefined, undefined, undefined, undefined, undefined, undefined, false, environment)
 }
 
 /** Uses the actual Happy app-server adapter, including its managed rotation proxy. */
 export async function probeHappyCodex(
   cwd: string,
-  factory: () => ProbeClient | Promise<ProbeClient> = createClient,
+  factory: (environment?: { CODEX_SQLITE_HOME: string }) => ProbeClient | Promise<ProbeClient> = createClient,
+  environment?: { CODEX_SQLITE_HOME: string },
 ): Promise<CodexRecoveryProbeResult> {
   for (let attempts = 1; attempts <= 2; attempts++) {
     let client: ProbeClient
-    try { client = await factory() }
+    try { client = await factory(environment) }
     catch (error) { return { ok: false, errorKind: codexRecoveryErrorKind(error), attempts } }
     let timer: ReturnType<typeof setTimeout> | undefined
     let initialized = false

@@ -20,6 +20,12 @@ function client(failure?: string, completion: Record<string, unknown> = { type: 
 }
 
 describe('Happy Codex recovery probe', () => {
+  it('scopes a SQLite diagnostic override to the probe client factory', async () => {
+    const factory = vi.fn(() => client())
+    const environment = { CODEX_SQLITE_HOME: '/isolated/state' }
+    expect(await probeHappyCodex('/tmp/probe', factory, environment)).toMatchObject({ ok: true })
+    expect(factory).toHaveBeenCalledExactlyOnceWith(environment)
+  })
   it('requires a completed inference turn and a real reply through the Happy client', async () => {
     const instance = client()
     const result = await probeHappyCodex('/tmp/probe', () => instance)

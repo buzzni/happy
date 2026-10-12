@@ -185,15 +185,60 @@ describe('AI credential machine runtime', () => {
     expect(probeCodex).toHaveBeenCalledOnce()
   })
 
+  it('recovers an initialization timeout only after an isolated SQLite Happy response, preserving original databases', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn().mockResolvedValueOnce({ ok: false, errorKind: 'CODEX_INITIALIZE_TIMEOUT', attempts: 2 })
+      .mockResolvedValueOnce({ ok: true, model: 'gpt-6.1-sol', attempts: 1 })
+    const configured = setup({ probeCodex })
+    configured.files.set('/home/operator/.codex/state_5.sqlite', 'original database')
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    expect(result).toMatchObject({ configured: true, runtime: { stateRecovered: true } })
+    expect(probeCodex).toHaveBeenNthCalledWith(2, expect.any(String), undefined,
+      { CODEX_SQLITE_HOME: '/home/operator/.codex/happy-runtime-state/1' })
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/happy-runtime-state/current.json')!)).toEqual({ version: 1, generation: 1 })
+    expect(configured.files.get('/home/operator/.codex/state_5.sqlite')).toBe('original database')
+  })
+
   it('returns an authentication failure rather than configured success when the Happy response fails', async () => {
     const source = codexMultiAuthBundle()
     const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
-    const configured = setup({ probeCodex: vi.fn(async () => ({ ok: false as const, errorKind: 'CODEX_AUTHENTICATION_FAILED', attempts: 1 })) })
+    const probeCodex = vi.fn(async () => ({ ok: false as const, errorKind: 'CODEX_AUTHENTICATION_FAILED', attempts: 1 }))
+    const configured = setup({ probeCodex })
     const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
     expect(result.configured).toBe(false)
     expect(result.verification.accounts[0]).toMatchObject({ ok: false, errorKind: 'CODEX_AUTHENTICATION_FAILED' })
     expect(JSON.stringify(result)).not.toContain('access-a')
     expect(JSON.stringify(result)).not.toContain('refresh-a')
+    expect(probeCodex).toHaveBeenCalledOnce()
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/current.json')).toBe(false)
+  })
+
+  it.each([false, true])('does not commit isolated state without a verified response or over explicit SQLite configuration (%s)', async explicit => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn().mockResolvedValue({ ok: false, errorKind: 'CODEX_INITIALIZE_TIMEOUT', attempts: 2 })
+    const configured = setup({ probeCodex, env: explicit ? { CODEX_SQLITE_HOME: '/explicit/state' } : {} })
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    expect(result).toMatchObject({ configured: false, runtime: { stateRecovered: false } })
+    expect(probeCodex).toHaveBeenCalledTimes(explicit ? 1 : 2)
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/current.json')).toBe(false)
+  })
+
+  it('does not retain recovered state when the active login changes during the isolated response', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn().mockResolvedValueOnce({ ok: false, errorKind: 'CODEX_INITIALIZE_TIMEOUT', attempts: 2 })
+      .mockImplementationOnce(async () => {
+        configured.files.set('/home/operator/.codex/auth.json', JSON.stringify({ tokens: { account_id: 'changed' } }))
+        return { ok: true, model: 'gpt-6.1-sol', attempts: 1 }
+      })
+    const configured = setup({ probeCodex })
+    configured.files.set('/home/operator/.codex/happy-runtime-state/1/test.sqlite', 'probe state')
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) }))
+      .rejects.toMatchObject({ kind: 'ACTIVE_ACCOUNT_CHANGED' })
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/current.json')).toBe(false)
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/1/test.sqlite')).toBe(false)
   })
 
   it('does not accept a Happy response after another login replaced the selected authentication', async () => {
