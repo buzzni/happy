@@ -1952,7 +1952,6 @@ describe('AI credential machine runtime', () => {
 
     expect(calls.map(({ command, args }) => [command, args])).toEqual([
       ['uv', ['--version']],
-      ['uv', ['python', 'find', '>=3.12']],
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
@@ -3011,7 +3010,6 @@ describe('AI credential machine runtime', () => {
 
     expect(calls.map(({ command, args }) => [command, args])).toEqual([
       ['uv', ['--version']],
-      ['uv', ['python', 'find', '>=3.12']],
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
