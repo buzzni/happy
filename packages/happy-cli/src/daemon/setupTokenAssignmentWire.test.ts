@@ -51,4 +51,15 @@ describe('setup-token assignment wire', () => {
     const wrongProvider = sealSetupTokenAssignment(context({ provider: 'codex' as 'claude' }), recipient.publicKey)
     expect(() => openSetupTokenAssignment(wrongProvider, recipient, 1_000)).toThrow('SETUP_TOKEN_SEALED_CONTEXT_INVALID')
   })
+
+  it('opens a machine-principal context only when it names the machine as its principal', () => {
+    const recipient = createSetupTokenAssignmentRecipient()
+    const machine = context({ principalType: 'machine', userId: 'machine-1' })
+    expect(openSetupTokenAssignment(sealSetupTokenAssignment(machine, recipient.publicKey), recipient, 1_000)).toEqual(machine)
+
+    const otherPrincipal = sealSetupTokenAssignment(context({ principalType: 'machine', userId: 'user-1' }), recipient.publicKey)
+    expect(() => openSetupTokenAssignment(otherPrincipal, recipient, 1_000)).toThrow('SETUP_TOKEN_SEALED_CONTEXT_INVALID')
+    const userPrincipal = sealSetupTokenAssignment(context({ principalType: 'user' as 'machine' }), recipient.publicKey)
+    expect(() => openSetupTokenAssignment(userPrincipal, recipient, 1_000)).toThrow('SETUP_TOKEN_SEALED_CONTEXT_INVALID')
+  })
 })

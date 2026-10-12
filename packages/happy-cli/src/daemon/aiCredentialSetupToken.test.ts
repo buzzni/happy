@@ -51,7 +51,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -60,14 +60,19 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
   const execFile = vi.fn(async (command: string, args: string[]): Promise<AiCredentialCommandResult> => {
     calls.push({ command, args })
     if (command === 'cswap' && kind === 'missing') throw Object.assign(new Error('not found'), { kind: 'COMMAND_NOT_AVAILABLE' })
-    if (command === 'cswap' && args[0] === '--version') return { stdout: 'cswap 0.27.0b1', stderr: '' }
+    if (command === 'cswap' && args[0] === '--version') return { stdout: `cswap ${options.cswapVersion ?? '0.27.0b1'}`, stderr: '' }
+    if (command === 'uv' && args[0] === 'python' && options.noUvPython) {
+      if (args[1] === 'dir') return { stdout: 'C:\\Users\\operator\\AppData\\Roaming\\uv\\python\r\n', stderr: '' }
+      throw Object.assign(new Error('No interpreter found for Python >=3.12'), { kind: 'COMMAND_FAILED' })
+    }
     if (command === 'cswap' && args[0] === 'token-runtime') {
       if (kind !== 'marked') throw Object.assign(new Error('unknown command'), { kind: 'COMMAND_FAILED' })
       if (args[1] === 'status') return { stdout: options.tokenRuntimeStatus ?? JSON.stringify({ version: 1, artifact: 'saycode-setup-token-runtime-v1', accounts: [] }), stderr: '' }
       return { stdout: options.capabilities ? JSON.stringify(options.capabilities) : MARKER, stderr: '' }
     }
     if (command === 'cswap' && args[0] === 'list' && options.listFails) throw Object.assign(new Error('list failed'), { kind: 'COMMAND_FAILED' })
-    if (command === 'cswap' && args[0] === 'list') return { stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber: state.active,
+    // cswap keeps activeAccountNumber when the active slot is removed; it reads as active again once that number exists.
+    if (command === 'cswap' && args[0] === 'list') return { stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber: state.slots.some(slot => slot.number === state.active) ? state.active : null,
       accounts: state.slots.map(({ credentials: _c, config: _f, ...row }) => ({ ...row, active: row.number === state.active })) }), stderr: '' }
     if (command === 'cswap' && args[0] === 'export' && options.clock && options.advanceOnExport) options.clock.now += options.advanceOnExport
     if (command === 'cswap' && args[0] === 'export') return { stdout: JSON.stringify({ version: 1, encrypted: false, accounts: state.slots }), stderr: '' }
@@ -76,7 +81,11 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       for (const account of envelope.accounts) {
         const index = state.slots.findIndex(slot => slot.email === account.email)
         const metadata = kind === 'marked' ? Object.fromEntries(MANAGED_FIELDS.filter(key => key in account).map(key => [key, account[key]])) : {}
-        const slot = { number: index >= 0 ? state.slots[index]!.number : state.slots.length + 1, email: account.email, organizationUuid: '',
+        // Like cswap (transfer.py), --force included: an import never changes whether a slot of that email is managed.
+        if (kind === 'marked' && index >= 0 && state.slots[index]!.managedAccountId !== metadata.managedAccountId
+          && (state.slots[index]!.managedAccountId || metadata.managedAccountId)) throw Object.assign(new Error('managed identity conflict'), { kind: 'COMMAND_FAILED' })
+        const free = (n: number) => !state.slots.some(slot => slot.number === n)
+        const slot = { number: index >= 0 ? state.slots[index]!.number : free(account.number) ? account.number : Math.max(0, ...state.slots.map(row => row.number)) + 1, email: account.email, organizationUuid: '',
           usageStatus: 'unavailable', credentials: account.credentials, config: account.config, ...metadata }
         // Like cswap, --force rewrites the account record and so drops its disabled flag.
         if (index < 0) state.slots.push(slot); else if (args.includes('--force') && !options.ignoreForce) state.slots[index] = slot
@@ -85,7 +94,6 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
     }
     if (command === 'cswap' && args[0] === 'remove') {
       state.slots = state.slots.filter(slot => slot.number !== Number(args[1]))
-      if (state.active === Number(args[1])) state.active = null
       return { stdout: '', stderr: '' }
     }
     if (command === 'cswap' && args[0] === 'disable') { state.slots.find(slot => slot.number === Number(args[1]))!.disabled = true; return { stdout: '', stderr: '' } }
@@ -104,7 +112,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       if (path.includes('setup-token-binding-nonces') && options.clock && options.advanceOnNonceWrite) options.clock.now += options.advanceOnNonceWrite
       files.set(path, content)
     }),
-    readdir: vi.fn(async () => []), mkdir: vi.fn(async () => undefined),
+    readdir: vi.fn(async () => { if (options.noUvPython) throw Object.assign(new Error('ENOENT: no such file or directory, scandir'), { code: 'ENOENT' }); return [] }), mkdir: vi.fn(async () => undefined),
     rename: vi.fn(async (from: string, to: string) => { if (to.includes('setup-token-binding-nonces')) syncEvents.push('rename:' + to); files.set(to, files.get(from)!); files.delete(from) }),
     chmod: vi.fn(async () => undefined), rm: vi.fn(async (path: string) => { files.delete(path) }),
     makeTempDir: vi.fn(async () => '/tmp/happy-setup-token-fixed'),
@@ -180,6 +188,31 @@ describe('sealed setup-token group assignment', () => {
     expect(await machine.runtime.groupReceipt('company-1', 'claude')).toMatchObject({ assignmentGeneration: 2, leaseId: 'lease-1' })
   })
 
+  it('installs a shared machine assignment under the machine principal and refuses a relabelled principal', async () => {
+    const machine = fakeMachine([], null, { machineId: 'machine-1' })
+    const recipient = createSetupTokenAssignmentRecipient()
+    const context = (principal: 'machine' | 'user') => ({
+      version: 1 as const, scope: 'company-1', userId: principal === 'machine' ? 'machine-1' : 'user-1', machineId: 'machine-1',
+      provider: 'claude' as const, generation: 1, fingerprint: '1'.padStart(64, '0'), leaseId: 'lease-1', expiresAt: NOW + 10_000,
+      payload: payload(managed(A, 1, fakeToken('shared'))), ...(principal === 'machine' ? { principalType: 'machine' as const } : {}),
+    })
+    const outer = (principal: 'machine' | 'user') => ({
+      version: 1, scope: 'company-1', provider: 'claude', credentialType: 'setup_token', machineId: 'machine-1', generation: 1,
+      fingerprint: '1'.padStart(64, '0'), payload: null, ...(principal === 'machine' ? { principalType: 'machine' } : { userId: 'user-1' }),
+    })
+    await expect(machine.runtime.setupTokenGroupSync({ ...outer('user'), sealedPayload: sealSetupTokenAssignment(context('machine'), recipient.publicKey) },
+      'machine-1', recipient)).rejects.toThrow('AI_GROUP_CONTEXT_CONFLICT')
+    await expect(machine.runtime.setupTokenGroupSync({ ...outer('machine'), sealedPayload: sealSetupTokenAssignment(context('user'), recipient.publicKey) },
+      'machine-1', recipient)).rejects.toThrow('AI_GROUP_CONTEXT_CONFLICT')
+
+    const receipt = await machine.runtime.setupTokenGroupSync({ ...outer('machine'), sealedPayload: sealSetupTokenAssignment(context('machine'), recipient.publicKey) },
+      'machine-1', recipient)
+    expect(receipt).toMatchObject({ principalType: 'machine', machineId: 'machine-1', reconciled: true, leaseId: 'lease-1',
+      appliedCredentials: [{ managedAccountId: A, credentialGeneration: 1 }] })
+    expect(await machine.runtime.groupReceipt('company-1', 'claude', { principalType: 'machine', machineId: 'machine-1' })).toMatchObject({ leaseId: 'lease-1' })
+    expect(await machine.runtime.groupReceipt('company-1', 'claude')).toBeNull()
+  })
+
   it('fails closed on the assignment kill switch before probing or changing credentials', async () => {
     const machine = fakeMachine([], null, { env: { APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH: 'on' } })
     const recipient = createSetupTokenAssignmentRecipient()
@@ -220,6 +253,33 @@ describe('managed Claude setup-token runtime', () => {
     expect(spawn).not.toHaveBeenCalled()
     expect(command.mock.calls.some(([args]) => args[0] === 'new-window')).toBe(false)
     await expect(runtime.launchSession(env, spawn)).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
+  })
+
+  it('launches an unbound session on a shared machine with the setup-token assigned to that machine', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    const shared = (generation: number, token: string) => runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1',
+      provider: 'claude', generation, fingerprint: String(generation).padStart(64, '0'), payload: payload(managed(A, generation, token)) })
+    await shared(1, fakeToken('shared-1'))
+
+    const env = await runtime.sessionEnvironment('claude')
+    expect(env).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('shared-1'), HAPPY_AI_AUTH_SOURCE: 'org-bundle', ANTHROPIC_API_KEY: '' })
+    expect(env).not.toHaveProperty('HAPPY_AI_AUTH_SETUP_TOKEN_BINDING')
+    const spawn = vi.fn(() => 'started')
+    await expect(runtime.launchSession(env, spawn)).resolves.toBe('started')
+
+    // The token replaced between preparation and launch is a different credential.
+    const stale = await runtime.sessionEnvironment('claude')
+    await shared(2, fakeToken('shared-2'))
+    await expect(runtime.launchSession(stale, spawn)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_STALE')
+    expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps refusing an unbound session while a user assignment desires a setup-token, even on a shared machine', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('shared'))) })
+    await runtime.groupSync(sync(1, payload(managed(B, 1, fakeToken('user')))))
+    await expect(runtime.sessionEnvironment('claude')).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
   })
 
   it('preserves machine-personal, non-Claude and prepared ZAI bypasses at final launch', async () => {
@@ -353,9 +413,67 @@ describe('managed Claude setup-token runtime', () => {
     expect(calls.filter(call => call.args[0] === 'import').map(call => call.args.includes('--force'))).toEqual([false, true, true])
   })
 
+  // 2026-10-12 hmrepo: the live Claude login was a managed account whose cswap slot was gone; the personal capture
+  // re-added it without managed metadata and every later group apply refused it as managed-id-mismatch.
+  it('does not capture a live managed login as a personal account; the group installs it as managed', async () => {
+    const files = new Map<string, string>([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: managedSetupTokenEmail(A) } })],
+      ['/home/operator/.claude/.credentials.json', JSON.stringify({ claudeAiOauth: { accessToken: fakeToken('live') } })]])
+    const { runtime, state, calls } = fakeMachine([], null, { files })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
+    expect(state.slots).toEqual([expect.objectContaining({ email: managedSetupTokenEmail(A), managedAccountId: A, credentialGeneration: 1 })])
+  })
+
+  it('restores its own managed slot that lost its managed metadata instead of refusing it', async () => {
+    const { runtime, state } = fakeMachine([], null)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = state.slots[0]!
+    state.slots[0] = bare as typeof state.slots[0]
+    await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('b')))))
+    expect(state.slots[0]).toMatchObject({ email: managedSetupTokenEmail(A), managedAccountId: A, credentialGeneration: 2,
+      credentials: { claudeAiOauth: { accessToken: fakeToken('b') } } })
+  })
+
+  // 2026-10-12 hmrepo: the restore above used `import --force`, which cswap refuses for a bare slot of a managed email
+  // ('managed identity conflict') — COMMAND_FAILED on every apply. The bare slot is removed and imported again.
+  it('restores the active bare slot of its own managed account by removing and importing it, and keeps it active', async () => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { runtime, state, calls } = fakeMachine([personal], 1)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    state.active = 2
+    state.slots[1]!.disabled = true
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = state.slots[1]!
+    state.slots[1] = bare as typeof state.slots[1]
+    calls.length = 0
+    await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('b')))))
+    const restoredSlot = state.slots.find(slot => slot.email === managedSetupTokenEmail(A))!
+    expect(restoredSlot).toMatchObject({ managedAccountId: A, credentialGeneration: 2, disabled: true, credentials: { claudeAiOauth: { accessToken: fakeToken('b') } } })
+    expect(state.active).toBe(restoredSlot.number)
+    expect(state.slots.find(slot => slot.number === 1)).toEqual(personal)
+    expect(calls.filter(call => call.command === 'cswap' && ['remove', 'import'].includes(call.args[0]!)).map(call => [call.args[0], call.args.includes('--force')]))
+      .toEqual([['remove', false], ['import', false]])
+  })
+
+  // 2026-10-12 hmrepo: Desktop installed cswap on its own pinned Python, which uv cannot discover. The daemon still looked
+  // for a uv Python before every apply and failed on the missing uv python folder (AI_GROUP_SYNC_FAILED, Error:ENOENT).
+  it('applies with an installed current claude-swap without needing a Python that uv can find', async () => {
+    const { runtime, state, calls } = fakeMachine([], null, { cswapVersion: '0.27.0b2', noUvPython: true })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    expect(state.slots).toEqual([expect.objectContaining({ managedAccountId: A, credentialGeneration: 1 })])
+    expect(installs(calls)).toEqual([])
+    expect(calls.some(call => call.command === 'uv' && call.args[0] === 'python')).toBe(false)
+  })
+
+  it('reports a missing uv Python folder as the original lookup failure when claude-swap must be installed', async () => {
+    const { runtime, calls } = fakeMachine([], null, { cswapVersion: '0.26.0', noUvPython: true })
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))).rejects.not.toMatchObject({ failureCause: 'Error:ENOENT' })
+    expect(installs(calls)).toEqual([])
+  })
+
   it('never takes over a personally imported slot with the same synthetic email', async () => {
     const { runtime, state, calls } = fakeMachine([stored(A, 1, fakeToken('personal'))], 2)
-    await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')))))).rejects.toThrow('AI_GROUP_CREDENTIAL_CONFLICT')
+    // 2026-10-12 hmrepo: the conflict did not say which check refused, so the daemon log could not tell a takeover from a stale journal.
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')))))).rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
     expect(state.slots[0]!.credentials).toEqual(managed(A, 1, fakeToken('personal')).credentials)
     expect(calls.some(call => call.args[0] === 'import')).toBe(false)
   })
@@ -745,7 +863,7 @@ describe('managed Claude setup-token runtime', () => {
     const { runtime, state } = fakeMachine([], null)
     await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
     const other = { ...sync(1, payload(managed(A, 2, fakeToken('b')))), scope: 'company-2' }
-    await expect(runtime.groupSync(other)).rejects.toThrow('AI_GROUP_CREDENTIAL_CONFLICT')
+    await expect(runtime.groupSync(other)).rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
     // Unassigning the second scope leaves the first scope's slot in place.
     await runtime.groupSync({ ...sync(2, null as never), scope: 'company-2', payload: null })
     expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A])

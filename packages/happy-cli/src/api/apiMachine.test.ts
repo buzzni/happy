@@ -715,6 +715,20 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(runtime.status).not.toHaveBeenCalled();
     });
 
+    it('routes Codex recovery through the credential runtime without logging its payload', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        const repairCodex = vi.fn(async () => ({ provider: 'codex', configured: true }));
+        client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(),
+            portRegistry: {} as any, aiCredentialRuntime: { repairCodex } as any });
+        const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls
+            .find(([method]: [string]) => method === 'ai-credential:repair-codex')?.[1];
+        expect(handler).toBeTypeOf('function');
+        const input = { provider: 'codex', payload: 'encrypted-transport-only-secret' };
+        await expect(handler(input)).resolves.toEqual({ provider: 'codex', configured: true });
+        expect(repairCodex).toHaveBeenCalledExactlyOnceWith(input);
+        expect(JSON.stringify([vi.mocked(logger.debug).mock.calls, vi.mocked(logger.debugLargeJson).mock.calls])).not.toContain(input.payload);
+    });
+
     it('exposes additive credential capability without receiving credentials', async () => {
         const client = new ApiMachineClient('fake-token', makeMachine());
         const capabilities = vi.fn(() => ({ version: 1, applyModes: ['merge', 'replace'] }));
@@ -743,7 +757,7 @@ describe('ApiMachineClient socket reconnection', () => {
         };
         const first = await makeClient()();
         const second = await makeClient()();
-        expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
+        expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, sharedMachineSetupTokenVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect(second).toMatchObject({ setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect((first.setupTokenRecipient as { keyId: string }).keyId).not.toBe((second.setupTokenRecipient as { keyId: string }).keyId);
     });

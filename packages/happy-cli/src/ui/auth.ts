@@ -345,10 +345,13 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     // 의 has-local-sessions 게이트). best-effort — 실패는 legacy 로 계속.
     try {
         const backupPath = `${configuration.privateKeyFile}.legacy-backup`;
-        // 되돌림은 원본을 바이트 그대로 복원하므로, 백업의 secret 이 지금 것과 같을 때만 이 신원이 되돌린 흔적이다.
-        // 재등록은 이전 신원의 백업을 남긴다 — 그것은 낡은 파일이고 승격 시 이 신원의 원본으로 덮어쓴다.
-        const ownBackup = credentials.encryption.type === 'legacy'
-            && readBackupSecret(backupPath) === encodeBase64(credentials.encryption.secret);
+        // 되돌림은 원본을 바이트 그대로 복원하므로, 백업의 secret 과 machineKey 가 모두 지금 것과 같을 때만 이 신원이
+        // 되돌린 흔적이다. 조직 PC 재등록은 계정의 같은 token·secret 에 새 machineKey 만 받는다(2026-10-12 hmrepo) —
+        // 이전 신원의 백업은 낡은 파일이고 승격 시 이 신원의 원본으로 덮어쓴다.
+        const backup = readBackupIdentity(backupPath);
+        const ownBackup = credentials.encryption.type === 'legacy' && !!credentials.encryption.provisioned
+            && backup.secret === encodeBase64(credentials.encryption.secret)
+            && backup.machineKey === encodeBase64(credentials.encryption.provisioned.machineKey);
         const plan = planDataKeyOnboarding({
             credentials,
             accountPublicKey: settings.accountPublicKey ?? null,
@@ -379,11 +382,14 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     return { credentials, machineId: settings.machineId!, serverPublicKey: settings.serverPublicKey ?? null };
 }
 
-function readBackupSecret(path: string): string | null {
+function readBackupIdentity(path: string): { secret: string | null; machineKey: string | null } {
     try {
-        const secret = (JSON.parse(readFileSync(path, 'utf8')) as { secret?: unknown }).secret;
-        return typeof secret === 'string' ? secret : null;
+        const backup = JSON.parse(readFileSync(path, 'utf8')) as { secret?: unknown; encryption?: { machineKey?: unknown } };
+        return {
+            secret: typeof backup.secret === 'string' ? backup.secret : null,
+            machineKey: typeof backup.encryption?.machineKey === 'string' ? backup.encryption.machineKey : null,
+        };
     } catch {
-        return null;
+        return { secret: null, machineKey: null };
     }
 }

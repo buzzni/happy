@@ -11,6 +11,7 @@ const {
     mockSpawn,
     mockPrepareCodexMultiAuthProxy,
     mockProxyCleanup,
+    mockResolveCodexStateEnvironment,
 } = vi.hoisted(() => ({
     mockExecSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
@@ -20,7 +21,10 @@ const {
     mockSpawn: vi.fn(),
     mockPrepareCodexMultiAuthProxy: vi.fn(),
     mockProxyCleanup: vi.fn(),
+    mockResolveCodexStateEnvironment: vi.fn(async env => env),
 }));
+
+vi.mock('./codexStateRecovery', () => ({ resolveCodexStateEnvironment: mockResolveCodexStateEnvironment }));
 
 vi.mock('node:child_process', () => ({
     execSync: mockExecSync,
@@ -147,6 +151,7 @@ describe('CodexAppServerClient sandbox integration', () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        mockResolveCodexStateEnvironment.mockImplementation(async env => env);
         process.env.RUST_LOG = originalRustLog;
         mockExecSync.mockReturnValue('codex-cli 0.107.0');
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
@@ -159,6 +164,49 @@ describe('CodexAppServerClient sandbox integration', () => {
 
     afterAll(() => {
         process.env.RUST_LOG = originalRustLog;
+    });
+
+    it('uses verified state recovery for subsequent Happy launches and permits a scoped diagnostic override', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        mockResolveCodexStateEnvironment.mockImplementation(async env => ({ ...env, CODEX_SQLITE_HOME: env.CODEX_SQLITE_HOME || '/verified/state' }));
+        const normal = new CodexAppServerClient();
+        await normal.connect();
+        expect(mockSpawn.mock.calls[0][2].env.CODEX_SQLITE_HOME).toBe('/verified/state');
+        await normal.disconnect();
+        const diagnostic = new CodexAppServerClient(undefined, undefined, undefined, undefined, undefined, undefined, false, { CODEX_SQLITE_HOME: '/diagnostic/state' });
+        await diagnostic.connect();
+        expect(mockSpawn.mock.calls[1][2].env.CODEX_SQLITE_HOME).toBe('/diagnostic/state');
+        expect(process.env.CODEX_SQLITE_HOME).not.toBe('/diagnostic/state');
+        await diagnostic.disconnect();
+    });
+
+    it.each(['completed', 'failed'])('verifies recovery through the real Happy adapter after a final-answer fallback (%s)', async status => {
+        const requests: MockRpcMessage[] = [];
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            requests.push(msg);
+            if (msg.method === 'thread/start') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'probe-thread' }, model: 'gpt-6.1-sol' } });
+            if (msg.method === 'turn/start') {
+                setTimeout(() => {
+                    pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'probe-turn' } } });
+                    pushJsonLine(stdout, { method: 'turn/started', params: { threadId: 'probe-thread', turn: { id: 'probe-turn' } } });
+                    pushJsonLine(stdout, { method: 'item/completed', params: { threadId: 'probe-thread', turnId: 'probe-turn', item: { id: 'reply', type: 'agentMessage', phase: 'final_answer', text: 'SHARED_AI_OK' } } });
+                    // Later than the client's 250 ms UI completion fallback.
+                    setTimeout(() => pushJsonLine(stdout, { method: 'turn/completed', params: { threadId: 'probe-thread', turn: { id: 'probe-turn', status, error: status === 'failed' ? { message: 'private provider failure' } : null } } }), 500);
+                }, 0);
+            }
+        } });
+        mockSpawn.mockReturnValue(proc);
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({ args: ['-c', 'managed-proxy'], env: { PROBE_ROUTE: 'managed' }, cleanup: mockProxyCleanup });
+        const { probeHappyCodex } = await import('../daemon/codexRecoveryProbe');
+        const result = await probeHappyCodex('/tmp/happy-recovery');
+        expect(result.ok).toBe(status === 'completed');
+        expect(requests.find(request => request.method === 'thread/start')?.params).toMatchObject({ cwd: '/tmp/happy-recovery', approvalPolicy: 'never', sandbox: 'read-only', model: 'gpt-6.1-sol' });
+        expect(requests.some(request => request.method === 'turn/start')).toBe(true);
+        expect(mockPrepareCodexMultiAuthProxy).toHaveBeenCalledOnce();
+        expect(mockSpawn.mock.calls[0][2].env.PROBE_ROUTE).toBe('managed');
+        expect(mockProxyCleanup).toHaveBeenCalledOnce();
+        expect(proc.kill).toHaveBeenCalled();
+        expect(JSON.stringify(result)).not.toContain('private provider failure');
     });
 
     it('retains host recall ownership on reconnect without mutating the parent environment', async () => {

@@ -22,6 +22,7 @@ import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { nativeCodexRecallOwnershipOverrides } from '@/memory/nativeCodexRecallOwnership';
 import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroundTasks';
 import { readCodexOutput } from './codexOutputReader';
+import { resolveCodexStateEnvironment } from './codexStateRecovery';
 import type {
     InitializeParams,
     NewConversationParams,
@@ -440,6 +441,7 @@ export class CodexAppServerClient {
         markTurnDispatched?: () => void,
         /** Host-only decision retained across reconnects; never a user/provider override. */
         private readonly recallHostPrepared = false,
+        private readonly startupEnvironment?: { CODEX_SQLITE_HOME: string },
     ) {
         this.sandboxConfig = sandboxConfig;
         this.sandboxPolicyMode = sandboxPolicyMode;
@@ -1083,6 +1085,7 @@ export class CodexAppServerClient {
         for (const [key, value] of Object.entries(process.env)) {
             if (typeof value === 'string') env[key] = value;
         }
+        env = await resolveCodexStateEnvironment({ ...env, ...this.startupEnvironment });
         if (!this.managedProviderArgs) {
             // Account rotation swaps in another account's proxy, its own
             // client key and its own base URL. For a managed run that is a

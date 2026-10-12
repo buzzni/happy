@@ -147,6 +147,170 @@ function setup(
 }
 
 describe('AI credential machine runtime', () => {
+  it('captures the working live Codex login into a recovery snapshot without changing the source files', async () => {
+    const current = codexMultiAuthBundle()
+    const token = (sub: string) => `header.${Buffer.from(JSON.stringify({ sub, exp: 9999999999 })).toString('base64url')}.signature`
+    current.accounts.accounts[0]!.accessToken = token('same-user')
+    const live = { tokens: { account_id: 'workspace-live', access_token: token('same-user'), refresh_token: 'latest-refresh', id_token: token('same-user') }, last_refresh: '2026-10-12T00:00:00Z' }
+    const configured = setup({ execFile: vi.fn(async (command, args) => {
+      if (command === 'codex') return { stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"SHARED_AI_OK"}}\n{"type":"turn.completed"}', stderr: '', exitCode: 0 }
+      return { stdout: command === 'npm' ? '/global/node_modules' : '2.16.0', stderr: '' }
+    }) })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(current.accounts))
+    configured.files.set('/home/operator/.codex/auth.json', JSON.stringify(live))
+    const result = await configured.runtime.capture({ provider: 'codex', codexRecovery: true })
+    const captured = JSON.parse(result.payload)
+    expect(captured.accounts.accounts[0]).toMatchObject({ accountId: 'workspace-live', refreshToken: 'latest-refresh' })
+    expect(captured.recoveryAuth.tokens).toEqual(live.tokens)
+    expect(configured.files.get('/home/operator/.codex/auth.json')).toBe(JSON.stringify(live))
+    expect(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')).toBe(JSON.stringify(current.accounts))
+  })
+
+  it('repairs Codex pool, live auth and rotation settings before verifying through Happy, preserving unrelated accounts', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'latest-access', refresh_token: 'latest-refresh', id_token: 'id-token' } }
+    source.accounts.accounts[0] = { ...source.accounts.accounts[0]!, accessToken: 'latest-access', refreshToken: 'latest-refresh' }
+    const probeCodex = vi.fn(async () => ({ ok: true as const, model: 'gpt-6.1-sol' as const, attempts: 1 }))
+    const configured = setup({ probeCodex })
+    const local = codexMultiAuthBundle().accounts
+    local.accounts.push({ accountId: 'personal', email: 'personal@example.com', accessToken: 'personal-access', refreshToken: 'personal-refresh', addedAt: 1, lastUsed: 1 })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(local))
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    expect(result).toMatchObject({ provider: 'codex', configured: true, verification: { accounts: [{ account: 1, ok: true, model: 'gpt-6.1-sol' }] }, runtime: { transport: 'happy-app-server', attempts: 1 } })
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/auth.json')!).tokens).toEqual(recoveryAuth.tokens)
+    const pool = JSON.parse(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')!)
+    expect(pool.accounts[pool.activeIndex]).toMatchObject({ accessToken: 'latest-access', refreshToken: 'latest-refresh' })
+    expect(pool.accounts.find((account: { accountId: string }) => account.accountId === 'personal')).toEqual(local.accounts[3])
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/multi-auth/settings.json')!).pluginConfig.codexRuntimeRotationProxy).toBe(true)
+    expect(probeCodex).toHaveBeenCalledOnce()
+  })
+
+  it('recovers an initialization timeout only after an isolated SQLite Happy response, preserving original databases', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn().mockResolvedValueOnce({ ok: false, errorKind: 'CODEX_INITIALIZE_TIMEOUT', attempts: 2 })
+      .mockResolvedValueOnce({ ok: true, model: 'gpt-6.1-sol', attempts: 1 })
+    const configured = setup({ probeCodex })
+    configured.files.set('/home/operator/.codex/state_5.sqlite', 'original database')
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    expect(result).toMatchObject({ configured: true, runtime: { stateRecovered: true } })
+    expect(probeCodex).toHaveBeenNthCalledWith(2, expect.any(String), undefined,
+      { CODEX_SQLITE_HOME: '/home/operator/.codex/happy-runtime-state/1' })
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/happy-runtime-state/current.json')!)).toEqual({ version: 1, generation: 1 })
+    expect(configured.files.get('/home/operator/.codex/state_5.sqlite')).toBe('original database')
+  })
+
+  it('returns an authentication failure rather than configured success when the Happy response fails', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn(async () => ({ ok: false as const, errorKind: 'CODEX_AUTHENTICATION_FAILED', attempts: 1 }))
+    const configured = setup({ probeCodex })
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    expect(result.configured).toBe(false)
+    expect(result.verification.accounts[0]).toMatchObject({ ok: false, errorKind: 'CODEX_AUTHENTICATION_FAILED' })
+    expect(JSON.stringify(result)).not.toContain('access-a')
+    expect(JSON.stringify(result)).not.toContain('refresh-a')
+    expect(probeCodex).toHaveBeenCalledOnce()
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/current.json')).toBe(false)
+  })
+
+  it.each([false, true])('does not commit isolated state without a verified response or over explicit SQLite configuration (%s)', async explicit => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn().mockResolvedValue({ ok: false, errorKind: 'CODEX_INITIALIZE_TIMEOUT', attempts: 2 })
+    const configured = setup({ probeCodex, env: explicit ? { CODEX_SQLITE_HOME: '/explicit/state' } : {} })
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    expect(result).toMatchObject({ configured: false, runtime: { stateRecovered: false } })
+    expect(probeCodex).toHaveBeenCalledTimes(explicit ? 1 : 2)
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/current.json')).toBe(false)
+  })
+
+  it('does not retain recovered state when the active login changes during the isolated response', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn().mockResolvedValueOnce({ ok: false, errorKind: 'CODEX_INITIALIZE_TIMEOUT', attempts: 2 })
+      .mockImplementationOnce(async () => {
+        configured.files.set('/home/operator/.codex/auth.json', JSON.stringify({ tokens: { account_id: 'changed' } }))
+        return { ok: true, model: 'gpt-6.1-sol', attempts: 1 }
+      })
+    const configured = setup({ probeCodex })
+    configured.files.set('/home/operator/.codex/happy-runtime-state/1/test.sqlite', 'probe state')
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) }))
+      .rejects.toMatchObject({ kind: 'ACTIVE_ACCOUNT_CHANGED' })
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/current.json')).toBe(false)
+    expect(configured.files.has('/home/operator/.codex/happy-runtime-state/1/test.sqlite')).toBe(false)
+  })
+
+  it('does not accept a Happy response after another login replaced the selected authentication', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const configured = setup({ probeCodex: vi.fn(async () => {
+      configured.files.set('/home/operator/.codex/auth.json', JSON.stringify({ tokens: { account_id: 'another-user', access_token: 'another-token' } }))
+      return { ok: true as const, model: 'gpt-6.1-sol' as const, attempts: 1 }
+    }) })
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) }))
+      .rejects.toMatchObject({ kind: 'ACTIVE_ACCOUNT_CHANGED' })
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/auth.json')!).tokens.account_id).toBe('another-user')
+  })
+
+  it('restores existing files and does not launch a probe when a Codex recovery write fails', async () => {
+    const source = codexMultiAuthBundle()
+    const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const probeCodex = vi.fn()
+    const configured = setup({ probeCodex })
+    const paths = ['/home/operator/.codex/multi-auth/openai-codex-accounts.json', '/home/operator/.codex/multi-auth/settings.json', '/home/operator/.codex/auth.json']
+    const contents = [JSON.stringify(source.accounts), JSON.stringify(source.settings), JSON.stringify({ tokens: { account_id: 'personal', access_token: 'personal' } })]
+    paths.forEach((path, index) => configured.files.set(path, contents[index]!))
+    const original = configured.writeFile.getMockImplementation()!
+    configured.writeFile.mockImplementation(async (path, content) => {
+      if (path === `${paths[2]}.happy-tmp`) throw new Error('disk write failure with private details')
+      return original(path, content)
+    })
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) }))
+      .rejects.toMatchObject({ kind: 'CODEX_MULTI_AUTH_APPLY_FAILED' })
+    paths.forEach((path, index) => expect(configured.files.get(path)).toBe(contents[index]))
+    expect(probeCodex).not.toHaveBeenCalled()
+  })
+
+  it('updates family indexes to the source active account while preserving personal accounts and settings', async () => {
+    const source = codexMultiAuthBundle()
+    source.accounts.activeIndex = 1
+    const recoveryAuth = { tokens: { account_id: 'account-b', access_token: 'access-b', refresh_token: 'refresh-b', id_token: 'id-b' } }
+    const configured = setup({ probeCodex: vi.fn(async () => ({ ok: true as const, model: 'gpt-6.1-sol' as const, attempts: 1 })) })
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify({ ...source.accounts, activeIndex: 0, pinnedAccountIndex: 0, activeIndexByFamily: { codex: 0, gpt: 2 } }))
+    configured.files.set('/home/operator/.codex/multi-auth/settings.json', JSON.stringify({ version: 1, pluginConfig: { userPreference: 'preserve' } }))
+    await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    const pool = JSON.parse(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')!)
+    expect(pool.activeIndex).toBe(1)
+    expect(pool.activeIndexByFamily).toEqual({ codex: 1, gpt: 1 })
+    expect(pool.pinnedAccountIndex).toBeUndefined()
+    expect(JSON.parse(configured.files.get('/home/operator/.codex/multi-auth/settings.json')!).pluginConfig.userPreference).toBe('preserve')
+  })
+
+  it('rejects a mismatched recovery auth before any target file is changed', async () => {
+    const configured = setup({ probeCodex: vi.fn() })
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...codexMultiAuthBundle(),
+      recoveryAuth: { tokens: { account_id: 'account-a', access_token: 'wrong-access', refresh_token: 'refresh-a', id_token: 'id-a' } } }) }))
+      .rejects.toMatchObject({ kind: 'CODEX_ACTIVE_CREDENTIAL_MISMATCH' })
+    expect(configured.writeFile).not.toHaveBeenCalled()
+  })
+
+  it('replaces the same users stale workspace slot instead of leaving a second broken rotation candidate', async () => {
+    const source = codexMultiAuthBundle()
+    const token = `header.${Buffer.from(JSON.stringify({ sub: 'same-user' })).toString('base64url')}.signature`
+    source.accounts.accounts[0] = { ...source.accounts.accounts[0]!, accountId: 'working-workspace', accessToken: token }
+    const recoveryAuth = { tokens: { account_id: 'working-workspace', access_token: token, refresh_token: 'refresh-a', id_token: 'id-a' } }
+    const configured = setup({ probeCodex: vi.fn(async () => ({ ok: true as const, model: 'gpt-6.1-sol' as const, attempts: 1 })) })
+    const old = codexMultiAuthBundle().accounts
+    old.accounts[0] = { ...old.accounts[0]!, accountId: 'old-workspace', accessToken: token }
+    configured.files.set('/home/operator/.codex/multi-auth/openai-codex-accounts.json', JSON.stringify(old))
+    await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...source, recoveryAuth }) })
+    const pool = JSON.parse(configured.files.get('/home/operator/.codex/multi-auth/openai-codex-accounts.json')!)
+    expect(pool.accounts).toHaveLength(3)
+    expect(pool.activeIndex).toBe(0)
+    expect(pool.accounts[0].accountId).toBe('working-workspace')
+    expect(pool.accounts.some((account: { accountId: string }) => account.accountId === 'old-workspace')).toBe(false)
+  })
   it.each([
     ['ok', 'usage-readable', 1, 1],
     ['relogin_required', 'relogin-required', 0, 2],
@@ -1788,7 +1952,6 @@ describe('AI credential machine runtime', () => {
 
     expect(calls.map(({ command, args }) => [command, args])).toEqual([
       ['uv', ['--version']],
-      ['uv', ['python', 'find', '>=3.12']],
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
@@ -2847,7 +3010,6 @@ describe('AI credential machine runtime', () => {
 
     expect(calls.map(({ command, args }) => [command, args])).toEqual([
       ['uv', ['--version']],
-      ['uv', ['python', 'find', '>=3.12']],
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
