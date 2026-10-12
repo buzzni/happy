@@ -20,3 +20,17 @@ export function describeClaudeLaunchFailure(error: unknown): string {
     }
     return 'Claude Code could not start on this machine. Check this machine\'s daemon log for details.';
 }
+
+/**
+ * Claude Code without a login on this machine still starts, then answers with a synthetic
+ * "Not logged in · Please run /login" and an `is_error` result (claude-code 2.1.296). That says neither
+ * which machine nor that the daemon's user is the one to sign in (Desktop specs/headless-standalone-server R36).
+ */
+export const CLAUDE_NOT_SIGNED_IN_NOTICE = 'Claude Code is not signed in on this machine. '
+    + 'Sign in as the user that runs this machine\'s daemon (run `claude`, then /login) and send the message again.';
+
+export function claudeNotSignedInNotice(result: { is_error?: unknown; result?: unknown }): string | null {
+    return result.is_error === true && typeof result.result === 'string' && /^not logged in\b/i.test(result.result.trim())
+        ? CLAUDE_NOT_SIGNED_IN_NOTICE
+        : null;
+}
