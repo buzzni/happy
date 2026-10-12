@@ -25,6 +25,12 @@ import React from "react";
 import { ApiClient } from '@/api/api';
 import { CodexAppServerClient } from './codexAppServerClient';
 import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
+import {
+    CODEX_CAPACITY_CONTINUE_PROMPT,
+    CODEX_CAPACITY_RETRY_DELAYS_MS,
+    createCodexCapacityRetryPolicy,
+    isCodexServerOverloadedFailure,
+} from './codexCapacityRetry';
 import type { ReasoningEffort } from './codexAppServerTypes';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -791,6 +797,18 @@ export async function runCodex(opts: {
             errorName: error instanceof Error ? error.name : typeof error,
         });
     });
+    /*
+     * Codex ends the whole turn when one request comes back "at capacity" and does not
+     * retry it. The host continues the thread itself after a short wait, unless the user
+     * has already taken over (codexCapacityRetry.ts).
+     */
+    const capacityRetry = createCodexCapacityRetryPolicy(CODEX_CAPACITY_RETRY_DELAYS_MS);
+    let turnServerOverloaded = false;
+    let capacityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    const cancelCapacityRetry = () => {
+        if (capacityRetryTimer) clearTimeout(capacityRetryTimer);
+        capacityRetryTimer = null;
+    };
     session.onUserMessage((message) => {
         // A managed run answers exactly the prompt its envelope was admitted
         // for. A message posted to this session by the account owner arrives
@@ -810,6 +828,8 @@ export async function runCodex(opts: {
         const latencyTrace = captureCodexLatencyTrace(message.meta?.latencyTrace, diagnostic => session.sendTurnLatency(diagnostic));
         const accept = () => {
             preemptLessonReview();
+            cancelCapacityRetry();
+            capacityRetry.reset();
             const attachmentsPromise = session.drainAttachmentsForUserMessage();
             return handleUserMessage({ message, attachmentsPromise, latencyTrace });
         };
@@ -993,6 +1013,8 @@ export async function runCodex(opts: {
     async function handleAbort() {
         if (runtimeGate?.isFrozen()) return;
         preemptLessonReview();
+        // Stop means stop: a capacity continuation waiting to fire must not restart the work.
+        cancelCapacityRetry();
         if (abortInProgress) {
             await abortInProgress;
             return;
@@ -1710,6 +1732,7 @@ export async function runCodex(opts: {
             // inactivity notice applies here too, not just to turn_aborted.
             const inactivityNotice = describeCodexInactivityAbort(msg);
             const failure = describeCodexFailure(msg);
+            if (isCodexServerOverloadedFailure(msg)) turnServerOverloaded = true;
             if (inactivityNotice) {
                 const message = failure ? `${inactivityNotice} Provider error: ${failure}` : inactivityNotice;
                 messageBuffer.addMessage(message, 'status');
@@ -2437,6 +2460,9 @@ export async function runCodex(opts: {
                     routingApplied = true;
                     latency?.submitted();
                     const memoryIngest = reserveCompletedTurnIngest(activeThreadId);
+                    // Any turn that starts — the continuation itself, or input from any path — supersedes a pending one.
+                    cancelCapacityRetry();
+                    turnServerOverloaded = false;
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
                         ...(memoryIngest ? { onCompleted: memoryIngest.onCompleted,
@@ -2516,6 +2542,24 @@ export async function runCodex(opts: {
                         void (runtimeGate ? runtimeGate.admit(reviewWork, 'writer') : reviewWork()).catch(() => undefined);
                     }
                     codexTurnCounter += 1;
+                    // A run-once automation ends after this turn; nothing would pick a continuation up.
+                    const retry = exitAfterFirstTurn ? null : capacityRetry.afterTurn(!result.aborted && turnServerOverloaded);
+                    if (retry) {
+                        const notice = `Model at capacity — continuing automatically in ${Math.round(retry.delayMs / 1000)}s (${retry.attempt}/${retry.maxAttempts}).`;
+                        messageBuffer.addMessage(notice, 'status');
+                        session.sendSessionEvent({ type: 'message', message: notice });
+                        const continuationMode = message.mode;
+                        cancelCapacityRetry();
+                        capacityRetryTimer = setTimeout(() => {
+                            capacityRetryTimer = null;
+                            // Whatever the user sent meanwhile is the next turn instead.
+                            if (shouldExit || thinking || pending || messageQueue.size() > 0 || messageQueue.isClosed()) {
+                                logger.debug('[Codex] Capacity continuation skipped: session moved on');
+                                return;
+                            }
+                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode);
+                        }, retry.delayMs);
+                    }
                 } catch (error) {
                     latency?.finish('failed');
                     preemptLessonReview();
@@ -2607,6 +2651,7 @@ export async function runCodex(opts: {
         }
 
     } finally {
+        cancelCapacityRetry();
         let loopExitRecorded = false;
         try {
             preemptLessonReview();
