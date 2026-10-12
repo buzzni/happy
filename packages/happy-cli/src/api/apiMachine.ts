@@ -1120,6 +1120,8 @@ export class ApiMachineClient {
                     ...capabilities,
                     setupTokenAssignmentVersion: 1,
                     setupTokenSealedPayloadVersion: 1,
+                    // A shared machine's sealed assignment names the machine as principal.
+                    sharedMachineSetupTokenVersion: 1,
                     setupTokenRecipient: setupTokenRecipientCapability(this.setupTokenAssignmentRecipient),
                 };
             }

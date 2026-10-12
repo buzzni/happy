@@ -180,6 +180,31 @@ describe('sealed setup-token group assignment', () => {
     expect(await machine.runtime.groupReceipt('company-1', 'claude')).toMatchObject({ assignmentGeneration: 2, leaseId: 'lease-1' })
   })
 
+  it('installs a shared machine assignment under the machine principal and refuses a relabelled principal', async () => {
+    const machine = fakeMachine([], null, { machineId: 'machine-1' })
+    const recipient = createSetupTokenAssignmentRecipient()
+    const context = (principal: 'machine' | 'user') => ({
+      version: 1 as const, scope: 'company-1', userId: principal === 'machine' ? 'machine-1' : 'user-1', machineId: 'machine-1',
+      provider: 'claude' as const, generation: 1, fingerprint: '1'.padStart(64, '0'), leaseId: 'lease-1', expiresAt: NOW + 10_000,
+      payload: payload(managed(A, 1, fakeToken('shared'))), ...(principal === 'machine' ? { principalType: 'machine' as const } : {}),
+    })
+    const outer = (principal: 'machine' | 'user') => ({
+      version: 1, scope: 'company-1', provider: 'claude', credentialType: 'setup_token', machineId: 'machine-1', generation: 1,
+      fingerprint: '1'.padStart(64, '0'), payload: null, ...(principal === 'machine' ? { principalType: 'machine' } : { userId: 'user-1' }),
+    })
+    await expect(machine.runtime.setupTokenGroupSync({ ...outer('user'), sealedPayload: sealSetupTokenAssignment(context('machine'), recipient.publicKey) },
+      'machine-1', recipient)).rejects.toThrow('AI_GROUP_CONTEXT_CONFLICT')
+    await expect(machine.runtime.setupTokenGroupSync({ ...outer('machine'), sealedPayload: sealSetupTokenAssignment(context('user'), recipient.publicKey) },
+      'machine-1', recipient)).rejects.toThrow('AI_GROUP_CONTEXT_CONFLICT')
+
+    const receipt = await machine.runtime.setupTokenGroupSync({ ...outer('machine'), sealedPayload: sealSetupTokenAssignment(context('machine'), recipient.publicKey) },
+      'machine-1', recipient)
+    expect(receipt).toMatchObject({ principalType: 'machine', machineId: 'machine-1', reconciled: true, leaseId: 'lease-1',
+      appliedCredentials: [{ managedAccountId: A, credentialGeneration: 1 }] })
+    expect(await machine.runtime.groupReceipt('company-1', 'claude', { principalType: 'machine', machineId: 'machine-1' })).toMatchObject({ leaseId: 'lease-1' })
+    expect(await machine.runtime.groupReceipt('company-1', 'claude')).toBeNull()
+  })
+
   it('fails closed on the assignment kill switch before probing or changing credentials', async () => {
     const machine = fakeMachine([], null, { env: { APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH: 'on' } })
     const recipient = createSetupTokenAssignmentRecipient()
@@ -220,6 +245,33 @@ describe('managed Claude setup-token runtime', () => {
     expect(spawn).not.toHaveBeenCalled()
     expect(command.mock.calls.some(([args]) => args[0] === 'new-window')).toBe(false)
     await expect(runtime.launchSession(env, spawn)).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
+  })
+
+  it('launches an unbound session on a shared machine with the setup-token assigned to that machine', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    const shared = (generation: number, token: string) => runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1',
+      provider: 'claude', generation, fingerprint: String(generation).padStart(64, '0'), payload: payload(managed(A, generation, token)) })
+    await shared(1, fakeToken('shared-1'))
+
+    const env = await runtime.sessionEnvironment('claude')
+    expect(env).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('shared-1'), HAPPY_AI_AUTH_SOURCE: 'org-bundle', ANTHROPIC_API_KEY: '' })
+    expect(env).not.toHaveProperty('HAPPY_AI_AUTH_SETUP_TOKEN_BINDING')
+    const spawn = vi.fn(() => 'started')
+    await expect(runtime.launchSession(env, spawn)).resolves.toBe('started')
+
+    // The token replaced between preparation and launch is a different credential.
+    const stale = await runtime.sessionEnvironment('claude')
+    await shared(2, fakeToken('shared-2'))
+    await expect(runtime.launchSession(stale, spawn)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_STALE')
+    expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps refusing an unbound session while a user assignment desires a setup-token, even on a shared machine', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('shared'))) })
+    await runtime.groupSync(sync(1, payload(managed(B, 1, fakeToken('user')))))
+    await expect(runtime.sessionEnvironment('claude')).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
   })
 
   it('preserves machine-personal, non-Claude and prepared ZAI bypasses at final launch', async () => {

@@ -146,10 +146,13 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     entry.managed=managed.filter(value=>entry.desired.includes(value))
     await deps.write(JSON.stringify(journal))
   }
-  async function hasManagedDesired(provider:GroupProvider){return parse(await deps.read()).entries.some(e=>e.provider===provider&&(e.managed??[]).some(value=>e.desired.includes(value)))}
+  async function hasManagedDesired(provider:GroupProvider,principal?:'user'|'machine'){return parse(await deps.read()).entries.some(e=>e.provider===provider&&(!principal||principalType(e)===principal)&&(e.managed??[]).some(value=>e.desired.includes(value)))}
+  /** Shared-machine assignments of `machineId` that desire org-managed setup-tokens: the machine's default credential. */
+  async function machineManaged(provider:GroupProvider,machineId:string){return parse(await deps.read()).entries.filter(e=>e.provider===provider&&principalType(e)==='machine'&&e.machineId===machineId)
+    .map(e=>({scope:e.scope,managed:(e.managed??[]).filter(value=>e.desired.includes(value)),pending:e.pending})).filter(e=>e.managed.length>0)}
   /** Collector custody: the scope's reconciled assignment for this user both desires and installed the identity. */
   const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&!e.pending&&e.userId===userId&&e.desired.includes(identity)&&e.owned.includes(identity))}
-  return {sync,invalidate,assignment,hasManagedDesired,unprojected,recordManaged,authorize,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
+  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
 }
 
 function effectivePrincipal(entry:Pick<Entry,'principalType'|'userId'|'machineId'>):Pick<NormalizedRequest,'principalType'|'userId'|'machineId'> {
