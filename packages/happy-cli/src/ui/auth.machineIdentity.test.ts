@@ -131,8 +131,16 @@ describe('authAndSetupMachineIfNeeded end-to-end encryption start', () => {
     expect(JSON.parse(readFileSync(backupPath, 'utf8')).secret).toBe(encodeBase64(secret))
   })
 
+  // 2026-10-12 hmrepo: an organization PC re-registered with the account's same token and secret; only its machine key is new.
+  it('starts encrypted over a backup that shares the account secret but carries an earlier identity\'s machine key', async () => {
+    writeFileSync(join(home, 'access.key.legacy-backup'), JSON.stringify({ token: 't', secret: encodeBase64(secret), encryption: { publicKey: encodeBase64(accountKey), machineKey: encodeBase64(new Uint8Array(32).fill(5)) } }))
+    await authAndSetupMachineIfNeeded()
+    expect((await readCredentials())?.encryption.type).toBe('dataKey')
+  })
+
   it('does not switch again after this identity undid the switch', async () => {
-    writeFileSync(join(home, 'access.key.legacy-backup'), JSON.stringify({ token: 't', secret: encodeBase64(secret) }))
+    // `datakey deactivate` restores the backup byte for byte: same secret and the same machine key.
+    writeFileSync(join(home, 'access.key.legacy-backup'), JSON.stringify({ token: 't', secret: encodeBase64(secret), encryption: { publicKey: encodeBase64(accountKey), machineKey: encodeBase64(machineKey) } }))
     await authAndSetupMachineIfNeeded()
     expect((await readCredentials())?.encryption.type).toBe('legacy')
   })
