@@ -353,6 +353,27 @@ describe('managed Claude setup-token runtime', () => {
     expect(calls.filter(call => call.args[0] === 'import').map(call => call.args.includes('--force'))).toEqual([false, true, true])
   })
 
+  // 2026-10-12 hmrepo: the live Claude login was a managed account whose cswap slot was gone; the personal capture
+  // re-added it without managed metadata and every later group apply refused it as managed-id-mismatch.
+  it('does not capture a live managed login as a personal account; the group installs it as managed', async () => {
+    const files = new Map<string, string>([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: managedSetupTokenEmail(A) } })],
+      ['/home/operator/.claude/.credentials.json', JSON.stringify({ claudeAiOauth: { accessToken: fakeToken('live') } })]])
+    const { runtime, state, calls } = fakeMachine([], null, { files })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
+    expect(state.slots).toEqual([expect.objectContaining({ email: managedSetupTokenEmail(A), managedAccountId: A, credentialGeneration: 1 })])
+  })
+
+  it('restores its own managed slot that lost its managed metadata instead of refusing it', async () => {
+    const { runtime, state } = fakeMachine([], null)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = state.slots[0]!
+    state.slots[0] = bare as typeof state.slots[0]
+    await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('b')))))
+    expect(state.slots[0]).toMatchObject({ email: managedSetupTokenEmail(A), managedAccountId: A, credentialGeneration: 2,
+      credentials: { claudeAiOauth: { accessToken: fakeToken('b') } } })
+  })
+
   it('never takes over a personally imported slot with the same synthetic email', async () => {
     const { runtime, state, calls } = fakeMachine([stored(A, 1, fakeToken('personal'))], 2)
     // 2026-10-12 hmrepo: the conflict did not say which check refused, so the daemon log could not tell a takeover from a stale journal.

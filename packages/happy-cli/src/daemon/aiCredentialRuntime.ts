@@ -512,7 +512,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     const unregistered = typeof liveIdentity?.emailAddress === 'string' && !!liveIdentity.emailAddress
       && !before.accounts.some(account => account.email === liveIdentity.emailAddress
         && (account.organizationUuid ?? '') === (liveIdentity.organizationUuid ?? ''))
-    if (unregistered || before.activeAccountNumber === null) {
+    // A live login on a managed setup-token account is the group's own slot, never a personal account to keep: capturing
+    // it drops the managed metadata and every later apply refuses the slot (2026-10-12 hmrepo).
+    const liveManaged = typeof liveIdentity?.emailAddress === 'string' && managedSetupTokenId(liveIdentity.emailAddress) !== null
+    if (!liveManaged && (unregistered || before.activeAccountNumber === null)) {
       const live = await readOptionalJson(join(deps.env.CLAUDE_CONFIG_DIR || join(deps.homeDir, '.claude'), '.credentials.json'))
       if (unregistered || isObject(live?.claudeAiOauth)) {
         await deps.execFile('cswap', ['add'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
@@ -599,6 +602,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const changed = managedExisting.filter(account => !sameManagedSetupToken(local.find(slot => slot.email === account.email), account))
       for (const account of changed) {
         const stored = local.find(slot => slot.email === account.email)
+        // This scope installed that managed account (owned) and the slot only lost its managed metadata: restore it.
+        if (stored && stored.managedAccountId === undefined && owns(account)) continue
         if (!owns(account) || !stored || stored.managedAccountId !== account.managedAccountId) {
           // Which check refused, without any account detail: the daemon log otherwise cannot tell a takeover attempt
           // from a slot missing in cswap or a changed managed id (2026-10-12 hmrepo).
