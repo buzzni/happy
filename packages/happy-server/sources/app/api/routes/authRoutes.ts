@@ -18,6 +18,9 @@ import {
 const AUTH_LIMITS = {
     ip: { limit: 30, windowMs: 60_000 },
     key: { limit: 20, windowMs: 60_000 },
+    // Pairing clients poll once per second, in addition to the initial request.
+    pairingIp: { limit: 90, windowMs: 60_000 },
+    pairingKey: { limit: 65, windowMs: 60_000 },
     global: { limit: 600, windowMs: 60_000 },
 };
 
@@ -48,7 +51,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
         return forwarded || request.socket?.remoteAddress || 'unknown';
     };
     /** Self-host only: true when the request was answered with 400/429. */
-    const refuseUnauthenticated = (request: any, reply: any, fields: Record<string, unknown>): boolean => {
+    const refuseUnauthenticated = (request: any, reply: any, fields: Record<string, unknown>, pairingPoll = false): boolean => {
         if (!policy.hardened) return false;
         for (const [name, value] of Object.entries(fields)) {
             const max = AUTH_FIELD_MAX_LENGTH[name as keyof typeof AUTH_FIELD_MAX_LENGTH];
@@ -59,9 +62,9 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
         }
         const at = now();
         const waits = [
-            limiter('ip', clientAddress(request), at),
+            limiter(pairingPoll ? 'pairingIp' : 'ip', clientAddress(request), at),
             limiter('global', 'all', at),
-            typeof fields.publicKey === 'string' ? limiter('key', fields.publicKey, at) : 0,
+            typeof fields.publicKey === 'string' ? limiter(pairingPoll ? 'pairingKey' : 'key', fields.publicKey, at) : 0,
         ];
         const wait = Math.max(...waits);
         if (wait > 0) {
@@ -141,7 +144,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             }
         }
     }, async (request, reply) => {
-        if (refuseUnauthenticated(request, reply, request.body)) return reply;
+        if (refuseUnauthenticated(request, reply, request.body, true)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = decodeAuthField(request.body.publicKey);
         if (!publicKey) {
@@ -313,7 +316,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             }
         }
     }, async (request, reply) => {
-        if (refuseUnauthenticated(request, reply, request.body)) return reply;
+        if (refuseUnauthenticated(request, reply, request.body, true)) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = decodeAuthField(request.body.publicKey);
         if (!publicKey) {

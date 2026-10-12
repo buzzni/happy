@@ -51,11 +51,18 @@ function publishManifest(source, distContents, version = source.version) {
 
 function main() {
   const outIndex = process.argv.indexOf('--out');
-  const out = outIndex >= 0 ? path.resolve(process.argv[outIndex + 1] ?? '') : '';
-  if (!out) throw new Error('usage: prepare-publish-package.cjs --out <dir> [--version <semver>]');
+  const outArgument = outIndex >= 0 ? process.argv[outIndex + 1] : undefined;
+  if (!outArgument?.trim() || outArgument.startsWith('-')) {
+    throw new Error('usage: prepare-publish-package.cjs --out <dir> [--version <semver>]');
+  }
+  const out = path.resolve(outArgument);
   const versionIndex = process.argv.indexOf('--version');
   const version = versionIndex >= 0 ? process.argv[versionIndex + 1] ?? '' : undefined;
   const root = path.resolve(__dirname, '..');
+  const sourceFromOut = path.relative(out, root);
+  if (sourceFromOut === '' || (!path.isAbsolute(sourceFromOut) && sourceFromOut !== '..' && !sourceFromOut.startsWith(`..${path.sep}`))) {
+    throw new Error('output must not be the source directory or contain the source directory');
+  }
   const source = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const dist = path.join(root, 'dist', 'standalone.mjs');
   if (!fs.existsSync(dist)) throw new Error('dist/standalone.mjs is missing; run scripts/build-runtime.cjs first');

@@ -116,6 +116,49 @@ describe("authRoutes without self-host hardening", () => {
 });
 
 describe("authRoutes with self-host hardening", () => {
+    it.each(["terminal", "account"] as const)("allows one-second %s pairing polls until delayed approval", async (kind) => {
+        let clock = Date.now();
+        const app = await createApp(hardened(), () => clock);
+        const prefix = kind === "terminal" ? "/v1/auth" : "/v1/auth/account";
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        try {
+            for (let second = 0; second <= 125; second++) {
+                const poll = await app.inject({ method: "POST", url: `${prefix}/request`, payload: { publicKey: pairing } });
+                expect(poll.statusCode, `poll at ${second}s`).toBe(200);
+                expect(poll.json()).toEqual({ state: "requested" });
+                clock += 1000;
+            }
+            expect((await app.inject({ method: "POST", url: `${prefix}/response`, payload: { publicKey: pairing, response: "sealed" } })).statusCode).toBe(200);
+            const approved = await app.inject({ method: "POST", url: `${prefix}/request`, payload: { publicKey: pairing } });
+            expect(approved.statusCode).toBe(200);
+            expect(approved.json()).toEqual({ state: "authorized", token: "token-for-owner-account", response: "sealed" });
+            expect((await app.inject({ method: "POST", url: `${prefix}/request`, payload: { publicKey: pairing } })).statusCode).toBe(410);
+        } finally {
+            await app.close();
+        }
+    });
+
+    it.each([
+        { scope: "key", limit: 65 },
+        { scope: "address", limit: 90 },
+    ])("still throttles pairing bursts per $scope with Retry-After", async ({ scope, limit }) => {
+        const clock = Date.now();
+        const app = await createApp(hardened(), () => clock);
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        try {
+            for (let i = 0; i < limit; i++) {
+                const publicKey = scope === "key" ? pairing : b64(tweetnacl.box.keyPair().publicKey);
+                expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey } })).statusCode).toBe(200);
+            }
+            const refused = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+            expect(refused.statusCode).toBe(429);
+            expect(Number(refused.headers["retry-after"])).toBe(60);
+            expect(db.terminalAuthRequest.upsert).toHaveBeenCalledTimes(limit);
+        } finally {
+            await app.close();
+        }
+    });
+
     it("lets only the owner key sign in and creates no account for others", async () => {
         const app = await createApp(hardened());
         const refused = await app.inject({ method: "POST", url: "/v1/auth", payload: signedBody(stranger) });
