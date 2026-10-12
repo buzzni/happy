@@ -62,6 +62,22 @@ import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
  * binding", which is exactly what it would be.
  */
 export const PREVIEW_BOUND_PROXY_EVENT = 'preview-proxy-http-bound';
+
+/**
+ * aplus-dev-studio specs/e2ee-machine-control-boundary strict-followup-plan F0-b (daemon 5). On a
+ * strict machine the plaintext preview relay serves only requests bound to a registered preview
+ * runtime, and the remote-screen relay is off until it has a customer-encrypted channel.
+ */
+const STRICT_UNBOUND_RELAY_REFUSAL = {
+    outcome: 'rejected' as const,
+    code: 'STRICT_BINDING_REQUIRED',
+    message: 'This machine runs in strict mode and relays bound preview requests only',
+};
+const STRICT_VIEWER_REFUSAL = {
+    outcome: 'rejected' as const,
+    code: 'STRICT_VIEWER_UNAVAILABLE',
+    message: 'The remote screen is not available on a machine in strict mode',
+};
 /** Upgrade counterpart of PREVIEW_BOUND_PROXY_EVENT — see openPreviewWsTunnelBound. */
 export const PREVIEW_BOUND_WS_OPEN_EVENT = 'preview-proxy-ws-open-bound';
 /**
@@ -2079,11 +2095,16 @@ export class ApiMachineClient {
         binding: unknown,
         port: number,
     ): Promise<{ outcome: 'enforced' } | { outcome: 'rejected'; code: string; message: string }> {
+        if (configuration.machineControl === 'strict') return Promise.resolve(STRICT_VIEWER_REFUSAL);
         return enforceViewerRelayBinding(binding, port, this.viewerLeaseDeps());
     }
 
     /** Handler body of the `preview-viewer-runtime-lease` socket event. */
     private async answerPreviewViewerRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        if (configuration.machineControl === 'strict') {
+            ack({ type: 'error', code: STRICT_VIEWER_REFUSAL.code, message: STRICT_VIEWER_REFUSAL.message });
+            return;
+        }
         try {
             const result = await acquireViewerLease(
                 { viewerKey: params?.viewerKey, port: params?.port },
@@ -2292,7 +2313,11 @@ export class ApiMachineClient {
         binding: unknown,
         port: number,
     ): Promise<{ outcome: 'enforced' | 'unbound' } | { outcome: 'rejected'; code: string; message: string }> {
-        if (binding === undefined || binding === null) return { outcome: 'unbound' };
+        if (binding === undefined || binding === null) {
+            // A strict machine relays only requests bound to a registered preview runtime: unbound, the
+            // relay would let happy-server reach any local port in plaintext.
+            return configuration.machineControl === 'strict' ? STRICT_UNBOUND_RELAY_REFUSAL : { outcome: 'unbound' };
+        }
         const deps = this.previewLeaseDeps();
         if (!deps) {
             // A bound request we cannot verify is refused, never relayed —
@@ -3984,16 +4009,35 @@ export class ApiMachineClient {
                 // Handle machine metadata or daemon state updates from other clients (e.g., mobile app)
                 const update = data.body as UpdateMachineBody;
 
+                // aplus-dev-studio strict-followup-plan F0-b (daemon 6) — an update the machine key
+                // cannot open came from someone without that key; it must not blank what we hold.
+                const open = (value: string): unknown => {
+                    try {
+                        return decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(value));
+                    } catch {
+                        return null;
+                    }
+                };
                 if (update.metadata) {
                     logger.debug('[API MACHINE] Received external metadata update');
-                    this.machine.metadata = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(update.metadata.value));
-                    this.machine.metadataVersion = update.metadata.version;
+                    const metadata = open(update.metadata.value);
+                    if (metadata === null) {
+                        logger.debug('[API MACHINE] Ignored a metadata update this machine key cannot open');
+                    } else {
+                        this.machine.metadata = metadata as Machine['metadata'];
+                        this.machine.metadataVersion = update.metadata.version;
+                    }
                 }
 
                 if (update.daemonState) {
                     logger.debug('[API MACHINE] Received external daemon state update');
-                    this.machine.daemonState = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(update.daemonState.value));
-                    this.machine.daemonStateVersion = update.daemonState.version;
+                    const daemonState = open(update.daemonState.value);
+                    if (daemonState === null) {
+                        logger.debug('[API MACHINE] Ignored a daemon state update this machine key cannot open');
+                    } else {
+                        this.machine.daemonState = daemonState as Machine['daemonState'];
+                        this.machine.daemonStateVersion = update.daemonState.version;
+                    }
                 }
             } else {
                 logger.debug(`[API MACHINE] Received unknown update type: ${(data.body as any).t}`);
