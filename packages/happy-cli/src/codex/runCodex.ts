@@ -805,9 +805,18 @@ export async function runCodex(opts: {
     const capacityRetry = createCodexCapacityRetryPolicy(CODEX_CAPACITY_RETRY_DELAYS_MS);
     let turnServerOverloaded = false;
     let capacityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let capacityRetryGeneration = 0;
+    const capacityContinuationModes = new WeakMap<EnhancedMode, number>();
+    const isCurrentCapacityContinuation = (mode: EnhancedMode) => {
+        const generation = capacityContinuationModes.get(mode);
+        return generation === undefined || generation === capacityRetryGeneration;
+    };
     const cancelCapacityRetry = () => {
+        capacityRetryGeneration += 1;
         if (capacityRetryTimer) clearTimeout(capacityRetryTimer);
         capacityRetryTimer = null;
+        // Stop can arrive after the timer has queued its turn but before dispatch.
+        messageQueue.queue = messageQueue.queue.filter(item => !capacityContinuationModes.has(item.mode));
     };
     session.onUserMessage((message) => {
         // A managed run answers exactly the prompt its envelope was admitted
@@ -1563,14 +1572,18 @@ export async function runCodex(opts: {
             // a close can arrive after the server has already committed the row.
             return outcome.ok ? { ok: true as const } : { ok: false as const, provenNotWritten: false };
         },
-        enqueue: (input) => enqueueChannelTurn(input, () => ({
-            permissionMode: currentPermissionMode || 'default',
-            model: currentModel,
-            appendSystemPrompt: currentAppendSystemPrompt,
-            saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
-            saycodePromptBlocks: currentSaycodePromptBlocks,
-            effort: currentEffort,
-        }), { queue: messageQueue, deferredContinuation }),
+        enqueue: (input) => {
+            cancelCapacityRetry();
+            capacityRetry.reset();
+            return enqueueChannelTurn(input, () => ({
+                permissionMode: currentPermissionMode || 'default',
+                model: currentModel,
+                appendSystemPrompt: currentAppendSystemPrompt,
+                saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
+                saycodePromptBlocks: currentSaycodePromptBlocks,
+                effort: currentEffort,
+            }), { queue: messageQueue, deferredContinuation });
+        },
         now: () => Date.now(),
     });
     // Accepting a channel prompt records a user row and queues a turn, so it is input work:
@@ -2150,6 +2163,7 @@ export async function runCodex(opts: {
                 latency ? latency.measure(stage, action) : action();
 
             try {
+                if (!isCurrentCapacityContinuation(message.mode)) continue;
                 /*
                  * Relayed channel text is never read as session control. This is a *second* parser,
                  * on the consumer side: a channel turn reaches the queue through the session's own
@@ -2438,6 +2452,7 @@ export async function runCodex(opts: {
                     });
                     // The worker awaited after the permit was granted. Keep consumption at
                     // the synchronous dispatch boundary so channel cancellation still wins.
+                    if (!isCurrentCapacityContinuation(message.mode)) { lessonProposalTurn.cancel(); continue; }
                     if (message.channelRequestId !== undefined
                         && !channelAcceptance.beginExecution(message.channelRequestId)) {
                         codexPendingRequestId = null;
@@ -2462,6 +2477,7 @@ export async function runCodex(opts: {
                     const memoryIngest = reserveCompletedTurnIngest(activeThreadId);
                     // Any turn that starts — the continuation itself, or input from any path — supersedes a pending one.
                     cancelCapacityRetry();
+                    const turnCapacityRetryGeneration = capacityRetryGeneration;
                     turnServerOverloaded = false;
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
@@ -2542,18 +2558,22 @@ export async function runCodex(opts: {
                         void (runtimeGate ? runtimeGate.admit(reviewWork, 'writer') : reviewWork()).catch(() => undefined);
                     }
                     codexTurnCounter += 1;
-                    // A run-once automation ends after this turn; nothing would pick a continuation up.
-                    const retry = exitAfterFirstTurn ? null : capacityRetry.afterTurn(!result.aborted && turnServerOverloaded);
+                    // Channel requests are terminal after this turn; the channel lifecycle cannot
+                    // authorize a second execution or route an uncorrelated continuation's answer.
+                    const retry = exitAfterFirstTurn || message.channelRequestId !== undefined ? null : capacityRetry.afterTurn(
+                        !result.aborted && turnServerOverloaded && turnCapacityRetryGeneration === capacityRetryGeneration,
+                    );
                     if (retry) {
                         const notice = `Model at capacity — continuing automatically in ${Math.round(retry.delayMs / 1000)}s (${retry.attempt}/${retry.maxAttempts}).`;
                         messageBuffer.addMessage(notice, 'status');
                         session.sendSessionEvent({ type: 'message', message: notice });
-                        const continuationMode = message.mode;
-                        cancelCapacityRetry();
+                        const continuationMode = { ...message.mode };
+                        capacityContinuationModes.set(continuationMode, turnCapacityRetryGeneration);
                         capacityRetryTimer = setTimeout(() => {
                             capacityRetryTimer = null;
                             // Whatever the user sent meanwhile is the next turn instead.
-                            if (shouldExit || thinking || pending || messageQueue.size() > 0 || messageQueue.isClosed()) {
+                            if (turnCapacityRetryGeneration !== capacityRetryGeneration
+                                || shouldExit || thinking || pending || messageQueue.size() > 0 || messageQueue.isClosed()) {
                                 logger.debug('[Codex] Capacity continuation skipped: session moved on');
                                 return;
                             }
