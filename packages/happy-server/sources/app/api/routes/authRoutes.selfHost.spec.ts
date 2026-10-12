@@ -217,6 +217,42 @@ describe("authRoutes with self-host hardening", () => {
         expect(Number(last.headers["retry-after"])).toBeGreaterThan(0);
     });
 
+    // Desktop specs/headless-standalone-server R29: a machine waits on its code until the owner
+    // approves it, polling about once a second; that wait must not run into the sign-in limits.
+    it("lets a machine keep polling its pending code and the owner check it, then approve it", async () => {
+        const app = await createApp(hardened());
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing, supportsV2: true } })).statusCode).toBe(200);
+        for (let i = 0; i < 90; i++) {
+            const poll = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing, supportsV2: true } });
+            expect(poll.statusCode).toBe(200);
+        }
+        const status = await app.inject({ method: "GET", url: `/v1/auth/request/status?publicKey=${encodeURIComponent(pairing)}` });
+        expect(status.json()).toEqual(expect.objectContaining({ status: "pending" }));
+        await app.inject({ method: "POST", url: "/v1/auth/response", payload: { publicKey: pairing, response: "sealed" } });
+        expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } })).json().state).toBe("authorized");
+    });
+
+    it("still throttles one address creating many new pairing codes", async () => {
+        const app = await createApp(hardened());
+        let last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: b64(tweetnacl.box.keyPair().publicKey) } });
+        for (let i = 0; i < 40 && last.statusCode !== 429; i++) {
+            last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: b64(tweetnacl.box.keyPair().publicKey) } });
+        }
+        expect(last.statusCode).toBe(429);
+    });
+
+    it("bounds even a pending code's polling", async () => {
+        const app = await createApp(hardened());
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        let last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        for (let i = 0; i < 200 && last.statusCode !== 429; i++) {
+            last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        }
+        expect(last.statusCode).toBe(429);
+    });
+
     it("rejects oversized auth fields before verifying them", async () => {
         const app = await createApp(hardened());
         const body = { ...signedBody(owner), challenge: "A".repeat(4096) };

@@ -19,6 +19,9 @@ const AUTH_LIMITS = {
     ip: { limit: 30, windowMs: 60_000 },
     key: { limit: 20, windowMs: 60_000 },
     global: { limit: 600, windowMs: 60_000 },
+    // A machine re-checks its own pending pairing code about once a second until the owner
+    // approves it (Desktop specs/headless-standalone-server R29); only that has its own budget.
+    poll: { limit: 120, windowMs: 60_000 },
 };
 
 /**
@@ -47,8 +50,8 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
         const forwarded = policy.trustProxy ? String(request.headers['x-forwarded-for'] ?? '').split(',')[0].trim() : '';
         return forwarded || request.socket?.remoteAddress || 'unknown';
     };
-    /** Self-host only: true when the request was answered with 400/429. */
-    const refuseUnauthenticated = (request: any, reply: any, fields: Record<string, unknown>): boolean => {
+    /** Self-host only: true when the request was answered with 400/429. A pending code's re-check counts only against `poll`. */
+    const refuseUnauthenticated = (request: any, reply: any, fields: Record<string, unknown>, pendingPoll = false): boolean => {
         if (!policy.hardened) return false;
         for (const [name, value] of Object.entries(fields)) {
             const max = AUTH_FIELD_MAX_LENGTH[name as keyof typeof AUTH_FIELD_MAX_LENGTH];
@@ -58,7 +61,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             }
         }
         const at = now();
-        const waits = [
+        const waits = pendingPoll ? [limiter('poll', String(fields.publicKey), at)] : [
             limiter('ip', clientAddress(request), at),
             limiter('global', 'all', at),
             typeof fields.publicKey === 'string' ? limiter('key', fields.publicKey, at) : 0,
@@ -71,6 +74,15 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
         return false;
     };
     const pairingExpired = (row: { createdAt: Date }) => policy.hardened && now() - row.createdAt.getTime() > policy.pairingTtlMs;
+    /** Self-host only: the key already has an unanswered, unexpired pairing request. */
+    const isPendingPairing = async (table: 'terminal' | 'account', publicKeyField: unknown): Promise<boolean> => {
+        if (!policy.hardened || typeof publicKeyField !== 'string' || publicKeyField.length > AUTH_FIELD_MAX_LENGTH.publicKey) return false;
+        const publicKey = decodeAuthField(publicKeyField);
+        if (!publicKey) return false;
+        const where = { where: { publicKey: privacyKit.encodeHex(publicKey) } };
+        const row = table === 'terminal' ? await db.terminalAuthRequest.findUnique(where) : await db.accountAuthRequest.findUnique(where);
+        return !!row && !row.response && !pairingExpired(row);
+    };
     const logKey = (publicKeyHex: string) => policy.hardened ? `fp:${keyFingerprint(publicKeyHex)}` : publicKeyHex;
 
     app.post('/v1/auth', {
@@ -141,7 +153,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             }
         }
     }, async (request, reply) => {
-        if (refuseUnauthenticated(request, reply, request.body)) return reply;
+        if (refuseUnauthenticated(request, reply, request.body, await isPendingPairing('terminal', request.body.publicKey))) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = decodeAuthField(request.body.publicKey);
         if (!publicKey) {
@@ -202,7 +214,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             }
         }
     }, async (request, reply) => {
-        if (refuseUnauthenticated(request, reply, request.query)) return reply;
+        if (refuseUnauthenticated(request, reply, request.query, await isPendingPairing('terminal', request.query.publicKey))) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = decodeAuthField(request.query.publicKey);
         if (!publicKey) {
@@ -313,7 +325,7 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
             }
         }
     }, async (request, reply) => {
-        if (refuseUnauthenticated(request, reply, request.body)) return reply;
+        if (refuseUnauthenticated(request, reply, request.body, await isPendingPairing('account', request.body.publicKey))) return reply;
         const tweetnacl = (await import("tweetnacl")).default;
         const publicKey = decodeAuthField(request.body.publicKey);
         if (!publicKey) {
