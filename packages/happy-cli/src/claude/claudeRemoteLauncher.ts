@@ -42,7 +42,7 @@ import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
-import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { claudeNotSignedInNotice, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -340,6 +340,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const result = message as unknown as { subtype?: unknown; is_error?: unknown; result?: unknown };
             lastResultSucceeded = result.subtype === 'success' && result.is_error !== true;
             lastResultInterrupted = result.subtype === 'error_during_execution';
+            const notSignedIn = claudeNotSignedInNotice(result);
+            if (notSignedIn) session.client.sendSessionEvent({ type: 'message', message: notSignedIn });
             // Only a successful result carries an answer. A failed one must not leave an earlier
             // candidate standing either — the queue marker with an empty text clears it, and the
             // terminal that follows then reports no answer rather than an old one.
