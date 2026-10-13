@@ -84,6 +84,23 @@ describe('scoped credential group synchronization',()=>{
     expect(await sync.authorize(request.scope,request.userId,'shared')).toBe(false)
   })
 
+  // Shared-machine collector: the machine is the principal, so custody is read from its own entry only.
+  it('authorizes a machine principal only from that machine entry',async()=>{
+    const {sync,input}=setup()
+    const machine={version:1 as const,scope:'company',principalType:'machine' as const,machineId:'machine-1',provider:'claude' as const,generation:1,fingerprint:'c'.repeat(64),payload:'["shared"]'}
+    await sync.sync(input(1,'["user-account"]'))
+    await sync.sync(machine)
+    expect(await sync.authorizeMachine('company','machine-1','shared')).toBe(true)
+    expect(await sync.authorizeMachine('company','machine-2','shared')).toBe(false)
+    expect(await sync.authorizeMachine('other','machine-1','shared')).toBe(false)
+    // Neither principal borrows the other's custody.
+    expect(await sync.authorizeMachine('company','machine-1','user-account')).toBe(false)
+    expect(await sync.authorize('company','machine-1','shared')).toBe(false)
+    expect(await sync.authorize('company','user','shared')).toBe(false)
+    await sync.invalidate('claude',[])
+    expect(await sync.authorizeMachine('company','machine-1','shared')).toBe(false)
+  })
+
   it('keeps a machine principal separate from user assignments and returns a machine receipt',async()=>{
     const {sync,input,deps}=setup()
     const machine={version:1 as const,scope:'company',principalType:'machine' as const,machineId:'machine-1',provider:'claude' as const,generation:1,fingerprint:'c'.repeat(64),payload:'["shared"]'}

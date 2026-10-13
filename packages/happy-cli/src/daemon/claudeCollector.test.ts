@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createClaudeCollector, consumeCollectorPermit } from './claudeCollector'
+import { createClaudeCollector, consumeCollectorPermit, authorizeCollectorRequest } from './claudeCollector'
 const now = 2000000000000
 const pair = generateKeyPairSync('ed25519')
 const der = pair.publicKey.export({type:'spki',format:'der'}) as Buffer
@@ -148,4 +148,42 @@ command(sys.argv[2:])
    expect(JSON.stringify(probe)).not.toContain('sk-ant-oat01-')
   }finally{await rm(dir,{recursive:true,force:true})}
  },15000)
+})
+
+// specs/claude-setup-token-collector "공용 머신 수집 담당": a shared machine collects as itself (no userId).
+describe('machine principal',()=>{
+ const {userId:_u,...base}=request
+ const machineRequest={...base,principalType:'machine' as const}
+ // JSON drops the undefined userId, so the signed claims carry principalType instead.
+ const machineEnvelope=(extra={})=>envelope({principalType:'machine',userId:undefined,...extra})
+ it('accepts a machine grant for this machine and authorizes the machine principal',async()=>{
+  const {collector,deps}=setup()
+  const result=await collector({...machineRequest,grant:machineEnvelope()})
+  expect(result).toMatchObject({status:'observed',machineId:'m',permitId:request.permitId})
+  expect(deps.authorize).toHaveBeenCalledWith(expect.objectContaining({principalType:'machine',machineId:'m'}))
+  expect((deps.authorize.mock.calls[0] as unknown[])[0]).not.toHaveProperty('userId')
+ })
+ it('never mixes the two variants or targets another machine',async()=>{
+  const {collector,deps}=setup()
+  for(const input of [
+   {...machineRequest,grant:envelope()},
+   {...request,grant:machineEnvelope()},
+   {...machineRequest,userId:'u',grant:machineEnvelope()},
+   {...machineRequest,grant:machineEnvelope({machineId:'other'})},
+   {...machineRequest,machineId:'other',grant:machineEnvelope({machineId:'other'})},
+   {...machineRequest,principalType:'user',grant:machineEnvelope()},
+   // Even a consistently signed unknown principal is refused, not treated as a user.
+   {...machineRequest,principalType:'user',grant:machineEnvelope({principalType:'user'})},
+  ])expect(await collector(input)).toMatchObject({error:'COLLECTOR_GRANT_INVALID'})
+  expect(deps.consume).not.toHaveBeenCalled()
+ })
+ it('routes custody to the matching journal principal',async()=>{
+  const groups={authorize:vi.fn(async()=>true),authorizeMachine:vi.fn(async()=>true)}
+  const identity=(id:string)=>'identity:'+id
+  await authorizeCollectorRequest(groups,identity,{...request,version:1,grant:''})
+  expect(groups.authorize).toHaveBeenCalledWith('c','u','identity:'+request.managedAccountId)
+  await authorizeCollectorRequest(groups,identity,{...machineRequest,version:1,grant:''})
+  expect(groups.authorizeMachine).toHaveBeenCalledWith('c','m','identity:'+request.managedAccountId)
+  expect(groups.authorize).toHaveBeenCalledTimes(1)
+ })
 })

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { createPersonalProbeScheduler } from './personalProbeScheduler'
 import { createTokenProbe, personalProbeSupported, readTokenRuntime } from './tokenProbe'
-import { createClaudeCollector, consumeCollectorPermit, collectorVerificationReady } from './claudeCollector'
+import { createClaudeCollector, consumeCollectorPermit, collectorVerificationReady, authorizeCollectorRequest } from './claudeCollector'
 import { createCredentialGroupSync, type CredentialGroupRequest } from './aiCredentialGroups'
 import { createGroupProviderAdapters, groupAccountIdentity, groupPayloadIdentities } from './aiCredentialGroupAdapters'
 import { spawn as crossSpawn } from 'cross-spawn'
@@ -2376,7 +2376,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const origin = collectorOrigin()
       return createClaudeCollector({
         studioOrigin: origin, machineId, now: deps.now,
-        authorize: r => groups.authorize(r.companyId, r.userId, setupTokenGroupIdentity(r.managedAccountId)),
+        authorize: r => authorizeCollectorRequest(groups, setupTokenGroupIdentity, r),
         consume: (id, expiresAt) => consumeCollectorPermit(join(deps.homeDir, '.happy', 'claude-collector'), id, expiresAt, deps.now()),
         invoke: async (args, input) => (await deps.execFile('cswap', args, {
           input, ...cswapCollectorCommandOptions(args), environment: deps.env,
@@ -2385,7 +2385,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
-  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.

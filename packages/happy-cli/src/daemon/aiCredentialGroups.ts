@@ -159,7 +159,9 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   /** Collector custody: the scope's reconciled assignment for this user both desires and installed the identity. */
   const custody=(e:Entry|undefined,identity:string)=>Boolean(e&&appliedHere(e)&&!e.pending&&e.desired.includes(identity)&&e.owned.includes(identity))
   const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&e.userId===userId)&&custody(e,identity)}
-  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
+  /** Shared-machine collector custody: the machine's own reconciled assignment desires and installed the identity. */
+  const authorizeMachine=async(scope:string,machineId:string,identity:string)=>custody(await readReceipt(scope,'claude',{principalType:'machine',userId:machineId,machineId}),identity)
+  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
 }
 
 function effectivePrincipal(entry:Pick<Entry,'principalType'|'userId'|'machineId'>):Pick<NormalizedRequest,'principalType'|'userId'|'machineId'> {
