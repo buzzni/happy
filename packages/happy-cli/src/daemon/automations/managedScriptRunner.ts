@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -49,15 +49,23 @@ export async function runManagedScript(input: ManagedScriptInput): Promise<Manag
   try {
     await writeFile(bundle, input.source, { mode: 0o444 });
     await writeFile(secretFile, JSON.stringify(input.secrets), { mode: 0o444 });
+    // uid 65534 reads these through bind mounts. writeFile's mode is masked by the daemon umask (077 leaves 0400), chmod is not;
+    // the private mkdtemp directory still keeps other host users out.
+    await chmod(bundle, 0o444);
+    await chmod(secretFile, 0o444);
     let network = 'none';
     if (action.allowedOrigins.length) {
       await docker(['network', 'create', ...ownerLabel, '--internal', '--opt', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', id]);
       networkCreated = true;
       network = id;
+      // The installed package can be owner-only (npm honours umask 077), so mount a readable copy instead.
+      const proxyScript = join(directory, 'proxy.mjs');
+      await copyFile(join(projectPath(), 'scripts/script-egress-proxy.mjs'), proxyScript);
+      await chmod(proxyScript, 0o444);
       await docker(['create', '--name', proxy, '--label', `happy.script.runId=${input.runId}`, ...ownerLabel, ...limits,
         '--network', 'bridge', '--env', `SCRIPT_ALLOWED_ORIGINS=${JSON.stringify(action.allowedOrigins)}`,
         '--env', `SCRIPT_PRIVATE_ORIGINS=${JSON.stringify(input.approvedPrivateOrigins ?? [])}`,
-        '--mount', `type=bind,src=${join(projectPath(), 'scripts/script-egress-proxy.mjs')},dst=/proxy.mjs,readonly`,
+        '--mount', `type=bind,src=${proxyScript},dst=/proxy.mjs,readonly`,
         input.image, 'timeout', '-s', 'KILL', String(action.timeoutSeconds + 60), 'node', '/proxy.mjs']);
       containers.push(proxy);
       await docker(['network', 'connect', '--alias', 'egress', id, proxy]);
