@@ -157,7 +157,8 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   async function machineManaged(provider:GroupProvider,machineId:string){return parse(await deps.read()).entries.filter(e=>e.provider===provider&&principalType(e)==='machine'&&e.machineId===machineId)
     .map(e=>({scope:e.scope,managed:(e.managed??[]).filter(value=>e.desired.includes(value)),pending:e.pending})).filter(e=>e.managed.length>0)}
   /** Collector custody: the scope's reconciled assignment for this user both desires and installed the identity. */
-  const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&appliedHere(e)&&!e.pending&&e.userId===userId&&e.desired.includes(identity)&&e.owned.includes(identity))}
+  const custody=(e:Entry|undefined,identity:string)=>Boolean(e&&appliedHere(e)&&!e.pending&&e.desired.includes(identity)&&e.owned.includes(identity))
+  const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&e.userId===userId)&&custody(e,identity)}
   return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
 }
 
