@@ -1,9 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { chmod, copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { runManagedScript } from './managedScriptRunner';
 import type { ScriptAutomationPayload } from '@slopus/happy-wire';
+
+const packageRoot = vi.hoisted(() => ({ actual: '', override: null as string | null }));
+vi.mock('@/projectPath', async (importOriginal) => {
+  packageRoot.actual = (await importOriginal<typeof import('@/projectPath')>()).projectPath();
+  return { projectPath: () => packageRoot.override ?? packageRoot.actual };
+});
 
 const source = 'console.log("ok")';
 const action: ScriptAutomationPayload['action'] = {
@@ -56,6 +65,28 @@ describe.runIf(process.env.HAPPY_SCRIPT_DOCKER_TESTS === '1')('managed script Do
     const result = await runManagedScript({ ...base, signal: controller.signal, beforeStart: async () => { setTimeout(() => controller.abort(), 200); } });
     expect(result.failureCode).toBe('SCRIPT_CANCELLED');
     expect((await docker('docker', ['ps', '-aq', '--filter', 'label=happy.script.runId=script-integration-cancel'])).stdout.trim()).toBe('');
+  }, 30000);
+
+  it('runs a proxied script when the daemon umask hides files from other users', async () => {
+    // A daemon started with umask 077 must still hand uid 65534 a readable bundle and egress proxy,
+    // even when npm installed the package owner-only.
+    const installed = await mkdtemp(join(tmpdir(), 'happy-owner-only-'));
+    const previous = process.umask(0o077);
+    try {
+      await mkdir(join(installed, 'scripts'));
+      await copyFile(join(packageRoot.actual, 'scripts/script-egress-proxy.mjs'), join(installed, 'scripts/script-egress-proxy.mjs'));
+      await chmod(join(installed, 'scripts/script-egress-proxy.mjs'), 0o600);
+      packageRoot.override = installed;
+      const source = 'console.log("readable")';
+      const result = await runManagedScript({ runId: 'script-integration-umask', source,
+        action: { ...makeAction(source), allowedOrigins: ['https://example.invalid'] }, input: {}, secrets: {}, image: await image() });
+      expect(result.exitCode).toBe(0);
+      expect(result.log.trim()).toBe('readable');
+    } finally {
+      packageRoot.override = null;
+      process.umask(previous);
+      await rm(installed, { recursive: true, force: true });
+    }
   }, 30000);
 
   it('reaches only a bound private DB through the proxy and blocks unbound destinations', async () => {
