@@ -292,7 +292,7 @@ export type ReviewDecision =
 
 // --- Shared enums ---
 
-export type ApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
+export type ApprovalPolicy = "untrusted" | "on-request" | "never";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
