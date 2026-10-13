@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
+import type { PermissionMode } from '@/api/types';
 import { resolveCodexExecutionPolicy, resolveCodexSandboxPolicy } from '../executionPolicy';
+
+// String approval policies the Codex app-server accepts on thread/start and turn/start
+// (0.162.1 rejects `on-failure`; `granular` is a struct variant, not a bare string).
+const CODEX_ACCEPTED_APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+
+const ALL_PERMISSION_MODES: readonly PermissionMode[] = [
+    'default', 'acceptEdits', 'bypassPermissions', 'plan', 'read-only', 'safe-yolo', 'yolo',
+];
 
 describe('resolveCodexExecutionPolicy', () => {
     it('forces never + danger-full-access when sandbox is managed by Happy', () => {
@@ -29,11 +38,11 @@ describe('resolveCodexExecutionPolicy', () => {
         });
     });
 
-    it('maps safe-yolo mode to on-failure + workspace-write without managed sandbox', () => {
+    it('maps safe-yolo mode to on-request + workspace-write without managed sandbox', () => {
         const policy = resolveCodexExecutionPolicy('safe-yolo', false);
 
         expect(policy).toEqual({
-            approvalPolicy: 'on-failure',
+            approvalPolicy: 'on-request',
             sandbox: 'workspace-write',
         });
     });
@@ -54,6 +63,11 @@ describe('resolveCodexExecutionPolicy', () => {
             approvalPolicy: 'never',
             sandbox: 'danger-full-access',
         });
+    });
+
+    it.each(ALL_PERMISSION_MODES)('maps %s only to an approval policy the Codex app-server accepts', (mode) => {
+        expect(CODEX_ACCEPTED_APPROVAL_POLICIES).toContain(resolveCodexExecutionPolicy(mode, false).approvalPolicy);
+        expect(CODEX_ACCEPTED_APPROVAL_POLICIES).toContain(resolveCodexExecutionPolicy(mode, true).approvalPolicy);
     });
 });
 
