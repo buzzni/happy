@@ -33,7 +33,10 @@ const {
         messages: [] as MessageRecord[],
         accountSeqById: new Map<string, number>(),
         nextMessageId: 1,
-        nowMs: 1700000000000
+        nowMs: 1700000000000,
+        // Simulated DB latency of every query made inside an interactive
+        // transaction, charged against the transaction's timeout like Prisma.
+        txQueryLatencyMs: 0
     };
 
     const resetState = () => {
@@ -42,6 +45,7 @@ const {
         state.accountSeqById = new Map<string, number>();
         state.nextMessageId = 1;
         state.nowMs = 1700000000000;
+        state.txQueryLatencyMs = 0;
     };
 
     const seedSession = (input: Partial<SessionRecord> & Pick<SessionRecord, "id" | "accountId">) => {
@@ -168,18 +172,45 @@ const {
         return selectFields(row as unknown as Record<string, unknown>, args?.select);
     });
 
-    const txClient = {
-        session: {
-            update: sessionUpdate
-        },
-        sessionMessage: {
-            findMany: sessionMessageFindMany,
-            create: sessionMessageCreate
-        },
-        account: {
-            update: accountUpdate
+    const sessionMessageCreateManyAndReturn = vi.fn(async (args: any) => {
+        const rows = [];
+        for (const data of args?.data ?? []) {
+            rows.push(await sessionMessageCreate({ data, select: args?.select }));
         }
-    };
+        return rows;
+    });
+
+    // Prisma's interactive-transaction default when no `timeout` is passed.
+    const PRISMA_DEFAULT_TX_TIMEOUT_MS = 5000;
+
+    const transaction = vi.fn(async (fn: any, options?: { timeout?: number }) => {
+        const timeoutMs = options?.timeout ?? PRISMA_DEFAULT_TX_TIMEOUT_MS;
+        let elapsedMs = 0;
+        const timed = (query: (args: any) => Promise<any>) => async (args: any) => {
+            const result = await query(args);
+            elapsedMs += state.txQueryLatencyMs;
+            if (elapsedMs > timeoutMs) {
+                throw Object.assign(new Error(
+                    `Transaction already closed: The timeout for this transaction was ${timeoutMs} ms, ` +
+                    `however ${elapsedMs} ms passed since the start of the transaction.`
+                ), { code: "P2028" });
+            }
+            return result;
+        };
+        return fn({
+            session: {
+                update: timed(sessionUpdate)
+            },
+            sessionMessage: {
+                findMany: timed(sessionMessageFindMany),
+                create: timed(sessionMessageCreate),
+                createManyAndReturn: timed(sessionMessageCreateManyAndReturn)
+            },
+            account: {
+                update: timed(accountUpdate)
+            }
+        });
+    });
 
     const dbMock = {
         session: {
@@ -193,7 +224,7 @@ const {
             findMany: sessionMessageFindMany,
             create: sessionMessageCreate
         },
-        $transaction: vi.fn(async (fn: any) => fn(txClient))
+        $transaction: transaction
     };
 
     const emitUpdateMock = vi.fn();
@@ -617,6 +648,54 @@ describe("v3SessionRoutes", () => {
         expect(body.messages.map((message: any) => message.seq)).toEqual([1, 2]);
         expect(state.messages).toHaveLength(2);
         expect(emitUpdateMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("stores a full 100-message batch when every DB round-trip inside the transaction is slow", async () => {
+        seedSession({ id: "session-1", accountId: "user-1", seq: 0 });
+        state.txQueryLatencyMs = 120;
+
+        app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v3/sessions/session-1/messages",
+            headers: { "x-user-id": "user-1" },
+            payload: {
+                messages: Array.from({ length: 100 }, (_, index) => ({
+                    localId: `l-${index}`,
+                    content: `enc-${index}`
+                }))
+            }
+        });
+
+        // The round-trip count must not grow with the batch size, or a slow
+        // DB pushes a large daemon batch past the transaction timeout (P2028).
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+        expect(body.messages.map((message: any) => message.seq)).toEqual(Array.from({ length: 100 }, (_, index) => index + 1));
+        expect(body.messages.map((message: any) => message.localId)).toEqual(Array.from({ length: 100 }, (_, index) => `l-${index}`));
+        expect(state.messages).toHaveLength(100);
+        expect(state.messages[99].content).toEqual({ t: "encrypted", c: "enc-99" });
+        const emitted = emitUpdateMock.mock.calls.map(([call]: any[]) => call.payload);
+        expect(emitted).toHaveLength(100);
+        expect(emitted[99].body.message.seq).toBe(100);
+        expect(emitted[99].body.message.content.c).toBe("enc-99");
+    });
+
+    it("tolerates the observed ~7s slow-DB transaction instead of failing at Prisma's 5s default", async () => {
+        seedSession({ id: "session-1", accountId: "user-1", seq: 0 });
+        // Three round-trips at 2.4s each ≈ the 6.9s seen in production.
+        state.txQueryLatencyMs = 2400;
+
+        app = await createApp();
+        const response = await app.inject({
+            method: "POST",
+            url: "/v3/sessions/session-1/messages",
+            headers: { "x-user-id": "user-1" },
+            payload: { messages: [{ localId: "l1", content: "enc-1" }] }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().messages.map((message: any) => message.seq)).toEqual([1]);
     });
 
     it("enforces send validation limits and auth/session ownership", async () => {

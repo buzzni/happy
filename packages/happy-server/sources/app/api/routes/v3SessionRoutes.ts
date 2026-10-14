@@ -184,11 +184,13 @@ export function v3SessionRoutes(app: Fastify) {
             const newMessages = uniqueMessages.filter((message) => !existingByLocalId.has(message.localId));
             const seqs = await allocateSessionSeqBatch(sessionId, newMessages.length, tx);
 
-            const createdMessages: Omit<SelectedMessage, 'content'>[] = [];
-            for (let i = 0; i < newMessages.length; i += 1) {
-                const message = newMessages[i];
-                const createdMessage = await tx.sessionMessage.create({
-                    data: {
+            // One INSERT for the whole batch: the seq allocation above holds the
+            // Session row lock until commit, so a per-message round-trip loop
+            // kept it (and the transaction) open long enough to expire (P2028).
+            const createdMessages: Omit<SelectedMessage, 'content'>[] = newMessages.length === 0
+                ? []
+                : (await tx.sessionMessage.createManyAndReturn({
+                    data: newMessages.map((message, i) => ({
                         sessionId,
                         seq: seqs[i],
                         content: {
@@ -196,18 +198,15 @@ export function v3SessionRoutes(app: Fastify) {
                             c: message.content
                         },
                         localId: message.localId
-                    },
+                    })),
                     select: {
                         id: true,
                         seq: true,
-                        content: true,
                         localId: true,
                         createdAt: true,
                         updatedAt: true
                     }
-                });
-                createdMessages.push(createdMessage);
-            }
+                })).sort((a, b) => a.seq - b.seq);
 
             const responseMessages = [...existing, ...createdMessages].sort((a, b) => a.seq - b.seq);
 
@@ -215,6 +214,10 @@ export function v3SessionRoutes(app: Fastify) {
                 responseMessages,
                 createdMessages
             };
+        }, {
+            // Prisma's 5s default failed requests under DB slowness; match the
+            // 10s `inTx` budget used by the server's other write transactions.
+            timeout: 10000
         });
 
         // Announce outside the transaction, and take the whole block of update
