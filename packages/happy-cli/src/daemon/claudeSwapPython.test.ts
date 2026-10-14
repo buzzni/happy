@@ -47,7 +47,7 @@ describe('claude-swap through its base Python on Windows', () => {
     const resolver = { get: vi.fn(async () => target), peek: () => target, forget: vi.fn() }
     const routed = routeClaudeSwapThroughPython(run, resolver)
     await routed('cswap', ['list', '--json'], { timeoutMs: 5, environment: { KEEP: '1' } })
-    expect(run).toHaveBeenLastCalledWith(target.python, ['-m', 'claude_swap', 'list', '--json'], { timeoutMs: 5, environment: { KEEP: '1', PYTHONPATH: target.sitePackages } })
+    expect(run).toHaveBeenLastCalledWith(target.python, ['-P', '-m', 'claude_swap', 'list', '--json'], { timeoutMs: 5, environment: { KEEP: '1', PYTHONPATH: target.sitePackages } })
     await routed('uv', ['--version'])
     expect(run).toHaveBeenLastCalledWith('uv', ['--version'], undefined)
     await routed('uv', ['tool', 'install', 'saycode-claude-swap==0.27.0b2', '--force'])
@@ -58,7 +58,7 @@ describe('claude-swap through its base Python on Windows', () => {
   })
 
   it('launches the long-running cswap auto through that Python when it is known', () => {
-    expect(claudeSwapLaunch('cswap', ['auto', '--json'], target, { KEEP: '1' })).toEqual({ command: target.python, args: ['-m', 'claude_swap', 'auto', '--json'], env: { KEEP: '1', PYTHONPATH: target.sitePackages } })
+    expect(claudeSwapLaunch('cswap', ['auto', '--json'], target, { KEEP: '1' })).toEqual({ command: target.python, args: ['-P', '-m', 'claude_swap', 'auto', '--json'], env: { KEEP: '1', PYTHONPATH: target.sitePackages } })
     expect(claudeSwapLaunch('cswap', ['auto'], null, { KEEP: '1' })).toEqual({ command: 'cswap', args: ['auto'], env: { KEEP: '1' } })
   })
 })
