@@ -1,53 +1,32 @@
-# Windows stale Claude identity recovery
+# Windows의 오래된 Claude 로그인 정보 복구
 
-Status: source implemented and locally verified; runtime release and Desktop adoption pending.
-Updated: 2026-10-14
+- 상태: 소스 구현·로컬 검증 완료, 런타임 릴리스 및 Desktop 반영 대기
+- 갱신: 2026-10-14
 
-## Scope and decision
+## 판단과 범위
 
-Core: credential preservation and organization account application already belong to the Happy daemon.
-An installer must not delete the user's Claude configuration merely because an identity looks stale.
-The existing additive organization apply path can instead skip personal capture when Windows secure
-storage is demonstrably absent. This also covers retries after installation without a reinstall.
+Core의 기존 조직 계정 적용 경로에서 처리한다. 자격증명 보존은 데몬이 소유하는 책임이고,
+설치 시점에 사용자 설정을 삭제할 필요가 없다. 시작 준비 재시도도 같은 경로를 사용한다.
+공개 프로토콜·저장 스키마·Desktop UI는 바꾸지 않는다.
 
-No public protocol, stored schema or Desktop UI changes. The optional platform dependency is for
-deterministic tests; production defaults to process.platform. Revert the runtime change to restore
-the previous capture behavior; no configuration migration needs rollback.
+Windows에서 보안 저장소 파일을 읽었을 때 ENOENT이고 환경변수로 지정한 인증 수단도 없으면,
+남은 개인 계정 이름을 보관하려는 동작만 건너뛰고 기존 조직 계정 import·검증·receipt를 수행한다.
+설정 파일이나 개인 계정을 직접 삭제하지 않는다.
 
-## Implemented behavior
+보안 저장소 위치는 CLAUDE_SECURESTORAGE_CONFIG_DIR가 정의되어 있으면 그 값을,
+아니면 CLAUDE_CONFIG_DIR를 따른다. 빈 값은 기본 ~/.claude 저장소를 뜻한다.
+기존 파일·손상된 JSON·접근 오류는 부재로 취급하지 않는다.
+macOS에는 Keychain이 있으므로 파일 부재만으로 개인 계정 보관을 생략하지 않는다.
 
-- Resolve the secure store from CLAUDE_SECURESTORAGE_CONFIG_DIR when defined, otherwise CLAUDE_CONFIG_DIR.
-  An empty value selects the default ~/.claude store, matching the provider's capture behavior.
-- On Windows only, an ENOENT credential store and no explicit API/auth/OAuth token environment
-  credential allow stale identity metadata to bypass personal capture.
-- Existing stores, malformed JSON and access errors never count as absence. macOS retains the
-  capture path because a missing plaintext file does not prove absence from Keychain.
-- Keep configuration and stored personal accounts intact; use the normal organization import,
-  verification and receipt flow. Do not turn arbitrary COMMAND_FAILED errors into success.
+Windows의 OAuth 저장 방식이나 provider의 저장소 위치 판정이 바뀌면 부재 조건을 재검토한다.
+런타임 변경을 되돌리면 이전 동작으로 복원되며 데이터 migration은 없다.
 
-Reconsider the absence test if Windows Claude starts storing OAuth outside this file or the provider
-changes secure-store resolution. Broader recovery needs provider-authoritative presence diagnostics.
+## 검증과 다음 단계
 
-## Validation
+개인 계정 보존 테스트에는 실제 인증 파일에 해당하는 fixture를 두고
+Windows·macOS·Linux를 명시해 호스트 OS에 따라 성공 조건이 바뀌지 않게 했다.
+정식 unit 테스트 설정의 관련 4개 suite: 332 통과, 기존 2개 skip. CLI 빌드·타입 검사 통과.
 
-- Regression first failed on the old implementation with AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED.
-- Related Vitest suites: aiCredentialSetupToken, aiCredentialRuntime, aiCredentialGroupAdapters,
-  aiCredentialGroups: 330 passed, 2 existing skipped.
-- happy-wire build and happy-cli build (including tsc --noEmit) passed.
-- Tests cover successful orphan recovery without settings deletion, personal capture protection,
-  macOS, existing empty stores, explicit environment credentials, redirected and explicitly default
-  secure stores, malformed JSON, EACCES and EPERM.
-- Tests used the repository unit setup and alias with a temporary focused Vitest config, after
-  explicitly building the CLI; no integration suites or full repository test run.
-- Installed Windows app was not patched. End-to-end startup recovery on the released artifact remains
-  unverified.
-
-## Release follow-up
-
-Publish through the existing Happy release process with the required release authorization, then
-update Desktop's runtime pin and Windows lock together and add its release note. Do not point the
-pin at an unpublished version. Verify the installed Windows startup retry with an isolated stale
-identity fixture before claiming shipped recovery.
-
-Suggested release note: Windows 시작 준비에서 Claude 계정 이름만 남고 인증 파일이 없는 경우에도
-조직 AI 계정 연결을 계속합니다. 설정 파일을 직접 삭제하거나 다시 설치할 필요가 없습니다.
+설치된 Windows 앱은 교체하지 않았고 실제 시작 준비 복구는 아직 미검증이다.
+Happy 릴리스 후 Desktop runtime pin·Windows lock·릴리스 노트를 갱신하고
+릴리스 산출물의 Windows 시작 준비 재시도를 검증해야 한다.
