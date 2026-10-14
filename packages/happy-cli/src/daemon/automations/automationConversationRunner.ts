@@ -15,14 +15,24 @@ export async function deliverAutomationConversation(input: { runId: string; clai
     role: 'user', content: { type: 'text', text: input.prompt },
     localKey: `happy-automation:${input.runId}`, meta: { sentFrom: 'automation' },
   })
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let activationRetries = 0
+  for (let attempt = 0; attempt < 3;) {
     const seq = await deps.readSeq(input.sessionId)
     if (seq === null || !Number.isSafeInteger(seq) || seq < 0) return { ok: false, error: 'conversation sequence unavailable' }
     try {
       const result = await deps.deliver({ wireVersion: 1, runId: input.runId, claimToken: input.claimToken, sessionId: input.sessionId, expectedSeq: seq, contentCiphertext })
       if (result.ok) return { ok: true, sessionId: input.sessionId }
+      if (result.error === 'session-inactive') {
+        // Allow the 30s activity throttle and 5s batch flush after local resume.
+        // This separate bounded budget preserves sequence/unknown-ACK retries.
+        if (activationRetries >= 20) return { ok: false, error: 'conversation activation unconfirmed' }
+        activationRetries++
+        await new Promise(resolve => setTimeout(resolve, 2000))
+        continue
+      }
       if (result.error !== 'session-changed') return { ok: false, error: result.error ?? 'conversation delivery failed' }
     } catch { /* Replay the same run after an unknown ACK; the server fences its localId. */ }
+    attempt++
   }
   return { ok: false, error: 'conversation delivery unconfirmed' }
 }

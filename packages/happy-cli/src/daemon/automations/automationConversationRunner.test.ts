@@ -25,4 +25,45 @@ describe('ordinary conversation delivery', () => {
     deps.deliver.mockClear().mockResolvedValue({ ok: false, error: 'claim-cancelled' } as never)
     expect(await deliverAutomationConversation(request, deps)).toMatchObject({ ok: false }); expect(deps.deliver).toHaveBeenCalledTimes(1)
   })
+  it('waits for a resumed target heartbeat without consuming sequence or ACK retries', async () => {
+    vi.useFakeTimers()
+    try {
+      const deps = setup(), resumedAt = Date.now()
+      deps.deliver.mockImplementation(async () => Date.now() - resumedAt < 6000 ? { ok: false, error: 'session-inactive' } : { ok: true })
+      const result = deliverAutomationConversation(request, deps)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(deps.deliver).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(5999)
+      expect(deps.deliver).toHaveBeenCalledTimes(3)
+      deps.readSeq.mockResolvedValue(6)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await result).toEqual({ ok: true, sessionId: 's1' })
+      expect(deps.deliver.mock.calls.map(([input]) => input.expectedSeq)).toEqual([4, 4, 4, 6])
+      expect(deps.encryptUserMessage).toHaveBeenCalledTimes(1)
+      expect(deps.deliver.mock.calls.every(([input]) => input.runId === 'r1' && input.contentCiphertext === 'ciphertext')).toBe(true)
+    } finally { vi.useRealTimers() }
+  })
+  it('bounds waiting for a target that never becomes active', async () => {
+    vi.useFakeTimers()
+    try {
+      const deps = setup(), startedAt = Date.now()
+      deps.deliver.mockResolvedValue({ ok: false, error: 'session-inactive' })
+      const result = deliverAutomationConversation(request, deps)
+      await vi.runAllTimersAsync()
+      expect(await result).toEqual({ ok: false, error: 'conversation activation unconfirmed' })
+      expect(Date.now() - startedAt).toBe(40_000)
+      expect(deps.deliver).toHaveBeenCalledTimes(21)
+    } finally { vi.useRealTimers() }
+  })
+  it('stops waiting when the claim is revoked before activation', async () => {
+    vi.useFakeTimers()
+    try {
+      const deps = setup()
+      deps.deliver.mockResolvedValueOnce({ ok: false, error: 'session-inactive' }).mockResolvedValue({ ok: false, error: 'claim-cancelled' })
+      const result = deliverAutomationConversation(request, deps)
+      await vi.runAllTimersAsync()
+      expect(await result).toEqual({ ok: false, error: 'claim-cancelled' })
+      expect(deps.deliver).toHaveBeenCalledTimes(2)
+    } finally { vi.useRealTimers() }
+  })
 })

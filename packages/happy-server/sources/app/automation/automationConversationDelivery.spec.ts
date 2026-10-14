@@ -58,3 +58,12 @@ it('rejects a stale sequence without consuming the prompt and permits a rechecke
   expect(await client.sessionMessage.count()).toBe(0);
   expect(await deliver({ expectedSeq: 2 })).toMatchObject({ ok: true });
 });
+it('reports an inactive resumed target separately and delivers after its heartbeat activates it', async () => {
+  await client.session.update({ where: { id: 's1' }, data: { active: false } });
+  expect(await deliver()).toMatchObject({ ok: false, error: 'session-inactive' });
+  expect(await client.sessionMessage.count()).toBe(0);
+  expect((await client.session.findUniqueOrThrow({ where: { id: 's1' } })).seq).toBe(0);
+  await client.session.update({ where: { id: 's1' }, data: { active: true } });
+  expect(await deliver()).toMatchObject({ ok: true, value: { message: { seq: 1 } } });
+  expect(await client.sessionMessage.count()).toBe(1);
+});

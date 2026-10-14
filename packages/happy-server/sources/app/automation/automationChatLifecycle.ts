@@ -30,6 +30,8 @@ export async function transitionChatAutomations(tx: Tx, accountId: string, proje
   const rows = await tx.automation.findMany({ where: { projectId, deletedAt: null }, orderBy: { id: 'asc' } });
   for (const row of rows) {
     if (state === 'archived' && row.paused && !row.runRequestedAt) continue;
+    // Script revisions identify stored code/admission, so a lifecycle pause
+    // preserves that revision. Generation still fences cancelled executions.
     const updated = await tx.automation.update({ where: { id: row.id }, data: {
       paused: true, runRequestedAt: null, ...(row.payloadVersion === 3 ? {} : { revision: { increment: 1 } }), generation: { increment: 1 },
       ...(state === 'deleted' ? { deletedAt: now } : {}),

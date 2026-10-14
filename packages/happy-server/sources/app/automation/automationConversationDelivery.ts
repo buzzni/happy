@@ -37,7 +37,12 @@ export async function deliverAutomationConversationMessage(tx: Prisma.Transactio
     const replay = await tx.sessionMessage.findUnique({ where: { sessionId_localId: { sessionId: input.sessionId, localId } } });
     if (replay) return { ok: true as const, value: { idempotent: true, message: replay } };
     const updated = await tx.session.updateMany({ where: { id: input.sessionId, accountId, active: true, seq: input.expectedSeq }, data: { seq: { increment: 1 }, lastActiveAt: now } });
-    if (updated.count !== 1) return denied('session-changed');
+    if (updated.count !== 1) {
+        // Local resume readiness precedes the batched server activity update.
+        // Let the daemon wait for activation without spending sequence retries.
+        const latest = await tx.session.findFirst({ where: { id: input.sessionId, accountId }, select: { active: true } });
+        return denied(latest?.active === false ? 'session-inactive' : 'session-changed');
+    }
     const message = await tx.sessionMessage.create({ data: { sessionId: input.sessionId, localId, seq: input.expectedSeq + 1, content: { t: 'encrypted', c: input.contentCiphertext } } });
     return { ok: true as const, value: { idempotent: false, message } };
 }
