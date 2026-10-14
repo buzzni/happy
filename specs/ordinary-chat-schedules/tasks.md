@@ -1,5 +1,12 @@
 # Ordinary Chat schedules tasks
 
+## Official release and live acceptance (user requested 2026-10-14)
+
+- [x] Prepare .323 from main, validate production build/173 relevant tests/prepared tarball fresh-install guard, and commit the release candidate.
+- [ ] Merge the validated version bump, push the matching tag through the approved release checkpoint, and confirm publisher plus registry verification success.
+- [ ] Install the exact registry artifact on this PC; Desktop pin/staging must match the release tag and commit.
+- [ ] Verify actual scheduled questions, manual follow-up and subsequent scheduled question accumulate in the same Chat on Desktop and web; pause the test reservation after acceptance.
+
 - [x] Review: script archive→restore→HTTP list→explicit resume/ready/admission preserves revision payload and schedule.
 - [x] Review: legacy v1 first stop fails→reconcile→second stop confirms; unknown target remains pending.
 - [x] Related 31 server/140 CLI tests and type/production builds; documented fix for Happy #812 and Studio pin.
