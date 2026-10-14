@@ -4190,3 +4190,34 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
     }))
   })
 })
+
+
+describe('ordinary scheduled conversation execution', () => {
+  it.each(['none', 'required'] as const)('rejects the %s connector policy instead of weakening it in an ordinary session', async connectorPolicy => {
+    const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy, requiredConnectors: [] } });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } });
+    const deliver = vi.fn(); f.input.deliverConversation = deliver;
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }]);
+    expect(deliver).not.toHaveBeenCalled(); expect(f.spawnSession).not.toHaveBeenCalled();
+  });
+  it('delivers consecutive due runs to the same ordinary session while its provider stays alive', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } });
+    f.input.isSessionRunning = () => true;
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' })); f.input.deliverConversation = deliver;
+    for (let i = 0; i < 3; i++) { f.input.now = 1000000 + i * 15 * 60000; await runServerAutomationTick(f.input); }
+    expect(deliver).toHaveBeenCalledTimes(3); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+    expect(f.input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'r', claimToken: 't', conversationSessionId: 'ordinary' });
+  });
+  it('does not spawn a replacement when ordinary delivery fails', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32)); f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } });
+    f.input.deliverConversation = async () => ({ ok: false, error: 'target unavailable' });
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }]); expect(f.spawnSession).not.toHaveBeenCalled();
+  });
+});

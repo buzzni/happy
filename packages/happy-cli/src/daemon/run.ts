@@ -1,3 +1,4 @@
+import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { CheckpointRetention } from '@/checkpoint/checkpointRetention';
 import { CheckpointRetentionSchedule } from '@/checkpoint/checkpointRetentionSchedule';
@@ -4489,12 +4490,13 @@ export async function startDaemon(): Promise<void> {
             },
           });
         },
-        resolveProjectEnvironment: ({ runId, claimToken }) => fetchAutomationProjectEnvironment({
+        resolveProjectEnvironment: ({ runId, claimToken, conversationSessionId }) => fetchAutomationProjectEnvironment({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,
           machineId,
           runId,
           claimToken,
+          conversationSessionId,
         }),
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
@@ -4519,6 +4521,23 @@ export async function startDaemon(): Promise<void> {
           claimToken,
           logDebug: (message) => logger.debug(`[DAEMON RUN] [server-automation] ${message}`),
           sessionId,
+        }),
+        deliverConversation: (input) => deliverAutomationConversation(input, {
+          resolveSession: (sessionId) => {
+            const tracked = findTrackedSessionById(sessionId);
+            const directory = tracked?.happySessionMetadataFromLocalWebhook?.path ?? tracked?.directory;
+            return tracked?.encryption && directory ? { directory, ...tracked.encryption } : null;
+          },
+          sameDirectory: async (left, right) => (await resolveAutomationDirectoryMatch(left, right)) === true,
+          ensureRunning: async (sessionId) => (await resumeSession(sessionId)).type === 'success',
+          readSeq: async (sessionId) => {
+            const tracked = findTrackedSessionById(sessionId);
+            if (!tracked?.encryption) return null;
+            const snapshot = await fetchServerSessionSnapshot(sessionId, tracked.encryption);
+            return snapshot?.seq ?? null;
+          },
+          encryptUserMessage: (binding, message) => encodeBase64(encrypt(binding.encryptionKey, binding.encryptionVariant, message)),
+          deliver: (request) => apiMachine.deliverAutomationConversation(request),
         }),
         resumeSession: resumeAutomationSession,
         resumeServerChosenSession: configuration.machineControl !== 'strict',

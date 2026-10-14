@@ -59,3 +59,10 @@ describe('fetchAutomationProjectEnvironment', () => {
     await expect(fetchAutomationProjectEnvironment(input)).resolves.toEqual({ ok: false, error: 'project environment request failed' })
   })
 })
+
+it('requires the server to confirm the exact ordinary session, including on old servers', async () => {
+  const fetcher = vi.fn(async () => new Response(JSON.stringify({ projectId: 'chat:c', environmentVariables: {} }))); vi.stubGlobal('fetch', fetcher);
+  expect(await fetchAutomationProjectEnvironment({ ...input, conversationSessionId: 's1' })).toMatchObject({ ok: false });
+  fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ projectId: 'chat:c', environmentVariables: {}, conversationSessionId: 's1' })));
+  expect(await fetchAutomationProjectEnvironment({ ...input, conversationSessionId: 's1' })).toMatchObject({ ok: true });
+});

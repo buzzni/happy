@@ -23,7 +23,7 @@ export interface EncryptedServerAutomation {
   automationId: string
   revision: number
   generation: number
-  payloadVersion: 1
+  payloadVersion: 1 | 4
   payloadCiphertext: string
   machineKeyVersion: number
   machineKeyEnvelope: string
@@ -87,7 +87,7 @@ function base64(value: unknown, maxBytes: number, exactBytes?: number): string {
 }
 
 function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
-  if (row.kind !== 'UPSERT' || row.payloadVersion !== 1 || typeof row.paused !== 'boolean') fail()
+  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4) || typeof row.paused !== 'boolean') fail()
   const payloadCiphertext = base64(row.payloadCiphertext, PAYLOAD_MAX_BYTES)
   const machineKeyEnvelope = base64(row.machineKeyEnvelope, AUTHENTICATED_ENVELOPE_BYTES)
   const envelope = Buffer.from(machineKeyEnvelope, 'base64')
@@ -98,7 +98,7 @@ function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
     automationId: nonEmptyString(row.automationId),
     revision: positiveInteger(row.revision),
     generation: positiveInteger(row.generation),
-    payloadVersion: 1,
+    payloadVersion: row.payloadVersion,
     payloadCiphertext,
     machineKeyVersion: positiveInteger(row.machineKeyVersion),
     machineKeyEnvelope,
@@ -125,7 +125,7 @@ function readState(filePath: string): ServerAutomationCacheState {
     const disk = object(JSON.parse(raw))
     if (disk.version !== 1 || !Array.isArray(disk.automations) || !Array.isArray(disk.pendingAcknowledgements)) throw new Error()
     const state = {
-      cursor: sequence(disk.cursor),
+      cursor: disk.conversationSync === true ? sequence(disk.cursor) : 0n,
       serverTime: timestamp(disk.serverTime),
       syncedAt: timestamp(disk.syncedAt),
       automations: disk.automations.map((entry) => parseUpsert({ ...object(entry), kind: 'UPSERT' })),
@@ -146,6 +146,7 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
   writeFileSync(tmp, JSON.stringify({
     version: 1,
+    conversationSync: true,
     cursor: state.cursor.toString(),
     serverTime: state.serverTime,
     syncedAt: state.syncedAt,
@@ -245,7 +246,7 @@ export function openServerAutomationPayload(
   machineSecretKey: Uint8Array,
 ): MachinePayloadOpening<ServerAutomationPayload> {
   return openAutomationPayloadForMachine({
-    payloadVersion: 1,
+    payloadVersion: automation.payloadVersion,
     payloadCiphertext: automation.payloadCiphertext,
     machineKeyEnvelope: automation.machineKeyEnvelope,
     recipientSecretKey: machineSecretKey,

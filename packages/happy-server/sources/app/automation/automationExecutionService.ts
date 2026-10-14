@@ -94,7 +94,7 @@ export async function syncAutomations(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { afterSeq: bigint; limit: number },
+    input: { afterSeq: bigint; limit: number; payloadVersions?: number[] },
     now: Date = new Date(),
 ): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>> }>> {
     const rows = await tx.automationChange.findMany({
@@ -117,7 +117,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation || automation.payloadVersion === 3) {
+        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion === 4 && !input.payloadVersions?.includes(4))) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }

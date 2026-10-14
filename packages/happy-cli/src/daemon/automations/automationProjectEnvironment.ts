@@ -9,6 +9,7 @@ export async function fetchAutomationProjectEnvironment(input: {
   machineId: string
   runId: string
   claimToken: string
+  conversationSessionId?: string
 }): Promise<AutomationProjectEnvironmentResult> {
   if (!input.configUrl) return { ok: false, error: 'Aplus MCP config URL is not configured' }
   let url: URL
@@ -22,7 +23,7 @@ export async function fetchAutomationProjectEnvironment(input: {
       method: 'POST',
       redirect: 'error',
       headers: { Authorization: `Bearer ${input.machineToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ machineId: input.machineId, runId: input.runId, claimToken: input.claimToken }),
+      body: JSON.stringify({ machineId: input.machineId, runId: input.runId, claimToken: input.claimToken, ...(input.conversationSessionId ? { conversationSessionId: input.conversationSessionId } : {}) }),
       signal: AbortSignal.timeout(10_000),
     })
     if (!response.ok) {
@@ -40,8 +41,8 @@ export async function fetchAutomationProjectEnvironment(input: {
     }
     const body: unknown = await response.json()
     if (body && typeof body === 'object' && !Array.isArray(body)) {
-      const { projectId, environmentVariables } = body as Record<string, unknown>
-      if (typeof projectId === 'string' && projectId
+      const { projectId, environmentVariables, conversationSessionId } = body as Record<string, unknown>
+      if ((!input.conversationSessionId || conversationSessionId === input.conversationSessionId) && typeof projectId === 'string' && projectId
         && environmentVariables && typeof environmentVariables === 'object' && !Array.isArray(environmentVariables)
         && Object.entries(environmentVariables).every(([key, value]) =>
           /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0'))) {

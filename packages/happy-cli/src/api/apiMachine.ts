@@ -1,3 +1,4 @@
+import type { AutomationConversationDeliverRequest } from '@slopus/happy-wire';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
@@ -373,7 +374,7 @@ interface DaemonToServerEvents {
         value?: { keyVersion: number };
         error?: string;
     }) => void) => void;
-    'automation-sync': (data: { afterSeq: string; limit: number }, cb: (answer: {
+    'automation-sync': (data: { afterSeq: string; limit: number; payloadVersions?: number[] }, cb: (answer: {
         ok: boolean;
         value?: unknown;
         error?: string;
@@ -398,6 +399,7 @@ interface DaemonToServerEvents {
         runId: string;
         claimToken: string;
     }, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
+    'automation-conversation-deliver': (data: AutomationConversationDeliverRequest, cb: (answer: { ok: boolean; value?: unknown; error?: string }) => void) => void;
     'automation-run-report': (data: PendingAutomationReport, cb: (answer: {
         ok: boolean;
         value?: unknown;
@@ -2429,6 +2431,10 @@ export class ApiMachineClient {
         };
     }
 
+    deliverAutomationConversation(input: AutomationConversationDeliverRequest): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+        return this.socket.timeout(15_000).emitWithAck('automation-conversation-deliver', input);
+    }
+
     sessionFollowupTransport(): SessionFollowupTransport {
         const normalize = async (request: Promise<{ ok: boolean; value?: unknown; error?: string }>) => {
             const response = await request;
@@ -3187,7 +3193,7 @@ export class ApiMachineClient {
         if (!this.serverAutomationCache || this.serverAutomationSyncInFlight) return;
         const sync = syncServerAutomationDeltas({
             cache: this.serverAutomationCache,
-            sync: (request) => this.socket.emitWithAck('automation-sync', request),
+            sync: (request) => this.socket.emitWithAck('automation-sync', { ...request, payloadVersions: [1, 4] }),
             ack: (request) => this.socket.emitWithAck('automation-sync-ack', request),
         }).then((result) => {
             if (result.changed > 0) logger.debug(`[API MACHINE] Applied ${result.changed} automation delta(s)`);
@@ -3235,6 +3241,7 @@ export class ApiMachineClient {
                 serverBacked: true,
                 keyVersion,
                 sessionFollowup: true,
+                conversation: true,
                 protocolVersion: this.automationProtocolVersion,
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
@@ -4121,6 +4128,7 @@ export class ApiMachineClient {
                         serverBacked: this.automationServerKeyVersion !== null,
                         ...(this.automationServerKeyVersion !== null ? { keyVersion: this.automationServerKeyVersion } : {}),
                         sessionFollowup: true,
+                conversation: true,
                         protocolVersion: this.automationProtocolVersion,
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),

@@ -261,3 +261,14 @@ describe('client-sealed payloads on the daemon', () => {
     })
   })
 })
+
+it('resyncs once after reading a cache written by a daemon that could not negotiate ordinary conversations', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conversation-cache-'));
+  const file = path.join(dir, 'cache.json');
+  try {
+    const cache = createServerAutomationCache({ filePath: file }); cache.applySync({ serverTime: 1, nextSeq: '9', changes: [] });
+    const disk = JSON.parse(readFileSync(file, 'utf8')); delete disk.conversationSync;
+    writeFileSync(file, JSON.stringify(disk)); expect(cache.read().cursor).toBe(0n);
+    cache.applySync({ serverTime: 2, nextSeq: '9', changes: [] }); expect(cache.read().cursor).toBe(9n);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

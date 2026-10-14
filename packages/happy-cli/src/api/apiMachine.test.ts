@@ -6,7 +6,7 @@ import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTermina
 import { deriveServerRpcKey, encodeBase64, encrypt } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
-import type { Machine } from './types';
+import { MachineMetadataSchema, type Machine } from './types';
 import type { RpcHandlerConfig } from './rpc/types';
 import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
@@ -1521,6 +1521,8 @@ describe('ApiMachineClient socket reconnection', () => {
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(true));
         expect(machine.metadata?.automationSupport?.hostCommands).toBe(expected);
+        expect(machine.metadata?.automationSupport?.conversation).toBe(true);
+        expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.conversation).toBe(true);
         client.shutdown();
     });
 
@@ -1696,7 +1698,7 @@ describe('ApiMachineClient socket reconnection', () => {
 
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(cache.markAcknowledged).toHaveBeenCalled());
-        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500 });
+        expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync', { afterSeq: '0', limit: 500, payloadVersions: [1, 4] });
         expect(cache.applySync.mock.invocationCallOrder[0]).toBeLessThan(cache.markAcknowledged.mock.invocationCallOrder[0]!);
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-sync-ack', {
             items: [{ automationId: 'automation-1', revision: 1 }],
