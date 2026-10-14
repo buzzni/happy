@@ -471,7 +471,7 @@ function reconcileSchedules(
    */
   knownAutomations: EncryptedServerAutomation[] = cache.automations,
 ): ServerAutomationRuntimeState {
-  const activeIds = new Set(cache.automations.map((automation) => automation.automationId))
+  const activeIds = new Set([...cache.automations, ...cache.pendingCancellations ?? []].map((automation) => automation.automationId))
   const schedules = state.schedules.filter((schedule) => activeIds.has(schedule.automationId))
   const byId = new Map(schedules.map((schedule) => [schedule.automationId, schedule]))
   for (const automation of cache.automations) {
@@ -1742,7 +1742,7 @@ export async function runServerAutomationTick(
     try {
       const payload = input.decryptPayload(cancelled, input.machineSecretKey)
       const sessionId = payload.conversation?.sessionId ?? input.runtimeStore.read().schedules.find(row => row.automationId === cancelled.automationId)?.lastSessionId
-      if (!sessionId || await input.cancelScheduledSession?.({ sessionId, directory: payload.directory })) {
+      if (sessionId && await input.cancelScheduledSession?.({ sessionId, directory: payload.directory })) {
         input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
       }
     } catch (error) { input.logDebug?.(`[server-automation] cancellation pending: ${error}`) }

@@ -1,5 +1,9 @@
 # Ordinary Chat schedules tasks
 
+- [x] Review: script archive→restore→HTTP list→explicit resume/ready/admission preserves revision payload and schedule.
+- [x] Review: legacy v1 first stop fails→reconcile→second stop confirms; unknown target remains pending.
+- [x] Related 31 server/140 CLI tests and type/production builds; documented fix for Happy #812 and Studio pin.
+
 - [x] Wire payload 4, downgrade rejection, encrypted metadata capability and explicit sync negotiation.
 - [x] Cache recovery and current Chat authority confirmation with an exact Studio response echo.
 - [x] Local binding, canonical directory and existing per-session resume fence.

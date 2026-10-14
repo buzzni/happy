@@ -31,10 +31,10 @@ export async function transitionChatAutomations(tx: Tx, accountId: string, proje
   for (const row of rows) {
     if (state === 'archived' && row.paused && !row.runRequestedAt) continue;
     const updated = await tx.automation.update({ where: { id: row.id }, data: {
-      paused: true, runRequestedAt: null, revision: { increment: 1 }, generation: { increment: 1 },
+      paused: true, runRequestedAt: null, ...(row.payloadVersion === 3 ? {} : { revision: { increment: 1 } }), generation: { increment: 1 },
       ...(state === 'deleted' ? { deletedAt: now } : {}),
     } });
-    if (row.machineAccountId && row.machineId) await appendChange(tx, updated, { machineAccountId: row.machineAccountId, machineId: row.machineId }, state === 'deleted' ? 'TOMBSTONE' : 'UPSERT');
+    if (row.payloadVersion !== 3 && row.machineAccountId && row.machineId) await appendChange(tx, updated, { machineAccountId: row.machineAccountId, machineId: row.machineId }, state === 'deleted' ? 'TOMBSTONE' : 'UPSERT');
   }
   const ids = rows.map(row => row.id);
   await tx.automationRun.updateMany({ where: { automationId: { in: ids }, status: { in: ['CLAIMED', 'RUNNING'] } }, data: { status: 'CANCELLED', completedAt: now, failureCode: state === 'deleted' ? 'CHAT_DELETED' : 'CHAT_ARCHIVED' } });

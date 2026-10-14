@@ -6,6 +6,12 @@ updated: 2026-10-14
 
 # Ordinary Chat schedules context
 
+## 2026-10-14 AgentTask lifecycle review fixes
+
+Reproduced a script list HTTP 409 after Chat archive/restore and a legacy v1 cancellation whose second stop was never attempted. Script v3 now preserves its existing definition revision during lifecycle pause/delete and stays out of the legacy change stream; admission, ciphertext, readiness and schedule cursor remain in the matching ScriptAutomationRevision. Explicit resume follows the normal new-revision verification contract and can enqueue the preserved due schedule. Runtime schedules for pending cancellations survive reconciliation; a missing target is not treated as confirmed shutdown.
+
+Actual Prisma/PGlite archive→restore→HTTP list→explicit resume/ready/admission regression and lifecycle suite: 31 passed, 2 existing conditional skips. CLI executor/cache: 140 passed, including failed stop→reconcile→confirmed retry and unavailable-target retention. Server/CLI types, server runtime build and CLI production build passed. Update Happy #812, then pin the reviewed commit in Studio #5039. No CLI publication/install, deployment or PR merge is authorized.
+
 ## 2026-10-14 PR preparation
 
 User invoked pushpr. Merged origin/main cafe2446 without conflicts and created [Happy #812](https://github.com/buzzni/happy/pull/812). Post-merge server related 89 tests and CLI runner/environment/cache/executor/API/managed-script 267 tests passed (5 platform conditions skipped); server/CLI type checks, server runtime build and CLI production build passed. Existing production build warnings are unchanged. No runtime installation, CLI release/tag, deployment or PR merge was performed. Studio must pin this branch's final validated commit, followed by Desktop.

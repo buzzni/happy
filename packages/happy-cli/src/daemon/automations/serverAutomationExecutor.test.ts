@@ -4199,12 +4199,35 @@ describe('ordinary scheduled conversation execution', () => {
     const markCancelled = vi.fn(); f.input.cache.markCancelled = markCancelled;
     const payload = f.input.decryptPayload(record, new Uint8Array(32));
     f.input.decryptPayload = () => ({ ...payload, conversation: { sessionId: 'ordinary' } });
-    const cancel = vi.fn(async () => false); f.input.cancelScheduledSession = cancel;
+    const cancel = vi.fn(async (_input: { sessionId: string; directory: string }) => false); f.input.cancelScheduledSession = cancel;
     await runServerAutomationTick(f.input); expect(markCancelled).not.toHaveBeenCalled();
     cancel.mockResolvedValue(true); await runServerAutomationTick(f.input);
     expect(cancel).toHaveBeenCalledWith({ sessionId: 'ordinary', directory: payload.directory });
     expect(markCancelled).toHaveBeenCalledWith([{ automationId: record.automationId, revision: record.revision }]);
     expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+  });
+  it('retains a legacy cancellation target through reconciliation and retries until shutdown is confirmed', async () => {
+    const f = setup(); const record = cacheRecord();
+    const cache = f.input.cache.read();
+    let pending = [record];
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: pending });
+    const markCancelled = vi.fn(() => { pending = [] }); f.input.cache.markCancelled = markCancelled;
+    const state = f.store.read(); state.schedules[0].lastSessionId = 'legacy-worker'; f.store.write(state);
+    const cancel = vi.fn(async (_input: { sessionId: string; directory: string }) => false); f.input.cancelScheduledSession = cancel;
+    await runServerAutomationTick(f.input);
+    expect(markCancelled).not.toHaveBeenCalled();
+    cancel.mockResolvedValue(true); await runServerAutomationTick(f.input);
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(cancel.mock.calls[1][0]).toMatchObject({ sessionId: 'legacy-worker' });
+    expect(markCancelled).toHaveBeenCalledTimes(1);
+    expect(f.store.read().schedules).toEqual([]);
+  });
+  it('does not acknowledge a legacy cancellation merely because its session target is unavailable', async () => {
+    const f = setup(); const cache = f.input.cache.read();
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [cacheRecord()] });
+    const markCancelled = vi.fn(); f.input.cache.markCancelled = markCancelled;
+    await runServerAutomationTick(f.input);
+    expect(markCancelled).not.toHaveBeenCalled();
   });
   it.each(['none', 'required'] as const)('rejects the %s connector policy instead of weakening it in an ordinary session', async connectorPolicy => {
     const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
