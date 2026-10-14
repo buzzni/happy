@@ -6,6 +6,10 @@ updated: 2026-10-14
 
 # Ordinary Chat schedules context
 
+## 2026-10-14 PR preparation
+
+User invoked pushpr. Merged origin/main cafe2446 without conflicts and created [Happy #812](https://github.com/buzzni/happy/pull/812). Post-merge server related 89 tests and CLI runner/environment/cache/executor/API/managed-script 267 tests passed (5 platform conditions skipped); server/CLI type checks, server runtime build and CLI production build passed. Existing production build warnings are unchanged. No runtime installation, CLI release/tag, deployment or PR merge was performed. Studio must pin this branch's final validated commit, followed by Desktop.
+
 Implementation is on `oskar/ordinary-chat-schedules`, based on Studio's pinned `6ec808ce`. The existing source checkout was left untouched. User approved public execution contract extension and excluded all historical migration.
 
 The normal message store and AutomationRun are authoritative; no DB schema was changed. Daemon delivery uses tracked encryption and canonical path plus the existing resume fence. Studio confirms owner/current Chat mapping before delivery. Happy fences the run, definition and session sequence and deduplicates by `happy-automation:<runId>`. A failed delivery never spawns a replacement. A live ordinary provider does not suppress future scheduled runs.
