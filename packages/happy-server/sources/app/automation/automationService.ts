@@ -109,7 +109,12 @@ export async function projectAccess(tx: Tx, actorId: string, projectId: string):
     };
 }
 
+export function chatAutomationsBlocked(project: { id: string; config: unknown }): boolean {
+    const state = project.config && typeof project.config === 'object' ? (project.config as { chatAutomationState?: unknown }).chatAutomationState : null;
+    return project.id.startsWith('chat:') && (state === 'archived' || state === 'deleted');
+}
 async function targetForProject(tx: Tx, project: ProjectAccess['project']): Promise<AutomationTarget | null> {
+    if (chatAutomationsBlocked(project)) return null;
     const machineId = typeof project.config === 'object' && project.config !== null
         && typeof (project.config as { machineId?: unknown }).machineId === 'string'
         ? (project.config as { machineId: string }).machineId
@@ -229,7 +234,7 @@ function validateKeyVersions(
     return null;
 }
 
-async function appendChange(
+export async function appendChange(
     tx: Tx,
     automation: Pick<Automation, 'id' | 'revision' | 'generation'>,
     target: { machineAccountId: string; machineId: string },
@@ -291,6 +296,7 @@ export async function requestAutomationRun(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    if (chatAutomationsBlocked(access.project)) return { ok: false, error: 'automation-paused' };
     const current = await tx.automation.findFirst({
         where: { id: automationId, projectId, deletedAt: null },
         include: {
@@ -499,6 +505,7 @@ export async function updateAutomation(
     const access = await projectAccess(tx, actorId, projectId);
     if (!access) return { ok: false, error: 'not-found' };
     if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    if (chatAutomationsBlocked(access.project)) return { ok: false, error: 'automation-paused' };
     const current = await tx.automation.findFirst({ where: { id: automationId, projectId, deletedAt: null } });
     if (!current) return { ok: false, error: 'not-found' };
     if (current.legacyMigrationPending) return { ok: false, error: 'migration-pending' };

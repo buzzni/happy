@@ -672,3 +672,11 @@ describe('automationExecutionService', () => {
     });
 
 });
+
+it('returns ordinary schedules only to daemons that explicitly negotiate payload 4', async () => {
+  const tx = makeTx(); tx.automation.findFirst.mockResolvedValue(automation({ payloadVersion: 4 }));
+  const old = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100 });
+  expect(old).toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'TOMBSTONE' })] } });
+  const current = await syncAutomations(tx as never, 'account-1', 'machine-1', { afterSeq: 0n, limit: 100, payloadVersions: [1, 4] });
+  expect(current).toMatchObject({ ok: true, value: { changes: [expect.objectContaining({ kind: 'UPSERT', payloadVersion: 4 })] } });
+});

@@ -48,4 +48,10 @@ describe('projectUpdate follow-up fence', () => {
         });
         expect(mocks.invalidateSessionFollowups).not.toHaveBeenCalled();
     });
+    it('preserves the internal Chat lifecycle fence when an older client updates config', async () => {
+        const project = await mocks.tx.project.findUnique();
+        mocks.tx.project.findUnique.mockResolvedValue({ ...project, id: 'chat:c', config: { ...project.config, chatAutomationState: 'deleted' } });
+        const result = await projectUpdate({ uid: 'owner-1' } as never, 'chat:c', { config: { machineId: 'machine-2' } });
+        expect(result).toMatchObject({ ok: true, value: { config: { machineId: 'machine-2', chatAutomationState: 'deleted' } } });
+    });
 });

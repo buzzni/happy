@@ -1,3 +1,4 @@
+import { deliverAutomationConversationMessage } from '@/app/automation/automationConversationDelivery';
 import type { Socket } from 'socket.io';
 import {
     ackAutomationSync,
@@ -19,6 +20,7 @@ import {
 } from '@/app/automation/sessionFollowupExecutionService';
 import { emitSessionFollowupMessageUpdate } from '@/app/automation/sessionFollowupUpdate';
 import {
+    automationConversationDeliverRequestSchema,
     sessionFollowupClaimRequestSchema,
     sessionFollowupDeliverRequestSchema,
     sessionFollowupEvaluationRequestSchema,
@@ -102,6 +104,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         return inTx((tx) => syncAutomations(tx, accountId, machineId, {
             afterSeq,
             limit: integer(data?.limit, 1, 500),
+            ...(data?.payloadVersions !== undefined ? { payloadVersions: Array.isArray(data.payloadVersions) && data.payloadVersions.length <= 2 && data.payloadVersions.every((version: unknown) => version === 1 || version === 4) ? data.payloadVersions : (() => { throw new Error('invalid-input'); })() } : {}),
         }));
     }));
 
@@ -148,6 +151,14 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     on('automation-run-heartbeat', async (data, callback) => answer(callback, () => inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, {
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
     }))));
+
+    on('automation-conversation-deliver', async (data, callback) => answer(callback, () => {
+        const input = automationConversationDeliverRequestSchema.parse(data);
+        return inTx((tx) => deliverAutomationConversationMessage(tx, accountId, machineId, input));
+    }, async (value) => {
+        const { message } = value as { message: { id: string; sessionId: string; seq: number; localId: string | null; content: { c: string }; createdAt: Date; updatedAt: Date } };
+        await emitSessionFollowupMessageUpdate({ userId: accountId, ...message, contentCiphertext: message.content.c });
+    }));
 
     on('automation-run-report', async (data, callback) => answer(callback, () => {
         const status = data?.status === 'COMPLETED' || data?.status === 'FAILED' ? data.status : null;

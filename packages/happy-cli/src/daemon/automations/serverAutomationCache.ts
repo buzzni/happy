@@ -23,7 +23,7 @@ export interface EncryptedServerAutomation {
   automationId: string
   revision: number
   generation: number
-  payloadVersion: 1
+  payloadVersion: 1 | 4
   payloadCiphertext: string
   machineKeyVersion: number
   machineKeyEnvelope: string
@@ -39,6 +39,7 @@ export interface ServerAutomationCacheState {
   syncedAt: number
   automations: EncryptedServerAutomation[]
   pendingAcknowledgements: Array<{ automationId: string; revision: number }>
+  pendingCancellations?: EncryptedServerAutomation[]
 }
 
 export type ServerAutomationPayload = AutomationPayload
@@ -47,6 +48,7 @@ export interface ServerAutomationCache {
   read(): ServerAutomationCacheState
   applySync(value: unknown): { nextSeq: bigint; acknowledgements: Array<{ automationId: string; revision: number }> }
   markAcknowledged(items: Array<{ automationId: string; revision: number }>): void
+  markCancelled?(items: Array<{ automationId: string; revision: number }>): void
 }
 
 function fail(): never {
@@ -87,7 +89,7 @@ function base64(value: unknown, maxBytes: number, exactBytes?: number): string {
 }
 
 function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
-  if (row.kind !== 'UPSERT' || row.payloadVersion !== 1 || typeof row.paused !== 'boolean') fail()
+  if (row.kind !== 'UPSERT' || (row.payloadVersion !== 1 && row.payloadVersion !== 4) || typeof row.paused !== 'boolean') fail()
   const payloadCiphertext = base64(row.payloadCiphertext, PAYLOAD_MAX_BYTES)
   const machineKeyEnvelope = base64(row.machineKeyEnvelope, AUTHENTICATED_ENVELOPE_BYTES)
   const envelope = Buffer.from(machineKeyEnvelope, 'base64')
@@ -98,7 +100,7 @@ function parseUpsert(row: Record<string, unknown>): EncryptedServerAutomation {
     automationId: nonEmptyString(row.automationId),
     revision: positiveInteger(row.revision),
     generation: positiveInteger(row.generation),
-    payloadVersion: 1,
+    payloadVersion: row.payloadVersion,
     payloadCiphertext,
     machineKeyVersion: positiveInteger(row.machineKeyVersion),
     machineKeyEnvelope,
@@ -125,7 +127,7 @@ function readState(filePath: string): ServerAutomationCacheState {
     const disk = object(JSON.parse(raw))
     if (disk.version !== 1 || !Array.isArray(disk.automations) || !Array.isArray(disk.pendingAcknowledgements)) throw new Error()
     const state = {
-      cursor: sequence(disk.cursor),
+      cursor: disk.conversationSync === true && disk.chatLifecycleSync === true ? sequence(disk.cursor) : 0n,
       serverTime: timestamp(disk.serverTime),
       syncedAt: timestamp(disk.syncedAt),
       automations: disk.automations.map((entry) => parseUpsert({ ...object(entry), kind: 'UPSERT' })),
@@ -133,6 +135,10 @@ function readState(filePath: string): ServerAutomationCacheState {
         const row = object(entry)
         return { automationId: nonEmptyString(row.automationId), revision: positiveInteger(row.revision) }
       }),
+      pendingCancellations: disk.pendingCancellations === undefined ? [] : (() => {
+        if (!Array.isArray(disk.pendingCancellations)) fail()
+        return disk.pendingCancellations.map(entry => parseUpsert({ ...object(entry), kind: 'UPSERT' }))
+      })(),
     }
     chmodSync(filePath, 0o600)
     return state
@@ -146,11 +152,14 @@ function persist(filePath: string, state: ServerAutomationCacheState): void {
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
   writeFileSync(tmp, JSON.stringify({
     version: 1,
+    conversationSync: true,
+    chatLifecycleSync: true,
     cursor: state.cursor.toString(),
     serverTime: state.serverTime,
     syncedAt: state.syncedAt,
     automations: state.automations,
     pendingAcknowledgements: state.pendingAcknowledgements,
+    pendingCancellations: state.pendingCancellations ?? [],
   }), { encoding: 'utf8', mode: 0o600 })
   renameSync(tmp, filePath)
   chmodSync(filePath, 0o600)
@@ -168,6 +177,7 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
       if (nextSeq < current.cursor) fail()
 
       const byId = new Map(current.automations.map((automation) => [automation.automationId, automation]))
+      const cancellations = new Map((current.pendingCancellations ?? []).map(row => [row.automationId, row]))
       const acknowledgements = new Map(current.pendingAcknowledgements.map((item) => [item.automationId, item.revision]))
       let previousSeq = current.cursor
       for (const value of response.changes) {
@@ -180,6 +190,10 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
         positiveInteger(row.generation)
         const existing = byId.get(automationId)
         if (row.kind === 'TOMBSTONE') {
+          if (row.chatDeleted === true) {
+            const cancelled = parseUpsert({ ...row, kind: 'UPSERT' })
+            if ((cancellations.get(automationId)?.revision ?? 0) <= revision) cancellations.set(automationId, cancelled)
+          }
           if (!existing || revision >= existing.revision) byId.delete(automationId)
           continue
         }
@@ -196,11 +210,17 @@ export function createServerAutomationCache(options: { filePath: string; now?: (
         syncedAt: (options.now ?? Date.now)(),
         automations: [...byId.values()],
         pendingAcknowledgements,
+        pendingCancellations: [...cancellations.values()],
       })
       return {
         nextSeq,
         acknowledgements: pendingAcknowledgements,
       }
+    },
+    markCancelled(items) {
+      const state = readState(options.filePath)
+      const completed = new Map(items.map(row => [row.automationId, row.revision]))
+      persist(options.filePath, { ...state, pendingCancellations: (state.pendingCancellations ?? []).filter(row => (completed.get(row.automationId) ?? 0) < row.revision) })
     },
     markAcknowledged(items) {
       const state = readState(options.filePath)
@@ -245,7 +265,7 @@ export function openServerAutomationPayload(
   machineSecretKey: Uint8Array,
 ): MachinePayloadOpening<ServerAutomationPayload> {
   return openAutomationPayloadForMachine({
-    payloadVersion: 1,
+    payloadVersion: automation.payloadVersion,
     payloadCiphertext: automation.payloadCiphertext,
     machineKeyEnvelope: automation.machineKeyEnvelope,
     recipientSecretKey: machineSecretKey,

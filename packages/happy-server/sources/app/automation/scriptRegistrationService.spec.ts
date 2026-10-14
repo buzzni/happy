@@ -13,6 +13,7 @@ import nacl from 'tweetnacl';
 import { decryptScriptValue, encryptScriptValue, type ScriptRegistrationRequest } from '@slopus/happy-wire';
 import { markScriptReady, enqueueScriptInput, enqueueDueScript, scriptQueueInTransaction, validateScriptTarget } from './scriptExecutionService';
 import { saveScriptAutomation } from './scriptRegistrationService';
+import { transitionChatAutomations } from './automationChatLifecycle';
 import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import { scriptAutomationRoutes } from '../api/routes/scriptAutomationRoutes';
@@ -45,6 +46,34 @@ beforeEach(async () => {
 });
 afterEach(async () => { await client?.$disconnect(); await db?.close(); });
 
+it('archives, restores, lists and explicitly resumes a script without breaking its revision or schedule', async () => {
+  await client.project.update({ where: { id: 'p1' }, data: { id: 'chat:c' } });
+  const scoped = { ...context, projectId: 'chat:c' };
+  const config = { ...registration,
+    encrypted: encryptScriptValue({ value: {}, context: scoped, viewerPublicKey: pair.publicKey, machinePublicKey: pair.publicKey }),
+    artifact: encryptScriptValue({ value: { source: 'test' }, context: { ...scoped, resourceId: 'code-1', purpose: 'artifact' }, viewerPublicKey: pair.publicKey, machinePublicKey: pair.publicKey }),
+    admission: { ...registration.admission, schedule: { kind: 'interval' as const, minutes: 15, enabled: true } } };
+  const first = await client.$transaction(tx => saveScriptAutomation(tx, 'owner', 'chat:c', config));
+  await client.$transaction(tx => markScriptReady(tx, 'owner', 'machine', first.id, first.revision, 1000));
+  const revision = await client.scriptAutomationRevision.findFirstOrThrow();
+  await client.$transaction(tx => transitionChatAutomations(tx, 'owner', 'chat:c', 'archived'));
+  await client.$transaction(tx => transitionChatAutomations(tx, 'owner', 'chat:c', 'active'));
+  const app = fastify().withTypeProvider<ZodTypeProvider>();
+  app.setValidatorCompiler(validatorCompiler); app.setSerializerCompiler(serializerCompiler);
+  app.decorate('authenticate', async (request: any) => { request.userId = 'owner'; });
+  scriptAutomationRoutes(app, { transaction: action => client.$transaction(action), enabled: () => true });
+  try {
+    const listed = await app.inject({ method: 'GET', url: '/v1/machines/machine/script-automations' });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().automations).toMatchObject([{ id: first.id, revision: first.revision, paused: true }]);
+    const resumed = await client.$transaction(tx => saveScriptAutomation(tx, 'owner', 'chat:c', { ...config, expectedRevision: first.revision }));
+    expect(resumed.paused).toBe(false);
+    expect(await client.scriptAutomationRevision.findUniqueOrThrow({ where: { automationId_revision: { automationId: first.id, revision: resumed.revision } } })).toMatchObject({ admission: revision.admission, payloadCiphertext: revision.payloadCiphertext, ready: false, nextRunAt: revision.nextRunAt });
+    await client.$transaction(tx => markScriptReady(tx, 'owner', 'machine', first.id, resumed.revision, 2000));
+    expect(await client.$transaction(tx => enqueueDueScript(tx, 'owner', 'machine', first.id, 901000))).toMatchObject({ revision: resumed.revision, generation: resumed.generation, status: 'QUEUED' });
+    expect(await client.automationChange.count()).toBe(0);
+  } finally { await app.close(); }
+});
 it('atomically registers an encrypted artifact and automation with idempotent registration', async () => {
   const first = await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', registration));
   const again = await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', registration));
@@ -53,6 +82,44 @@ it('atomically registers an encrypted artifact and automation with idempotent re
   expect(await client.automation.count()).toBe(1);
   expect(await client.scriptAutomationRevision.count({ where: { ready: false } })).toBe(1);
   expect(await client.automationChange.count()).toBe(0);
+});
+it('keeps an archived Chat script pollable and editable after restore without losing its schedule', async () => {
+  const projectId = 'chat:p1';
+  await client.project.update({ where: { id: 'p1' }, data: { id: projectId } });
+  const chatContext = { ...context, projectId };
+  const config: ScriptRegistrationRequest = { ...registration,
+    encrypted: encryptScriptValue({ value: {}, context: chatContext, viewerPublicKey: pair.publicKey, machinePublicKey: pair.publicKey }),
+    artifact: encryptScriptValue({ value: { source: 'test' }, context: { ...chatContext, resourceId: 'code-1', purpose: 'artifact' }, viewerPublicKey: pair.publicKey, machinePublicKey: pair.publicKey }),
+    admission: { ...registration.admission, schedule: { kind: 'interval', minutes: 15, enabled: true } },
+  };
+  const row = await client.$transaction(tx => saveScriptAutomation(tx, 'owner', projectId, config));
+  await client.$transaction(tx => markScriptReady(tx, 'owner', 'machine', row.id, 1, 1000));
+  await client.$transaction(tx => enqueueScriptInput(tx, 'owner', projectId, row.id, { input: {} }, 'before-archive', 1001));
+  const before = await client.scriptAutomationRevision.findFirstOrThrow();
+  const app = fastify().withTypeProvider<ZodTypeProvider>();
+  app.setValidatorCompiler(validatorCompiler); app.setSerializerCompiler(serializerCompiler);
+  app.decorate('authenticate', async (request: { userId: string }) => { request.userId = 'owner'; });
+  scriptAutomationRoutes(app, { transaction: action => client.$transaction(action), enabled: () => true });
+  try {
+    const poll = () => app.inject({ method: 'GET', url: '/v1/machines/machine/script-automations' });
+    expect((await poll()).statusCode).toBe(200);
+    await client.$transaction(tx => transitionChatAutomations(tx, 'owner', projectId, 'archived'));
+    const archived = await poll();
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json().automations[0]).toMatchObject({ id: row.id, paused: true, revision: 1, generation: 2 });
+    expect(await client.scriptAutomationRevision.findFirstOrThrow()).toEqual(before);
+    expect((await client.scriptInvocation.findFirstOrThrow()).status).toBe('CANCELLED');
+    await client.$transaction(tx => transitionChatAutomations(tx, 'owner', projectId, 'active'));
+    expect((await poll()).statusCode).toBe(200);
+    const listed = await app.inject({ method: 'GET', url: `/v1/projects/${projectId}/script-automations` });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().automations[0]).toMatchObject({ paused: true, revision: 1 });
+    const edited = await client.$transaction(tx => saveScriptAutomation(tx, 'owner', projectId, { ...config, expectedRevision: 1, paused: true }));
+    expect(edited).toMatchObject({ revision: 2, generation: 2, paused: true });
+    expect(await client.scriptAutomationRevision.findUniqueOrThrow({ where: { automationId_revision: { automationId: row.id, revision: 2 } } }))
+      .toMatchObject({ admission: before.admission, nextRunAt: before.nextRunAt, scheduleInitialized: before.scheduleInitialized });
+    expect((await poll()).statusCode).toBe(200);
+  } finally { await app.close(); }
 });
 it('removes an unused previous revision and its artifact after a successful edit', async () => {
   await client.$transaction((tx) => saveScriptAutomation(tx, 'owner', 'p1', registration));

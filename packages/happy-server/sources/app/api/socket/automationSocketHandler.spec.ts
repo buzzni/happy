@@ -60,7 +60,7 @@ describe('automationSocketHandler', () => {
         automationSocketHandler('account-1', 'machine-1', socket as never);
 
         expect([...handlers.keys()].sort()).toEqual([
-            'automation-claim', 'automation-key-register', 'automation-run-heartbeat',
+            'automation-claim', 'automation-conversation-deliver', 'automation-key-register', 'automation-run-heartbeat',
             'automation-run-report', 'automation-run-start', 'automation-sync', 'automation-sync-ack',
             'session-followup-claim', 'session-followup-deliver', 'session-followup-evaluate',
             'session-followup-sync',

@@ -379,3 +379,13 @@ describe('githubTriggerSchema escalateTo', () => {
     }).success).toBe(false);
   });
 });
+
+
+describe('ordinary conversation automations', () => {
+  const ordinary = { name: 'Report', schedule: { kind: 'interval', minutes: 15 }, prompt: 'Report', directory: '/chat', scriptCommand: null, suppressSilent: false, agent: 'claude', conversation: { sessionId: 'chat-session' } };
+  it('retains the client-selected conversation instead of stripping it', () => { expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary); });
+  it.each([{ sessionId: '' }, { sessionId: 'x'.repeat(201) }])('rejects malformed conversation targets', (conversation) => { expect(automationPayloadSchema.safeParse({ ...ordinary, conversation }).success).toBe(false); });
+  it('does not combine conversation delivery with GitHub triggers', () => {
+    expect(automationPayloadSchema.safeParse({ ...ordinary, schedule: { kind: 'github', minutes: 15 }, githubTrigger: { event: 'opened', action: 'start-session', githubCredentialId: null, filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] } } }).success).toBe(false);
+  });
+});
