@@ -8,6 +8,8 @@ updated: 2026-10-14
 
 ## 2026-10-14 official CLI release and live acceptance
 
+Release PR #814 macOS CI exposed two existing immediate PID-disappearance assertions in separate attempts: sealedSpawnEnv timeout, then checkpoint writer descendant cleanup. Neither runtime/test changed since .322; each attempt otherwise passed 10,953 tests. The tests now poll up to 2 seconds for ESRCH, allowing OS reaping after group shutdown while rejecting permission errors and surviving processes. Product shutdown logic is unchanged. Both affected files (12 tests) and CLI typecheck pass locally; a fresh CI run is required before merging/tagging.
+
 The user explicitly requested publishing the supporting CLI, applying it to this PC, and verifying actual scheduled execution and ordinary Chat accumulation on the web. Prepared @buzzni/happy-cli 1.1.10-aplus.323 from main ec9c0bae, which includes Happy #812/#813 and all reviewed fixes. The currently published .322 lacks the conversation runner. GitHub Actions remains the sole publisher; no local publish or independent registry tag/deprecation changes are allowed. Candidate production build and 173 relevant automation/version/package tests passed. Prepared tarball guard with fresh install smoke passed after correcting this worktree's stale ignored Saycode dependency symlink from 0.8.1 to the declared 0.9.4; other checkouts and running installations were untouched. Studio product 7baa34792 includes vendor 8400a129 and its production deployment succeeded. Keep existing PC sessions, credentials, reservation history and ordinary messages intact. Desktop must consume the exact successful release identity, and real provider/web acceptance is separate from package verification.
 
 ## 2026-10-14 AgentTask lifecycle review fixes
