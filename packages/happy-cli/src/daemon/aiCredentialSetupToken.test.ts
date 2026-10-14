@@ -51,7 +51,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -101,13 +101,13 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
     return { stdout: '', stderr: '' }
   })
   const runtime = createAiCredentialRuntime({
-    homeDir: '/home/operator', machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
+    homeDir: '/home/operator', platform: options.platform, machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier() }),
     ...(options.durability === 'missing' ? {} : {
       syncFile: async (path: string) => { syncEvents.push('file:' + path); if (options.durability === 'file-fails') throw new Error('sync failed') },
       syncDirectory: async (path: string) => { syncEvents.push('directory:' + path); if (options.durability === 'directory-fails') throw new Error('sync failed') },
     }),
-    readFile: vi.fn(async (path: string) => files.get(path) ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' }))),
+    readFile: vi.fn(async (path: string) => { if (options.readError && path.endsWith('.credentials.json')) throw Object.assign(new Error('unreadable'), { code: options.readError }); return files.get(path) ?? Promise.reject(Object.assign(new Error('missing'), { code: 'ENOENT' })); }),
     writeFile: vi.fn(async (path: string, content: string) => {
       if (path.includes('setup-token-binding-nonces') && options.clock && options.advanceOnNonceWrite) options.clock.now += options.advanceOnNonceWrite
       files.set(path, content)
@@ -431,6 +431,59 @@ describe('managed Claude setup-token runtime', () => {
     await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))
     expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
     expect(state.slots).toEqual([expect.objectContaining({ email: managedSetupTokenEmail(A), managedAccountId: A, credentialGeneration: 1 })])
+  })
+
+  it('applies a Windows organization account despite an orphaned personal identity, without deleting settings', async () => {
+    const config = JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' }, theme: 'dark' })
+    const files = new Map([['/home/operator/.claude.json', config]])
+    const { runtime, state, calls } = fakeMachine([], null, { files, platform: 'win32' })
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots).toEqual([expect.objectContaining({ managedAccountId: A })])
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
+    expect(files.get('/home/operator/.claude.json')).toBe(config)
+  })
+
+  it.each([
+    { platform: 'darwin' as const },
+    { platform: 'win32' as const, env: { ANTHROPIC_API_KEY: 'test-key' } },
+    { platform: 'win32' as const, credential: JSON.stringify({ claudeAiOauth: { accessToken: 'personal' } }) },
+    { platform: 'win32' as const, credential: '{}' },
+    { platform: 'win32' as const, env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '/secure' }, secureCredential: '{}' },
+  ])('still requires personal capture when absence is not proven: %j', async options => {
+    const files = new Map([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })]])
+    if (options.credential) files.set('/home/operator/.claude/.credentials.json', options.credential)
+    if (options.secureCredential) files.set('/secure/.credentials.json', options.secureCredential)
+    const { runtime, calls, state } = fakeMachine([], null, { files, ...options })
+    // The fake add cannot save the personal account: applying must stop before importing.
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
+    expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(true)
+    expect(state.slots).toEqual([])
+  })
+
+  it('respects an explicitly default secure store without deleting a custom profile', async () => {
+    const config = JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })
+    const files = new Map([['/profile/.claude.json', config], ['/profile/.credentials.json', '{}']])
+    const { runtime, calls } = fakeMachine([], null, { files, platform: 'win32',
+      env: { CLAUDE_CONFIG_DIR: '/profile', CLAUDE_SECURESTORAGE_CONFIG_DIR: '' } })
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).resolves.toMatchObject({ reconciled: true })
+    expect(calls.some(call => call.args[0] === 'add')).toBe(false)
+    expect(files.get('/profile/.credentials.json')).toBe('{}')
+    expect(files.get('/profile/.claude.json')).toBe(config)
+  })
+
+  it('does not treat malformed credentials as absent', async () => {
+    const files = new Map([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })],
+      ['/home/operator/.claude/.credentials.json', '{broken']])
+    const { runtime, state } = fakeMachine([], null, { files, platform: 'win32' })
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow()
+    expect(state.slots).toEqual([])
+  })
+
+  it.each(['EACCES', 'EPERM'])('does not treat unreadable credentials as absent (%s)', async readError => {
+    const files = new Map([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })]])
+    const { runtime, state } = fakeMachine([], null, { files, platform: 'win32', readError })
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow()
+    expect(state.slots).toEqual([])
   })
 
   it('restores its own managed slot that lost its managed metadata instead of refusing it', async () => {
