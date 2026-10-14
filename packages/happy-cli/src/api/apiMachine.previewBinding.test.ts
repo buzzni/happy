@@ -7,18 +7,19 @@
  * failure mode is not a wrong verdict but a skipped one: a daemon that cannot
  * verify yet must refuse the request, not relay it as if it were unbound.
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('@/configuration', () => ({
-    configuration: {
-        currentCliVersion: 'test',
-        happyHomeDir: '/tmp/happy-test',
-        happyLibDir: '/tmp/happy-test/lib',
-        isDaemonProcess: true,
-        logsDir: '/tmp/happy-test/logs',
-        serverUrl: 'http://127.0.0.1:3005',
-    },
+const config = vi.hoisted(() => ({
+    currentCliVersion: 'test',
+    happyHomeDir: '/tmp/happy-test',
+    happyLibDir: '/tmp/happy-test/lib',
+    isDaemonProcess: true,
+    logsDir: '/tmp/happy-test/logs',
+    serverUrl: 'http://127.0.0.1:3005',
+    machineControl: undefined as string | undefined,
 }))
+
+vi.mock('@/configuration', () => ({ configuration: config }))
 
 vi.mock('@/modules/common/registerCommonHandlers', () => ({
     registerCommonHandlers: vi.fn(),
@@ -352,5 +353,55 @@ describe('ApiMachineClient bound preview WS event', () => {
 
         expect(ack).toMatchObject({ ok: false, code: 'PORT_PROJECT_MISMATCH' })
         expect(open).not.toHaveBeenCalled()
+    })
+})
+
+// aplus-dev-studio specs/e2ee-machine-control-boundary strict-followup-plan F0-b (daemon 5). On a
+// strict machine happy-server must not reach local services through the plaintext relay: only a
+// request bound to a registered preview runtime is relayed, and the remote-screen relay is off until
+// it has a customer-encrypted channel.
+describe('ApiMachineClient preview relay on a strict machine', () => {
+    beforeEach(() => {
+        config.machineControl = 'strict'
+    })
+    afterEach(() => {
+        config.machineControl = undefined
+    })
+
+    it('refuses an unbound relay request instead of reaching the local port', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        await expect(client.enforcePreviewBinding(undefined, 3000)).resolves.toMatchObject({
+            outcome: 'rejected',
+            code: 'STRICT_BINDING_REQUIRED',
+        })
+        await expect(client.relayPreviewHttp('proxy-http-request', { port: 3000, method: 'GET', path: '/' })).resolves.toMatchObject({
+            type: 'error',
+            code: 'STRICT_BINDING_REQUIRED',
+        })
+        await expect(client.openPreviewWsTunnel({ tunnelId: 't1', port: 3000, path: '/' })).resolves.toMatchObject({
+            ok: false,
+            code: 'STRICT_BINDING_REQUIRED',
+        })
+    })
+
+    it('still verifies a bound request as on any machine', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({
+            readAll: vi.fn().mockResolvedValue({ 'session:other-project': { port: 3000, projectId: 'other-project' } }),
+        }))
+        await expect(client.enforcePreviewBinding(BINDING, 3000)).resolves.toMatchObject({ code: 'PORT_PROJECT_MISMATCH' })
+    })
+
+    it('refuses the remote-screen relay and its lease', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        await expect(client.enforceViewerBinding({ purpose: 'viewer', viewerKey: 'k', leaseId: 'l' }, 6080)).resolves.toMatchObject({
+            outcome: 'rejected',
+            code: 'STRICT_VIEWER_UNAVAILABLE',
+        })
+        const ack = vi.fn()
+        await client.answerPreviewViewerRuntimeLease({ viewerKey: 'k', port: 6080 }, ack)
+        expect(ack).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', code: 'STRICT_VIEWER_UNAVAILABLE' }))
     })
 })

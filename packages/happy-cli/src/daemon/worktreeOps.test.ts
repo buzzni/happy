@@ -3,7 +3,7 @@
  * operations for a strict machine itself, from a ticket the server issued, and signs what it did.
  * Real git in temporary repositories.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -132,6 +132,16 @@ describe('worktree ops tickets', () => {
         const once = ticket('capability', { workspaceDir: repo });
         expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: true });
         expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: false, errorCode: 'TICKET_REPLAYED' });
+    });
+
+    // aplus-dev-studio strict-followup-plan F0-b (Q12 a): a restart used to forget every used ticket.
+    it('remembers used tickets across a daemon restart', async () => {
+        const once = ticket('capability', { workspaceDir: repo });
+        expect(await handlers()['worktree:capability']({ ticket: once })).toMatchObject({ success: true });
+        vi.resetModules();
+        const restarted = await import('./worktreeOps');
+        const fresh = restarted.createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW });
+        expect(await fresh['worktree:capability']({ ticket: once })).toMatchObject({ success: false, errorCode: 'TICKET_REPLAYED' });
     });
 
     it('needs a machine key to sign with', async () => {
@@ -361,6 +371,29 @@ describe('worktree:remove', () => {
 
     it('reports a worktree already gone', async () => {
         expect((await call('remove', remove(`${repo}/.aplus/worktrees/p1/gone`))).result).toEqual({ outcome: 'missing' });
+    });
+
+    // aplus-dev-studio strict-followup-plan F0-b (daemon 3): the server names the branch, and the
+    // server may be hostile. Unapplied commits are judged from the worktree itself.
+    it('keeps unapplied work whatever branch the ticket names, unless forced', async () => {
+        const { result } = await call('create', create());
+        git(result.path, 'commit', '--quiet', '--allow-empty', '-m', 'work');
+        expect(await call('remove', remove(result.path, { branch: null }))).toMatchObject({ success: false, errorCode: 'WORKTREE_DIRTY' });
+        // An already merged branch named instead of the worktree's own.
+        expect(await call('remove', remove(result.path, { branch: 'main' }))).toMatchObject({ success: false });
+        git(result.path, 'switch', '--quiet', '--detach');
+        expect(await call('remove', remove(result.path, { branch: null }))).toMatchObject({ success: false, errorCode: 'WORKTREE_DIRTY' });
+        expect(existsSync(result.path)).toBe(true);
+        expect(git(repo, 'branch', '--list', 'main')).toContain('main');
+    });
+
+    it('deletes only the worktree\'s own branch, even when forced', async () => {
+        git(repo, 'switch', '--quiet', '-c', 'keep-me');
+        git(repo, 'commit', '--quiet', '--allow-empty', '-m', 'unmerged');
+        git(repo, 'switch', '--quiet', 'main');
+        const { result } = await call('create', create());
+        expect((await call('remove', remove(result.path, { force: true, branch: 'keep-me' }))).result).toEqual({ outcome: 'removed' });
+        expect(git(repo, 'branch', '--list', 'keep-me')).toContain('keep-me');
     });
 
     it('refuses a path outside this project\'s managed worktrees', async () => {
@@ -595,6 +628,47 @@ describe('worktree:publish', () => {
     it('refuses without a remote', async () => {
         const path = await worktree();
         expect(await call('publish', publish(path))).toMatchObject({ success: false, errorCode: 'WORKTREE_PUBLISH_NO_REMOTE' });
+    });
+
+    // aplus-dev-studio strict-followup-plan F0-b (daemon 4): the address comes from the server, so it
+    // must name the repository this workspace already pushes to, before anything is changed or sent.
+    describe('pins the address to the repository origin already names', () => {
+        const ONLINE = 'https://github.com/acme/app.git';
+        const ELSEWHERE = 'https://evil.example/acme/app.git';
+
+        it('refuses another repository, and leaves origin as it was', async () => {
+            git(repo, 'remote', 'add', 'origin', ONLINE);
+            const path = await worktree();
+            expect(await call('publish', publish(path, { remoteUrl: ELSEWHERE }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+            expect(await call('publish', publish(path, { remoteUrl: 'https://github.com/acme/other.git' }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+            expect(git(repo, 'remote', 'get-url', 'origin')).toBe(ONLINE);
+        });
+
+        it('refuses when origin pushes, or is rewritten, somewhere else', async () => {
+            git(repo, 'remote', 'add', 'origin', ONLINE);
+            git(repo, 'remote', 'set-url', '--push', 'origin', ELSEWHERE);
+            const path = await worktree();
+            expect(await call('publish', publish(path, { remoteUrl: ONLINE }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+            git(repo, 'config', '--unset', 'remote.origin.pushurl');
+            git(repo, 'config', 'url.https://evil.example/.insteadOf', 'https://github.com/');
+            expect(await call('publish', publish(path, { remoteUrl: ONLINE }))).toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        });
+
+        it('accepts the same repository over another transport', async () => {
+            git(repo, 'remote', 'add', 'origin', 'git@github.com:Acme/app.git');
+            git(repo, 'switch', '--quiet', '-c', 'side');
+            const answer = await call('prepare-conversation', {
+                workspaceDir: repo, baseBranch: 'main', source: 'origin', allowCurrentBranchDirty: true, remoteUrl: ONLINE, statusPathspecs: ['.'],
+            });
+            expect(answer.errorCode).not.toBe('WORKTREE_REMOTE_MISMATCH');
+            expect(git(repo, 'remote', 'get-url', 'origin')).toBe(ONLINE);
+        });
+
+        it('does not fetch a base from another repository', async () => {
+            git(repo, 'remote', 'add', 'origin', ONLINE);
+            expect(await call('create', create({ baseSource: 'origin', baseRef: 'main', remoteUrl: ELSEWHERE })))
+                .toMatchObject({ success: false, errorCode: 'WORKTREE_REMOTE_MISMATCH' });
+        });
     });
 });
 

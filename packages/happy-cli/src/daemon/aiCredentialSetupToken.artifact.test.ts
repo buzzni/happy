@@ -228,4 +228,28 @@ if sys.argv[1:3] == ['auth', 'logout']:
     }
   }, 40_000)
 
+  // 2026-10-12 hmrepo: the live managed login had been captured into a bare slot. Real cswap refuses to make that slot
+  // managed through `import --force` ('managed identity conflict'); the runtime must remove and import it, keeping it active.
+  it('restores its own active managed slot that lost its managed metadata', async () => {
+    const runtime = make()
+    expect(await runtime.groupSync(sync(10, payload(managed(A, 1, token('r1')))))).toMatchObject({ generation: 10, reconciled: true })
+    const exported = JSON.parse((await runAiCredentialCommand('cswap', ['export', '-'])).stdout)
+    const slot = exported.accounts.find((account: { managedAccountId?: string }) => account.managedAccountId === A)
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = slot
+    await runAiCredentialCommand('cswap', ['remove', String(slot.number)], { input: 'y\n' })
+    const file = join(root, 'bare.json')
+    writeFileSync(file, JSON.stringify({ version: 1, encrypted: false, accounts: [bare] }))
+    await runAiCredentialCommand('cswap', ['import', file])
+    await runAiCredentialCommand('cswap', ['switch', String(slot.number), '--force', '--json'])
+    const stripped = JSON.parse((await runAiCredentialCommand('cswap', ['export', '-'])).stdout).accounts.find((account: { email: string }) => account.email === managedSetupTokenEmail(A))
+    expect(stripped.managedAccountId).toBeUndefined()
+
+    failures.length = 0
+    expect(await runtime.groupSync(sync(11, payload(managed(A, 2, token('r2')))))).toMatchObject({ generation: 11, reconciled: true })
+    const list = JSON.parse((await runAiCredentialCommand('cswap', ['list', '--json'])).stdout)
+    const restored = JSON.parse((await runAiCredentialCommand('cswap', ['export', '-'])).stdout).accounts.find((account: { email: string }) => account.email === managedSetupTokenEmail(A))
+    expect(restored).toMatchObject({ managedAccountId: A, credentialGeneration: 2, credentials: { claudeAiOauth: { accessToken: token('r2') } } })
+    expect(list.activeAccountNumber).toBe(restored.number)
+    expect(failures).toEqual([])
+  }, 300_000)
 })

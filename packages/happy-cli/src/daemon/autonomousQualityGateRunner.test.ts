@@ -179,7 +179,9 @@ describe('runAutonomousQualityGatePhase', () => {
                 timeoutMs: 5_000,
                 readinessUrl: `http://127.0.0.1:${port}/`,
             }, { cwd: process.cwd(), signal: controller.signal, killGraceMs: 100 });
-            await vi.waitFor(() => expect(kill.mock.calls.some(([, signal]) => signal === 'SIGTERM')).toBe(true));
+            // Readiness cleanup runs once node has started and answered; a cold node on a CI macOS
+            // runner takes longer than waitFor's 1 s default. Stay inside the phase's 5 s timeout.
+            await vi.waitFor(() => expect(kill.mock.calls.some(([, signal]) => signal === 'SIGTERM')).toBe(true), { timeout: 4_500 });
             controller.abort();
 
             await expect(completion).resolves.toMatchObject({ status: 'aborted' });

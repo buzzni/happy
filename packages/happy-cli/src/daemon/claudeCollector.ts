@@ -2,12 +2,22 @@
 import { createHash, createPublicKey, verify } from 'node:crypto'
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-export type CollectorRequest = {version:1;companyId:string;userId:string;machineId:string;managedAccountId:string;accountRef:string;permitId:string;credentialGeneration:number;policyRevision:number;grant:string}
+type CollectorRequestBase = {version:1;companyId:string;machineId:string;managedAccountId:string;accountRef:string;permitId:string;credentialGeneration:number;policyRevision:number;grant:string}
+/** A dedicated machine collects as its assignee; a shared machine collects as itself and carries no userId. */
+export type CollectorRequest = CollectorRequestBase & ({userId:string;principalType?:never}|{principalType:'machine';userId?:never})
 type Deps = {studioOrigin:string|null;machineId:string;now():number;fetchImpl?:typeof fetch;authorize(request:CollectorRequest):Promise<boolean>;consume(id:string,expiresAt:number):Promise<boolean>;invoke(args:string[],input?:string):Promise<string>}
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
 const exact = (value:any,keys:string[]) => value && typeof value==='object' && !Array.isArray(value) && Object.keys(value).sort().join('|')===keys.sort().join('|')
 const integer = (n:unknown):n is number => Number.isSafeInteger(n) && Number(n)>=0
 const failure = (error:string,action=false) => ({version:1,status:action?'action-required':'unavailable',error:'COLLECTOR_'+error})
+const requestKeys=['version','companyId','machineId','managedAccountId','accountRef','permitId','credentialGeneration','policyRevision','grant']
+const claimKeys=['v','type','aud','keyId','companyId','machineId','managedAccountId','credentialGeneration','policyRevision','permitId','reservedAt','transportDeadline','expiresAt']
+/** The principal-specific key: userId for a dedicated assignee, principalType for a shared machine. */
+const principalKey=(value:any)=>value&&typeof value==='object'&&'principalType' in value?'principalType':'userId'
+/** Collector custody comes from the journal entry of the request's own principal, never the other kind. */
+export function authorizeCollectorRequest(groups:{authorize(scope:string,userId:string,identity:string):Promise<boolean>;authorizeMachine(scope:string,machineId:string,identity:string):Promise<boolean>},identity:(managedAccountId:string)=>string,r:CollectorRequest) {
+ return r.principalType==='machine'?groups.authorizeMachine(r.companyId,r.machineId,identity(r.managedAccountId)):groups.authorize(r.companyId,r.userId,identity(r.managedAccountId))
+}
 export async function collectorVerificationReady(studioOrigin:string|null, fetchImpl?:typeof fetch):Promise<boolean> {
  return Boolean(await publicKey({studioOrigin,fetchImpl}))
 }
@@ -51,16 +61,18 @@ function observation(raw:any,claims:any) {
 export function createClaudeCollector(deps:Deps) {
  return async (input:unknown) => {
   try {
-   if(!exact(input,['version','companyId','userId','machineId','managedAccountId','accountRef','permitId','credentialGeneration','policyRevision','grant']))return failure('GRANT_INVALID')
+   const key=principalKey(input)
+   if(!exact(input,[...requestKeys,key]))return failure('GRANT_INVALID')
    const r=input as CollectorRequest
-   if(r.version!==1||r.machineId!==deps.machineId||![r.companyId,r.userId,r.machineId].every(v=>typeof v==='string'&&v.length>0&&v.length<=128)||!uuid.test(r.managedAccountId)||!uuid.test(r.accountRef)||!uuid.test(r.permitId)||!integer(r.credentialGeneration)||r.credentialGeneration<1||!integer(r.policyRevision)||r.policyRevision<1||typeof r.grant!=='string'||Buffer.byteLength(r.grant)>8192)return failure('GRANT_INVALID')
+   const principal=r.principalType==='machine'?r.machineId:r.userId
+   if(r.version!==1||r.machineId!==deps.machineId||![r.companyId,principal,r.machineId].every(v=>typeof v==='string'&&v.length>0&&v.length<=128)||!uuid.test(r.managedAccountId)||!uuid.test(r.accountRef)||!uuid.test(r.permitId)||!integer(r.credentialGeneration)||r.credentialGeneration<1||!integer(r.policyRevision)||r.policyRevision<1||typeof r.grant!=='string'||Buffer.byteLength(r.grant)>8192)return failure('GRANT_INVALID')
    const trust=await publicKey(deps);if(!trust)return failure('SIGNER_UNAVAILABLE',true)
    const segments=r.grant.split('.')
    if(segments.length!==2||segments.some(s=>!s||!/^[A-Za-z0-9_-]+$/.test(s)))return failure('GRANT_INVALID')
    if(!verify(null,Buffer.from(segments[0]),trust.key,Buffer.from(segments[1],'base64url')))return failure('GRANT_INVALID')
    const c=JSON.parse(Buffer.from(segments[0],'base64url').toString('utf8'))
-   if(!exact(c,['v','type','aud','keyId','companyId','userId','machineId','managedAccountId','credentialGeneration','policyRevision','permitId','reservedAt','transportDeadline','expiresAt'])||c.v!==1||c.type!=='claude-collector-v1'||c.aud!==trust.audience||c.keyId!==trust.keyId||!uuid.test(c.permitId))return failure('GRANT_INVALID')
-   for(const f of ['companyId','userId','machineId','managedAccountId','credentialGeneration','policyRevision','permitId'] as const)if(c[f]!==r[f])return failure('GRANT_INVALID')
+   if(!exact(c,[...claimKeys,key])||c.v!==1||c.type!=='claude-collector-v1'||c.aud!==trust.audience||c.keyId!==trust.keyId||!uuid.test(c.permitId))return failure('GRANT_INVALID')
+   for(const f of ['companyId',key,'machineId','managedAccountId','credentialGeneration','policyRevision','permitId'] as const)if(c[f]!==(r as Record<string,unknown>)[f])return failure('GRANT_INVALID')
    if(![c.reservedAt,c.transportDeadline,c.expiresAt].every(integer)||c.transportDeadline!==c.reservedAt+10000||c.expiresAt!==c.reservedAt+30000||c.reservedAt>deps.now())return failure('GRANT_INVALID')
    if(deps.now()>=c.transportDeadline)return failure('PERMIT_EXPIRED')
    if(!await deps.authorize(r))return failure('ACCOUNT_NOT_ASSIGNED')

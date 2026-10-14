@@ -163,6 +163,49 @@ describe('Claude model changes across provider restarts', () => {
         expect(client.closeClaudeSessionTurn).not.toHaveBeenCalledWith('failed');
     });
 
+    it('tells the user to sign in to Claude Code on this machine when it answers "Not logged in"', async () => {
+        // Desktop specs/headless-standalone-server R36 (M1): without a Claude login Claude Code answers with a
+        // synthetic "Not logged in · Please run /login" (shape captured from claude-code 2.1.296), which said
+        // neither which machine nor how; Desktop showed it as an ordinary reply.
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const order: string[] = [];
+        const client = {
+            sessionId: 'not-signed-in-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(),
+            closeClaudeSessionTurn: vi.fn((status: string) => order.push(`close:${status}`)),
+            failClaudeLaunchTurn: vi.fn(),
+            sendSessionEvent: vi.fn((event: { message?: string }) => order.push(`event:${event.message}`)),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const response = (async function* () {
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    yield { type: 'assistant', parent_tool_use_id: null, error: 'authentication_failed', message: { id: 'm1', model: '<synthetic>', role: 'assistant', type: 'message', content: [{ type: 'text', text: 'Not logged in · Please run /login' }] } };
+                    yield { type: 'result', subtype: 'success', is_error: true, result: 'Not logged in · Please run /login' };
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'bypassPermissions', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        const running = claudeRemoteLauncher(session);
+        await vi.waitFor(() => expect(order.some((entry) => entry.startsWith('event:Claude Code is not signed in'))).toBe(true));
+        void handlers.get('switch')!();
+        await running;
+        expect(order.filter((entry) => entry.startsWith('event:Claude Code is not signed in'))).toHaveLength(1);
+        expect(client.failClaudeLaunchTurn).not.toHaveBeenCalled();
+    });
+
     it('records turn latency for a turn held back behind a provider restart', async () => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { describeClaudeLaunchFailure } from './launchFailureMessage';
+import { CLAUDE_NOT_SIGNED_IN_NOTICE, claudeNotSignedInNotice, describeClaudeLaunchFailure } from './launchFailureMessage';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
@@ -20,5 +20,14 @@ describe('describeClaudeLaunchFailure', () => {
         expect(message).not.toMatch(/sk-ant|\/home\/me/);
         expect(message).toMatch(/could not start/);
         expect(describeClaudeLaunchFailure('weird')).toMatch(/could not start/);
+    });
+});
+
+describe('claudeNotSignedInNotice', () => {
+    it('explains a missing Claude login only for Claude Code\'s own failed answer', () => {
+        expect(claudeNotSignedInNotice({ is_error: true, result: 'Not logged in · Please run /login' })).toBe(CLAUDE_NOT_SIGNED_IN_NOTICE);
+        expect(claudeNotSignedInNotice({ is_error: false, result: 'Not logged in · Please run /login' })).toBeNull();
+        expect(claudeNotSignedInNotice({ is_error: true, result: 'Failed to authenticate. API Error: 401' })).toBeNull();
+        expect(claudeNotSignedInNotice({ is_error: true })).toBeNull();
     });
 });

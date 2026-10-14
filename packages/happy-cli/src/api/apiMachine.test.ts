@@ -216,6 +216,28 @@ describe('ApiMachineClient socket reconnection', () => {
         vi.restoreAllMocks();
     });
 
+    // aplus-dev-studio strict-followup-plan F0-b (daemon 6): an update the machine key cannot open
+    // came from someone without that key. It must not blank what the daemon holds.
+    it('keeps its metadata and daemon state when an update cannot be decrypted', () => {
+        const machine = makeMachine();
+        machine.daemonState = { status: 'running' } as any;
+        machine.daemonStateVersion = 3;
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+        emitSocketEvent('update', {
+            body: {
+                t: 'update-machine',
+                machineId: 'test-machine-id',
+                metadata: { value: Buffer.alloc(64, 7).toString('base64'), version: 7 },
+                daemonState: { value: Buffer.from('short').toString('base64'), version: 8 },
+            },
+        });
+        expect(machine.metadata).toMatchObject({ host: 'localhost' });
+        expect(machine.metadataVersion).toBe(0);
+        expect(machine.daemonState).toEqual({ status: 'running' });
+        expect(machine.daemonStateVersion).toBe(3);
+    });
+
     it('refuses terminal-open-fwd with TERMINAL_DISABLED under the trial lockdown policy', async () => {
         const previous = process.env.HAPPY_REMOTE_TERMINAL_POLICY;
         process.env.HAPPY_REMOTE_TERMINAL_POLICY = 'disabled';

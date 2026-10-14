@@ -13,6 +13,7 @@ import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
 import { authMethodWithoutPrompt } from "./authMethodChoice";
+import { authPollStep } from "./authPollRetry";
 import { render } from 'ink';
 import React from 'react';
 import { randomUUID } from 'node:crypto';
@@ -147,8 +148,11 @@ async function doWebAuth(keypair: tweetnacl.BoxKeyPair): Promise<Credentials | n
  * Wait for authentication to complete and return credentials
  */
 async function waitForAuthentication(keypair: tweetnacl.BoxKeyPair): Promise<Credentials | null> {
-    process.stdout.write('Waiting for authentication');
+    // Without a terminal the dots would pile up in logs as one ever-growing line (R31).
+    const animate = process.stdout.isTTY === true;
+    process.stdout.write(animate ? 'Waiting for authentication' : 'Waiting for authentication...\n');
     let dots = 0;
+    let consecutiveFailures = 0;
     let cancelled = false;
 
     // Handle Ctrl-C during waiting
@@ -162,8 +166,9 @@ async function waitForAuthentication(keypair: tweetnacl.BoxKeyPair): Promise<Cre
 
     try {
         while (!cancelled) {
+            let response;
             try {
-                const response = await axios.post(`${configuration.serverUrl}/v1/auth/request`, {
+                response = await axios.post(`${configuration.serverUrl}/v1/auth/request`, {
                     publicKey: encodeBase64(keypair.publicKey),
                     supportsV2: true
                 }, {
@@ -171,6 +176,21 @@ async function waitForAuthentication(keypair: tweetnacl.BoxKeyPair): Promise<Cre
                         'X-Happy-Client': `cli/${configuration.currentCliVersion}`
                     }
                 });
+                consecutiveFailures = 0;
+            } catch (error) {
+                // Only the check itself is retried; a failure handling an answer is not (R30).
+                const failure = (error as { response?: { status?: number; headers?: Record<string, unknown> } }).response;
+                const status = failure?.status;
+                if (status === undefined || status >= 500) consecutiveFailures++;
+                const step = authPollStep({ status, retryAfter: failure?.headers?.['retry-after'] as string | undefined }, consecutiveFailures);
+                if (step.action === 'stop') {
+                    console.log(`\n\n${step.message}`);
+                    return null;
+                }
+                await delay(step.delayMs);
+                continue;
+            }
+            try {
                 if (response.data.state === 'authorized') {
                     let token = response.data.token as string;
                     let r = decodeBase64(response.data.response);
@@ -224,9 +244,10 @@ async function waitForAuthentication(keypair: tweetnacl.BoxKeyPair): Promise<Cre
                 return null;
             }
 
-            // Animate waiting dots
-            process.stdout.write('\rWaiting for authentication' + '.'.repeat((dots % 3) + 1) + '   ');
-            dots++;
+            if (animate) {
+                process.stdout.write('\rWaiting for authentication' + '.'.repeat((dots % 3) + 1) + '   ');
+                dots++;
+            }
 
             await delay(1000);
         }

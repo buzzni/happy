@@ -84,6 +84,23 @@ describe('scoped credential group synchronization',()=>{
     expect(await sync.authorize(request.scope,request.userId,'shared')).toBe(false)
   })
 
+  // Shared-machine collector: the machine is the principal, so custody is read from its own entry only.
+  it('authorizes a machine principal only from that machine entry',async()=>{
+    const {sync,input}=setup()
+    const machine={version:1 as const,scope:'company',principalType:'machine' as const,machineId:'machine-1',provider:'claude' as const,generation:1,fingerprint:'c'.repeat(64),payload:'["shared"]'}
+    await sync.sync(input(1,'["user-account"]'))
+    await sync.sync(machine)
+    expect(await sync.authorizeMachine('company','machine-1','shared')).toBe(true)
+    expect(await sync.authorizeMachine('company','machine-2','shared')).toBe(false)
+    expect(await sync.authorizeMachine('other','machine-1','shared')).toBe(false)
+    // Neither principal borrows the other's custody.
+    expect(await sync.authorizeMachine('company','machine-1','user-account')).toBe(false)
+    expect(await sync.authorize('company','machine-1','shared')).toBe(false)
+    expect(await sync.authorize('company','user','shared')).toBe(false)
+    await sync.invalidate('claude',[])
+    expect(await sync.authorizeMachine('company','machine-1','shared')).toBe(false)
+  })
+
   it('keeps a machine principal separate from user assignments and returns a machine receipt',async()=>{
     const {sync,input,deps}=setup()
     const machine={version:1 as const,scope:'company',principalType:'machine' as const,machineId:'machine-1',provider:'claude' as const,generation:1,fingerprint:'c'.repeat(64),payload:'["shared"]'}
@@ -162,6 +179,26 @@ describe('several Saycode PC identities on one Windows profile', () => {
     expect(installed.has('shared-a')).toBe(false)
     expect(await pcB.assignment('company', 'claude')).toMatchObject({ userId: 'bob', desired: ['shared-b'] })
     await expect(pcB.sync({ ...input(12, '["shared-a"]'), userId: 'bob' })).rejects.toThrow('AI_GROUP_GENERATION_STALE')
+  })
+
+  // 2026-10-12: another daemon on the same OS home wrote a managed setup-token entry for its own
+  // assignment, and every daemon there refused unbound Claude launches with SELECTION_REQUIRED.
+  it('decides launches only from entries this PC applied, keeping unrecorded entries as its own', async () => {
+    const { deps, input } = setup()
+    const managed = { ...deps, managedIdentities: (_provider: string, payload: string) => JSON.parse(payload) as string[] }
+    const pcA = createCredentialGroupSync({ ...managed, appliedMachineId: 'pc-a' })
+    const pcB = createCredentialGroupSync({ ...managed, appliedMachineId: 'pc-b' })
+    await pcA.sync({ ...input(1, '["managed-a"]', 'company-a'), userId: 'alice' })
+
+    expect(await pcA.hasManagedDesired('claude')).toBe(true)
+    expect(await pcB.hasManagedDesired('claude')).toBe(false)
+    expect(await pcB.assignment('company-a', 'claude')).toBeNull()
+    expect(await pcB.authorize('company-a', 'alice', 'managed-a')).toBe(false)
+    expect(await pcA.authorize('company-a', 'alice', 'managed-a')).toBe(true)
+
+    // An entry from before PCs were recorded may be this PC's own: it still decides.
+    await createCredentialGroupSync(managed).sync({ ...input(1, '["managed-legacy"]', 'company-legacy'), userId: 'carol' })
+    expect(await pcB.hasManagedDesired('claude')).toBe(true)
   })
 
   it('treats an entry written before PCs were recorded as replaceable by a PC that records itself', async () => {

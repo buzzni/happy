@@ -79,6 +79,12 @@ function parse(raw:string|null):Journal {
 const receipt=(entry:Entry)=>({version:1 as const,scope:entry.scope, ...(principalType(entry)==='machine' ? {principalType:'machine' as const,machineId:entry.machineId} : {userId:entry.userId}),provider:entry.provider,generation:entry.generation,fingerprint:entry.fingerprint,payloadDigest:entry.payloadDigest,reconciled:!entry.pending,
   assignmentGeneration:entry.assignmentGeneration??entry.generation,leaseId:entry.leaseId??null,appliedCredentials:[...(entry.appliedCredentials??[])]})
 export function createCredentialGroupSync(deps:CredentialGroupDeps) {
+  /**
+   * The journal is shared by every daemon on one OS home, like the account manager's pool it records:
+   * removal and ownership stay journal-wide. Launch and custody decisions read only entries this PC
+   * applied; an entry written before PCs were recorded may be this PC's own and still counts.
+   */
+  const appliedHere=(entry:Pick<Entry,'appliedMachineId'>)=>!deps.appliedMachineId||!entry.appliedMachineId||entry.appliedMachineId===deps.appliedMachineId
   async function readReceipt(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) {
     return parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&(principal?samePrincipal(e,principal):principalType(e)==='user'))
   }
@@ -134,25 +140,28 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     if(changed)await deps.write(JSON.stringify(journal))
   }
   /** Who a scope's applied assignment belongs to and what it installed: the local ownership proof. */
-  async function assignment(scope:string,provider:GroupProvider){const entry=parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&principalType(e)==='user');return entry?{userId:entry.userId,desired:[...entry.desired],reconciled:!entry.pending}:null}
+  async function assignment(scope:string,provider:GroupProvider){const entry=parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&principalType(e)==='user'&&appliedHere(e));return entry?{userId:entry.userId,desired:[...entry.desired],reconciled:!entry.pending}:null}
   /** Some current assignment (applied or in flight) desires an org-managed setup-token. Revoked entries desire nothing. */
   /** Entries written before the `managed` projection existed: unknown, never assumed unmanaged. */
-  async function unprojected(provider:GroupProvider){return parse(await deps.read()).entries.filter(e=>e.provider===provider&&e.managed===undefined).map(e=>({scope:e.scope,desired:[...e.desired]}))}
+  async function unprojected(provider:GroupProvider){return parse(await deps.read()).entries.filter(e=>e.provider===provider&&e.managed===undefined&&appliedHere(e)).map(e=>({scope:e.scope,desired:[...e.desired]}))}
   /** One-time migration: record which desired identities of an old entry are managed. */
   async function recordManaged(provider:GroupProvider,scope:string,managed:string[]){
     const journal=parse(await deps.read())
-    const entry=journal.entries.find(e=>e.provider===provider&&e.scope===scope&&e.managed===undefined)
+    const entry=journal.entries.find(e=>e.provider===provider&&e.scope===scope&&e.managed===undefined&&appliedHere(e))
     if(!entry)return
     entry.managed=managed.filter(value=>entry.desired.includes(value))
     await deps.write(JSON.stringify(journal))
   }
-  async function hasManagedDesired(provider:GroupProvider,principal?:'user'|'machine'){return parse(await deps.read()).entries.some(e=>e.provider===provider&&(!principal||principalType(e)===principal)&&(e.managed??[]).some(value=>e.desired.includes(value)))}
+  async function hasManagedDesired(provider:GroupProvider,principal?:'user'|'machine'){return parse(await deps.read()).entries.some(e=>e.provider===provider&&appliedHere(e)&&(!principal||principalType(e)===principal)&&(e.managed??[]).some(value=>e.desired.includes(value)))}
   /** Shared-machine assignments of `machineId` that desire org-managed setup-tokens: the machine's default credential. */
   async function machineManaged(provider:GroupProvider,machineId:string){return parse(await deps.read()).entries.filter(e=>e.provider===provider&&principalType(e)==='machine'&&e.machineId===machineId)
     .map(e=>({scope:e.scope,managed:(e.managed??[]).filter(value=>e.desired.includes(value)),pending:e.pending})).filter(e=>e.managed.length>0)}
   /** Collector custody: the scope's reconciled assignment for this user both desires and installed the identity. */
-  const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&!e.pending&&e.userId===userId&&e.desired.includes(identity)&&e.owned.includes(identity))}
-  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
+  const custody=(e:Entry|undefined,identity:string)=>Boolean(e&&appliedHere(e)&&!e.pending&&e.desired.includes(identity)&&e.owned.includes(identity))
+  const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&e.userId===userId)&&custody(e,identity)}
+  /** Shared-machine collector custody: the machine's own reconciled assignment desires and installed the identity. */
+  const authorizeMachine=async(scope:string,machineId:string,identity:string)=>custody(await readReceipt(scope,'claude',{principalType:'machine',userId:machineId,machineId}),identity)
+  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
 }
 
 function effectivePrincipal(entry:Pick<Entry,'principalType'|'userId'|'machineId'>):Pick<NormalizedRequest,'principalType'|'userId'|'machineId'> {

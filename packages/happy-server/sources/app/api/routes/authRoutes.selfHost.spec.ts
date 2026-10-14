@@ -217,6 +217,114 @@ describe("authRoutes with self-host hardening", () => {
         expect(Number(last.headers["retry-after"])).toBeGreaterThan(0);
     });
 
+    // Desktop specs/headless-standalone-server R29: a machine waits on its code until the owner
+    // approves it, polling about once a second; that wait must not run into the sign-in limits.
+    it("lets a machine keep polling its pending code and the owner check it, then approve it", async () => {
+        const app = await createApp(hardened());
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing, supportsV2: true } })).statusCode).toBe(200);
+        for (let i = 0; i < 90; i++) {
+            const poll = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing, supportsV2: true } });
+            expect(poll.statusCode).toBe(200);
+        }
+        const status = await app.inject({ method: "GET", url: `/v1/auth/request/status?publicKey=${encodeURIComponent(pairing)}` });
+        expect(status.json()).toEqual(expect.objectContaining({ status: "pending" }));
+        await app.inject({ method: "POST", url: "/v1/auth/response", payload: { publicKey: pairing, response: "sealed" } });
+        expect((await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } })).json().state).toBe("authorized");
+    });
+
+    it("still throttles one address creating many new pairing codes", async () => {
+        const app = await createApp(hardened());
+        let last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: b64(tweetnacl.box.keyPair().publicKey) } });
+        for (let i = 0; i < 40 && last.statusCode !== 429; i++) {
+            last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: b64(tweetnacl.box.keyPair().publicKey) } });
+        }
+        expect(last.statusCode).toBe(429);
+    });
+
+    it("bounds even a pending code's polling", async () => {
+        const app = await createApp(hardened());
+        const pairing = b64(tweetnacl.box.keyPair().publicKey);
+        await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        let last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        for (let i = 0; i < 200 && last.statusCode !== 429; i++) {
+            last = await app.inject({ method: "POST", url: "/v1/auth/request", payload: { publicKey: pairing } });
+        }
+        expect(last.statusCode).toBe(429);
+    });
+
+    const pairingRoutes = [
+        ["POST", "/v1/auth/request", "terminal"],
+        ["GET", "/v1/auth/request/status", "terminal"],
+        ["POST", "/v1/auth/account/request", "account"],
+    ] as const;
+    const pairingCall = (route: readonly ["GET" | "POST", string, "terminal" | "account"], publicKey: string, remoteAddress = "127.0.0.1") =>
+        route[0] === "GET"
+            ? { method: route[0], url: `${route[1]}?publicKey=${encodeURIComponent(publicKey)}`, remoteAddress }
+            : { method: route[0], url: route[1], payload: { publicKey }, remoteAddress };
+
+    it.each(pairingRoutes)("shares the decoded polling key on %s %s", async (method, url, table) => {
+        let clock = Date.now();
+        const app = await createApp(hardened(), () => clock);
+        const publicKey = b64(tweetnacl.box.keyPair().publicKey);
+        const route = [method, url, table] as const;
+        const createUrl = table === "terminal" ? "/v1/auth/request" : "/v1/auth/account/request";
+        expect((await app.inject({ method: "POST", url: createUrl, payload: { publicKey } })).statusCode).toBe(200);
+        // A fresh window allows the ingress guard's 121st request; the poll bucket must stop it.
+        clock += 60_000;
+        const alternate = publicKey.replace(/=+$/, "");
+        for (let i = 0; i < 120; i++) {
+            expect((await app.inject(pairingCall(route, i % 2 ? alternate : publicKey))).statusCode).toBe(200);
+        }
+        const rejected = await app.inject(pairingCall(route, alternate));
+        expect(rejected.statusCode).toBe(429);
+        expect(rejected.headers["retry-after"]).toBe("60");
+    });
+
+    it.each(pairingRoutes)("stops pending-key database work before classification on %s %s", async (method, url, table) => {
+        const clock = Date.now();
+        const app = await createApp(hardened(), () => clock);
+        const publicKey = b64(tweetnacl.box.keyPair().publicKey);
+        const createUrl = table === "terminal" ? "/v1/auth/request" : "/v1/auth/account/request";
+        await app.inject({ method: "POST", url: createUrl, payload: { publicKey } });
+        const route = [method, url, table] as const;
+        for (let i = 0; i < 120; i++) {
+            expect((await app.inject(pairingCall(route, publicKey))).statusCode).toBe(200);
+        }
+        vi.clearAllMocks();
+        for (let i = 0; i < 50; i++) {
+            const spelling = i % 2 ? publicKey.replace(/=+$/, "") : publicKey;
+            expect((await app.inject(pairingCall(route, spelling, `10.0.0.${i + 1}`))).statusCode).toBe(429);
+        }
+        expect(db.terminalAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.terminalAuthRequest.upsert).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.upsert).not.toHaveBeenCalled();
+    });
+
+    it.each(["ip", "global"] as const)("bounds classification of unknown keys by %s across pairing routes", async (bucket) => {
+        const app = await createApp(hardened(), () => 1_000_000);
+        const publicKey = (i: number) => {
+            const key = Buffer.alloc(32);
+            key.writeUInt32LE(i);
+            return key.toString("base64");
+        };
+        const limit = bucket === "ip" ? 150 : 600;
+        for (let i = 0; i < limit; i++) {
+            await app.inject(pairingCall(pairingRoutes[i % 3], publicKey(i), bucket === "ip" ? "127.0.0.1" : `10.0.${Math.floor(i / 250)}.${i % 250 + 1}`));
+        }
+        vi.clearAllMocks();
+        for (let i = 0; i < 50; i++) {
+            const rejected = await app.inject(pairingCall(pairingRoutes[i % 3], publicKey(limit + i), bucket === "ip" ? "127.0.0.1" : `10.1.0.${i + 1}`));
+            expect(rejected.statusCode).toBe(429);
+            expect(rejected.headers["retry-after"]).toBe("60");
+        }
+        expect(db.terminalAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.findUnique).not.toHaveBeenCalled();
+        expect(db.terminalAuthRequest.upsert).not.toHaveBeenCalled();
+        expect(db.accountAuthRequest.upsert).not.toHaveBeenCalled();
+    });
+
     it("rejects oversized auth fields before verifying them", async () => {
         const app = await createApp(hardened());
         const body = { ...signedBody(owner), challenge: "A".repeat(4096) };

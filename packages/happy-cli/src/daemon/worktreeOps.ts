@@ -38,7 +38,7 @@ import {
     type WorktreeTicket,
 } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
-import { RpcNonceGuard } from '@/api/rpc/rpcNonceGuard';
+import { DurableTicketGuard } from './usedWorktreeTickets';
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
 import { logger } from '@/ui/logger';
@@ -507,6 +507,7 @@ async function createWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
         let base: string;
         let baseRevision: string;
         if (originBase) {
+            if (params.remoteUrl) await requireSameRepository(repo, params.remoteUrl);
             base = `refs/remotes/origin/${originBase}`;
             const fetchRef = `refs/aplus/fetch/${process.pid}-${Date.now()}`;
             try {
@@ -574,10 +575,15 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     return serialized(target.repoRoot, async () => {
         // Checked before anything is stopped or removed: a refusal leaves everything as it was.
         const status = await runGit(target.path, ['status', '--porcelain'], { readOnly: true });
+        const ownBranch = await currentBranch(target.path);
         if (!params.force) {
             if (status.code !== 0) throw new OpFailure('WORKTREE_REMOVE_FAILED', gitError(status));
             if (status.stdout.trim()) throw new OpFailure('WORKTREE_DIRTY', 'contains modified or untracked files');
-            if (params.branch && (await runGit(target.repoRoot, ['merge-base', '--is-ancestor', params.branch, 'HEAD'], { readOnly: true })).code !== 0) {
+            // aplus-dev-studio strict-followup-plan F0-b — judged from the worktree itself, not the
+            // branch the ticket names: a detached or renamed checkout must not lose its commits.
+            if (params.branch) await requireBranch(target.path, params.branch);
+            const head = (await gitOk(target.path, ['rev-parse', '--verify', 'HEAD^{commit}'], 'WORKTREE_REMOVE_FAILED', { readOnly: true })).trim();
+            if ((await runGit(target.repoRoot, ['merge-base', '--is-ancestor', head, 'HEAD'], { readOnly: true })).code !== 0) {
                 throw new OpFailure('WORKTREE_DIRTY', 'contains changes not applied to the default version');
             }
         }
@@ -588,8 +594,9 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
             throw new OpFailure(!params.force && /contains modified or untracked files/i.test(error) ? 'WORKTREE_DIRTY' : 'WORKTREE_REMOVE_FAILED', error);
         }
         await runGit(target.repoRoot, ['worktree', 'prune']);
-        // A non-forced `-d` keeps a branch whose commits are not merged.
-        if (params.branch) await runGit(target.repoRoot, ['branch', params.force ? '-D' : '-d', params.branch]);
+        // A non-forced `-d` keeps a branch whose commits are not merged. Only the worktree's own
+        // branch goes, whatever the ticket names (aplus-dev-studio strict-followup-plan F0-b).
+        if (params.branch && params.branch === ownBranch) await runGit(target.repoRoot, ['branch', params.force ? '-D' : '-d', ownBranch]);
         return { outcome: 'removed' as const };
     });
 }
@@ -648,11 +655,64 @@ async function fetchBranch(dir: string, remote: string, branch: string, credenti
     }
 }
 
-/** Points `origin` at the address the server chose, as its scripts do before fetching. */
+/**
+ * The repository an address names — host and owner/name, lowercased, without scheme, credentials or
+ * `.git` — so an https and an ssh address of one repository compare equal. Null when unreadable.
+ */
+export function repositoryIdentity(address: string): string | null {
+    const value = address.trim();
+    const scp = /^[^@/\s]+@([^:/\s]+):(.+)$/.exec(value);
+    let host: string;
+    let path: string;
+    if (scp) {
+        host = scp[1]!;
+        path = scp[2]!;
+    } else {
+        let url: URL;
+        try {
+            url = new URL(value);
+        } catch {
+            return null;
+        }
+        if (!['https:', 'http:', 'ssh:', 'git:'].includes(url.protocol)) return null;
+        host = url.hostname;
+        path = url.pathname;
+    }
+    const name = path.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+    if (!host || !name || name.split('/').some((part) => !part || part === '.' || part === '..')) return null;
+    return `${host.toLowerCase()}/${name.toLowerCase()}`;
+}
+
+/** Every address `origin` actually uses (fetch and push, after `insteadOf` rewrites); empty without it. */
+async function originAddresses(dir: string): Promise<string[]> {
+    const fetchUrls = await runGit(dir, ['remote', 'get-url', '--all', 'origin'], { readOnly: true });
+    if (fetchUrls.code !== 0) return [];
+    const pushUrls = await runGit(dir, ['remote', 'get-url', '--push', '--all', 'origin'], { readOnly: true });
+    return [...fetchUrls.stdout.split('\n'), ...(pushUrls.code === 0 ? pushUrls.stdout.split('\n') : [])]
+        .map((line) => line.trim())
+        .filter(Boolean);
+}
+
+/**
+ * aplus-dev-studio strict-followup-plan F0-b — the address comes from the server, so it must name
+ * the repository `origin` already fetches from and pushes to, checked before anything is changed or
+ * sent. Without an `origin`, the first one is the server's (as its scripts set it today).
+ */
+async function requireSameRepository(dir: string, remoteUrl: string): Promise<'same' | 'no-origin'> {
+    const wanted = repositoryIdentity(remoteUrl);
+    const current = await originAddresses(dir);
+    if (current.length === 0) return 'no-origin';
+    if (!wanted || current.some((address) => repositoryIdentity(address) !== wanted)) {
+        throw new OpFailure('WORKTREE_REMOTE_MISMATCH', '연결된 온라인 저장소가 이 작업 공간의 origin과 다른 저장소입니다.');
+    }
+    return 'same';
+}
+
+/** Points `origin` at the address the server chose, as its scripts do before fetching — one repository only. */
 async function setOrigin(dir: string, remoteUrl: string | null): Promise<void> {
     if (!remoteUrl) return;
-    const existing = await runGit(dir, ['remote', 'get-url', 'origin'], { readOnly: true });
-    await gitOk(dir, existing.code === 0 ? ['remote', 'set-url', 'origin', remoteUrl] : ['remote', 'add', 'origin', remoteUrl], 'WORKTREE_REMOTE_FAILED');
+    const origin = await requireSameRepository(dir, remoteUrl);
+    await gitOk(dir, origin === 'same' ? ['remote', 'set-url', 'origin', remoteUrl] : ['remote', 'add', 'origin', remoteUrl], 'WORKTREE_REMOTE_FAILED');
 }
 
 async function applyWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: 'apply' }): Promise<WorktreeOpResult<'apply'>> {
@@ -867,8 +927,18 @@ async function prepareConversation(
 
 // ── Handlers ───────────────────────────────────────────────────────────────────────────────────
 
-// Process-wide: a daemon that reconnects builds new handlers, and a used ticket must stay used.
-const usedTickets = new RpcNonceGuard({ windowMs: WORKTREE_TICKET_MAX_TTL_MS + ISSUE_SKEW_MS, maxEntries: 10_000, whenFull: 'refuse' });
+// Process-wide, and on disk: a daemon that reconnects builds new handlers, one that restarts starts
+// a new process, and a used ticket must stay used through both (strict-followup-plan F0-b, Q12 a).
+const usedTicketGuards = new Map<string, DurableTicketGuard>();
+function usedTickets(happyHomeDir: string): DurableTicketGuard {
+    const file = join(happyHomeDir, 'worktree-used-tickets.json');
+    let guard = usedTicketGuards.get(file);
+    if (!guard) {
+        guard = new DurableTicketGuard({ file, windowMs: WORKTREE_TICKET_MAX_TTL_MS + ISSUE_SKEW_MS, maxEntries: 10_000 });
+        usedTicketGuards.set(file, guard);
+    }
+    return guard;
+}
 
 export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<WorktreeOpsMethod, (request: unknown) => Promise<WorktreeOpAnswer>> {
     const now = deps.now ?? Date.now;
@@ -911,7 +981,7 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             if (!read.ok) return refused('GIT_CREDENTIAL_INVALID', 'The credential was not sealed for this machine and ticket');
             credential = { username: read.username, token: read.token };
         }
-        const admission = usedTickets.admit(ticket.opId, ticket.issuedAt, at);
+        const admission = await usedTickets(deps.happyHomeDir).admit(ticket.opId, ticket.issuedAt, at);
         if (admission === 'replayed') return refused('TICKET_REPLAYED', 'This ticket was already used');
         if (admission === 'full') return refused('TICKET_BUSY', 'Too many worktree operations in the window');
 

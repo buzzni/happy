@@ -1952,7 +1952,6 @@ describe('AI credential machine runtime', () => {
 
     expect(calls.map(({ command, args }) => [command, args])).toEqual([
       ['uv', ['--version']],
-      ['uv', ['python', 'find', '>=3.12']],
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
@@ -3011,7 +3010,6 @@ describe('AI credential machine runtime', () => {
 
     expect(calls.map(({ command, args }) => [command, args])).toEqual([
       ['uv', ['--version']],
-      ['uv', ['python', 'find', '>=3.12']],
       ['cswap', ['--version']],
       ['cswap', ['config', 'set', 'autoswitch.threshold', '95']],
       ['cswap', ['config', 'set', 'autoswitch.strategy', 'consume-first']],
@@ -3561,6 +3559,24 @@ it.each(['OFF','offline'])('fences manual collection queued behind organization 
   expect(invoke.mock.calls.filter(([,args])=>args[1]==='collect')).toHaveLength(0)
   expect(invoke.mock.calls.map(([,args])=>args[1])).toEqual(action==='OFF'?['capabilities','status','consent','status']:[])
  }finally{release?.();fetcher.mockRestore();runtime.stopPersonalScheduler()}
+})
+
+// Shared-machine collector: Desktop only relays a machine-principal grant to a daemon that advertises it.
+it('advertises machine-principal collection exactly when the collector itself is available', async () => {
+ const { generateKeyPairSync, createHash } = await import('node:crypto')
+ const der = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }) as Buffer
+ const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ version: 1, type: 'claude-collector-v1', algorithm: 'Ed25519',
+  keyId: createHash('sha256').update(der).digest('hex'), publicKeyBase64: der.toString('base64'), audience: 'claude-collector-v1@https://studio.test' })))
+ const execFile = vi.fn(async (_command: string, args: string[]) => args[1] === 'capabilities'
+  ? { stdout: JSON.stringify({ artifact: 'saycode-setup-token-runtime-v1', organizationCollectorVersion: 1 }), stderr: '' }
+  : { stdout: '{}', stderr: '' })
+ try {
+  const ready = setup({ execFile, env: { HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.test' } }).runtime
+  expect(await ready.capabilities('m')).toMatchObject({ collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 })
+  const noOrigin = await setup({ execFile, env: {} }).runtime.capabilities('m')
+  expect(noOrigin).not.toHaveProperty('collectorProbeVersion')
+  expect(noOrigin).not.toHaveProperty('collectorMachinePrincipalVersion')
+ } finally { fetcher.mockRestore() }
 })
 
 describe('cswap collector command options', () => {
