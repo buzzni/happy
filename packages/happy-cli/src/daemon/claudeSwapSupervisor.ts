@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
-import { withUvToolBinOnPath, type AiCredentialRotationStatus } from './aiCredentialRuntime'
+import { claudeSwapPython, withUvToolBinOnPath, type AiCredentialRotationStatus } from './aiCredentialRuntime'
+import { claudeSwapLaunch } from './claudeSwapPython'
 
 export type ClaudeSwapChild = {
   pid?: number
@@ -315,11 +316,11 @@ export function createClaudeSwapSupervisor(stateFile: string): ClaudeSwapSupervi
       await writeFile(temp, `${JSON.stringify({ enabled })}\n`, { mode: 0o600 })
       await rename(temp, stateFile)
     },
-    spawn: (command, args) => nodeSpawn(command, args, {
-      env: withUvToolBinOnPath(process.env, homedir()),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    }),
+    spawn: (command, args) => {
+      // Windows: the verified base Python, when the daemon has one, so cswap.exe is neither slow to start nor held (RE8).
+      const launch = claudeSwapLaunch(command, args, claudeSwapPython.peek(), withUvToolBinOnPath(process.env, homedir()))
+      return nodeSpawn(launch.command, launch.args, { env: launch.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    },
     schedule: (callback, delay) => setTimeout(callback, delay),
     clearSchedule: (handle) => clearTimeout(handle as NodeJS.Timeout),
   })
