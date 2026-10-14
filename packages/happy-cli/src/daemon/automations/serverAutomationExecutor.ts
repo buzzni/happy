@@ -471,7 +471,9 @@ function reconcileSchedules(
    */
   knownAutomations: EncryptedServerAutomation[] = cache.automations,
 ): ServerAutomationRuntimeState {
-  const activeIds = new Set(cache.automations.map((automation) => automation.automationId))
+  // Deleted legacy runs keep their only stop target here until shutdown is acknowledged.
+  const activeIds = new Set([...cache.automations, ...(cache.pendingCancellations ?? [])]
+    .map((automation) => automation.automationId))
   const schedules = state.schedules.filter((schedule) => activeIds.has(schedule.automationId))
   const byId = new Map(schedules.map((schedule) => [schedule.automationId, schedule]))
   for (const automation of cache.automations) {

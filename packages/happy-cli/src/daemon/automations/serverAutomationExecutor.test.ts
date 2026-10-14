@@ -4193,6 +4193,37 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
 
 
 describe('ordinary scheduled conversation execution', () => {
+  it('retries a legacy deleted session stop across reconciliation and daemon restart', async () => {
+    const f = setup()
+    const cache = f.input.cache.read()
+    const record = cacheRecord()
+    let pending = [record]
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: pending })
+    const markCancelled = vi.fn(() => { pending = [] })
+    f.input.cache.markCancelled = markCancelled
+    f.store.write({ ...f.store.read(), schedules: [{
+      automationId: record.automationId, generation: record.generation,
+      nextRunAt: f.now, lastSessionId: 'legacy-live',
+    }] })
+    const cancel = vi.fn(async () => false)
+    f.input.cancelScheduledSession = cancel
+    await runServerAutomationTick(f.input)
+    expect(markCancelled).not.toHaveBeenCalled()
+    expect(cancel).toHaveBeenCalledTimes(1)
+
+    // Reload the persisted journal, as a new daemon process would.
+    const restarted = runtime(f.store.state())
+    f.input.runtimeStore = restarted
+    cancel.mockResolvedValue(true)
+    await runServerAutomationTick(f.input)
+    expect(cancel).toHaveBeenCalledTimes(2)
+    expect(cancel).toHaveBeenLastCalledWith({ sessionId: 'legacy-live', directory: '/repo' })
+    expect(markCancelled).toHaveBeenCalledWith([{ automationId: record.automationId, revision: record.revision }])
+    expect(restarted.state().schedules).toEqual([])
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.resumeSession).not.toHaveBeenCalled()
+  })
+
   it('keeps deletion pending until the sealed ordinary target is stopped, without resuming it', async () => {
     const f = setup(); const cache = f.input.cache.read(); const record = cacheRecord();
     f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [record] });

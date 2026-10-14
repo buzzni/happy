@@ -9,6 +9,12 @@ import { resolve } from 'node:path';
 import { readChatAutomationImpact, transitionChatAutomations } from './automationChatLifecycle';
 import { createAutomation, updateAutomation, requestAutomationRun } from './automationService';
 import { syncAutomations } from './automationExecutionService';
+import { saveScriptAutomation } from './scriptRegistrationService';
+import { scriptAutomationRoutes } from '../api/routes/scriptAutomationRoutes';
+import { encryptScriptValue } from '@slopus/happy-wire';
+import nacl from 'tweetnacl';
+import fastify from 'fastify';
+import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 let sql: string, db: PGlite, client: PrismaClient;
 const now = new Date('2026-10-14T00:00:00Z');
 beforeAll(async () => {
@@ -80,4 +86,34 @@ it.each(['QUEUED', 'RUNNING'])('cancels a %s script without erasing its history'
   const run = await client.scriptInvocation.findUniqueOrThrow({ where: { id: 'script-run' } });
   expect(run.status).toBe(status === 'QUEUED' ? 'CANCELLED' : 'RUNNING');
   if (status === 'RUNNING') expect(run.cancelRequestedAt).toBe(now.getTime());
+});
+
+it('lists and explicitly resumes a script after archive and restore without losing its definition or schedule cursor', async () => {
+  const keys = nacl.box.keyPair();
+  await client.project.update({ where: { id: 'chat:c' }, data: { automationViewerPublicKey: new Uint8Array(keys.publicKey) } });
+  await client.machine.update({ where: { id: 'm' }, data: { automationPublicKey: new Uint8Array(keys.publicKey), automationProtocolVersion: 5 } });
+  const encrypted = encryptScriptValue({ value: {}, context: { projectId: 'chat:c', resourceId: 'script', purpose: 'configuration' }, viewerPublicKey: keys.publicKey, machinePublicKey: keys.publicKey });
+  const registration = {
+    registrationKey: 'script', expectedRevision: 0, paused: false, viewerKeyVersion: 1, machineKeyVersion: 1,
+    encrypted, artifact: encrypted,
+    admission: { artifactId: 'artifact', digest: 'a'.repeat(64), schedule: { kind: 'interval' as const, minutes: 15, enabled: true }, externalEnabled: false, inputSchema: {} },
+  };
+  const row = await client.$transaction(tx => saveScriptAutomation(tx, 'owner', 'chat:c', registration));
+  await client.scriptAutomationRevision.update({ where: { automationId_revision: { automationId: row.id, revision: 1 } }, data: { ready: true, scheduleInitialized: true, nextRunAt: 123456 } });
+  await transition('archived');
+  await transition('active');
+
+  const app = fastify().withTypeProvider<ZodTypeProvider>();
+  app.setValidatorCompiler(validatorCompiler); app.setSerializerCompiler(serializerCompiler);
+  app.decorate('authenticate', async (request: { userId: string }) => { request.userId = 'owner'; });
+  scriptAutomationRoutes(app, { transaction: action => client.$transaction(action), enabled: () => true });
+  try {
+    const listed = await app.inject({ method: 'GET', url: '/v1/projects/chat:c/script-automations' });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().automations).toEqual([expect.objectContaining({ id: row.id, revision: 1, generation: 2, paused: true, encrypted, admission: registration.admission, nextRunAt: null })]);
+    const resumed = await app.inject({ method: 'POST', url: '/v1/projects/chat:c/script-automations', payload: { ...registration, expectedRevision: 1 } });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json().automation).toMatchObject({ revision: 2, paused: false, encrypted, admission: registration.admission });
+    expect(await client.scriptAutomationRevision.findUniqueOrThrow({ where: { automationId_revision: { automationId: row.id, revision: 2 } } })).toMatchObject({ scheduleInitialized: true, nextRunAt: 123456 });
+  } finally { await app.close(); }
 });
