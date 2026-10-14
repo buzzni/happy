@@ -4193,6 +4193,19 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
 
 
 describe('ordinary scheduled conversation execution', () => {
+  it('keeps deletion pending until the sealed ordinary target is stopped, without resuming it', async () => {
+    const f = setup(); const cache = f.input.cache.read(); const record = cacheRecord();
+    f.input.cache.read = () => ({ ...cache, automations: [], pendingCancellations: [record] });
+    const markCancelled = vi.fn(); f.input.cache.markCancelled = markCancelled;
+    const payload = f.input.decryptPayload(record, new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...payload, conversation: { sessionId: 'ordinary' } });
+    const cancel = vi.fn(async () => false); f.input.cancelScheduledSession = cancel;
+    await runServerAutomationTick(f.input); expect(markCancelled).not.toHaveBeenCalled();
+    cancel.mockResolvedValue(true); await runServerAutomationTick(f.input);
+    expect(cancel).toHaveBeenCalledWith({ sessionId: 'ordinary', directory: payload.directory });
+    expect(markCancelled).toHaveBeenCalledWith([{ automationId: record.automationId, revision: record.revision }]);
+    expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+  });
   it.each(['none', 'required'] as const)('rejects the %s connector policy instead of weakening it in an ordinary session', async connectorPolicy => {
     const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
     f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy, requiredConnectors: [] } });

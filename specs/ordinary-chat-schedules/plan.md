@@ -8,3 +8,7 @@ Core owns the run, session and encrypted message consistency. payloadVersion 4 s
 4. Related tests, production CLI build, server types and contract smoke; record deployment limitations.
 
 The existing provider retains ordinary owner permissions and AI settings. Reject per-run restrictive connector policies instead of claiming they were applied to a live session. No replacement session on failure. Roll back by pausing v4 definitions and reverting versions, preserving all ordinary messages. Do not convert v4 into v1. Deploy Happy server, Studio, CLI, then Desktop; tags/install/release/push require separate authorization.
+
+## Lifecycle implementation
+
+An owner+CAL1-protected impact/lifecycle API persists the internal Chat state in existing Project.config. Serializable updates fence definitions, cancel claims/queued scripts and request active script cancellation. Ordinary project config updates preserve this fence. Deleted tombstones carry only encrypted execution targets; CLI persists pending cancellations and validates tracked keys/canonical directory before verified stop. Older caches resync once via chatLifecycleSync. CAL1 is a separate server-only wire export with Chat/action/bearer-hash binding and 30-second TTL. Reuse cloud SCRIPT_AUTOMATION_ADMISSION_SECRET or standalone HANDY_MASTER_SECRET, never expose either to clients. Missing authority fails closed. Roll back versions with definitions paused/deleted and history preserved.

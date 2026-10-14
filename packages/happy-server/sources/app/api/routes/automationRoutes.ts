@@ -26,6 +26,8 @@ import {
 } from '@/app/automation/automationService';
 import { resolveAutomationRunMcpContext } from '@/app/automation/automationExecutionService';
 import { listAutomationPage } from '@/app/automation/automationPageService';
+import { readChatAutomationImpact, transitionChatAutomations } from '@/app/automation/automationChatLifecycle';
+import { verifyChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken';
 import { inTx } from '@/storage/inTx';
 import { db } from '@/storage/db';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
@@ -118,6 +120,26 @@ function rejectWhenDisabled(reply: FastifyReply): boolean {
 }
 
 export function automationRoutes(app: Fastify) {
+    const lifecycleProof = (authorization: unknown, proof: unknown, projectId: string, state: 'impact' | 'active' | 'archived' | 'deleted') => typeof authorization === 'string' && typeof proof === 'string' && verifyChatAutomationLifecycle({
+        token: proof, bearer: authorization.replace(/^Bearer /i, ''), projectId, state, now: Date.now(),
+        secret: process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET || (process.env.HAPPY_STANDALONE_CONTROL === 'stdin-v1' ? process.env.HANDY_MASTER_SECRET : '') || '',
+    });
+    app.get('/v1/projects/:projectId/automation-impact', { preHandler: app.authenticate, schema: { params: paramsSchema } }, async (request, reply) => {
+        if (!lifecycleProof(request.headers.authorization, request.headers['x-chat-automation-proof'], request.params.projectId, 'impact')) return reply.code(403).send({ error: 'CHAT_AUTOMATION_OWNER_PROOF_REQUIRED' });
+        try { return reply.send(await inTx(tx => readChatAutomationImpact(tx, request.userId, request.params.projectId))); }
+        catch (error) { if (error instanceof Error && error.message === 'CHAT_AUTOMATIONS_FORBIDDEN') return reply.code(403).send({ error: error.message }); throw error; }
+    });
+    app.post('/v1/projects/:projectId/automation-lifecycle', { preHandler: app.authenticate, schema: { params: paramsSchema, body: z.object({ state: z.enum(['active', 'archived', 'deleted']) }) } }, async (request, reply) => {
+        if (!lifecycleProof(request.headers.authorization, request.headers['x-chat-automation-proof'], request.params.projectId, request.body.state)) return reply.code(403).send({ error: 'CHAT_AUTOMATION_OWNER_PROOF_REQUIRED' });
+        try {
+            const result = await inTx(tx => transitionChatAutomations(tx, request.userId, request.params.projectId, request.body.state));
+            await emitProjectAutomationUpdate(request.params.projectId, { projectId: request.params.projectId, reason: request.body.state === 'deleted' ? 'delete' : 'upsert' }, request.userId);
+            return reply.send(result);
+        } catch (error) {
+            if (error instanceof Error && error.message.startsWith('CHAT_AUTOMATIONS_')) return reply.code(error.message.endsWith('FORBIDDEN') ? 403 : 409).send({ error: error.message });
+            throw error;
+        }
+    });
     app.post('/v1/automation-runs/:runId/mcp-context', {
         preHandler: app.authenticate,
         schema: { params: runParamsSchema, body: mcpContextSchema },

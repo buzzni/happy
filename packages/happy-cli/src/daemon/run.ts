@@ -4540,6 +4540,16 @@ export async function startDaemon(): Promise<void> {
           deliver: (request) => apiMachine.deliverAutomationConversation(request),
         }),
         resumeSession: resumeAutomationSession,
+        cancelScheduledSession: async ({ sessionId, directory }) => {
+          if (!launchReadiness.isReady()) return false;
+          const tracked = findTrackedSessionById(sessionId);
+          if (!tracked) return true;
+          const localDirectory = tracked.happySessionMetadataFromLocalWebhook?.path ?? tracked.directory;
+          if (!tracked.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) return false;
+          if (!isAutomationSessionRunning(sessionId)) return true;
+          const stopped = await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Owning Chat was deleted' });
+          return stopped.exitVerification.status === 'exited' || stopped.exitVerification.status === 'not-tracked';
+        },
         resumeServerChosenSession: configuration.machineControl !== 'strict',
         spawnSession: spawnAutomationSession,
         prepareGithubWorktree: (input) => prepareGithubTriggerWorktree({

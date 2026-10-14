@@ -69,7 +69,7 @@ export interface ServerAutomationTransport {
 }
 
 export interface ServerAutomationExecutorInput {
-  cache: { read(): ServerAutomationCacheState }
+  cache: { read(): ServerAutomationCacheState; markCancelled?(items: Array<{ automationId: string; revision: number }>): void }
   runtimeStore: ServerAutomationRuntimeStore
   machineSecretKey: Uint8Array
   now: number
@@ -226,6 +226,7 @@ export interface ServerAutomationExecutorInput {
   isSessionRunning: (sessionId: string) => boolean
   /** 매달린 워커 세션에 종료를 요청한다. 실제 종료는 다음 틱의 isSessionRunning 으로 확인한다. */
   stopSession?: (sessionId: string) => void
+  cancelScheduledSession?: (input: { sessionId: string; directory: string }) => Promise<boolean>
   isDirectoryInUse: (directory: string) => boolean
   /**
    * false 면 스크립트 조건과 GitHub 트리거를 실행하지 않고 HOST_COMMANDS_UNSUPPORTED 로
@@ -1737,6 +1738,15 @@ async function executeStartedRun(
 export async function runServerAutomationTick(
   input: ServerAutomationExecutorInput,
 ): Promise<Array<{ automationId: string; outcome: ServerAutomationReportOutcome }>> {
+  for (const cancelled of input.cache.read().pendingCancellations ?? []) {
+    try {
+      const payload = input.decryptPayload(cancelled, input.machineSecretKey)
+      const sessionId = payload.conversation?.sessionId ?? input.runtimeStore.read().schedules.find(row => row.automationId === cancelled.automationId)?.lastSessionId
+      if (!sessionId || await input.cancelScheduledSession?.({ sessionId, directory: payload.directory })) {
+        input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
+      }
+    } catch (error) { input.logDebug?.(`[server-automation] cancellation pending: ${error}`) }
+  }
   await flushPendingReports(input)
   // Cleanup runs git outside the Windows Job; keep the journal until a runtime that may run it.
   if (input.hostCommandsAllowed !== false) await cleanupInactiveGithubWorktrees(input)

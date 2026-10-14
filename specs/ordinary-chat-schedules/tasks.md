@@ -9,3 +9,12 @@
 - [x] Validated local commit preparation and Studio pointer/document handoff.
 
 Deployment, real provider execution, CLI publication/install and live restart acceptance remain outside this local task.
+
+## Lifecycle validation
+
+- [x] Persistent state, definition/run/script cleanup and owner boundary in real Prisma/PGlite.
+- [x] Late create/unpause/run denial, idempotent delete and history preservation.
+- [x] Server-only proof, wrong scope/action/token/key/expiry/canonical encoding rejection.
+- [x] Encrypted cancellation sync, durable acknowledgement and pre-support cache resync.
+- [x] Related server 113, wire 35, CLI runner/cache 138 plus API/exit-verification coverage; type/build checks.
+- [x] Validated local commit preparation and Studio vendor handoff.

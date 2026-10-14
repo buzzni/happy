@@ -54,7 +54,11 @@ export async function projectUpdate(ctx: Context, projectId: string, params: Pro
                 ...(params.name !== undefined && { name: params.name }),
                 ...(params.description !== undefined && { description: params.description }),
                 ...(params.color !== undefined && { color: params.color }),
-                ...(params.config !== undefined && { config: params.config ?? undefined })
+                ...(params.config !== undefined && { config: project.id.startsWith('chat:') && project.config && typeof project.config === 'object' && 'chatAutomationState' in project.config ? {
+                    ...(params.config && typeof params.config === 'object' ? params.config : {}),
+                    ...(project.id.startsWith('chat:') && project.config && typeof project.config === 'object' && 'chatAutomationState' in project.config
+                        ? { chatAutomationState: project.config.chatAutomationState } : {}),
+                } : params.config ?? undefined })
             }
         });
 
