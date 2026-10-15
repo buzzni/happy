@@ -13,6 +13,7 @@ import { CHANNEL_SUPPORT_CAPABILITY } from '@/channel/channelSupportCapability';
 import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
 import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
+import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
 import { join } from 'node:path';
 
 const {
@@ -148,7 +149,7 @@ describe('ApiMachineClient machine RPC server lane', () => {
             { machineRun: {
                 profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
                 writeScopePolicy: { acquire: expect.any(Function) },
-                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [expect.objectContaining({ id: 'buzzni.moai', version: '0.8.0' })] },
+                managedTools: { root: expect.stringMatching(/managed-tools$/), tools: [MOAI_MANAGED_TOOL] },
                 allowToolInstall: true,
             } },
         );

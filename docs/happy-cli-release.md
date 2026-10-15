@@ -337,3 +337,24 @@ That is not enough for this fork right now. The CLI currently needs the local A+
 Current rule: build with pnpm, prepare a clean publish directory, pack a `.tgz` from inside that directory, guard that `.tgz`, publish from inside the prepared directory, then verify the exact published version by installing from the npm registry.
 
 If `@slopus/happy-wire` or an A+ scoped replacement is later published independently with its own bumped version, we can revisit this and simplify the release path to versioned workspace dependencies plus `pnpm publish`/`pnpm pack`.
+
+## Moai 2.0 rollout
+
+The catalog matches the Moai 2.0.0 extension's declarations for list, archive,
+read marks, wiki, skill status, and worktree reads. The older task-write profiles
+remain available so installed 1.x extensions do not lose their contract.
+Managed tool archives and executable digests are pinned to the public v0.17.0
+release on darwin-arm64 and linux-x64; changing a user's shell PATH is not an
+upgrade of this managed binary.
+
+`buzzni.moai.skill-install-saycode` is intentionally not advertised. Its declared
+`--hook-exe moai` argument is absent from v0.17.0. Before enabling it, publish and
+pin a CLI with that option and optional-skill status output, verify hook paths
+under the restricted daemon PATH, and add the exact declaration with
+`writeScope: project`. The panel falls back to terminal instructions meanwhile.
+
+Release the daemon before tagging the extension bundle, then promote the
+published extension bytes into Desktop. Desktop promotion must compare its
+bundled checksum with the actual GitHub release asset; local candidate archives
+are insufficient proof of publication. A Desktop runtime pin and registry lock
+must be updated only after the CLI release has passed registry verification.

@@ -3,16 +3,11 @@ import type { MachineRunManagedTools, MachineRunParameter, MachineRunProfile } f
 import type { ManagedMachineTool } from './managedMachineTool';
 
 /**
- * Host-owned machine.run catalog for Moai v0.8.0 (buzzni/moai tag commit
- * ace3897f661b831ac4eca01f76dbe7e2c097c481). Extensions declare these
- * profiles verbatim; the daemon runs only what is listed here.
- *
- * Verified against the pinned binary under the daemon's restricted PATH:
- * reads degrade without git, writes resolve the actor through git config, and
- * the user config lives under HOME, so every profile allows HOME and a git
- * descendant. Writes change only `.moai/` (issues.jsonl, journal/).
- * `init`, `merge-driver`, `skill`, `hook`, `tui`, `--from` and `--wake` are
- * deliberately absent.
+ * Host-owned Moai catalog. Existing write operations remain available to old
+ * extensions; the additional reads match Moai extension 2.0.0 verbatim.
+ * The managed CLI is pinned independently to the verified v0.17.0 release.
+ * Skill installation is deliberately absent: v0.17.0 does not accept the
+ * extension's --hook-exe option. Never advertise an operation it cannot run.
  */
 const text = (maxLength: number): MachineRunParameter => ({ type: 'string', maxLength });
 
@@ -34,7 +29,7 @@ function write(name: string, argv: string[], parameters: Record<string, MachineR
     return { ...read(name, argv, parameters), writeScope: 'moai' };
 }
 
-export const MOAI_V080_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
+export const MOAI_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
     read('status', ['status']),
     read('ready', ['ready']),
     read('prime', ['prime']),
@@ -42,6 +37,17 @@ export const MOAI_V080_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
     read('stats', ['stats']),
     read('wiki-ls', ['wiki', 'ls']),
     read('wiki-show', ['wiki', 'show', '{{slug}}'], { slug: text(128) }),
+    read('show-all', ['show', '--all']),
+    read('backlog-all', ['backlog', 'show', '--all']),
+    read('show-archived', ['show', '--archived', '-n', '200', '--sort', 'id']),
+    read('show-archived-after', ['show', '--archived', '-n', '200', '--sort', 'id', '--after', '{{after}}'], { after: text(128) }),
+    // These write only the user's personal read marks, never the project tracker.
+    read('read', ['read', '{{id}}'], { id: text(128) }),
+    read('read-all', ['read', '--all']),
+    read('read-group', ['read', '-e', '{{group}}'], { group: text(128) }),
+    read('skill-status', ['skill', 'status']),
+    read('show-all-worktree', ['show', '--all', '--worktree']),
+    read('show-worktree', ['show', '{{id}}', '--worktree'], { id: text(128) }),
     write('add', ['add', '{{title}}'], { title: text(512) }),
     write('mv', ['mv', '{{id}}', '{{target}}'], { id: text(128), target: { type: 'string', maxLength: 32, values: ['todo', 'in_progress', 'review', 'done'] } }),
     write('edit', ['edit', '{{id}}', '--body', '{{body}}'], { id: text(128), body: text(4096) }),
@@ -53,30 +59,30 @@ export const MOAI_V080_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
 ];
 
 /**
- * The pinned v0.8.0 release artifacts. Archive and extracted-executable
+ * The pinned v0.17.0 release artifacts. Archive and extracted-executable
  * digests were checked against the public release assets.
  */
-export const MOAI_V080_MANAGED_TOOL: ManagedMachineTool = {
+export const MOAI_MANAGED_TOOL: ManagedMachineTool = {
     id: 'buzzni.moai',
-    version: '0.8.0',
+    version: '0.17.0',
     executable: 'moai',
     artifacts: {
         'darwin-arm64': {
-            url: 'https://github.com/buzzni/moai/releases/download/v0.8.0/moai-v0.8.0-aarch64-apple-darwin.tar.gz',
-            sha256: 'c79200aa0b10b5949efa19a1c280465a1db5c3d6163f4e8b27f979b7403edeb2',
-            archiveRoot: 'moai-v0.8.0-aarch64-apple-darwin',
-            executableSha256: '81c2102d4326d1be8b622ec66dd191596fe38d54aae78bf9b8eec58b247b5e6e',
+            url: 'https://github.com/buzzni/moai/releases/download/v0.17.0/moai-v0.17.0-aarch64-apple-darwin.tar.gz',
+            sha256: '89364d0f9ca19bcd054b2a87f000d50bd0971c86a5f183e5d12355b20def4e01',
+            archiveRoot: 'moai-v0.17.0-aarch64-apple-darwin',
+            executableSha256: 'ebda55033dae9c10f3e8c488a14617a6cdca010329d2a9e71391406f8ea035a3',
         },
         'linux-x64': {
-            url: 'https://github.com/buzzni/moai/releases/download/v0.8.0/moai-v0.8.0-x86_64-unknown-linux-musl.tar.gz',
-            sha256: '9c1db13a9a589c9dfcdc5645f757734e2fbc2eda7674a9f2d8662b2fb8d4c3e5',
-            archiveRoot: 'moai-v0.8.0-x86_64-unknown-linux-musl',
-            executableSha256: '7cb0ee09e1159ab2b19d1102db7bb3d5c41ddca0d4781707944c3781747d15e6',
+            url: 'https://github.com/buzzni/moai/releases/download/v0.17.0/moai-v0.17.0-x86_64-unknown-linux-musl.tar.gz',
+            sha256: '6906d3e045844feca31b75f2a416bd80db0d7a28a970782444d7f5d7ec7ce1db',
+            archiveRoot: 'moai-v0.17.0-x86_64-unknown-linux-musl',
+            executableSha256: 'e025a79af0a4cead969d0003b1a597d165dd72a4db04ed28b2840f538facd043',
         },
     },
 };
 
 /** Managed tools this daemon build installs under `<happyHome>/managed-tools`. */
 export function hostManagedMachineTools(happyHomeDir: string): MachineRunManagedTools {
-    return { root: join(happyHomeDir, 'managed-tools'), tools: [MOAI_V080_MANAGED_TOOL] };
+    return { root: join(happyHomeDir, 'managed-tools'), tools: [MOAI_MANAGED_TOOL] };
 }
