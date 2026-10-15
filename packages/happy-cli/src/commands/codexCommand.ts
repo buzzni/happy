@@ -12,6 +12,7 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
   const standaloneLaunch = takeStandaloneLaunchBootstrap(process.env)
   let startedBy: 'daemon' | 'terminal' | undefined = undefined
   let permissionMode: PermissionMode | undefined = undefined
+  let initialModel: string | undefined = undefined
   const sandboxArgs = extractNoSandboxFlag(args)
   const codexArgs = extractCodexResumeFlag(sandboxArgs.args)
 
@@ -22,6 +23,10 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
       permissionMode = codexArgs.args[++i] as PermissionMode
     } else if (codexArgs.args[i] === '--yolo') {
       permissionMode = 'yolo'
+    } else if (codexArgs.args[i] === '--model') {
+      const value = codexArgs.args[++i]?.trim()
+      if (!value || value.startsWith('-')) throw new Error('Codex model requires a model ID: happy codex --model <model-id>')
+      initialModel = value
     }
   }
 
@@ -38,6 +43,7 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
       noSandbox: sandboxArgs.noSandbox,
       resumeThreadId: codexArgs.resumeThreadId ?? undefined,
       permissionMode,
+      ...(initialModel ? { initialModel } : {}),
     })
     return
   }
@@ -52,5 +58,6 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     noSandbox: sandboxArgs.noSandbox,
     resumeThreadId: codexArgs.resumeThreadId ?? undefined,
     permissionMode,
+    ...(initialModel ? { initialModel } : {}),
   })
 }
