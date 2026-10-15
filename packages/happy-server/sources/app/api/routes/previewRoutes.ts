@@ -67,6 +67,7 @@ import { rewriteLinkHeader } from "@/modules/preview/rewriteLinkHeader";
 import { rewriteLocationHeader } from "@/modules/preview/rewriteLocationHeader";
 import { renderExpiredPtokenHtml, shouldServeExpiredHtml } from "@/modules/preview/expiredPtokenHtml";
 import { parsePreviewHost } from "@/modules/preview/parsePreviewHost";
+import { LOCALHOST_PREVIEW_HEADER, LOCALHOST_PREVIEW_VERSION, sendLocalhostPreviewResponse } from "@/modules/preview/localhostPreviewResponse";
 import { type Fastify } from "../types";
 
 interface ProxySuccess {
@@ -517,7 +518,7 @@ export function filterForwardedHeaders(raw: Record<string, string | string[] | u
             lower === 'proxy-authorization' ||
             lower === 'te' ||
             lower === 'trailer' ||
-            lower === 'transfer-encoding'
+            lower === 'transfer-encoding' || lower === LOCALHOST_PREVIEW_HEADER
         ) continue;
         if (lower === 'cookie') {
             const forwarded = filterUpstreamCookieHeader(
@@ -1282,6 +1283,7 @@ export function previewRoutes(app: Fastify) {
 
                 if (
                     request.method === 'OPTIONS' &&
+                    request.headers[LOCALHOST_PREVIEW_HEADER] !== LOCALHOST_PREVIEW_VERSION &&
                     typeof request.headers['access-control-request-method'] === 'string'
                 ) {
                     const outHeaders = applySubdomainPreviewCorsHeaders(
@@ -1408,6 +1410,10 @@ export function previewRoutes(app: Fastify) {
                     });
                 }
 
+                if (request.headers[LOCALHOST_PREVIEW_HEADER] === LOCALHOST_PREVIEW_VERSION) {
+                    sendLocalhostPreviewResponse(reply.raw, rpcResponse);
+                    return;
+                }
                 // Successful proxy response — rewrite HTML/JS/CSS if applicable.
                 // subdomain mode: prefix='' so absolute paths stay on the
                 // isolated origin and rewriters become no-ops.
