@@ -1,3 +1,5 @@
+import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
+import type { DeviceKeys } from '@/daemon/deviceKeys';
 import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
@@ -653,8 +655,8 @@ export class ApiClient {
     return new ApiSessionClient(this.bearer(), session, undefined, options);
   }
 
-  machineSyncClient(machine: Machine): ApiMachineClient {
-    return new ApiMachineClient(this.bearer(), machine);
+  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>): ApiMachineClient {
+    return new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment);
   }
 
   /**

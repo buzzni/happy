@@ -1,3 +1,4 @@
+import type { createDeviceEnrollment } from './deviceEnrollment';
 import { attachLocalToolAgentRelayRoutes } from './localToolAgentRelay';
 import { attachStandaloneDrain, type StandaloneDrain } from './standaloneDrain';
 import { attachBrowserLocalSetupRoutes } from './browserLocalSetupRoutes';
@@ -106,7 +107,9 @@ export function startDaemonControlServer({
   standaloneDrain,
   writeScopeRuntime,
   browserLocalSetup,
+  getDeviceEnrollment = () => null,
 }: {
+  getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
   writeScopeRuntime?: SessionWriteScopeRuntime | null;
   standaloneDrain?: StandaloneDrain;
   browserLocalSetup?: BrowserLocalSetup;
@@ -214,6 +217,30 @@ export function startDaemonControlServer({
           await reply.code(403).send({ error: 'Endpoint unavailable in the standalone Windows Codex trial',
             code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED' });
         }
+      }
+    });
+
+    app.post('/device/status', { bodyLimit: 4096 }, async (request, reply) => {
+      if (request.headers.origin !== undefined) return reply.code(403).send({ code: 'DEVICE_LOCAL_CONFIRM_REQUIRED' });
+      const parsed = z.object({ companyId: z.string().min(1).max(512).regex(/^[^\u0000-\u001f\u007f-\u009f]+$/) }).strict().safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: 'DEVICE_STATUS_INVALID' });
+      const enrollment = getDeviceEnrollment();
+      if (!enrollment) return reply.code(409).send({ code: 'DEVICE_ENROLLMENT_UNAVAILABLE' });
+      try { return await enrollment.getStatus(parsed.data.companyId); }
+      catch { return reply.code(409).send({ code: 'DEVICE_STATUS_UNAVAILABLE' }); }
+    });
+
+    app.post('/device/confirm-org-key', { bodyLimit: 4096 }, async (request, reply) => {
+      if (request.headers.origin !== undefined) return reply.code(403).send({ code: 'DEVICE_LOCAL_CONFIRM_REQUIRED' });
+      const enrollment = getDeviceEnrollment();
+      if (!enrollment) return reply.code(409).send({ code: 'DEVICE_ENROLLMENT_EXPIRED' });
+      try {
+        await enrollment.confirm(request.body as Parameters<typeof enrollment.confirm>[0]);
+        return { locallyConfirmed: true };
+      } catch (error) {
+        const code = error instanceof Error && ['DEVICE_ENROLLMENT_EXPIRED', 'DEVICE_ENROLLMENT_MISMATCH', 'DEVICE_PIN_PERSIST_FAILED'].includes(error.message)
+          ? error.message : 'DEVICE_ENROLLMENT_INVALID';
+        return reply.code(409).send({ code });
       }
     });
 

@@ -1,3 +1,4 @@
+import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
@@ -782,6 +783,25 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(first).toMatchObject({ setupTokenAssignmentVersion: 1, setupTokenSealedPayloadVersion: 1, sharedMachineSetupTokenVersion: 1, setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect(second).toMatchObject({ setupTokenRecipient: { keyId: expect.any(String), publicKey: expect.any(String) } });
         expect((first.setupTokenRecipient as { keyId: string }).keyId).not.toBe((second.setupTokenRecipient as { keyId: string }).keyId);
+    });
+
+    it('keeps the persistent recipient and publishes only public device keys across client restarts', async () => {
+        const deviceKeys = { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() };
+        const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })) } as any;
+        const capabilities = async () => {
+            const client = new ApiMachineClient('fake-token', makeMachine(), deviceKeys);
+            client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: runtime });
+            const handler = (client as any).rpcHandlerManager.registerHandler.mock.calls.find(([method]: [string]) => method === 'ai-credential:capabilities')[1];
+            return handler();
+        };
+        const first = await capabilities(), second = await capabilities();
+        expect(first.setupTokenRecipient).toEqual(second.setupTokenRecipient);
+        expect(first.setupTokenRecipient.publicKey).toBe(Buffer.from(deviceKeys.recipient.publicKey).toString('base64'));
+        expect(first.deviceKeyVersion).toBe(1);
+        expect(first.recipientPublicKey).toBe(Buffer.from(deviceKeys.recipient.publicKey).toString('base64url'));
+        expect(first.deviceSigningPublicKey).toBe(Buffer.from(deviceKeys.signing.publicKey).toString('base64url'));
+        expect(JSON.stringify(first)).not.toContain(Buffer.from(deviceKeys.signing.secretKey).toString('base64url'));
+        expect(JSON.stringify(first)).not.toContain(Buffer.from(deviceKeys.recipient.secretKey).toString('base64'));
     });
 
     it('rejects malformed additional directories before spawning', async () => {
@@ -1843,5 +1863,25 @@ describe('stop-session verifyExit contract', () => {
             },
         });
         expect(stopSession).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('device registration RPC boundary', () => {
+    it('relays enrollment and signed approval, exposes status but never remote confirmation', async () => {
+        const enrollment = { begin: vi.fn(async () => ({ digest: 'digest' })), approve: vi.fn(async () => {}), getStatus: vi.fn(async () => ({ pin: null })) };
+        const client = new ApiMachineClient('token', makeMachine(), undefined, enrollment as never);
+        const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;
+        const handler = (name: string) => manager.registerHandler.mock.calls.find(([method]) => method === name)?.[1];
+        expect(handler('device:confirm')).toBeUndefined();
+        await expect(handler('device:enroll')({ companyId: 'company' })).resolves.toEqual({ digest: 'digest' });
+        await expect(handler('device:approve')({ document: 'signed' })).resolves.toEqual({ accepted: true });
+        expect(enrollment.approve).toHaveBeenCalledWith('signed');
+        await expect(handler('device:approve')({ document: 'signed', confirm: true })).rejects.toThrow();
+        await expect(handler('device:status')({ companyId: 'company' })).resolves.toEqual({ pin: null });
+    });
+    it('does not expose enrollment for runtimes without a local enrollment controller', () => {
+        const client = new ApiMachineClient('token', makeMachine());
+        const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;
+        expect(manager.registerHandler.mock.calls.map(([method]) => method)).not.toContain('device:enroll');
     });
 });
