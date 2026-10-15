@@ -3569,14 +3569,22 @@ it('advertises machine-principal collection exactly when the collector itself is
  const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ version: 1, type: 'claude-collector-v1', algorithm: 'Ed25519',
   keyId: createHash('sha256').update(der).digest('hex'), publicKeyBase64: der.toString('base64'), audience: 'claude-collector-v1@https://studio.test' })))
  const execFile = vi.fn(async (_command: string, args: string[]) => args[1] === 'capabilities'
-  ? { stdout: JSON.stringify({ artifact: 'saycode-setup-token-runtime-v1', organizationCollectorVersion: 1 }), stderr: '' }
+  ? { stdout: JSON.stringify({ version: 1, artifact: 'saycode-setup-token-runtime-v1', managedAccountMetadata: true, organizationCollectorVersion: 1, setupTokenObservation: true, durableProbeBudget: true, personalProbeVersion: 1 }), stderr: '' }
   : { stdout: '{}', stderr: '' })
  try {
   const ready = setup({ execFile, env: { HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.test' } }).runtime
-  expect(await ready.capabilities('m')).toMatchObject({ collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 })
+  expect(await ready.capabilities('m')).toMatchObject({ collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1, setupTokenVersion: 1, tokenProbeVersion: 1 })
+  expect(execFile).toHaveBeenCalledTimes(1)
   const noOrigin = await setup({ execFile, env: {} }).runtime.capabilities('m')
   expect(noOrigin).not.toHaveProperty('collectorProbeVersion')
   expect(noOrigin).not.toHaveProperty('collectorMachinePrincipalVersion')
+  expect(execFile).toHaveBeenCalledTimes(2)
+  execFile.mockResolvedValueOnce({ stdout: '{}', stderr: '' })
+  const changed = await ready.capabilities('m')
+  expect(changed).not.toHaveProperty('collectorProbeVersion')
+  expect(changed).not.toHaveProperty('setupTokenVersion')
+  expect(changed).not.toHaveProperty('tokenProbeVersion')
+  expect(execFile).toHaveBeenCalledTimes(3)
  } finally { fetcher.mockRestore() }
 })
 

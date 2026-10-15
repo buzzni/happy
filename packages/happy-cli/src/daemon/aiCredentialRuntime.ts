@@ -2368,18 +2368,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return personalScheduler.tick()
   }
   function stopPersonalScheduler() { personalUse = { online: false, inUse: false }; personalScheduler.close(); cancelPersonal() }
-  async function tokenProbeCapability() {
-    try { return personalProbeSupported(JSON.parse((await deps.execFile('cswap', ['token-runtime', 'capabilities'], { timeoutMs: 5000, maxOutputBytes: 8192 })).stdout)) } catch { return false }
-  }
   function collectorOrigin() {
     return readTrustedStudioOrigin(deps.env)
-  }
-  async function collectorCapability() {
-    if (!collectorOrigin()) return false
-    try {
-      const caps = JSON.parse((await deps.execFile('cswap', ['token-runtime', 'capabilities'], { timeoutMs: 5000, maxOutputBytes: 8192 })).stdout)
-      return caps.artifact === 'saycode-setup-token-runtime-v1' && caps.organizationCollectorVersion === 1 && await collectorVerificationReady(collectorOrigin())
-    } catch { return false }
   }
   async function collectorProbe(input: unknown, machineId: string) {
     return serialize(async () => {
@@ -2395,7 +2385,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
-  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => { const setupToken = await setupTokenRuntimeSupported(); const collector = Boolean(machineId) && await collectorCapability(); const personal = await tokenProbeCapability(); return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
+  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+    // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
+    let stdout = ''
+    try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
+    let metadata: Record<string, unknown> = {}
+    try { const value: unknown = JSON.parse(stdout); if (isObject(value)) metadata = value } catch {}
+    const setupToken = supportsManagedSetupTokens(stdout), personal = personalProbeSupported(metadata), origin = collectorOrigin()
+    let collector = false
+    if (machineId && origin && metadata.artifact === 'saycode-setup-token-runtime-v1' && metadata.organizationCollectorVersion === 1) {
+      try { collector = await collectorVerificationReady(origin) } catch {}
+    }
+    return { version: 1, codexRecoveryVersion: 1, ...(personal ? { tokenProbeVersion: 1 } : {}), ...(collector ? { collectorProbeVersion: 1, collectorMachinePrincipalVersion: 1 } : {}), groupAssignmentVersion: 1, sharedMachineAssignmentVersion: 1, activeSelectionVersion: 1, verificationVersion: 1, verificationScopes: ['accounts', 'active'], applyModes: ['merge', 'replace', 'repair'],
     // Managed setup-token import with metadata verification, only on the marked cswap token runtime.
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
