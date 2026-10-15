@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitchDeps } from './setupTokenAccountSwitch'
-import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, type SetupTokenBinding } from './sessionEnv'
+import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, type AiAuthSelection, type SetupTokenBinding } from './sessionEnv'
 import type { TrackedSession } from './types'
 
 const A = '00000000-0000-4000-8000-00000000000a'
@@ -132,5 +132,24 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     const { switcher } = setup({ fetch: forbidden })
     expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'FORBIDDEN' })
     expect(await switcher.reportUsage('session-a', RUNNING_A, observation)).toEqual({ ok: false, reason: 'FORBIDDEN' })
+  })
+
+  it('finishes a switch whose answer the session never received, from the binding it recorded', async () => {
+    // Like the runtime: a launch needs a fresh grant unless it resumes a recorded binding.
+    const sessionEnvironment = vi.fn(async (_agent: string, selection: AiAuthSelection, recorded?: SetupTokenBinding) => {
+      if (!('bindingGrant' in selection && selection.bindingGrant) && !recorded) throw new Error('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
+      const bound = recorded ?? binding(B)
+      return { CLAUDE_CODE_OAUTH_TOKEN: `token-${bound.managedAccountId}`, [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(bound) }
+    })
+    const { switcher, requests, session } = setup({
+      sessionEnvironment,
+      recordAgentEnvironment: (tracked, value) => { tracked.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: value } },
+    })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toMatchObject({ ok: true })
+    expect(session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(formatSetupTokenBinding(binding(B)))
+    // The session's request timed out: it still runs A and asks again.
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: true, environment: {
+      CLAUDE_CODE_OAUTH_TOKEN: `token-${B}`, [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) } })
+    expect(requests.filter(request => request.url.endsWith('/rebind'))).toHaveLength(1)
   })
 })
