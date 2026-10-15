@@ -2828,7 +2828,6 @@ export function createNodeAiCredentialRuntime(
   homeDir: string = homedir(),
   options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'> = {},
 ) {
-  void claudeSwapPython.get() // settles before `cswap auto` usually starts, so the supervisor can use it too
   return createAiCredentialRuntime({
     ...options,
     homeDir,

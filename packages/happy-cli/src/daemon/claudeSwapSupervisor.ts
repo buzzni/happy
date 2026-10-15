@@ -21,6 +21,8 @@ type SupervisorDependencies = {
   spawn(command: string, args: string[]): ClaudeSwapChild
   schedule(callback: () => void, delay: number): unknown
   clearSchedule(handle: unknown): void
+  /** Settles what `spawn` launches before a restored or newly enabled rotation starts (Windows: claude-swap's base Python, RE8). */
+  prepare?(): Promise<unknown>
 }
 
 export class ClaudeSwapSupervisor {
@@ -40,7 +42,9 @@ export class ClaudeSwapSupervisor {
 
   async restore(): Promise<void> {
     this.enabled = await this.deps.readEnabled()
-    if (this.enabled) this.start()
+    if (!this.enabled) return
+    await this.deps.prepare?.().catch(() => undefined)
+    this.start()
   }
 
   async enable(): Promise<void> {
@@ -52,6 +56,7 @@ export class ClaudeSwapSupervisor {
       this.enabled = wasEnabled
       throw error
     }
+    await this.deps.prepare?.().catch(() => undefined)
     this.start()
   }
 
@@ -323,5 +328,6 @@ export function createClaudeSwapSupervisor(stateFile: string): ClaudeSwapSupervi
     },
     schedule: (callback, delay) => setTimeout(callback, delay),
     clearSchedule: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    prepare: () => claudeSwapPython.get(),
   })
 }

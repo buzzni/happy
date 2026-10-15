@@ -16,7 +16,7 @@ function child(): ClaudeSwapChild & { emit: EventEmitter['emit']; stdout: EventE
   }
 }
 
-function setup(enabled = false) {
+function setup(enabled = false, prepare?: () => Promise<unknown>) {
   const children: ReturnType<typeof child>[] = []
   const scheduled: Array<{ callback: () => void; delay: number }> = []
   const spawn = vi.fn(() => {
@@ -34,11 +34,27 @@ function setup(enabled = false) {
       return callback
     },
     clearSchedule: vi.fn(),
+    prepare,
   })
   return { supervisor, spawn, children, scheduled, writeEnabled }
 }
 
 describe('Claude swap supervisor', () => {
+  // Windows (RE8): `cswap auto` starts only once claude-swap's base Python is known, also when rotation is restored at daemon start.
+  it('waits for its launcher to be prepared before restoring or enabling cswap auto', async () => {
+    let ready!: () => void
+    const { supervisor, spawn } = setup(true, () => new Promise<void>(resolve => { ready = resolve }))
+    const restored = supervisor.restore()
+    await Promise.resolve()
+    expect(spawn).not.toHaveBeenCalled()
+    ready()
+    await restored
+    expect(spawn).toHaveBeenCalledOnce()
+    const failing = setup(false, async () => { throw new Error('python check failed') })
+    await failing.supervisor.enable()
+    expect(failing.spawn).toHaveBeenCalledOnce()
+  })
+
   it('keeps a below-threshold active account running when only peer usage is unreadable', async () => {
     const { supervisor, children, spawn } = setup()
     await supervisor.enable()
