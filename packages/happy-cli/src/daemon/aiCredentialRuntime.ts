@@ -11,6 +11,7 @@ import { probeHappyCodex, type CodexRecoveryProbeResult } from './codexRecoveryP
 import { codexStateRecoveryRoot } from '../codex/codexStateRecovery'
 import { CODEX_MULTI_AUTH_VERSION, isSupportedCodexMultiAuthVersion, SUPPORTED_CODEX_MULTI_AUTH_VERSION_RANGE } from '../utils/codexMultiAuthVersions'
 import { stagingParent } from './stagedCredentialRoot'
+import { createClaudeSwapPythonResolver, findClaudeSwapPython, routeClaudeSwapThroughPython, verifyClaudeSwapPython } from './claudeSwapPython'
 import { spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -46,6 +47,8 @@ import {
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 const CLAUDE_SWAP_PACKAGE = 'saycode-claude-swap'
 const CLAUDE_SWAP_VERSION = '0.27.0b2'
+/** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
+export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
 // Keep readable historical bundles separate from supported installed runtimes.
 // Bundles from supported runtimes are readable; parseCodexMultiAuthBundle still
@@ -111,6 +114,7 @@ type Supervisor = {
 export type AiCredentialRuntimeDependencies = {
   probeCodex?: typeof probeHappyCodex
   homeDir: string
+  platform?: NodeJS.Platform
   /** Happy machine identity used to bind server-side machine principal mutations. */
   machineId?: string
   now(): number
@@ -649,8 +653,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     // it drops the managed metadata and every later apply refuses the slot (2026-10-12 hmrepo).
     const liveManaged = typeof liveIdentity?.emailAddress === 'string' && managedSetupTokenId(liveIdentity.emailAddress) !== null
     if (!liveManaged && (unregistered || before.activeAccountNumber === null)) {
-      const live = await readOptionalJson(join(deps.env.CLAUDE_CONFIG_DIR || join(deps.homeDir, '.claude'), '.credentials.json'))
-      if (unregistered || isObject(live?.claudeAiOauth)) {
+      // Secure storage may be redirected independently; an explicitly empty override means the default home.
+      const credentialHome = deps.env.CLAUDE_SECURESTORAGE_CONFIG_DIR ?? deps.env.CLAUDE_CONFIG_DIR
+      const live = await readOptionalJson(join(credentialHome || join(deps.homeDir, '.claude'), '.credentials.json'))
+      // Windows has no macOS Keychain fallback. ENOENT alone proves this is only a stale identity;
+      // unreadable/malformed/existing stores still require capture, as do explicit environment credentials.
+      const staleWindowsIdentity = (deps.platform ?? process.platform) === 'win32' && live === null
+        && !['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'].some(key => deps.env[key])
+      if ((unregistered && !staleWindowsIdentity) || isObject(live?.claudeAiOauth)) {
         await deps.execFile('cswap', ['add'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         before = await list()
         if (before.activeAccountNumber === null) throw new AiCredentialRuntimeError('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
@@ -2823,7 +2833,7 @@ export function createNodeAiCredentialRuntime(
     homeDir,
     now: Date.now,
     env,
-    execFile: (command, args, options) => runAiCredentialCommand(command, args, options),
+    execFile: routeClaudeSwapThroughPython((command, args, options) => runAiCredentialCommand(command, args, options), claudeSwapPython),
     readFile: (path) => readFile(path, 'utf8'),
     readdir: (path) => readdir(path),
     syncFile: async (path) => { const file = await open(path, 'r+'); try { await file.sync() } finally { await file.close() } },

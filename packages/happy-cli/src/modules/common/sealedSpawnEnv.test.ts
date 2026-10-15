@@ -68,7 +68,11 @@ describe('spawn-with-sealed-env', () => {
     expect(result).toMatchObject({ success: false, error: 'Command timed out' });
     const pid = Number(String(result.stdout).trim().split(/\s+/)[0]);
     expect(pid).toBeGreaterThan(0);
-    expect(() => process.kill(pid, 0)).toThrow();
+    // The shell can close before the OS reaps its killed descendant.
+    await expect.poll(() => {
+      try { process.kill(pid, 0); return null; }
+      catch (error) { return (error as NodeJS.ErrnoException).code; }
+    }, { timeout: 2_000, interval: 20 }).toBe('ESRCH');
   });
 
   it('refuses a reserved name and runs nothing', async () => {

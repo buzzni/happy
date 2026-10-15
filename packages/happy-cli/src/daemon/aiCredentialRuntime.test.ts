@@ -928,9 +928,10 @@ describe('AI credential machine runtime', () => {
     expect(files.has('/home/operator/.codex/multi-auth/openai-codex-accounts.json')).toBe(false)
   })
 
-  it('captures a live unregistered Claude identity before import and retains it as active', async () => {
-    const { runtime, execFile, files, calls } = setup()
+  it.each(['win32', 'darwin', 'linux'] as const)('captures a live unregistered Claude identity before import and retains it as active (%s)', async platform => {
+    const { runtime, execFile, files, calls } = setup({ platform })
     files.set('/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'personal@example.com' } }))
+    files.set('/home/operator/.claude/.credentials.json', JSON.stringify({ claudeAiOauth: { accessToken: 'test-personal-token' } }))
     let registered = false, imported = false
     const original = execFile.getMockImplementation()!
     execFile.mockImplementation(async (command, args, options) => {

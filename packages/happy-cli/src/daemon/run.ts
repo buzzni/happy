@@ -1,6 +1,7 @@
 import { createDeviceOrgPinStore } from './deviceOrgPinStore';
 import { createDeviceEnrollment } from './deviceEnrollment';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
+import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { CheckpointRetention } from '@/checkpoint/checkpointRetention';
 import { CheckpointRetentionSchedule } from '@/checkpoint/checkpointRetentionSchedule';
@@ -4497,12 +4498,13 @@ export async function startDaemon(): Promise<void> {
             },
           });
         },
-        resolveProjectEnvironment: ({ runId, claimToken }) => fetchAutomationProjectEnvironment({
+        resolveProjectEnvironment: ({ runId, claimToken, conversationSessionId }) => fetchAutomationProjectEnvironment({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,
           machineId,
           runId,
           claimToken,
+          conversationSessionId,
         }),
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
@@ -4528,7 +4530,34 @@ export async function startDaemon(): Promise<void> {
           logDebug: (message) => logger.debug(`[DAEMON RUN] [server-automation] ${message}`),
           sessionId,
         }),
+        deliverConversation: (input) => deliverAutomationConversation(input, {
+          resolveSession: (sessionId) => {
+            const tracked = findTrackedSessionById(sessionId);
+            const directory = tracked?.happySessionMetadataFromLocalWebhook?.path ?? tracked?.directory;
+            return tracked?.encryption && directory ? { directory, ...tracked.encryption } : null;
+          },
+          sameDirectory: async (left, right) => (await resolveAutomationDirectoryMatch(left, right)) === true,
+          ensureRunning: async (sessionId) => (await resumeSession(sessionId)).type === 'success',
+          readSeq: async (sessionId) => {
+            const tracked = findTrackedSessionById(sessionId);
+            if (!tracked?.encryption) return null;
+            const snapshot = await fetchServerSessionSnapshot(sessionId, tracked.encryption);
+            return snapshot?.seq ?? null;
+          },
+          encryptUserMessage: (binding, message) => encodeBase64(encrypt(binding.encryptionKey, binding.encryptionVariant, message)),
+          deliver: (request) => apiMachine.deliverAutomationConversation(request),
+        }),
         resumeSession: resumeAutomationSession,
+        cancelScheduledSession: async ({ sessionId, directory }) => {
+          if (!launchReadiness.isReady()) return false;
+          const tracked = findTrackedSessionById(sessionId);
+          if (!tracked) return true;
+          const localDirectory = tracked.happySessionMetadataFromLocalWebhook?.path ?? tracked.directory;
+          if (!tracked.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) return false;
+          if (!isAutomationSessionRunning(sessionId)) return true;
+          const stopped = await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Owning Chat was deleted' });
+          return stopped.exitVerification.status === 'exited' || stopped.exitVerification.status === 'not-tracked';
+        },
         resumeServerChosenSession: configuration.machineControl !== 'strict',
         spawnSession: spawnAutomationSession,
         prepareGithubWorktree: (input) => prepareGithubTriggerWorktree({

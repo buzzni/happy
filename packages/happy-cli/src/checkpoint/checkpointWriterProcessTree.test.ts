@@ -44,7 +44,11 @@ describe('CheckpointWriterProcessTree', () => {
                 child.kill('SIGTERM');
             });
 
-            expect(() => process.kill(descendantPid, 0)).toThrow();
+            // macOS may finish the group before reaping the killed descendant.
+            await expect.poll(() => {
+                try { process.kill(descendantPid, 0); return null; }
+                catch (error) { return (error as NodeJS.ErrnoException).code; }
+            }, { timeout: 2_000, interval: 20 }).toBe('ESRCH');
         },
         10_000,
     );

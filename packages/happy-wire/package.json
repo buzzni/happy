@@ -31,6 +31,16 @@
         "types": "./dist/scriptServiceToken.d.mts",
         "default": "./dist/scriptServiceToken.mjs"
       }
+    },
+    "./chatAutomationLifecycleToken": {
+      "require": {
+        "types": "./dist/chatAutomationLifecycleToken.d.cts",
+        "default": "./dist/chatAutomationLifecycleToken.cjs"
+      },
+      "import": {
+        "types": "./dist/chatAutomationLifecycleToken.d.mts",
+        "default": "./dist/chatAutomationLifecycleToken.mjs"
+      }
     }
   },
   "files": [
@@ -67,6 +77,9 @@
     "*": {
       "scriptServiceToken": [
         "dist/scriptServiceToken.d.cts"
+      ],
+      "chatAutomationLifecycleToken": [
+        "dist/chatAutomationLifecycleToken.d.cts"
       ]
     }
   }

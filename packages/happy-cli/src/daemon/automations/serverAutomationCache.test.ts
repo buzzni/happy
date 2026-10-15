@@ -89,6 +89,17 @@ describe('serverAutomationCache', () => {
     })
   })
 
+  it('durably keeps the sealed deletion target until its session stop is acknowledged', () => {
+    const keyPair = tweetnacl.box.keyPair(); const encrypted = bundle({ name: 'task', prompt: 'work', directory: '/chat', schedule: { kind: 'interval', minutes: 15 }, conversation: { sessionId: 's' } }, keyPair.publicKey)
+    const cache = createServerAutomationCache({ filePath: file })
+    cache.applySync({ serverTime: 1000, nextSeq: '1', changes: [{ seq: '1', automationId: 'a', revision: 2, generation: 2, kind: 'TOMBSTONE', chatDeleted: true, payloadVersion: 4, ...encrypted, machineKeyVersion: 1, paused: true, enabledAt: 1 }] })
+    expect(cache.read().automations).toEqual([])
+    expect(createServerAutomationCache({ filePath: file }).read().pendingCancellations).toHaveLength(1)
+    expect(readFileSync(file, 'utf8')).not.toContain('/chat')
+    cache.markCancelled!([{ automationId: 'a', revision: 1 }]); expect(cache.read().pendingCancellations).toHaveLength(1)
+    cache.markCancelled!([{ automationId: 'a', revision: 2 }]); expect(cache.read().pendingCancellations).toEqual([])
+  })
+
   it('applies tombstones and ignores stale upserts without moving the cursor backwards', () => {
     const keyPair = tweetnacl.box.keyPair()
     const encrypted = bundle({
@@ -261,3 +272,14 @@ describe('client-sealed payloads on the daemon', () => {
     })
   })
 })
+
+it.each(['conversationSync', 'chatLifecycleSync'])('resyncs once when an older daemon did not support %s', marker => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conversation-cache-'));
+  const file = path.join(dir, 'cache.json');
+  try {
+    const cache = createServerAutomationCache({ filePath: file }); cache.applySync({ serverTime: 1, nextSeq: '9', changes: [] });
+    const disk = JSON.parse(readFileSync(file, 'utf8')); delete disk[marker];
+    writeFileSync(file, JSON.stringify(disk)); expect(cache.read().cursor).toBe(0n);
+    cache.applySync({ serverTime: 2, nextSeq: '9', changes: [] }); expect(cache.read().cursor).toBe(9n);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -2,6 +2,7 @@ import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Fastify } from '../types';
+import { signChatAutomationLifecycle } from '@slopus/happy-wire/chatAutomationLifecycleToken';
 
 const mocks = vi.hoisted(() => ({
     activateAutomationAdoption: vi.fn(),
@@ -18,11 +19,14 @@ const mocks = vi.hoisted(() => ({
     updateAutomation: vi.fn(),
     emitAutomationUpdate: vi.fn(),
     emitProjectAutomationUpdate: vi.fn(),
+    readChatAutomationImpact: vi.fn(async () => ({ total: 2, paused: 1, running: 1 })),
+    transitionChatAutomations: vi.fn(async () => ({ total: 0, paused: 0, running: 0 })),
 }));
 
 vi.mock('@/storage/db', () => ({ db: {} }));
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 vi.mock('@/app/automation/automationService', () => mocks);
+vi.mock('@/app/automation/automationChatLifecycle', () => ({ readChatAutomationImpact: mocks.readChatAutomationImpact, transitionChatAutomations: mocks.transitionChatAutomations }));
 vi.mock('@/app/automation/automationExecutionService', () => ({
     resolveAutomationRunMcpContext: mocks.resolveAutomationRunMcpContext,
 }));
@@ -74,6 +78,20 @@ async function makeApp() {
 }
 
 describe('automationRoutes', () => {
+    it('rejects ambient Happy credentials and binds server proof to the exact Chat and action', async () => {
+        const secret = 'server-only-test-secret'.repeat(3); vi.stubEnv('SCRIPT_AUTOMATION_ADMISSION_SECRET', secret);
+        try {
+            const app = await makeApp(); const url = '/v1/projects/chat:c/automation-lifecycle';
+            expect((await app.inject({ method: 'POST', url, headers: { authorization: 'Bearer test' }, payload: { state: 'deleted' } })).statusCode).toBe(403);
+            expect(mocks.transitionChatAutomations).not.toHaveBeenCalled();
+            const proof = signChatAutomationLifecycle({ projectId: 'chat:c', actorUserId: 'studio-owner', bearer: 'test', state: 'deleted', secret, now: Date.now() });
+            const headers = { authorization: 'Bearer test', 'x-chat-automation-proof': proof };
+            expect((await app.inject({ method: 'POST', url, headers, payload: { state: 'archived' } })).statusCode).toBe(403);
+            expect((await app.inject({ method: 'POST', url: '/v1/projects/chat:other/automation-lifecycle', headers, payload: { state: 'deleted' } })).statusCode).toBe(403);
+            expect((await app.inject({ method: 'POST', url, headers, payload: { state: 'deleted' } })).statusCode).toBe(200);
+            expect(mocks.transitionChatAutomations).toHaveBeenCalledTimes(1);
+        } finally { vi.unstubAllEnvs(); }
+    });
     const payloadCiphertext = new Uint8Array([1, ...new Uint8Array(40).fill(2)]);
     const keyEnvelope = new Uint8Array([1, ...new Uint8Array(104).fill(3)]);
 

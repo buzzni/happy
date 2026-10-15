@@ -69,7 +69,7 @@ export interface ServerAutomationTransport {
 }
 
 export interface ServerAutomationExecutorInput {
-  cache: { read(): ServerAutomationCacheState }
+  cache: { read(): ServerAutomationCacheState; markCancelled?(items: Array<{ automationId: string; revision: number }>): void }
   runtimeStore: ServerAutomationRuntimeStore
   machineSecretKey: Uint8Array
   now: number
@@ -163,7 +163,7 @@ export interface ServerAutomationExecutorInput {
    * 현재 HEAD 를 읽는다. 읽지 못하면 null 이고, 그때는 재개하지 않는다.
    */
   readHeadSha?: (input: { directory: string }) => Promise<string | null>
-  resolveProjectEnvironment: (input: { runId: string; claimToken: string }) => Promise<AutomationProjectEnvironmentResult>
+  resolveProjectEnvironment: (input: { runId: string; claimToken: string; conversationSessionId?: string }) => Promise<AutomationProjectEnvironmentResult>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -177,6 +177,7 @@ export interface ServerAutomationExecutorInput {
     claimToken: string
     sessionId: string
   }) => Promise<{ ok: boolean; error?: string; skipped?: boolean }>
+  deliverConversation?: (input: { runId: string; claimToken: string; sessionId: string; directory: string; prompt: string }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   resumeSession: (input: {
     sessionId: string
     directory: string
@@ -225,6 +226,7 @@ export interface ServerAutomationExecutorInput {
   isSessionRunning: (sessionId: string) => boolean
   /** 매달린 워커 세션에 종료를 요청한다. 실제 종료는 다음 틱의 isSessionRunning 으로 확인한다. */
   stopSession?: (sessionId: string) => void
+  cancelScheduledSession?: (input: { sessionId: string; directory: string }) => Promise<boolean>
   isDirectoryInUse: (directory: string) => boolean
   /**
    * false 면 스크립트 조건과 GitHub 트리거를 실행하지 않고 HOST_COMMANDS_UNSUPPORTED 로
@@ -469,7 +471,7 @@ function reconcileSchedules(
    */
   knownAutomations: EncryptedServerAutomation[] = cache.automations,
 ): ServerAutomationRuntimeState {
-  const activeIds = new Set(cache.automations.map((automation) => automation.automationId))
+  const activeIds = new Set([...cache.automations, ...cache.pendingCancellations ?? []].map((automation) => automation.automationId))
   const schedules = state.schedules.filter((schedule) => activeIds.has(schedule.automationId))
   const byId = new Map(schedules.map((schedule) => [schedule.automationId, schedule]))
   for (const automation of cache.automations) {
@@ -1515,6 +1517,7 @@ async function executeStartedRun(
         ...(degradedCode ? { degradedCode } : {}),
       }
     }
+    if (payload.conversation && (context.connectorPolicy !== 'optional' || context.requiredConnectors.length > 0)) return { outcome: 'ERROR', sessionId: null, failureCode: 'CONVERSATION_POLICY_UNSUPPORTED' }
     expectedConnectors = context.requiredConnectors
     if (context.connectorPolicy !== 'none') {
       const preflight = await input.preflightMcpConnectors({ runId: run.runId, context })
@@ -1603,7 +1606,11 @@ async function executeStartedRun(
       githubWorktree = prepared
     }
   }
-  const initialPrompt = buildAutomationPrompt(prompt, scriptOutput)
+  if (payload.conversation) {
+    const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId })
+    if (!authority.ok) return { outcome: 'ERROR', sessionId: null, failureCode: authority.code ?? 'CONVERSATION_TARGET_UNAVAILABLE' }
+  }
+  const initialPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
   const spawnInput = {
     directory: githubWorktree?.directory ?? payload.directory,
     initialPrompt,
@@ -1661,7 +1668,9 @@ async function executeStartedRun(
       spawned = resumed
     }
   } else {
-    spawned = await input.spawnSession(spawnInput)
+    spawned = payload.conversation
+      ? await input.deliverConversation?.({ ...run, sessionId: payload.conversation.sessionId, directory: payload.directory, prompt: initialPrompt }) ?? { ok: false, error: 'conversation delivery unsupported' }
+      : await input.spawnSession(spawnInput)
   }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) {
@@ -1729,6 +1738,15 @@ async function executeStartedRun(
 export async function runServerAutomationTick(
   input: ServerAutomationExecutorInput,
 ): Promise<Array<{ automationId: string; outcome: ServerAutomationReportOutcome }>> {
+  for (const cancelled of input.cache.read().pendingCancellations ?? []) {
+    try {
+      const payload = input.decryptPayload(cancelled, input.machineSecretKey)
+      const sessionId = payload.conversation?.sessionId ?? input.runtimeStore.read().schedules.find(row => row.automationId === cancelled.automationId)?.lastSessionId
+      if (sessionId && await input.cancelScheduledSession?.({ sessionId, directory: payload.directory })) {
+        input.cache.markCancelled?.([{ automationId: cancelled.automationId, revision: cancelled.revision }])
+      }
+    } catch (error) { input.logDebug?.(`[server-automation] cancellation pending: ${error}`) }
+  }
   await flushPendingReports(input)
   // Cleanup runs git outside the Windows Job; keep the journal until a runtime that may run it.
   if (input.hostCommandsAllowed !== false) await cleanupInactiveGithubWorktrees(input)
@@ -1784,7 +1802,7 @@ export async function runServerAutomationTick(
     const payload = payloads.get(automation.automationId)!
     const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
     const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
-    if (!payload.githubTrigger
+    if (!payload.githubTrigger && !payload.conversation
       && schedule.lastSessionId
       && input.isSessionRunning(schedule.lastSessionId)) {
       scheduleNextTick(input, automation.automationId, now)

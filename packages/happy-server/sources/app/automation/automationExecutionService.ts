@@ -94,7 +94,7 @@ export async function syncAutomations(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { afterSeq: bigint; limit: number },
+    input: { afterSeq: bigint; limit: number; payloadVersions?: number[] },
     now: Date = new Date(),
 ): Promise<Result<{ serverTime: Date; nextSeq: bigint; changes: Array<Record<string, unknown>> }>> {
     const rows = await tx.automationChange.findMany({
@@ -105,7 +105,13 @@ export async function syncAutomations(
     const changes: Array<Record<string, unknown>> = [];
     for (const change of rows) {
         if (change.kind === 'TOMBSTONE') {
-            changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
+            const deleted = await tx.automation.findFirst({ where: { id: change.automationId, machineAccountId: accountId, machineId }, include: { project: true } });
+            const cancelled = deleted?.projectId.startsWith('chat:') && deleted.deletedAt && deleted.payloadVersion !== 3
+                && (deleted.project?.config as { chatAutomationState?: unknown } | null)?.chatAutomationState === 'deleted'
+                && (deleted.payloadVersion === 1 || input.payloadVersions?.includes(deleted.payloadVersion));
+            changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE',
+                ...(cancelled && deleted ? { chatDeleted: true, payloadVersion: deleted.payloadVersion, payloadCiphertext: deleted.payloadCiphertext, machineKeyEnvelope: deleted.machineKeyEnvelope, machineKeyVersion: deleted.machineKeyVersion, paused: true, enabledAt: deleted.enabledAt } : {}),
+            });
             continue;
         }
         const automation = await tx.automation.findFirst({
@@ -117,7 +123,7 @@ export async function syncAutomations(
                 revision: { gte: change.revision },
             },
         });
-        if (!automation || automation.payloadVersion === 3) {
+        if (!automation || automation.payloadVersion === 3 || (automation.payloadVersion === 4 && !input.payloadVersions?.includes(4))) {
             changes.push({ seq: change.seq, automationId: change.automationId, revision: change.revision, generation: change.generation, kind: 'TOMBSTONE' });
             continue;
         }

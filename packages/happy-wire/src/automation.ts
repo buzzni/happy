@@ -11,6 +11,7 @@ import {
 export const AUTOMATION_RUN_NOW_PROTOCOL_VERSION = 2;
 export const AUTOMATION_ISSUE_TRIGGER_PROTOCOL_VERSION = 3;
 export const AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION = 4;
+export const AUTOMATION_CONVERSATION_PAYLOAD_VERSION = 4;
 export const AUTOMATION_PROTOCOL_VERSION = AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION;
 
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -124,8 +125,10 @@ export const automationPayloadSchema = z.object({
   model: z.string().nullable().optional(),
   effort: z.string().nullable().optional(),
   githubTrigger: githubTriggerSchema.optional(),
+  conversation: z.object({ sessionId: z.string().trim().min(1).max(200) }).optional(),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
+  if (payload.conversation && payload.githubTrigger) context.addIssue({ code: 'custom', path: ['conversation'], message: 'conversation delivery cannot use GitHub triggers' });
   const isGithubSchedule = payload.schedule.kind === 'github';
   if (isGithubSchedule !== (payload.githubTrigger !== undefined)) {
     context.addIssue({
@@ -145,7 +148,7 @@ export const automationPublicSchema = z.object({
   machineId: z.string().min(1).nullable(),
   revision: positiveInteger,
   generation: positiveInteger,
-  payloadVersion: z.literal(1),
+  payloadVersion: z.union([z.literal(1), z.literal(4)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -201,7 +204,7 @@ export const automationRunSchema = z.object({
 export type AutomationRun = z.infer<typeof automationRunSchema>;
 
 export const automationEncryptedFieldsSchema = z.object({
-  payloadVersion: z.literal(1),
+  payloadVersion: z.union([z.literal(1), z.literal(4)]),
   payloadCiphertext: payloadCiphertextSchema,
   viewerKeyId: z.string().min(1).max(128),
   viewerKeyVersion: positiveInteger,
@@ -230,7 +233,7 @@ export interface AutomationAdoption {
 export const automationUpdateRequestSchema = z.object({
   expectedRevision: positiveInteger,
   paused: z.boolean().optional(),
-  payloadVersion: z.literal(1).optional(),
+  payloadVersion: z.union([z.literal(1), z.literal(4)]).optional(),
   payloadCiphertext: payloadCiphertextSchema.optional(),
   viewerKeyId: z.string().min(1).max(128).optional(),
   viewerKeyVersion: positiveInteger.optional(),
@@ -308,7 +311,7 @@ export async function encryptAutomationPayload(input: {
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const ciphertext = versioned(input.crypto.secretBoxSeal(plaintext, dek));
   const result = {
-    payloadVersion: 1 as const,
+    payloadVersion: payload.conversation ? 4 as const : 1 as const,
     payloadCiphertext: input.crypto.encodeBase64(ciphertext),
     viewerKeyId: input.crypto.encodeBase64(await input.crypto.sha256(input.viewer.publicKey), true),
     viewerKeyVersion: input.viewer.keyVersion,
@@ -344,7 +347,7 @@ function sealMachineKey(input: {
  * Whether to trust the sender, and what to check in `seal`, is the caller's.
  */
 export function openAutomationPayloadForMachine(input: {
-  payloadVersion: 1;
+  payloadVersion: 1 | 4;
   payloadCiphertext: string;
   machineKeyEnvelope: string;
   recipientSecretKey: Uint8Array;
@@ -353,7 +356,7 @@ export function openAutomationPayloadForMachine(input: {
   let ciphertext: Uint8Array;
   let envelope: Uint8Array;
   try {
-    if (input.payloadVersion !== 1 || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
+    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) return { ok: false, reason: 'malformed' };
     ciphertext = input.crypto.decodeBase64(input.payloadCiphertext);
     envelope = input.crypto.decodeBase64(input.machineKeyEnvelope);
   } catch {
@@ -374,7 +377,7 @@ export function openAutomationPayloadForMachine(input: {
     const plaintext = input.crypto.secretBoxOpen(ciphertext.slice(1), opened.key);
     if (!plaintext) return { ok: false, reason: 'malformed' };
     const payload = automationPayloadSchema.safeParse(JSON.parse(new TextDecoder().decode(plaintext)));
-    if (!payload.success) return { ok: false, reason: 'malformed' };
+    if (!payload.success || (input.payloadVersion === 4) !== !!payload.data.conversation) return { ok: false, reason: 'malformed' };
     return { ok: true, payload: payload.data, authentication: opened.authentication };
   } catch {
     return { ok: false, reason: 'malformed' };
@@ -384,21 +387,23 @@ export function openAutomationPayloadForMachine(input: {
 }
 
 export async function decryptAutomationPayload(input: {
-  payloadVersion: 1;
+  payloadVersion: 1 | 4;
   payloadCiphertext: string;
   keyEnvelope: string;
   recipientSecretKey: Uint8Array;
   crypto: AutomationCryptoAdapter;
 }): Promise<AutomationPayload> {
   try {
-    if (input.payloadVersion !== 1 || input.recipientSecretKey.length !== 32) throw new Error();
+    if ((input.payloadVersion !== 1 && input.payloadVersion !== 4) || input.recipientSecretKey.length !== 32) throw new Error();
     const encryptedDek = openVersioned(input.keyEnvelope, input.crypto, ENVELOPE_BYTES);
     const dek = input.crypto.boxOpen(encryptedDek, input.recipientSecretKey);
     if (!dek || dek.length !== 32) throw new Error();
     const encryptedPayload = openVersioned(input.payloadCiphertext, input.crypto);
     const plaintext = input.crypto.secretBoxOpen(encryptedPayload, dek);
     if (!plaintext) throw new Error();
-    return automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
+    const payload = automationPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
+    if ((input.payloadVersion === 4) !== !!payload.conversation) throw new Error();
+    return payload;
   } catch {
     throw new Error('automation-decrypt-failed');
   }
@@ -574,3 +579,15 @@ export function createAutomationApiClient(options: {
     },
   };
 }
+
+
+/** An authenticated machine may append one encrypted prompt per claimed run. */
+export const automationConversationDeliverRequestSchema = z.object({
+  wireVersion: z.literal(1),
+  runId: z.string().min(1).max(200),
+  claimToken: z.string().min(1).max(256),
+  sessionId: z.string().min(1).max(200),
+  expectedSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1),
+  contentCiphertext: base64Schema(128 * 1024),
+});
+export type AutomationConversationDeliverRequest = z.infer<typeof automationConversationDeliverRequestSchema>;
