@@ -117,6 +117,8 @@ describe('typed machine-run handler', () => {
         }
     });
 
+    // This exercises the real 128-entry retention limit by spawning 129 processes
+    // serially. Allow for process startup under CI load, beyond the default 5 s.
     it('bounds terminal retention even when remote continuation remains unresolved', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
         const handler = createTypedMachineRunHandler(root);
@@ -135,10 +137,14 @@ describe('typed machine-run handler', () => {
             // A status request runs retention before looking up the operation.
             await expect(handler({ version: 1, action: 'status', operationId: operationIds.at(-1)! })).resolves.toMatchObject({ state: 'passed' });
             await expect(handler({ version: 1, action: 'status', operationId: operationIds[0] })).rejects.toThrow('MACHINE_RUN_NOT_FOUND');
+            // Eviction must leave all 128 retained results accessible.
+            for (const operationId of operationIds.slice(1)) {
+                await expect(handler({ version: 1, action: 'status', operationId })).resolves.toMatchObject({ state: 'passed' });
+            }
         } finally {
             await rm(root, { recursive: true, force: true });
         }
-    });
+    }, 30_000);
 
     it('does not let spawn failures exhaust the active-operation quota', async () => {
         const root = await mkdtemp(join(tmpdir(), 'happy-machine-run-'));
