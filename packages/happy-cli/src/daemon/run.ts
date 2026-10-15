@@ -4299,7 +4299,8 @@ export async function startDaemon(): Promise<void> {
       machineId,
       bearer: () => credentials.token,
       fetch,
-      sessionEnvironment: (agent, selection) => aiCredentialRuntime.sessionEnvironment(agent, selection),
+      // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
+      sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
       recordAgentEnvironment: (session, binding) => {
         session.agentEnvironment = { ...session.agentEnvironment, [SETUP_TOKEN_BINDING_ENV]: binding };
         persistAgentEnvironment(session);

@@ -98,3 +98,11 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     expect(text).toMatch(/\.\.\.result,\s*appliedAiAuthSource\s*\}/)
   })
 })
+
+describe('setup-token account switch wiring (Saycode specs/claude-setup-token-account-selection)', () => {
+  it("hands the switch the runtime's own session environment, recorded binding included", async () => {
+    const block = (await runSource()).match(/createSetupTokenAccountSwitch\(\{[\s\S]*?\n {4}\}\);/)?.[0] ?? ''
+    // A wrapper that drops the third argument breaks catching a session up to its recorded binding.
+    expect(block).toMatch(/sessionEnvironment: aiCredentialRuntime\.sessionEnvironment,/)
+  })
+})
