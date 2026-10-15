@@ -10,6 +10,7 @@
 import type { AiAuthSelection, SetupTokenBinding } from './sessionEnv'
 import { readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
 import type { TrackedSession } from './types'
+import { logger } from '@/ui/logger'
 
 export type SetupTokenUsageObservation = {
   observedAt: number
@@ -30,7 +31,8 @@ export type SetupTokenAccountSwitchDeps = {
   /** Records the new binding as the session's resume authority. */
   recordAgentEnvironment(session: TrackedSession, binding: string): void
 }
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'REQUEST_FAILED' | 'BINDING_REJECTED'
+/** FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking. */
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -38,13 +40,24 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const parseBinding = (value: string | undefined) => {
   try { return readSetupTokenResumeSelection({ [SETUP_TOKEN_BINDING_ENV]: value }) } catch { return undefined }
 }
-/** The daemon's record for the session, and whether the session still runs that same binding. */
+/**
+ * The daemon's record for the session against the binding the session runs: the same one, a newer record
+ * (the session missed a switch this daemon finished), or an older record (this daemon lost a switch).
+ */
 function boundSession(deps: SetupTokenAccountSwitchDeps, sessionId: string, running: string) {
   const session = deps.findSession(sessionId)
   const recorded = parseBinding(session?.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV])
   const current = parseBinding(running)
-  return session && recorded && current ? { session, recorded, current: current.binding.nonce === recorded.binding.nonce } : null
+  if (!session || !recorded || !current) return null
+  const state = current.binding.nonce === recorded.binding.nonce ? 'same' as const
+    : recorded.binding.issuedAt > current.binding.issuedAt ? 'session-behind' as const : 'daemon-behind' as const
+  return { session, recorded, state }
 }
+const failure = (reason: SwitchFailure, detail: string) => {
+  logger.debug(`[setup-token-switch] ${reason}: ${detail}`)
+  return { ok: false as const, reason }
+}
+const refusal = (status: number) => status === 401 || status === 403 ? 'FORBIDDEN' as const : 'REQUEST_FAILED' as const
 
 export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps) {
   const post = (route: string, body: object) => deps.fetch(`${deps.studioOrigin}/api/claude-setup-token/daemon/${route}`, {
@@ -57,10 +70,12 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return { ok: false, reason: 'NOT_BOUND' }
     const { session, recorded } = bound
+    // Never move a session back onto a binding older than the one it runs.
+    if (bound.state === 'daemon-behind') return failure('STALE', `session ${sessionId} runs a newer binding than this daemon records`)
     // The session missed a switch this daemon finished (its request timed out): catch it up, no new grant.
-    if (!bound.current) {
+    if (bound.state === 'session-behind') {
       try { return { ok: true, environment: await deps.sessionEnvironment('claude', recorded.selection, recorded.binding) } }
-      catch { return { ok: false, reason: 'BINDING_REJECTED' } }
+      catch (error) { logger.debug(`[setup-token-switch] recorded binding unusable for ${sessionId}; asking Studio: ${(error as Error)?.message}`) }
     }
     if (!deps.studioOrigin) return { ok: false, reason: 'STUDIO_UNAVAILABLE' }
     const binding = recorded.binding
@@ -69,20 +84,20 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const response = await post('rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce })
       const body = await response.json().catch(() => null) as Record<string, unknown> | null
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return { ok: false, reason: 'NO_ACCOUNT' }
-      if (!response.ok || !body) return { ok: false, reason: 'REQUEST_FAILED' }
+      if (!response.ok || !body) return failure(refusal(response.status), `rebind ${response.status} ${String(body?.error ?? '')}`)
       grant = body
-    } catch { return { ok: false, reason: 'REQUEST_FAILED' } }
+    } catch (error) { return failure('REQUEST_FAILED', `rebind ${(error as Error)?.name ?? 'error'}`) }
     if (grant.version !== 1 || typeof grant.bindingGrant !== 'string' || typeof grant.managedAccountId !== 'string' || !UUID.test(grant.managedAccountId)
-      || !Number.isSafeInteger(grant.credentialGeneration) || Number(grant.credentialGeneration) < 1) return { ok: false, reason: 'REQUEST_FAILED' }
+      || !Number.isSafeInteger(grant.credentialGeneration) || Number(grant.credentialGeneration) < 1) return failure('REQUEST_FAILED', 'rebind answered an unreadable grant')
     let environment: Record<string, string>
     try {
       environment = await deps.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: grant.managedAccountId,
         groupScope: binding.groupScope, credentialGeneration: grant.credentialGeneration as number, bindingGrant: grant.bindingGrant })
-    } catch { return { ok: false, reason: 'BINDING_REJECTED' } }
+    } catch (error) { return failure('BINDING_REJECTED', `grant verification: ${(error as Error)?.message}`) }
     // The session stays with its member and organization; only the account changes.
     const next = parseBinding(environment[SETUP_TOKEN_BINDING_ENV])?.binding
     if (!next || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN) {
-      return { ok: false, reason: 'BINDING_REJECTED' }
+      return failure('BINDING_REJECTED', 'the new binding changes member, machine or organization')
     }
     deps.recordAgentEnvironment(session, environment[SETUP_TOKEN_BINDING_ENV])
     return { ok: true, environment }
@@ -93,13 +108,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
       const bound = boundSession(deps, sessionId, running)
       if (!bound) return { ok: false, reason: 'NOT_BOUND' }
-      if (!bound.current) return { ok: false, reason: 'STALE' }
+      if (bound.state !== 'same') return { ok: false, reason: 'STALE' }
       if (!deps.studioOrigin) return { ok: false, reason: 'STUDIO_UNAVAILABLE' }
       const { binding } = bound.recorded
       try {
         const response = await post('usage', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, observation })
-        return response.ok ? { ok: true } : { ok: false, reason: 'REQUEST_FAILED' }
-      } catch { return { ok: false, reason: 'REQUEST_FAILED' } }
+        return response.ok ? { ok: true } : failure(refusal(response.status), `usage ${response.status}`)
+      } catch (error) { return failure('REQUEST_FAILED', `usage ${(error as Error)?.name ?? 'error'}`) }
     },
 
     /** One switch per session at a time; a second request while one runs gets that one's answer. */

@@ -2524,7 +2524,11 @@ export async function startDaemon(): Promise<void> {
     const persistAgentEnvironment = (session: TrackedSession): void => {
       const sessionId = session.happySessionId;
       const metadata = session.happySessionMetadataFromLocalWebhook;
-      if (!sessionId || !session.encryption || !metadata) return;
+      if (!sessionId || !session.encryption || !metadata) {
+        // Kept in memory only: a daemon restart before the next persisted record resumes on the previous binding.
+        logger.debug(`[DAEMON RUN] Switched binding for ${sessionId ?? 'unknown session'} not persisted: session record incomplete`);
+        return;
+      }
       persistSession(sessionId, {
         encryptionKey: encodeBase64(session.encryption.encryptionKey),
         encryptionVariant: session.encryption.encryptionVariant,

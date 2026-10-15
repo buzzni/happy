@@ -7,9 +7,10 @@ const A = '00000000-0000-4000-8000-00000000000a'
 const B = '00000000-0000-4000-8000-00000000000b'
 const NONCE_A = '00000000-0000-4000-8000-0000000000aa'
 const NONCE_B = '00000000-0000-4000-8000-0000000000bb'
+// B was issued after A: a switch from A to B.
 const binding = (managedAccountId: string, userId = 'user-a', nonce = managedAccountId === A ? NONCE_A : NONCE_B): SetupTokenBinding => ({
   managedAccountId, credentialGeneration: 1, groupScope: 'org-a', companyId: 'org-a', userId, machineId: 'pc-a',
-  keyId: 'f'.repeat(64), nonce, issuedAt: 1,
+  keyId: 'f'.repeat(64), nonce, issuedAt: managedAccountId === A ? 1 : 2,
 })
 const RUNNING_A = formatSetupTokenBinding(binding(A))
 const observation = { observedAt: 10, reason: 'ok' as const, retryAt: null, windows: [{ kind: 'unified5h' as const, pct: 96, resetsAt: 20 }] }
@@ -107,5 +108,29 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(await first).toMatchObject({ ok: true })
     expect(await second).toMatchObject({ ok: true })
     expect(deps.fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('never moves a session back to an older binding the daemon still records', async () => {
+    const { switcher, requests, deps, session } = setup()
+    // The daemon lost the switch to B (its write failed, then it restarted); the session runs B.
+    expect(await switcher.rebind('session-a', formatSetupTokenBinding(binding(B)))).toEqual({ ok: false, reason: 'STALE' })
+    expect(requests).toEqual([])
+    expect(deps.sessionEnvironment).not.toHaveBeenCalled()
+    expect(session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(RUNNING_A)
+  })
+
+  it('asks Studio when the binding a session missed can no longer be used', async () => {
+    const { switcher, requests, deps, session } = setup()
+    session.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) }
+    vi.mocked(deps.sessionEnvironment).mockRejectedValueOnce(new Error('CLAUDE_SETUP_TOKEN_BINDING_STALE'))
+    expect(await switcher.rebind('session-a', RUNNING_A)).toMatchObject({ ok: true })
+    expect(requests.map(request => [request.url.split('/').pop(), request.body.bindingNonce])).toEqual([['rebind', NONCE_B]])
+  })
+
+  it('tells the session when Studio refuses this binding for good', async () => {
+    const forbidden = vi.fn(async () => Response.json({ error: 'SETUP_TOKEN_DAEMON_BINDING_FORBIDDEN' }, { status: 403 })) as unknown as typeof fetch
+    const { switcher } = setup({ fetch: forbidden })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'FORBIDDEN' })
+    expect(await switcher.reportUsage('session-a', RUNNING_A, observation)).toEqual({ ok: false, reason: 'FORBIDDEN' })
   })
 })
