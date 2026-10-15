@@ -9,7 +9,13 @@ with differing launch and saved models, for both unused and existing provider
 threads, then run related tests and CLI type/build checks. This is an internal
 Core session-launch correction with no wire/schema/dependency changes. Revert
 the fix commit for rollback. Publication and PC runtime replacement are outside
-this local review-fix request.
+the initial local review-fix request. The user's subsequent request authorizes
+PR/CI/main integration, official publication, this PC's runtime application and
+live scheduled validation. Prepare .328 and its artifact; obtain exact tag-push
+approval per AGENTS immediately before publication. Prove a different explicit
+daemon resume model, then a real clock-based QA reservation in that same Chat;
+pause QA afterward and preserve unrelated sessions/credentials. Retain the old
+runtime directory for rollback without changing keys or machine registration.
 
 Review follow-up (2026-10-14): preserve the v3 script revision contract during Chat lifecycle transitions and keep legacy runtime cancellation targets until stop acknowledgement. Use existing state and APIs; no DB or wire schema changes. Reproduce the HTTP list and second-stop failures, validate pause/restore/resume and restart-safe runtime persistence, then update Happy #812 and Studio's pin. Revert these fix commits for rollback; preserve encrypted definitions/history.
 

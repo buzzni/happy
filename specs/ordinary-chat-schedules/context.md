@@ -1,12 +1,26 @@
 ---
 feature: ordinary-chat-schedules
-status: local-resume-model-review-fix-validated
+status: resume-model-release-preparation
 updated: 2026-10-15
 ---
 
 # Ordinary Chat schedules context
 
 ## 2026-10-15 review 2f9e69c: explicit daemon resume model
+
+Follow-up: user requested a PR, official CLI publication, application to this
+PC and actual scheduled model-override acceptance. Candidate .328 is not yet
+published; main 94591828 was merged into the fix branch, resolving squash-merge
+overlaps by retaining the verified correction. Post-merge 130 related tests,
+26 version/package/verifier tests, CLI production build/typecheck and prepared
+.328 artifact guard/fresh-install smoke pass. Create PR; merge after green CI.
+Happy AGENTS requires the exact tag-push checkpoint immediately before release.
+Keep credentials, machine/key identity, existing user schedules and sessions;
+only the dedicated QA Chat/reservation may be manipulated. Prove an explicit
+daemon resume model overrides its different saved pin, then let a clock-based
+QA reservation use that process/model. Read model evidence from runtime/provider
+metadata, not the model's own answer. Restore QA to paused at the end. The
+separate Default gpt-5.5 defect and Studio vendor pin remain outside this fix.
 
 Happy #820 merged as main 94591828 and CLI .327 was officially published and
 applied to the target PC. That release restores a saved reconnect pin but still
