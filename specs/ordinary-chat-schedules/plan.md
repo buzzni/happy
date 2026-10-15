@@ -1,5 +1,16 @@
 # Ordinary Chat schedules plan
 
+Review follow-up (2026-10-15, 2f9e69c): parse the daemon resume command's
+`--model` in the existing Codex command handler and pass it to the runner.
+Explicit command model takes precedence over the one-shot environment seed,
+then the saved reconnect pin; always consume the environment seed so children
+cannot inherit it. Reproduce this through the real command/runner boundary
+with differing launch and saved models, for both unused and existing provider
+threads, then run related tests and CLI type/build checks. This is an internal
+Core session-launch correction with no wire/schema/dependency changes. Revert
+the fix commit for rollback. Publication and PC runtime replacement are outside
+this local review-fix request.
+
 Review follow-up (2026-10-14): preserve the v3 script revision contract during Chat lifecycle transitions and keep legacy runtime cancellation targets until stop acknowledgement. Use existing state and APIs; no DB or wire schema changes. Reproduce the HTTP list and second-stop failures, validate pause/restore/resume and restart-safe runtime persistence, then update Happy #812 and Studio's pin. Revert these fix commits for rollback; preserve encrypted definitions/history.
 
 Core owns the run, session and encrypted message consistency. payloadVersion 4 seals `conversation.sessionId`; 3 remains script-only. Keep protocolVersion unchanged because script readiness uses its 4/5 gate. Publish encrypted machine metadata `automationSupport.conversation: true` and explicitly negotiate sync `payloadVersions: [1, 4]`. Old sync callers receive tombstones for v4. Resync pre-capability disk caches once.

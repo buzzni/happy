@@ -1,10 +1,39 @@
 ---
 feature: ordinary-chat-schedules
-status: release-preparation
-updated: 2026-10-14
+status: local-resume-model-review-fix-validated
+updated: 2026-10-15
 ---
 
 # Ordinary Chat schedules context
+
+## 2026-10-15 review 2f9e69c: explicit daemon resume model
+
+Happy #820 merged as main 94591828 and CLI .327 was officially published and
+applied to the target PC. That release restores a saved reconnect pin but still
+ignores a daemon resume `--model`: codexCommand did not parse the flag, while
+runCodex only read HAPPY_INITIAL_MODEL and the saved pin. The user requested
+this review correction and tests; no further release or runtime replacement
+is part of this local follow-up.
+
+The existing command handler now passes an initialModel to both account and
+managed runners. Runtime precedence is command model, one-shot environment
+model, saved reconnect pin, then runtime default. The environment seed is
+always consumed even when the command model wins. Empty/missing flag values
+fail before auth or daemon work. No daemon identity, credentials, encryption,
+wire/schema or dependencies change. This does not fix the separate Default
+gpt-5.5 incompatibility reported during live .327 acceptance.
+
+Before the fix, four real command→runner regressions sent the saved Astra or
+environment Sol instead of the requested 6.1 Sol; three invalid-model cases
+also failed. After the fix, 130 related tests across seven files pass, including
+unused-session recovery and existing-thread resume, explicit model versus
+saved model, explicit versus environment model, environment fallback, saved
+fallback, retained effort, same Happy session identity and seed removal.
+CLI production build including tsc --noEmit passes; existing bundle warnings
+remain. The provider/network and authentication are stubbed in these automated
+tests; this follow-up is not a new live provider/PC acceptance test. Code and
+documentation are ready for a local fix commit above 2f9e69c. Main, published
+.327 and the running PC have not received this follow-up yet.
 
 ## 2026-10-14 official CLI release and live acceptance
 

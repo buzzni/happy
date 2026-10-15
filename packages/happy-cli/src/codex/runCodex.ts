@@ -200,6 +200,7 @@ export async function runCodex(opts: {
     noSandbox?: boolean;
     resumeThreadId?: string;
     permissionMode?: PermissionMode;
+    initialModel?: string;
     /**
      * Project lesson recall and background review for this session.
      *
@@ -507,7 +508,9 @@ export async function runCodex(opts: {
     // Split out what the user actually asked for from the runtime fallback, so
     // callers can tell "no model was chosen" apart from "the default model".
     const reconnectPin = publishedSessionModelPin(reconnectSession?.metadata);
-    const explicitInitialModel = consumePendingInitialModel(process.env) ?? reconnectPin.model;
+    // Consume even when --model wins, so child processes cannot inherit the seed.
+    const pendingInitialModel = consumePendingInitialModel(process.env);
+    const explicitInitialModel = opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
     const initialModelSeed = explicitInitialModel ?? DEFAULT_CODEX_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {

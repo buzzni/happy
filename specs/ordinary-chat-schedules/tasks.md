@@ -1,5 +1,11 @@
 # Ordinary Chat schedules tasks
 
+## 2026-10-15 daemon resume model override review
+
+- [x] Reproduce ignored `--model` through the real command/runner with a different saved reconnect model, for unused and existing threads (four precedence failures plus three invalid-argument failures).
+- [x] Parse and pass the explicit model, preserve environment/saved fallback and one-shot environment consumption.
+- [x] Validate 130 related tests and CLI types/production build; document the local follow-up and unchanged published/PC runtime.
+
 ## Official release and live acceptance (user requested 2026-10-14)
 
 - [x] Prepare .323 from main, validate production build/173 relevant tests/prepared tarball fresh-install guard, and commit the release candidate.

@@ -97,6 +97,13 @@ describe('handleCodexCommand', () => {
     })
   })
 
+  it.each([['--model'], ['--model', '--started-by', 'daemon'], ['--model', '  ']])('rejects a missing model before starting a session: %j', async (...args) => {
+    await expect(handleCodexCommand(args)).rejects.toThrow('Codex model requires a model ID')
+    expect(mocks.mockAuthAndSetupMachineIfNeeded).not.toHaveBeenCalled()
+    expect(mocks.mockEnsureDaemonRunning).not.toHaveBeenCalled()
+    expect(mocks.mockRunCodex).not.toHaveBeenCalled()
+  })
+
   it('maps --yolo to codex yolo permission mode', async () => {
     await handleCodexCommand(['--yolo'])
 

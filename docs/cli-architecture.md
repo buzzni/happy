@@ -7,7 +7,10 @@ Codex without a provider `--resume` only when both the fresh server sequence and
 processed cursor are zero. The reconnect envelope still binds the original
 Happy session ID. Missing threads in nonempty or unverified sessions remain an
 error; this is not context-loss recovery. Reconnected turns inherit the stored
-model and effort pins unless explicit launch seeds override them. Revisit the
+model and effort pins unless explicit launch seeds override them. For Codex,
+the command's `--model` overrides `HAPPY_INITIAL_MODEL`, which overrides the
+stored model pin. The one-shot environment seed is consumed even when the
+command model wins, preventing inheritance by child processes. Revisit the
 zero-sequence proof if session creation begins writing durable messages.
 
 This document describes the Happy CLI (`packages/happy-cli`) and its daemon. The CLI is both an interactive tool and a background session manager that keeps machine state in sync with the server.
