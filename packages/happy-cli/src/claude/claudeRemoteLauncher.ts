@@ -53,6 +53,9 @@ interface PermissionsField {
 }
 
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
+import { createSetupTokenAccountSwitching, CONTINUE_PROMPT } from './setupTokenAccountSwitching';
+import { reportSetupTokenUsage, requestSetupTokenRebind } from '@/daemon/controlClient';
+import { SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
@@ -290,6 +293,32 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
+    /*
+     * Saycode specs/claude-setup-token-account-selection — a session bound to an organization
+     * setup-token account moves off it once the provider reports it used up. The token is read when
+     * a provider process starts, so a switch restarts the provider on the same conversation.
+     */
+    const setupTokenSwitching = process.env[SETUP_TOKEN_BINDING_ENV] ? createSetupTokenAccountSwitching({
+        sessionId: () => session.client.sessionId ?? null,
+        binding: () => providerBinding ?? process.env[SETUP_TOKEN_BINDING_ENV],
+        report: reportSetupTokenUsage,
+        rebind: requestSetupTokenRebind,
+        applyEnvironment: (environment) => { for (const [key, value] of Object.entries(environment)) process.env[key] = value; },
+        notify: (message) => session.client.sendSessionEvent({ type: 'message', message }),
+    }) : null;
+    /** Whether this generation's provider process has started (its `system/init` arrived). */
+    let providerRunning = false;
+    /** The mode the last turn ran with, across provider restarts — the continuation of a refused turn reuses it. */
+    let lastTurnMode: EnhancedMode | null = null;
+    /** The setup-token binding the running provider started with; usage is booked to it, not to a later switch. */
+    let providerBinding: string | undefined;
+    /** Whether the last turn answered a channel request; its lifecycle cannot authorize a second execution. */
+    let lastTurnChannel = false;
+    /** A refused turn to continue as the first turn of the next provider (set by a switch). */
+    let continuation: EnhancedMode | null = null;
+    /** The provider runs on a binding the session has since switched away from. */
+    const providerStale = () => providerRunning && providerBinding !== undefined && providerBinding !== process.env[SETUP_TOKEN_BINDING_ENV];
+
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
         backgroundTasks = next;
@@ -297,7 +326,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
+        if ((message as { type?: unknown }).type === 'rate_limit_event') {
+            setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
+        }
         if (message.type === 'system' && message.subtype === 'init') {
+            providerRunning = true;
+            providerBinding = process.env[SETUP_TOKEN_BINDING_ENV];
             // The level signal is per provider process. Until its first full
             // snapshot, older CLIs still use this generation's transcript.
             publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });
@@ -613,6 +647,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
+            providerRunning = false;
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -699,6 +734,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         return permissionHandler.isAborted(toolCallId);
                     },
                     nextMessage: async () => {
+                        if (mode) lastTurnMode = mode;
+                        const accountSwitch = await setupTokenSwitching?.switchIfWanted();
+                        if (accountSwitch?.switched && accountSwitch.continueAfter && !lastResultSucceeded && !lastTurnChannel && !controller.signal.aborted) {
+                            continuation = mode ?? lastTurnMode;
+                        }
+                        // A running provider keeps the token it started with: end it, the loop resumes the conversation.
+                        if (providerStale()) return null;
+                        // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
+                        if (!providerRunning && continuation) {
+                            if (!session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                            continuation = null;
+                        }
                         if (pending) {
                             // A held-back batch is a turn like any other: refused once input is closed.
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
@@ -708,6 +755,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
                             messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
+                            lastTurnChannel = Boolean(p.channelRequestId);
                             // This message starts the new provider. Seed its comparison
                             // baseline too, or the next model/effort change is missed.
                             modeHash = p.hash;
@@ -788,6 +836,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // end the loop, or every relaunch meets the same refusal and spins forever.
                         if (msg === null && drain?.gate.isClosed()) exitReason = 'exit';
 
+                        // A message that arrives after a switch (another boundary, or while it ran) belongs to the next provider.
+                        if (msg && providerStale()) {
+                            pending = msg;
+                            drain?.releaseClaim();
+                            return null;
+                        }
+
                         // Check if mode has changed
                         if (msg) {
                             // Preview without committing: a changed engine setting needs a
@@ -812,6 +867,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // A batch with no channel message clears it, so an in-app turn never
                             // inherits an id.
                             messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
+                            lastTurnChannel = Boolean(msg.channelRequestId);
                             permissionHandler.handleModeChange(mode.permissionMode);
                             const latency = toTurnLatency(msg);
 

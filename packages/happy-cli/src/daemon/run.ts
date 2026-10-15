@@ -96,7 +96,9 @@ import {
   type AiAuthSelection,
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
+  SETUP_TOKEN_BINDING_ENV,
 } from './sessionEnv';
+import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
@@ -2518,6 +2520,30 @@ export async function startDaemon(): Promise<void> {
      */
     const resumeCursorPersistedAt = new Map<string, number>();
 
+    /** A changed resume authority (a switched setup-token account) must reach disk now, not with the next cursor. */
+    const persistAgentEnvironment = (session: TrackedSession): void => {
+      const sessionId = session.happySessionId;
+      const metadata = session.happySessionMetadataFromLocalWebhook;
+      if (!sessionId || !session.encryption || !metadata) {
+        // Kept in memory only: a daemon restart before the next persisted record resumes on the previous binding.
+        logger.debug(`[DAEMON RUN] Switched binding for ${sessionId ?? 'unknown session'} not persisted: session record incomplete`);
+        return;
+      }
+      persistSession(sessionId, {
+        encryptionKey: encodeBase64(session.encryption.encryptionKey),
+        encryptionVariant: session.encryption.encryptionVariant,
+        seq: session.encryption.seq,
+        metadataVersion: session.encryption.metadataVersion,
+        agentStateVersion: session.encryption.agentStateVersion,
+        metadata,
+        savedAt: Date.now(),
+        userHomeDir: session.userHomeDir,
+        lastProcessedSeq: session.persistedLastProcessedSeq,
+        agentEnvironment: session.agentEnvironment,
+        deferredContinuationContextFile: session.deferredContinuationContextFile,
+      });
+    };
+
     /**
      * Keeps the on-disk resume cursor current while the session is running.
      *
@@ -3674,8 +3700,11 @@ export async function startDaemon(): Promise<void> {
       return null;
     });
 
+    // Assigned once the AI credential runtime exists; the control server asks for it per request.
+    let setupTokenAccountSwitch: SetupTokenAccountSwitch | null = null;
     // Start control server
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
+      getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
       spawnSession: requestEnvironments.rememberSpawn(spawnSession),
@@ -4263,6 +4292,19 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor = () => { stopPersonalProbes(); claudeSwapSupervisor.shutdown(); };
 
     resolveManagedAiCredentialEnvironment = (agent, selection, recorded) => aiCredentialRuntime.sessionEnvironment(agent, selection, recorded);
+    // Saycode specs/claude-setup-token-account-selection — a bound session moves off a used-up account.
+    setupTokenAccountSwitch = createSetupTokenAccountSwitch({
+      findSession: (sessionId) => getCurrentChildren().find(session => session.happySessionId === sessionId),
+      studioOrigin: trustedStudioOrigin,
+      machineId,
+      bearer: () => credentials.token,
+      fetch,
+      sessionEnvironment: (agent, selection) => aiCredentialRuntime.sessionEnvironment(agent, selection),
+      recordAgentEnvironment: (session, binding) => {
+        session.agentEnvironment = { ...session.agentEnvironment, [SETUP_TOKEN_BINDING_ENV]: binding };
+        persistAgentEnvironment(session);
+      },
+    });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     let activeServerAutomationLeaseCount = 0;
     let scriptRuntime: ReturnType<typeof createScriptRuntimeSupervisor> | null = null;
