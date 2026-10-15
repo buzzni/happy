@@ -347,9 +347,10 @@ describe('createChannelHostSupervisor', () => {
         expect(children[0].signals).toEqual([]);
     });
 
-    it('kills a child that does not exit within 10s of stop', async () => {
+    it('kills a ready child that does not exit within 10s of stop', async () => {
         const supervisor = make();
         supervisor.start();
+        children[0].send(ready);
         await flush();
         let done = false;
         const stopped = supervisor.stop().then(() => { done = true; });
@@ -359,6 +360,20 @@ describe('createChannelHostSupervisor', () => {
         await vi.advanceTimersByTimeAsync(1);
         await stopped;
         expect(children[0].signals).toEqual(['SIGKILL']);
+    });
+
+    it('kills a child still starting up at once, since it cannot hear stop until it is ready', async () => {
+        const supervisor = make();
+        supervisor.start();
+        await flush();
+        let done = false;
+        const stopped = supervisor.stop().then(() => { done = true; });
+        await flush();
+        expect(done).toBe(true);
+        await stopped;
+        expect(children[0].signals).toEqual(['SIGKILL']);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(children).toHaveLength(1);
     });
 
     it('cancels a scheduled restart on stop', async () => {
