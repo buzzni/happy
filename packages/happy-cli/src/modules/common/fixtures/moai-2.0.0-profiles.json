@@ -1,0 +1,375 @@
+[
+  {
+    "id": "buzzni.moai.status",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "status"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.prime",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "prime"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.show",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "show",
+      "{{id}}"
+    ],
+    "parameters": {
+      "id": {
+        "type": "string",
+        "maxLength": 128
+      }
+    },
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.show-all",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "show",
+      "--all"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.backlog-all",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "backlog",
+      "show",
+      "--all"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.show-archived",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "show",
+      "--archived",
+      "-n",
+      "200",
+      "--sort",
+      "id"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.show-archived-after",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "show",
+      "--archived",
+      "-n",
+      "200",
+      "--sort",
+      "id",
+      "--after",
+      "{{after}}"
+    ],
+    "parameters": {
+      "after": {
+        "type": "string",
+        "maxLength": 128
+      }
+    },
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.wiki-ls",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "wiki",
+      "ls"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.wiki-show",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "wiki",
+      "show",
+      "{{slug}}"
+    ],
+    "parameters": {
+      "slug": {
+        "type": "string",
+        "maxLength": 128
+      }
+    },
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.read",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "read",
+      "{{id}}"
+    ],
+    "parameters": {
+      "id": {
+        "type": "string",
+        "maxLength": 128
+      }
+    },
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.read-all",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "read",
+      "--all"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.read-group",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "read",
+      "-e",
+      "{{group}}"
+    ],
+    "parameters": {
+      "group": {
+        "type": "string",
+        "maxLength": 128
+      }
+    },
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.show-all-worktree",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "show",
+      "--all",
+      "--worktree"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.show-worktree",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "show",
+      "{{id}}",
+      "--worktree"
+    ],
+    "parameters": {
+      "id": {
+        "type": "string",
+        "maxLength": 128
+      }
+    },
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  },
+  {
+    "id": "buzzni.moai.skill-status",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "skill",
+      "status"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "descendantAllowlist": [
+      "git"
+    ]
+  }
+]

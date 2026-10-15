@@ -12,7 +12,7 @@ import {
     type TypedMachineRunResponse,
 } from './typedMachineRun';
 import { validatePath } from './pathSecurity';
-import { MOAI_V080_MACHINE_RUN_PROFILES } from './moaiMachineRunProfiles';
+import { MOAI_MACHINE_RUN_PROFILES } from './moaiMachineRunProfiles';
 import {
     managedMachineToolPlatform,
     managedMachineToolStatus,
@@ -270,7 +270,7 @@ export function createTrustedMachineRunProfileResolver(profiles: readonly Machin
 
 /** Host-owned profiles shipped by this daemon build. */
 export const TRUSTED_MACHINE_RUN_PROFILE_REGISTRY: TrustedMachineRunProfileRegistry =
-    createTrustedMachineRunProfileResolver(MOAI_V080_MACHINE_RUN_PROFILES);
+    createTrustedMachineRunProfileResolver(MOAI_MACHINE_RUN_PROFILES);
 
 /**
  * A profile is enforceable when its descendants are confined to a restricted
