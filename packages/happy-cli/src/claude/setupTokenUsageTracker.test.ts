@@ -70,4 +70,11 @@ describe('setup-token usage tracker (Saycode specs/claude-setup-token-account-se
     const tracker = createSetupTokenUsageTracker(() => NOW)
     expect(tracker.observe({ status: 'allowed', rateLimitType: 'five_hour', utilization: 1.02, resetsAt: inSeconds(60_000) })?.observation?.windows[0].pct).toBe(100)
   })
+
+  it('knows only the account-wide windows, not inherited names', () => {
+    const tracker = createSetupTokenUsageTracker(() => NOW)
+    for (const rateLimitType of ['__proto__', 'constructor', 'toString']) {
+      expect(tracker.observe({ status: 'rejected', rateLimitType, utilization: 1, resetsAt: inSeconds(60_000) })).toBeNull()
+    }
+  })
 })

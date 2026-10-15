@@ -490,8 +490,9 @@ export async function confirmDeviceOrganization(input: { companyId: string; mach
  * Saycode specs/claude-setup-token-account-selection — a setup-token-bound session's usage, and its request
  * to move off a used-up organization account. The daemon resolves the account from the session's own binding.
  */
-export async function reportSetupTokenUsage(sessionId: string, binding: string, observation: SetupTokenUsageObservation): Promise<void> {
-  await daemonPost('/setup-token/usage', { sessionId, binding, observation });
+export async function reportSetupTokenUsage(sessionId: string, binding: string, observation: SetupTokenUsageObservation): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const result = await daemonPost('/setup-token/usage', { sessionId, binding, observation });
+  return result?.ok === true ? { ok: true } : { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED' };
 }
 /** Longer than the daemon's whole switch (Studio call, grant verification, token slot reads). */
 const SETUP_TOKEN_REBIND_TIMEOUT_MS = 90_000;

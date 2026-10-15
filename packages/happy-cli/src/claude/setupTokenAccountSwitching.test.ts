@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createSetupTokenAccountSwitching, type SetupTokenAccountSwitchingDeps } from './setupTokenAccountSwitching'
+import { createSetupTokenAccountSwitching, FORBIDDEN_NOTICE, NO_ACCOUNT_NOTICE, type SetupTokenAccountSwitchingDeps } from './setupTokenAccountSwitching'
 
 const NOW = 1_800_000_000_000
 const reset = Math.floor((NOW + 3_600_000) / 1000)
@@ -12,7 +12,7 @@ function setup(extra: Partial<SetupTokenAccountSwitchingDeps> = {}) {
   const deps: SetupTokenAccountSwitchingDeps = {
     sessionId: () => 'session-a',
     binding: () => 'binding-a',
-    report: vi.fn(async () => {}),
+    report: vi.fn(async () => ({ ok: true as const })),
     rebind: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })),
     applyEnvironment: vi.fn(),
     notify: vi.fn(),
@@ -68,6 +68,7 @@ describe('setup-token account switching in a running session', () => {
     await switching.switchIfWanted()
     expect(deps.applyEnvironment).not.toHaveBeenCalled()
     expect(deps.notify).toHaveBeenCalledOnce()
+    expect(deps.notify).toHaveBeenCalledWith(NO_ACCOUNT_NOTICE)
   })
 
   it('stops switching after a bounded number of moves in one session', async () => {
@@ -81,5 +82,45 @@ describe('setup-token account switching in a running session', () => {
     const { switching } = setup()
     switching.onRateLimitEvent(refused); switching.onRateLimitEvent(fine); switching.onRateLimitEvent(near)
     expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: false })
+  })
+
+  it('tries again at the next turn boundary after a failure that may pass', async () => {
+    const rebind = vi.fn().mockResolvedValueOnce({ ok: false, reason: 'REQUEST_FAILED' })
+      .mockResolvedValue({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })
+    const { switching } = setup({ rebind })
+    switching.onRateLimitEvent(near)
+    expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
+    expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: false })
+  })
+
+  it('stops reporting and switching once Studio refuses this binding, and says so once', async () => {
+    const report = vi.fn(async () => ({ ok: false as const, reason: 'FORBIDDEN' }))
+    const { deps, switching, advance } = setup({ report })
+    switching.onRateLimitEvent(near)
+    await vi.waitFor(() => expect(deps.notify).toHaveBeenCalledWith(FORBIDDEN_NOTICE))
+    advance(120_000)
+    switching.onRateLimitEvent(near)
+    expect(report).toHaveBeenCalledOnce()
+    expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
+    expect(deps.rebind).not.toHaveBeenCalled()
+    expect(deps.notify).toHaveBeenCalledOnce()
+  })
+
+  it('stops after Studio refuses a switch for this binding', async () => {
+    const { deps, switching } = setup({ rebind: vi.fn(async () => ({ ok: false as const, reason: 'FORBIDDEN' })) })
+    switching.onRateLimitEvent(near)
+    await switching.switchIfWanted()
+    switching.onRateLimitEvent(near)
+    await switching.switchIfWanted()
+    expect(deps.rebind).toHaveBeenCalledOnce()
+    expect(deps.notify).toHaveBeenCalledWith(FORBIDDEN_NOTICE)
+  })
+
+  it('answers concurrent turn boundaries with one switch', async () => {
+    const { deps, switching } = setup()
+    switching.onRateLimitEvent(near)
+    const [first, second] = await Promise.all([switching.switchIfWanted(), switching.switchIfWanted()])
+    expect(deps.rebind).toHaveBeenCalledOnce()
+    expect([first.switched, second.switched]).toEqual([true, true])
   })
 })

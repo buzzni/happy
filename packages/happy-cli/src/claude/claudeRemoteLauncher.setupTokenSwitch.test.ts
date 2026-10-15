@@ -98,4 +98,58 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }));
         expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE });
     });
+
+    it('hands a message that arrives after a switch to a provider restarted on the new account', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const generations: Array<{ token?: string; prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    yield assistant(`msg-${generations.length}`);
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${generations.length}` };
+                    if (first) {
+                        // Another turn boundary switched the account while this provider waits for its next message.
+                        setTimeout(() => {
+                            process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-second';
+                            process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = '{"account":"second"}';
+                            queue.push('after the switch', { permissionMode: 'default', model: 'claude-sonnet-5' });
+                        }, 10);
+                        continue;
+                    }
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session: Record<string, unknown> = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(generations[0].prompts.join()).not.toContain('after the switch');
+        expect(generations[1].prompts[0]).toContain('after the switch');
+        expect(requestSetupTokenRebind).not.toHaveBeenCalled();
+    });
 });
