@@ -1,0 +1,104 @@
+{
+  "description": "Public deterministic test vectors; Node crypto Ed25519, seed 0x11 repeated (never use for real keys).",
+  "seed": "ERERERERERERERERERERERERERERERERERERERERERE",
+  "publicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+  "transcript": {
+    "version": 1,
+    "companyId": "company-한글",
+    "machineId": "machine-1",
+    "machineType": "dedicated",
+    "ownerUserId": "user-1",
+    "deviceSigningPublicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+    "recipientPublicKey": "FxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxc",
+    "orgSigningPublicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+    "signingGeneration": 1,
+    "enrollmentNonce": "Hx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8",
+    "expiresAt": 1800000600000
+  },
+  "enrollmentInput": "saycode/device-enrollment/v1\n{\"companyId\":\"company-한글\",\"deviceSigningPublicKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"enrollmentNonce\":\"Hx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8fHx8\",\"expiresAt\":1800000600000,\"machineId\":\"machine-1\",\"machineType\":\"dedicated\",\"orgSigningPublicKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"ownerUserId\":\"user-1\",\"recipientPublicKey\":\"FxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxc\",\"signingGeneration\":1,\"version\":1}",
+  "enrollmentDigest": "39315cd6bd751060509384a57cff3df01255bfc3eedcfe69d35e1ef3de830947",
+  "vectors": [
+    {
+      "body": {
+        "version": 1,
+        "companyId": "company-한글",
+        "signingGeneration": 1,
+        "signingKeyId": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+        "issuedAt": 1800000000000,
+        "kind": "device-approval",
+        "approvalId": "approval-1",
+        "approvalRevision": 1,
+        "machineId": "machine-1",
+        "machineType": "dedicated",
+        "ownerUserId": "user-1",
+        "deviceSigningPublicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+        "recipientPublicKey": "FxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxc",
+        "enrollmentDigest": "39315cd6bd751060509384a57cff3df01255bfc3eedcfe69d35e1ef3de830947"
+      },
+      "canonical": "{\"approvalId\":\"approval-1\",\"approvalRevision\":1,\"companyId\":\"company-한글\",\"deviceSigningPublicKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"enrollmentDigest\":\"39315cd6bd751060509384a57cff3df01255bfc3eedcfe69d35e1ef3de830947\",\"issuedAt\":1800000000000,\"kind\":\"device-approval\",\"machineId\":\"machine-1\",\"machineType\":\"dedicated\",\"ownerUserId\":\"user-1\",\"recipientPublicKey\":\"FxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxc\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"version\":1}",
+      "signingInput": "saycode/device-approval/v1\n{\"approvalId\":\"approval-1\",\"approvalRevision\":1,\"companyId\":\"company-한글\",\"deviceSigningPublicKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"enrollmentDigest\":\"39315cd6bd751060509384a57cff3df01255bfc3eedcfe69d35e1ef3de830947\",\"issuedAt\":1800000000000,\"kind\":\"device-approval\",\"machineId\":\"machine-1\",\"machineType\":\"dedicated\",\"ownerUserId\":\"user-1\",\"recipientPublicKey\":\"FxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxc\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"version\":1}",
+      "signature": "01hYxOQ7XTfeiRouQ6gfmoBDSCYHJ5rarANcHxZvtySNGFEDNmGXuOY_MFlXI1P9g-k2J7_IWLHPCg3jFvAtBQ"
+    },
+    {
+      "body": {
+        "version": 1,
+        "companyId": "company-한글",
+        "signingGeneration": 1,
+        "signingKeyId": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+        "issuedAt": 1800000000000,
+        "kind": "ai-assignment",
+        "bindingId": "binding-1",
+        "assignmentRevision": 1,
+        "credentialGroupId": "group-1",
+        "credentialGroupRevision": 1,
+        "target": {
+          "kind": "user-group",
+          "id": "all-members"
+        },
+        "accounts": [
+          {
+            "managedAccountId": "account-1",
+            "credentialGeneration": 1,
+            "credentialDigest": "f06e194de9d2ad49576b401e6890ab835f65e522c25aaabb8a48e95a0186cfea"
+          }
+        ]
+      },
+      "canonical": "{\"accounts\":[{\"credentialDigest\":\"f06e194de9d2ad49576b401e6890ab835f65e522c25aaabb8a48e95a0186cfea\",\"credentialGeneration\":1,\"managedAccountId\":\"account-1\"}],\"assignmentRevision\":1,\"bindingId\":\"binding-1\",\"companyId\":\"company-한글\",\"credentialGroupId\":\"group-1\",\"credentialGroupRevision\":1,\"issuedAt\":1800000000000,\"kind\":\"ai-assignment\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"target\":{\"id\":\"all-members\",\"kind\":\"user-group\"},\"version\":1}",
+      "signingInput": "saycode/ai-assignment/v1\n{\"accounts\":[{\"credentialDigest\":\"f06e194de9d2ad49576b401e6890ab835f65e522c25aaabb8a48e95a0186cfea\",\"credentialGeneration\":1,\"managedAccountId\":\"account-1\"}],\"assignmentRevision\":1,\"bindingId\":\"binding-1\",\"companyId\":\"company-한글\",\"credentialGroupId\":\"group-1\",\"credentialGroupRevision\":1,\"issuedAt\":1800000000000,\"kind\":\"ai-assignment\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"target\":{\"id\":\"all-members\",\"kind\":\"user-group\"},\"version\":1}",
+      "signature": "k1fHR-nY1EegA44I4kv9d9TdHbkdaLMdjkyo_5TLR7cgGytnr9G3kMpSCJNCyJlQbSxYZf8tAFFfdF0OJevzCA"
+    },
+    {
+      "body": {
+        "version": 1,
+        "companyId": "company-한글",
+        "signingGeneration": 1,
+        "signingKeyId": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+        "issuedAt": 1800000000000,
+        "kind": "device-revocation",
+        "approvalId": "approval-1",
+        "approvalRevision": 2,
+        "machineId": "machine-1",
+        "recipientKeyId": "78b37abf24aecb9a7dea23f58120c6257872846a097471296c9947182aa1c875"
+      },
+      "canonical": "{\"approvalId\":\"approval-1\",\"approvalRevision\":2,\"companyId\":\"company-한글\",\"issuedAt\":1800000000000,\"kind\":\"device-revocation\",\"machineId\":\"machine-1\",\"recipientKeyId\":\"78b37abf24aecb9a7dea23f58120c6257872846a097471296c9947182aa1c875\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"version\":1}",
+      "signingInput": "saycode/device-revocation/v1\n{\"approvalId\":\"approval-1\",\"approvalRevision\":2,\"companyId\":\"company-한글\",\"issuedAt\":1800000000000,\"kind\":\"device-revocation\",\"machineId\":\"machine-1\",\"recipientKeyId\":\"78b37abf24aecb9a7dea23f58120c6257872846a097471296c9947182aa1c875\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"version\":1}",
+      "signature": "tPgZ1kHcs3TtPNcsGmZcgujShfeyoB6C311UusJbKZnDnFrN_cOAEiyiKcSJxyTRgBWX5tIm1BJ75DzmU7boDQ"
+    },
+    {
+      "body": {
+        "version": 1,
+        "companyId": "company-한글",
+        "signingGeneration": 1,
+        "signingKeyId": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+        "issuedAt": 1800000000000,
+        "kind": "org-signing-rotation",
+        "nextGeneration": 2,
+        "nextPublicKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+        "nextKeyId": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d"
+      },
+      "canonical": "{\"companyId\":\"company-한글\",\"issuedAt\":1800000000000,\"kind\":\"org-signing-rotation\",\"nextGeneration\":2,\"nextKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"nextPublicKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"version\":1}",
+      "signingInput": "saycode/org-signing-rotation/v1\n{\"companyId\":\"company-한글\",\"issuedAt\":1800000000000,\"kind\":\"org-signing-rotation\",\"nextGeneration\":2,\"nextKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"nextPublicKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"signingGeneration\":1,\"signingKeyId\":\"10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d\",\"version\":1}",
+      "signature": "NufvA_fZ8-gxVmLjeVWRlQBUiCawKX27LIGguPBcf7gtmUYKBIRAPV1ZLuUFPMRG0Gdl50DVsnFDYev-ffOpAQ"
+    }
+  ]
+}

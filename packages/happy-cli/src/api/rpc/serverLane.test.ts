@@ -50,10 +50,15 @@ describe('machineServerLane', () => {
             'container-runtime-status', 'gh-auth-status', 'machine-info']) {
             expect(SERVER_LANE_METHODS.has(method), method).toBe(true);
         }
-        expect(SERVER_LANE_METHODS.size).toBe(22);
+        expect(SERVER_LANE_METHODS.size).toBe(25);
     });
 
     it('lists no content-capable method', () => {
         for (const method of CONTENT_CAPABLE) expect(SERVER_LANE_METHODS.has(method), method).toBe(false);
     });
+});
+
+it('never allows remote device confirmation', () => {
+    expect(SERVER_LANE_METHODS.has('device:confirm')).toBe(false);
+    expect(SERVER_LANE_METHODS.has('device:enroll')).toBe(true);
 });

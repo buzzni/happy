@@ -63,3 +63,11 @@ describe('setup-token assignment wire', () => {
     expect(() => openSetupTokenAssignment(userPrincipal, recipient, 1_000)).toThrow('SETUP_TOKEN_SEALED_CONTEXT_INVALID')
   })
 })
+it('derives the same sealed-payload recipient from a persisted secret without exposing or aliasing it', () => {
+  const secret = new Uint8Array(32).fill(42);
+  const first = createSetupTokenAssignmentRecipient(secret);
+  const second = createSetupTokenAssignmentRecipient(secret);
+  expect(setupTokenRecipientCapability(first)).toEqual(setupTokenRecipientCapability(second));
+  secret.fill(0);
+  expect(first.secretKey).toEqual(new Uint8Array(32).fill(42));
+});

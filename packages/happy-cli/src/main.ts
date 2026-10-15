@@ -33,6 +33,7 @@ import { handleConnectCommand } from './commands/connect'
 import { handleSandboxCommand } from './commands/sandbox'
 import { handleBrowserCommand } from './commands/browser'
 import { handleServerCommand } from './commands/server'
+import { handleDeviceCommand } from './commands/device'
 import { handleDataKeyCommand } from './commands/datakey'
 import { captureSpawnOutputStdio, spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
@@ -202,6 +203,10 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
       process.exit(1)
     }
+    return;
+  } else if (subcommand === 'device') {
+    try { await handleDeviceCommand(args.slice(1)); }
+    catch (error) { console.error(error instanceof Error ? error.message : 'DEVICE_CONTROL_UNAVAILABLE'); process.exit(1); }
     return;
   } else if (subcommand === 'datakey') {
     // aplus §6-1 — dataKey-활성 전환 관리 (specs/e2ee-cli-datakey-activation)
