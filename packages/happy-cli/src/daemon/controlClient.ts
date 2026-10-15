@@ -6,6 +6,7 @@
 import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState, readDaemonStateSnapshot, writeDaemonStateIfUnchanged } from '@/persistence';
 import { Metadata } from '@/api/types';
+import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch';
 import { configuration } from '@/configuration';
 import { initializeScopeReportSigner, SCOPE_REPORT_HEADER } from './sessionWriteScopeReports';
 import {
@@ -129,6 +130,8 @@ async function daemonPost(
   body?: any,
   /** Set for the two managed lifecycle reports, which must be signed. */
   reportKind?: ManagedReportKind,
+  /** A call the daemon answers only after its own outbound work; defaults to the usual HTTP timeout. */
+  timeoutMs?: number,
 ): Promise<{ error?: string } | any> {
   if (reportKind) {
     const signer = await managedReportSigner();
@@ -165,7 +168,7 @@ async function daemonPost(
   }
 
   try {
-    const timeout = process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : 10_000;
+    const timeout = timeoutMs ?? (process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : 10_000);
     const response = await fetch(`http://127.0.0.1:${state.httpPort}${path}`, {
       method: 'POST',
       headers: {
@@ -481,4 +484,20 @@ export async function confirmDeviceOrganization(input: { companyId: string; mach
   const result = await daemonPost('/device/confirm-org-key', input);
   if (result.error || result.locallyConfirmed !== true) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
   return { locallyConfirmed: true };
+}
+
+/**
+ * Saycode specs/claude-setup-token-account-selection — a setup-token-bound session's usage, and its request
+ * to move off a used-up organization account. The daemon resolves the account from the session's own binding.
+ */
+export async function reportSetupTokenUsage(sessionId: string, binding: string, observation: SetupTokenUsageObservation): Promise<void> {
+  await daemonPost('/setup-token/usage', { sessionId, binding, observation });
+}
+/** Longer than the daemon's whole switch (Studio call, grant verification, token slot reads). */
+const SETUP_TOKEN_REBIND_TIMEOUT_MS = 90_000;
+export async function requestSetupTokenRebind(sessionId: string, binding: string): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }> {
+  const result = await daemonPost('/setup-token/rebind', { sessionId, binding }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS);
+  if (result?.ok === true && result.environment && typeof result.environment === 'object'
+    && Object.values(result.environment).every((value) => typeof value === 'string')) return { ok: true, environment: result.environment };
+  return { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED' };
 }

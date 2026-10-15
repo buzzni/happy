@@ -25,6 +25,7 @@ import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
+import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 
 /**
  * The only control-server paths a managed runtime may serve, and even these
@@ -108,8 +109,11 @@ export function startDaemonControlServer({
   writeScopeRuntime,
   browserLocalSetup,
   getDeviceEnrollment = () => null,
+  getSetupTokenAccountSwitch = () => null,
 }: {
   getDeviceEnrollment?: () => ReturnType<typeof createDeviceEnrollment> | null;
+  /** Saycode specs/claude-setup-token-account-selection — null until the AI credential runtime exists. */
+  getSetupTokenAccountSwitch?: () => SetupTokenAccountSwitch | null;
   writeScopeRuntime?: SessionWriteScopeRuntime | null;
   standaloneDrain?: StandaloneDrain;
   browserLocalSetup?: BrowserLocalSetup;
@@ -415,6 +419,26 @@ export function startDaemonControlServer({
       }, hostPid !== undefined ? { hostPid } : undefined);
 
       return { status: 'ok' as const };
+    });
+
+    // A bound session reports its account's usage and asks to move off a used-up account (turn boundary).
+    const setupTokenWindow = z.object({ kind: z.enum(['unified5h', 'unified7d']), pct: z.number().min(0).max(100).nullable(), resetsAt: z.number().int().nonnegative().nullable() }).strict();
+    typed.post('/setup-token/usage', {
+      bodyLimit: 8192,
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(2048), observation: z.object({
+        observedAt: z.number().int().nonnegative(), windows: z.array(setupTokenWindow).min(1).max(2),
+        reason: z.enum(['ok', 'rate-limited']), retryAt: z.number().int().nonnegative().nullable(),
+      }).strict() }).strict() },
+    }, async (request) => {
+      const switcher = getSetupTokenAccountSwitch();
+      return switcher ? switcher.reportUsage(request.body.sessionId, request.body.binding, request.body.observation) : { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
+    });
+    typed.post('/setup-token/rebind', {
+      bodyLimit: 4096,
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(2048) }).strict() },
+    }, async (request) => {
+      const switcher = getSetupTokenAccountSwitch();
+      return switcher ? switcher.rebind(request.body.sessionId, request.body.binding) : { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
     });
 
     // List all tracked sessions
