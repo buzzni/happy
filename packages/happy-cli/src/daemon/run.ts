@@ -1,3 +1,6 @@
+import { createDeviceOrgPinStore } from './deviceOrgPinStore';
+import { createDeviceEnrollment } from './deviceEnrollment';
+import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import { CheckpointRetention } from '@/checkpoint/checkpointRetention';
@@ -2741,6 +2744,7 @@ export async function startDaemon(): Promise<void> {
           {
             startedBy: 'daemon',
             claudeStartingMode: 'remote',
+            emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
           },
         );
 
@@ -3657,6 +3661,7 @@ export async function startDaemon(): Promise<void> {
     // machine object below doesn't exist until `api.getOrCreateMachine()`
     // resolves, well after this server starts — a ref the terminal route
     // reads lazily, rather than reordering daemon startup around it.
+    let deviceEnrollment: ReturnType<typeof createDeviceEnrollment> | null = null;
     let machineEncryptionForTerminalWs: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' } | null = null;
 
     writeScopeRuntime = await createSessionWriteScopeRuntime({
@@ -3695,6 +3700,7 @@ export async function startDaemon(): Promise<void> {
        */
       verifyManagedReport: async (claim) => managedReportVerifier(claim),
       getMachineEncryption: () => machineEncryptionForTerminalWs,
+      getDeviceEnrollment: () => deviceEnrollment,
     });
 
     // The managed launch path hands this to each child with its credential.
@@ -3827,7 +3833,10 @@ export async function startDaemon(): Promise<void> {
     });
 
     // Create realtime machine session
-    const apiMachine = api.machineSyncClient(machine);
+    const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);
+    if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
+      store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }) });
+    const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({
       apiMachine,

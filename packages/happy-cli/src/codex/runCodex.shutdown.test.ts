@@ -20,6 +20,7 @@ const fixture = vi.hoisted(() => ({
     events: [] as string[],
     markDispatched: null as null | (() => void),
     send: vi.fn(),
+    startThread: vi.fn(),
     recoverMcp: vi.fn(async (_input: { includeRuntimeStatuses?: boolean }): Promise<import('./codexMcpRuntimeRecovery').CodexMcpRecoveryResult> => ({ status: 'ready', affectedServers: [] })),
     readMcpStatuses: vi.fn(async (): Promise<import('@slopus/happy-wire').McpRuntimeServerStatus[]> => []),
     getOrCreateSession: vi.fn(async () => ({ id: 'lesson-session' })),
@@ -39,6 +40,7 @@ const fixture = vi.hoisted(() => ({
         sendSessionEvent: vi.fn(), sendSessionProtocolMessage: vi.fn(), sendSessionMessage: vi.fn(),
         updateMetadata: vi.fn(), updateAgentState: vi.fn(), keepAlive: vi.fn(() => { fixture.events.push('keepAlive'); }),
         sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
+        suppressNextArchiveSignal: vi.fn(), skipExistingMessages: vi.fn(), capRuntimeProcessedSeq: vi.fn(),
         rpcHandlerManager: { registerHandler: vi.fn() },
     },
 }));
@@ -88,7 +90,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     setEventHandler = (handler: (event: unknown) => void) => { fixture.emit = handler; };
     supportsGoalActions = () => false;
     hasActiveThread = () => Boolean(this.threadId);
-    startThread = async () => { this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
+    startThread = async (options: unknown) => { fixture.startThread(options); this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     readThread = (options: { threadId: string; includeTurns: boolean }) => fixture.readThread(options);
     abortPreparedTurn = vi.fn();
     abortTurnWithFallback = async () => ({ forcedRestart: false });
@@ -96,7 +98,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
         onCompleted?: (turnId: string, thread: { id: string; path: string } | null) => void;
         onCompletionObservationSettled?: () => void;
     }) => {
-        fixture.send(prompt);
+        fixture.send(prompt, options);
         fixture.markDispatched?.();
         await fixture.onSend?.();
         if (!fixture.omitCompletionObservers) {
@@ -133,11 +135,15 @@ afterEach(() => {
 });
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
-async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string) {
+async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
     }
     vi.stubEnv('HAPPY_INITIAL_PROMPT', prompt);
+    if (reconnect) {
+        vi.spyOn(await import('@/daemon/reconnectSessionEnv'), 'consumeReconnectSessionEnvironment').mockReturnValue(reconnect);
+        vi.stubEnv('HAPPY_AUTOMATION_RESUME_PROMPT', '1');
+    }
     if (confirmed) { vi.stubEnv('HAPPY_MANAGED_REQUIRE_PROMPT_ACK', '1'); vi.stubEnv('HAPPY_INITIAL_PROMPT_LOCAL_ID', 'test-ack'); }
     vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
     const { runCodex } = await import('./runCodex');
@@ -151,6 +157,16 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    it('starts the first reconnected turn with the saved model and effort without creating another Happy session', async () => {
+        await start('First scheduled prompt', false, undefined, undefined, undefined, {
+            id: 'lesson-session', seq: 0, metadataVersion: 1, agentStateVersion: 1,
+            encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy',
+            metadata: { path: '/chat', flavor: 'codex', currentModelCode: 'gpt-6-astra', currentThoughtLevelCode: 'high' } as never,
+        });
+        expect(fixture.startThread).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-6-astra' }));
+        expect(fixture.send).toHaveBeenCalledWith('First scheduled prompt', expect.objectContaining({ effort: 'high' }));
+        expect(fixture.getOrCreateSession).not.toHaveBeenCalled();
+    });
     it('stops a slow optional ingest before the frozen drain decision', async () => {
         const memory = await import('@/memory/codexIngestHost');
         let releaseIngest!: () => void;

@@ -15,3 +15,5 @@ export * from './rpcBinding';
 export * from './machineKeyAttestation';
 export * from './sealedSpawnEnv';
 export * from './worktreeOps';
+
+export * from './orgSetupTokenApproval';

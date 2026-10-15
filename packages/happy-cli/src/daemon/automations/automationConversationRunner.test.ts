@@ -1,10 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
 import { deliverAutomationConversation } from './automationConversationRunner'
+import { buildResumeLaunch } from '@/resume/handleResumeCommand'
 const request = { runId: 'r1', claimToken: 'token', sessionId: 's1', directory: '/chat', prompt: 'Report' }
 function setup() {
-  return { resolveSession: vi.fn(() => ({ directory: '/chat', encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' as const })), sameDirectory: vi.fn(async () => true), ensureRunning: vi.fn(async () => true), readSeq: vi.fn(async () => 4), encryptUserMessage: vi.fn<Parameters<typeof deliverAutomationConversation>[1]['encryptUserMessage']>(() => 'ciphertext'), deliver: vi.fn<Parameters<typeof deliverAutomationConversation>[1]['deliver']>(async () => ({ ok: true })) }
+  return { resolveSession: vi.fn(() => ({ directory: '/chat', encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' as const })), sameDirectory: vi.fn(async () => true), ensureRunning: vi.fn<Parameters<typeof deliverAutomationConversation>[1]['ensureRunning']>(async () => true), readSeq: vi.fn(async () => 4), encryptUserMessage: vi.fn<Parameters<typeof deliverAutomationConversation>[1]['encryptUserMessage']>(() => 'ciphertext'), deliver: vi.fn<Parameters<typeof deliverAutomationConversation>[1]['deliver']>(async () => ({ ok: true })) }
 }
 describe('ordinary conversation delivery', () => {
+  it('delivers the first scheduled prompt to the same unused Happy session after its empty process was reaped', async () => {
+    const deps = setup()
+    deps.readSeq.mockResolvedValue(0)
+    deps.ensureRunning.mockImplementation(async sessionId => {
+      const options = { startedBy: 'daemon' as const, emptyCodexSession: { serverSeq: 0, processedSeq: 0 } }
+      const launch = buildResumeLaunch({ id: sessionId, active: false, metadata: { path: '/chat', flavor: 'codex' } as never }, options)
+      expect(launch.args).toEqual(['codex', '--started-by', 'daemon'])
+      return true
+    })
+    expect(await deliverAutomationConversation(request, deps)).toEqual({ ok: true, sessionId: 's1' })
+    expect(deps.deliver).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1', expectedSeq: 0, runId: 'r1' }))
+  })
   it('resumes the fixed ordinary session and appends a normal user envelope', async () => {
     const deps = setup(); expect(await deliverAutomationConversation(request, deps)).toEqual({ ok: true, sessionId: 's1' })
     expect(deps.ensureRunning).toHaveBeenCalledWith('s1'); expect(deps.deliver).toHaveBeenCalledWith({ wireVersion: 1, runId: 'r1', claimToken: 'token', sessionId: 's1', expectedSeq: 4, contentCiphertext: 'ciphertext' })
