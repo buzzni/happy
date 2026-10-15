@@ -1,4 +1,5 @@
 import { parsePreviewHost } from '@/modules/preview/parsePreviewHost';
+import { LOCALHOST_PREVIEW_HEADER, LOCALHOST_PREVIEW_VERSION } from '@/modules/preview/localhostPreviewResponse';
 
 const FIXED_ORIGINS = new Set([
     'https://saycode.ai',
@@ -57,9 +58,13 @@ const API_CORS_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
  * gets no CORS headers.
  */
 export function fastifyCorsDelegate(
-    request: { headers: { origin?: string | string[] } },
+    request: { url?: string; headers: { origin?: string | string[]; [LOCALHOST_PREVIEW_HEADER]?: string | string[] } },
     callback: (error: Error | null, options: { origin: string | boolean; credentials?: boolean; methods: string[] }) => void,
 ): void {
+    if (request.url?.startsWith('/v1/preview/') && request.headers[LOCALHOST_PREVIEW_HEADER] === LOCALHOST_PREVIEW_VERSION) {
+        callback(null, { origin: false, methods: API_CORS_METHODS });
+        return;
+    }
     const origin = typeof request.headers.origin === 'string' ? request.headers.origin : undefined;
     if (origin && isAllowedCorsOrigin(origin)) {
         callback(null, { origin, credentials: true, methods: API_CORS_METHODS });

@@ -1,10 +1,53 @@
 ---
 feature: ordinary-chat-schedules
-status: release-preparation
-updated: 2026-10-14
+status: resume-model-release-preparation
+updated: 2026-10-15
 ---
 
 # Ordinary Chat schedules context
+
+## 2026-10-15 review 2f9e69c: explicit daemon resume model
+
+Follow-up: user requested a PR, official CLI publication, application to this
+PC and actual scheduled model-override acceptance. Candidate .328 is not yet
+published; main 94591828 was merged into the fix branch, resolving squash-merge
+overlaps by retaining the verified correction. Post-merge 130 related tests,
+26 version/package/verifier tests, CLI production build/typecheck and prepared
+.328 artifact guard/fresh-install smoke pass. Create PR; merge after green CI.
+Happy AGENTS requires the exact tag-push checkpoint immediately before release.
+Keep credentials, machine/key identity, existing user schedules and sessions;
+only the dedicated QA Chat/reservation may be manipulated. Prove an explicit
+daemon resume model overrides its different saved pin, then let a clock-based
+QA reservation use that process/model. Read model evidence from runtime/provider
+metadata, not the model's own answer. Restore QA to paused at the end. The
+separate Default gpt-5.5 defect and Studio vendor pin remain outside this fix.
+
+Happy #820 merged as main 94591828 and CLI .327 was officially published and
+applied to the target PC. That release restores a saved reconnect pin but still
+ignores a daemon resume `--model`: codexCommand did not parse the flag, while
+runCodex only read HAPPY_INITIAL_MODEL and the saved pin. The user requested
+this review correction and tests; no further release or runtime replacement
+is part of this local follow-up.
+
+The existing command handler now passes an initialModel to both account and
+managed runners. Runtime precedence is command model, one-shot environment
+model, saved reconnect pin, then runtime default. The environment seed is
+always consumed even when the command model wins. Empty/missing flag values
+fail before auth or daemon work. No daemon identity, credentials, encryption,
+wire/schema or dependencies change. This does not fix the separate Default
+gpt-5.5 incompatibility reported during live .327 acceptance.
+
+Before the fix, four real command→runner regressions sent the saved Astra or
+environment Sol instead of the requested 6.1 Sol; three invalid-model cases
+also failed. After the fix, 130 related tests across seven files pass, including
+unused-session recovery and existing-thread resume, explicit model versus
+saved model, explicit versus environment model, environment fallback, saved
+fallback, retained effort, same Happy session identity and seed removal.
+CLI production build including tsc --noEmit passes; existing bundle warnings
+remain. The provider/network and authentication are stubbed in these automated
+tests; this follow-up is not a new live provider/PC acceptance test. Code and
+documentation are ready for a local fix commit above 2f9e69c. Main, published
+.327 and the running PC have not received this follow-up yet.
 
 ## 2026-10-14 official CLI release and live acceptance
 

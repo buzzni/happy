@@ -20,6 +20,7 @@ const fixture = vi.hoisted(() => ({
     events: [] as string[],
     markDispatched: null as null | (() => void),
     send: vi.fn(),
+    startThread: vi.fn(),
     recoverMcp: vi.fn(async (_input: { includeRuntimeStatuses?: boolean }): Promise<import('./codexMcpRuntimeRecovery').CodexMcpRecoveryResult> => ({ status: 'ready', affectedServers: [] })),
     readMcpStatuses: vi.fn(async (): Promise<import('@slopus/happy-wire').McpRuntimeServerStatus[]> => []),
     getOrCreateSession: vi.fn(async () => ({ id: 'lesson-session' })),
@@ -39,6 +40,7 @@ const fixture = vi.hoisted(() => ({
         sendSessionEvent: vi.fn(), sendSessionProtocolMessage: vi.fn(), sendSessionMessage: vi.fn(),
         updateMetadata: vi.fn(), updateAgentState: vi.fn(), keepAlive: vi.fn(() => { fixture.events.push('keepAlive'); }),
         sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
+        suppressNextArchiveSignal: vi.fn(), skipExistingMessages: vi.fn(), capRuntimeProcessedSeq: vi.fn(),
         rpcHandlerManager: { registerHandler: vi.fn() },
     },
 }));
@@ -55,6 +57,8 @@ vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCre
 vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: () => ({ session: fixture.session }) }));
 vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
+vi.mock('@/ui/auth', () => ({ authAndSetupMachineIfNeeded: vi.fn(async () => ({ credentials: { token: 'test-token' } })) }));
+vi.mock('@/daemon/ensureDaemonRunning', () => ({ ensureDaemonRunning: vi.fn(async () => {}) }));
 vi.mock('@/checkpoint/checkpointSessionComposition', () => ({ createCheckpointSessionComposition: vi.fn(async () => ({})) }));
 vi.mock('@/codex/codexSkills', () => ({ discoverCodexSkillCommands: vi.fn(async () => []) }));
 vi.mock('@/aplus/fetchAplusMcpServers', async (original) => ({ ...await original<typeof import('@/aplus/fetchAplusMcpServers')>(), fetchAplusMcpConfigSnapshot: vi.fn(async () => null) }));
@@ -81,14 +85,14 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     reconnectForAuth = fixture.reconnect;
     threadId: string | null = null;
     connect = async () => { await fixture.onConnect?.(); };
-    resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); return { threadId, model: 'test' }; };
+    resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); this.threadId = threadId; return { threadId, model: 'test' }; };
     disconnect = fixture.disconnect;
     steerTurn = async (text: string) => { fixture.steerText = text; await fixture.onSteer?.(); };
     setApprovalHandler = vi.fn();
     setEventHandler = (handler: (event: unknown) => void) => { fixture.emit = handler; };
     supportsGoalActions = () => false;
     hasActiveThread = () => Boolean(this.threadId);
-    startThread = async () => { this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
+    startThread = async (options: unknown) => { fixture.startThread(options); this.threadId = 'thread'; return { threadId: 'thread', model: 'test' }; };
     readThread = (options: { threadId: string; includeTurns: boolean }) => fixture.readThread(options);
     abortPreparedTurn = vi.fn();
     abortTurnWithFallback = async () => ({ forcedRestart: false });
@@ -96,7 +100,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
         onCompleted?: (turnId: string, thread: { id: string; path: string } | null) => void;
         onCompletionObservationSettled?: () => void;
     }) => {
-        fixture.send(prompt);
+        fixture.send(prompt, options);
         fixture.markDispatched?.();
         await fixture.onSend?.();
         if (!fixture.omitCompletionObservers) {
@@ -133,13 +137,22 @@ afterEach(() => {
 });
 afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.clearAllMocks(); fixture.onSend = null; fixture.onInterrupt = null; fixture.onSteer = null; fixture.onConnect = null; fixture.onResumeThread = null; fixture.steerText = ''; fixture.omitCompletionObservers = false; fixture.completionThread = { id: 'thread', path: '/tmp/native-rollout.jsonl' }; fixture.readThread.mockReset().mockResolvedValue({ thread: { id: 'thread', path: '/tmp/native-rollout.jsonl' } }); fixture.gate = null; fixture.events = []; fixture.session.freezeInboundMessagesForShutdown.mockReturnValue(true); });
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
-async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string) {
+async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
     }
     vi.stubEnv('HAPPY_INITIAL_PROMPT', prompt);
+    if (launch?.modelSeed) vi.stubEnv('HAPPY_INITIAL_MODEL', launch.modelSeed);
+    if (reconnect) {
+        vi.spyOn(await import('@/daemon/reconnectSessionEnv'), 'consumeReconnectSessionEnvironment').mockReturnValue(reconnect);
+        vi.stubEnv('HAPPY_AUTOMATION_RESUME_PROMPT', '1');
+    }
     if (confirmed) { vi.stubEnv('HAPPY_MANAGED_REQUIRE_PROMPT_ACK', '1'); vi.stubEnv('HAPPY_INITIAL_PROMPT_LOCAL_ID', 'test-ack'); }
     vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+    if (launch?.args) {
+        const { handleCodexCommand } = await import('@/commands/codexCommand');
+        return handleCodexCommand(['--started-by', 'daemon', '--no-sandbox', ...(resumeThreadId ? ['--resume', resumeThreadId] : []), ...launch.args]);
+    }
     const { runCodex } = await import('./runCodex');
     return runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true, ...(resumeThreadId ? { resumeThreadId } : {}), ...(standaloneLaunch ? { standaloneLaunch, startedBy: 'daemon' as const } : {}), ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}) });
 }
@@ -151,6 +164,48 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    it.each([
+        { threadId: undefined, modelSeed: undefined },
+        { threadId: 'saved-thread', modelSeed: undefined },
+        { threadId: undefined, modelSeed: 'gpt-6-sol' },
+        { threadId: 'saved-thread', modelSeed: 'gpt-6-sol' },
+    ])('uses the daemon command model ahead of the saved pin ($threadId, env=$modelSeed)', async ({ threadId, modelSeed }) => {
+        const resumed = vi.fn(async () => {});
+        fixture.onResumeThread = resumed;
+        await start('Explicit resume model', false, undefined, undefined, threadId, {
+            id: 'lesson-session', seq: threadId ? 4 : 0, metadataVersion: 1, agentStateVersion: 1,
+            encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy',
+            metadata: { path: '/chat', flavor: 'codex', currentModelCode: 'gpt-6-astra', currentThoughtLevelCode: 'high', ...(threadId ? { codexThreadId: threadId } : {}) } as never,
+        }, { args: ['--model', 'gpt-6.1-sol'], modelSeed });
+        expect(fixture.send).toHaveBeenCalledWith('Explicit resume model', expect.objectContaining({ model: 'gpt-6.1-sol', effort: 'high' }));
+        if (threadId) {
+            expect(resumed).toHaveBeenCalled();
+            expect(fixture.startThread).not.toHaveBeenCalled();
+        }
+        else expect(fixture.startThread).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-6.1-sol' }));
+        expect(fixture.getOrCreateSession).not.toHaveBeenCalled();
+        expect(process.env.HAPPY_INITIAL_MODEL).toBeUndefined();
+    });
+    it('uses the environment model ahead of the saved pin when the command omits a model', async () => {
+        await start('Environment resume model', false, undefined, undefined, 'saved-thread', {
+            id: 'lesson-session', seq: 4, metadataVersion: 1, agentStateVersion: 1,
+            encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy',
+            metadata: { path: '/chat', flavor: 'codex', currentModelCode: 'gpt-6-astra', currentThoughtLevelCode: 'high', codexThreadId: 'saved-thread' } as never,
+        }, { args: [], modelSeed: 'gpt-6-sol' });
+        expect(fixture.send).toHaveBeenCalledWith('Environment resume model', expect.objectContaining({ model: 'gpt-6-sol', effort: 'high' }));
+        expect(fixture.getOrCreateSession).not.toHaveBeenCalled();
+        expect(process.env.HAPPY_INITIAL_MODEL).toBeUndefined();
+    });
+    it.each([undefined, 'saved-thread'])('inherits the saved model and effort without an explicit launch model (thread=%s)', async (threadId) => {
+        await start('First scheduled prompt', false, undefined, undefined, threadId, {
+            id: 'lesson-session', seq: threadId ? 4 : 0, metadataVersion: 1, agentStateVersion: 1,
+            encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy',
+            metadata: { path: '/chat', flavor: 'codex', currentModelCode: 'gpt-6-astra', currentThoughtLevelCode: 'high', ...(threadId ? { codexThreadId: threadId } : {}) } as never,
+        }, { args: [] });
+        if (!threadId) expect(fixture.startThread).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-6-astra' }));
+        expect(fixture.send).toHaveBeenCalledWith('First scheduled prompt', expect.objectContaining({ model: 'gpt-6-astra', effort: 'high' }));
+        expect(fixture.getOrCreateSession).not.toHaveBeenCalled();
+    });
     it('stops a slow optional ingest before the frozen drain decision', async () => {
         const memory = await import('@/memory/codexIngestHost');
         let releaseIngest!: () => void;

@@ -77,7 +77,7 @@ type ChannelHostCallResult = { wire: { sealed: string; error?: string } } | { er
 
 export interface ChannelHostSupervisor {
     start(): void;
-    /** Asks the child to stop, waits for its exit (SIGKILL after the grace), and stops restarting. */
+    /** Asks a ready child to stop, waits for its exit (SIGKILL after the grace), and stops restarting. A child still starting up is killed at once. */
     stop(): Promise<void>;
     /** The `channel-host:call` machine RPC. Never throws. */
     call(params: unknown): Promise<ChannelHostCallResult>;
@@ -343,7 +343,16 @@ export function createChannelHostSupervisor(deps: {
             }
             const target = running;
             if (!target) return;
-            if (target.ready) setReady(target, undefined);
+            if (!target.ready) {
+                // The host listens for stop only once it is ready; before that it may sit in a
+                // keychain probe for seconds and would hold the daemon's shutdown for the whole grace.
+                // It has nothing to flush yet, and its pid lock is taken over once the pid is gone.
+                deps.log('stop-killed-starting');
+                target.child.kill('SIGKILL');
+                await target.exited;
+                return;
+            }
+            setReady(target, undefined);
             write(target, { t: 'stop' });
             let graceTimer: NodeJS.Timeout | null = null;
             const graceOver = new Promise<'grace-over'>((resolve) => {

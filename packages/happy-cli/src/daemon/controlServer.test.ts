@@ -1221,3 +1221,81 @@ it.each(['standalone-unowned', 'standalone-blocked'] as const)('preserves %s on 
     expect(await response.json()).toMatchObject({ stopped: false, reason, detail: 'unavailable' })
   } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
+
+describe('device local confirmation boundary', () => {
+ it('requires Bearer, refuses browser Origin, and validates local transcript identity and expiry', async () => {
+  const nacl = (await import('tweetnacl')).default;
+  const { createDeviceEnrollment } = await import('./deviceEnrollment');
+  let now=1000;
+  const enrollment=createDeviceEnrollment({machineId:'machine',keys:{signing:nacl.sign.keyPair(),recipient:nacl.box.keyPair()},now:()=>now});
+  const pending=await enrollment.begin({companyId:'company',machineType:'dedicated',ownerUserId:'user',orgSigningPublicKey:Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url'),signingGeneration:1});
+  const server=await startDaemonControlServer({getChildren:()=>[],stopSession:()=>({success:false} as any),spawnSession:async()=>({type:'error',errorMessage:'unused'} as any),requestShutdown:()=>{},onHappySessionWebhook:()=>{},portRegistry:createPortRegistry({filePath:path.join(process.env.HAPPY_HOME_DIR!,'device-test-ports.json')}),getDeviceEnrollment:()=>enrollment});
+  try {
+   const url=`http://127.0.0.1:${server.port}/device/confirm-org-key`;
+   const body={companyId:'company',machineId:'machine',enrollmentDigest:pending.digest};
+   const send=(headers:Record<string,string>,data=body)=>realFetch(url,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(data)});
+   const auth={Authorization:`Bearer ${server.controlSecret}`};
+   expect((await send({})).status).toBe(401);
+   expect((await send({...auth,Origin:'http://localhost'})).status).toBe(403);
+   expect((await send(auth,{...body,machineId:'other'})).status).toBe(409);
+   expect(enrollment.status()?.locallyConfirmed).toBe(false);
+   expect((await send(auth)).status).toBe(200);
+   expect(enrollment.status()?.locallyConfirmed).toBe(true);
+   now=601000;expect((await send(auth)).status).toBe(409);
+  } finally {await server.stop();}
+ });
+});
+it('does not expose device confirmation on managed runtimes even with the control Bearer', async () => {
+ const server=await startDaemonControlServer({getChildren:()=>[],stopSession:()=>({stopped:false,reason:'not-found'}),spawnSession:async()=>({type:'error',errorMessage:'unused'}),requestShutdown:()=>{},onHappySessionWebhook:()=>{},portRegistry:createPortRegistry({filePath:path.join(process.env.HAPPY_HOME_DIR!,'managed-device-ports.json')}),managedRuntime:true});
+ try { const response=await realFetch(`http://127.0.0.1:${server.port}/device/confirm-org-key`,{method:'POST',headers:{Authorization:`Bearer ${server.controlSecret}`,'Content-Type':'application/json'},body:'{}'});expect(response.status).toBe(403); }
+ finally {await server.stop();}
+});
+
+it('returns a sanitized failure instead of success when local confirmation cannot persist the approved pin',async()=>{
+ const nacl=(await import('tweetnacl')).default;
+ const {createDeviceEnrollment}=await import('./deviceEnrollment');
+ const {signOrgSetupTokenDocument,orgSetupTokenKeyId}=await import('@slopus/happy-wire');
+ const signer=nacl.sign.keyPair();
+ const enrollment=createDeviceEnrollment({machineId:'machine',keys:{signing:nacl.sign.keyPair(),recipient:nacl.box.keyPair()},store:{get:async()=>null,pin:async()=>{throw new Error('private disk path');}}});
+ const pending=await enrollment.begin({companyId:'company',machineType:'dedicated',ownerUserId:'user',orgSigningPublicKey:Buffer.from(signer.publicKey).toString('base64url'),signingGeneration:1});
+ const t=pending.transcript;
+ await enrollment.approve(JSON.stringify(await signOrgSetupTokenDocument({version:1,kind:'device-approval',companyId:t.companyId,machineId:t.machineId,machineType:t.machineType,ownerUserId:t.ownerUserId,signingGeneration:1,signingKeyId:await orgSetupTokenKeyId(signer.publicKey),issuedAt:Date.now(),approvalId:'approval',approvalRevision:1,deviceSigningPublicKey:t.deviceSigningPublicKey,recipientPublicKey:t.recipientPublicKey,enrollmentDigest:pending.digest},signer.secretKey)));
+ const server=await startDaemonControlServer({getChildren:()=>[],stopSession:()=>({stopped:false,reason:'not-found'}),spawnSession:async()=>({type:'error',errorMessage:'unused'}),requestShutdown:()=>{},onHappySessionWebhook:()=>{},portRegistry:createPortRegistry({filePath:path.join(process.env.HAPPY_HOME_DIR!,'device-pin-failure-ports.json')}),getDeviceEnrollment:()=>enrollment});
+ try {
+  const response=await realFetch(`http://127.0.0.1:${server.port}/device/confirm-org-key`,{method:'POST',headers:{Authorization:`Bearer ${server.controlSecret}`,'Content-Type':'application/json'},body:JSON.stringify({companyId:'company',machineId:'machine',enrollmentDigest:pending.digest})});
+  expect(response.status).toBe(409);expect(await response.json()).toEqual({code:'DEVICE_PIN_PERSIST_FAILED'});
+  expect(enrollment.status()?.pinned).toBe(false);
+ }finally{await server.stop();}
+});
+
+it('exposes only public device status behind Bearer and without browser Origin',async()=>{
+ const nacl=(await import('tweetnacl')).default;
+ const {createDeviceEnrollment}=await import('./deviceEnrollment');
+ const keys={signing:nacl.sign.keyPair(),recipient:nacl.box.keyPair()};
+ const enrollment=createDeviceEnrollment({machineId:'machine',keys});
+ const pending=await enrollment.begin({companyId:'company',machineType:'shared',ownerUserId:null,orgSigningPublicKey:Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url'),signingGeneration:1});
+ const server=await startDaemonControlServer({getChildren:()=>[],stopSession:()=>({stopped:false,reason:'not-found'}),spawnSession:async()=>({type:'error',errorMessage:'unused'}),requestShutdown:()=>{},onHappySessionWebhook:()=>{},portRegistry:createPortRegistry({filePath:path.join(process.env.HAPPY_HOME_DIR!,'device-status-ports.json')}),getDeviceEnrollment:()=>enrollment});
+ try{
+  const send=(headers:Record<string,string>,body:unknown={companyId:'company'})=>realFetch(`http://127.0.0.1:${server.port}/device/status`,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(body)});
+  expect((await send({})).status).toBe(401);
+  const auth={Authorization:`Bearer ${server.controlSecret}`};
+  expect((await send({...auth,Origin:'http://localhost'})).status).toBe(403);
+  expect((await send(auth,{companyId:'company',extra:true})).status).toBe(400);
+  const response=await send(auth);expect(response.status).toBe(200);
+  const text=await response.text();expect(text).not.toContain(server.controlSecret);expect(text).not.toContain(pending.proof);expect(text).not.toContain(Buffer.from(keys.signing.secretKey).toString('base64url'));
+  expect(JSON.parse(text)).toMatchObject({machineId:'machine',enrollment:{digest:pending.digest},pin:null});
+  const {writeFile}=await import('node:fs/promises');
+  const {promisify}=await import('node:util');
+  const {execFile}=await import('node:child_process');
+  const cliHome=mkdtempSync(path.join(tmpdir(),'device-cli-home-'));
+  try {
+   await writeFile(path.join(cliHome,'daemon.state.json'),JSON.stringify({pid:process.pid,httpPort:server.port,controlSecret:server.controlSecret}),{mode:0o600});
+   const cli=(args:string[])=>promisify(execFile)(process.execPath,['bin/happy.mjs','device',...args],{cwd:process.cwd(),env:{...process.env,HAPPY_HOME_DIR:cliHome},timeout:15000});
+   const status=await cli(['status','--company-id','company']);
+   expect(status.stdout).toContain(pending.digest.match(/.{4}/g)!.join(' '));expect(status.stdout).not.toContain(server.controlSecret);
+   const confirmation=await cli(['confirm','--company-id','company','--machine-id','machine','--digest',pending.digest]);
+   expect(confirmation.stdout).toContain('로컬 확인이 완료되었습니다');expect(enrollment.status()?.locallyConfirmed).toBe(true);
+  } finally {rmSync(cliHome,{recursive:true,force:true});}
+
+ }finally{await server.stop();}
+}, 30000);

@@ -1,5 +1,17 @@
 # Ordinary Chat schedules tasks
 
+## 2026-10-15 daemon resume model override review
+
+- [x] Prepare .328, integrate latest main, verify 156 related tests, candidate build/typecheck and artifact guard/fresh-install smoke.
+- [ ] Create the requested PR and confirm CI.
+- [ ] After green CI/main integration and exact tag-push checkpoint, publish through official Actions and verify the registry artifact.
+- [ ] Apply the exact registry release to the target PC, preserving identity/keys and existing sessions.
+- [ ] Live explicit resume model versus different saved pin, followed by a clock-based reservation with runtime model evidence; leave QA paused.
+
+- [x] Reproduce ignored `--model` through the real command/runner with a different saved reconnect model, for unused and existing threads (four precedence failures plus three invalid-argument failures).
+- [x] Parse and pass the explicit model, preserve environment/saved fallback and one-shot environment consumption.
+- [x] Validate 130 related tests and CLI types/production build; document the local follow-up and unchanged published/PC runtime.
+
 ## Official release and live acceptance (user requested 2026-10-14)
 
 - [x] Prepare .323 from main, validate production build/173 relevant tests/prepared tarball fresh-install guard, and commit the release candidate.

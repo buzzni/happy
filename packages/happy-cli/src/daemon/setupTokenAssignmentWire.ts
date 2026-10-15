@@ -57,8 +57,8 @@ function keyId(publicKey: Uint8Array): string {
   return createHash('sha256').update(publicKey).digest('hex')
 }
 
-export function createSetupTokenAssignmentRecipient(): SetupTokenAssignmentRecipient {
-  const pair = tweetnacl.box.keyPair()
+export function createSetupTokenAssignmentRecipient(secretKey?: Uint8Array): SetupTokenAssignmentRecipient {
+  const pair = secretKey ? tweetnacl.box.keyPair.fromSecretKey(new Uint8Array(secretKey)) : tweetnacl.box.keyPair()
   return { keyId: keyId(pair.publicKey), publicKey: Buffer.from(pair.publicKey).toString('base64'), secretKey: pair.secretKey }
 }
 
