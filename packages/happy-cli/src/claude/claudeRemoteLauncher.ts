@@ -53,6 +53,9 @@ interface PermissionsField {
 }
 
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
+import { createSetupTokenAccountSwitching, CONTINUE_PROMPT } from './setupTokenAccountSwitching';
+import { reportSetupTokenUsage, requestSetupTokenRebind } from '@/daemon/controlClient';
+import { SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
@@ -290,6 +293,24 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
+    /*
+     * Saycode specs/claude-setup-token-account-selection — a session bound to an organization
+     * setup-token account moves off it once the provider reports it used up. The token is read when
+     * a provider process starts, so a switch restarts the provider on the same conversation.
+     */
+    const setupTokenSwitching = process.env[SETUP_TOKEN_BINDING_ENV] ? createSetupTokenAccountSwitching({
+        sessionId: () => session.client.sessionId ?? null,
+        binding: () => process.env[SETUP_TOKEN_BINDING_ENV],
+        report: reportSetupTokenUsage,
+        rebind: requestSetupTokenRebind,
+        applyEnvironment: (environment) => { for (const [key, value] of Object.entries(environment)) process.env[key] = value; },
+        notify: (message) => session.client.sendSessionEvent({ type: 'message', message }),
+    }) : null;
+    /** Whether this generation's provider process has started (its `system/init` arrived). */
+    let providerRunning = false;
+    /** The mode the last turn ran with, across provider restarts — the continuation of a refused turn reuses it. */
+    let lastTurnMode: EnhancedMode | null = null;
+
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
         backgroundTasks = next;
@@ -297,7 +318,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
+        if ((message as { type?: unknown }).type === 'rate_limit_event') {
+            setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
+        }
         if (message.type === 'system' && message.subtype === 'init') {
+            providerRunning = true;
             // The level signal is per provider process. Until its first full
             // snapshot, older CLIs still use this generation's transcript.
             publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });
@@ -613,6 +638,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
+            providerRunning = false;
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -699,6 +725,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         return permissionHandler.isAborted(toolCallId);
                     },
                     nextMessage: async () => {
+                        if (mode) lastTurnMode = mode;
+                        const accountSwitch = await setupTokenSwitching?.switchIfWanted();
+                        if (accountSwitch?.switched) {
+                            // Ahead of anything the user queued meanwhile, and alone, so it is not merged into their batch.
+                            const continueMode = mode ?? lastTurnMode;
+                            if (accountSwitch.continueAfter && continueMode && !controller.signal.aborted) session.queue.unshiftIsolated(CONTINUE_PROMPT, continueMode);
+                            // A running provider keeps the token it started with: end it, the loop resumes the conversation.
+                            if (providerRunning) return null;
+                        }
                         if (pending) {
                             // A held-back batch is a turn like any other: refused once input is closed.
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
