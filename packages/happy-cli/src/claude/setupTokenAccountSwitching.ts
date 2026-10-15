@@ -67,4 +67,3 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     },
   }
 }
-export type SetupTokenAccountSwitching = ReturnType<typeof createSetupTokenAccountSwitching>

@@ -10,7 +10,7 @@
 import type { SetupTokenUsageObservation } from '@/daemon/setupTokenAccountSwitch'
 
 /** Either window at or above this share means the account is used up; matches Studio's rule. */
-export const EXHAUSTED_PCT = 95
+const EXHAUSTED_PCT = 95
 
 type Kind = 'unified5h' | 'unified7d'
 type RawWindow = { utilization?: unknown; resetsAt?: unknown }
@@ -59,4 +59,3 @@ export function createSetupTokenUsageTracker(now: () => number = Date.now) {
     reset() { windows.clear() },
   }
 }
-export type SetupTokenUsageTracker = ReturnType<typeof createSetupTokenUsageTracker>
