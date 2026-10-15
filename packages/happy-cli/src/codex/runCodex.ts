@@ -506,9 +506,10 @@ export async function runCodex(opts: {
     // ReasoningEffort; anything else falls back to the default.
     // Split out what the user actually asked for from the runtime fallback, so
     // callers can tell "no model was chosen" apart from "the default model".
-    const explicitInitialModel = consumePendingInitialModel(process.env);
+    const reconnectPin = publishedSessionModelPin(reconnectSession?.metadata);
+    const explicitInitialModel = consumePendingInitialModel(process.env) ?? reconnectPin.model;
     const initialModelSeed = explicitInitialModel ?? DEFAULT_CODEX_MODEL;
-    const rawInitialEffortSeed = consumePendingInitialEffort(process.env);
+    const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
     }

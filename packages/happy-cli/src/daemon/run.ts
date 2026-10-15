@@ -2741,6 +2741,7 @@ export async function startDaemon(): Promise<void> {
           {
             startedBy: 'daemon',
             claudeStartingMode: 'remote',
+            emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
           },
         );
 

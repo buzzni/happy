@@ -25,6 +25,23 @@ describe('parseResumeCommandArgs', () => {
 });
 
 describe('buildResumeLaunch', () => {
+    it('starts Codex without a provider resume only for a daemon-confirmed unused Happy session', () => {
+        const options = { startedBy: 'daemon' as const, emptyCodexSession: { serverSeq: 0, processedSeq: 0 } };
+        expect(buildResumeLaunch({ id: 'unused', active: false, metadata: { path: '/chat', flavor: 'codex' } as never }, options)).toEqual({
+            cwd: '/chat', args: ['codex', '--started-by', 'daemon'],
+        });
+    });
+
+    it.each([{ serverSeq: 1, processedSeq: 0 }, { serverSeq: 0, processedSeq: 1 }, { serverSeq: -1, processedSeq: 0 }, { serverSeq: undefined, processedSeq: 0 }, { serverSeq: 0, processedSeq: Number.NaN }])('refuses a missing Codex thread when the session is not proven unused (%j)', emptyCodexSession => {
+        const options = { startedBy: 'daemon' as const, emptyCodexSession };
+        expect(() => buildResumeLaunch({ id: 'used', active: false, metadata: { path: '/chat', flavor: 'codex' } as never }, options)).toThrow('has no Codex thread to resume');
+    });
+
+    it('does not accept unused-session evidence for a terminal launch', () => {
+        const options = { startedBy: 'terminal' as const, emptyCodexSession: { serverSeq: 0, processedSeq: 0 } };
+        expect(() => buildResumeLaunch({ id: 'unused', active: false, metadata: { path: '/chat', flavor: 'codex' } as never }, options)).toThrow('has no Codex thread to resume');
+    });
+
     it('builds a Codex resume command', () => {
         expect(buildResumeLaunch({
             id: 'session-1',
