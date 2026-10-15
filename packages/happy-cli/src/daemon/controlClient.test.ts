@@ -160,3 +160,15 @@ describe('stopDaemon', () => {
     }
   })
 })
+
+it('uses only the authenticated loopback daemon for device status and confirmation',async()=>{
+ const {getDeviceApprovalStatus,confirmDeviceOrganization}=await import('./controlClient');
+ const state={...stateWithPid(process.pid),controlSecret:'local-only-secret'};
+ mocks.mockReadDaemonStateSnapshot.mockResolvedValue({state,raw:JSON.stringify(state)});
+ const fetchSpy=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({companyId:'company',machineId:'machine',enrollment:null,pin:null}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({locallyConfirmed:true}),{status:200}));
+ try {
+  await getDeviceApprovalStatus('company');await confirmDeviceOrganization({companyId:'company',machineId:'machine',enrollmentDigest:'a'.repeat(64)});
+  expect(fetchSpy.mock.calls.map(call=>call[0])).toEqual([`http://127.0.0.1:${HTTP_PORT}/device/status`,`http://127.0.0.1:${HTTP_PORT}/device/confirm-org-key`]);
+  expect(fetchSpy.mock.calls[0][1]?.headers).toMatchObject({Authorization:'Bearer local-only-secret'});
+ }finally{fetchSpy.mockRestore();}
+});

@@ -469,3 +469,16 @@ async function waitForProcessDeath(pid: number, timeout: number): Promise<void> 
   }
   throw new Error('Process did not die within timeout');
 }
+
+
+/** Local-only organization approval controls. Never use machine RPC or return the control secret. */
+export async function getDeviceApprovalStatus(companyId: string): Promise<Awaited<ReturnType<ReturnType<typeof import('./deviceEnrollment').createDeviceEnrollment>['getStatus']>>> {
+  const result = await daemonPost('/device/status', { companyId });
+  if (result.error || !result.machineId || result.companyId !== companyId) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
+  return result;
+}
+export async function confirmDeviceOrganization(input: { companyId: string; machineId: string; enrollmentDigest: string }): Promise<{ locallyConfirmed: true }> {
+  const result = await daemonPost('/device/confirm-org-key', input);
+  if (result.error || result.locallyConfirmed !== true) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
+  return { locallyConfirmed: true };
+}

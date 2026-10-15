@@ -5,7 +5,9 @@ import type { ServerLaneConfig } from './types';
  * aplus-dev-studio specs/e2ee-machine-control-boundary R3 — the machine-scope
  * methods the server's own key may call. Each one answers with status the
  * server routes or schedules by, or relays a body sealed to a key the server
- * does not hold. None reads or writes a file, runs a command, starts or
+ * does not hold. Device approval may persist a verified public pin only after
+ * independent local confirmation; remote confirmation is never exposed.
+ * Other methods do not read or write a file, run a command, start or
  * resumes an agent, moves a transcript, touches a credential, schedules work
  * or opens a terminal.
  *
@@ -13,6 +15,9 @@ import type { ServerLaneConfig } from './types';
  * key until it is reviewed and listed here.
  */
 export const SERVER_LANE_METHODS: ReadonlySet<string> = new Set([
+    'device:enroll',
+    'device:approve',
+    'device:status',
     'daemon-session-state',
     'browser-session-waiting',
     'stop-session',

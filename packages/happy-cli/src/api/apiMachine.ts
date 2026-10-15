@@ -1,3 +1,6 @@
+import { z } from 'zod';
+import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
+import type { DeviceKeys } from '@/daemon/deviceKeys';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { createWorktreeReclaimHandler } from '@/daemon/worktreeDependencyReclaimRpc';
 import { createSealedSpawnEnvHandler } from '@/modules/common/sealedSpawnEnv';
@@ -765,8 +768,8 @@ export class ApiMachineClient {
     private serverAutomationCache: ServerAutomationCache | null = null;
     private serverAutomationSyncInFlight: Promise<void> | null = null;
     private rpcHandlerManager: RpcHandlerManager;
-    /** Per API socket incarnation recipient; the secret never leaves this process. */
-    private readonly setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient();
+    /** General daemons reuse the protected device key; managed runtimes keep their existing ephemeral recipient. */
+    private readonly setupTokenAssignmentRecipient: ReturnType<typeof createSetupTokenAssignmentRecipient>;
     /**
      * The machine's only resource sampler. It measures nothing until something
      * subscribes and stops again when the last subscription goes away, so an
@@ -905,8 +908,11 @@ export class ApiMachineClient {
 
     constructor(
         private token: string,
-        private machine: Machine
+        private machine: Machine,
+        private readonly deviceKeys?: DeviceKeys,
+        deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>
     ) {
+        this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
             scopePrefix: this.machine.id,
@@ -917,6 +923,21 @@ export class ApiMachineClient {
             requireBoundRequests: configuration.machineControl === 'strict',
             logger: (msg, data) => logger.debug(msg, data)
         });
+
+        // Only public registration and signed approval relay are remote. Local confirmation
+        // remains on authenticated loopback HTTP and is never registered as an RPC.
+        if (deviceEnrollment) {
+            this.rpcHandlerManager.registerHandler('device:enroll', async params => deviceEnrollment.begin(params));
+            this.rpcHandlerManager.registerHandler('device:approve', async params => {
+                const input = z.object({ document: z.string().min(1).max(12000) }).strict().parse(params);
+                await deviceEnrollment.approve(input.document);
+                return { accepted: true };
+            });
+            this.rpcHandlerManager.registerHandler('device:status', async params => {
+                const input = z.object({ companyId: z.string().min(1).max(512) }).strict().parse(params);
+                return deviceEnrollment.getStatus(input.companyId);
+            });
+        }
 
         // specs/daemon-rpc-workspace-rebase/ Phase 2 — rebase the
         // path-validation root for machine-scoped RPCs (getDirectoryTree
@@ -1139,6 +1160,7 @@ export class ApiMachineClient {
                     // A shared machine's sealed assignment names the machine as principal.
                     sharedMachineSetupTokenVersion: 1,
                     setupTokenRecipient: setupTokenRecipientCapability(this.setupTokenAssignmentRecipient),
+                    ...(this.deviceKeys ? { deviceKeyVersion: 1, deviceSigningPublicKey: Buffer.from(this.deviceKeys.signing.publicKey).toString('base64url'), recipientPublicKey: Buffer.from(this.deviceKeys.recipient.publicKey).toString('base64url') } : {}),
                 };
             }
             return capabilities;
