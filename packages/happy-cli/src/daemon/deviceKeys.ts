@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import nacl from 'tweetnacl';
@@ -56,7 +56,9 @@ export async function loadOrCreateDeviceKeys(home: string, machineId: string): P
     if (created) {
         // Establish and verify Windows protection before writing any private bytes.
         await protectStandaloneObservationDirectory(directory, true);
-        const temporary = join(directory, randomUUID() + '.tmp');
+        // mkdir grants exactly one initializer. Keep its unpublished path no longer than keys.json
+        // so Windows PowerShell ACL checks can protect it whenever the committed path fits MAX_PATH.
+        const temporary = join(directory, '.keys.tmp');
         const signing = nacl.sign.keyPair();
         const recipient = nacl.box.keyPair();
         let serialized: Buffer | undefined;
@@ -75,13 +77,16 @@ export async function loadOrCreateDeviceKeys(home: string, machineId: string): P
     }
     // A simultaneous creator may still be flushing. A crashed creator stays fail-closed;
     // timeout never grants permission to generate replacement keys.
-    for (let attempt = 0; attempt < 50; attempt++) {
-        try { return await readKeys(directory, machineId); }
-        catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw reapproval();
-            if (attempt === 49) throw reapproval();
+    const deadline = Date.now() + (process.platform === 'win32' ? 30_000 : 1_000);
+    for (;;) {
+        try {
+            // A creator has not published keys.json yet. Do not inspect its partial directory
+            // or spawn another PowerShell ACL check on every missing-file retry.
+            await lstat(join(directory, 'keys.json'));
+            return await readKeys(directory, machineId);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || Date.now() >= deadline) throw reapproval();
             await delay(20);
         }
     }
-    throw reapproval();
 }
