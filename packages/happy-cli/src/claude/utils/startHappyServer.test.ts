@@ -109,6 +109,8 @@ describe('Happy MCP shutdown admission', () => {
             expect(names).toContain('session_write_scope');
             expect(names).not.toContain('bash_stream');
             expect(names).not.toContain('script_automations');
+            expect(names).not.toContain('scheduled_tasks');
+            expect(server.toolNames).not.toContain('scheduled_tasks');
         } finally {
             server?.stop();
             Object.defineProperty(process, 'platform', descriptor);
@@ -153,6 +155,7 @@ describe('Happy MCP shutdown admission', () => {
             checkpoint_diff: { checkpointId: 'a'.repeat(40), path: 'file.txt' },
             change_title: { title: 'no-write' }, bash_stream: { command: 'no-execution' },
             script_automations: { request: { operation: 'list' } },
+            scheduled_tasks: { request: { operation: 'list' } },
             browser_click: { ref: '@e1' }, browser_fill: { ref: '@e1', value: 'x' },
             browser_scroll: { deltaY: 1 }, browser_navigate: { url: 'https://example.com' },
             browser_open_tab: { url: 'https://example.com' }, browser_close_tab: { tabId: 1 },
@@ -343,6 +346,7 @@ describe('startHappyServer tool registration', () => {
             expect(names).toEqual(expect.arrayContaining([
                 'change_title',
                 'script_automations',
+                'scheduled_tasks',
                 'bash_stream',
                 'browser_tabs',
                 'browser_snapshot',
@@ -587,7 +591,9 @@ describe('session write scope protected tool surface', () => {
             expect(names).toContain('session_write_scope');
             expect(names).not.toContain('bash_stream');
             expect(names).not.toContain('script_automations');
+            expect(names).not.toContain('scheduled_tasks');
             expect(names).not.toContain('browser_open_tab');
+            expect(server.toolNames).not.toContain('scheduled_tasks');
         } finally { server.stop(); if (previous === undefined) delete process.env.HAPPY_WRITE_SCOPE_SESSION; else process.env.HAPPY_WRITE_SCOPE_SESSION = previous; }
     });
 });

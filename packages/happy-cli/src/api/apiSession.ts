@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger'
+import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
@@ -990,9 +991,12 @@ export class ApiSessionClient extends EventEmitter {
     private routeIncomingMessage(message: unknown, serverMessageId?: string) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
-            const userMessage: UserMessage = serverMessageId
+            const incoming: UserMessage = serverMessageId
                 ? { ...userResult.data, serverMessageId }
                 : userResult.data;
+            const userMessage = incoming.meta?.sentFrom === 'automation' && incoming.localKey?.startsWith('happy-automation:')
+                ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text) } }
+                : incoming;
             this.inputObservedForNextTurn = true;
             if (userMessage.meta?.sentFrom !== 'daemon') {
                 this.lastUserInteractionAt = Date.now();

@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
     activateAutomationAdoption: vi.fn(),
     adoptAutomation: vi.fn(),
     createAutomation: vi.fn(),
+    createRegisteredAutomation: vi.fn(),
+    getRegisteredAutomation: vi.fn(),
     deleteAutomation: vi.fn(),
     getAutomationTarget: vi.fn(),
     listAutomationRuns: vi.fn(),
@@ -78,6 +80,27 @@ async function makeApp() {
 }
 
 describe('automationRoutes', () => {
+    it('exposes readonly registration recovery and only paused v4 idempotent creation', async () => {
+        const app = await makeApp();
+        const url = '/v1/projects/project-1/automations/registrations/registration-key-1';
+        mocks.getRegisteredAutomation.mockResolvedValue({ ok: true, value: null });
+        const missing = await app.inject({ method: 'GET', url });
+        expect(missing.statusCode).toBe(200); expect(missing.json()).toEqual({ automation: null });
+        expect(mocks.getRegisteredAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', 'registration-key-1');
+        const payload = { payloadVersion: 4, paused: true, payloadCiphertext: Buffer.from(payloadCiphertext).toString('base64'),
+            viewerKeyId: 'viewer-key', viewerKeyVersion: 1, viewerKeyEnvelope: Buffer.from(keyEnvelope).toString('base64'),
+            machineKeyVersion: 1, machineKeyEnvelope: Buffer.from(keyEnvelope).toString('base64') };
+        mocks.createRegisteredAutomation.mockResolvedValue({ ok: true, value: { ...record(), payloadVersion: 4, paused: true } });
+        const created = await app.inject({ method: 'PUT', url, payload });
+        expect(created.statusCode).toBe(200); expect(created.json().automation.paused).toBe(true);
+        expect(mocks.createRegisteredAutomation).toHaveBeenCalledWith({}, 'user-1', 'project-1', 'registration-key-1', expect.objectContaining({ payloadVersion: 4, paused: true }));
+        for (const patch of [{ paused: false }, { payloadVersion: 1 }, { userId: 'other' }]) {
+            expect((await app.inject({ method: 'PUT', url, payload: { ...payload, ...patch } })).statusCode).toBe(400);
+        }
+        expect(mocks.createRegisteredAutomation).toHaveBeenCalledTimes(1);
+        await app.close();
+    });
+
     it('rejects ambient Happy credentials and binds server proof to the exact Chat and action', async () => {
         const secret = 'server-only-test-secret'.repeat(3); vi.stubEnv('SCRIPT_AUTOMATION_ADMISSION_SECRET', secret);
         try {

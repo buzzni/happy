@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Automation, AutomationRun, Prisma } from '@prisma/client';
 import {
     AUTOMATION_RUN_NOW_PROTOCOL_VERSION,
@@ -22,7 +23,8 @@ export type AutomationServiceError =
     | 'automation-paused'
     | 'automation-run-unsupported'
     | 'invalid-payload-update'
-    | 'revision-conflict';
+    | 'revision-conflict'
+    | 'registration-conflict';
 
 export type AutomationServiceResult<T> =
     | { ok: true; value: T }
@@ -376,6 +378,38 @@ export async function createAutomation(
     };
     const row = await tx.automation.create({ data });
     await appendChange(tx, row, target, 'UPSERT');
+    return { ok: true, value: row };
+}
+
+// A scope-bound ID makes a lost create response recoverable without adding a second scheduler or DB schema.
+function registrationId(projectId: string, registrationKey: string): string {
+    return `scheduled_${createHash('sha256').update(JSON.stringify([projectId, registrationKey])).digest('hex')}`;
+}
+
+export async function getRegisteredAutomation(tx: Tx, actorId: string, projectId: string, registrationKey: string): Promise<AutomationServiceResult<Automation | null>> {
+    if (!await projectAccess(tx, actorId, projectId)) return { ok: false, error: 'not-found' };
+    const row = await tx.automation.findUnique({ where: { id: registrationId(projectId, registrationKey) } });
+    if (row && (row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt)) return { ok: false, error: 'registration-conflict' };
+    return { ok: true, value: row };
+}
+
+export async function createRegisteredAutomation(tx: Tx, actorId: string, projectId: string, registrationKey: string, input: AutomationCreateInput): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (!access.canEdit) return { ok: false, error: 'forbidden' };
+    if (input.payloadVersion !== 4 || input.paused !== true || !/^[A-Za-z0-9_-]{16,128}$/.test(registrationKey)) return { ok: false, error: 'invalid-payload-update' };
+    const target = await targetForProject(tx, access.project);
+    if (!target) return { ok: false, error: 'automation-target-unavailable' };
+    const keyError = validateKeyVersions(access.project, target, input);
+    if (keyError) return { ok: false, error: keyError };
+    const id = registrationId(projectId, registrationKey);
+    const created = await tx.automation.createMany({ data: [{ id, projectId, ownerAccountId: actorId,
+        machineAccountId: target.machineAccountId, machineId: target.machineId, ...input }], skipDuplicates: true });
+    const row = await tx.automation.findUnique({ where: { id } });
+    if (!row || row.projectId !== projectId || row.ownerAccountId !== actorId || row.deletedAt || row.payloadVersion !== 4
+        || row.machineAccountId !== target.machineAccountId || row.machineId !== target.machineId) return { ok: false, error: 'registration-conflict' };
+    if (created.count === 1) await appendChange(tx, row, target, 'UPSERT');
+    // Existing ciphertext/state is returned unchanged. Only the viewer can compare decrypted retry intent.
     return { ok: true, value: row };
 }
 
