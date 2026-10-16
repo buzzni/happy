@@ -180,7 +180,6 @@ import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 /** See the Claude counterpart. */
 const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 
-const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
 const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
 
@@ -505,13 +504,12 @@ export async function runCodex(opts: {
     // HAPPY_INITIAL_EFFORT, e.g. automations). Consumed exactly once — read
     // then deleted so children never inherit. Effort is whitelisted against
     // ReasoningEffort; anything else falls back to the default.
-    // Split out what the user actually asked for from the runtime fallback, so
-    // callers can tell "no model was chosen" apart from "the default model".
+    // An unspecified model stays unspecified: Codex resolves its configured or
+    // native default for the current provider and account.
     const reconnectPin = publishedSessionModelPin(reconnectSession?.metadata);
     // Consume even when --model wins, so child processes cannot inherit the seed.
     const pendingInitialModel = consumePendingInitialModel(process.env);
     const explicitInitialModel = opts.initialModel ?? pendingInitialModel ?? reconnectPin.model;
-    const initialModelSeed = explicitInitialModel ?? DEFAULT_CODEX_MODEL;
     const rawInitialEffortSeed = consumePendingInitialEffort(process.env) ?? reconnectPin.effort;
     if (rawInitialEffortSeed && !isSupportedCodexReasoningEffort(rawInitialEffortSeed)) {
         logger.debug(`[Codex] Ignoring invalid initial effort seed: ${rawInitialEffortSeed}`);
@@ -528,14 +526,12 @@ export async function runCodex(opts: {
         appendSystemPrompt: consumePendingInitialAppendSystemPrompt(process.env),
         saycodeSystemPromptEnabled: initialSaycodeSystemPromptEnabled,
     });
-    let currentModel: string | undefined = initialModelSeed;
+    let currentModel: string | undefined = explicitInitialModel;
     let currentEffort: ReasoningEffort | undefined = initialEffortSeed;
 
     // The model/effort the *user* pinned, advertised on the session so another
-    // device can carry on with the same model. Kept apart from currentModel:
-    // that one always holds a concrete model, so publishing it would advertise
-    // the runtime default as a deliberate choice and stop other clients from
-    // routing a Default session themselves.
+    // device can carry on with the same model. Native defaults are not a user
+    // pin and must not stop other clients from routing a Default session.
     const initialModelPin: SessionModelPin = {
         ...(explicitInitialModel ? { model: explicitInitialModel } : {}),
         ...(explicitInitialEffort ? { effort: explicitInitialEffort } : {}),
@@ -556,7 +552,7 @@ export async function runCodex(opts: {
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
-        currentModel = initialModelSeed;
+        currentModel = explicitInitialModel;
         currentEffort = initialEffortSeed;
         sessionModelPinPublisher.reset();
         // Cached append prompt and account preference survive turn-scoped abort resets.
@@ -1683,7 +1679,7 @@ export async function runCodex(opts: {
                     sessionId: session.sessionId,
                     responseId: String(msg.response_id ?? ''),
                     occurredAt: Date.now(),
-                    model: currentModel ?? DEFAULT_CODEX_MODEL,
+                    model: currentModel,
                     usage: msg.usage as Parameters<typeof createCodexUsageEvent>[0]['usage'],
                 }));
             } catch (error) {
