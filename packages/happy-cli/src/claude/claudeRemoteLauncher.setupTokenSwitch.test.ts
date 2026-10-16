@@ -152,4 +152,56 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(generations[1].prompts[0]).toContain('after the switch');
         expect(requestSetupTokenRebind).not.toHaveBeenCalled();
     });
+    it('retries a switch that failed at the turn boundary before the next message reaches the used-up account', async () => {
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'REQUEST_FAILED' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const generations: Array<{ token?: string; prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, prompts: [] as string[] };
+            generations.push(generation);
+            const first = generations.length === 1;
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    if (first) {
+                        yield refused;
+                        yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                        // The boundary's switch fails for now; the user writes again a little later.
+                        setTimeout(() => queue.push('try again', { permissionMode: 'default', model: 'claude-sonnet-5' }), 10);
+                        continue;
+                    }
+                    yield assistant('msg-2');
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-2' };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session: Record<string, unknown> = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
+        expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(generations[0].prompts.join()).not.toContain('try again');
+        expect(generations[1].prompts.join()).toContain('try again');
+    });
 });
