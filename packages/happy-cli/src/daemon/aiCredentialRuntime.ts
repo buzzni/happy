@@ -2124,14 +2124,6 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   /**
-   * Binds one Claude spawn to a managed setup-token slot. A new spawn needs a
-   * server-signed binding grant (caller, company, machine, account, generation,
-   * one-use nonce); a resume reuses the binding recorded when that grant was
-   * consumed. Both re-check the journal (reconciled, owned by that user) and the
-   * stored generation. The token reaches only that child's environment and every
-   * other Claude auth override is written empty. Never a substitute credential.
-   */
-  /**
    * Both launch reads are read-only and independent. Each is its own helper start, which costs
    * seconds on endpoint-secured Windows PCs, so they run together; every check still sees both.
    */
@@ -2144,6 +2136,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return { listed, exported }
   }
 
+  /**
+   * Binds one Claude spawn to a managed setup-token slot. A new spawn needs a
+   * server-signed binding grant (caller, company, machine, account, generation,
+   * one-use nonce); a resume reuses the binding recorded when that grant was
+   * consumed. Both re-check the journal (reconciled, owned by that user) and the
+   * stored generation. The token reaches only that child's environment and every
+   * other Claude auth override is written empty. Never a substitute credential.
+   */
   async function setupTokenSessionEnvironment(agent: string | undefined, selection: Extract<AiAuthSelection, { kind: 'claude-setup-token' }>, recorded: SetupTokenBinding | undefined) {
     const { managedAccountId, credentialGeneration, groupScope } = selection
     if (agent !== undefined && agent !== 'claude') throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
