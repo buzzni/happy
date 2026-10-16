@@ -2131,6 +2131,19 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * stored generation. The token reaches only that child's environment and every
    * other Claude auth override is written empty. Never a substitute credential.
    */
+  /**
+   * Both launch reads are read-only and independent. Each is its own helper start, which costs
+   * seconds on endpoint-secured Windows PCs, so they run together; every check still sees both.
+   */
+  async function readSlotRosterAndExport() {
+    const [listed, exported] = await Promise.all([
+      deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
+        .then(result => parseClaudeListDetails(result.stdout).accounts),
+      deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES }).then(result => JSON.parse(result.stdout)),
+    ])
+    return { listed, exported }
+  }
+
   async function setupTokenSessionEnvironment(agent: string | undefined, selection: Extract<AiAuthSelection, { kind: 'claude-setup-token' }>, recorded: SetupTokenBinding | undefined) {
     const { managedAccountId, credentialGeneration, groupScope } = selection
     if (agent !== undefined && agent !== 'claude') throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
@@ -2156,9 +2169,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (!assignment || !assignment.reconciled || assignment.userId !== binding.userId
       || !assignment.desired.includes(setupTokenGroupIdentity(managedAccountId))) throw unavailable()
     const email = managedSetupTokenEmail(managedAccountId)
-    const listed = parseClaudeListDetails((await deps.execFile('cswap', ['list', '--json'], {
-      maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout).accounts.find(account => account.email === email)
-    const exported = JSON.parse((await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })).stdout)
+    const { listed: roster, exported } = await readSlotRosterAndExport()
+    const listed = roster.find(account => account.email === email)
     const slot = Array.isArray(exported?.accounts) ? exported.accounts.find((account: Record<string, unknown>) => account?.email === email) : undefined
     const token = slot?.credentials?.claudeAiOauth?.accessToken
     if (!listed || listed.disabled === true || slot?.credentialType !== 'setup_token' || slot.managedAccountId !== managedAccountId
@@ -2195,9 +2207,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (!await setupTokenRuntimeSupported()) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_UNSUPPORTED')
     const identities = new Set(entries.flatMap(entry => entry.managed))
     return withSafeErrors('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE', async () => {
-      const listed = parseClaudeListDetails((await deps.execFile('cswap', ['list', '--json'], {
-        maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout).accounts
-      const exported = JSON.parse((await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })).stdout)
+      const { listed, exported } = await readSlotRosterAndExport()
       const slots: Array<Record<string, unknown>> = Array.isArray(exported?.accounts) ? exported.accounts : []
       const token = slots.map(slot => {
         const id = managedSetupTokenId(slot?.email)
