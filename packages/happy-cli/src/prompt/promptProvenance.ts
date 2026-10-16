@@ -71,6 +71,24 @@ export function resolveSaycodeAppendSystemPromptForMessage(input: {
     : currentClientPrompt;
 }
 
+const CLIENT_TURN_BLOCK_CANDIDATE = /^<!-- saycode:client-turn-prompt:([a-z0-9]+-[a-z0-9]+):start -->\n[\s\S]*?\n<!-- saycode:client-turn-prompt:\1:end -->$/gm;
+
+/**
+ * Splits a client append prompt into the context that stays for the thread and the
+ * client-turn blocks valid for this turn only. A candidate counts only when the wire
+ * validator would remove it on its own, so marker-like user text stays standing.
+ */
+export function splitClientTurnPromptBlocks(prompt: string | undefined): { standing: string | undefined; turn: string | undefined } {
+  if (!prompt) return { standing: prompt, turn: undefined };
+  const blocks = [...prompt.matchAll(CLIENT_TURN_BLOCK_CANDIDATE)]
+    .map((match) => match[0])
+    .filter((block) => stripClientTurnPromptBlocks(block) === undefined);
+  return {
+    standing: stripClientTurnPromptBlocks(prompt),
+    turn: blocks.length > 0 ? blocks.join('\n\n') : undefined,
+  };
+}
+
 /**
  * Individually toggleable Saycode-owned prompt blocks. Provider title blocks
  * are deliberately excluded — they are `always-on` (see

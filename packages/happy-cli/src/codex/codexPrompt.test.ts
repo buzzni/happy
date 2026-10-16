@@ -1,5 +1,6 @@
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
 import { describe, expect, it } from 'vitest';
+import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import {
@@ -75,6 +76,37 @@ describe('buildCodexDeveloperInstructions', () => {
                 saycodePromptBlocks: { agentOrchestration: false },
             },
         })).toBe('CONNECTOR FACTS\n\n' + SAYCODE_API_GATEWAY_PROMPT);
+    });
+});
+
+describe('client-turn blocks on a running Codex thread', () => {
+    // Codex app-server does not re-inject changed developer instructions into an open
+    // thread, so a block valid for one turn must travel with that turn's input.
+    const firstGuide = wrapClientTurnPrompt('GUIDE FOR TURN 1')!;
+    const secondGuide = wrapClientTurnPrompt('GUIDE FOR TURN 2')!;
+
+    it('keeps them out of developer instructions so turn 1 does not linger', () => {
+        const instructions = buildCodexDeveloperInstructions({
+            mode: { appendSystemPrompt: `USER CONTEXT\n\n${firstGuide}`, saycodeSystemPromptEnabled: true },
+        });
+        expect(instructions).toContain('USER CONTEXT');
+        expect(instructions).not.toContain('GUIDE FOR TURN 1');
+    });
+
+    it('sends each turn its own block before the request', () => {
+        expect(buildCodexTurnPrompt({
+            message: 'second question',
+            mode: { appendSystemPrompt: `USER CONTEXT\n\n${secondGuide}`, saycodeSystemPromptEnabled: true },
+            includeAppendSystemPrompt: false, hasTitle: true, lessonBlock: 'lesson references',
+        })).toBe(`${secondGuide}\n\nlesson references\n\nsecond question`);
+    });
+
+    it('does not repeat the block when a legacy first turn already carries the whole append prompt', () => {
+        expect(buildCodexTurnPrompt({
+            message: 'first question',
+            mode: { appendSystemPrompt: `LEGACY CONTEXT\n\n${firstGuide}` },
+            includeAppendSystemPrompt: true, hasTitle: true,
+        })).toBe(`LEGACY CONTEXT\n\n${firstGuide}\n\nfirst question`);
     });
 });
 
