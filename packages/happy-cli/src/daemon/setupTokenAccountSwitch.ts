@@ -68,7 +68,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
 
   async function rebindOnce(sessionId: string, running: string): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
-    if (!bound) return { ok: false, reason: 'NOT_BOUND' }
+    if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
     const { session, recorded } = bound
     // Never move a session back onto a binding older than the one it runs.
     if (bound.state === 'daemon-behind') return failure('STALE', `session ${sessionId} runs a newer binding than this daemon records`)
@@ -77,7 +77,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       try { return { ok: true, environment: await deps.sessionEnvironment('claude', recorded.selection, recorded.binding) } }
       catch (error) { logger.debug(`[setup-token-switch] recorded binding unusable for ${sessionId}; asking Studio: ${(error as Error)?.message}`) }
     }
-    if (!deps.studioOrigin) return { ok: false, reason: 'STUDIO_UNAVAILABLE' }
+    if (!deps.studioOrigin) return failure('STUDIO_UNAVAILABLE', 'rebind: Studio origin is not configured')
     const binding = recorded.binding
     let grant: Record<string, unknown>
     try {
@@ -107,9 +107,9 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     /** `running`: the binding record the session itself runs with, so usage is never booked to another account. */
     async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
       const bound = boundSession(deps, sessionId, running)
-      if (!bound) return { ok: false, reason: 'NOT_BOUND' }
-      if (bound.state !== 'same') return { ok: false, reason: 'STALE' }
-      if (!deps.studioOrigin) return { ok: false, reason: 'STUDIO_UNAVAILABLE' }
+      if (!bound) return failure('NOT_BOUND', `usage: no binding recorded for session ${sessionId}`)
+      if (bound.state !== 'same') return failure('STALE', `usage: session ${sessionId} runs another binding than this daemon records`)
+      if (!deps.studioOrigin) return failure('STUDIO_UNAVAILABLE', 'usage: Studio origin is not configured')
       const { binding } = bound.recorded
       try {
         const response = await post('usage', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce, observation })

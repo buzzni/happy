@@ -9,6 +9,7 @@
  */
 import type { SetupTokenUsageObservation } from '@/daemon/setupTokenAccountSwitch'
 import { createSetupTokenUsageTracker } from './setupTokenUsageTracker'
+import { logger } from '@/ui/logger'
 
 type Outcome = { ok: true } | { ok: false; reason: string }
 export type SetupTokenAccountSwitchingDeps = {
@@ -47,6 +48,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   async function switchOnce(sessionId: string, binding: string) {
     const result = await deps.rebind(sessionId, binding).catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
     if (!result.ok) {
+      logger.debug(`[setup-token-switch] session ${sessionId} could not switch accounts: ${result.reason}`)
       if (result.reason === 'NO_ACCOUNT') {
         wanted = false
         if (!toldNoAccount) { toldNoAccount = true; deps.notify(NO_ACCOUNT_NOTICE) }
@@ -61,6 +63,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     deps.applyEnvironment(result.environment)
     tracker.reset()
     switches++; toldNoAccount = false; lastReportAt = -Infinity; lastReportedExhausted = false
+    logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${switches} of ${MAX_SWITCHES})`)
     const continueAfter = refused
     refused = false
     deps.notify(SWITCHED_NOTICE)
