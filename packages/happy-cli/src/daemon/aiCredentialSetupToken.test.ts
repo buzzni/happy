@@ -51,14 +51,24 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] } } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean } } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
   const files = options.files ?? new Map<string, string>()
   const syncEvents: string[] = []
-  const execFile = vi.fn(async (command: string, args: string[]): Promise<AiCredentialCommandResult> => {
+  const execFile = vi.fn(async (command: string, args: string[], commandOptions?: { signal?: AbortSignal }): Promise<AiCredentialCommandResult> => {
     calls.push({ command, args })
+    if (command === 'cswap' && args[0] === 'export' && options.hangingExport) {
+      const hanging = options.hangingExport
+      // A helper stuck under endpoint scanning: it ends only when the caller cancels it.
+      return new Promise((_, reject) => {
+        const cancel = () => { hanging.cancelled = true; reject(Object.assign(new Error('cancelled'), { kind: 'COMMAND_CANCELLED' })) }
+        if (commandOptions?.signal?.aborted) cancel()
+        commandOptions?.signal?.addEventListener('abort', cancel, { once: true })
+        setTimeout(() => reject(Object.assign(new Error('timed out'), { kind: 'COMMAND_TIMEOUT' })), 200)
+      })
+    }
     if (command === 'cswap' && kind === 'missing') throw Object.assign(new Error('not found'), { kind: 'COMMAND_NOT_AVAILABLE' })
     if (command === 'cswap' && args[0] === '--version') return { stdout: `cswap ${options.cswapVersion ?? '0.27.0b1'}`, stderr: '' }
     if (command === 'uv' && args[0] === 'python' && options.noUvPython) {
@@ -384,6 +394,20 @@ describe('managed Claude setup-token runtime', () => {
     overlap.exportStarted = false
     await runtime.launchSession(env, () => undefined)
     expect(overlap.listSawExport.slice(-2)).toEqual([true, true])
+  })
+
+  it('cancels the token export still running when the roster read fails', async () => {
+    const hangingExport = { cancelled: false }
+    const options: Parameters<typeof fakeMachine>[2] = {}
+    const { runtime } = fakeMachine([], null, options)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    options.listFails = true
+    options.hangingExport = hangingExport
+
+    await expect(runtime.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: A,
+      groupScope: 'company-1', credentialGeneration: 1, bindingGrant: bindingGrant() })).rejects.toThrow()
+
+    expect(hangingExport.cancelled).toBe(true)
   })
 
   it('checks expiry after the final provider read and permits only one submitted spawn', async () => {

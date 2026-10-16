@@ -2126,12 +2126,16 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   /**
    * Both launch reads are read-only and independent. Each is its own helper start, which costs
    * seconds on endpoint-secured Windows PCs, so they run together; every check still sees both.
+   * The first failure refuses the launch and cancels the other read, so no export is left running.
    */
   async function readSlotRosterAndExport() {
+    const pair = new AbortController()
+    const cancelSiblingOnFailure = <T>(read: Promise<T>) => read.catch((error: unknown) => { pair.abort(); throw error })
     const [listed, exported] = await Promise.all([
-      deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
-        .then(result => parseClaudeListDetails(result.stdout).accounts),
-      deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES }).then(result => JSON.parse(result.stdout)),
+      cancelSiblingOnFailure(deps.execFile('cswap', ['list', '--json'], { maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS, signal: pair.signal })
+        .then(result => parseClaudeListDetails(result.stdout).accounts)),
+      cancelSiblingOnFailure(deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES, signal: pair.signal })
+        .then(result => JSON.parse(result.stdout))),
     ])
     return { listed, exported }
   }
