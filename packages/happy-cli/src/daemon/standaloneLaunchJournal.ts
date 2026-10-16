@@ -14,24 +14,34 @@ $path=[IO.Path]::GetFullPath($path)
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 $sid=$identity.User
 $allowed=@($sid.Value,'S-1-5-18') | Select-Object -Unique
-$trusted=@($sid.Value,'S-1-5-18','S-1-5-32-544',([Security.Principal.NTAccount]::new('NT SERVICE','TrustedInstaller')).Translate([Security.Principal.SecurityIdentifier]).Value)
-function Assert-Ancestor($info, [bool]$root) {
-  if ($info.GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) { throw 'Credential ancestor has an untrusted owner' }
+# Desktop windows-credential-acl-resilience R5: keep company management/service
+# grants on ancestors, but refuse replacement rights held by ordinary users broadly.
+$allUsers=@('S-1-1-0','S-1-2-0','S-1-2-1','S-1-5-1','S-1-5-2','S-1-5-4','S-1-5-7','S-1-5-11','S-1-5-13','S-1-5-14','S-1-5-15','S-1-5-32-545','S-1-5-32-546','S-1-5-32-555')
+function Test-AnyUser([string]$principal) { return ($principal -in $allUsers -or $principal -match '^S-1-5-21-\d+-\d+-\d+-51[34]$') }
+function Assert-Ancestor($info, [bool]$root, [bool]$shielded) {
+  if (Test-AnyUser $info.GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value) { throw 'Credential ancestor has an untrusted owner' }
+  if ($root -and $shielded) { return }
   $danger=[Security.AccessControl.FileSystemRights]'DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
   if (-not $root) { $danger=$danger -bor [Security.AccessControl.FileSystemRights]::Delete }
   foreach ($rule in $info.GetAccessControl().GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
     if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
-    if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted -and ($rule.FileSystemRights -band $danger)) { throw 'Credential ancestor permits replacement by another principal' }
+    if ($rule.AccessControlType -eq 'Allow' -and (Test-AnyUser $rule.IdentityReference.Value) -and ($rule.FileSystemRights -band $danger)) { throw 'Credential ancestor permits replacement by another principal' }
   }
 }
 function Assert-Chain([string]$target) {
+  $profile=[Environment]::GetFolderPath('UserProfile').TrimEnd('\')+'\'
+  $below=$null
   for ($p=$target; $p; $p=[IO.Path]::GetDirectoryName($p)) {
+    $item=$null
+    $root=$p -eq [IO.Path]::GetPathRoot($p)
     if (Test-Path -LiteralPath $p) {
       $item=Get-Item -LiteralPath $p -Force
       if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse points are not credential storage' }
-      if ($p -ne $target) { Assert-Ancestor $item ($p -eq [IO.Path]::GetPathRoot($p)) }
+      $shielded=$root -and $null -ne $below -and $below.FullName -ne $target -and $target.StartsWith($profile,[StringComparison]::OrdinalIgnoreCase) -and $profile.StartsWith($below.FullName.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase) -and $below.GetAccessControl().AreAccessRulesProtected
+      if ($p -ne $target) { Assert-Ancestor $item $root $shielded }
     }
-    if ($p -eq [IO.Path]::GetPathRoot($p)) { break }
+    if ($root) { break }
+    $below=$item
   }
 }
 function Assert-Owner($info) {
