@@ -102,7 +102,8 @@ export function createScheduledTaskTools(options: {
       const publicKey = Buffer.from(options.viewerKeyPair.publicKey).toString('base64');
       if (target.machineId !== options.machineId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
       if (!target.viewerPublicKey) {
-        await options.request({ operation: 'viewer_key', expectedKeyVersion: target.viewerKeyVersion, publicKey });
+        try { await options.request({ operation: 'viewer_key', expectedKeyVersion: target.viewerKeyVersion, publicKey }); }
+        catch { /* A lost receipt or concurrent writer may have installed this key; verify the exact key below. */ }
         target = automationTargetSchema.parse(await options.request({ operation: 'target' }));
       }
       if (target.machineId !== options.machineId || target.viewerPublicKey !== publicKey) throw new Error('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');

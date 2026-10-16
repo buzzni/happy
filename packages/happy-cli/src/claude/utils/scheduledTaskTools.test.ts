@@ -118,6 +118,23 @@ describe('current-Chat scheduled task tools', () => {
     await expect(f.tools.execute(create)).rejects.toThrow('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');
     expect(f.request.mock.calls.some(([r]) => ['create', 'viewer_key'].includes(r.operation))).toBe(false);
   });
+  it('recovers a lost or concurrent viewer key receipt only when rereading confirms the same key', async () => {
+    for (const conflict of [false, true]) {
+      const f = fixture(), original = f.request.getMockImplementation()!;
+      let registered = false;
+      f.request.mockImplementation(async input => {
+        if (input.operation === 'viewer_key') { registered = true; throw new Error('VIEWER_KEY_VERSION_CONFLICT'); }
+        const response = await original(input);
+        if (input.operation === 'target') response.viewerPublicKey = !registered ? null : Buffer.from(conflict ? machine.publicKey : viewer.publicKey).toString('base64');
+        return response;
+      });
+      if (conflict) {
+        await expect(f.tools.execute(create)).rejects.toThrow('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');
+        expect(f.request.mock.calls.some(([r]) => r.operation === 'create')).toBe(false);
+      } else expect(await f.tools.execute(create)).toMatchObject({ id: 'reservation', paused: false });
+      expect(f.request.mock.calls.filter(([r]) => r.operation === 'viewer_key')).toHaveLength(1);
+    }
+  });
 });
 
 describe('scheduled tool runtime authority and runner capability', () => {
