@@ -1,14 +1,14 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as protection from './standaloneLaunchJournal';
-import { mkdtemp, readFile, readdir, rm, stat, chmod, unlink, writeFile, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, chmod, unlink, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import nacl from 'tweetnacl';
 import { afterEach, expect, it, vi } from 'vitest';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 const homes: string[] = [];
-async function home() { const path = await mkdtemp(join(tmpdir(), 'device-keys-')); homes.push(path); return path; }
+async function home() { const base = process.platform === 'win32' && process.env.SAYCODE_DEVICE_KEYS_TEST_ROOT || tmpdir(); const path = await mkdtemp(join(base, 'device-keys-')); homes.push(path); return path; }
 afterEach(async () => { vi.restoreAllMocks(); for (const path of homes.splice(0)) await rm(path, { recursive: true, force: true }); });
 it('persists independent signing and recipient keys across reloads and machine IDs', async () => {
   const path = await home();
@@ -93,8 +93,9 @@ it('does not write private material or recover with fresh keys after protection 
   await expect(loadOrCreateDeviceKeys(path, 'machine').then(() => true)).rejects.toThrow('ACL failed');
   const directory = join(path, (await readdir(path))[0]);
   expect(await readdir(directory)).toEqual([]);
-  protect.mockRestore();
+  protect.mockResolvedValue(undefined); protect.mockClear();
   await expect(loadOrCreateDeviceKeys(path, 'machine').then(() => true)).rejects.toThrow(/reapproval/i);
+  expect(protect).not.toHaveBeenCalled();
 });
 it.skipIf(process.platform === 'win32')('refuses a hard-linked private key file', async () => {
   const path = await home(); await loadOrCreateDeviceKeys(path, 'machine');
@@ -111,4 +112,17 @@ it.skipIf(process.platform === 'win32')('refuses a FIFO without blocking the dae
   const script = `const {loadOrCreateDeviceKeys}=await import(${JSON.stringify(source)}); try { await loadOrCreateDeviceKeys(process.argv[1],'machine'); process.exitCode=1; } catch { console.log('refused'); }`;
   const result = await promisify(execFile)(process.execPath, ['--import','tsx','--input-type=module','-e',script,path], { timeout: 5000 });
   expect(result.stdout.trim()).toBe('refused');
+});
+
+it.skipIf(process.platform !== 'win32' || !process.env.SAYCODE_DEVICE_KEYS_TEST_ROOT)('initializes device keys when the committed path fits the Windows ACL limit', async () => {
+  // The caller supplies an already trusted private fixture root; never repair company TEMP.
+  const base = await mkdtemp(join(process.env.SAYCODE_DEVICE_KEYS_TEST_ROOT!, 'dk-')); homes.push(base);
+  const path = join(base, 'h'.repeat(170 - base.length - 1));
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const first = await loadOrCreateDeviceKeys(path, 'long-path-fixture');
+  const directory = join(path, (await readdir(path))[0]);
+  expect(directory.length).toBe(242);
+  expect(join(directory, 'keys.json').length).toBeLessThan(260);
+  expect(await readdir(directory)).toEqual(['keys.json']);
+  expect(await loadOrCreateDeviceKeys(path, 'long-path-fixture')).toEqual(first);
 });

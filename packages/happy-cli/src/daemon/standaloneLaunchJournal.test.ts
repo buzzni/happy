@@ -1,9 +1,10 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, linkSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, linkSync, mkdirSync, symlinkSync, existsSync } from 'node:fs';
+import { join, win32 } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
-import { StandaloneLaunchJournal } from './standaloneLaunchJournal';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { StandaloneLaunchJournal, protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 
 vi.mock('node:fs', async importOriginal => {
   const fs = await importOriginal<typeof import('node:fs')>();
@@ -13,6 +14,40 @@ const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 async function fixture(){const root=mkdtempSync(join(tmpdir(),'standalone-journal-'));roots.push(root);const directory=join(root,'launches');return {directory,journal:await StandaloneLaunchJournal.open(directory)};}
 const proof={stored:true,runtimeExited:true,jobEmpty:true};
+async function windowsGrant(directory: string, principal: string) {
+  const script = `$ErrorActionPreference='Stop'; $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:ACL_FIXTURE_PATH)); $a=Get-Acl -LiteralPath $p; $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($env:ACL_FIXTURE_SID),[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.AccessControlType]::Allow)); Set-Acl -LiteralPath $p -AclObject $a`;
+  await promisify(execFile)(win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+      windowsHide: true, timeout: 15000,
+      env: { ...process.env, ACL_FIXTURE_PATH: Buffer.from(directory).toString('base64'), ACL_FIXTURE_SID: principal },
+    });
+}
+it.skipIf(process.platform !== 'win32')('accepts an individual management principal on a Windows ancestor without allowing it on the protected leaf', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'journal-management-acl-')); roots.push(root);
+  const management = 'S-1-5-21-101-102-103-1001';
+  await windowsGrant(root, management);
+  const directory = join(root, 'observations');
+  await expect(protectStandaloneObservationDirectory(directory, true)).resolves.toBeUndefined();
+  await expect(protectStandaloneObservationDirectory(directory)).resolves.toBeUndefined();
+  await windowsGrant(directory, management);
+  await expect(protectStandaloneObservationDirectory(directory)).rejects.toThrow('ACL protection failed');
+}, 60000);
+it.skipIf(process.platform !== 'win32').each([
+  'S-1-1-0', 'S-1-2-0', 'S-1-2-1', 'S-1-5-1', 'S-1-5-2', 'S-1-5-4', 'S-1-5-7',
+  'S-1-5-11', 'S-1-5-13', 'S-1-5-14', 'S-1-5-15', 'S-1-5-32-545', 'S-1-5-32-546',
+  'S-1-5-32-555', 'S-1-5-21-101-102-103-513', 'S-1-5-21-101-102-103-514',
+])('rejects Windows ancestor replacement rights for broad principal %s', async principal => {
+  const root = mkdtempSync(join(tmpdir(), 'journal-broad-acl-')); roots.push(root);
+  await windowsGrant(root, principal);
+  await expect(protectStandaloneObservationDirectory(join(root, 'observations'), true)).rejects.toThrow('ACL protection failed');
+}, 30000);
+it.skipIf(process.platform !== 'win32')('rejects a Windows junction in the storage chain without changing its target', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'journal-reparse-acl-')); roots.push(root);
+  const target = join(root, 'target'); mkdirSync(target);
+  const link = join(root, 'linked'); symlinkSync(target, link, 'junction');
+  await expect(protectStandaloneObservationDirectory(join(link, 'observations'), true)).rejects.toThrow('ACL protection failed');
+  expect(existsSync(join(target, 'observations'))).toBe(false);
+}, 30000);
 it('keeps pending ownership across reopen and blocks another daemon generation',async()=>{
   const {journal,directory}=await fixture();await journal.reserve('instance-a','launch-a');
   const reopened=await StandaloneLaunchJournal.open(directory);
