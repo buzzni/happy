@@ -3,6 +3,8 @@ import {
     activateAutomationAdoption,
     adoptAutomation,
     createAutomation,
+    createRegisteredAutomation,
+    getRegisteredAutomation,
     deleteAutomation,
     getAutomationTarget,
     listAutomationRuns,
@@ -132,6 +134,49 @@ const createInput = {
 };
 
 describe('automationService', () => {
+    it('registers one paused ordinary reservation and recovers the same row on concurrent retries', async () => {
+        const { tx } = makeTx({ automation: null });
+        let stored: ReturnType<typeof automationRecord> | null = null;
+        tx.automation.createMany = vi.fn(async ({ data }: any) => {
+            if (stored) return { count: 0 };
+            stored = automationRecord(data[0]); return { count: 1 };
+        });
+        tx.automation.findUnique = vi.fn(async () => stored);
+        const input = { ...createInput, payloadVersion: 4, paused: true };
+        const results = await Promise.all(Array.from({ length: 3 }, () =>
+            createRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1', input)));
+        expect(results.every(result => result.ok)).toBe(true);
+        expect(new Set(results.map(result => result.ok && result.value.id)).size).toBe(1);
+        expect(tx.automation.createMany).toHaveBeenCalledWith(expect.objectContaining({ skipDuplicates: true }));
+        expect(tx.automationChange.create).toHaveBeenCalledTimes(1);
+        expect(stored).toMatchObject({ paused: true, payloadVersion: 4, ownerAccountId: 'editor-1' });
+        await expect(getRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1')).resolves.toEqual({ ok: true, value: stored });
+    });
+
+    it('never resurrects a deleted registration or rebinds it to a different target', async () => {
+        for (const patch of [{ deletedAt: new Date() }, { machineId: 'other' }, { projectId: 'other' }, { ownerAccountId: 'other' }]) {
+            const { tx } = makeTx();
+            tx.automation.createMany = vi.fn(async () => ({ count: 0 }));
+            tx.automation.findUnique = vi.fn(async () => automationRecord(patch));
+            await expect(createRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1', { ...createInput, payloadVersion: 4, paused: true }))
+                .resolves.toMatchObject({ ok: false, error: 'registration-conflict' });
+            expect(tx.automationChange.create).not.toHaveBeenCalled();
+        }
+    });
+
+    it('keeps registration reads readonly and refuses active creates, scripts and non-editors', async () => {
+        const { tx } = makeTx({ automation: null }); tx.automation.findUnique = vi.fn(async () => null);
+        await expect(getRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1')).resolves.toEqual({ ok: true, value: null });
+        expect(tx.automation.createMany).not.toHaveBeenCalled();
+        for (const input of [createInput, { ...createInput, payloadVersion: 4 }]) {
+            await expect(createRegisteredAutomation(tx as never, 'editor-1', 'project-1', 'registration-key-1', input)).resolves.toMatchObject({ ok: false });
+        }
+        const viewer = makeTx({ actorRole: 'viewer' });
+        await expect(createRegisteredAutomation(viewer.tx as never, 'editor-1', 'project-1', 'registration-key-1', { ...createInput, payloadVersion: 4, paused: true }))
+            .resolves.toEqual({ ok: false, error: 'forbidden' });
+        expect(viewer.tx.automation.createMany).not.toHaveBeenCalled();
+    });
+
     beforeEach(() => vi.clearAllMocks());
 
     it('lists only for an accepted project member', async () => {

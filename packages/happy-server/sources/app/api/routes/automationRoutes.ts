@@ -13,6 +13,8 @@ import {
     activateAutomationAdoption,
     adoptAutomation,
     createAutomation,
+    createRegisteredAutomation,
+    getRegisteredAutomation,
     deleteAutomation,
     getAutomationTarget,
     listAutomationRuns,
@@ -267,6 +269,29 @@ export function automationRoutes(app: Fastify) {
         const result = await listAutomationRuns(db, request.userId, request.params.projectId, request.query);
         if (!result.ok) return sendError(reply, result);
         return reply.send({ runs: result.value.map(serializeRun) });
+    });
+
+    const registrationParams = paramsSchema.extend({ registrationKey: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/) });
+    app.get('/v1/projects/:projectId/automations/registrations/:registrationKey', {
+        preHandler: app.authenticate, schema: { params: registrationParams },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        const result = await inTx(tx => getRegisteredAutomation(tx, request.userId, request.params.projectId, request.params.registrationKey));
+        if (!result.ok) return sendError(reply, result);
+        return reply.send({ automation: result.value ? serializeAutomation(result.value) : null });
+    });
+    app.put('/v1/projects/:projectId/automations/registrations/:registrationKey', {
+        preHandler: app.authenticate, schema: { params: registrationParams, body: createSchema.extend({ payloadVersion: z.literal(4), paused: z.literal(true) }).strict() },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        const body = request.body;
+        const result = await inTx(tx => createRegisteredAutomation(tx, request.userId, request.params.projectId, request.params.registrationKey, {
+            ...body, payloadCiphertext: decode(body.payloadCiphertext), viewerKeyEnvelope: decode(body.viewerKeyEnvelope), machineKeyEnvelope: decode(body.machineKeyEnvelope),
+        }));
+        if (!result.ok) return sendError(reply, result);
+        await emitAutomationUpdate(request.userId, { projectId: request.params.projectId, automationId: result.value.id,
+            revision: result.value.revision, generation: result.value.generation, reason: 'upsert' });
+        return reply.send({ automation: serializeAutomation(result.value) });
     });
 
     app.post('/v1/projects/:projectId/automations', {

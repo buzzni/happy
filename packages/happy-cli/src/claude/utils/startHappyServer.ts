@@ -41,6 +41,7 @@ import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 // for Claude, AcpSessionManager for ACP, …) consistently key the call
 // registry against the same name.
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
+import { runScheduledTaskTool, scheduledTaskToolRequestSchema } from './scheduledTaskTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
@@ -151,6 +152,22 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
             return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
         } catch (error) {
             const code = error instanceof Error && /^[A-Z0-9_-]{1,100}$/.test(error.message) ? error.message : 'SCRIPT_MANAGEMENT_FAILED';
+            return { isError: true, content: [{ type: 'text' as const, text: code }] };
+        }
+    }));
+
+    if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('scheduled_tasks', {
+        title: 'Manage AI Repeating Tasks',
+        description: 'Manage AI repeating tasks in the current Chat only. list/get/create/set_paused. List first and use the returned exact ID and revision; if the task or time is ambiguous, ask the user. create uses a stable registrationKey (16-128 letters, digits, _ or -) for the same request across retries, a name, prompt, and interval (minimum 15 minutes) or daily time in the execution PC timezone. Results accumulate in this ordinary conversation and inherit its AI/model. set_paused=true stops future runs, preserves history and does not abort a running turn; false resumes. Do not retry with a new key after uncertain creation. A registration receipt is not proof that its first run finished. Never install cron, hidden timers, or use script_automations for AI prompts.',
+        inputSchema: { request: scheduledTaskToolRequestSchema },
+    }, async ({ request }) => runTool(async () => {
+        try {
+            const metadata = handlers.client.getMetadata();
+            if (!metadata?.path || !metadata.machineId) throw new Error('SCHEDULED_TASK_CONTEXT_REQUIRED');
+            const result = await runScheduledTaskTool(request, { sessionId: handlers.client.sessionId, directory: metadata.path, machineId: metadata.machineId });
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        } catch (error) {
+            const code = error instanceof Error && /^[A-Z0-9_-]{1,100}$/.test(error.message) ? error.message : 'SCHEDULED_TASK_MANAGEMENT_FAILED';
             return { isError: true, content: [{ type: 'text' as const, text: code }] };
         }
     }));
@@ -637,7 +654,7 @@ export async function startHappyServer(
         mcpConfig,
         toolNames: [...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
-            : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
+            : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
             server.close(() => { if (privateDir) rmSync(privateDir, { recursive: true, force: true }); });
