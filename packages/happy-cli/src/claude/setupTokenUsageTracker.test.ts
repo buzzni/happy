@@ -66,6 +66,17 @@ describe('setup-token usage tracker (Saycode specs/claude-setup-token-account-se
     expect(tracker.observe({ status: 'rejected', rateLimitType: 'seven_day_opus', resetsAt: inSeconds(86_400_000) })).toBeNull()
   })
 
+  it('treats a refusal of the overage-inclusive weekly window or of overage as the whole account used up', () => {
+    // Claude Code reports these when the plan's quota and any extra usage are gone; no request on this account will pass.
+    const weekly = createSetupTokenUsageTracker(() => NOW)
+    expect(weekly.observe({ status: 'rejected', rateLimitType: 'seven_day_overage_included', resetsAt: inSeconds(86_400_000) })).toEqual({
+      exhausted: true,
+      observation: { observedAt: NOW, reason: 'rate-limited', retryAt: NOW + 86_400_000, windows: [{ kind: 'unified7d', pct: 100, resetsAt: NOW + 86_400_000 }] },
+    })
+    const overage = createSetupTokenUsageTracker(() => NOW)
+    expect(overage.observe({ status: 'rejected', rateLimitType: 'overage', resetsAt: inSeconds(3_600_000) })).toEqual({ exhausted: true, observation: null })
+  })
+
   it('reads a utilization just above 1 as full', () => {
     const tracker = createSetupTokenUsageTracker(() => NOW)
     expect(tracker.observe({ status: 'allowed', rateLimitType: 'five_hour', utilization: 1.02, resetsAt: inSeconds(60_000) })?.observation?.windows[0].pct).toBe(100)
