@@ -297,6 +297,8 @@ jobs:
         run: |
           brew list postgresql@16 >/dev/null 2>&1 || brew install postgresql@16
           npm install -g codex-multi-auth@2.16.0
+          npm install -g @openai/codex@0.162.1
+          codex --version
       - name: Verify legacy Chat and dataKey Project scheduled conversations
         timeout-minutes: 10
         env:
