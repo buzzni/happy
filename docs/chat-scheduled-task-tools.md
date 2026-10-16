@@ -30,3 +30,5 @@ The integration fixture owns isolated HOME/account/server/daemon processes and a
 Local verification on 2026-10-16: 41 server tests, 42 CLI/MCP tests, 32 existing wire tests, CLI/server/wire type checks, CLI build and one real PostgreSQL/server/daemon scenario passed. Studio's 195 related tests/targeted lint/type ratchet and Desktop's CLI ciphertext/read-update tests/native fixture were verified in their owning repositories. This does not establish an official release or production browser acceptance.
 
 Clean-code review (2026-10-16): same-ID/different-account machine credentials are refused; pause/resume and activation receipts must retain ID, ciphertext, key and ownership fields and advance revision/generation to the requested state. Malformed upstream responses return a server response error, not an input validation error. The initial viewer-key retry regression passed alongside the existing CLI/MCP cases.
+
+The runtime requires the current session's machine ID already provided by its MCP caller; it does not infer a different machine from global local settings.

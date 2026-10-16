@@ -5,7 +5,6 @@ import * as z from 'zod';
 import { automationPublicSchema, automationTargetSchema, decryptAutomationPayload, encryptAutomationPayload,
   scheduledTaskToolRequestSchema, type AutomationCryptoAdapter, type AutomationPublic, type ScheduledManagementRequest } from '@slopus/happy-wire';
 import { readLocalHappyAgentCredentials } from '@/resume/localHappyAgentAuth';
-import { readSettings } from '@/persistence';
 import { configuration } from '@/configuration';
 import { decodeBase64, decryptLegacy } from '@/api/encryption';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
@@ -124,9 +123,9 @@ export function createScheduledTaskTools(options: {
   } };
 }
 
-export async function runScheduledTaskTool(raw: unknown, session: { sessionId: string; directory: string; machineId?: string }) {
+export async function runScheduledTaskTool(raw: unknown, session: { sessionId: string; directory: string; machineId: string }) {
   const configured = process.env.HAPPY_APLUS_MCP_CONFIG_URL, credentials = readLocalHappyAgentCredentials();
-  const machineId = session.machineId ?? (await readSettings()).machineId;
+  const machineId = session.machineId;
   if (!configured || !credentials || !machineId) throw new Error('SCHEDULED_TASK_CONTEXT_REQUIRED');
   const url = new URL(configured);
   if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/api/me/mcp-config' || url.searchParams.has('project_id')) throw new Error('SCHEDULED_TASK_CHAT_REQUIRED');
