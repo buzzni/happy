@@ -26,3 +26,8 @@ export const scheduledManagementRequestSchema = z.discriminatedUnion('operation'
   z.strictObject({ operation: z.literal('set_paused'), automationId: identifier, expectedRevision: z.number().int().positive(), paused: z.boolean() }),
 ]);
 export type ScheduledManagementRequest = z.infer<typeof scheduledManagementRequestSchema>;
+
+/** Shared registration identity input; callers hash these UTF-8 bytes with SHA-256. */
+export function scheduledRegistrationIdentity(projectId: string, registrationKey: string): string {
+  return JSON.stringify([projectId, registrationKey]);
+}

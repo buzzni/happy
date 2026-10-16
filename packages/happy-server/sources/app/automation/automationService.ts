@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Automation, AutomationRun, Prisma } from '@prisma/client';
 import {
+    scheduledRegistrationIdentity,
     AUTOMATION_RUN_NOW_PROTOCOL_VERSION,
     AUTOMATION_SESSION_FOLLOWUP_PROTOCOL_VERSION,
 } from '@slopus/happy-wire';
@@ -383,7 +384,7 @@ export async function createAutomation(
 
 // A scope-bound ID makes a lost create response recoverable without adding a second scheduler or DB schema.
 function registrationId(projectId: string, registrationKey: string): string {
-    return `scheduled_${createHash('sha256').update(JSON.stringify([projectId, registrationKey])).digest('hex')}`;
+    return `scheduled_${createHash('sha256').update(scheduledRegistrationIdentity(projectId, registrationKey)).digest('hex')}`;
 }
 
 export async function getRegisteredAutomation(tx: Tx, actorId: string, projectId: string, registrationKey: string): Promise<AutomationServiceResult<Automation | null>> {
