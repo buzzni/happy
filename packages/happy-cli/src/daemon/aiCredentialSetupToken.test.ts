@@ -51,14 +51,24 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean } } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
   const files = options.files ?? new Map<string, string>()
   const syncEvents: string[] = []
-  const execFile = vi.fn(async (command: string, args: string[]): Promise<AiCredentialCommandResult> => {
+  const execFile = vi.fn(async (command: string, args: string[], commandOptions?: { signal?: AbortSignal }): Promise<AiCredentialCommandResult> => {
     calls.push({ command, args })
+    if (command === 'cswap' && args[0] === 'export' && options.hangingExport) {
+      const hanging = options.hangingExport
+      // A helper stuck under endpoint scanning: it ends only when the caller cancels it.
+      return new Promise((_, reject) => {
+        const cancel = () => { hanging.cancelled = true; reject(Object.assign(new Error('cancelled'), { kind: 'COMMAND_CANCELLED' })) }
+        if (commandOptions?.signal?.aborted) cancel()
+        commandOptions?.signal?.addEventListener('abort', cancel, { once: true })
+        setTimeout(() => reject(Object.assign(new Error('timed out'), { kind: 'COMMAND_TIMEOUT' })), 200)
+      })
+    }
     if (command === 'cswap' && kind === 'missing') throw Object.assign(new Error('not found'), { kind: 'COMMAND_NOT_AVAILABLE' })
     if (command === 'cswap' && args[0] === '--version') return { stdout: `cswap ${options.cswapVersion ?? '0.27.0b1'}`, stderr: '' }
     if (command === 'uv' && args[0] === 'python' && options.noUvPython) {
@@ -71,6 +81,12 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
       return { stdout: options.capabilities ? JSON.stringify(options.capabilities) : MARKER, stderr: '' }
     }
     if (command === 'cswap' && args[0] === 'list' && options.listFails) throw Object.assign(new Error('list failed'), { kind: 'COMMAND_FAILED' })
+    if (command === 'cswap' && args[0] === 'list' && options.overlap) {
+      // A slow helper start: give a concurrent export the chance to begin before this read finishes.
+      await new Promise(resolve => setTimeout(resolve, 20))
+      options.overlap.listSawExport.push(options.overlap.exportStarted)
+    }
+    if (command === 'cswap' && args[0] === 'export' && options.overlap) options.overlap.exportStarted = true
     // cswap keeps activeAccountNumber when the active slot is removed; it reads as active again once that number exists.
     if (command === 'cswap' && args[0] === 'list') return { stdout: JSON.stringify({ schemaVersion: 1, activeAccountNumber: state.slots.some(slot => slot.number === state.active) ? state.active : null,
       accounts: state.slots.map(({ credentials: _c, config: _f, ...row }) => ({ ...row, active: row.number === state.active })) }), stderr: '' }
@@ -364,6 +380,34 @@ describe('managed Claude setup-token runtime', () => {
       .toMatchObject({ success: false })
     await runtime.launchSession(env, () => spawnHappyCLI(['claude'], { env }))
     expect(crossSpawn).toHaveBeenLastCalledWith(expect.any(String), expect.any(Array), expect.objectContaining({ env }))
+  })
+
+  it('reads the slot roster and token export together for a launch, each helper start being expensive on Windows', async () => {
+    const overlap = { exportStarted: false, listSawExport: [] as boolean[] }
+    const { runtime } = fakeMachine([], null, { overlap })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    overlap.exportStarted = false
+    overlap.listSawExport.length = 0
+    const env = await runtime.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: A,
+      groupScope: 'company-1', credentialGeneration: 1, bindingGrant: bindingGrant() })
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(fakeToken('a'))
+    overlap.exportStarted = false
+    await runtime.launchSession(env, () => undefined)
+    expect(overlap.listSawExport.slice(-2)).toEqual([true, true])
+  })
+
+  it('cancels the token export still running when the roster read fails', async () => {
+    const hangingExport = { cancelled: false }
+    const options: Parameters<typeof fakeMachine>[2] = {}
+    const { runtime } = fakeMachine([], null, options)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    options.listFails = true
+    options.hangingExport = hangingExport
+
+    await expect(runtime.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: A,
+      groupScope: 'company-1', credentialGeneration: 1, bindingGrant: bindingGrant() })).rejects.toThrow()
+
+    expect(hangingExport.cancelled).toBe(true)
   })
 
   it('checks expiry after the final provider read and permits only one submitted spawn', async () => {

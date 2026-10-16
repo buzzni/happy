@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { logger } from '@/ui/logger';
 
 // Same SID/ancestor policy as Desktop windowsSecretAcl; this store owns no credential contents.
 const ACL_SCRIPT = String.raw`
@@ -109,6 +110,7 @@ const execFileAsync = promisify(execFile);
 async function protectDirectory(directory: string, initialize = false, archiveId = '') {
   if (process.platform === 'win32') {
     if (!/^[A-Za-z]:[\\/]/.test(directory)) throw new Error('Journal requires an absolute local path');
+    const startedAt = Date.now();
     try {
       await execFileAsync(win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
         ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(ACL_SCRIPT, 'utf16le').toString('base64')], {
@@ -116,6 +118,7 @@ async function protectDirectory(directory: string, initialize = false, archiveId
           env: { ...process.env, SAYCODE_ACL_PATH: Buffer.from(directory).toString('base64'), SAYCODE_ACL_INITIALIZE: initialize ? '1' : '0', SAYCODE_ACL_ARCHIVE_ID: archiveId },
         });
     } catch { throw new Error('Standalone journal ACL protection failed'); }
+    finally { logger.debug(`[timing] windows-acl dir=${win32.basename(directory)} initialize=${initialize} ${Date.now() - startedAt}ms`); }
   } else {
     try { if (initialize) mkdirSync(directory, { mode: 0o700 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }

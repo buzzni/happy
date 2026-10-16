@@ -1952,9 +1952,11 @@ export async function startDaemon(): Promise<void> {
         // `machine-personal` 은 이 머신의 자기 로그인을 고른 것이다. 관리 자격을
         // 해석해 두면 overlayManagedCredentialEnvironment 가 마지막에 덮어 항상
         // 이긴다 — 그래서 해석 자체를 하지 않는다.
+        const credentialStartedAt = Date.now();
         const managedAiCredentialEnvironment = honorsManagedAiCredentials(options.aiAuthSelection)
           ? await resolveManagedAiCredentialEnvironment(options.agent, options.aiAuthSelection)
           : {};
+        logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
             buildSpawnRequestEnvironment(authEnv, options.environmentVariables,
@@ -2413,7 +2415,9 @@ export async function startDaemon(): Promise<void> {
         return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
       }
       // Native preparation creates a suspended root; authorize execution at resume below.
+      const prepareStartedAt = Date.now();
       const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
+      if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
       const startupLogFileName = 'daemon-session-startup.log';
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(managedAiCredentialEnvironment,
@@ -2465,7 +2469,9 @@ export async function startDaemon(): Promise<void> {
       if (prepared) {
         try {
           if (!standaloneWindows?.owner.acceptingLaunches) throw new Error('Standalone launch frozen before resume');
+          const resumeStartedAt = Date.now();
           await launchManagedAiCredentialSession(managedAiCredentialEnvironment, () => prepared.resume()); resumed = true;
+          logger.debug(`[timing] spawn windows-resume ${Date.now() - resumeStartedAt}ms`);
         }
         catch (error) { webhookCancellation.abort(); prepared.cancelBeforeResume?.(); throw error; }
       }
