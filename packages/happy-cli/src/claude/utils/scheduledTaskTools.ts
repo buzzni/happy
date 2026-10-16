@@ -3,11 +3,13 @@ import { isDeepStrictEqual } from 'node:util';
 import nacl from 'tweetnacl';
 import * as z from 'zod';
 import { automationPublicSchema, automationTargetSchema, decryptAutomationPayload, encryptAutomationPayload,
-  scheduledTaskToolRequestSchema, type AutomationCryptoAdapter, type AutomationPublic, type ScheduledManagementRequest } from '@slopus/happy-wire';
+  scheduledManagementAutomationSchema, scheduledTaskToolRequestSchema, type AutomationCryptoAdapter, type AutomationPublic, type ScheduledManagementRequest } from '@slopus/happy-wire';
 import { readLocalHappyAgentCredentials } from '@/resume/localHappyAgentAuth';
 import { configuration } from '@/configuration';
-import { decodeBase64, decryptLegacy } from '@/api/encryption';
+import { decodeBase64, decryptLegacy, decryptWithDataKey } from '@/api/encryption';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
+import { readCredentials } from '@/persistence';
+import { readMachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
 
 export { scheduledTaskToolRequestSchema } from '@slopus/happy-wire';
 const crypto: AutomationCryptoAdapter = {
@@ -20,16 +22,35 @@ const crypto: AutomationCryptoAdapter = {
   encodeBase64: (value, urlSafe) => Buffer.from(value).toString(urlSafe ? 'base64url' : 'base64'),
   decodeBase64: value => new Uint8Array(Buffer.from(value, 'base64')),
 };
-const rowResponse = z.object({ automation: automationPublicSchema.nullable() });
 export function createScheduledTaskTools(options: {
-  projectId: string; sessionId: string; machineId: string; directory: string; viewerKeyPair: nacl.BoxKeyPair;
+  projectId: string; sessionId: string; machineId: string; directory: string;
+  viewerKeyPair?: nacl.BoxKeyPair; viewerPublicKey?: Uint8Array; machineKey?: { publicKey: Uint8Array; secretKey: Uint8Array; registeredKeyVersion: number };
   request(input: ScheduledManagementRequest): Promise<unknown>;
   ensureExecutionSupported(): Promise<void>;
 }) {
+  const viewerPublicKey = options.viewerKeyPair?.publicKey ?? options.viewerPublicKey;
+  if (!viewerPublicKey || (!options.viewerKeyPair && !options.machineKey)) throw new Error('SCHEDULED_TASK_CREDENTIALS_REQUIRED');
+  const responseRow = options.machineKey ? scheduledManagementAutomationSchema : automationPublicSchema;
+  const rowResponse = z.object({ automation: responseRow.nullable() });
+  function verifyMachine(target: z.infer<typeof automationTargetSchema>) {
+    if (target.machineId !== options.machineId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
+    if (options.machineKey && (target.machinePublicKey !== crypto.encodeBase64(options.machineKey.publicKey)
+      || target.machineKeyVersion !== options.machineKey.registeredKeyVersion)) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+  }
   async function payload(row: AutomationPublic) {
     if (row.projectId !== options.projectId || row.machineId !== options.machineId || row.payloadVersion !== 4) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
-    const value = await decryptAutomationPayload({ ...row, keyEnvelope: row.viewerKeyEnvelope, recipientSecretKey: options.viewerKeyPair.secretKey, crypto });
-    if (!value.conversation || value.directory !== options.directory) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
+    let keyEnvelope = row.viewerKeyEnvelope, secretKey = options.viewerKeyPair?.secretKey;
+    if (options.machineKey) {
+      const target = automationTargetSchema.parse(await options.request({ operation: 'read_target' }));
+      verifyMachine(target);
+      if (target.viewerPublicKey !== crypto.encodeBase64(viewerPublicKey!) || row.machineKeyVersion !== target.machineKeyVersion
+        || row.machineAccountId !== target.machineAccountId) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+      keyEnvelope = scheduledManagementAutomationSchema.parse(row).machineKeyEnvelope;
+      secretKey = options.machineKey.secretKey;
+    }
+    const value = await decryptAutomationPayload({ ...row, keyEnvelope, recipientSecretKey: secretKey!, crypto });
+    if (!value.conversation || value.directory !== options.directory
+      || !options.projectId.startsWith('chat:') && value.conversation.sessionId !== options.sessionId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
     return value;
   }
   async function summary(row: AutomationPublic) {
@@ -51,7 +72,7 @@ export function createScheduledTaskTools(options: {
   return { async execute(raw: unknown): Promise<unknown> {
     const input = scheduledTaskToolRequestSchema.parse(raw);
     if (input.operation === 'list') {
-      const rows = z.object({ automations: z.array(automationPublicSchema) }).parse(await options.request(input)).automations;
+      const rows = z.object({ automations: z.array(responseRow) }).parse(await options.request(input)).automations;
       return Promise.all(rows.map(summary));
     }
     if (input.operation === 'get') return summary(await read(input.automationId));
@@ -97,16 +118,25 @@ export function createScheduledTaskTools(options: {
     }
     let encrypted: z.infer<typeof import('@slopus/happy-wire').scheduledTaskEncryptedCreateSchema>;
     {
-      let target = automationTargetSchema.parse(await options.request({ operation: 'target' }));
-      const publicKey = Buffer.from(options.viewerKeyPair.publicKey).toString('base64');
-      if (target.machineId !== options.machineId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
+      let rawTarget: unknown;
+      if (options.machineKey) {
+        try { rawTarget = await options.request({ operation: 'read_target' }); }
+        catch (error) {
+          if (!(error instanceof Error) || !['NOT_FOUND', 'AUTOMATION_TARGET_UNAVAILABLE'].includes(error.message)) throw error;
+          rawTarget = await options.request({ operation: 'target' });
+        }
+      } else rawTarget = await options.request({ operation: 'target' });
+      let target = automationTargetSchema.parse(rawTarget);
+      const publicKey = Buffer.from(viewerPublicKey).toString('base64');
+      verifyMachine(target);
       if (!target.viewerPublicKey) {
         try { await options.request({ operation: 'viewer_key', expectedKeyVersion: target.viewerKeyVersion, publicKey }); }
         catch { /* A lost receipt or concurrent writer may have installed this key; verify the exact key below. */ }
-        target = automationTargetSchema.parse(await options.request({ operation: 'target' }));
+        target = automationTargetSchema.parse(await options.request({ operation: options.machineKey ? 'read_target' : 'target' }));
       }
+      verifyMachine(target);
       if (target.machineId !== options.machineId || target.viewerPublicKey !== publicKey) throw new Error('SCHEDULED_TASK_VIEWER_KEY_MISMATCH');
-      encrypted = { ...await encryptAutomationPayload({ payload: intended, viewer: { publicKey: options.viewerKeyPair.publicKey, keyVersion: target.viewerKeyVersion },
+      encrypted = { ...await encryptAutomationPayload({ payload: intended, viewer: { publicKey: viewerPublicKey, keyVersion: target.viewerKeyVersion },
         machine: { publicKey: crypto.decodeBase64(target.machinePublicKey), keyVersion: target.machineKeyVersion }, crypto }), payloadVersion: 4, paused: true };
     }
     let row: AutomationPublic;
@@ -126,31 +156,53 @@ export function createScheduledTaskTools(options: {
 export async function runScheduledTaskTool(raw: unknown, session: { sessionId: string; directory: string; machineId: string }) {
   const configured = process.env.HAPPY_APLUS_MCP_CONFIG_URL, credentials = readLocalHappyAgentCredentials();
   const machineId = session.machineId;
-  if (!configured || !credentials || !machineId) throw new Error('SCHEDULED_TASK_CONTEXT_REQUIRED');
+  if (!configured) throw new Error('SCHEDULED_TASK_CONFIG_REQUIRED');
+  if (!machineId) throw new Error('SCHEDULED_TASK_MACHINE_CONTEXT_REQUIRED');
+  const dataCredentials = credentials ? null : await readCredentials();
+  const encryption = dataCredentials?.encryption.type === 'dataKey' ? dataCredentials.encryption : null;
+  if (!credentials && !encryption) throw new Error('SCHEDULED_TASK_CREDENTIALS_REQUIRED');
+  const machineKey = encryption ? readMachineAutomationKey(configuration.automationKeyFile) : undefined;
+  if (encryption && (!machineKey || machineKey.registeredKeyVersion < 1)) throw new Error('SCHEDULED_TASK_MACHINE_KEY_REQUIRED');
+  const token = credentials?.token ?? dataCredentials!.token;
   const url = new URL(configured);
-  if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/api/me/mcp-config' || url.searchParams.has('project_id')) throw new Error('SCHEDULED_TASK_CHAT_REQUIRED');
-  await refreshMcpCallerGrantIfExpiring(credentials.token, machineId);
+  if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/api/me/mcp-config') throw new Error('SCHEDULED_TASK_CHAT_REQUIRED');
+  const projectId = url.searchParams.get('project_id');
+  if (!process.env.HAPPY_APLUS_MCP_CALLER_GRANT) throw new Error('SCHEDULED_TASK_CALLER_GRANT_REQUIRED');
+  await refreshMcpCallerGrantIfExpiring(token, machineId);
   const callerGrant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
-  let chatId: string | undefined;
-  try { chatId = z.object({ personalChatId: z.string().min(1).max(200), projectId: z.null() }).parse(JSON.parse(Buffer.from(callerGrant?.split('.')[0] ?? '', 'base64url').toString('utf8'))).personalChatId; }
-  catch { throw new Error('SCHEDULED_TASK_CHAT_REQUIRED'); }
-  const tools = createScheduledTaskTools({ projectId: `chat:${chatId}`, sessionId: session.sessionId, directory: session.directory, machineId,
-    viewerKeyPair: credentials.contentKeyPair,
+  if (!callerGrant) throw new Error('SCHEDULED_TASK_CALLER_GRANT_REQUIRED');
+  let scope: string;
+  try {
+    const claim = z.object({ personalChatId: z.string().min(1).max(200).nullable(), projectId: z.string().min(1).max(200).nullable() })
+      .parse(JSON.parse(Buffer.from(callerGrant.split('.')[0], 'base64url').toString('utf8')));
+    if (projectId ? claim.projectId !== projectId || claim.personalChatId !== null : claim.projectId !== null || !claim.personalChatId) throw new Error();
+    scope = projectId ?? `chat:${claim.personalChatId}`;
+  } catch { throw new Error('SCHEDULED_TASK_CHAT_REQUIRED'); }
+  const tools = createScheduledTaskTools({ projectId: scope, sessionId: session.sessionId, directory: session.directory, machineId,
+    ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, machineKey: machineKey! }),
     ensureExecutionSupported: async () => {
       if (configuration.machineControl === 'strict') throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
       const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`, {
-        headers: { Authorization: `Bearer ${credentials.token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
+        headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
       if (!response.ok) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
       const machine = z.object({ machine: z.object({ id: z.string(), metadata: z.string() }) }).parse(await response.json()).machine;
       if (machine.id !== machineId) throw new Error('SCHEDULED_TASK_SCOPE_MISMATCH');
-      const metadata = decryptLegacy(decodeBase64(machine.metadata), credentials.secret);
+      const metadata = credentials ? decryptLegacy(decodeBase64(machine.metadata), credentials.secret) : decryptWithDataKey(decodeBase64(machine.metadata), encryption!.machineKey);
       if (metadata?.automationSupport?.conversation !== true || metadata?.automationSupport?.serverBacked !== true) throw new Error('SCHEDULED_TASK_RUNNER_UNSUPPORTED');
       if (metadata.automationSupport.authenticatedEnvelopes?.required) throw new Error('SCHEDULED_TASK_SEALING_UNSUPPORTED');
+      if (machineKey) {
+        const response = await fetch(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}/automation-reader-key`, {
+          headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(10000) });
+        if (!response.ok) throw new Error('SCHEDULED_TASK_MACHINE_KEY_UNAVAILABLE');
+        const key = z.object({ machineId: z.string(), publicKey: z.string(), keyVersion: z.number().int().positive() }).parse(await response.json());
+        if (key.machineId !== machineId || key.publicKey !== crypto.encodeBase64(machineKey.publicKey)
+          || key.keyVersion !== machineKey.registeredKeyVersion) throw new Error('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+      }
     },
     request: async request => {
       const response = await fetch(new URL('/api/automation/scheduled-management', url), { method: 'POST', redirect: 'error',
-        headers: { Authorization: `Bearer ${credentials.token}`, 'X-Aplus-Caller-Grant': callerGrant!, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ machineId, sessionId: session.sessionId, request }), signal: AbortSignal.timeout(15000) });
+        headers: { Authorization: `Bearer ${token}`, 'X-Aplus-Caller-Grant': callerGrant!, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ machineId, sessionId: session.sessionId, ...(projectId ? { projectId, directory: session.directory } : {}), request }), signal: AbortSignal.timeout(15000) });
       const value = await response.json() as { error?: unknown };
       if (!response.ok) throw new Error(typeof value.error === 'string' && /^[A-Z0-9_-]{1,100}$/.test(value.error) ? value.error : 'SCHEDULED_TASK_UNAVAILABLE');
       return value;

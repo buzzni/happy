@@ -9,7 +9,7 @@ const db = vi.hoisted(() => ({
     project: { findUnique: vi.fn() },
     projectMember: { findUnique: vi.fn() },
     machine: { findUnique: vi.fn() },
-    automation: { findMany: vi.fn() },
+    automation: { findMany: vi.fn(), findUnique: vi.fn() },
     automationRun: { findMany: vi.fn() },
 }));
 vi.mock('@/storage/db', () => ({ db }));
@@ -92,6 +92,40 @@ describe('automation reads without interactive transaction expiry', () => {
             where: { automation: { projectId: 'project-1' }, automationId: 'automation-1' },
             orderBy: [{ claimedAt: 'desc' }, { scheduledFor: 'desc' }], take: 100,
         });
+    });
+
+    it('reads an existing machine public key without creating a project or rotating a key', async () => {
+        db.machine.findUnique.mockResolvedValue({ id: 'machine-1', accountId: 'reader', automationPublicKey: new Uint8Array(32).fill(7), automationKeyVersion: 3 });
+        const response = await app.inject({ method: 'GET', url: '/v1/machines/machine-1/automation-reader-key' });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toEqual({ machineId: 'machine-1', machineAccountId: 'reader', publicKey: Buffer.alloc(32, 7).toString('base64'), keyVersion: 3 });
+        expect(db.machine.findUnique).toHaveBeenCalledWith({ where: { accountId_id: { accountId: 'reader', id: 'machine-1' } }, select: { id: true, automationPublicKey: true, automationKeyVersion: true } });
+        expect(db.project.findUnique).not.toHaveBeenCalled();
+        db.machine.findUnique.mockResolvedValue(null);
+        expect((await app.inject({ method: 'GET', url: '/v1/machines/machine-1/automation-reader-key' })).statusCode).toBe(404);
+    });
+
+    it('returns a machine envelope only to its owner on the currently bound machine', async () => {
+        const url = '/v1/projects/project-1/automations/reservation/management?machineId=machine-1';
+        expect((await app.inject({ method: 'GET', url })).statusCode).toBe(403);
+        expect(db.automation.findUnique).not.toHaveBeenCalled();
+        db.project.findUnique.mockResolvedValue({ id: 'project-1', accountId: 'reader', config: { machineId: 'machine-1' } });
+        db.machine.findUnique.mockResolvedValue({ id: 'machine-1', accountId: 'reader', automationPublicKey: new Uint8Array(32), automationKeyVersion: 1, automationProtocolVersion: 1 });
+        const now = new Date();
+        const row = { id: 'reservation', projectId: 'project-1', ownerAccountId: 'reader', machineAccountId: 'reader', machineId: 'machine-1', payloadVersion: 4, deletedAt: null,
+            payloadCiphertext: new Uint8Array([1]), viewerKeyEnvelope: new Uint8Array([2]), machineKeyEnvelope: new Uint8Array([3]), enabledAt: now, createdAt: now, updatedAt: now };
+        db.automation.findUnique.mockResolvedValue(row);
+        const response = await app.inject({ method: 'GET', url });
+        expect(response.statusCode).toBe(200);
+        expect(response.json().automation.machineKeyEnvelope).toBe('Aw==');
+        db.automation.findMany.mockResolvedValue([row]);
+        expect((await app.inject({ method: 'GET', url: '/v1/projects/project-1/automations' })).json().automations[0]).not.toHaveProperty('machineKeyEnvelope');
+        for (const change of [{ machineId: 'other' }, { ownerAccountId: 'other' }, { machineAccountId: 'other' }, { deletedAt: now }]) {
+            db.automation.findUnique.mockResolvedValue({ ...row, ...change });
+            const denied = await app.inject({ method: 'GET', url });
+            expect(denied.statusCode).toBe(403);
+            expect(denied.json()).not.toHaveProperty('automation');
+        }
     });
 
     it('retains interactive transactions for writes', async () => {

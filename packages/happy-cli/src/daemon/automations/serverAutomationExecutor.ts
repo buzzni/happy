@@ -164,7 +164,7 @@ export interface ServerAutomationExecutorInput {
    * 현재 HEAD 를 읽는다. 읽지 못하면 null 이고, 그때는 재개하지 않는다.
    */
   readHeadSha?: (input: { directory: string }) => Promise<string | null>
-  resolveProjectEnvironment: (input: { runId: string; claimToken: string; conversationSessionId?: string }) => Promise<AutomationProjectEnvironmentResult>
+  resolveProjectEnvironment: (input: { runId: string; claimToken: string; conversationSessionId?: string; conversationDirectory?: string }) => Promise<AutomationProjectEnvironmentResult>
   resolveMcpSpawnContext: (input: {
     runId: string
     claimToken: string
@@ -1608,7 +1608,8 @@ async function executeStartedRun(
     }
   }
   if (payload.conversation) {
-    const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId })
+    const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId,
+      ...(!mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
     if (!authority.ok) return { outcome: 'ERROR', sessionId: null, failureCode: authority.code ?? 'CONVERSATION_TARGET_UNAVAILABLE' }
   }
   const initialPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)

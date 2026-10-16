@@ -4251,6 +4251,21 @@ describe('ordinary scheduled conversation execution', () => {
     expect(deliver).toHaveBeenCalledTimes(3); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
     expect(f.input.resolveProjectEnvironment).toHaveBeenCalledWith({ runId: 'r', claimToken: 't', conversationSessionId: 'ordinary' });
   });
+  it('revalidates the Project directory on each timer and never delivers after access is revoked', async () => {
+    const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
+    f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'project', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32));
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } });
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' })); f.input.deliverConversation = deliver;
+    const authority = vi.fn(async () => ({ ok: true as const, environmentVariables: {} })); f.input.resolveProjectEnvironment = authority;
+    await runServerAutomationTick(f.input);
+    expect(authority).toHaveBeenCalledWith({ runId: 'r', claimToken: 't', conversationSessionId: 'ordinary', conversationDirectory: base.directory });
+    expect(deliver).toHaveBeenCalledOnce();
+    f.input.now += 15 * 60000;
+    f.input.resolveProjectEnvironment = async () => ({ ok: false, error: 'access revoked' });
+    await runServerAutomationTick(f.input);
+    expect(deliver).toHaveBeenCalledOnce(); expect(f.spawnSession).not.toHaveBeenCalled(); expect(f.resumeSession).not.toHaveBeenCalled();
+  });
   it('does not spawn a replacement when ordinary delivery fails', async () => {
     const f = setup({ claim: { ok: true, value: { runId: 'r', claimToken: 't' } } });
     f.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } });

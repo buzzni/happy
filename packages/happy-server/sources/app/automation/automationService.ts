@@ -269,6 +269,20 @@ export async function listAutomations(
     return { ok: true, value: rows };
 }
 
+/** Owner-only machine reader used after Studio verifies its conversation binding. */
+export async function getAutomationManagement(tx: Tx, actorId: string, projectId: string, automationId: string, machineId: string): Promise<AutomationServiceResult<Automation>> {
+    const access = await projectAccess(tx, actorId, projectId);
+    if (!access) return { ok: false, error: 'not-found' };
+    if (access.project.accountId !== actorId) return { ok: false, error: 'forbidden' };
+    const target = await targetForProject(tx, access.project);
+    if (!target || target.machineId !== machineId) return { ok: false, error: 'forbidden' };
+    const row = await tx.automation.findUnique({ where: { id: automationId } });
+    if (!row) return { ok: false, error: 'not-found' };
+    if (row.projectId !== projectId || row.ownerAccountId !== actorId || row.machineId !== machineId
+        || row.machineAccountId !== target.machineAccountId || row.payloadVersion !== 4 || row.deletedAt) return { ok: false, error: 'forbidden' };
+    return { ok: true, value: row };
+}
+
 export async function listAutomationRuns(
     tx: Tx,
     actorId: string,

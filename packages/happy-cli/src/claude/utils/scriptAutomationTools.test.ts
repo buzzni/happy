@@ -4,11 +4,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import nacl from 'tweetnacl';
 import { decryptScriptValue, encryptScriptValue, openScriptValueForMachine } from '@slopus/happy-wire';
-import { createScriptAutomationTools, resolveScriptAutomationScope } from './scriptAutomationTools';
+import { createScriptAutomationTools, resolveScriptAutomationScope, runScriptAutomationTool } from './scriptAutomationTools';
+const runtime = vi.hoisted(() => ({ credentials: vi.fn(), machineCredentials: vi.fn(async (): Promise<unknown> => null), settings: vi.fn(async () => ({})), refresh: vi.fn(async () => false) }));
+vi.mock('@/resume/localHappyAgentAuth', () => ({ readLocalHappyAgentCredentials: runtime.credentials }));
+vi.mock('@/persistence', async () => ({ ...await vi.importActual<typeof import('@/persistence')>('@/persistence'), readCredentials: runtime.machineCredentials, readSettings: runtime.settings }));
+vi.mock('@/aplus/refreshMcpCallerGrant', () => ({ refreshMcpCallerGrantIfExpiring: runtime.refresh }));
 let directory: string;
 const pair = nacl.box.keyPair();
 beforeEach(async () => { directory = await mkdtemp(join(tmpdir(), 'script-agent-')); });
-afterEach(async () => { await rm(directory, { recursive: true, force: true }); });
+afterEach(async () => { await rm(directory, { recursive: true, force: true }); vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 function setup(localAutomationKey?: nacl.BoxKeyPair) {
   const rows: any[] = [];
   const request = vi.fn(async (body: any): Promise<any> => {
@@ -115,4 +119,40 @@ it('has no scope when neither the config URL nor the grant names a project or Ch
   expect(resolveScriptAutomationScope('https://saycode.ai/api/me/mcp-config', grantWith({ projectId: null, personalChatId: null }))).toBeNull();
   expect(resolveScriptAutomationScope('https://saycode.ai/api/me/mcp-config', 'not-a-grant')).toBeNull();
   expect(resolveScriptAutomationScope('https://saycode.ai/api/me/mcp-config', undefined)).toBeNull();
+});
+
+function runtimeFixture() {
+  runtime.credentials.mockReturnValue({ token: 'fixture-only-token', secret: nacl.randomBytes(32), contentKeyPair: pair });
+  runtime.machineCredentials.mockResolvedValue(null);
+  runtime.settings.mockResolvedValue({});
+  runtime.refresh.mockClear();
+  vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config?project_id=project');
+  vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', grantWith({ projectId: 'project' }));
+  const fetch = vi.fn();
+  vi.stubGlobal('fetch', fetch);
+  return { fetch, session: { directory, machineId: 'pc' } };
+}
+
+it('identifies dataKey-only script credentials without refreshing or contacting a server', async () => {
+  const f = runtimeFixture();
+  runtime.credentials.mockReturnValue(null);
+  runtime.machineCredentials.mockResolvedValue({ token: 'fixture-only-token', encryption: { type: 'dataKey', publicKey: pair.publicKey, machineKey: nacl.randomBytes(32) } });
+  await expect(runScriptAutomationTool({ operation: 'list' }, f.session)).rejects.toThrow('SCRIPT_CREDENTIALS_UNSUPPORTED');
+  expect(runtime.refresh).not.toHaveBeenCalled();
+  expect(f.fetch).not.toHaveBeenCalled();
+});
+
+it('distinguishes missing script configuration, machine identity, credentials and grant before a request', async () => {
+  const f = runtimeFixture();
+  vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', '');
+  await expect(runScriptAutomationTool({ operation: 'list' }, f.session)).rejects.toThrow('SCRIPT_CONFIG_REQUIRED');
+  vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config?project_id=project');
+  await expect(runScriptAutomationTool({ operation: 'list' }, { directory })).rejects.toThrow('SCRIPT_MACHINE_CONTEXT_REQUIRED');
+  runtime.credentials.mockReturnValue(null);
+  await expect(runScriptAutomationTool({ operation: 'list' }, f.session)).rejects.toThrow('SCRIPT_CREDENTIALS_REQUIRED');
+  runtime.credentials.mockReturnValue({ token: 'fixture-only-token', secret: nacl.randomBytes(32), contentKeyPair: pair });
+  vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', '');
+  await expect(runScriptAutomationTool({ operation: 'list' }, f.session)).rejects.toThrow('SCRIPT_CALLER_GRANT_REQUIRED');
+  expect(runtime.refresh).not.toHaveBeenCalled();
+  expect(f.fetch).not.toHaveBeenCalled();
 });

@@ -7,7 +7,7 @@ import type nacl from 'tweetnacl';
 import { decryptScriptValue, encryptScriptValue, scriptAdmissionSchema, scriptAutomationPayloadSchema,
   scriptEncryptedValueSchema, scriptScheduleSchema, type ScriptAutomationPayload, type ScriptManagementRequest } from '@slopus/happy-wire';
 import { readLocalHappyAgentCredentials } from '@/resume/localHappyAgentAuth';
-import { readSettings } from '@/persistence';
+import { readCredentials, readSettings } from '@/persistence';
 import { configuration } from '@/configuration';
 import { readMachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
@@ -144,12 +144,18 @@ export async function runScriptAutomationTool(raw: unknown, session: { directory
   const configUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL;
   const credentials = readLocalHappyAgentCredentials();
   const machineId = session.machineId ?? (await readSettings()).machineId;
-  if (!configUrl || !credentials || !machineId) throw new Error('SCRIPT_AGENT_CONTEXT_REQUIRED');
+  if (!configUrl) throw new Error('SCRIPT_CONFIG_REQUIRED');
+  if (!machineId) throw new Error('SCRIPT_MACHINE_CONTEXT_REQUIRED');
+  if (!credentials) {
+    const machineCredentials = await readCredentials();
+    throw new Error(machineCredentials?.encryption.type === 'dataKey' ? 'SCRIPT_CREDENTIALS_UNSUPPORTED' : 'SCRIPT_CREDENTIALS_REQUIRED');
+  }
   const url = new URL(configUrl);
+  if (!process.env.HAPPY_APLUS_MCP_CALLER_GRANT) throw new Error('SCRIPT_CALLER_GRANT_REQUIRED');
   // The grant refresh keeps the grant's own scope; it reads project_id from the config URL itself.
   await refreshMcpCallerGrantIfExpiring(credentials.token, machineId);
   const callerGrant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
-  if (!callerGrant) throw new Error('SCRIPT_AGENT_CONTEXT_REQUIRED');
+  if (!callerGrant) throw new Error('SCRIPT_CALLER_GRANT_REQUIRED');
   const projectId = resolveScriptAutomationScope(configUrl, callerGrant);
   if (!projectId) throw new Error('SCRIPT_PROJECT_CONTEXT_REQUIRED');
   const client = createScriptAutomationTools({ projectId, directory: session.directory, viewerKeyPair: credentials.contentKeyPair,

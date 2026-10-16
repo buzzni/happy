@@ -66,3 +66,13 @@ it('requires the server to confirm the exact ordinary session, including on old 
   fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ projectId: 'chat:c', environmentVariables: {}, conversationSessionId: 's1' })));
   expect(await fetchAutomationProjectEnvironment({ ...input, conversationSessionId: 's1' })).toMatchObject({ ok: true });
 });
+
+it('confirms the encrypted conversation directory before dispatch, including with older servers', async () => {
+  const body = { projectId: 'project', environmentVariables: {}, conversationSessionId: 's' };
+  const request = vi.fn(async (_url: string, _init: RequestInit) => Response.json(body)); vi.stubGlobal('fetch', request);
+  const projectInput = { ...input, conversationSessionId: 's', conversationDirectory: '/work/project' };
+  expect(await fetchAutomationProjectEnvironment(projectInput)).toMatchObject({ ok: false });
+  request.mockResolvedValueOnce(Response.json({ ...body, conversationDirectory: '/work/project' }));
+  expect(await fetchAutomationProjectEnvironment(projectInput)).toMatchObject({ ok: true });
+  expect(JSON.parse(request.mock.calls[0][1].body as string)).toMatchObject({ conversationDirectory: '/work/project' });
+});
