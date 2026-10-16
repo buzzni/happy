@@ -11,10 +11,35 @@ import {
   runAiCredentialCommand,
   selectLeastRemainingCodexAccounts,
   syncDirectoryForDurability,
+  timeAiCredentialCommand,
   withUvToolBinOnPath,
   type AiCredentialCommandResult,
   type AiCredentialRuntimeDependencies,
 } from './aiCredentialRuntime'
+
+describe('timeAiCredentialCommand', () => {
+  it('logs each helper duration with word-shaped subcommands only', async () => {
+    const lines: string[] = []
+    let clock = 1_000
+    const run = timeAiCredentialCommand(async () => { clock += 2_400; return 'done' }, () => clock, line => lines.push(line))
+
+    await expect(run('cswap', ['import', 'C:\\Users\\me\\AppData\\Local\\Temp\\slot.json', '--force'])).resolves.toBe('done')
+    await run('cswap', ['switch', '3', '--force', '--json'])
+
+    expect(lines).toEqual([
+      '[timing] ai-credential-command cswap import ok 2400ms',
+      '[timing] ai-credential-command cswap switch ok 2400ms',
+    ])
+  })
+
+  it('still logs the duration when the helper fails', async () => {
+    const lines: string[] = []
+    const run = timeAiCredentialCommand(async () => { throw new Error('boom') }, () => 5, line => lines.push(line))
+
+    await expect(run('cswap', ['list', '--json'])).rejects.toThrow('boom')
+    expect(lines).toEqual(['[timing] ai-credential-command cswap list --json failed 0ms'])
+  })
+})
 
 describe('syncDirectoryForDurability', () => {
   it('skips directory fsync on Windows, where it fails with EPERM and would refuse every setup-token spawn', async () => {

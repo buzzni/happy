@@ -310,6 +310,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             metadata: initialMachineMetadata
         });
     }
+    logger.debug(`[timing] child machine-ready uptime=${Math.round(process.uptime() * 1000)}ms`);
 
     // Lineage from the daemon's spawn RPC (set by app-side fork / duplicate).
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
@@ -1686,6 +1687,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                     logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
                 } else {
                     logger.debug(`[START] Reported session ${response.id} to daemon`);
+                    logger.debug(`[timing] child reported-to-daemon uptime=${Math.round(process.uptime() * 1000)}ms`);
                 }
             } catch (error) {
                 logger.debug('[START] Failed to report to daemon (may not be running):', error);

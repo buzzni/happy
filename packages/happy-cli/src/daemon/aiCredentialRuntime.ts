@@ -249,6 +249,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return result
   }
 
+  // Launch steps share this queue with background probes and group sync; log how long a launch waited behind them.
+  function serializeLaunch<T>(step: string, operation: () => Promise<T>): Promise<T> {
+    const queuedAt = deps.now()
+    return serialize(() => {
+      logger.debug(`[timing] ai-credential-queue ${step} waited ${deps.now() - queuedAt}ms`)
+      return operation()
+    })
+  }
+
   function provider(value: unknown): AiCredentialProvider {
     if (value !== 'claude' && value !== 'codex' && value !== 'zai') {
       throw new AiCredentialRuntimeError('UNSUPPORTED_PROVIDER')
@@ -2261,10 +2270,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function sessionEnvironment(agent: string | undefined, selection?: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>> {
-    if (selection?.kind === 'claude-setup-token') return serialize(() => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE',
+    if (selection?.kind === 'claude-setup-token') return serializeLaunch('prepare', () => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE',
       () => setupTokenSessionEnvironment(agent, selection, recorded)))
     if (agent !== undefined && agent !== 'claude') return {}
-    return serialize(async () => {
+    return serializeLaunch('prepare', async () => {
       const marker = await readTrialMarker()
       if (marker.leases.zai) return parseZaiEnvironment(await deps.readFile(zaiEnvironmentPath()))
       const shared = await sharedMachineSessionEnvironment()
@@ -2287,18 +2296,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       // Recognize only default Claude environments prepared by this runtime.
       // Explicit personal, other agents and ZAI environments retain their bypass.
       // The shared machine's token is read again under the group-sync queue; a replaced one is stale.
-      if (sharedMachineLaunches.has(environment)) return serialize(async () => {
+      if (sharedMachineLaunches.has(environment)) return serializeLaunch('launch', async () => {
         const current = await sharedMachineSessionEnvironment()
         if (current?.CLAUDE_CODE_OAUTH_TOKEN !== environment.CLAUDE_CODE_OAUTH_TOKEN) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_STALE')
         return await start()
       })
-      if (defaultSessionLaunches.has(environment)) return serialize(async () => {
+      if (defaultSessionLaunches.has(environment)) return serializeLaunch('launch', async () => {
         await refuseUnboundManagedDefault()
         return await start()
       })
       return start()
     }
-    return serialize(() => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE', async () => {
+    return serializeLaunch('launch', () => withSafeErrors('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE', async () => {
       if (launch.started) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_REPLAYED')
       const checkExpiry = () => {
         if (launch.expiresAt !== null && deps.now() >= launch.expiresAt) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_EXPIRED')
@@ -2823,6 +2832,29 @@ export async function syncDirectoryForDurability(path: string, platform: NodeJS.
   try { await directory.sync() } finally { await directory.close() }
 }
 
+/**
+ * Field PCs with endpoint security pay a large per-process cost for every
+ * credential helper start. Log each call's duration (command and word-shaped
+ * subcommands only, never paths, numbers or payload arguments) so a slow launch can be split by step.
+ */
+export function timeAiCredentialCommand<O, R>(
+  run: (command: string, args: string[], options?: O) => Promise<R>,
+  now: () => number = Date.now,
+  log: (message: string) => void = message => logger.debug(message),
+) {
+  return async (command: string, args: string[], options?: O): Promise<R> => {
+    const startedAt = now()
+    let outcome = 'failed'
+    try {
+      const result = await run(command, args, options)
+      outcome = 'ok'
+      return result
+    } finally {
+      log(`[timing] ai-credential-command ${[command, ...args.slice(0, 2).filter(arg => /^-{0,2}[a-z][a-z-]*$/.test(arg))].join(' ')} ${outcome} ${now() - startedAt}ms`)
+    }
+  }
+}
+
 export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
@@ -2834,7 +2866,7 @@ export function createNodeAiCredentialRuntime(
     homeDir,
     now: Date.now,
     env,
-    execFile: routeClaudeSwapThroughPython((command, args, options) => runAiCredentialCommand(command, args, options), claudeSwapPython),
+    execFile: timeAiCredentialCommand(routeClaudeSwapThroughPython((command, args, options) => runAiCredentialCommand(command, args, options), claudeSwapPython)),
     readFile: (path) => readFile(path, 'utf8'),
     readdir: (path) => readdir(path),
     syncFile: async (path) => { const file = await open(path, 'r+'); try { await file.sync() } finally { await file.close() } },

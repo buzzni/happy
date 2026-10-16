@@ -56,6 +56,8 @@ import { waitForDaemonStart } from './daemon/waitForDaemonStart'
   // If --version is passed - do not log, its likely daemon inquiring about our version
   if (!args.includes('--version')) {
     logger.debug('Starting happy CLI with args: ', process.argv)
+    // Node start plus static module loading; on endpoint-secured Windows PCs this is the first suspect.
+    logger.debug(`[timing] child modules-loaded uptime=${Math.round(process.uptime() * 1000)}ms`)
   }
 
   // Check if first argument is a subcommand

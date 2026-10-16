@@ -721,6 +721,7 @@ function readTurnText(content: unknown): string {
         return 'not-started' as const;
     }
     // Start the loop
+    const queryStartedAt = Date.now();
     const response = query({
         prompt: messages,
         options: sdkOptions,
@@ -925,6 +926,8 @@ function readTurnText(content: unknown): string {
 
                 const systemInit = message as SDKSystemMessage;
                 aiAuthObservation?.noteTurnApiKeySource(systemInit.apiKeySource);
+                // Provider executable start until it is ready to work (first run pays any endpoint scan).
+                logger.debug(`[timing] claude system-init ${Date.now() - queryStartedAt}ms`);
 
                 // Session id is still in memory, wait until session file is written to disk
                 // Start a watcher for to detect the session id
@@ -948,6 +951,7 @@ function readTurnText(content: unknown): string {
                     const projectDir = getProjectPath(providerPath, processSandbox?.claudeConfigDir);
                     const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`), 30000);
                     logger.debug(`[claudeRemote] Session file found: ${systemInit.session_id} ${found}`);
+                    logger.debug(`[timing] claude transcript-file ${Date.now() - queryStartedAt}ms`);
                     if (!found) {
                         // The transcript never landed on disk within the grace
                         // window. We still register the id so the (now
