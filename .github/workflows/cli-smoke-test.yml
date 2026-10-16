@@ -37,6 +37,12 @@ jobs:
         node-version: ${{ matrix.node-version }}
         cache: 'pnpm'
 
+    # npm 10 crashes in Arborist while installing the packed CLI + self-host
+    # server together. Keep the Node 20 runtime test with the verified npm 11.
+    - name: Use verified npm for Node 20
+      if: matrix.node-version == 20
+      run: npm install -g npm@11.19.0
+
     - name: Install dependencies
       run: pnpm install --frozen-lockfile
 
