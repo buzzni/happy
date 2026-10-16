@@ -352,6 +352,8 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
     expect(spawnSession).toHaveBeenCalledOnce()
     const prompt = spawnSession.mock.calls[0]![0].initialPrompt
     expect(prompt.startsWith('## 예약 자동화 진단 지침\n')).toBe(true)
+    expect(prompt).toContain('already-registered scheduled task')
+    expect(prompt).toContain('Do not create, register, or resume a schedule')
     expect(prompt.match(/## 예약 자동화 진단 지침/g)).toHaveLength(1)
     for (const label of ['연동 판단', '고장 판단', '사용자 요구', '보고', '안전']) {
       expect(prompt).toContain(`[${label}]`)

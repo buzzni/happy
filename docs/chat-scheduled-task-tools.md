@@ -32,3 +32,11 @@ Local verification on 2026-10-16: 41 server tests, 42 CLI/MCP tests, 32 existing
 Clean-code review (2026-10-16): same-ID/different-account machine credentials are refused; pause/resume and activation receipts must retain ID, ciphertext, key and ownership fields and advance revision/generation to the requested state. Malformed upstream responses return a server response error, not an input validation error. The initial viewer-key retry regression passed alongside the existing CLI/MCP cases.
 
 The runtime requires the current session's machine ID already provided by its MCP caller; it does not infer a different machine from global local settings.
+
+## Scheduled occurrences
+
+An encrypted message marked `sentFrom: automation` with a `happy-automation:` local key is an occurrence of an existing task. The shared session input boundary adds model-only instructions to execute its underlying work once, leave recurrence to the scheduler, and avoid creating/resuming another reservation or substituting `script_automations`/cron. Stored message ciphertext and visible user text stay unchanged. Manual follow-ups keep their original input; legacy initial turns receive the same guidance alongside their existing diagnostic preamble. GitHub/AgentTask-specific prompts retain their own contracts. This is execution guidance, not a replacement for server authorization or a sandbox capability boundary.
+
+2026-10-16 release preparation: API buffering/immediate delivery and legacy Claude/Codex regression cases failed on the old source, then API/MCP/executor suites passed 314 cases. Candidate `1.1.10-aplus.333` is prepared for the official tag workflow; production publication/deployment/PC verification require separate recorded results.
+
+Release candidate verification: 245 wire tests, 41 Happy server tests, 314 focused CLI/MCP/session/executor tests and CLI/server type checks passed. The isolated PostgreSQL/server/built-daemon scenario passed with three occurrences, unchanged stored task text, model-only occurrence guidance, one reservation and same-session follow-up/pause/resume. These are local protocol checks; official publication and live PC/provider/timer acceptance remain pending.

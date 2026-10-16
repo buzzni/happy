@@ -92,7 +92,7 @@ describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darw
             const credentials = readLocalHappyAgentCredentials(fixture.happyHome)!;
             const tools = createScheduledTaskTools({ projectId, sessionId, machineId, directory: fixture.project, viewerKeyPair: credentials.contentKeyPair,
                 request, ensureExecutionSupported: async () => {} });
-            const create = { operation: 'create', registrationKey: 'scheduled-integration-request-001', name: 'Fixture check', prompt: 'scope-marker-reservation', schedule: { kind: 'interval', minutes: 15 } };
+            const create = { operation: 'create', registrationKey: 'scheduled-integration-request-001', name: 'Fixture check', prompt: 'Every 15 minutes provide scope-marker-reservation once', schedule: { kind: 'interval', minutes: 15 } };
             let row = await tools.execute(create) as { id: string; revision: number; paused: boolean };
             expect(row).toMatchObject({ paused: false, revision: 2, executionConfirmed: false });
             expect(await tools.execute(create)).toMatchObject({ id: row.id, revision: 2 });
@@ -132,6 +132,10 @@ describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darw
             const messages = await fixture.messages(sessionId);
             expect(messages.every(message => message.content.t === 'encrypted' && fixture.decode(message.content.c, sessionId) !== null)).toBe(true);
             expect(messages.filter(message => message.localId?.startsWith('happy-automation:'))).toHaveLength(3);
+            const occurrences = messages.filter(message => message.localId?.startsWith('happy-automation:')).map(message => fixture.decode(message.content.c, sessionId));
+            expect(occurrences.every(message => message.content.text === create.prompt)).toBe(true);
+            expect(fixture.modelRequests.some(body => body.includes('already-registered scheduled task') && body.includes('Do not create, register, or resume a schedule'))).toBe(true);
+            expect((await happy('GET', `${base}/automations`)).automations).toHaveLength(1);
             expect((await happy('GET', `${base}/automations`)).automations[0].payloadCiphertext).toBe((encryptedCreate as { payloadCiphertext: string }).payloadCiphertext);
             expect(links).toEqual([sessionId, sessionId, sessionId]);
             expect(bridgeErrors).toEqual([]); expect(fixture.failures).toEqual([]);
