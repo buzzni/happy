@@ -836,6 +836,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // end the loop, or every relaunch meets the same refusal and spins forever.
                         if (msg === null && drain?.gate.isClosed()) exitReason = 'exit';
 
+                        // A switch that failed at the boundary is tried again before this message reaches the used-up
+                        // account. The user's own message replaces the automatic continuation.
+                        if (msg && !providerStale()) await setupTokenSwitching?.switchIfWanted();
                         // A message that arrives after a switch (another boundary, or while it ran) belongs to the next provider.
                         if (msg && providerStale()) {
                             pending = msg;
