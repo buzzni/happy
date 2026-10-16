@@ -58,7 +58,7 @@ export class SessionWriteScopeFixture {
     private readonly ownedPids = new Set<number>();
     private readonly processes = new Set<ChildProcess>();
 
-    constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey' } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
+    constructor(readonly options: { provider: 'codex' | 'claude'; encryptionVariant: 'legacy' | 'dataKey'; automationStudioUrl?: string; databaseUrl?: string } = { provider: 'codex', encryptionVariant: 'legacy' }) {}
     get modelHost() { return process.platform === 'linux' ? 'scope-model.test' : '127.0.0.1'; }
     get modelName() { return this.options.provider === 'codex' ? 'gpt-5.1-codex' : 'claude-sonnet-4-6'; }
     get providerIdentityField() { return this.options.provider === 'codex' ? 'codexThreadId' : 'claudeSessionId'; }
@@ -147,17 +147,22 @@ export class SessionWriteScopeFixture {
             TMPDIR: this.temporaryDirectory, LANG: 'en_US.UTF-8', HAPPY_HOME_DIR: this.happyHome,
             HAPPY_SERVER_URL: this.serverUrl, HAPPY_WEBAPP_URL: this.serverUrl, HAPPY_DISABLE_CAFFEINATE: '1',
             HAPPY_DAEMON_HEARTBEAT_INTERVAL: '500',
+            ...(this.options.automationStudioUrl ? { HAPPY_APLUS_MCP_CONFIG_URL: `${this.options.automationStudioUrl}/api/me/mcp-config` } : {}),
             CODEX_HOME: codexHome, OPENAI_API_KEY: 'fixture-local-only', NO_PROXY: process.platform === 'linux' ? '' : '127.0.0.1,localhost',
             HAPPY_BROWSER_BRIDGE_HOST: '127.0.0.1',
             ANTHROPIC_API_KEY: 'fixture-local-only', ANTHROPIC_BASE_URL: `http://${this.modelHost}:${modelPort}`,
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
             ...(process.env.HAPPY_CLAUDE_PATH ? { HAPPY_CLAUDE_PATH: process.env.HAPPY_CLAUDE_PATH } : {}) };
         this.serverEnvironment = { ...this.environment, TSX_TSCONFIG_PATH: join(this.serverDirectory, 'tsconfig.json'),
-            HANDY_MASTER_SECRET: randomBytes(32).toString('hex'), DB_PROVIDER: 'pglite',
+            HANDY_MASTER_SECRET: randomBytes(32).toString('hex'), DB_PROVIDER: this.options.databaseUrl ? 'postgres' : 'pglite',
+            ...(this.options.databaseUrl ? { DATABASE_URL: this.options.databaseUrl } : {}),
             ...(process.env.HAPPY_SCOPE_PACKAGED_PRISMA_ENGINE ? { PRISMA_QUERY_ENGINE_LIBRARY: process.env.HAPPY_SCOPE_PACKAGED_PRISMA_ENGINE } : {}),
             DATA_DIR: join(this.root, 'server'), PGLITE_DIR: join(this.root, 'server/pglite'),
-            HOST: '127.0.0.1', PORT: String(serverPort), METRICS_ENABLED: 'false', HAPPY_STANDALONE_CONTROL: 'stdin-v1' };
-        const migration = this.launchServer('migrate');
+            HOST: '127.0.0.1', PORT: String(serverPort), METRICS_ENABLED: 'false', HAPPY_STANDALONE_CONTROL: 'stdin-v1',
+            ...(this.options.automationStudioUrl ? { SAYCODE_AUTOMATION_ENABLED: 'true' } : {}) };
+        const migration = this.options.databaseUrl
+            ? this.launch([join(this.serverDirectory, 'node_modules/prisma/build/index.js'), 'migrate', 'deploy', '--schema', 'prisma/schema.prisma'], this.serverDirectory, this.serverEnvironment)
+            : this.launchServer('migrate');
         await waitExit(migration);
         await this.startServer();
         const privateKey = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), this.seed]), type: 'pkcs8', format: 'der' });

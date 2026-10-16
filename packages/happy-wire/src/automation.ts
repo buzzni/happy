@@ -410,13 +410,15 @@ export async function decryptAutomationPayload(input: {
 }
 
 export class AutomationApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    readonly latest: AutomationPublic | null = null,
-  ) {
+  readonly status: number;
+  readonly code: string;
+  readonly latest: AutomationPublic | null;
+  constructor(status: number, code: string, latest: AutomationPublic | null = null) {
     super(code);
     this.name = 'AutomationApiError';
+    this.status = status;
+    this.code = code;
+    this.latest = latest;
   }
 }
 

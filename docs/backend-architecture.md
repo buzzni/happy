@@ -1,5 +1,7 @@
 # Backend Architecture
 
+Current-Chat AI repeating tools retain the existing v4 automation store and ordinary conversation delivery. `GET/PUT /v1/projects/:projectId/automations/registrations/:registrationKey` derives a stable scoped ID and creates only a paused definition inside the existing Serializable transaction/retry boundary. Duplicate inserts retain the original ciphertext and state; tombstones, owner and target conflicts cannot resurrect or move a definition. Studio records the execution binding before activating through the existing revision-CAS PATCH. The CLI compares decrypted retry intent and recovers using the same registration/ciphertext. No plaintext fingerprint, new table or scheduler is introduced. See [tool contract and verification](chat-scheduled-task-tools.md).
+
 This document describes the Happy backend structure as implemented in `packages/happy-server`. It focuses on how the server is wired, how data flows through the system, and which subsystems handle which responsibilities.
 
 ## System overview

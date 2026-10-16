@@ -1577,6 +1577,29 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect((client as any).lastSeq).toBe(1);
     });
 
+    it.each([false, true])('adds scheduled-run context only to provider input, including buffered delivery (%s)', async buffered => {
+        const client = new ApiSessionClient('fake-token', session);
+        const onUserMessage = vi.fn();
+        if (!buffered) client.onUserMessage(onUserMessage);
+        const original = { role: 'user', content: { type: 'text', text: '1시간마다 철학적인 문구 하나씩 해줘' }, localKey: 'happy-automation:run-1', meta: { sentFrom: 'automation' } };
+        mockAxiosGet.mockResolvedValueOnce({ data: { messages: [{ id: 'scheduled-message', seq: 1, content: { t: 'encrypted', c: encryptContent(session, original) } }], hasMore: false } });
+        await (client as any).fetchMessages();
+        if (buffered) client.onUserMessage(onUserMessage);
+        const delivered = onUserMessage.mock.calls[0][0];
+        expect(delivered.content.text).toContain('already-registered scheduled task');
+        expect(delivered.content.text).toContain('Do not create, register, or resume a schedule');
+        expect(delivered.content.text).toContain('current occurrence');
+        expect(delivered.content.text.endsWith(original.content.text)).toBe(true);
+        expect(original.content.text).toBe('1시간마다 철학적인 문구 하나씩 해줘');
+        expect(mockAxiosPost).not.toHaveBeenCalled();
+        expect(mockAxiosPut).not.toHaveBeenCalled();
+        expect(delivered).toMatchObject({ serverMessageId: 'scheduled-message', localKey: original.localKey, meta: original.meta });
+        (client as any).routeIncomingMessage({ ...original, localKey: 'manual-message', meta: { sentFrom: 'web' } });
+        expect(onUserMessage.mock.calls[1][0].content.text).toBe(original.content.text);
+        (client as any).routeIncomingMessage({ ...original, localKey: 'manual-message' });
+        expect(onUserMessage.mock.calls[2][0].content.text).toBe(original.content.text);
+    });
+
     it('preserves effort in user message metadata after schema parsing', async () => {
         const client = new ApiSessionClient('fake-token', session);
         const onUserMessage = vi.fn();

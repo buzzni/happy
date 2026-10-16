@@ -4,11 +4,10 @@ import type { Metadata } from '@/api/types';
  * The model/effort a *user* chose for a session, as opposed to whatever the
  * session happens to be running this turn.
  *
- * The distinction is the whole point of this module. `currentModel` in the agent
- * loops is always a concrete model — it falls back to the runtime default when
- * nobody pinned anything — so it cannot be published as-is: clients read the
- * published value as "the user picked this" and stop auto-routing. An absent
- * field means "no pin", which is what keeps Default sessions routable.
+ * A runtime model can come from a user choice, routing, or a provider default.
+ * It cannot be published as-is: clients read the published value as "the user
+ * picked this" and stop auto-routing. An absent field means "no pin", which is
+ * what keeps Default sessions routable.
  */
 export interface SessionModelPin {
     model?: string;

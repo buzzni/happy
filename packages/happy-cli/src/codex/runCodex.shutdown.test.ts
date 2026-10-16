@@ -28,6 +28,7 @@ const fixture = vi.hoisted(() => ({
     admitTool: undefined as undefined | (<T>(work: () => Promise<T>) => Promise<T>),
     reconnect: vi.fn(async () => ({})),
     session: {
+        sendProviderUsageEvent: vi.fn(),
         tracksShutdownStorage: true,
         flushForShutdown: vi.fn(async () => ({ stored: true as const, revision: 1 })),
         isStorageConfirmationCurrent: vi.fn(() => true),
@@ -164,6 +165,23 @@ async function finishFrozenFixture(running: Promise<void>) {
     await running;
 }
 describe('Codex runtime producer bookkeeping', () => {
+    it('lets Codex resolve the native model for a fresh Default launch', async () => {
+        await start('Default first prompt');
+        expect(fixture.startThread).toHaveBeenCalledWith(expect.objectContaining({ model: undefined }));
+        expect(fixture.send).toHaveBeenCalledWith('Default first prompt', expect.objectContaining({ model: undefined }));
+    });
+
+    it('does not invent a legacy model for usage when the native default is unknown', async () => {
+        fixture.onSend = async () => {
+            fixture.emit?.({ type: 'codex_usage', response_id: 'native-default-response', usage: {
+                totalTokens: 3, inputTokens: 2, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+                outputTokens: 1, reasoningOutputTokens: 0,
+            } });
+        };
+        await start('Default usage');
+        expect(fixture.session.sendProviderUsageEvent).toHaveBeenCalledWith(expect.objectContaining({ model: null }));
+    });
+
     it.each([
         { threadId: undefined, modelSeed: undefined },
         { threadId: 'saved-thread', modelSeed: undefined },
