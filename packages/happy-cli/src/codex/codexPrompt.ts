@@ -2,6 +2,7 @@ import type { MessageMeta, PermissionMode } from '@/api/types';
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import {
     isSaycodePromptBlockEnabled,
+    splitClientTurnPromptBlocks,
     type SaycodePromptBlockOverrides,
 } from '@/prompt/promptProvenance';
 import { hashObject } from '@/utils/deterministicJson';
@@ -74,7 +75,10 @@ export function buildCodexDeveloperInstructions({
         blocks.push(agentOrchestrationPrompt);
     }
     if (mode.saycodeSystemPromptEnabled !== undefined) {
-        blocks.push(mode.appendSystemPrompt);
+        // Client-turn blocks go with the turn input (buildCodexTurnPrompt): an open Codex
+        // thread keeps its first developer instructions, so a turn-only block put here
+        // would answer every later turn with turn 1's content.
+        blocks.push(splitClientTurnPromptBlocks(mode.appendSystemPrompt).standing);
     }
     if (mode.saycodeSystemPromptEnabled !== false) {
         blocks.push(SAYCODE_API_GATEWAY_PROMPT);
@@ -102,6 +106,9 @@ export function buildCodexTurnPrompt(opts: {
 
     if (opts.includeAppendSystemPrompt && opts.mode.appendSystemPrompt) {
         parts.push(opts.mode.appendSystemPrompt);
+    } else {
+        const turnBlocks = splitClientTurnPromptBlocks(opts.mode.appendSystemPrompt).turn;
+        if (turnBlocks) parts.push(turnBlocks);
     }
     if (opts.lessonBlock) {
         parts.push(opts.lessonBlock);
