@@ -368,7 +368,6 @@ export const initialMachineMetadata: MachineMetadata = {
   homeDir: os.homedir(),
   happyHomeDir: configuration.happyHomeDir,
   happyLibDir: projectPath(),
-  cliAvailability: detectCLIAvailability(),
   resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
   automationSupport: {
     rpcAvailable: true,
@@ -392,6 +391,14 @@ export const initialMachineMetadata: MachineMetadata = {
   worktreeOps: WORKTREE_OPS_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
 };
+
+// Agent children import the base metadata to register their existing machine.
+// Discovering every provider here used to launch four synchronous PowerShell
+// processes on Windows for every new conversation, before its first log line.
+// Only the daemon publishes and refreshes the machine-wide tool inventory.
+export function createDaemonMachineMetadata(): MachineMetadata {
+  return { ...initialMachineMetadata, cliAvailability: detectCLIAvailability() };
+}
 
 /**
  * The host owns this call's deadline and passes its own signal: recomputing one here from
@@ -607,6 +614,7 @@ export async function startDaemon(): Promise<void> {
     .filter(([key]) => key.startsWith('HAPPY_WRITE_SCOPE_HOST_')));
   // Direct `daemon start-sync` must not retain a disposable caller worktree.
   process.chdir(os.homedir());
+  const daemonMachineMetadata = createDaemonMachineMetadata();
 
   // The daemon can be auto-(re)started by any happy CLI child — including a
   // resumed/forked session that carries HAPPY_RECONNECT_*/HAPPY_FORK* in its
@@ -842,7 +850,7 @@ export async function startDaemon(): Promise<void> {
         credentials: authSetup.credentials,
         machineId,
         serverPublicKey,
-        metadata: initialMachineMetadata,
+        metadata: daemonMachineMetadata,
         io: createMachineControlIo({ token: authSetup.credentials.token, machineId }),
       });
     logger.debug(`[DAEMON RUN] Auth and machine setup complete (machine control: ${managedCredential?.ok ? 'managed' : configuration.machineControl})`);
@@ -1054,7 +1062,7 @@ export async function startDaemon(): Promise<void> {
       authorize: authorizeDifficultyRoutingRequest,
     });
     const difficultyRoutingMachineMetadata: MachineMetadata = {
-      ...initialMachineMetadata,
+      ...daemonMachineMetadata,
       difficultyRouting: {
         version: 1,
         protocol: DIFFICULTY_ROUTING_POLICY_VERSION,
@@ -4764,7 +4772,7 @@ export async function startDaemon(): Promise<void> {
           machine: {
             id: machine.id,
             platform: os.platform(),
-            hostname: initialMachineMetadata.host,
+            hostname: daemonMachineMetadata.host,
             homeDir: os.homedir(),
             // What this daemon advertises for the machine. It has no filesystem scope to report.
             capabilities: {
