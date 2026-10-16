@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { automationCreateRequestSchema, automationEncryptedFieldsSchema } from './automation';
+import { automationCreateRequestSchema, automationEncryptedFieldsSchema, automationPublicSchema } from './automation';
 
 const identifier = z.string().trim().min(1).max(200);
 export const scheduledRegistrationKeySchema = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
@@ -20,9 +20,21 @@ export const scheduledManagementRequestSchema = z.discriminatedUnion('operation'
   z.strictObject({ operation: z.literal('get'), automationId: identifier }),
   z.strictObject({ operation: z.literal('get_registration'), registrationKey: scheduledRegistrationKeySchema }),
   z.strictObject({ operation: z.literal('target') }),
+  z.strictObject({ operation: z.literal('read_target') }),
   z.strictObject({ operation: z.literal('viewer_key'), expectedKeyVersion: z.number().int().nonnegative(), publicKey: z.string().length(44) }),
   z.strictObject({ operation: z.literal('create'), registrationKey: scheduledRegistrationKeySchema, encrypted: scheduledTaskEncryptedCreateSchema }),
   z.strictObject({ operation: z.literal('complete_registration'), registrationKey: scheduledRegistrationKeySchema, payloadCiphertext: automationEncryptedFieldsSchema.shape.payloadCiphertext }),
   z.strictObject({ operation: z.literal('set_paused'), automationId: identifier, expectedRevision: z.number().int().positive(), paused: z.boolean() }),
 ]);
 export type ScheduledManagementRequest = z.infer<typeof scheduledManagementRequestSchema>;
+
+/** Internal authenticated management response; never part of AutomationPublic. */
+export const scheduledManagementAutomationSchema = automationPublicSchema.extend({
+  machineKeyEnvelope: automationEncryptedFieldsSchema.shape.machineKeyEnvelope,
+});
+export type ScheduledManagementAutomation = z.infer<typeof scheduledManagementAutomationSchema>;
+
+/** Shared registration identity input; callers hash these UTF-8 bytes with SHA-256. */
+export function scheduledRegistrationIdentity(projectId: string, registrationKey: string): string {
+  return JSON.stringify([projectId, registrationKey]);
+}

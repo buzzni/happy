@@ -4542,13 +4542,14 @@ export async function startDaemon(): Promise<void> {
             },
           });
         },
-        resolveProjectEnvironment: ({ runId, claimToken, conversationSessionId }) => fetchAutomationProjectEnvironment({
+        resolveProjectEnvironment: ({ runId, claimToken, conversationSessionId, conversationDirectory }) => fetchAutomationProjectEnvironment({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,
           machineToken: credentials.token,
           machineId,
           runId,
           claimToken,
           conversationSessionId,
+          conversationDirectory,
         }),
         resolveMcpSpawnContext: ({ runId, claimToken }) => exchangeAutomationMcpCallerGrant({
           configUrl: process.env.HAPPY_APLUS_MCP_CONFIG_URL,

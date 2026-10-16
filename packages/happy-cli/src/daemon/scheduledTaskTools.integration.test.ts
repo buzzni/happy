@@ -1,3 +1,5 @@
+import { join } from 'node:path';
+import { readMachineAutomationKey } from '@/daemon/automations/machineAutomationKey';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
@@ -10,9 +12,9 @@ import type { ScheduledManagementRequest } from '@slopus/happy-wire';
 // Studio authority/bindings are a local contract fixture here; its real HTTP authorization
 // and binding recovery are covered by Studio's scheduledManagementRoute/Service tests.
 describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darwin', 'linux'].includes(process.platform))('scheduled task server/daemon integration', () => {
-    it('keeps concurrent registration, two deliveries and a follow-up in one encrypted conversation, then pauses and resumes', async () => {
+    it.each(['legacy', 'dataKey'] as const)('keeps one encrypted conversation through registration, follow-up, pause and resume (%s)', async encryptionVariant => {
         let fixture: SessionWriteScopeFixture;
-        const projectId = `chat:scheduled-tools-fixture-${randomUUID()}`;
+        const projectId = `${encryptionVariant === 'legacy' ? 'chat:' : ''}scheduled-tools-fixture-${randomUUID()}`;
         let sessionId = '', machineId = '';
         const links: string[] = [], bridgeErrors: string[] = [];
         const bridge = createServer(async (req, res) => {
@@ -33,7 +35,7 @@ describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darw
                 }
                 if (req.url === '/api/automation/project-environment') {
                     if (body.conversationSessionId !== sessionId) { reply(409, {}); return; }
-                    reply(200, { projectId, environmentVariables: {}, conversationSessionId: sessionId }); return;
+                    reply(200, { projectId, environmentVariables: {}, conversationSessionId: sessionId, ...(encryptionVariant === 'dataKey' ? { conversationDirectory: fixture.project } : {}) }); return;
                 }
                 if (req.url === '/api/automation/session-link' && body.sessionId === sessionId) {
                     links.push(body.sessionId); reply(200, { ok: true }); return;
@@ -42,7 +44,7 @@ describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darw
             } catch (error) { bridgeErrors.push(String(error)); reply(500, { error: 'FIXTURE_BRIDGE_FAILED' }); }
         });
         await new Promise<void>(resolve => bridge.listen(0, '127.0.0.1', resolve));
-        fixture = new SessionWriteScopeFixture({ provider: 'codex', encryptionVariant: 'legacy', databaseUrl: process.env.HAPPY_SCHEDULED_TOOLS_DATABASE_URL,
+        fixture = new SessionWriteScopeFixture({ provider: 'codex', encryptionVariant, databaseUrl: process.env.HAPPY_SCHEDULED_TOOLS_DATABASE_URL,
             automationStudioUrl: `http://127.0.0.1:${(bridge.address() as { port: number }).port}` });
         async function happy(method: string, path: string, body?: unknown): Promise<any> {
             const response = await fetch(fixture.serverUrl + path, { method, headers: { Authorization: `Bearer ${fixture.token}`, 'Content-Type': 'application/json' },
@@ -61,15 +63,19 @@ describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darw
             const base = `/v1/projects/${encodeURIComponent(projectId)}`;
             let encryptedCreate: unknown;
             const bindings = new Set<string>();
+            const management = async (response: any): Promise<any> => {
+                if (encryptionVariant === 'legacy' || !response.automation) return response;
+                return happy('GET', `${base}/automations/${response.automation.id}/management?machineId=${encodeURIComponent(machineId)}`);
+            };
             const request = async (input: ScheduledManagementRequest): Promise<unknown> => {
                 const reg = (key: string) => `${base}/automations/registrations/${encodeURIComponent(key)}`;
-                if (input.operation === 'target') return (await happy('GET', `${base}/automation-target`)).target;
+                if (input.operation === 'target' || input.operation === 'read_target') return (await happy('GET', `${base}/automation-target`)).target;
                 if (input.operation === 'viewer_key') return happy('PUT', `${base}/automation-viewer-key`, { expectedKeyVersion: input.expectedKeyVersion, publicKey: input.publicKey });
                 if (input.operation === 'get_registration') {
                     const response = await fetch(fixture.serverUrl + reg(input.registrationKey), { headers: { Authorization: `Bearer ${fixture.token}` } });
                     if (response.status === 404) return { automation: null };
                     if (!response.ok) throw new Error(`Registration read ${response.status}`);
-                    return response.json();
+                    return management(await response.json());
                 }
                 if (input.operation === 'create') {
                     encryptedCreate = input.encrypted;
@@ -77,20 +83,22 @@ describe.skipIf(process.env.HAPPY_SCHEDULED_TOOLS_INTEGRATION !== '1' || !['darw
                     const concurrent = await Promise.all([happy('PUT', reg(input.registrationKey), input.encrypted), happy('PUT', reg(input.registrationKey), input.encrypted)]);
                     expect(concurrent[0].automation.id).toBe(concurrent[1].automation.id);
                     bindings.add(concurrent[0].automation.id);
-                    return happy('PATCH', `${base}/automations/${concurrent[0].automation.id}`, { expectedRevision: 1, paused: false });
+                    return management(await happy('PATCH', `${base}/automations/${concurrent[0].automation.id}`, { expectedRevision: 1, paused: false }));
                 }
                 const rows = (await happy('GET', `${base}/automations`)).automations;
-                if (input.operation === 'list') return { automations: rows };
+                if (input.operation === 'list') return { automations: await Promise.all(rows.map(async (automation: any) => (await management({ automation })).automation)) };
                 if (input.operation === 'get' || input.operation === 'set_paused') {
                     const row = rows.find((row: any) => row.id === input.automationId);
-                    if (input.operation === 'get') return { automation: row ?? null };
+                    if (input.operation === 'get') return management({ automation: row ?? null });
                     expect(bindings.has(input.automationId)).toBe(true);
-                    return happy('PATCH', `${base}/automations/${input.automationId}`, { expectedRevision: input.expectedRevision, paused: input.paused });
+                    return management(await happy('PATCH', `${base}/automations/${input.automationId}`, { expectedRevision: input.expectedRevision, paused: input.paused }));
                 }
                 throw new Error('Unexpected management request');
             };
-            const credentials = readLocalHappyAgentCredentials(fixture.happyHome)!;
-            const tools = createScheduledTaskTools({ projectId, sessionId, machineId, directory: fixture.project, viewerKeyPair: credentials.contentKeyPair,
+            const credentials = readLocalHappyAgentCredentials(fixture.happyHome);
+            if (encryptionVariant === 'dataKey') expect(credentials).toBeNull();
+            const machineKey = readMachineAutomationKey(join(fixture.happyHome, 'automation-key.v1.json'))!;
+            const tools = createScheduledTaskTools({ projectId, sessionId, machineId, directory: fixture.project, ...(encryptionVariant === 'legacy' ? { viewerKeyPair: credentials!.contentKeyPair } : { viewerPublicKey: fixture.accountBox.publicKey, machineKey }),
                 request, ensureExecutionSupported: async () => {} });
             const create = { operation: 'create', registrationKey: 'scheduled-integration-request-001', name: 'Fixture check', prompt: 'Every 15 minutes provide scope-marker-reservation once', schedule: { kind: 'interval', minutes: 15 } };
             let row = await tools.execute(create) as { id: string; revision: number; paused: boolean };

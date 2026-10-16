@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import nacl from 'tweetnacl';
 import { createScheduledTaskTools, runScheduledTaskTool } from './scheduledTaskTools';
 import { openServerAutomationPayload } from '@/daemon/automations/serverAutomationCache';
-import { encryptLegacy } from '@/api/encryption';
+import { encryptWithDataKey, encryptLegacy } from '@/api/encryption';
 
-const runtime = vi.hoisted(() => ({ credentials: vi.fn(), refresh: vi.fn(async () => false), configuration: { machineControl: 'legacy', serverUrl: 'http://happy.fixture' } }));
+const runtime = vi.hoisted(() => ({ key: vi.fn(), credentials: vi.fn(), machineCredentials: vi.fn(async (): Promise<unknown> => null), refresh: vi.fn(async () => false), configuration: { machineControl: 'legacy', serverUrl: 'http://happy.fixture' } }));
 vi.mock('@/resume/localHappyAgentAuth', () => ({ readLocalHappyAgentCredentials: runtime.credentials }));
+vi.mock('@/daemon/automations/machineAutomationKey', () => ({ readMachineAutomationKey: runtime.key }));
+vi.mock('@/persistence', async () => ({ ...await vi.importActual<typeof import('@/persistence')>('@/persistence'), readCredentials: runtime.machineCredentials }));
 vi.mock('@/aplus/refreshMcpCallerGrant', () => ({ refreshMcpCallerGrantIfExpiring: runtime.refresh }));
 vi.mock('@/configuration', async () => {
   const actual = await vi.importActual<{ configuration: object }>('@/configuration');
@@ -16,10 +18,10 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); runtime.configurati
 
 const viewer = nacl.box.keyPair(), machine = nacl.box.keyPair();
 const create = { operation: 'create', registrationKey: 'reservation-request-001', name: '상태 확인', prompt: '접속 상태를 확인해줘', schedule: { kind: 'interval', minutes: 15 } };
-function fixture() {
+function fixture(machineReader = false) {
   const rows: any[] = []; let loseCreate = false, loseUpdate = false;
   const request = vi.fn(async (input: any): Promise<any> => {
-    if (input.operation === 'target') return { machineAccountId: 'owner', machineId: 'pc', machinePublicKey: Buffer.from(machine.publicKey).toString('base64'),
+    if (input.operation === 'target' || input.operation === 'read_target') return { machineAccountId: 'owner', machineId: 'pc', machinePublicKey: Buffer.from(machine.publicKey).toString('base64'),
       machineKeyVersion: 1, viewerPublicKey: Buffer.from(viewer.publicKey).toString('base64'), viewerKeyVersion: 1, automationProtocolVersion: 4 };
     if (input.operation === 'list') return { automations: rows };
     if (input.operation === 'get_registration') return { automation: rows.find(row => row.key === input.registrationKey) ?? null };
@@ -41,7 +43,7 @@ function fixture() {
     throw new Error('unexpected-request');
   });
   const ensureExecutionSupported = vi.fn(async () => {});
-  const tools = createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc', directory: '/work/chat', viewerKeyPair: viewer, request, ensureExecutionSupported });
+  const tools = createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc', directory: '/work/chat', ...(machineReader ? { viewerPublicKey: viewer.publicKey, machineKey: { ...machine, registeredKeyVersion: 1 } } : { viewerKeyPair: viewer }), request, ensureExecutionSupported });
   return { tools, rows, request, ensureExecutionSupported, loseCreate: () => { loseCreate = true; }, loseUpdate: () => { loseUpdate = true; } };
 }
 
@@ -179,7 +181,74 @@ describe('scheduled tool runtime authority and runner capability', () => {
     await expect(runScheduledTaskTool(create, session)).rejects.toThrow('SCHEDULED_TASK_CHAT_REQUIRED');
     vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config');
     runtime.credentials.mockReturnValue(null);
-    await expect(runScheduledTaskTool(create, session)).rejects.toThrow('SCHEDULED_TASK_CONTEXT_REQUIRED');
+    runtime.machineCredentials.mockResolvedValue(null);
+    await expect(runScheduledTaskTool(create, session)).rejects.toThrow('SCHEDULED_TASK_CREDENTIALS_REQUIRED');
     expect(f.calls).toEqual([]);
   });
+  it('identifies dataKey-only credentials before grant refresh or any remote call', async () => {
+    const f = runtimeFixture({});
+    runtime.credentials.mockReturnValue(null);
+    runtime.machineCredentials.mockResolvedValue({ token: 'fixture-only-token', encryption: { type: 'dataKey', publicKey: machine.publicKey, machineKey: nacl.randomBytes(32) } });
+    runtime.refresh.mockClear();
+    await expect(runScheduledTaskTool({ operation: 'list' }, session)).rejects.toThrow('SCHEDULED_TASK_MACHINE_KEY_REQUIRED');
+    expect(runtime.refresh).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+  });
+  it('distinguishes missing config, machine identity and caller grant before a remote call', async () => {
+    const f = runtimeFixture({});
+    vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', '');
+    await expect(runScheduledTaskTool({ operation: 'list' }, session)).rejects.toThrow('SCHEDULED_TASK_CONFIG_REQUIRED');
+    vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config');
+    await expect(runScheduledTaskTool({ operation: 'list' }, { ...session, machineId: '' })).rejects.toThrow('SCHEDULED_TASK_MACHINE_CONTEXT_REQUIRED');
+    vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', '');
+    runtime.refresh.mockClear();
+    await expect(runScheduledTaskTool({ operation: 'list' }, session)).rejects.toThrow('SCHEDULED_TASK_CALLER_GRANT_REQUIRED');
+    expect(runtime.refresh).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+  });
+});
+
+it('creates, reads and retries with only the account public key and existing machine key', async () => {
+  const f = fixture(true); f.loseCreate();
+  expect(await f.tools.execute(create)).toMatchObject({ id: 'reservation', prompt: create.prompt });
+  expect(await f.tools.execute(create)).toMatchObject({ id: 'reservation' });
+  expect(await f.tools.execute({ operation: 'list' })).toMatchObject([{ prompt: create.prompt }]);
+  const viewerReader = createScheduledTaskTools({ projectId: 'chat:chat', sessionId: 'session', machineId: 'pc', directory: '/work/chat', viewerKeyPair: viewer, request: f.request, ensureExecutionSupported: f.ensureExecutionSupported });
+  expect(await viewerReader.execute({ operation: 'get', automationId: 'reservation' })).toMatchObject({ prompt: create.prompt });
+  expect(f.request.mock.calls.filter(([r]) => r.operation === 'create')).toHaveLength(1);
+});
+it('rejects stale machine keys before encrypted writes or opening a row', async () => {
+  const f = fixture(true), original = f.request.getMockImplementation()!;
+  f.request.mockImplementation(async input => { const value = await original(input); if (input.operation === 'target' || input.operation === 'read_target') value.machineKeyVersion = 2; return value; });
+  await expect(f.tools.execute(create)).rejects.toThrow('SCHEDULED_TASK_MACHINE_KEY_MISMATCH');
+  expect(f.request.mock.calls.some(([r]) => ['create', 'viewer_key', 'target'].includes(r.operation))).toBe(false);
+});
+
+it('runs the dataKey Project transport without an account private key', async () => {
+  const f = fixture(true), machineKey = nacl.randomBytes(32);
+  runtime.credentials.mockReturnValue(null);
+  runtime.machineCredentials.mockResolvedValue({ token: 'fixture-token', encryption: { type: 'dataKey', publicKey: viewer.publicKey, machineKey } });
+  runtime.key.mockReturnValue({ ...machine, registeredKeyVersion: 1 });
+  vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', 'http://studio.fixture/api/me/mcp-config?project_id=project');
+  vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', Buffer.from(JSON.stringify({ personalChatId: null, projectId: 'project' })).toString('base64url') + '.signature');
+  vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+    if (String(url).endsWith('/automation-reader-key')) return Response.json({ machineId: 'pc', machineAccountId: 'owner', publicKey: Buffer.from(machine.publicKey).toString('base64'), keyVersion: 1 });
+    if (String(url).includes('/v1/machines/')) return Response.json({ machine: { id: 'pc', metadata: Buffer.from(encryptWithDataKey({ automationSupport: { conversation: true, serverBacked: true } }, machineKey)).toString('base64') } });
+    const body = JSON.parse(init.body);
+    expect(body.projectId).toBe('project');
+    const result = await f.request(body.request);
+    if (result.automation) result.automation.projectId = 'project';
+    return Response.json(result);
+  }));
+  expect(await runScheduledTaskTool(create, { sessionId: 'session', machineId: 'pc', directory: '/work/chat' })).toMatchObject({ id: 'reservation', prompt: create.prompt });
+});
+
+it('keeps simultaneous machine-reader creates on one reservation and does not expose another Project session', async () => {
+  const f = fixture(true);
+  const results = await Promise.all([f.tools.execute(create), f.tools.execute(create)]);
+  expect(results).toHaveLength(2); expect(f.rows).toHaveLength(1);
+  const other = createScheduledTaskTools({ projectId: 'project', sessionId: 'other-session', machineId: 'pc', directory: '/work/chat',
+    viewerPublicKey: viewer.publicKey, machineKey: { ...machine, registeredKeyVersion: 1 }, request: f.request, ensureExecutionSupported: f.ensureExecutionSupported });
+  f.rows[0].projectId = 'project';
+  await expect(other.execute({ operation: 'get', automationId: 'reservation' })).rejects.toThrow('SCHEDULED_TASK_SCOPE_MISMATCH');
 });

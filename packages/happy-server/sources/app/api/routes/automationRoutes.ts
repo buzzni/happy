@@ -19,6 +19,7 @@ import {
     getAutomationTarget,
     listAutomationRuns,
     listAutomations,
+    getAutomationManagement,
     replaceAutomationViewerKeyIfUnused,
     requestAutomationRun,
     setAutomationViewerKey,
@@ -245,6 +246,18 @@ export function automationRoutes(app: Fastify) {
         }
     });
 
+    app.get('/v1/machines/:machineId/automation-reader-key', {
+        preHandler: app.authenticate, schema: { params: z.object({ machineId: z.string().min(1) }) },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        const machine = await db.machine.findUnique({ where: { accountId_id: { accountId: request.userId, id: request.params.machineId } },
+            select: { id: true, automationPublicKey: true, automationKeyVersion: true } });
+        if (!machine) return reply.code(404).send({ error: 'not-found' });
+        if (!machine.automationPublicKey || machine.automationKeyVersion < 1) return reply.code(409).send({ error: 'machine-key-unavailable' });
+        return reply.header('Cache-Control', 'no-store').send({ machineId: machine.id, machineAccountId: request.userId,
+            publicKey: Buffer.from(machine.automationPublicKey).toString('base64'), keyVersion: machine.automationKeyVersion });
+    });
+
     app.get('/v1/projects/:projectId/automations', {
         preHandler: app.authenticate,
         schema: { params: paramsSchema },
@@ -253,6 +266,17 @@ export function automationRoutes(app: Fastify) {
         const result = await listAutomations(db, request.userId, request.params.projectId);
         if (!result.ok) return sendError(reply, result);
         return reply.send({ automations: result.value.map(serializeAutomation) });
+    });
+
+    app.get('/v1/projects/:projectId/automations/:automationId/management', {
+        preHandler: app.authenticate,
+        schema: { params: automationParamsSchema, querystring: z.object({ machineId: z.string().min(1) }).strict() },
+    }, async (request, reply) => {
+        if (rejectWhenDisabled(reply)) return;
+        const result = await getAutomationManagement(db, request.userId, request.params.projectId, request.params.automationId, request.query.machineId);
+        if (!result.ok) return sendError(reply, result);
+        return reply.header('Cache-Control', 'no-store').send({ automation: { ...serializeAutomation(result.value),
+            machineKeyEnvelope: Buffer.from(result.value.machineKeyEnvelope).toString('base64') } });
     });
 
     app.get('/v1/projects/:projectId/automation-runs', {

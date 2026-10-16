@@ -293,5 +293,25 @@ jobs:
         run: |
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
           rg --version
+      - name: Install scheduled conversation integration dependencies
+        run: |
+          brew list postgresql@16 >/dev/null 2>&1 || brew install postgresql@16
+          npm install -g codex-multi-auth@2.16.0
+          npm install -g @openai/codex@0.162.1
+          codex --version
+      - name: Verify legacy Chat and dataKey Project scheduled conversations
+        timeout-minutes: 10
+        env:
+          HAPPY_SCHEDULED_TOOLS_INTEGRATION: '1'
+          HAPPY_SCOPE_FIXTURE_PARENT: ${{ runner.temp }}
+        run: |
+          export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+          SCHEDULED_PG_DIR="$RUNNER_TEMP/scheduled-conversation-pg"
+          initdb -D "$SCHEDULED_PG_DIR" -A trust -U scheduled_fixture
+          pg_ctl -D "$SCHEDULED_PG_DIR" -l "$RUNNER_TEMP/scheduled-conversation-pg.log" -o "-h 127.0.0.1 -p 55432" -w start
+          trap 'pg_ctl -D "$SCHEDULED_PG_DIR" -m immediate -w stop' EXIT
+          createdb -h 127.0.0.1 -p 55432 -U scheduled_fixture scheduled_fixture
+          export HAPPY_SCHEDULED_TOOLS_DATABASE_URL="postgresql://scheduled_fixture@127.0.0.1:55432/scheduled_fixture"
+          pnpm --filter @buzzni/happy-cli exec vitest run --project integration-scheduled-tools
       - name: Run unit tests including real Git sandbox enforcement
         run: pnpm --filter @buzzni/happy-cli exec vitest run --project unit
