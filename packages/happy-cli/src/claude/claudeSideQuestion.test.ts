@@ -210,6 +210,45 @@ describe('ClaudeSideQuestionBridge', () => {
         expect(await bridge.ask('slow', { timeoutMs: 20 })).toEqual({ ok: false, error: 'timeout' });
         expect(seenSignal?.aborted).toBe(true);
     });
+
+    it('shouldStillMeasureUsageSpentByASideQuestionThatTimedOut', async () => {
+        const bridge = new ClaudeSideQuestionBridge();
+        bridge.provide({
+            request: (request, { signal }) => {
+                if (request.subtype === 'get_usage') {
+                    return Promise.resolve(signal.aborted ? null : bridgeUsage.shift());
+                }
+                return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted'))));
+            },
+            isTurnInProgress: () => false,
+        });
+        const bridgeUsage = [usageReply(0, 0, 0, 0), usageReply(7, 2, 40, 0)];
+
+        // Claude already spent tokens on the fork; a timeout is less certain, so it is an estimate.
+        expect(await bridge.ask('slow', { timeoutMs: 20 })).toEqual({
+            ok: false, error: 'timeout',
+            usage: { input_tokens: 7, output_tokens: 2, cache_read_input_tokens: 40, cache_creation_input_tokens: 0 },
+            usageQuality: 'estimated', model: MODEL,
+        });
+    });
+
+    it('shouldStillMeasureUsageWhenTheProviderFailedOrAnsweredEmpty', async () => {
+        const failing = new ClaudeSideQuestionBridge();
+        failing.provide(channelWith({ fail: new Error('boom'), usage: [usageReply(0, 0, 0, 0), usageReply(3, 1, 0, 0)] }).channel);
+        expect(await failing.ask('q')).toMatchObject({
+            ok: false, error: 'failed', detail: 'boom', usageQuality: 'exact', usage: { input_tokens: 3, output_tokens: 1 },
+        });
+
+        const empty = new ClaudeSideQuestionBridge();
+        empty.provide(channelWith({ answer: { response: '' }, usage: [usageReply(0, 0, 0, 0), usageReply(4, 0, 0, 0)] }).channel);
+        expect(await empty.ask('q')).toMatchObject({ ok: false, error: 'failed', usageQuality: 'exact', usage: { input_tokens: 4 } });
+    });
+
+    it('shouldLeaveUsageOffAFailureThatSpentNothing', async () => {
+        const bridge = new ClaudeSideQuestionBridge();
+        bridge.provide(channelWith({ fail: new Error('boom'), usage: [usageReply(1, 1, 0, 0), usageReply(1, 1, 0, 0)] }).channel);
+        expect(await bridge.ask('q')).toEqual({ ok: false, error: 'failed', detail: 'boom' });
+    });
 });
 
 describe('modelUsageDelta', () => {
@@ -277,6 +316,14 @@ describe('createSideQuestionRpcHandler', () => {
         const d = deps({ bridge: { ask: vi.fn(async () => ({ ...answered, usage: null, usageQuality: null })) } });
         expect(await createSideQuestionRpcHandler(d)({ question: 'q' })).toMatchObject({ success: true, usage: null, usageQuality: null });
         expect(d.reportUsage).not.toHaveBeenCalled();
+    });
+
+    it('shouldReportUsageOfAFailedSideQuestionAndStillReturnTheCodedError', async () => {
+        const spent = { input_tokens: 7, output_tokens: 2, cache_read_input_tokens: 40, cache_creation_input_tokens: 0 };
+        const d = deps({ bridge: { ask: vi.fn(async () => ({ ok: false as const, error: 'timeout' as const, usage: spent, usageQuality: 'estimated' as const, model: MODEL })) } });
+
+        expect(await createSideQuestionRpcHandler(d)({ question: 'q' })).toEqual({ success: false, error: 'side-question:timeout' });
+        expect(d.reportUsage).toHaveBeenCalledWith({ requestId: 'req-1', usage: spent, model: MODEL, quality: 'estimated' });
     });
 
     it('shouldRefuseAManagedRunBeforeAskingClaude', async () => {
