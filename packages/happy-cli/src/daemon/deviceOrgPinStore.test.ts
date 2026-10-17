@@ -104,3 +104,9 @@ it('does nothing when the device has no key directory yet',async()=>{
  const home=await mkdtemp(join(tmpdir(),'device-pin-'));homes.push(home);
  await expect(migrateLegacyOrgPinNames(home,'machine')).resolves.toEqual([]);
 });
+// A crash mid-write in CLI ≤ .338 left org-<uuid>.tmp / assignments-<uuid>.tmp (44+ chars); never published, so safe to drop.
+it('removes temp files an older CLI left behind, which were never published',async()=>{
+ const f=await fixture();const leftover=join(f.directory,'assignments-'+'0123abcd-4567-89ab-cdef-0123456789ab'+'.tmp');await writeFile(leftover,'partial');
+ expect(await migrateLegacyOrgPinNames(f.deps.home,'machine')).toEqual([{name:'assignments-0123abcd-4567-89ab-cdef-0123456789ab.tmp',outcome:'removed'}]);
+ expect(await readdir(f.directory)).not.toContain('assignments-0123abcd-4567-89ab-cdef-0123456789ab.tmp');
+});

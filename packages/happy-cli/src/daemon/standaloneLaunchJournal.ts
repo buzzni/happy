@@ -129,8 +129,8 @@ async function protectDirectory(directory: string, initialize = false, archiveId
         });
     } catch (error) {
       // Keep only what explains the refusal: the execFile error's own message and cmd carry the whole encoded script.
-      const { code, stderr } = error as { code?: unknown; stderr?: unknown };
-      throw new Error('Standalone journal ACL protection failed', { cause: { code, stderr: String(stderr ?? '').trim().slice(0, 2000) } });
+      const { code, killed, signal, stderr } = error as { code?: unknown; killed?: unknown; signal?: unknown; stderr?: unknown };
+      throw new Error('Standalone journal ACL protection failed', { cause: { code, killed, signal, stderr: String(stderr ?? '').trim().slice(0, 2000) } });
     }
     finally { logger.debug(`[timing] windows-acl dir=${win32.basename(directory)} initialize=${initialize} ${Date.now() - startedAt}ms`); }
   } else {

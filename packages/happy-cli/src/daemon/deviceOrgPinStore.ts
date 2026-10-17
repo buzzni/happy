@@ -19,8 +19,9 @@ export const DEVICE_ENTRY_NAME_BUDGET = 16;
 export const deviceStateName = (kind: 'o' | 'a', companyId: string) => kind + '-' + hash(companyId).slice(0, 8) + '.json';
 export const deviceTempName = (kind: 'o' | 'a') => kind + '-' + randomBytes(3).toString('hex') + '.tmp';
 const LEGACY_LONG_NAME = /^(org|assignments)-([0-9a-f]{8})[0-9a-f]{56}\.json$/;
+const LEGACY_TEMP_NAME = /^(?:org|assignments)-[0-9a-f-]{36}\.tmp$/;
 const PIN_MAX_BYTES = 70000;
-export type LegacyDeviceStateRename = { name: string; outcome: 'renamed' | 'duplicate' | 'quarantined' | 'skipped' };
+export type LegacyDeviceStateRename = { name: string; outcome: 'renamed' | 'duplicate' | 'quarantined' | 'removed' | 'skipped' };
 
 /** CLI ≤ 1.1.10-aplus.338 named pins and the signed assignment state with the full company hash, ~279 chars deep on
  * every Windows install, so the next daemon start failed its ACL check as "reapproval required". Rename them before
@@ -34,10 +35,12 @@ export async function migrateLegacyOrgPinNames(home: string, machineId: string):
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
     const results: LegacyDeviceStateRename[] = [];
     for (const name of names) {
-        const match = LEGACY_LONG_NAME.exec(name);
-        if (!match) continue;
+        const match = LEGACY_LONG_NAME.exec(name), temp = LEGACY_TEMP_NAME.test(name);
+        if (!match && !temp) continue;
         const legacy = join(directory, name), info = await lstat(legacy);
         if (!info.isFile() || info.size > PIN_MAX_BYTES) { results.push({ name, outcome: 'skipped' }); continue; }
+        // An older CLI's temp file was never published, so it holds no committed state.
+        if (!match) { await unlink(legacy); results.push({ name, outcome: 'removed' }); continue; }
         const target = join(directory, (match[1] === 'org' ? 'o' : 'a') + '-' + match[2] + '.json');
         let outcome: LegacyDeviceStateRename['outcome'] = 'renamed';
         try { await link(legacy, target); }
