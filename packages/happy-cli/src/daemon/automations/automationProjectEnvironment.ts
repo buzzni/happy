@@ -1,6 +1,8 @@
+import { unreachableFetchFailure, unreachableHttpStatus } from './automationUnreachableRetry'
+
 export type AutomationProjectEnvironmentResult =
   | { ok: true; environmentVariables: Record<string, string> }
-  | { ok: false; error: string; code?: 'EXECUTION_PRINCIPAL_UNBOUND' }
+  | { ok: false; error: string; code?: 'EXECUTION_PRINCIPAL_UNBOUND'; unreachable?: string }
 
 /** Run-scoped secrets stay in memory; never put response bodies in diagnostics. */
 export async function fetchAutomationProjectEnvironment(input: {
@@ -38,7 +40,12 @@ export async function fetchAutomationProjectEnvironment(input: {
           }
         }
       }
-      return { ok: false, error: `project environment request returned ${response.status}` }
+      const unreachable = unreachableHttpStatus(response.status)
+      return {
+        ok: false,
+        error: `project environment request returned ${response.status}`,
+        ...(unreachable ? { unreachable } : {}),
+      }
     }
     const body: unknown = await response.json()
     if (body && typeof body === 'object' && !Array.isArray(body)) {
@@ -51,7 +58,8 @@ export async function fetchAutomationProjectEnvironment(input: {
       }
     }
     return { ok: false, error: 'invalid project environment response' }
-  } catch {
-    return { ok: false, error: 'project environment request failed' }
+  } catch (error) {
+    const unreachable = unreachableFetchFailure(error)
+    return { ok: false, error: 'project environment request failed', ...(unreachable ? { unreachable } : {}) }
   }
 }

@@ -1,4 +1,5 @@
 import { describeHttpFailure, describeHttpFailureBody } from './describeHttpFailure'
+import { unreachableFetchFailure, unreachableHttpStatus } from './automationUnreachableRetry'
 
 export type AutomationMcpSpawnContext = {
   mcpCallerGrant?: string
@@ -16,6 +17,8 @@ export type AutomationMcpCallerGrantResult =
     ok: false
     error: string
     code?: 'EXECUTION_PRINCIPAL_UNBOUND' | 'EXECUTION_PRINCIPAL_ACCESS_REVOKED'
+    /** 교환 서버에 닿지 못한 실패의 코드. 있으면 예약 실행이 재시도할 수 있다. */
+    unreachable?: string
   }
 
 const EXCHANGE_TIMEOUT_MS = 3_000
@@ -101,10 +104,12 @@ export async function exchangeAutomationMcpCallerGrant(input: {
         : response.status === 403 && body?.error === 'EXECUTION_PRINCIPAL_ACCESS_REVOKED'
           ? 'EXECUTION_PRINCIPAL_ACCESS_REVOKED' as const
           : undefined
+      const unreachable = unreachableHttpStatus(response.status)
       return {
         ok: false,
         error: `caller grant exchange returned ${response.status}${describeHttpFailureBody(body)}`,
         ...(code ? { code } : {}),
+        ...(unreachable ? { unreachable } : {}),
       }
     }
     const parsed = parseExchangeResponse(await response.json())
@@ -112,12 +117,14 @@ export async function exchangeAutomationMcpCallerGrant(input: {
       return { ok: false, error: 'caller grant exchange returned an invalid response' }
     }
     return { ok: true, value: parsed.context }
-  } catch {
+  } catch (error) {
+    const unreachable = controller.signal.aborted ? 'TIMEOUT' : unreachableFetchFailure(error)
     return {
       ok: false,
       error: controller.signal.aborted
         ? 'caller grant exchange timed out'
         : 'caller grant exchange failed',
+      ...(unreachable ? { unreachable } : {}),
     }
   } finally {
     clearTimeout(timer)

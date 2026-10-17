@@ -23,6 +23,13 @@ import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from '
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
 import {
+  hasDueUnreachableRetry,
+  holdUnreachableRetry,
+  maintainUnreachableRetries,
+  rememberRetrySession,
+  takeDueUnreachableRetry,
+} from './automationUnreachableRetry'
+import {
   ensureAgentTaskReviewObjects,
   reviewShasFromDispatchInput,
   reviewWorktreeRequestFromDispatchInput,
@@ -1112,6 +1119,8 @@ async function executeStartedRun(
   failureCode?: string
   degradedCode?: string
   queueDepth?: number
+  /** 프롬프트를 세션에 전달하기 전 단계가 상대에 닿지 못해 실패한 코드 (automationUnreachableRetry). */
+  unreachable?: string
 }> {
   if (input.hostCommandsAllowed === false && (payload.scriptCommand || payload.githubTrigger)) {
     input.logDebug?.(`[server-automation] ${automation.automationId} needs host commands, which this runtime does not allow`)
@@ -1513,6 +1522,7 @@ async function executeStartedRun(
       sessionId: null,
       failureCode: mcpContext.code ?? 'GRANT_EXCHANGE_FAILED',
       ...(degradedCode ? { degradedCode } : {}),
+      ...(mcpContext.unreachable ? { unreachable: mcpContext.unreachable } : {}),
     }
   }
   let spawnMcpContext: AutomationMcpSpawnContext | undefined
@@ -1618,7 +1628,12 @@ async function executeStartedRun(
   if (payload.conversation) {
     const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId,
       ...(!mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
-    if (!authority.ok) return { outcome: 'ERROR', sessionId: null, failureCode: authority.code ?? 'CONVERSATION_TARGET_UNAVAILABLE' }
+    if (!authority.ok) {
+      return {
+        outcome: 'ERROR', sessionId: null, failureCode: authority.code ?? 'CONVERSATION_TARGET_UNAVAILABLE',
+        ...(authority.unreachable ? { unreachable: authority.unreachable } : {}),
+      }
+    }
   }
   const initialPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
   const spawnInput = {
@@ -1782,6 +1797,14 @@ export async function runServerAutomationTick(
     || JSON.stringify(reconciled.githubTriggers) !== JSON.stringify(before.githubTriggers ?? [])) {
     input.runtimeStore.write(reconciled)
   }
+  // 정규 실행·즉시 실행과 겹친 보류 run 은 claim 전에 실패로 마감해야 서버의 active run 이 빈다.
+  if (maintainUnreachableRetries({
+    runtimeStore: input.runtimeStore,
+    automations: cache.automations,
+    now,
+    heartbeat: (run) => input.transport.heartbeat(run),
+    logDebug: input.logDebug,
+  })) await flushPendingReports(input)
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
   let githubEventsProcessed = 0
@@ -1805,17 +1828,20 @@ export async function runServerAutomationTick(
   while (workQueue.length > 0) {
     const automation = workQueue.shift()!
     if (automation.paused || automation.migrationPending === true) continue
-    const schedule = input.runtimeStore.read().schedules.find((item) => item.automationId === automation.automationId)
+    const runtimeState = input.runtimeStore.read()
+    const schedule = runtimeState.schedules.find((item) => item.automationId === automation.automationId)
     const immediateWorker = immediateWorkerIds.delete(automation.automationId)
-    if (!schedule || schedule.generation !== automation.generation
-      || (schedule.nextRunAt > now && !immediateWorker)) continue
+    if (!schedule || schedule.generation !== automation.generation) continue
+    const retryDue = hasDueUnreachableRetry(runtimeState, automation, now)
+    if (schedule.nextRunAt > now && !immediateWorker && !retryDue) continue
     const payload = payloads.get(automation.automationId)!
     const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
     const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
     if (!payload.githubTrigger && !payload.conversation
       && schedule.lastSessionId
       && input.isSessionRunning(schedule.lastSessionId)) {
-      scheduleNextTick(input, automation.automationId, now)
+      // 보류한 재시도는 그대로 두고 다음 틱에 다시 본다 — 정규 시각을 당기면 재시도가 정규 실행에 밀려 버려진다.
+      if (!retryDue) scheduleNextTick(input, automation.automationId, now)
       continue
     }
     const dispatchesGithubWork = payload.githubTrigger
@@ -1837,28 +1863,37 @@ export async function runServerAutomationTick(
       scheduleNextTick(input, automation.automationId, now)
       continue
     }
-    const claim = await input.transport.claim({
-      automationId: automation.automationId,
-      generation: automation.generation,
-      scheduledFor: schedule.nextRunAt,
-    })
-    if (!claim.ok || !claim.value) {
-      if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
-        || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
-        advanceSchedule(input, automation.automationId, payload, now)
-        deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
-        if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
+    // 재시도는 이미 시작된 같은 run 을 이어 쓴다 — 새로 claim 하면 서버 이력에 행이 늘고
+    // 같은 회차가 두 번 실행될 수 있다.
+    const retry = retryDue ? takeDueUnreachableRetry(input.runtimeStore, automation, now, input.logDebug) : null
+    let runId: string
+    let claimToken: string
+    if (retry) {
+      ({ runId, claimToken } = retry.report)
+    } else {
+      const claim = await input.transport.claim({
+        automationId: automation.automationId,
+        generation: automation.generation,
+        scheduledFor: schedule.nextRunAt,
+      })
+      if (!claim.ok || !claim.value) {
+        if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
+          || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
+          advanceSchedule(input, automation.automationId, payload, now)
+          deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
+          if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
+        }
+        continue
       }
-      continue
-    }
 
-    advanceSchedule(input, automation.automationId, payload, now)
-    const runId = claim.value.runId as string
-    const claimToken = claim.value.claimToken as string
-    const started = await input.transport.start({ runId, claimToken })
-    if (!started.ok) {
-      deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
-      continue
+      advanceSchedule(input, automation.automationId, payload, now)
+      runId = claim.value.runId as string
+      claimToken = claim.value.claimToken as string
+      const started = await input.transport.start({ runId, claimToken })
+      if (!started.ok) {
+        deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
+        continue
+      }
     }
 
     const heartbeat = setInterval(() => {
@@ -1872,6 +1907,7 @@ export async function runServerAutomationTick(
       failureCode?: string
       degradedCode?: string
       queueDepth?: number
+      unreachable?: string
     }
     try {
       result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
@@ -1907,7 +1943,8 @@ export async function runServerAutomationTick(
         rememberGithubSession(input, automation, result.sessionId)
         activeGithubWorkerSessions.add(result.sessionId)
       }
-      advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
+      if (retry) rememberRetrySession(input.runtimeStore, automation.automationId, result.sessionId)
+      else advanceSchedule(input, automation.automationId, payload, now, result.sessionId)
     }
     // AgentTask의 서버 큐는 로컬 GitHub 이벤트 queueDepth에 포함되지 않는다.
     // worker를 시작했으면 같은 tick의 남은 예산으로 다시 조회하고, 초과분은 다음 tick에 실행한다.
@@ -1933,6 +1970,11 @@ export async function runServerAutomationTick(
       queueEstimatedAt,
       createdAt: input.now,
     }
+    // 스크립트 조건은 사용자 코드가 이미 돈 것이고 GitHub 트리거는 매 틱 스스로 다시 폴링한다.
+    if (result.unreachable && !payload.scriptCommand && !payload.githubTrigger
+      && holdUnreachableRetry(input.runtimeStore, {
+        automation, report, attempt: retry?.attempt ?? 0, now, logDebug: input.logDebug,
+      })) continue
     const state = input.runtimeStore.read()
     input.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
     const reported = await input.transport.report(report)

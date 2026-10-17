@@ -64,6 +64,21 @@ export interface PendingAutomationReport {
   createdAt?: number
 }
 
+/**
+ * 모델 호출 전 연결 실패로 보고를 보류하고 재시도를 기다리는 run (automationUnreachableRetry).
+ * report 는 재시도를 포기할 때 그대로 보낼 실패 보고다.
+ */
+export interface UnreachableRetryState {
+  /** 이 run 을 붙잡은 데몬 프로세스. 다르면 재시작으로 보고 재시도를 버린다. */
+  ownerId: string
+  automationId: string
+  generation: number
+  /** 이미 예약한 재시도 횟수(1부터). */
+  attempt: number
+  retryAt: number
+  report: PendingAutomationReport
+}
+
 export interface ServerAutomationRuntimeState {
   schedules: ServerAutomationScheduleState[]
   githubTriggers?: Array<{
@@ -84,6 +99,7 @@ export interface ServerAutomationRuntimeState {
   }>
   githubIssueProgressMarkers?: GithubIssueProgressMarkerState[]
   githubWorktrees?: GithubAutomationWorktreeState[]
+  unreachableRetries?: UnreachableRetryState[]
   pendingReports: PendingAutomationReport[]
 }
 
@@ -314,9 +330,22 @@ function parse(raw: string): ServerAutomationRuntimeState {
         }),
       }
     })
+    const retryRows = disk.unreachableRetries === undefined ? [] : disk.unreachableRetries
+    if (!Array.isArray(retryRows)) invalid()
+    const unreachableRetries = retryRows.map((value) => {
+      const row = record(value)
+      return {
+        ownerId: text(row.ownerId, 200),
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        attempt: integer(row.attempt, 1),
+        retryAt: integer(row.retryAt),
+        report: parsePendingReport(row.report),
+      }
+    })
     return {
       schedules, githubTriggers, githubActiveSessions, githubQueueProgress,
-      githubIssueProgressMarkers, githubWorktrees, pendingReports,
+      githubIssueProgressMarkers, githubWorktrees, unreachableRetries, pendingReports,
     }
   } catch (error) {
     if (error instanceof Error && error.message === 'automation-runtime-invalid') throw error
@@ -335,7 +364,7 @@ export function createServerAutomationRuntimeStore(options: { filePath: string }
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
           return {
             schedules: [], githubTriggers: [], githubActiveSessions: [], githubQueueProgress: [],
-            githubIssueProgressMarkers: [], githubWorktrees: [], pendingReports: [],
+            githubIssueProgressMarkers: [], githubWorktrees: [], unreachableRetries: [], pendingReports: [],
           }
         }
         throw error

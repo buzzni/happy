@@ -4284,3 +4284,220 @@ describe('ordinary scheduled conversation execution', () => {
     expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }]); expect(f.spawnSession).not.toHaveBeenCalled();
   });
 });
+
+// specs/automation-unreachable-retry — 프롬프트가 세션에 닿기 전 연결 실패는 같은 run 으로
+// 5·15·30분 뒤 다시 시도하고, 재시도가 남은 동안은 실패를 보고하지 않는다.
+describe('unreachable pre-model retry', () => {
+  const MINUTE = 60_000
+  const unreachableGrant = { ok: false as const, error: 'caller grant exchange failed', unreachable: 'ENOTFOUND' }
+
+  function retrySetup(intervalMinutes = 120) {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...base, schedule: { kind: 'interval' as const, minutes: intervalMinutes } })
+    const tickAt = (offsetMs: number) => {
+      f.input.now = f.now + offsetMs
+      return runServerAutomationTick(f.input)
+    }
+    return { ...f, tickAt }
+  }
+
+  it('holds the failure without reporting it and retries the same run five minutes later', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValueOnce(unreachableGrant)
+
+    await expect(f.tickAt(0)).resolves.toEqual([])
+    expect(f.transport.report).not.toHaveBeenCalled()
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({
+      automationId: 'automation-1', attempt: 1, retryAt: f.now + 5 * MINUTE,
+      report: expect.objectContaining({ runId: 'run-1', status: 'FAILED', failureCode: 'GRANT_EXCHANGE_FAILED' }),
+    })])
+
+    await f.tickAt(4 * MINUTE)
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.transport.heartbeat).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-1' })
+
+    await expect(f.tickAt(5 * MINUTE)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+    expect(f.transport.start).toHaveBeenCalledTimes(1)
+    expect(f.resolveMcpSpawnContext).toHaveBeenLastCalledWith({ runId: 'run-1', claimToken: 'claim-1' })
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
+    }))
+    const state = f.store.state()
+    expect(state.unreachableRetries).toEqual([])
+    // 재시도 성공이 정규 주기를 재시도 시각 기준으로 밀지 않는다.
+    expect(state.schedules[0]).toMatchObject({ nextRunAt: f.now + 120 * MINUTE, lastSessionId: 'session-1' })
+
+    await f.tickAt(6 * MINUTE)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a due retry alive while the previous session of the automation is still running', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValueOnce(unreachableGrant)
+    await f.tickAt(0)
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [{ ...state.schedules[0]!, lastSessionId: 'previous-session' }] })
+    let previousRunning = true
+    f.input.isSessionRunning = vi.fn(() => previousRunning)
+
+    await f.tickAt(5 * MINUTE)
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.transport.heartbeat).toHaveBeenLastCalledWith({ runId: 'run-1', claimToken: 'claim-1' })
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ attempt: 1 })])
+    expect(f.store.state().schedules[0]!.nextRunAt).toBe(f.now + 120 * MINUTE)
+
+    previousRunning = false
+    await f.tickAt(6 * MINUTE)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', outcome: 'WOKE' }))
+  })
+
+  it('records the failure once, through the usual path, after the third retry also fails', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValue(unreachableGrant)
+
+    for (const offset of [0, 5, 20]) {
+      await expect(f.tickAt(offset * MINUTE)).resolves.toEqual([])
+      expect(f.transport.report).not.toHaveBeenCalled()
+    }
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ attempt: 3, retryAt: f.now + 50 * MINUTE })])
+
+    await expect(f.tickAt(50 * MINUTE)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(4)
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'FAILED', outcome: 'ERROR', failureCode: 'GRANT_EXCHANGE_FAILED',
+    }))
+    expect(f.store.state().unreachableRetries).toEqual([])
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('unreachable after 3 automatic retries'))
+  })
+
+  it('leaves the retry to the regular run when that run comes first', async () => {
+    const f = retrySetup(15)
+    f.resolveMcpSpawnContext.mockResolvedValue(unreachableGrant)
+
+    await f.tickAt(0)
+    expect(f.transport.report).not.toHaveBeenCalled()
+    // 5분 재시도도 실패하면 다음 재시도(+20분)가 정규 실행(+15분)보다 늦으므로 지금 기록한다.
+    await expect(f.tickAt(5 * MINUTE)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.store.state().unreachableRetries).toEqual([])
+
+    const short = retrySetup(5)
+    short.resolveMcpSpawnContext.mockResolvedValue(unreachableGrant)
+    await expect(short.tickAt(0)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(short.store.state().unreachableRetries ?? []).toEqual([])
+  })
+
+  it.each([
+    ['a grant refusal that is not a connectivity failure', (f: ReturnType<typeof retrySetup>) => {
+      f.resolveMcpSpawnContext.mockResolvedValue({ ok: false, error: 'caller grant exchange returned 400' })
+    }],
+    ['a spawn failure, after which the prompt may already be in flight', (f: ReturnType<typeof retrySetup>) => {
+      f.spawnSession.mockResolvedValue({ ok: false, error: 'connect ECONNREFUSED' })
+    }],
+    ['a script automation, whose script already ran', (f: ReturnType<typeof retrySetup>) => {
+      const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+      f.input.decryptPayload = () => ({ ...base, scriptCommand: 'check.sh' })
+      f.runScript.mockResolvedValue({ ok: true, stdout: '{"wakeAgent":true}' })
+      f.resolveMcpSpawnContext.mockResolvedValue(unreachableGrant)
+    }],
+  ])('reports immediately for %s', async (_label, arrange) => {
+    const f = retrySetup()
+    arrange(f)
+
+    await expect(f.tickAt(0)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ status: 'FAILED', outcome: 'ERROR' }))
+    expect(f.store.state().unreachableRetries ?? []).toEqual([])
+  })
+
+  it('retries a scheduled conversation whose target could not be confirmed for lack of a network', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValue({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } })
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' })); f.input.deliverConversation = deliver
+    f.input.resolveProjectEnvironment = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: 'project environment request failed', unreachable: 'ECONNREFUSED' })
+      .mockResolvedValue({ ok: true, environmentVariables: {} })
+
+    await f.tickAt(0)
+    expect(deliver).not.toHaveBeenCalled()
+    expect(f.transport.report).not.toHaveBeenCalled()
+
+    await f.tickAt(5 * MINUTE)
+    expect(deliver).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', outcome: 'WOKE' }))
+  })
+
+  it('discards a retry the previous daemon process held and records its failure', async () => {
+    const f = retrySetup()
+    const state = f.store.read()
+    f.store.write({
+      ...state,
+      schedules: [{ ...state.schedules[0]!, nextRunAt: f.now + 60 * MINUTE }],
+      unreachableRetries: [{
+        ownerId: 'previous-daemon', automationId: 'automation-1', generation: 2, attempt: 1, retryAt: f.now,
+        report: {
+          runId: 'run-0', claimToken: 'claim-0', reportId: 'report-0', status: 'FAILED', outcome: 'ERROR',
+          sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
+        },
+      }],
+    })
+
+    await f.tickAt(0)
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.resolveMcpSpawnContext).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-0', reportId: 'report-0', status: 'FAILED' }))
+    expect(f.store.state()).toMatchObject({ unreachableRetries: [], pendingReports: [] })
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('because the daemon restarted'))
+  })
+
+  it('records the held failure instead of retrying once the user pauses the automation', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValue(unreachableGrant)
+    await f.tickAt(0)
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [{ ...cacheRecord(), paused: true }] })
+
+    await f.tickAt(5 * MINUTE)
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', status: 'FAILED' }))
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('because the automation was paused'))
+  })
+
+  it('gives a run-now request a fresh run without running the held one again', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValueOnce(unreachableGrant)
+    await f.tickAt(0)
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({
+      ...cache,
+      automations: [{ ...cacheRecord(), revision: 3, runRequestedAt: f.now + 2 * MINUTE }],
+    })
+    f.transport.claim.mockResolvedValue({ ok: true, value: { runId: 'run-2', claimToken: 'claim-2' } })
+
+    await f.tickAt(2 * MINUTE)
+    // 보류한 실패가 먼저 기록되어 서버의 active run 이 비워진 뒤 새 run 을 claim 한다.
+    expect(f.transport.report.mock.calls.map(([report]) => [report.runId, report.status])).toEqual([
+      ['run-1', 'FAILED'], ['run-2', 'COMPLETED'],
+    ])
+    expect(f.transport.report.mock.invocationCallOrder[0]).toBeLessThan(f.transport.claim.mock.invocationCallOrder[1]!)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+
+    await f.tickAt(5 * MINUTE)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.claim).toHaveBeenCalledTimes(2)
+  })
+})
