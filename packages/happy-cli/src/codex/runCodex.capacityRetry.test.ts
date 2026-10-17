@@ -404,5 +404,26 @@ describe('automatic continuation after a capacity failure', () => {
             expect(collected).toBe(true);
             expect(continuations()).toHaveLength(0);
         }, 60_000);
+
+        it('exits when the continuation is skipped because late work reopened the turn', async () => {
+            // Work Codex reports after turn/completed reopens the lifecycle while the continuation waits.
+            script = [{
+                outcome: 'overloaded',
+                after: () => {
+                    setTimeout(() => {
+                        eventHandler?.({ type: 'task_started', turn_id: 'turn-1' });
+                        setTimeout(() => { eventHandler?.({ type: 'task_complete', status: 'completed', turn_id: 'turn-1' }); }, 100);
+                    }, 5);
+                },
+            }];
+            const exited = runOnce().then(() => true);
+            const settled = await Promise.race([exited, sleep(3_000).then(() => false)]);
+            if (!settled) { closeQueue(); await exited; }
+
+            expect(settled).toBe(true);
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+        }, 60_000);
     });
 });

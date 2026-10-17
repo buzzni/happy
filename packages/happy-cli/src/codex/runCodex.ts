@@ -2584,6 +2584,11 @@ export async function runCodex(opts: {
                             if (turnCapacityRetryGeneration !== capacityRetryGeneration
                                 || shouldExit || thinking || pending || messageQueue.size() > 0 || messageQueue.isClosed()) {
                                 logger.debug('[Codex] Capacity continuation skipped: session moved on');
+                                // A run-once session stayed only for this continuation; wake its idle wait so it exits.
+                                if (runOnceTurnEnded && !pending && messageQueue.size() === 0) {
+                                    shouldExit = true;
+                                    messageQueue.close();
+                                }
                                 return;
                             }
                             messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode);
