@@ -149,7 +149,9 @@ export async function signOrgSetupTokenDocument(value: unknown, secretKey: Uint8
   const body = bodySchema.parse(value);
   // Derive from seed, not the untrusted public-key suffix of an Ed25519 secret key.
   if (secretKey.length !== 64) throw new Error('Invalid signing secret key');
-  const pair = nacl.sign.keyPair.fromSeed(secretKey.slice(0, 32));
+  const seed = secretKey.slice(0, 32);
+  const pair = nacl.sign.keyPair.fromSeed(seed);
+  seed.fill(0);
   try {
     if (!nacl.verify(pair.secretKey, secretKey)) throw new Error('Inconsistent signing key');
     await checkKeyIds(body, pair.publicKey);

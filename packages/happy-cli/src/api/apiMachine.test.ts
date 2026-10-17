@@ -1880,6 +1880,32 @@ describe('device registration RPC boundary', () => {
         await expect(handler('device:approve')({ document: 'signed', confirm: true })).rejects.toThrow();
         await expect(handler('device:status')({ companyId: 'company' })).resolves.toEqual({ pin: null });
     });
+    it('registers signed setup-token delivery on the server lane and refuses it before installing when nothing is pinned', async () => {
+        const deviceKeys = { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() };
+        const enrollment = { begin: vi.fn(), approve: vi.fn(), getStatus: vi.fn(), orgPin: vi.fn(async () => null) };
+        const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;
+        const client = new ApiMachineClient('token', makeMachine(), deviceKeys, enrollment as never);
+        client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: runtime });
+        const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;
+        const registration = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:signed-setup-token-group-sync');
+        expect(registration).toBeDefined();
+        expect(registration?.[2]).toBeUndefined();
+        await expect(registration![1]({ approval: '{}', assignments: ['{}'], scope: 'company', sealedPayload: {} })).rejects.toThrow('DEVICE_APPROVAL_REQUIRED');
+        expect(enrollment.orgPin).toHaveBeenCalledWith('company');
+        expect(runtime.setupTokenGroupSync).not.toHaveBeenCalled();
+        const capabilities = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:capabilities')![1];
+        expect(await capabilities()).toMatchObject({ signedSetupTokenAssignmentVersion: 1, deviceKeyVersion: 1 });
+    });
+    it('does not offer signed delivery without both device keys and a local enrollment controller', async () => {
+        const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;
+        for (const client of [new ApiMachineClient('token', makeMachine(), { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() }), new ApiMachineClient('token', makeMachine())]) {
+            client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: runtime });
+            const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;
+            expect(manager.registerHandler.mock.calls.map(([method]) => method)).not.toContain('ai-credential:signed-setup-token-group-sync');
+            const capabilities = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:capabilities')![1];
+            expect(await capabilities()).not.toHaveProperty('signedSetupTokenAssignmentVersion');
+        }
+    });
     it('does not expose enrollment for runtimes without a local enrollment controller', () => {
         const client = new ApiMachineClient('token', makeMachine());
         const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;

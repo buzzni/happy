@@ -28,6 +28,8 @@ export const SERVER_LANE_METHODS: ReadonlySet<string> = new Set([
     'claude-code-usage:read',
     'ai-credential:status',
     'ai-credential:capabilities',
+    // contract R8: installs only after the pinned organization key's signatures verify.
+    'ai-credential:signed-setup-token-group-sync',
     'browser-viewer:status',
     'browser-viewer:lookup',
     'allocate-port',
