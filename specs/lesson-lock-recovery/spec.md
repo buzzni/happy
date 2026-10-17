@@ -25,7 +25,7 @@ Both stores use one helper, `src/memory/ownedFileLock.ts` (`withOwnedFileLock`).
 ## Residual risks
 
 - A pid reused within about 3 s of its owner's death cannot be told apart (whole-second `ps`); the lock stays busy while that process lives.
-- An older-version holder stalled for more than 10 minutes can still be reclaimed from under it; old code cannot be fixed here.
+- An older-version holder stalled for more than 10 minutes can still be reclaimed from under it, and if it releases while the reclaim is in flight, the reclaimer may remove the next holder's lock. Old code records no owner, so this cannot be fixed here.
 - A crash between writing and removing `<lock>.<token>.pending`, or a reclaimer dying three times in a row, leaves small files nobody removes.
 - Filesystems without hard links would fail every acquire; the store lives under the daemon home, where this is not expected.
 - Desktop maps unknown reasons to `runtime_error` and logs the original as `hostReason`, so `settings_busy` is safe but shows the generic message until Desktop maps it (with the pin bump).
