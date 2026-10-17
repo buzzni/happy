@@ -899,6 +899,8 @@ export async function runCodex(opts: {
     // the automation daemon. This prevents an incomplete or accidentally resumed
     // startup from treating a later interactive message as the automation turn.
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn && initialPromptDelivered;
+    // Set once the run-once turn has ended; from then on the session only waits for its capacity continuation.
+    let runOnceTurnEnded = false;
     let thinking = false;
     let currentTurnId: string | null = null;
     let currentProviderTurnId: string | null = null;
@@ -2118,6 +2120,11 @@ export async function runCodex(opts: {
                     shouldExit = true;
                     break;
                 }
+                // The continuation a run-once session stayed for was stopped or dropped; nothing else will come.
+                if (runOnceTurnEnded && capacityRetryTimer === null && messageQueue.size() === 0) {
+                    shouldExit = true;
+                    break;
+                }
                 // Capture the current signal to distinguish idle-abort from queue close
                 const waitSignal = abortController.signal;
                 const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal, runtimeGate ? () => runtimeGate.tryBeginPreparing() : undefined);
@@ -2560,7 +2567,9 @@ export async function runCodex(opts: {
                     codexTurnCounter += 1;
                     // Channel requests are terminal after this turn; the channel lifecycle cannot
                     // authorize a second execution or route an uncorrelated continuation's answer.
-                    const retry = exitAfterFirstTurn || message.channelRequestId !== undefined ? null : capacityRetry.afterTurn(
+                    // A run-once automation is continued too: exiting here would abandon its task
+                    // with nothing reported (aplus-dev-studio#5177).
+                    const retry = message.channelRequestId !== undefined ? null : capacityRetry.afterTurn(
                         !result.aborted && turnServerOverloaded && turnCapacityRetryGeneration === capacityRetryGeneration,
                     );
                     if (retry) {
@@ -2655,8 +2664,13 @@ export async function runCodex(opts: {
                         sendReady,
                     });
                     if (exitAfterFirstTurn) {
-                        logger.debug('[codex]: Automation turn completed, exiting run-once session');
-                        shouldExit = true;
+                        runOnceTurnEnded = true;
+                        if (capacityRetryTimer === null) {
+                            logger.debug('[codex]: Automation turn completed, exiting run-once session');
+                            shouldExit = true;
+                        } else {
+                            logger.debug('[codex]: Automation turn ended at capacity, waiting to continue it before exiting');
+                        }
                     }
                     // Clear after checkpoint cleanup: it may finish pending command events.
                     // Aborted/failed turns must not teach a recovery in the next turn.
