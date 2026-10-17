@@ -127,7 +127,7 @@ async function protectDirectory(directory: string, initialize = false, archiveId
           windowsHide: true, timeout: 15000, maxBuffer: 32768,
           env: { ...process.env, SAYCODE_ACL_PATH: Buffer.from(directory).toString('base64'), SAYCODE_ACL_INITIALIZE: initialize ? '1' : '0', SAYCODE_ACL_ARCHIVE_ID: archiveId },
         });
-    } catch { throw new Error('Standalone journal ACL protection failed'); }
+    } catch (error) { throw new Error('Standalone journal ACL protection failed', { cause: error }); }
     finally { logger.debug(`[timing] windows-acl dir=${win32.basename(directory)} initialize=${initialize} ${Date.now() - startedAt}ms`); }
   } else {
     try { if (initialize) mkdirSync(directory, { mode: 0o700 }); }
