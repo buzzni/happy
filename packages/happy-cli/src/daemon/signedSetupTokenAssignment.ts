@@ -26,6 +26,18 @@ const stateName = (companyId: string) => 'assignments-' + hash(companyId).slice(
 function fail(code: string): never {
     throw new Error(code);
 }
+/** Only an RPC error code leaves the verifier; anything else would carry paths or parser text to the caller. */
+async function failingWith<T>(code: string, work: () => Promise<T>): Promise<T> {
+    try { return await work(); }
+    catch { fail(code); }
+}
+/** A document for another key is a context problem and a malformed one is bad input, not a forgery. */
+function verified(document: string, key: Uint8Array) {
+    return verifyOrgSetupTokenDocument(document, key).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : '';
+        fail(message === 'Invalid signature' ? 'SIGNATURE_INVALID' : message === 'Signing key mismatch' ? 'CONTEXT_MISMATCH' : 'AI_GROUP_INVALID_INPUT');
+    });
+}
 
 /** contract §4 credentialDigest, computed from the opened payload; the web server signs the same value. */
 export function setupTokenAccountDigest(input: { companyId: string; managedAccountId: string; credentialGeneration: number; displayName: string; accessToken: string }): string {
@@ -56,23 +68,29 @@ export function createSignedSetupTokenVerifier(deps: {
     let queue: Promise<unknown> = Promise.resolve();
 
     async function readState(companyId: string) {
-        await protectStandaloneObservationDirectory(directory);
+        await failingWith('ASSIGNMENT_STATE_INVALID', () => protectStandaloneObservationDirectory(directory));
         let file;
         try { file = await open(join(directory, stateName(companyId)), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1 as const, accepted: {} }; throw error; }
-        try {
-            const info = await file.stat();
-            if (!info.isFile() || info.size > 1024 * 1024 || (process.platform !== 'win32' && (info.mode & 0o777) !== 0o600)) fail('ASSIGNMENT_STATE_INVALID');
-            return stateSchema.parse(JSON.parse(await file.readFile('utf8')));
-        } finally { await file.close(); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1 as const, accepted: {} }; fail('ASSIGNMENT_STATE_INVALID'); }
+        return failingWith('ASSIGNMENT_STATE_INVALID', async () => {
+            try {
+                const info = await file.stat();
+                if (!info.isFile() || info.size > 1024 * 1024 || (process.platform !== 'win32' && (info.mode & 0o777) !== 0o600)) fail('ASSIGNMENT_STATE_INVALID');
+                return stateSchema.parse(JSON.parse(await file.readFile('utf8')));
+            } finally { await file.close(); }
+        });
     }
     async function writeState(companyId: string, state: z.infer<typeof stateSchema>) {
         const temporary = join(directory, 'assignments-' + randomBytes(4).toString('hex') + '.tmp');
-        try {
-            const file = await open(temporary, 'wx', 0o600);
-            try { await file.writeFile(canonicalOrgSetupTokenJson(state)); await file.sync(); } finally { await file.close(); }
-            await rename(temporary, join(directory, stateName(companyId)));
-        } finally { await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }); }
+        await failingWith('ASSIGNMENT_STATE_INVALID', async () => {
+            try {
+                const file = await open(temporary, 'wx', 0o600);
+                try { await file.writeFile(canonicalOrgSetupTokenJson(state)); await file.sync(); } finally { await file.close(); }
+                await rename(temporary, join(directory, stateName(companyId)));
+                // The rename itself must survive a crash, or an older revision becomes acceptable again after restart.
+                if (process.platform !== 'win32') { const dir = await open(directory, constants.O_RDONLY); try { await dir.sync(); } finally { await dir.close(); } }
+            } finally { await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }); }
+        });
     }
 
     async function verifyOnce(raw: unknown) {
@@ -82,18 +100,18 @@ export function createSignedSetupTokenVerifier(deps: {
         if (!parsed.success) fail('AI_GROUP_INVALID_INPUT');
         const { approval, assignments, ...outer } = parsed.data;
         const companyId = outer.scope;
-        const pin = await deps.pins.get(companyId);
+        const pin = await failingWith('ORG_PIN_INVALID', () => deps.pins.get(companyId));
         if (!pin) fail('DEVICE_APPROVAL_REQUIRED');
         const pinKey = Buffer.from(pin.publicKey, 'base64url');
         const pinned = pin.approval.body;
         if (pinned.kind !== 'device-approval') fail('DEVICE_APPROVAL_REQUIRED');
-        const presented = await verifyOrgSetupTokenDocument(approval, pinKey).catch(() => fail('SIGNATURE_INVALID'));
+        const presented = await verified(approval, pinKey);
         // Revocation and rotation are not accepted yet, so only the pinned approval itself is valid.
         if (canonicalOrgSetupTokenJson(presented) !== canonicalOrgSetupTokenJson(pin.approval)) fail('DEVICE_APPROVAL_MISMATCH');
         if (!assignments.length) fail('SIGNED_ASSIGNMENT_REQUIRED');
         const statements: AssignmentBody[] = [];
         for (const document of assignments) {
-            const body = (await verifyOrgSetupTokenDocument(document, pinKey).catch(() => fail('SIGNATURE_INVALID'))).body;
+            const body = (await verified(document, pinKey)).body;
             if (body.kind !== 'ai-assignment' || body.companyId !== companyId
                 || body.signingGeneration !== pinned.signingGeneration || body.signingKeyId !== pinned.signingKeyId) fail('CONTEXT_MISMATCH');
             statements.push(body as AssignmentBody);
@@ -126,8 +144,8 @@ export function createSignedSetupTokenVerifier(deps: {
                 || !Number.isSafeInteger(value.credentialGeneration) || typeof value.displayName !== 'string' || typeof accessToken !== 'string') fail('ASSIGNMENT_CONTENT_MISMATCH');
             const managedAccountId = value.managedAccountId as string;
             const expected = signed.get(managedAccountId);
-            const digest = setupTokenAccountDigest({ companyId, managedAccountId, credentialGeneration: Number(value.credentialGeneration),
-                displayName: value.displayName as string, accessToken: accessToken as string });
+            const digest = await failingWith('ASSIGNMENT_CONTENT_MISMATCH', async () => setupTokenAccountDigest({ companyId, managedAccountId,
+                credentialGeneration: Number(value.credentialGeneration), displayName: value.displayName as string, accessToken: accessToken as string }));
             if (!expected || expected.generation !== value.credentialGeneration || expected.digest !== digest) fail('ASSIGNMENT_CONTENT_MISMATCH');
             delivered.add(managedAccountId);
         }

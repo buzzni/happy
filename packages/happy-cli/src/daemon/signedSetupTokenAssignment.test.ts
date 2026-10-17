@@ -1,4 +1,4 @@
-import { mkdtemp, rm, readdir, rename } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -85,8 +85,13 @@ it('refuses delivery without a local pin, with a forged signature, or with anoth
     const f = await fixture();
     const accounts = [account(idA, tokenA)];
     const forger = nacl.sign.keyPair();
-    await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts, { signingKeyId: await orgSetupTokenKeyId(forger.publicKey) }, forger.secretKey)])))
+    const signed = JSON.parse(await f.assignment(accounts));
+    await expect(f.verifier().verify(f.request(accounts, [canonicalOrgSetupTokenJson({ ...signed, body: { ...signed.body, issuedAt: 2001 } })])))
         .rejects.toThrow('SIGNATURE_INVALID');
+    // A statement naming another signing key is a context problem, and a malformed one is bad input, not a forgery.
+    await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts, { signingKeyId: await orgSetupTokenKeyId(forger.publicKey) }, forger.secretKey)])))
+        .rejects.toThrow('CONTEXT_MISMATCH');
+    await expect(f.verifier().verify(f.request(accounts, ['{"body":1}']))).rejects.toThrow('AI_GROUP_INVALID_INPUT');
     const otherApproval = await signOrgSetupTokenDocument({ ...f.approval.body, approvalId: 'other' }, f.signer.secretKey);
     await expect(f.verifier().verify({ ...f.request(accounts, [await f.assignment(accounts)]), approval: canonicalOrgSetupTokenJson(otherApproval) }))
         .rejects.toThrow('DEVICE_APPROVAL_MISMATCH');
@@ -158,4 +163,23 @@ it('verifies before opening nothing when the kill switch is on', async () => {
     const verifier = createSignedSetupTokenVerifier({ home: f.home, machineId: 'machine', keys: f.keys, pins: f.pins,
         recipient: createSetupTokenAssignmentRecipient(f.keys.recipient.secretKey), now: () => NOW, killSwitch: () => true });
     await expect(verifier.verify(f.request(accounts, [await f.assignment(accounts)]))).rejects.toThrow('CLAUDE_SETUP_TOKEN_ASSIGNMENT_DISABLED');
+});
+
+
+it('reports a corrupt revision file and an unencodable account as verification failures, not raw errors', async () => {
+    const f = await fixture();
+    const accounts = [account(idA, tokenA)];
+    const signed = await f.assignment(accounts);
+    await expect(f.verifier().verify(f.request([account(idA, tokenA, 1, '\ud800')], [signed]))).rejects.toThrow('ASSIGNMENT_CONTENT_MISMATCH');
+    const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+    await writeFile(join(f.home, 'device-' + sha('machine'), 'assignments-' + sha('company').slice(0, 16) + '.json'), '{"version":1,"accepted":{"x":{"revision":"a"}}}', { mode: 0o600 });
+    await expect(f.verifier().verify(f.request(accounts, [signed]))).rejects.toThrow('ASSIGNMENT_STATE_INVALID');
+});
+
+it('reports an unreadable organization pin by its code, not by a parser or filesystem message', async () => {
+    const f = await fixture();
+    const accounts = [account(idA, tokenA)];
+    const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+    await writeFile(join(f.home, 'device-' + sha('machine'), 'org-' + sha('company').slice(0, 16) + '.json'), '{not json', { mode: 0o600 });
+    await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts)]))).rejects.toThrow(/^ORG_PIN_INVALID$/);
 });
