@@ -1,13 +1,18 @@
-/** Project-scoped read hardening. This is not an OS sandbox against a hostile
- * process continually changing the filesystem: Node has no portable openat API.
- * Reject links, validate real paths, and withhold results if path identity changes.
+/** Project-scoped read and create-only write hardening. This is not an OS sandbox
+ * against a hostile process continually changing the filesystem: Node has no
+ * portable openat API. Reject links, validate real paths, and withhold results
+ * (or report failure after a write) if path identity changes.
  */
-import { constants } from 'node:fs';
-import { lstat, open, readdir, realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { constants, type BigIntStats } from 'node:fs';
+import { lstat, mkdir, open, readdir, realpath, unlink } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 function denied(): Error & { code: string } {
     return Object.assign(new Error('Workspace path is outside the project, linked, or changed during reading'), { code: 'WORKSPACE_PATH_DENIED' });
+}
+
+function errorCode(error: unknown): unknown {
+    return error && typeof error === 'object' && 'code' in error ? error.code : undefined;
 }
 
 function within(root: string, path: string): boolean {
@@ -88,4 +93,80 @@ export async function readWorkspaceFile(allowedRoot: string, workspaceRoot: stri
         await snapshot.verify();
         return buffer.subarray(0, length);
     } finally { await handle.close(); }
+}
+
+/** Creates a new file inside the project, never overwriting and never writing
+ * through a link (aplus-dev-studio#5176). The deepest existing ancestor is
+ * captured like a read; each missing directory is created alone and checked
+ * before descending; the file itself is opened O_EXCL|O_NOFOLLOW. Afterwards
+ * the identity (dev/ino) of every ancestor is re-checked. Directory times are
+ * not, because creating the children changes them, so this is the read
+ * boundary's "detect, then fail" guarantee rather than an atomic one.
+ */
+export async function writeWorkspaceFile(allowedRoot: string, workspaceRoot: string, target: string, content: Buffer): Promise<void> {
+    if (![allowedRoot, workspaceRoot, target].every(validPath)) throw denied();
+    const root = resolve(workspaceRoot);
+    const path = resolve(target);
+    if (relative(root, path) === '' || !within(root, path)) throw denied();
+    if (relative(resolve(allowedRoot), path).split(sep).length > 128) throw denied();
+    const missing: string[] = [];
+    let ancestor = dirname(path);
+    // relative(), not string equality: Windows compares paths case-insensitively.
+    while (relative(root, ancestor) !== '') {
+        try {
+            await lstat(ancestor);
+            break;
+        } catch (error) {
+            if (errorCode(error) === 'ENOTDIR') throw denied();
+            if (errorCode(error) !== 'ENOENT') throw error;
+        }
+        missing.unshift(basename(ancestor));
+        ancestor = dirname(ancestor);
+    }
+    const snapshot = await captureWorkspacePath(allowedRoot, workspaceRoot, ancestor);
+    if (!snapshot.info.isDirectory()) throw denied();
+    const created: Array<{ path: string; info: BigIntStats }> = [];
+    let directory = snapshot.path;
+    for (const part of missing) {
+        directory = join(directory, part);
+        try {
+            await mkdir(directory);
+        } catch (error) {
+            if (errorCode(error) !== 'EEXIST') throw error;
+        }
+        // Whoever created it, it must be a real directory before anything goes inside.
+        const info = await lstat(directory, { bigint: true });
+        if (info.isSymbolicLink() || !info.isDirectory()) throw denied();
+        created.push({ path: directory, info });
+    }
+    let handle;
+    try {
+        handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0));
+    } catch (error) {
+        if (errorCode(error) !== 'EEXIST') throw error;
+        // O_EXCL also refuses a link at the leaf, dangling or not; name it as a link.
+        const existing = await lstat(path).catch(() => undefined);
+        if (!existing || existing.isSymbolicLink()) throw denied();
+        throw Object.assign(new Error('Workspace file already exists'), { code: 'EEXIST' });
+    }
+    let opened: BigIntStats | undefined;
+    try {
+        opened = await handle.stat({ bigint: true });
+        await handle.writeFile(content);
+    } catch (error) {
+        await handle.close();
+        // A short write must not survive as a file the next create-only attempt
+        // would report as already written. Remove it only while it is still ours.
+        const current = opened && await lstat(path, { bigint: true }).catch(() => undefined);
+        if (opened && current && current.dev === opened.dev && current.ino === opened.ino) await unlink(path).catch(() => undefined);
+        throw error;
+    }
+    await handle.close();
+    const written = await lstat(path, { bigint: true });
+    if (!written.isFile() || written.dev !== opened.dev || written.ino !== opened.ino) throw denied();
+    for (const entry of [...snapshot.snapshots, ...created]) {
+        const current = await lstat(entry.path, { bigint: true });
+        if (current.dev !== entry.info.dev || current.ino !== entry.info.ino) throw denied();
+    }
+    if (!within(snapshot.realPath, await realpath(path))) throw denied();
 }

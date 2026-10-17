@@ -187,6 +187,18 @@ describe('standalone Windows machine admission', () => {
         expect(decrypt(machine.encryptionKey, 'legacy', decodeBase64(encrypted))).toMatchObject({ code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED' });
         expect(handler).not.toHaveBeenCalled();
     });
+    // aplus-dev-studio#5176: the link-safe digest write must not be refused where writeFile is admitted.
+    it('admits the link-safe workspace write, which spawns nothing', async () => {
+        const { ApiMachineClient } = await import('./apiMachine');
+        const { encodeBase64, decodeBase64, encrypt, decrypt } = await import('./encryption');
+        const machine = machineClient(); const client = new ApiMachineClient('token', machine);
+        client.setWindowsStandaloneTrial(); client.setRPCHandlers(rpcHandlers());
+        const manager = (client as any).rpcHandlerManager;
+        const handler = vi.fn(async () => ({ success: true })); manager.registerHandler('writeWorkspaceFile', handler);
+        const encrypted = await manager.handleRequest({ method: 'machine-1:writeWorkspaceFile', params: encodeBase64(encrypt(machine.encryptionKey, 'legacy', {})) });
+        expect(decrypt(machine.encryptionKey, 'legacy', decodeBase64(encrypted))).toEqual({ success: true });
+        expect(handler).toHaveBeenCalledOnce();
+    });
     it('keeps normal Codex session launch admitted through the native-owning spawn boundary', async () => {
         const { ApiMachineClient } = await import('./apiMachine');
         const { encodeBase64, decodeBase64, encrypt, decrypt } = await import('./encryption');

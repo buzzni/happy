@@ -153,6 +153,8 @@ const ALLOWED_RPC_NAMES: readonly string[] = [
     'renameFile',
     'ripgrep',
     'writeFile',
+    // Strictly narrower than writeFile: create-only and refuses links (aplus-dev-studio#5176).
+    'writeWorkspaceFile',
 ];
 
 /**
