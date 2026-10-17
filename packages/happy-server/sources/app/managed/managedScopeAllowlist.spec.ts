@@ -178,7 +178,7 @@ describe('RPC names', () => {
         for (const name of [
             'bash', 'readFile', 'readFileChunk', 'writeFile', 'copyFile', 'deleteFile',
             'renameFile', 'ensureDirectory', 'listDirectory', 'getDirectoryTree',
-            'ripgrep', 'difftastic',
+            'ripgrep', 'difftastic', 'writeWorkspaceFile',
         ]) {
             expect(rpc(`${SID}:${name}`), name).toEqual(allow);
         }

@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -198,6 +199,40 @@ describe('project-scoped file RPCs', () => {
             success: false, errorCode: 'WORKSPACE_PATH_DENIED',
         });
     });
+
+    // aplus-dev-studio#5176: session digests are written here instead of writeFile,
+    // which follows a committed `.ax` link into another user's folder.
+    it('creates new project files without overwriting or writing through a link', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const write = handlers.get('writeWorkspaceFile');
+        const path = join(workingDirectory, '.ax', 'session-digests', 'req-1', 'index.md');
+        const content = Buffer.from('# digest').toString('base64');
+
+        await expect(write?.({ workspaceRoot: workingDirectory, path, content, expectedHash: null })).resolves.toEqual({
+            success: true, hash: createHash('sha256').update('# digest').digest('hex'),
+        });
+        await expect(readFile(path, 'utf8')).resolves.toBe('# digest');
+        await expect(write?.({ workspaceRoot: workingDirectory, path, content: Buffer.from('other').toString('base64'), expectedHash: null })).resolves.toMatchObject({
+            success: false, errorCode: 'EEXIST',
+        });
+        await expect(readFile(path, 'utf8')).resolves.toBe('# digest');
+        await expect(write?.({ workspaceRoot: workingDirectory, path: join(workingDirectory, 'new.md'), content, expectedHash: 'abc' })).resolves.toMatchObject({
+            success: false, errorCode: 'WORKSPACE_OVERWRITE_UNSUPPORTED',
+        });
+        await expect(write?.({ path: join(workingDirectory, 'new.md'), content, expectedHash: null })).resolves.toMatchObject({
+            success: false, errorCode: 'WORKSPACE_PATH_DENIED',
+        });
+
+        const outside = await mkdtemp(join(tmpdir(), 'happy-write-outside-'));
+        temporaryDirectories.push(outside);
+        const project = join(workingDirectory, 'linked-project');
+        await mkdir(project);
+        await symlink(outside, join(project, '.ax'), process.platform === 'win32' ? 'junction' : 'dir');
+        await expect(write?.({ workspaceRoot: project, path: join(project, '.ax', 'session-digests', 'r', 'index.md'), content, expectedHash: null })).resolves.toMatchObject({
+            success: false, errorCode: 'WORKSPACE_PATH_DENIED',
+        });
+        await expect(readdir(outside)).resolves.toEqual([]);
+    });
 });
 
 /*
@@ -226,6 +261,9 @@ describe('file RPCs under strict machine control', () => {
             success: false, errorCode: 'WORKSPACE_PATH_DENIED',
         });
         await expect(handlers.get('listWorkspaceDirectory')?.({ workspaceRoot: dirname(home), path: home })).resolves.toMatchObject({
+            success: false, errorCode: 'WORKSPACE_PATH_DENIED',
+        });
+        await expect(handlers.get('writeWorkspaceFile')?.({ workspaceRoot: dirname(home), path: join(home, 'access.key'), content: 'eA==', expectedHash: null })).resolves.toMatchObject({
             success: false, errorCode: 'WORKSPACE_PATH_DENIED',
         });
 

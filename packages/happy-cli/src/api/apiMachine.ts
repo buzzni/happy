@@ -1031,7 +1031,7 @@ export class ApiMachineClient {
         // Session launch/resume use the daemon's native owner; recovery's preflight refuses separately.
         const allowed = new Set(['spawn-happy-session', 'resume-happy-session', 'recover-happy-session',
             'stop-session', 'daemon-session-state', 'readFile', 'readFileChunk', 'writeFile', 'listDirectory',
-            'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory', 'getDirectoryTree',
+            'renameFile', 'deleteFile', 'copyFile', 'ensureDirectory', 'getDirectoryTree', 'writeWorkspaceFile',
             'allocate-port', 'get-port', 'release-port']);
         this.rpcHandlerManager.setMethodPolicy(method => allowed.has(method) ? null : {
             error: 'Method unavailable in the standalone Windows Codex trial', code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED',

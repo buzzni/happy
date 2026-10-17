@@ -1,4 +1,4 @@
-import { listWorkspaceDirectory, readWorkspaceFile } from './workspaceFileBoundary';
+import { listWorkspaceDirectory, readWorkspaceFile, writeWorkspaceFile } from './workspaceFileBoundary';
 import { fileDiscovery } from './fileDiscovery';
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
@@ -761,6 +761,34 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             }
         });
     }
+
+    // Link-safe, create-only companion to writeFile (aplus-dev-studio#5176). Its own
+    // method name is the capability gate, as for the reads above: a client that needs
+    // the guarantee must fail closed on an old daemon instead of falling back to
+    // writeFile, which follows links.
+    rpcHandlerManager.registerHandler<{ workspaceRoot: string; path: string; content: string; expectedHash?: null }, object>('writeWorkspaceFile', async (data) => {
+        if ([data?.workspaceRoot, data?.path].some((path) => typeof path === 'string' && isStrictlyGuardedPath(path))) {
+            return {
+                success: false,
+                error: 'Workspace path is in the happy home directory, which strict machine control keeps out of reach',
+                errorCode: 'WORKSPACE_PATH_DENIED',
+            };
+        }
+        if (data?.expectedHash !== null && data?.expectedHash !== undefined) {
+            return { success: false, error: 'writeWorkspaceFile only creates new files', errorCode: 'WORKSPACE_OVERWRITE_UNSUPPORTED' };
+        }
+        try {
+            const buffer = Buffer.from(data.content, 'base64');
+            await writeWorkspaceFile(workingDirectory, data.workspaceRoot, data.path, buffer);
+            return { success: true, hash: createHash('sha256').update(buffer).digest('hex') };
+        } catch (error) {
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : 'Workspace write failed',
+                errorCode: error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'WORKSPACE_WRITE_FAILED',
+            };
+        }
+    });
 
     rpcHandlerManager.registerHandler<ListDirectoryRequest, ListDirectoryResponse>('listDirectory', async (data) => {
         logger.debug('List directory request:', data.path);
