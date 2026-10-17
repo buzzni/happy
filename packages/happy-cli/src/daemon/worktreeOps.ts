@@ -253,6 +253,8 @@ function slashed(path: string): string {
 type PathGuard = {
     /** The real directory, when it exists, is inside the allowed root and outside the happy home. */
     directory(path: string): Promise<string>;
+    /** A missing directory will be created or removed where its nearest existing parent leads. */
+    missing(path: string): Promise<void>;
 };
 
 function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
@@ -274,6 +276,12 @@ function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
             }
             if (!(await stat(real)).isDirectory()) throw new OpFailure('PATH_DENIED', 'Not a folder');
             return real;
+        },
+        async missing(path) {
+            if (!isAbsolute(path)) throw new OpFailure('PATH_DENIED', 'Not an absolute path on this machine');
+            if (!isWithinDirectory(path, allowedRoot) || isWithinDirectory(path, happyHomeDir)) {
+                throw new OpFailure('PATH_DENIED', 'The folder is outside the allowed root');
+            }
         },
     };
 }
@@ -986,8 +994,8 @@ async function purgeProject(guard: PathGuard, ticket: WorktreeTicket & { op: 'pu
         folder = await guard.directory(requested);
     } catch (error) {
         if (!(error instanceof OpFailure) || error.errorCode !== 'WORKSPACE_MISSING') throw error;
-        // Gone already: its resources may still be there. The path itself must still be ours to name.
-        if (!isAbsolute(requested)) throw new OpFailure('PATH_DENIED', 'Not an absolute path on this machine');
+        // Gone already: its resources may still be there. Its nearest existing parent must still be ours.
+        await guard.missing(requested);
     }
     // A link anywhere along the way would have the removal land somewhere else.
     if (folder !== null && slashed(folder) !== slashed(requested)) throw new OpFailure('PATH_DENIED', 'The folder is reached through a link');

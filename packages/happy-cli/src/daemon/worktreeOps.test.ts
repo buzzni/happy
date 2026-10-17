@@ -881,4 +881,12 @@ describe('worktree:purge-project', () => {
             rmSync(outside, { recursive: true, force: true });
         }
     });
+    it('rejects a missing purge path outside the allowed root before cleanup', async () => {
+        const outside = join(tmpdir(), `purge-outside-missing-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+        const { set, dockerCalls, nativeCalls } = purgeSet({ containers: ['c1'] });
+        expect(await call('purge-project', purge(outside), {}, set)).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+        expect(dockerCalls).toEqual([]);
+        expect(nativeCalls).toEqual([]);
+    });
+
 });
