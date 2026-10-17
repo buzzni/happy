@@ -8,7 +8,8 @@ import { z } from 'zod';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 
 export type DeviceKeys = { signing: nacl.SignKeyPair; recipient: nacl.BoxKeyPair };
-const reapproval = (cause?: unknown) => new Error('Device key unavailable; reapproval required', cause === undefined ? undefined : { cause });
+const REAPPROVAL = 'Device key unavailable; reapproval required';
+const reapproval = (cause?: unknown) => new Error(REAPPROVAL, cause === undefined ? undefined : { cause });
 const binary = z.string().regex(/^[A-Za-z0-9_-]{43}$/).refine(value => Buffer.from(value, 'base64url').toString('base64url') === value);
 const recordSchema = z.object({ version: z.literal(1), machineId: z.string(), signingSeed: binary, signingPublic: binary, recipientSecret: binary, recipientPublic: binary }).strict();
 
@@ -24,17 +25,17 @@ async function readKeys(directory: string, machineId: string): Promise<DeviceKey
     let bytes: Buffer | undefined;
     try {
         const info = await file.stat();
-        if (!info.isFile() || info.nlink !== 1 || info.size > 4096 || (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o600))) throw reapproval();
+        if (!info.isFile() || info.nlink !== 1 || info.size > 4096 || (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o600))) throw reapproval(new Error('key file is not one private regular file of key size'));
         bytes = await file.readFile();
         const record = recordSchema.parse(JSON.parse(bytes.toString('utf8')));
-        if (record.machineId !== machineId) throw reapproval();
+        if (record.machineId !== machineId) throw reapproval(new Error('key file belongs to another machine'));
         const seed = Buffer.from(record.signingSeed, 'base64url');
         const recipient = Buffer.from(record.recipientSecret, 'base64url');
         try {
             const keys = { signing: nacl.sign.keyPair.fromSeed(seed), recipient: nacl.box.keyPair.fromSecretKey(new Uint8Array(recipient)) };
             if (Buffer.from(keys.signing.publicKey).toString('base64url') !== record.signingPublic || Buffer.from(keys.recipient.publicKey).toString('base64url') !== record.recipientPublic) {
                 keys.signing.secretKey.fill(0); keys.recipient.secretKey.fill(0);
-                throw reapproval();
+                throw reapproval(new Error('stored public keys do not match the private keys'));
             }
             return keys;
         } finally { seed.fill(0); recipient.fill(0); }
@@ -46,9 +47,9 @@ async function readKeys(directory: string, machineId: string): Promise<DeviceKey
  * The caller supplies HAPPY_HOME and the authenticated local machine ID, never a remote path.
  */
 export async function loadOrCreateDeviceKeys(home: string, machineId: string): Promise<DeviceKeys> {
-    if (!isAbsolute(home) || !machineId || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(machineId) || /[\u0000-\u001f\u007f-\u009f]/.test(machineId)) throw reapproval();
+    if (!isAbsolute(home) || !machineId || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(machineId) || /[\u0000-\u001f\u007f-\u009f]/.test(machineId)) throw reapproval(new Error('invalid key home or machine id'));
     const root = await lstat(home);
-    if (!root.isDirectory() || root.isSymbolicLink() || (process.platform !== 'win32' && (root.uid !== process.getuid?.() || (root.mode & 0o022) !== 0))) throw reapproval();
+    if (!root.isDirectory() || root.isSymbolicLink() || (process.platform !== 'win32' && (root.uid !== process.getuid?.() || (root.mode & 0o022) !== 0))) throw reapproval(new Error('key home is not a private directory'));
     const directory = join(home, 'device-' + createHash('sha256').update(machineId).digest('hex'));
     let created = false;
     try { await mkdir(directory, { mode: 0o700 }); created = true; }
@@ -85,7 +86,7 @@ export async function loadOrCreateDeviceKeys(home: string, machineId: string): P
             await lstat(join(directory, 'keys.json'));
             return await readKeys(directory, machineId);
         } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || Date.now() >= deadline) throw reapproval(error);
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || Date.now() >= deadline) throw error instanceof Error && error.message === REAPPROVAL ? error : reapproval(error);
             await delay(20);
         }
     }

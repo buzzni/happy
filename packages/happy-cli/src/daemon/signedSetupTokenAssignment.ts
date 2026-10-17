@@ -8,21 +8,19 @@
  */
 import { constants } from 'node:fs';
 import { open, rename, unlink } from 'node:fs/promises';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { canonicalOrgSetupTokenJson, verifyOrgSetupTokenDocument, type OrgSetupTokenDocument } from '@slopus/happy-wire';
 import type { DeviceKeys } from './deviceKeys';
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
+import { deviceStateName, deviceTempName } from './deviceOrgPinStore';
 
 type AssignmentBody = Extract<OrgSetupTokenDocument['body'], { kind: 'ai-assignment' }>;
 type Pin = { publicKey: string; approval: OrgSetupTokenDocument };
 const MAX_STATEMENTS = 16;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-/** Lives in the device directory beside the org pins, so it keeps their short name for the same Windows MAX_PATH reason
- * (see deviceOrgPinStore pinName). A collision only fails closed: the company is re-checked against the pinned approval. */
-const stateName = (companyId: string) => 'assignments-' + hash(companyId).slice(0, 16) + '.json';
 function fail(code: string): never {
     throw new Error(code);
 }
@@ -70,7 +68,7 @@ export function createSignedSetupTokenVerifier(deps: {
     async function readState(companyId: string) {
         await failingWith('ASSIGNMENT_STATE_INVALID', () => protectStandaloneObservationDirectory(directory));
         let file;
-        try { file = await open(join(directory, stateName(companyId)), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); }
+        try { file = await open(join(directory, deviceStateName('a', companyId)), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); }
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1 as const, accepted: {} }; fail('ASSIGNMENT_STATE_INVALID'); }
         return failingWith('ASSIGNMENT_STATE_INVALID', async () => {
             try {
@@ -81,12 +79,12 @@ export function createSignedSetupTokenVerifier(deps: {
         });
     }
     async function writeState(companyId: string, state: z.infer<typeof stateSchema>) {
-        const temporary = join(directory, 'assignments-' + randomBytes(4).toString('hex') + '.tmp');
+        const temporary = join(directory, deviceTempName('a'));
         await failingWith('ASSIGNMENT_STATE_INVALID', async () => {
             try {
                 const file = await open(temporary, 'wx', 0o600);
                 try { await file.writeFile(canonicalOrgSetupTokenJson(state)); await file.sync(); } finally { await file.close(); }
-                await rename(temporary, join(directory, stateName(companyId)));
+                await rename(temporary, join(directory, deviceStateName('a', companyId)));
                 // The rename itself must survive a crash, or an older revision becomes acceptable again after restart.
                 if (process.platform !== 'win32') { const dir = await open(directory, constants.O_RDONLY); try { await dir.sync(); } finally { await dir.close(); } }
             } finally { await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }); }
