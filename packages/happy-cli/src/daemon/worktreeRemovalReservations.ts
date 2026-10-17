@@ -7,7 +7,8 @@
  * worktree removable reserves it; the removal (or the expiry, as on the server) ends the reservation.
  * It lives in memory: after a restart the server's reservation and the removal's own checks remain.
  */
-import { realpath } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { readlink, realpath } from 'node:fs/promises';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 /**
@@ -34,15 +35,32 @@ async function canonical(path: string): Promise<string> {
     }
 }
 
+/** A running session as the daemon tracks it; `directory` is unknown until its webhook arrives. */
+export type LiveSession = { pid: number; directory?: string };
+
+/** The process's working folder, or null when it cannot be read. */
+async function defaultProcessCwd(pid: number): Promise<string | null> {
+    if (process.platform === 'linux') return readlink(`/proc/${pid}/cwd`).catch(() => null);
+    if (process.platform !== 'darwin') return null;
+    return new Promise((resolveCwd) => {
+        execFile('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { timeout: 5_000 }, (error, stdout) => {
+            const line = error ? undefined : stdout.split('\n').find((entry) => entry.startsWith('n/'));
+            resolveCwd(line ? line.slice(1) : null);
+        });
+    });
+}
+
 export class WorktreeRemovalReservations {
     private readonly ttlMs: number;
+    private readonly processCwd: (pid: number) => Promise<string | null>;
     private readonly until = new Map<string, number>();
     private readonly launching = new Map<number, string>();
     private nextLaunch = 0;
-    private liveDirectories: () => Array<string | undefined> = () => [];
+    private liveSessions: () => LiveSession[] = () => [];
 
-    constructor(options: { ttlMs?: number } = {}) {
+    constructor(options: { ttlMs?: number; processCwd?: (pid: number) => Promise<string | null> } = {}) {
         this.ttlMs = options.ttlMs ?? WORKTREE_REMOVAL_RESERVATION_MS;
+        this.processCwd = options.processCwd ?? defaultProcessCwd;
     }
 
     async reserve(path: string, now: number = Date.now()): Promise<void> {
@@ -53,9 +71,9 @@ export class WorktreeRemovalReservations {
         this.until.delete(await canonical(path));
     }
 
-    /** Where the daemon's running sessions work (set by the daemon once its session table exists). */
-    setLiveDirectories(provider: () => Array<string | undefined>): void {
-        this.liveDirectories = provider;
+    /** The daemon's running sessions (set by the daemon once its session table exists). */
+    setLiveSessions(provider: () => LiveSession[]): void {
+        this.liveSessions = provider;
     }
 
     /**
@@ -74,7 +92,10 @@ export class WorktreeRemovalReservations {
         const root = await canonical(worktreePath);
         const inside = (dir: string) => dir === root || dir.startsWith(root + sep);
         if ([...this.launching.values()].some(inside)) return true;
-        for (const dir of this.liveDirectories()) {
+        for (const session of this.liveSessions()) {
+            // A session started from a terminal has no recorded folder until its webhook arrives: its
+            // process's working folder decides. One that cannot be read does not count.
+            const dir = session.directory ?? await this.processCwd(session.pid);
             if (dir && inside(await canonical(dir))) return true;
         }
         return false;
