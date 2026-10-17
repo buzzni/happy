@@ -141,16 +141,31 @@ export async function writeWorkspaceFile(allowedRoot: string, workspaceRoot: str
         if (info.isSymbolicLink() || !info.isDirectory()) throw denied();
         created.push({ path: directory, info });
     }
+    // Only an existing regular file is "already exists"; anything else at the leaf is refused.
+    const refuseExisting = async (): Promise<never> => {
+        const existing = await lstat(path).catch(() => undefined);
+        if (!existing?.isFile()) throw denied();
+        throw Object.assign(new Error('Workspace file already exists'), { code: 'EEXIST' });
+    };
+    // Windows has no O_NOFOLLOW and CREATE_NEW follows a dangling link to create
+    // its target, so refuse anything already at the leaf before opening.
+    if (!constants.O_NOFOLLOW) {
+        let present = true;
+        try {
+            await lstat(path);
+        } catch (error) {
+            if (errorCode(error) !== 'ENOENT') throw error;
+            present = false;
+        }
+        if (present) return await refuseExisting();
+    }
     let handle;
     try {
         handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0));
     } catch (error) {
         if (errorCode(error) !== 'EEXIST') throw error;
-        // O_EXCL also refuses a link at the leaf, dangling or not; only an existing
-        // regular file is "already exists", anything else at the leaf is refused.
-        const existing = await lstat(path).catch(() => undefined);
-        if (!existing?.isFile()) throw denied();
-        throw Object.assign(new Error('Workspace file already exists'), { code: 'EEXIST' });
+        // O_EXCL also refuses a link at the leaf, dangling or not.
+        return await refuseExisting();
     }
     let opened: BigIntStats;
     try {
