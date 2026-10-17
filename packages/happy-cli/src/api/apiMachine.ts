@@ -252,6 +252,7 @@ import type { PendingAutomationReport } from '@/daemon/automations/serverAutomat
 import type { SessionFollowupTransport } from '@/daemon/automations/sessionFollowupRunner';
 import type { AiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 import { createSetupTokenAssignmentRecipient, setupTokenRecipientCapability } from '@/daemon/setupTokenAssignmentWire';
+import { createSignedSetupTokenVerifier } from '@/daemon/signedSetupTokenAssignment';
 import type { AutonomousQualityGateRpcHandlers } from '@/daemon/autonomousQualityGateRpc';
 import type { CheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
 
@@ -912,7 +913,7 @@ export class ApiMachineClient {
         private token: string,
         private machine: Machine,
         private readonly deviceKeys?: DeviceKeys,
-        deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>
+        private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>
     ) {
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         // Initialize RPC handler manager
@@ -1163,6 +1164,7 @@ export class ApiMachineClient {
                     sharedMachineSetupTokenVersion: 1,
                     setupTokenRecipient: setupTokenRecipientCapability(this.setupTokenAssignmentRecipient),
                     ...(this.deviceKeys ? { deviceKeyVersion: 1, deviceSigningPublicKey: Buffer.from(this.deviceKeys.signing.publicKey).toString('base64url'), recipientPublicKey: Buffer.from(this.deviceKeys.recipient.publicKey).toString('base64url') } : {}),
+                    ...(this.deviceKeys && this.deviceEnrollment ? { signedSetupTokenAssignmentVersion: 1 } : {}),
                 };
             }
             return capabilities;
@@ -1182,6 +1184,18 @@ export class ApiMachineClient {
             (params) => aiCredentialRuntime.setupTokenGroupSync(params, this.machine.id, this.setupTokenAssignmentRecipient),
             { customerBound: true },
         );
+        // contract §5: server-lane delivery is verified against the locally pinned organization key first,
+        // then installed through the same sealed path. The customer-bound relay above stays unchanged.
+        const deviceEnrollment = this.deviceEnrollment;
+        if (this.deviceKeys && deviceEnrollment) {
+            const signedDelivery = createSignedSetupTokenVerifier({
+                home: configuration.happyHomeDir, machineId: this.machine.id, keys: this.deviceKeys,
+                pins: { get: companyId => deviceEnrollment.orgPin(companyId) },
+                recipient: this.setupTokenAssignmentRecipient, now: Date.now, killSwitch: setupTokenAssignmentKillSwitchEnabled,
+            });
+            this.rpcHandlerManager.registerHandler('ai-credential:signed-setup-token-group-sync', async (params) =>
+                aiCredentialRuntime.setupTokenGroupSync(await signedDelivery.verify(params), this.machine.id, this.setupTokenAssignmentRecipient));
+        }
         this.rpcHandlerManager.registerHandler('ai-credential:purge', (params) => (
             aiCredentialRuntime.purge(params)
         ));

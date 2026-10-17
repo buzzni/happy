@@ -78,6 +78,10 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
             enrollment.approval = { ...document, body };
             await persistIfReady();
         },
+        /** The locally confirmed organization pin, which signed setup-token delivery trusts. */
+        orgPin(companyId: string) {
+            return deps.store ? deps.store.get(companyId) : Promise.resolve(null);
+        },
         async getStatus(companyId: string) {
             z.string().min(1).max(512).regex(/^[^\u0000-\u001f\u007f-\u009f]+$/).parse(companyId);
             const pin = await deps.store?.get(companyId);

@@ -50,7 +50,7 @@ describe('machineServerLane', () => {
             'container-runtime-status', 'gh-auth-status', 'machine-info']) {
             expect(SERVER_LANE_METHODS.has(method), method).toBe(true);
         }
-        expect(SERVER_LANE_METHODS.size).toBe(25);
+        expect(SERVER_LANE_METHODS.size).toBe(26);
     });
 
     it('lists no content-capable method', () => {
@@ -61,4 +61,12 @@ describe('machineServerLane', () => {
 it('never allows remote device confirmation', () => {
     expect(SERVER_LANE_METHODS.has('device:confirm')).toBe(false);
     expect(SERVER_LANE_METHODS.has('device:enroll')).toBe(true);
+});
+
+// contract R8: the only setup-token carrier on the server lane is the signed method; its handler
+// installs nothing unless the pinned organization key signed the approval and every assignment.
+it('admits signed setup-token delivery but never the customer-bound relay methods', () => {
+    expect(SERVER_LANE_METHODS.has('ai-credential:signed-setup-token-group-sync')).toBe(true);
+    expect(SERVER_LANE_METHODS.has('ai-credential:setup-token-group-sync')).toBe(false);
+    expect(SERVER_LANE_METHODS.has('ai-credential:group-sync')).toBe(false);
 });
