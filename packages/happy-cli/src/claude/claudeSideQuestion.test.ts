@@ -123,6 +123,21 @@ describe('ClaudeSideQuestionBridge', () => {
         });
     });
 
+    it('shouldNotClaimMainTurnTokensWhenOverlappingMainMessagesCarryNoUsage', async () => {
+        // Z.AI-compatible path: main assistant usage arrives as 0 and the turn result meters it later.
+        const bridge = new ClaudeSideQuestionBridge();
+        const { channel } = channelWith({
+            usage: [usageReply(1000, 100, 0, 0), usageReply(6300, 550, 0, 0)],
+            turnInProgress: [true],
+            onSideQuestion: () => {
+                bridge.noteMainMessage({ type: 'assistant', message: { id: 'msg_main', usage: { input_tokens: 0, output_tokens: 0 } } });
+            },
+        });
+        bridge.provide(channel);
+
+        expect(await bridge.ask('status?')).toMatchObject({ ok: true, answer: 'PELICAN', usage: null, usageQuality: null });
+    });
+
     it('shouldNotCountMainMessagesSeenOutsideAMeasurementWindow', async () => {
         let now = 0;
         const bridge = new ClaudeSideQuestionBridge(() => now);

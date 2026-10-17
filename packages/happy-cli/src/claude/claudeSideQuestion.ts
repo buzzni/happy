@@ -8,6 +8,7 @@
  * 응답에는 토큰이 없다. 대신 Claude 의 세션 누적(`get_usage` → session.model_usage)에
  * 곁질문 사용량이 들어가므로 요청 전후 차이로 잰다. 본 턴과 겹친 구간이면 그 사이
  * 관측된 본 턴 assistant 사용량을 빼고 'estimated' 로 표시한다 (이미 따로 계량됨).
+ * 관측된 본 턴 사용량이 0 뿐이면(Z.AI 호환 경로) 나눌 수 없어 재지 않는다.
  */
 import type { ClaudeUsageLike } from '@/usage/claudeTurnUsage';
 
@@ -156,6 +157,9 @@ export class ClaudeSideQuestionBridge {
                 const after = before ? await this.readUsage(channel, AbortSignal.timeout(USAGE_READ_TIMEOUT_MS)) : null;
                 overlapped ||= observed.size > 0;
                 if (!before || !after) return null;
+                // 겹친 본 턴 메시지의 usage 가 0 이면(Z.AI 호환 경로) 본 턴 토큰은 턴 result 로 따로
+                // 계량된다 — 뺄 값이 없어 차이에 섞인 본 턴 토큰을 곁질문 몫으로 이중 보고하게 된다.
+                if (observed.size > 0 && [...observed.values()].every((usage) => usageTotal(usage) === 0)) return null;
                 const delta = modelUsageDelta(before, after);
                 return {
                     usage: overlapped ? subtractUsage(delta.usage, observed.values()) : delta.usage,
