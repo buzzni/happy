@@ -226,6 +226,11 @@ import {
   removeGithubTriggerWorktree,
 } from './automations/githubTriggerWorktree';
 import {
+  createGithubWorktreeTombstoneStore,
+  readWorktreeHead,
+  rememberGithubWorktreeRemoval,
+} from './automations/githubWorktreeTombstones';
+import {
   createGithubIssueProgressMarker,
   removeGithubIssueProgressMarker,
   resolveGithubIssueProgressMarkerIdentity,
@@ -2654,6 +2659,12 @@ export async function startDaemon(): Promise<void> {
       };
     };
 
+    // Where the daemon's removed automation worktrees came from, so a Chat replied to after its run-once
+    // session exited can resume in the same directory (2026-10-17).
+    const githubWorktreeTombstones = createGithubWorktreeTombstoneStore({
+      filePath: join(configuration.happyHomeDir, 'automation-worktree-tombstones.json'),
+    });
+
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
@@ -2694,25 +2705,6 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.`,
           };
         }
-        if (!options?.checkpointRestart) {
-          const checkpointAuthority = await resolveCheckpointSessionAuthority({
-            sessionId: happySessionId,
-            trackedSession: tracked,
-            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
-            platform: process.platform,
-          });
-          if (
-            checkpointAuthority?.protection.status === 'unavailable'
-            && checkpointAuthority.protection.reason === 'excluded-path'
-          ) {
-            return {
-              type: 'error',
-              code: 'SESSION_RESUME_FAILED',
-              errorMessage: `Session ${happySessionId} requires the dedicated checkpoint restart action.`,
-            };
-          }
-        }
-
         // 2026-07-23 incident: pin preflight and child to ONE identity.
         // A child that syncs under a different account than the session owner
         // gets identical-looking 404s and exits — never spawn that child.
@@ -2810,12 +2802,34 @@ export async function startDaemon(): Promise<void> {
           readBranchHint: async () => claudeSessionId
             ? readClaudeTranscriptBranch(join(getProjectPath(launch.cwd), `${claudeSessionId}.jsonl`))
             : null,
+          findRemovedAutomationWorktree: async (cwd) => githubWorktreeTombstones.find(cwd),
         });
         if (restoredWorktree.kind === 'recreated' || restoredWorktree.kind === 'failed') {
           logger.debug(`[DAEMON RUN] Missing worktree for resumed session ${happySessionId}`, restoredWorktree);
         }
         if (restoredWorktree.kind === 'failed') {
           throw new Error(`session directory ${launch.cwd} was removed and could not be recreated (${restoredWorktree.reason})`);
+        }
+
+        // After the restore: this resolves the session directory, which a
+        // removed worktree no longer has (2026-10-17, ENOENT before restore ran).
+        if (!options?.checkpointRestart) {
+          const checkpointAuthority = await resolveCheckpointSessionAuthority({
+            sessionId: happySessionId,
+            trackedSession: tracked,
+            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+            platform: process.platform,
+          });
+          if (
+            checkpointAuthority?.protection.status === 'unavailable'
+            && checkpointAuthority.protection.reason === 'excluded-path'
+          ) {
+            return {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `Session ${happySessionId} requires the dedicated checkpoint restart action.`,
+            };
+          }
         }
 
         if (options?.model) {
@@ -4655,7 +4669,10 @@ export async function startDaemon(): Promise<void> {
           ...input,
           managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
         }),
-        discardGithubWorktree: removeGithubTriggerWorktree,
+        discardGithubWorktree: rememberGithubWorktreeRemoval(removeGithubTriggerWorktree, {
+          readHead: readWorktreeHead,
+          record: (removed) => githubWorktreeTombstones.record(removed),
+        }),
         isSessionRunning: isAutomationSessionRunning,
         stopSession: (sessionId) => {
           stopSession(sessionId, {
