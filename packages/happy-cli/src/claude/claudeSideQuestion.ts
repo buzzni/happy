@@ -39,7 +39,15 @@ export type SideQuestionOutcome =
         usageQuality: 'exact' | 'estimated' | null;
         model: string | null;
     }
-    | { ok: false; error: SideQuestionError; detail?: string };
+    | {
+        ok: false;
+        error: SideQuestionError;
+        detail?: string;
+        /** 실패·시간 초과여도 Claude 가 이미 쓴 사용량. 0 이면 싣지 않는다. */
+        usage?: ClaudeUsageLike;
+        usageQuality?: 'exact' | 'estimated';
+        model?: string | null;
+    };
 
 type ModelUsageEntry = {
     inputTokens?: number;
@@ -93,6 +101,10 @@ function subtractUsage(from: ClaudeUsageLike, observed: Iterable<ClaudeUsageLike
     return result;
 }
 
+function usageTotal(usage: ClaudeUsageLike): number {
+    return num(usage.input_tokens) + num(usage.output_tokens) + num(usage.cache_creation_input_tokens) + num(usage.cache_read_input_tokens);
+}
+
 function errorText(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
@@ -138,34 +150,46 @@ export class ClaudeSideQuestionBridge {
         try {
             const before = await this.readUsage(channel, signal);
             let overlapped = channel.isTurnInProgress() || this.now() - this.lastMainActivityAt < RECENT_MAIN_ACTIVITY_MS;
+            // 답의 성패와 사용량은 따로다 — 실패·시간 초과여도 Claude 가 이미 쓴 토큰은 잰다.
+            const measure = async (forceEstimated = false) => {
+                overlapped ||= channel.isTurnInProgress();
+                const after = before ? await this.readUsage(channel, AbortSignal.timeout(USAGE_READ_TIMEOUT_MS)) : null;
+                overlapped ||= observed.size > 0;
+                if (!before || !after) return null;
+                const delta = modelUsageDelta(before, after);
+                return {
+                    usage: overlapped ? subtractUsage(delta.usage, observed.values()) : delta.usage,
+                    usageQuality: overlapped || forceEstimated ? 'estimated' as const : 'exact' as const,
+                    model: delta.model,
+                };
+            };
+            const failWith = async (error: SideQuestionError, detail: string | undefined, forceEstimated = false): Promise<SideQuestionOutcome> => {
+                const spent = await measure(forceEstimated);
+                return {
+                    ok: false,
+                    error,
+                    ...(detail ? { detail } : {}),
+                    ...(spent && usageTotal(spent.usage) > 0 ? spent : {}),
+                };
+            };
             let response: unknown;
             try {
                 response = await channel.request({ subtype: 'side_question', question }, { signal });
             } catch (error) {
-                return signal.aborted
-                    ? { ok: false, error: 'timeout' }
-                    : { ok: false, error: 'failed', detail: errorText(error) };
+                // 시간 초과 뒤에도 포크가 더 쓸 수 있어 그때까지 본 값은 추정이다.
+                return signal.aborted ? failWith('timeout', undefined, true) : failWith('failed', errorText(error));
             }
-            overlapped ||= channel.isTurnInProgress();
-            const after = before ? await this.readUsage(channel, AbortSignal.timeout(USAGE_READ_TIMEOUT_MS)) : null;
             const body = response as { response?: unknown; synthetic?: unknown } | null;
             const answer = typeof body?.response === 'string' ? body.response.trim() : '';
-            if (!answer) return { ok: false, error: 'failed', detail: 'empty side question answer' };
-            overlapped ||= observed.size > 0;
-            let usage: ClaudeUsageLike | null = null;
-            let model: string | null = null;
-            if (before && after) {
-                const delta = modelUsageDelta(before, after);
-                usage = overlapped ? subtractUsage(delta.usage, observed.values()) : delta.usage;
-                model = delta.model;
-            }
+            if (!answer) return failWith('failed', 'empty side question answer');
+            const spent = await measure();
             return {
                 ok: true,
                 answer,
                 synthetic: body?.synthetic === true,
-                usage,
-                usageQuality: usage ? (overlapped ? 'estimated' : 'exact') : null,
-                model,
+                usage: spent?.usage ?? null,
+                usageQuality: spent?.usageQuality ?? null,
+                model: spent?.model ?? null,
             };
         } finally {
             this.observedMain = null;
@@ -228,11 +252,12 @@ export function createSideQuestionRpcHandler(deps: {
         if (gate?.isClosed()) return fail('shutting-down');
         const run = async (): Promise<SideQuestionRpcReply> => {
             const outcome = await deps.bridge.ask(question, { timeoutMs: deps.timeoutMs });
-            if (!outcome.ok) return fail(outcome.error, outcome.detail);
             const usage = outcome.usage;
+            // 실패한 곁질문이 쓴 토큰도 집계에 넣는다 — 답을 못 받았다고 사용량을 숨기지 않는다.
             if (usage && outcome.usageQuality) {
-                deps.reportUsage({ requestId: deps.newRequestId(), usage, model: outcome.model, quality: outcome.usageQuality });
+                deps.reportUsage({ requestId: deps.newRequestId(), usage, model: outcome.model ?? null, quality: outcome.usageQuality });
             }
+            if (!outcome.ok) return fail(outcome.error, outcome.detail);
             const cacheRead = usage?.cache_read_input_tokens ?? 0;
             const cacheWrite = usage?.cache_creation_input_tokens ?? 0;
             return {
