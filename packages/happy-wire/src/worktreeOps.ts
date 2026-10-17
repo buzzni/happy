@@ -25,6 +25,14 @@ export const worktreeOpsCapabilitySchema = z.object({ version: z.literal(WORKTRE
 export type WorktreeOpsCapability = z.infer<typeof worktreeOpsCapabilitySchema>;
 export const WORKTREE_OPS_CAPABILITY: WorktreeOpsCapability = { version: WORKTREE_OPS_VERSION };
 
+/**
+ * aplus-dev-studio strict-followup-plan F1 — `worktree:purge-project` (cleanup after a project delete)
+ * is advertised on its own, so the existing `worktreeOps.version` check stays as it is.
+ */
+export const projectPurgeCapabilitySchema = z.object({ version: z.literal(1) });
+export type ProjectPurgeCapability = z.infer<typeof projectPurgeCapabilitySchema>;
+export const PROJECT_PURGE_CAPABILITY: ProjectPurgeCapability = { version: 1 };
+
 // ── Names and managed paths (the server's rules, moved here unchanged) ──────────────────────────
 
 const WORKTREE_NAME_ADJECTIVES = [
@@ -182,6 +190,16 @@ export const worktreeOpParamsSchemas = {
     remoteUrl: remoteUrlSchema.nullable(),
     statusPathspecs: z.array(pathspecSchema).min(1).max(100),
   }).strict(),
+  /**
+   * After a project delete: stop its proven dev servers, remove its preview containers and volumes,
+   * and remove its folder when it is a managed one. `dryRun` only reports what is there.
+   */
+  'purge-project': z.object({
+    workspaceDir: absolutePath,
+    port: z.number().int().min(1).max(65535).nullable(),
+    purgeFolder: z.boolean(),
+    dryRun: z.boolean(),
+  }).strict(),
 } as const;
 
 export type WorktreeOp = keyof typeof worktreeOpParamsSchemas;
@@ -253,6 +271,28 @@ export const worktreeOpResultSchemas = {
   reconcile: z.object({ appliedToBranch: z.string().min(1) }).strict(),
   'create-branch': z.object({ branch: z.string().min(1) }).strict(),
   'prepare-conversation': z.object({ branch: z.string().min(1) }).strict(),
+  /** Counts and per-step outcomes only: no command output reaches the server. */
+  'purge-project': z.object({
+    path: absolutePath,
+    managed: z.boolean(),
+    exists: z.boolean(),
+    entries: z.number().int().nonnegative(),
+    containers: z.number().int().nonnegative(),
+    volumes: z.number().int().nonnegative(),
+    processes: z.object({
+      verified: z.number().int().nonnegative(),
+      unverified: z.number().int().nonnegative(),
+      pending: z.number().int().nonnegative(),
+    }).strict(),
+    outcome: z.object({
+      processes: z.enum([
+        'skipped', 'cleaned', 'no-native-processes', 'proc-unavailable', 'registry-unreadable',
+        'identity-unverified', 'terminate-incomplete', 'evidence-unavailable',
+      ]),
+      containers: z.enum(['skipped', 'none', 'removed', 'failed']),
+      folder: z.enum(['skipped', 'removed', 'missing', 'preserved', 'blocked', 'failed']),
+    }).strict(),
+  }).strict(),
 } as const satisfies Record<WorktreeOp, z.ZodType>;
 
 export type WorktreeOpResult<Op extends WorktreeOp> = z.infer<(typeof worktreeOpResultSchemas)[Op]>;

@@ -15,7 +15,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { appendFile, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
@@ -39,6 +39,7 @@ import {
 } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
 import { DurableTicketGuard } from './usedWorktreeTickets';
+import { stopProjectNativeProcesses, type NativeStopResult } from './projectNativeProcesses';
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
 import { openSealedForMachine } from '@/modules/common/machineSeal';
 import { logger } from '@/ui/logger';
@@ -67,11 +68,19 @@ const REMOTE_OPS: ReadonlySet<WorktreeOp> = new Set(['create', 'publish', 'recon
 
 type MachineKeyView = { id: string; encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' };
 
+/** How `worktree:purge-project` reaches docker and the native process stop; tests replace both. */
+export type ProjectPurgeIo = {
+    /** `code` -2 means docker is not installed: there is nothing of it to clean. */
+    docker?: (args: string[]) => Promise<{ code: number; stdout: string }>;
+    stopNative?: (input: { projectId: string; machineId: string; dryRun?: boolean }) => Promise<NativeStopResult>;
+};
+
 export type WorktreeOpsDeps = {
     machine: () => MachineKeyView;
     allowedRoot: string;
     happyHomeDir: string;
     now?: () => number;
+    purge?: ProjectPurgeIo;
 };
 
 export type WorktreeOpAnswer =
@@ -244,6 +253,8 @@ function slashed(path: string): string {
 type PathGuard = {
     /** The real directory, when it exists, is inside the allowed root and outside the happy home. */
     directory(path: string): Promise<string>;
+    /** A missing directory will be created or removed where its nearest existing parent leads. */
+    missing(path: string): Promise<void>;
 };
 
 function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
@@ -265,6 +276,12 @@ function pathGuard(allowedRoot: string, happyHomeDir: string): PathGuard {
             }
             if (!(await stat(real)).isDirectory()) throw new OpFailure('PATH_DENIED', 'Not a folder');
             return real;
+        },
+        async missing(path) {
+            if (!isAbsolute(path)) throw new OpFailure('PATH_DENIED', 'Not an absolute path on this machine');
+            if (!isWithinDirectory(path, allowedRoot) || isWithinDirectory(path, happyHomeDir)) {
+                throw new OpFailure('PATH_DENIED', 'The folder is outside the allowed root');
+            }
         },
     };
 }
@@ -925,6 +942,108 @@ async function prepareConversation(
     });
 }
 
+// ── Cleanup after a project delete (aplus-dev-studio strict-followup-plan F1) ─────────────────────
+
+const DOCKER_TIMEOUT_MS = 60_000;
+/** Blocks the folder removal: a running process could not be stopped or proven not ours. */
+const PROCESSES_IN_DOUBT: ReadonlySet<NativeStopResult['reason']> = new Set([
+    'proc-unavailable', 'registry-unreadable', 'identity-unverified', 'terminate-incomplete', 'evidence-unavailable',
+]);
+
+function runDocker(args: string[]): Promise<{ code: number; stdout: string }> {
+    return new Promise((resolvePromise) => {
+        const child = spawn('docker', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+        const stdout: Buffer[] = [];
+        child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
+        const timer = setTimeout(() => terminateProcessTree(child), DOCKER_TIMEOUT_MS);
+        timer.unref?.();
+        child.on('error', (error: NodeJS.ErrnoException) => {
+            clearTimeout(timer);
+            resolvePromise({ code: error.code === 'ENOENT' ? -2 : -1, stdout: '' });
+        });
+        child.on('close', (code) => {
+            clearTimeout(timer);
+            resolvePromise({ code: code ?? -1, stdout: Buffer.concat(stdout).toString('utf8') });
+        });
+    });
+}
+
+/**
+ * The folder a delete may remove: `<anything>/aplus-dev-studio-workspace/<owner>/<projectId>`, named
+ * after this ticket's project. Anything else is a folder the user brought, and stays.
+ */
+function isManagedProjectFolder(path: string, projectId: string): boolean {
+    const parts = slashed(path).split('/').filter(Boolean);
+    return parts.length >= 3 && parts[parts.length - 1] === projectId && parts[parts.length - 3] === 'aplus-dev-studio-workspace';
+}
+
+/** The project's preview volumes, by the web's naming (`server/projectCleanupSteps.ts`). */
+function projectVolumes(listed: string, projectId: string): string[] {
+    return listed.split('\n').map((line) => line.trim()).filter((name) => name === `preview-${projectId}-node_modules`
+        || name.startsWith(`preview-${projectId}-node_modules-`)
+        || name === `preview-${projectId}-uv-cache`);
+}
+
+async function purgeProject(guard: PathGuard, ticket: WorktreeTicket & { op: 'purge-project' }, machineId: string, io: ProjectPurgeIo): Promise<WorktreeOpResult<'purge-project'>> {
+    const params: WorktreeOpParams<'purge-project'> = ticket.params;
+    const docker = io.docker ?? runDocker;
+    const stopNative = io.stopNative ?? ((input) => stopProjectNativeProcesses(input));
+    const requested = resolve(params.workspaceDir);
+    let folder: string | null = null;
+    try {
+        folder = await guard.directory(requested);
+    } catch (error) {
+        if (!(error instanceof OpFailure) || error.errorCode !== 'WORKSPACE_MISSING') throw error;
+        // Gone already: its resources may still be there. Its nearest existing parent must still be ours.
+        await guard.missing(requested);
+    }
+    // A link anywhere along the way would have the removal land somewhere else.
+    if (folder !== null && slashed(folder) !== slashed(requested)) throw new OpFailure('PATH_DENIED', 'The folder is reached through a link');
+    const path = slashed(folder ?? requested);
+    const managed = isManagedProjectFolder(path, ticket.projectId);
+
+    return serialized(path, async () => {
+        const entries = folder ? (await readdir(folder)).length : 0;
+        const listed = await docker(['ps', '-aq', '--filter', 'label=aplus.preview=true', '--filter', 'label=aplus.managedBy=aplus-preview', '--filter', `label=aplus.projectId=${ticket.projectId}`]);
+        const containerIds = listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean) : [];
+        const volumeList = listed.code === -2 ? { code: -2, stdout: '' } : await docker(['volume', 'ls', '-q']);
+        const volumes = volumeList.code === 0 ? projectVolumes(volumeList.stdout, ticket.projectId) : [];
+        const native = await stopNative({ projectId: ticket.projectId, machineId, dryRun: params.dryRun });
+        const processes = { verified: native.verified, unverified: native.unverified, pending: native.pending };
+        const base = { path, managed, exists: folder !== null, entries, containers: containerIds.length, volumes: volumes.length, processes };
+        if (params.dryRun) return { ...base, outcome: { processes: 'skipped' as const, containers: 'skipped' as const, folder: 'skipped' as const } };
+
+        let containers: 'none' | 'removed' | 'failed' = 'none';
+        if (listed.code !== 0 && listed.code !== -2) containers = 'failed';
+        else if (containerIds.length > 0 || volumes.length > 0) {
+            containers = 'removed';
+            for (const id of containerIds) {
+                if ((await docker(['rm', '-f', id])).code !== 0) containers = 'failed';
+            }
+            for (const volume of volumes) {
+                if ((await docker(['volume', 'rm', volume])).code !== 0) containers = 'failed';
+            }
+        }
+
+        let folderOutcome: WorktreeOpResult<'purge-project'>['outcome']['folder'] = 'skipped';
+        if (params.purgeFolder) {
+            if (!folder) folderOutcome = 'missing';
+            else if (!managed) folderOutcome = 'preserved';
+            else if (PROCESSES_IN_DOUBT.has(native.reason)) folderOutcome = 'blocked';
+            else {
+                try {
+                    await rm(folder, { recursive: true, force: true });
+                    folderOutcome = 'removed';
+                } catch (error) {
+                    logger.debug('[worktree-ops] project folder removal failed', { error: error instanceof Error ? error.message : String(error) });
+                    folderOutcome = 'failed';
+                }
+            }
+        }
+        return { ...base, outcome: { processes: native.reason, containers, folder: folderOutcome } };
+    });
+}
+
 // ── Handlers ───────────────────────────────────────────────────────────────────────────────────
 
 // Process-wide, and on disk: a daemon that reconnects builds new handlers, one that restarts starts
@@ -959,6 +1078,7 @@ export function createWorktreeOpsHandlers(deps: WorktreeOpsDeps): Record<Worktre
             case 'reconcile': return reconcileWorktree(guard, ticket, credential);
             case 'create-branch': return createBranch(guard, ticket);
             case 'prepare-conversation': return prepareConversation(guard, ticket, credential);
+            case 'purge-project': return purgeProject(guard, ticket, deps.machine().id, deps.purge ?? {});
         }
     };
 

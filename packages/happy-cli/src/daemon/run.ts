@@ -15,7 +15,7 @@ import os from 'os';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
 import { prepareManagedScriptRuntime, probeManagedScriptEngine, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
@@ -391,6 +391,7 @@ export const initialMachineMetadata: MachineMetadata = {
   rpcBinding: RPC_BINDING_CAPABILITY,
   sealedSpawnEnv: SEALED_SPAWN_ENV_CAPABILITY,
   worktreeOps: WORKTREE_OPS_CAPABILITY,
+  projectPurge: PROJECT_PURGE_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
 };
 

@@ -20,6 +20,9 @@ import {
   worktreeOpMethod,
   worktreeOpResultSchemas,
   worktreeOpsCapabilitySchema,
+    PROJECT_PURGE_CAPABILITY,
+    projectPurgeCapabilitySchema,
+    worktreeOpParamsSchemas,
 } from './worktreeOps';
 
 const opId = Buffer.alloc(16, 4).toString('base64');
@@ -265,4 +268,32 @@ describe('worktreeOpsCapabilitySchema', () => {
     expect(worktreeOpsCapabilitySchema.parse(WORKTREE_OPS_CAPABILITY)).toEqual({ version: 1 });
     expect(worktreeOpsCapabilitySchema.safeParse({ version: 2 }).success).toBe(false);
   });
+});
+
+// aplus-dev-studio strict-followup-plan F1 — project cleanup after a delete, on the worktree ticket rails.
+describe('purge-project', () => {
+    const params = { workspaceDir: '/home/me/workspace/aplus-dev-studio-workspace/u1/p1', port: null, purgeFolder: true, dryRun: true };
+
+    it('takes only the workspace, an optional port and the two switches', () => {
+        expect(worktreeOpParamsSchemas['purge-project'].safeParse(params).success).toBe(true);
+        expect(worktreeOpParamsSchemas['purge-project'].safeParse({ ...params, port: 3000 }).success).toBe(true);
+        expect(worktreeOpParamsSchemas['purge-project'].safeParse({ ...params, port: 70000 }).success).toBe(false);
+        expect(worktreeOpParamsSchemas['purge-project'].safeParse({ ...params, workspaceDir: 'relative/p1' }).success).toBe(false);
+        expect(worktreeOpParamsSchemas['purge-project'].safeParse({ ...params, command: 'rm -rf /' }).success).toBe(false);
+    });
+
+    it('answers counts and per-step outcomes, never output', () => {
+        const result = {
+            path: params.workspaceDir, managed: true, exists: true, entries: 4, containers: 1, volumes: 2,
+            processes: { verified: 1, unverified: 0, pending: 0 },
+            outcome: { processes: 'cleaned', containers: 'removed', folder: 'removed' },
+        };
+        expect(worktreeOpResultSchemas['purge-project'].safeParse(result).success).toBe(true);
+        expect(worktreeOpResultSchemas['purge-project'].safeParse({ ...result, stdout: 'x' }).success).toBe(false);
+        expect(worktreeOpResultSchemas['purge-project'].safeParse({ ...result, outcome: { ...result.outcome, folder: 'whatever' } }).success).toBe(false);
+    });
+
+    it('is advertised separately from worktreeOps', () => {
+        expect(projectPurgeCapabilitySchema.safeParse(PROJECT_PURGE_CAPABILITY).success).toBe(true);
+    });
 });
