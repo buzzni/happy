@@ -43,6 +43,8 @@ export type LessonHostFailure =
     | 'usage_unknown'
     | 'budget_exceeded'
     | 'settings_unreadable'
+    /** The settings file is locked by a live writer (or one not provably gone); retry later. */
+    | 'settings_busy'
     /** A confirmed lesson of this name already exists; a person must decide. */
     | 'merge_required'
     | 'candidate_cap_reached'

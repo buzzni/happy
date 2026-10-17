@@ -2,6 +2,7 @@ import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { FileLockHeldError, withOwnedFileLock } from './ownedFileLock';
 
 const amount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const entrySchema = z.object({
@@ -23,24 +24,24 @@ export class LessonReviewBudget {
 
     private async transaction<T>(work: (entries: Entry[]) => T): Promise<T> {
         await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
-        // Never steal a lock by guessing process liveness. A crashed lock fails closed.
-        const lock = await open(`${this.path}.lock`, 'wx', 0o600);
-        let temp: string | undefined;
-        try {
-            let entries: Entry[] = [];
-            try { entries = ledgerSchema.parse(JSON.parse(await readFile(this.path, 'utf8'))).entries; }
-            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-            const result = work(entries);
-            temp = `${this.path}.${randomUUID()}.tmp`;
-            const file = await open(temp, 'wx', 0o600);
-            try { await file.writeFile(JSON.stringify({ version: 1, entries })); await file.sync(); }
-            finally { await file.close(); }
-            await rename(temp, this.path); temp = undefined;
-            return result;
-        } finally {
-            if (temp) await unlink(temp).catch(() => {});
-            await lock.close(); await unlink(`${this.path}.lock`);
-        }
+        // A live holder's lock is never taken; one left by a crashed holder is reclaimed.
+        return withOwnedFileLock(`${this.path}.lock`, async () => {
+            let temp: string | undefined;
+            try {
+                let entries: Entry[] = [];
+                try { entries = ledgerSchema.parse(JSON.parse(await readFile(this.path, 'utf8'))).entries; }
+                catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+                const result = work(entries);
+                temp = `${this.path}.${randomUUID()}.tmp`;
+                const file = await open(temp, 'wx', 0o600);
+                try { await file.writeFile(JSON.stringify({ version: 1, entries })); await file.sync(); }
+                finally { await file.close(); }
+                await rename(temp, this.path); temp = undefined;
+                return result;
+            } finally {
+                if (temp) await unlink(temp).catch(() => {});
+            }
+        });
     }
 
     /** Foreground work has already consumed the session's normal usage. This is a
@@ -59,7 +60,7 @@ export class LessonReviewBudget {
                     state: 'settled', microUsd: 0, tokens: 0, execution: 'session' });
                 return { ok: true };
             });
-        } catch (error) { return { ok: false, reason: (error as NodeJS.ErrnoException).code === 'EEXIST' ? 'busy' : 'storage_error' }; }
+        } catch (error) { return { ok: false, reason: error instanceof FileLockHeldError ? 'busy' : 'storage_error' }; }
     }
 
     /** Release only our zero-cost claim before candidate enqueue has begun. */
@@ -96,7 +97,7 @@ export class LessonReviewBudget {
                     day, createdAt: now, state: 'reserved', microUsd: input.reserveMicroUsd, tokens: input.reserveTokens });
                 return { ok: true };
             });
-        } catch (error) { return { ok: false, reason: (error as NodeJS.ErrnoException).code === 'EEXIST' ? 'busy' : 'storage_error' }; }
+        } catch (error) { return { ok: false, reason: error instanceof FileLockHeldError ? 'busy' : 'storage_error' }; }
     }
 
     /** Only the worker may call this before handing a request to its transport. */

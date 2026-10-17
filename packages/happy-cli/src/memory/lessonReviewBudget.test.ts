@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LessonReviewBudget } from './lessonReviewBudget';
+import { UNOWNED_LOCK_STALE_MS } from './ownedFileLock';
 const dirs: string[] = [];
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'lesson-budget-')); dirs.push(dir);
@@ -65,3 +68,36 @@ describe('durable lesson review budget', () => {
     expect(await a.cancelSessionClaim(input.requestId)).toBe(true);
     expect(await a.claimSession(input)).toEqual({ ok: true });
  });
+
+describe('ledger lock left behind', () => {
+  const owner = (pid: number, startedAt: number) => JSON.stringify({ version: 1, pid, startedAt, token: randomUUID(), acquiredAt: startedAt });
+  const ledgerIds = async (path: string) => JSON.parse(await readFile(path, 'utf8')).entries.map((e: { requestId: string }) => e.requestId);
+
+  it('reclaims the lock of a holder that crashed and records the claim', async () => {
+    const f = await fixture();
+    const crashed = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    await new Promise(resolve => crashed.once('exit', resolve));
+    await writeFile(`${f.path}.lock`, owner(crashed.pid!, Date.now()));
+    expect(await new LessonReviewBudget(f.path, f.clock).claimSession(input)).toEqual({ ok: true });
+    expect(await ledgerIds(f.path)).toEqual(['one']);
+    await expect(readFile(`${f.path}.lock`)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('stays busy for a live holder and for a recent lock from an older version, leaving the ledger untouched', async () => {
+    const f = await fixture(); const a = new LessonReviewBudget(f.path, f.clock);
+    const live = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    try {
+      await new Promise(resolve => live.once('spawn', resolve));
+      await writeFile(`${f.path}.lock`, owner(live.pid!, Date.now()));
+      expect(await a.claimSession(input)).toEqual({ ok: false, reason: 'busy' });
+      expect(await a.reserve(input)).toEqual({ ok: false, reason: 'busy' });
+    } finally { live.kill(); }
+    await writeFile(`${f.path}.lock`, '');
+    expect(await a.claimSession(input)).toEqual({ ok: false, reason: 'busy' });
+    await expect(readFile(f.path)).rejects.toMatchObject({ code: 'ENOENT' });
+    const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
+    await utimes(`${f.path}.lock`, old, old);
+    expect(await a.claimSession(input)).toEqual({ ok: true });
+    expect(await ledgerIds(f.path)).toEqual(['one']);
+  });
+});
