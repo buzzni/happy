@@ -9,6 +9,15 @@ function setup() {
   return {deps,installed,sync,input,restart:()=>createCredentialGroupSync(deps)}
 }
 describe('scoped credential group synchronization',()=>{
+  it('does not acknowledge a preserved receipt after the account pool was cleared',async()=>{
+    const {sync,input,installed,restart}=setup()
+    const operation=input(1,'["shared"]')
+    await sync.sync(operation)
+    installed.delete('shared')
+    expect(await restart().receipt('company','claude')).toMatchObject({reconciled:false})
+    await restart().sync(operation)
+    expect(await restart().receipt('company','claude')).toMatchObject({reconciled:true})
+  })
   it('records introduced accounts only and preserves personal credentials on revoke',async()=>{
     const {sync,input,installed,deps}=setup()
     const receipt = await sync.sync(input(1,JSON.stringify(['personal','shared'])))

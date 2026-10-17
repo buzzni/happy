@@ -5,12 +5,42 @@ import { execFile as exec,execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { describe,expect,it,vi } from 'vitest'
 import { createGroupProviderAdapters,groupAccountIdentity } from './aiCredentialGroupAdapters'
+import { createCredentialGroupSync } from './aiCredentialGroups'
 import type { AiCredentialRuntimeDependencies } from './aiCredentialRuntime'
 
 let globalRoot=''
 try{globalRoot=execFileSync('npm',['root','--global'],{encoding:'utf8'}).trim();execFileSync(process.execPath,['-e',`require.resolve('codex-multi-auth/storage',{paths:[${JSON.stringify(globalRoot)}]})`],{stdio:'ignore'})}catch{globalRoot=''}
 
 describe('provider group custody removal',()=>{
+  it('restores a missing managed slot even when Claude retains its login marker',async()=>{
+    const managedAccountId='11111111-1111-4111-8111-111111111111'
+    const account={email:`managed-${managedAccountId}@setup-token.local`,credentialType:'setup_token',managedAccountId}
+    const accounts:typeof account[]=[]
+    const adapter=createGroupProviderAdapters({homeDir:'/fixture',env:{},
+      execFile:async()=>({stdout:JSON.stringify({accounts,activeAccountNumber:null}),stderr:''}),
+      readFile:async()=>JSON.stringify({oauthAccount:{emailAddress:account.email}}),
+    } as unknown as AiCredentialRuntimeDependencies)
+    let journal:string|null=null
+    const apply=vi.fn(async()=>{accounts.push(account)})
+    const groups=createCredentialGroupSync({read:async()=>journal,write:async value=>{journal=value},
+      snapshot:adapter.snapshot,incoming:()=>[groupAccountIdentity('claude',account)],apply,remove:vi.fn()})
+    const operation={version:1 as const,scope:'company',userId:'user',provider:'claude' as const,generation:1,fingerprint:'a'.repeat(64),payload:'fixture'}
+    await groups.sync(operation)
+    accounts.length=0
+    expect(await groups.receipt('company','claude')).toMatchObject({reconciled:false})
+    await groups.sync(operation)
+    expect(apply).toHaveBeenCalledTimes(2)
+    expect(accounts).toEqual([account])
+    expect(await groups.receipt('company','claude')).toMatchObject({reconciled:true})
+  })
+  it('keeps a live personal Claude OAuth identity in the snapshot without a pool slot',async()=>{
+    const account={email:'personal@example.test',organizationUuid:'personal-org'}
+    const adapter=createGroupProviderAdapters({homeDir:'/fixture',env:{},
+      execFile:async()=>({stdout:JSON.stringify({accounts:[]}),stderr:''}),
+      readFile:async()=>JSON.stringify({oauthAccount:{emailAddress:account.email,organizationUuid:account.organizationUuid}}),
+    } as unknown as AiCredentialRuntimeDependencies)
+    expect(await adapter.snapshot('claude')).toEqual([groupAccountIdentity('claude',account)])
+  })
   it.skipIf(!globalRoot)('removes only managed Codex slots using storage locking, preserving live personal auth and indexes',async()=>{
     const home=await mkdtemp(join(tmpdir(),'happy-group-pool-'))
     const root=join(home,'.codex','multi-auth'),pool=join(root,'openai-codex-accounts.json'),live=join(home,'.codex','auth.json')

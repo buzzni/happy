@@ -161,7 +161,18 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   const authorize=async(scope:string,userId:string,identity:string)=>{const e=await readReceipt(scope,'claude',{principalType:'user',userId});return Boolean(e&&e.userId===userId)&&custody(e,identity)}
   /** Shared-machine collector custody: the machine's own reconciled assignment desires and installed the identity. */
   const authorizeMachine=async(scope:string,machineId:string,identity:string)=>custody(await readReceipt(scope,'claude',{principalType:'machine',userId:machineId,machineId}),identity)
-  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:async(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>)=>{const entry=await readReceipt(scope,provider,principal);return entry?receipt(entry):null}}
+  async function currentReceipt(scope:string,provider:GroupProvider,principal?:Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) {
+    const entry=await readReceipt(scope,provider,principal)
+    if(!entry)return null
+    // The journal survives a pool reset. Its old acknowledgement is not proof
+    // that this computer still holds the accounts required for a new session.
+    if(!entry.pending&&entry.desired.length){
+      const installed=new Set(await deps.snapshot(provider))
+      if(entry.desired.some(identity=>!installed.has(identity)))return {...receipt(entry),reconciled:false}
+    }
+    return receipt(entry)
+  }
+  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:currentReceipt}
 }
 
 function effectivePrincipal(entry:Pick<Entry,'principalType'|'userId'|'machineId'>):Pick<NormalizedRequest,'principalType'|'userId'|'machineId'> {
