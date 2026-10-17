@@ -24,27 +24,60 @@ function coalescerWithFakeTimers(opts: { flushMs?: number; maxBytes?: number; se
 }
 
 describe('terminalOutputCoalescer', () => {
-  it('buffers rapid chunks and emits one frame per flush window', () => {
+  it('emits output that arrives after a quiet period right away, so a keystroke echo never waits for the window', () => {
+    const { coalescer, frames, timers } = coalescerWithFakeTimers({ flushMs: 8 })
+    coalescer.push('l')
+
+    expect(frames).toEqual(['l'])
+    expect(timers).toHaveLength(1)
+  })
+
+  it('buffers chunks that arrive inside the window and emits them as one frame when it ends', () => {
     const { coalescer, frames, timers, fire } = coalescerWithFakeTimers({ flushMs: 8 })
     coalescer.push('a')
     coalescer.push('b')
     coalescer.push('c')
 
-    expect(frames).toEqual([])
+    expect(frames).toEqual(['a'])
     expect(timers).toHaveLength(1)
     expect(timers[0].ms).toBe(8)
     fire()
-    expect(frames).toEqual(['abc'])
+    expect(frames).toEqual(['a', 'bc'])
+  })
+
+  it('keeps batching a continuous stream: a window that flushed output opens the next one', () => {
+    const { coalescer, frames, timers, fire } = coalescerWithFakeTimers()
+    coalescer.push('a')
+    coalescer.push('b')
+    fire()
+    coalescer.push('c')
+    coalescer.push('d')
+
+    expect(frames).toEqual(['a', 'b'])
+    expect(timers).toHaveLength(1)
+    fire()
+    expect(frames).toEqual(['a', 'b', 'cd'])
+  })
+
+  it('goes quiet when a window ends with nothing buffered, so the next output is sent at once', () => {
+    const { coalescer, frames, timers, fire } = coalescerWithFakeTimers()
+    coalescer.push('a')
+    fire()
+    expect(timers).toHaveLength(0)
+
+    coalescer.push('b')
+    expect(frames).toEqual(['a', 'b'])
   })
 
   it('flushes immediately once buffered bytes reach maxBytes, without waiting for the timer', () => {
     const { coalescer, frames } = coalescerWithFakeTimers({ maxBytes: 4 })
+    coalescer.push('x')
     coalescer.push('ab')
     coalescer.push('cd')
-    expect(frames).toEqual(['abcd'])
+    expect(frames).toEqual(['x', 'abcd'])
 
     coalescer.push('e')
-    expect(frames).toEqual(['abcd'])
+    expect(frames).toEqual(['x', 'abcd'])
   })
 
   it('does not schedule a second timer while one is already pending', () => {
@@ -58,12 +91,10 @@ describe('terminalOutputCoalescer', () => {
   it('starts a fresh timer after each flush', () => {
     const { coalescer, frames, fire, timers } = coalescerWithFakeTimers()
     coalescer.push('a')
-    fire()
-    expect(frames).toEqual(['a'])
+    coalescer.flush()
     coalescer.push('b')
-    expect(timers).toHaveLength(1)
-    fire()
     expect(frames).toEqual(['a', 'b'])
+    expect(timers).toHaveLength(2)
   })
 
   it('ignores empty chunks without starting a timer', () => {
@@ -79,22 +110,24 @@ describe('terminalOutputCoalescer', () => {
   })
 
   it('manual flush() emits and clears the pending timer', () => {
-    const { coalescer, frames, timers, fire } = coalescerWithFakeTimers()
+    const { coalescer, frames, fire } = coalescerWithFakeTimers()
     coalescer.push('a')
+    coalescer.push('b')
     coalescer.flush()
-    expect(frames).toEqual(['a'])
+    expect(frames).toEqual(['a', 'b'])
     // The timer that was scheduled for the push above must not double-flush later.
     fire()
-    expect(frames).toEqual(['a'])
+    expect(frames).toEqual(['a', 'b'])
   })
 
   it('dispose() drops buffered output and ignores further pushes', () => {
     const { coalescer, frames, fire } = coalescerWithFakeTimers()
     coalescer.push('a')
+    coalescer.push('b')
     coalescer.dispose()
     fire()
-    coalescer.push('b')
-    expect(frames).toEqual([])
+    coalescer.push('c')
+    expect(frames).toEqual(['a'])
   })
 
   it('logs a debug line (including the sessionId) when a chunk arrives after dispose, instead of dropping it silently', () => {
@@ -134,10 +167,11 @@ describe('terminalOutputCoalescer', () => {
       const frames: string[] = []
       const coalescer = createTerminalOutputCoalescer({ emit: (c) => frames.push(c), flushMs: 8 })
       coalescer.push('x')
+      coalescer.push('y')
       vi.advanceTimersByTime(7)
-      expect(frames).toEqual([])
-      vi.advanceTimersByTime(1)
       expect(frames).toEqual(['x'])
+      vi.advanceTimersByTime(1)
+      expect(frames).toEqual(['x', 'y'])
     } finally {
       vi.useRealTimers()
     }
