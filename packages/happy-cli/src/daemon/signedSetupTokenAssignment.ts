@@ -65,7 +65,7 @@ export function createSignedSetupTokenVerifier(deps: {
     let queue: Promise<unknown> = Promise.resolve();
 
     async function readState(companyId: string) {
-        await protectStandaloneObservationDirectory(directory);
+        await failingWith('ASSIGNMENT_STATE_INVALID', () => protectStandaloneObservationDirectory(directory));
         let file;
         try { file = await open(join(directory, 'assignments-' + hash(companyId) + '.json'), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); }
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1 as const, accepted: {} }; fail('ASSIGNMENT_STATE_INVALID'); }
@@ -97,7 +97,7 @@ export function createSignedSetupTokenVerifier(deps: {
         if (!parsed.success) fail('AI_GROUP_INVALID_INPUT');
         const { approval, assignments, ...outer } = parsed.data;
         const companyId = outer.scope;
-        const pin = await deps.pins.get(companyId);
+        const pin = await failingWith('ORG_PIN_INVALID', () => deps.pins.get(companyId));
         if (!pin) fail('DEVICE_APPROVAL_REQUIRED');
         const pinKey = Buffer.from(pin.publicKey, 'base64url');
         const pinned = pin.approval.body;

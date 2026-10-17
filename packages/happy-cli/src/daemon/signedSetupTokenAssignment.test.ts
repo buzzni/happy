@@ -148,3 +148,11 @@ it('reports a corrupt revision file and an unencodable account as verification f
     await writeFile(join(f.home, 'device-' + sha('machine'), 'assignments-' + sha('company') + '.json'), '{"version":1,"accepted":{"x":{"revision":"a"}}}', { mode: 0o600 });
     await expect(f.verifier().verify(f.request(accounts, [signed]))).rejects.toThrow('ASSIGNMENT_STATE_INVALID');
 });
+
+it('reports an unreadable organization pin by its code, not by a parser or filesystem message', async () => {
+    const f = await fixture();
+    const accounts = [account(idA, tokenA)];
+    const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+    await writeFile(join(f.home, 'device-' + sha('machine'), 'org-' + sha('company') + '.json'), '{not json', { mode: 0o600 });
+    await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts)]))).rejects.toThrow(/^ORG_PIN_INVALID$/);
+});
