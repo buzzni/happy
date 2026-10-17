@@ -1,5 +1,5 @@
 import { createDeviceOrgPinStore } from './deviceOrgPinStore';
-import { spawnRefusalForRemoval } from './worktreeRemovalReservations';
+import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
@@ -1099,6 +1099,9 @@ export async function startDaemon(): Promise<void> {
 
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
+    // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
+    worktreeRemovalReservations.setLiveDirectories(() => [...pidToTrackedSession.values()]
+      .map((session) => session.directory ?? session.happySessionMetadataFromLocalWebhook?.path));
     let writeScopeRuntime: SessionWriteScopeRuntime | null = null;
     /**
      * Generations this daemon launched through the supervisor, by pid.
@@ -1766,7 +1769,7 @@ export async function startDaemon(): Promise<void> {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
 
-    const spawnSession = async (
+    const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
     ): Promise<SpawnSessionResult> => {
@@ -1785,10 +1788,6 @@ export async function startDaemon(): Promise<void> {
 
       // Lesson eligibility uses the registered daemon machine, not an optional RPC field.
       const { directory, sessionId, approvedNewDirectoryCreation = true } = options;
-      // aplus-dev-studio strict-followup-plan F2 — a worktree between its removal's dry run and the
-      // removal takes no new or resumed conversation.
-      const removalRefusal = await spawnRefusalForRemoval(directory);
-      if (removalRefusal) return { type: 'error', errorMessage: removalRefusal };
       let directoryCreated = false;
 
       try {
@@ -2659,6 +2658,7 @@ export async function startDaemon(): Promise<void> {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
+      let endResumeLaunch: (() => void) | undefined;
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {
           if (options?.automation || options?.writeScopeEnvironment) {
@@ -2795,7 +2795,9 @@ export async function startDaemon(): Promise<void> {
         );
 
         // aplus-dev-studio strict-followup-plan F2 — checked before the restore below: a worktree
-        // being removed is neither resumed in nor put back.
+        // being removed is neither resumed in nor put back. Registered first, so a removal's dry run
+        // running now sees this resume (or this resume sees its reservation).
+        endResumeLaunch = await worktreeRemovalReservations.beginLaunch(launch.cwd);
         const resumeRemovalRefusal = await spawnRefusalForRemoval(launch.cwd);
         if (resumeRemovalRefusal) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: resumeRemovalRefusal };
 
@@ -3001,6 +3003,8 @@ export async function startDaemon(): Promise<void> {
           code: 'SESSION_RESUME_FAILED',
           errorMessage: `Failed to resume session: ${errorMessage}`,
         };
+      } finally {
+        endResumeLaunch?.();
       }
     };
 
@@ -3010,6 +3014,23 @@ export async function startDaemon(): Promise<void> {
     const resumeInFlight = new Map<string, Promise<ResumeSessionResult>>();
     // Client-sent env per session, memory only; daemon-started resumes re-send it (Chat org env).
     const requestEnvironments = createRequestEnvironmentMemory();
+    // aplus-dev-studio strict-followup-plan F2 — a worktree between its removal's dry run and the
+    // removal takes no new conversation. The launch is registered before the check and stays until the
+    // session is tracked, so a dry run running now sees it (or it sees the dry run's reservation).
+    const spawnSession = async (
+      options: SpawnSessionOptions,
+      trustedMcpContext?: AutomationMcpSpawnContext,
+    ): Promise<SpawnSessionResult> => {
+      const endLaunch = await worktreeRemovalReservations.beginLaunch(options.directory);
+      try {
+        const removalRefusal = await spawnRefusalForRemoval(options.directory);
+        if (removalRefusal) return { type: 'error', errorMessage: removalRefusal };
+        return await spawnSessionUnchecked(options, trustedMcpContext);
+      } finally {
+        endLaunch();
+      }
+    };
+
     const resumeSession = (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
       shareInFlight(resumeInFlight, happySessionId, () => spawnResumedSession(happySessionId, options));
 

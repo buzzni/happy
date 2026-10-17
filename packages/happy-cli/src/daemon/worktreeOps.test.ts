@@ -374,6 +374,30 @@ describe('worktree:remove', () => {
         expect(await worktreeRemovalReservations.covers(second.path)).toBe(false);
     });
 
+    // Review (F2 #3, #5): a conversation working in the worktree keeps a non-forced removal from going
+    // ahead, and every removal ends the reservation, also one that finds the worktree already gone.
+    it('refuses a non-forced removal while a conversation works inside, and leaves nothing reserved', async () => {
+        const { result } = await call('create', create());
+        worktreeRemovalReservations.setLiveDirectories(() => [result.path]);
+        try {
+            expect(await call('remove', remove(result.path, { dryRun: true }))).toMatchObject({ success: false, errorCode: 'WORKTREE_IN_USE' });
+            expect(await worktreeRemovalReservations.covers(result.path)).toBe(false);
+            expect(await call('remove', remove(result.path))).toMatchObject({ success: false, errorCode: 'WORKTREE_IN_USE' });
+            expect(existsSync(result.path)).toBe(true);
+            expect((await call('remove', remove(result.path, { force: true }))).result).toEqual({ outcome: 'removed' });
+        } finally {
+            worktreeRemovalReservations.setLiveDirectories(() => []);
+        }
+    });
+
+    it('ends the reservation when the worktree went away before the removal', async () => {
+        const { result } = await call('create', create());
+        await call('remove', remove(result.path, { dryRun: true }));
+        git(repo, 'worktree', 'remove', '--force', result.path);
+        expect((await call('remove', remove(result.path))).result).toEqual({ outcome: 'missing' });
+        expect(await worktreeRemovalReservations.covers(result.path)).toBe(false);
+    });
+
     it('keeps a worktree with uncommitted or unapplied work unless forced', async () => {
         const { result } = await call('create', create());
         writeFileSync(join(result.path, 'dirty.txt'), 'x');
