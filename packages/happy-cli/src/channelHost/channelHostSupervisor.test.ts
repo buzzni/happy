@@ -342,6 +342,17 @@ describe('createChannelHostSupervisor', () => {
         expect(logs.join(' ')).not.toMatch(/SECRET|someone|boom/);
     });
 
+    it('drops oversized stderr lines while continuing to drain diagnostics', async () => {
+        const supervisor = make();
+        supervisor.start();
+        children[0].stderr.write(`${'x'.repeat(4097)}\n`);
+        children[0].stderr.write('[channel-host] CHANNEL_REQUEST_REFUSED_SESSION_NOT_RUNNING\n');
+        await flush();
+
+        expect(logs.filter((log) => log.startsWith('diagnostic:')))
+            .toEqual(['diagnostic:CHANNEL_REQUEST_REFUSED_SESSION_NOT_RUNNING']);
+    });
+
     it('stops by asking the child, and does not restart it', async () => {
         const supervisor = make();
         supervisor.start();

@@ -28,6 +28,44 @@ export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
 
 /** The host's diagnostic line. Anchored and closed, so a crash trace or a quoted value never matches. */
 const HOST_DIAGNOSTIC_LINE = /^\[channel-host\] ([A-Z][A-Z0-9_]{0,95})$/;
+const MAX_HOST_DIAGNOSTIC_LINE_BYTES = 4096;
+
+/** Drains stderr without retaining an unbounded partial line. */
+function onBoundedLines(input: Readable, onLine: (line: string) => void): void {
+    let pending: Buffer[] = [];
+    let pendingBytes = 0;
+    let oversized = false;
+
+    input.on('data', (chunk: Buffer | string) => {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        let offset = 0;
+        while (offset < bytes.length) {
+            const newline = bytes.indexOf(0x0a, offset);
+            const end = newline === -1 ? bytes.length : newline;
+            const segment = bytes.subarray(offset, end);
+            if (!oversized) {
+                if (pendingBytes + segment.length > MAX_HOST_DIAGNOSTIC_LINE_BYTES) {
+                    pending = [];
+                    pendingBytes = 0;
+                    oversized = true;
+                } else if (segment.length > 0) {
+                    pending.push(segment);
+                    pendingBytes += segment.length;
+                }
+            }
+            if (newline === -1) break;
+
+            if (!oversized) {
+                const line = Buffer.concat(pending, pendingBytes).toString('utf8').replace(/\r$/, '');
+                onLine(line);
+            }
+            pending = [];
+            pendingBytes = 0;
+            oversized = false;
+            offset = newline + 1;
+        }
+    });
+}
 
 /**
  * The host's state lives in the happy home (sealed keys and credential; the adapter sandbox denies it).
@@ -326,7 +364,7 @@ export function createChannelHostSupervisor(deps: {
         });
         child.stdin?.on('error', () => undefined);
         if (child.stderr) {
-            createInterface({ input: child.stderr, crlfDelay: Infinity }).on('line', (line) => {
+            onBoundedLines(child.stderr, (line) => {
                 const code = HOST_DIAGNOSTIC_LINE.exec(line)?.[1];
                 if (code) deps.log(`diagnostic:${code}`);
             });
