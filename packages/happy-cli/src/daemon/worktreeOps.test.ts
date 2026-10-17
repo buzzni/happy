@@ -20,6 +20,7 @@ import {
 import { deriveServerRpcKey } from '@/api/encryption';
 import { sealForMachine } from '@/modules/common/machineSeal';
 import { createWorktreeOpsHandlers, prepareGitCredential, WORKTREE_OPS_METHODS } from './worktreeOps';
+import type { NativeStopResult } from './projectNativeProcesses';
 
 const machineKey = new Uint8Array(32).fill(7);
 const machine = { id: 'm1', encryptionKey: machineKey, encryptionVariant: 'dataKey' as 'dataKey' | 'legacy' };
@@ -777,5 +778,107 @@ describe.skipIf(process.platform === 'win32')('git before 2.36 (no worktree list
         expect(created.success).toBe(true);
         expect((await call('status', { worktreePath: created.result.path, branch: 'bright-fox', baseBranch: 'main' })).result)
             .toEqual({ dirty: false, behind: 0, ahead: 0 });
+    });
+});
+
+// aplus-dev-studio strict-followup-plan F1 — cleanup after a project delete on a strict machine.
+describe('worktree:purge-project', () => {
+    type DockerCall = string[];
+    function purgeSet(over: { containers?: string[]; volumes?: string[]; native?: Partial<NativeStopResult> } = {}) {
+        const dockerCalls: DockerCall[] = [];
+        const nativeCalls: Array<{ dryRun?: boolean }> = [];
+        const set = createWorktreeOpsHandlers({
+            machine: () => machine,
+            allowedRoot: root,
+            happyHomeDir: home,
+            now: () => NOW,
+            purge: {
+                docker: async (args) => {
+                    dockerCalls.push(args);
+                    if (args[0] === 'ps') return { code: 0, stdout: (over.containers ?? []).join('\n') };
+                    if (args[0] === 'volume' && args[1] === 'ls') return { code: 0, stdout: (over.volumes ?? []).join('\n') };
+                    return { code: 0, stdout: '' };
+                },
+                stopNative: async (input) => {
+                    nativeCalls.push(input);
+                    return { reason: 'no-native-processes', verified: 0, unverified: 0, pending: 0, signalled: 0, escalated: 0, ...over.native };
+                },
+            },
+        });
+        return { set, dockerCalls, nativeCalls };
+    }
+    function managedFolder(projectId = 'p1') {
+        const dir = join(root, 'aplus-dev-studio-workspace', 'owner-1', projectId);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'app.ts'), 'x');
+        writeFileSync(join(dir, 'README.md'), 'x');
+        return dir;
+    }
+    const purge = (workspaceDir: string, over: Record<string, unknown> = {}) => ({ workspaceDir, port: null, purgeFolder: true, dryRun: false, ...over });
+
+    it('reports what is there on a dry run, and changes nothing', async () => {
+        const dir = managedFolder();
+        const { set, dockerCalls, nativeCalls } = purgeSet({ containers: ['c1'], volumes: ['preview-p1-node_modules', 'preview-p1-uv-cache', 'preview-p2-uv-cache'], native: { verified: 2 } });
+        const answer = await call('purge-project', purge(dir, { dryRun: true }), {}, set);
+        expect(answer.result).toEqual({
+            path: dir, managed: true, exists: true, entries: 2, containers: 1, volumes: 2,
+            processes: { verified: 2, unverified: 0, pending: 0 },
+            outcome: { processes: 'skipped', containers: 'skipped', folder: 'skipped' },
+        });
+        expect(existsSync(dir)).toBe(true);
+        expect(nativeCalls).toEqual([expect.objectContaining({ dryRun: true })]);
+        expect(dockerCalls.every((args) => args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls'))).toBe(true);
+    });
+
+    it('stops the project\'s resources and removes its managed folder', async () => {
+        const dir = managedFolder();
+        const { set, dockerCalls } = purgeSet({ containers: ['c1'], volumes: ['preview-p1-node_modules-a', 'preview-p10-uv-cache'] });
+        const answer = await call('purge-project', purge(dir), {}, set);
+        expect(answer.result.outcome).toEqual({ processes: 'no-native-processes', containers: 'removed', folder: 'removed' });
+        expect(existsSync(dir)).toBe(false);
+        expect(dockerCalls).toContainEqual(['rm', '-f', 'c1']);
+        expect(dockerCalls).toContainEqual(['volume', 'rm', 'preview-p1-node_modules-a']);
+        expect(dockerCalls.some((args) => args.includes('preview-p10-uv-cache'))).toBe(false);
+        expect(dockerCalls[0]).toEqual(expect.arrayContaining(['label=aplus.projectId=p1']));
+    });
+
+    it('keeps a folder that is not a managed project folder, and still cleans the resources', async () => {
+        const dir = join(root, 'my-own-folder');
+        mkdirSync(dir);
+        const { set, dockerCalls } = purgeSet({ containers: ['c1'] });
+        const answer = await call('purge-project', purge(dir), {}, set);
+        expect(answer.result).toMatchObject({ managed: false, outcome: { containers: 'removed', folder: 'preserved' } });
+        expect(existsSync(dir)).toBe(true);
+        expect(dockerCalls).toContainEqual(['rm', '-f', 'c1']);
+        const elsewhere = managedFolder('another-project');
+        expect((await call('purge-project', purge(elsewhere), {}, set)).result.outcome.folder).toBe('preserved');
+        expect(existsSync(elsewhere)).toBe(true);
+    });
+
+    it('keeps the folder while a process it could not prove is still running', async () => {
+        const dir = managedFolder();
+        const { set } = purgeSet({ native: { reason: 'identity-unverified', unverified: 1 } });
+        const answer = await call('purge-project', purge(dir), {}, set);
+        expect(answer.result.outcome).toMatchObject({ processes: 'identity-unverified', folder: 'blocked' });
+        expect(existsSync(dir)).toBe(true);
+    });
+
+    it('reports a folder already gone, and refuses links and paths outside the allowed root', async () => {
+        const gone = join(root, 'aplus-dev-studio-workspace', 'owner-1', 'p1');
+        const { set } = purgeSet();
+        expect((await call('purge-project', purge(gone), {}, set)).result).toMatchObject({ exists: false, outcome: { folder: 'missing' } });
+        const real = managedFolder('p1');
+        const linkParent = join(root, 'aplus-dev-studio-workspace', 'linked');
+        mkdirSync(linkParent, { recursive: true });
+        symlinkSync(real, join(linkParent, 'p1'));
+        expect(await call('purge-project', purge(join(linkParent, 'p1')), {}, set)).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+        expect(existsSync(real)).toBe(true);
+        const outside = realpathSync(mkdtempSync(join(tmpdir(), 'outside-')));
+        try {
+            expect(await call('purge-project', purge(outside), {}, set)).toMatchObject({ success: false, errorCode: 'PATH_DENIED' });
+            expect(existsSync(outside)).toBe(true);
+        } finally {
+            rmSync(outside, { recursive: true, force: true });
+        }
     });
 });
