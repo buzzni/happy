@@ -45,8 +45,10 @@ describe('applyLessonLaunchEnvironment', () => {
         const source = readFileSync(new URL('../daemon/run.ts', import.meta.url), 'utf8');
         const parsed = ts.createSourceFile('run.ts', source, ts.ScriptTarget.Latest, true);
         let spawn: ts.ArrowFunction | undefined;
+        // The spawn body is `spawnSessionUnchecked`; `spawnSession` wraps it with the worktree removal
+        // check (aplus-dev-studio strict-followup-plan F2).
         const findSpawn = (node: ts.Node) => {
-            if (ts.isVariableDeclaration(node) && node.name.getText(parsed) === 'spawnSession'
+            if (ts.isVariableDeclaration(node) && node.name.getText(parsed) === 'spawnSessionUnchecked'
                 && node.initializer && ts.isArrowFunction(node.initializer)) spawn = node.initializer;
             ts.forEachChild(node, findSpawn);
         };
