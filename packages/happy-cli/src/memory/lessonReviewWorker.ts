@@ -128,6 +128,21 @@ function toCandidate(
     };
 }
 
+/**
+ * Resolves to `null` as soon as `signal` aborts. A finished-turn lease renewal
+ * may take seconds; a preempted review must stop waiting for it, or it keeps
+ * the worker busy and turns away the next turn's review.
+ */
+function unlessAborted<T>(pending: Promise<T> | T, signal: AbortSignal): Promise<T | null> {
+    return new Promise((resolve, reject) => {
+        const onAbort = () => resolve(null);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        Promise.resolve(pending).then(resolve, reject)
+            .finally(() => signal.removeEventListener('abort', onAbort));
+    });
+}
+
 export interface LessonReviewWorker {
     /** Optional for compatibility with older provider host adapters. */
     prepareReviewTurn?(): Promise<{ revision: number } | null>;
@@ -181,8 +196,8 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
             let releaseOnAbort: (() => void) | undefined;
             let issued: Awaited<ReturnType<LessonBindingIssuer['issue']>> | undefined;
             try {
-                const identity = await deps.identity('finished');
-                if (!identity) return report('permission_denied');
+                const identity = await unlessAborted(deps.identity('finished'), signal);
+                if (!identity) return report(signal.aborted ? 'cancelled' : 'permission_denied');
                 const proposalSubmitted = proposal !== undefined && proposal !== null;
                 const decision = evaluateLessonTurn(record, identity.projectId, { agentProposal: proposalSubmitted });
                 if (!decision.eligible) {
@@ -222,7 +237,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                         if ((await deps.issuer!.resolve(binding)).generation !== plannedRevision) return false;
                         const current = await deps.settings.read();
                         if (!current.reviewEnabled || current.revision !== plannedRevision) return false;
-                        const actor = await deps.identity('finished');
+                        const actor = await unlessAborted(deps.identity('finished'), signal);
                         return !signal.aborted && actor?.projectId === identity.projectId && actor.userId === identity.userId
                             && actor.machineId === identity.machineId;
                     } catch { return false; }

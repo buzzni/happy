@@ -242,6 +242,28 @@ describe('foreground lesson proposals', () => {
         expect(h.host.calls).toHaveLength(0);
         await rm(h.dir, { recursive: true, force: true });
     });
+    it.each([
+        ['admission', 1],
+        ['fence', 2],
+    ] as const)('stops waiting on a slow %s lease renewal once the turn is preempted', async (_label, slowCall) => {
+        const controller = new AbortController();
+        let finishedCalls = 0;
+        const h = await harness({
+            identity: phase => {
+                if (phase === 'finished' && ++finishedCalls === slowCall) {
+                    // The user speaks again while the studio is still renewing.
+                    setTimeout(() => controller.abort(), 0);
+                    return new Promise(resolve => setTimeout(() => resolve(null), 300));
+                }
+                return { userId: 'u1', projectId: 'p1', machineId: 'm1' };
+            },
+        });
+        const preempted = h.worker.reviewFinishedTurn({ ...input(), signal: controller.signal });
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(await h.worker.reviewFinishedTurn(input())).toBe('reviewed');
+        expect(await preempted).toBe('cancelled');
+        await rm(h.dir, { recursive: true, force: true });
+    });
     it('keeps applicability and ignores forged authority fields', async () => {
         const h = await harness();
         expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, validVersions: ['cml 2.4.3'],
