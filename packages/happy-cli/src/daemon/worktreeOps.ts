@@ -38,6 +38,7 @@ import {
     type WorktreeTicket,
 } from '@slopus/happy-wire';
 import { deriveServerRpcKey } from '@/api/encryption';
+import { worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { DurableTicketGuard } from './usedWorktreeTickets';
 import { stopProjectNativeProcesses, type NativeStopResult } from './projectNativeProcesses';
 import { isWithinDirectory } from '@/modules/common/happyHomeGuard';
@@ -589,7 +590,7 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
     const params: WorktreeOpParams<'remove'> = ticket.params;
     const target = await resolveWorktreeTarget(guard, params.worktreePath, ticket.projectId);
     if (!target.registered) return { outcome: 'missing' };
-    return serialized(target.repoRoot, async () => {
+    const removal = serialized(target.repoRoot, async () => {
         // Checked before anything is stopped or removed: a refusal leaves everything as it was.
         const status = await runGit(target.path, ['status', '--porcelain'], { readOnly: true });
         const ownBranch = await currentBranch(target.path);
@@ -604,7 +605,11 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
                 throw new OpFailure('WORKTREE_DIRTY', 'contains changes not applied to the default version');
             }
         }
-        if (params.dryRun) return { outcome: 'removable' as const };
+        if (params.dryRun) {
+            // aplus-dev-studio strict-followup-plan F2 — no conversation starts inside it until the removal.
+            await worktreeRemovalReservations.reserve(target.path);
+            return { outcome: 'removable' as const };
+        }
         const removed = await runGit(target.repoRoot, ['worktree', 'remove', ...(params.force ? ['--force'] : []), '--', target.path]);
         if (removed.code !== 0) {
             const error = gitError(removed);
@@ -616,6 +621,17 @@ async function removeWorktree(guard: PathGuard, ticket: WorktreeTicket & { op: '
         if (params.branch && params.branch === ownBranch) await runGit(target.repoRoot, ['branch', params.force ? '-D' : '-d', ownBranch]);
         return { outcome: 'removed' as const };
     });
+    // F2 — the removal, or a refused dry run, ends the reservation; a removable dry run keeps it.
+    return removal.then(
+        async (result) => {
+            if (!params.dryRun) await worktreeRemovalReservations.release(target.path);
+            return result;
+        },
+        async (error: unknown) => {
+            await worktreeRemovalReservations.release(target.path);
+            throw error;
+        },
+    );
 }
 
 // ── Changing, publishing and switching work ────────────────────────────────────────────────────

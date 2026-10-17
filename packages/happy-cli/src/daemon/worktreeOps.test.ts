@@ -21,6 +21,7 @@ import { deriveServerRpcKey } from '@/api/encryption';
 import { sealForMachine } from '@/modules/common/machineSeal';
 import { createWorktreeOpsHandlers, prepareGitCredential, WORKTREE_OPS_METHODS } from './worktreeOps';
 import type { NativeStopResult } from './projectNativeProcesses';
+import { worktreeRemovalReservations } from './worktreeRemovalReservations';
 
 const machineKey = new Uint8Array(32).fill(7);
 const machine = { id: 'm1', encryptionKey: machineKey, encryptionVariant: 'dataKey' as 'dataKey' | 'legacy' };
@@ -356,6 +357,21 @@ describe('worktree:remove', () => {
         expect((await call('remove', remove(result.path))).result).toEqual({ outcome: 'removed' });
         expect(existsSync(result.path)).toBe(false);
         expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+    });
+
+    // aplus-dev-studio strict-followup-plan F2 — between the dry run and the removal no conversation
+    // starts inside the worktree; a refused or finished removal leaves nothing reserved.
+    it('reserves the worktree from a removable dry run until the removal', async () => {
+        const { result } = await call('create', create());
+        await call('remove', remove(result.path, { dryRun: true }));
+        expect(await worktreeRemovalReservations.covers(result.path)).toBe(true);
+        await call('remove', remove(result.path));
+        expect(await worktreeRemovalReservations.covers(result.path)).toBe(false);
+
+        const second = (await call('create', create({ name: 'second' }))).result;
+        writeFileSync(join(second.path, 'dirty.txt'), 'x');
+        await call('remove', remove(second.path, { dryRun: true, branch: second.branch }));
+        expect(await worktreeRemovalReservations.covers(second.path)).toBe(false);
     });
 
     it('keeps a worktree with uncommitted or unapplied work unless forced', async () => {

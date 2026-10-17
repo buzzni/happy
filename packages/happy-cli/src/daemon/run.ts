@@ -1,4 +1,5 @@
 import { createDeviceOrgPinStore } from './deviceOrgPinStore';
+import { spawnRefusalForRemoval } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
@@ -1784,6 +1785,10 @@ export async function startDaemon(): Promise<void> {
 
       // Lesson eligibility uses the registered daemon machine, not an optional RPC field.
       const { directory, sessionId, approvedNewDirectoryCreation = true } = options;
+      // aplus-dev-studio strict-followup-plan F2 — a worktree between its removal's dry run and the
+      // removal takes no new or resumed conversation.
+      const removalRefusal = await spawnRefusalForRemoval(directory);
+      if (removalRefusal) return { type: 'error', errorMessage: removalRefusal };
       let directoryCreated = false;
 
       try {
@@ -2788,6 +2793,11 @@ export async function startDaemon(): Promise<void> {
             emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
           },
         );
+
+        // aplus-dev-studio strict-followup-plan F2 — checked before the restore below: a worktree
+        // being removed is neither resumed in nor put back.
+        const resumeRemovalRefusal = await spawnRefusalForRemoval(launch.cwd);
+        if (resumeRemovalRefusal) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: resumeRemovalRefusal };
 
         // The managed worktree this session ran in may have been cleaned up
         // while it was idle; put it back at the same path so the agent's
