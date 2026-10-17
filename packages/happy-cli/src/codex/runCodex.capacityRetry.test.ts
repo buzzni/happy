@@ -350,4 +350,80 @@ describe('automatic continuation after a capacity failure', () => {
         expect(continuations()).toHaveLength(0);
     }, 60_000);
 
+    describe('in an automation run-once session', () => {
+        // The daemon's automation marker: the session exits after its turn instead of waiting for input.
+        const runOnce = () => run(async () => {});
+        beforeEach(() => {
+            vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+            vi.stubEnv('HAPPY_INITIAL_PROMPT', 'review the pull request');
+        });
+
+        it('continues a turn that ended at capacity before exiting', async () => {
+            script = [{ outcome: 'overloaded' }, { outcome: 'ok' }];
+            await runOnce();
+
+            expect(turnsSent).toHaveLength(2);
+            expect(turnsSent[0]).toContain('review the pull request');
+            expect(turnsSent[1]).toContain(CODEX_CAPACITY_CONTINUE_PROMPT);
+            expect(notices()).toHaveLength(1);
+        }, 60_000);
+
+        it('exits once the retry budget is spent', async () => {
+            script = [{ outcome: 'overloaded' }, { outcome: 'overloaded' }, { outcome: 'overloaded' }];
+            await runOnce();
+
+            expect(turnsSent).toHaveLength(3);
+            expect(continuations()).toHaveLength(2);
+        }, 60_000);
+
+        it('exits without continuing when stopped while the continuation waits', async () => {
+            script = [{ outcome: 'overloaded', after: () => { setTimeout(() => { void rpc.get('abort')?.({}); }, 0); } }];
+            await runOnce();
+
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+        }, 60_000);
+
+        it('exits without continuing when stopped after the continuation was dequeued', async () => {
+            script = [{ outcome: 'overloaded' }];
+            let collected = false;
+            await run(async () => {
+                const queue = queues[0]!;
+                const collect = queue.waitForMessagesAndGetAsString.bind(queue);
+                vi.spyOn(queue, 'waitForMessagesAndGetAsString').mockImplementation(async (...args) => {
+                    const batch = await collect(...args);
+                    if (batch?.message === CODEX_CAPACITY_CONTINUE_PROMPT) {
+                        collected = true;
+                        await rpc.get('abort')?.({});
+                    }
+                    return batch;
+                });
+            });
+
+            expect(collected).toBe(true);
+            expect(continuations()).toHaveLength(0);
+        }, 60_000);
+
+        it('exits when the continuation is skipped because late work reopened the turn', async () => {
+            // Work Codex reports after turn/completed reopens the lifecycle while the continuation waits.
+            script = [{
+                outcome: 'overloaded',
+                after: () => {
+                    setTimeout(() => {
+                        eventHandler?.({ type: 'task_started', turn_id: 'turn-1' });
+                        setTimeout(() => { eventHandler?.({ type: 'task_complete', status: 'completed', turn_id: 'turn-1' }); }, 100);
+                    }, 5);
+                },
+            }];
+            const exited = runOnce().then(() => true);
+            const settled = await Promise.race([exited, sleep(3_000).then(() => false)]);
+            if (!settled) { closeQueue(); await exited; }
+
+            expect(settled).toBe(true);
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+        }, 60_000);
+    });
 });
