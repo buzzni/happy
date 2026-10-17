@@ -52,6 +52,14 @@ describe('serverAutomationRuntimeStore', () => {
         repositoryRoot: '/repo', worktreePath: '/managed/run-2', directory: '/managed/run-2/apps/web',
         sessionId: 'session-2', createdAt: 777,
       }],
+      unreachableRetries: [{
+        ownerId: 'daemon-a', automationId: 'automation-1', generation: 2, attempt: 1, retryAt: 400,
+        leaseExpiresAt: 500, releasing: true,
+        report: {
+          runId: 'run-3', claimToken: 'claim-3', reportId: 'report-3', status: 'FAILED',
+          outcome: 'ERROR', sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
+        },
+      }],
       pendingReports: [{
         runId: 'run-1', claimToken: 'claim-token', reportId: 'report-1', status: 'COMPLETED',
         outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
@@ -75,6 +83,14 @@ describe('serverAutomationRuntimeStore', () => {
         automationId: 'automation-2', generation: 3, runId: 'run-2',
         repositoryRoot: '/repo', worktreePath: '/managed/run-2', directory: '/managed/run-2/apps/web',
         sessionId: 'session-2', createdAt: 777,
+      }],
+      unreachableRetries: [{
+        ownerId: 'daemon-a', automationId: 'automation-1', generation: 2, attempt: 1, retryAt: 400,
+        leaseExpiresAt: 500, releasing: true,
+        report: {
+          runId: 'run-3', claimToken: 'claim-3', reportId: 'report-3', status: 'FAILED',
+          outcome: 'ERROR', sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
+        },
       }],
       githubTriggers: [{
         automationId: 'automation-2',

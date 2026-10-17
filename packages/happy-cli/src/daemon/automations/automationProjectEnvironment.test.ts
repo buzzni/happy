@@ -33,7 +33,11 @@ describe('fetchAutomationProjectEnvironment', () => {
 
   it.each([401, 403, 404, 503])('does not expose response bodies on HTTP %s', async (status) => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('sensitive-detail', { status })))
-    await expect(fetchAutomationProjectEnvironment(input)).resolves.toEqual({ ok: false, error: `project environment request returned ${status}` })
+    await expect(fetchAutomationProjectEnvironment(input)).resolves.toEqual({
+      ok: false, error: `project environment request returned ${status}`,
+      // 503 은 Studio 뒤 서비스에 닿지 못한 것이라 예약 실행이 재시도할 수 있게 표시만 붙는다.
+      ...(status === 503 ? { unreachable: 'HTTP_503' } : {}),
+    })
   })
 
   it('preserves the execution-unbound signal without exposing unrelated response details', async () => {
