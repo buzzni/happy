@@ -14,6 +14,7 @@ import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import React from "react";
 import { claudeRemote, type ClaudeActiveInputSender, type ClaudeTurnLatencyInput } from "./claudeRemote";
 import type { ClaudeAuthObservation, ObservedAiAuthSource } from "./aiAuthObservation";
+import { ClaudeSideQuestionBridge, createSideQuestionRpcHandler } from "./claudeSideQuestion";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
 import type { QueueLatencyTrace } from "@/utils/MessageQueue2";
@@ -189,6 +190,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         };
         return gate ? gate.admit(steer) : steer();
     });
+    // `/btw`: one answer from the live conversation, outside the transcript and the turn queue.
+    const sideQuestion = new ClaudeSideQuestionBridge();
+    session.client.rpcHandlerManager.registerHandler('side-question', createSideQuestionRpcHandler({
+        bridge: sideQuestion,
+        isManagedRun: () => session.managedRun === true,
+        gate: () => session.standaloneDrain?.gate,
+        reportUsage: (usage) => session.client.reportSideQuestionUsage(usage, aiAuthObservation?.current()),
+        newRequestId: () => randomUUID(),
+    }));
     // Removed catch-all stdin handler - now handled by RemoteModeDisplay keyboard handlers
 
     // Create permission handler
@@ -326,6 +336,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
+        sideQuestion.noteMainMessage(message);
         if ((message as { type?: unknown }).type === 'rate_limit_event') {
             setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
         }
@@ -998,6 +1009,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onActiveInputReady: (sender) => {
                         activeInputSender = sender;
+                    },
+                    onSideQuestionChannelReady: (channel) => {
+                        if (channel) sideQuestion.provide(channel); else sideQuestion.clear();
                     },
                     onMcpStatus: (status: McpRuntimeServerStatus) => {
                         session.client.updateMetadata((currentMetadata) => ({

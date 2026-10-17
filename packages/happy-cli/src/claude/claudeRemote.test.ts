@@ -103,6 +103,48 @@ describe('claudeRemote', () => {
         });
     });
 
+    describe('side question channel', () => {
+        const run = async (overrides: Record<string, unknown>, messages: unknown[] = [{ type: 'result', subtype: 'success' }]) => {
+            const request = vi.fn(async (body: unknown) => ({ subtype: 'success', response: { echoed: body } }));
+            const onMessage = vi.fn();
+            const channels: unknown[] = [];
+            let turnSeenInProgress: boolean | undefined;
+            vi.mocked(query).mockReturnValue({
+                request,
+                async *[Symbol.asyncIterator]() {
+                    const channel = channels[0] as { isTurnInProgress: () => boolean } | undefined;
+                    turnSeenInProgress = channel?.isTurnInProgress();
+                    for (const message of messages) yield message;
+                },
+            } as any);
+            let count = 0;
+            await claudeRemote({ sessionId: null, path: process.cwd(), allowedTools: [], hookSettingsPath: '/tmp/synthetic-settings.json',
+                nextMessage: async () => count++ === 0 ? { message: 'synthetic', mode } : null,
+                onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
+                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage,
+                onSideQuestionChannelReady: (channel: unknown) => channels.push(channel), ...overrides } as any);
+            return { channels, request, onMessage, turnSeenInProgress };
+        };
+
+        it('exposes the live query to side questions and withdraws it when the query ends', async () => {
+            const { channels, request, turnSeenInProgress } = await run({});
+            const channel = channels[0] as { request: (body: unknown, options: unknown) => Promise<unknown>; isTurnInProgress: () => boolean };
+            expect(channels.at(-1)).toBeNull();
+            expect(turnSeenInProgress).toBe(true);
+            expect(channel.isTurnInProgress()).toBe(false);
+            const signal = new AbortController().signal;
+            expect(await channel.request({ subtype: 'side_question', question: 'q' }, { signal }))
+                .toEqual({ echoed: { subtype: 'side_question', question: 'q' } });
+            expect(request).toHaveBeenCalledWith({ subtype: 'side_question', question: 'q' }, { signal });
+        });
+
+        it('does not forward side question progress to the transcript', async () => {
+            const progress = { type: 'system', subtype: 'control_request_progress', request_id: 'r', status: 'started' };
+            const { onMessage } = await run({}, [progress, { type: 'result', subtype: 'success' }]);
+            expect(onMessage).not.toHaveBeenCalledWith(progress);
+        });
+    });
+
     it('reports that the provider never started when mode switching aborts before the first message', async () => {
         const result = await claudeRemote({
             sessionId: null,

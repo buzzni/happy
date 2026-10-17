@@ -249,3 +249,63 @@ describe('Claude model changes across provider restarts', () => {
         expect(client.sendTurnLatency.mock.calls.map(([diagnostic]) => diagnostic.id)).toEqual(['trace-0', 'trace-1']);
     });
 });
+
+describe('/btw side question on the live provider', () => {
+    it('answers mid-turn through the SDK control request and meters it apart from the transcript', async () => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, (params?: Record<string, unknown>) => Promise<unknown>>();
+        const usageCalls = [{ inputTokens: 100, outputTokens: 10 }, { inputTokens: 130, outputTokens: 18 }];
+        const controlRequests: unknown[] = [];
+        const replies: unknown[] = [];
+        const client = {
+            sessionId: 'btw-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: (params?: Record<string, unknown>) => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            reportSideQuestionUsage: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const response = (async function* () {
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    void message;
+                    // Mid-turn: the side question runs while this turn has not reached its result.
+                    replies.push(await handlers.get('side-question')!({ question: 'which file?' }));
+                    yield { type: 'system', subtype: 'control_request_progress', request_id: 'x', status: 'started' };
+                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: 'result-1' };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, {
+                mcpServerStatus: async () => [], setPermissionMode: async () => {},
+                request: async (body: { subtype: string }) => {
+                    controlRequests.push(body);
+                    if (body.subtype === 'get_usage') return { response: { session: { model_usage: { 'claude-opus-5-5': usageCalls.shift() } } } };
+                    return { response: { response: 'src/app.ts', synthetic: false } };
+                },
+            }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('main turn', { permissionMode: 'default' }, undefined, ['req-0']);
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+
+        await claudeRemoteLauncher(session);
+
+        expect(controlRequests).toContainEqual({ subtype: 'side_question', question: 'which file?' });
+        expect(replies).toEqual([expect.objectContaining({
+            success: true, answer: 'src/app.ts', usageQuality: 'estimated',
+            usage: { input: 30, output: 8, cacheRead: 0, cacheWrite: 0, total: 38 },
+        })]);
+        expect(client.reportSideQuestionUsage).toHaveBeenCalledOnce();
+        expect(client.reportSideQuestionUsage.mock.calls[0][0]).toMatchObject({ model: 'claude-opus-5-5', quality: 'estimated' });
+        expect(client.sendClaudeSessionMessage.mock.calls.flat()).not.toContainEqual(expect.objectContaining({ subtype: 'control_request_progress' }));
+        expect(await handlers.get('side-question')!({ question: 'after exit?' })).toEqual({ success: false, error: 'side-question:not-running' });
+    });
+});
