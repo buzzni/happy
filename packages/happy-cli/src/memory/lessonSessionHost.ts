@@ -83,6 +83,17 @@ export const LESSON_SESSION_BOOTSTRAP_BUDGET_MS = 3_000;
  */
 export const LESSON_AUTHORIZE_BUDGET_MS = 500;
 
+/**
+ * How long a lease refresh may take after a turn has ended.
+ *
+ * Review runs off the chat's path — not awaited, and aborted when the user
+ * speaks again — so the turn budget buys nothing here. Applying it anyway
+ * discarded the agent's proposal whenever the studio took more than half a
+ * second to renew an expired lease (1.7 s was observed), and recorded that as
+ * `permission_denied`. Still bounded, so a hung studio cannot pin the worker.
+ */
+export const LESSON_REVIEW_AUTHORIZE_BUDGET_MS = 10_000;
+
 export interface LessonSessionHost {
     turn: LessonTurnHost | null;
     review: LessonReviewWorker | null;
@@ -481,8 +492,8 @@ async function bootstrapLessonSessionHost(input: {
      * names gets no identity, which stops the work rather than continuing it
      * under a stale one.
      */
-    const liveIdentity = async () => {
-        const current = await supervisor.authorize(projectId, LESSON_AUTHORIZE_BUDGET_MS);
+    const liveIdentity = async (budgetMs = LESSON_AUTHORIZE_BUDGET_MS) => {
+        const current = await supervisor.authorize(projectId, budgetMs);
         if (current !== userId) return null;
         return { projectId, userId, machineId: input.machineId!, sessionId: input.sessionId };
     };
@@ -508,7 +519,9 @@ async function bootstrapLessonSessionHost(input: {
                 issuer,
                 settings,
                 budget: new LessonReviewBudget(lessonReviewLedgerPath(stateRoot)),
-                identity: liveIdentity,
+                identity: phase => liveIdentity(
+                    phase === 'finished' ? LESSON_REVIEW_AUTHORIZE_BUDGET_MS : LESSON_AUTHORIZE_BUDGET_MS,
+                ),
                 onOutcome: (outcome, reason) => {
                     logger.debug(`[lesson-review] ${outcome}${reason ? ` (${reason})` : ''}`);
                     /*

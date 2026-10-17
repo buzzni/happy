@@ -51,8 +51,12 @@ export interface LessonReviewWorkerDeps {
      * `machineId` is the daemon's real machine, not a placeholder: the binding
      * issuer records it and CML stores it on the trace, so an empty string
      * would attribute every candidate to no machine at all.
+     *
+     * `phase` says whether the caller is still on the turn's path (`prepare`)
+     * or after the turn ended (`finished`), so the host can choose how long a
+     * lease renewal may take.
      */
-    identity(): Promise<{ projectId: string; userId: string; machineId: string } | null>
+    identity(phase: 'prepare' | 'finished'): Promise<{ projectId: string; userId: string; machineId: string } | null>
         | { projectId: string; userId: string; machineId: string } | null;
     /** `reason` names which eligibility rule refused a `not-eligible` turn. */
     onOutcome?(outcome: LessonReviewOutcome, reason?: string): void;
@@ -124,6 +128,21 @@ function toCandidate(
     };
 }
 
+/**
+ * Resolves to `null` as soon as `signal` aborts. A finished-turn lease renewal
+ * may take seconds; a preempted review must stop waiting for it, or it keeps
+ * the worker busy and turns away the next turn's review.
+ */
+function unlessAborted<T>(pending: Promise<T> | T, signal: AbortSignal): Promise<T | null> {
+    return new Promise((resolve, reject) => {
+        const onAbort = () => resolve(null);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        Promise.resolve(pending).then(resolve, reject)
+            .finally(() => signal.removeEventListener('abort', onAbort));
+    });
+}
+
 export interface LessonReviewWorker {
     /** Optional for compatibility with older provider host adapters. */
     prepareReviewTurn?(): Promise<{ revision: number } | null>;
@@ -151,7 +170,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                     logger.debug('[lesson-review-prepare] unsupported');
                     return null;
                 }
-                if (!(await deps.identity())) {
+                if (!(await deps.identity('prepare'))) {
                     logger.debug('[lesson-review-prepare] permission_denied');
                     return null;
                 }
@@ -177,8 +196,8 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
             let releaseOnAbort: (() => void) | undefined;
             let issued: Awaited<ReturnType<LessonBindingIssuer['issue']>> | undefined;
             try {
-                const identity = await deps.identity();
-                if (!identity) return report('permission_denied');
+                const identity = await unlessAborted(deps.identity('finished'), signal);
+                if (!identity) return report(signal.aborted ? 'cancelled' : 'permission_denied');
                 const proposalSubmitted = proposal !== undefined && proposal !== null;
                 const decision = evaluateLessonTurn(record, identity.projectId, { agentProposal: proposalSubmitted });
                 if (!decision.eligible) {
@@ -218,7 +237,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                         if ((await deps.issuer!.resolve(binding)).generation !== plannedRevision) return false;
                         const current = await deps.settings.read();
                         if (!current.reviewEnabled || current.revision !== plannedRevision) return false;
-                        const actor = await deps.identity();
+                        const actor = await unlessAborted(deps.identity('finished'), signal);
                         return !signal.aborted && actor?.projectId === identity.projectId && actor.userId === identity.userId
                             && actor.machineId === identity.machineId;
                     } catch { return false; }

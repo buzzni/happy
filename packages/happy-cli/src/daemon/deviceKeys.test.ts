@@ -45,6 +45,14 @@ it('requires reapproval after corruption or a missing key instead of silently re
   await expect(loadOrCreateDeviceKeys(path, 'machine').then(() => true)).rejects.toThrow(/reapproval/i);
   expect(await readdir(join(path, (await readdir(path))[0]))).toEqual([]);
 });
+// "Reapproval required" covers ACL refusals, corruption and ID mismatches alike; the daemon log needs which one.
+it('keeps the underlying failure as the cause of a reapproval error', async () => {
+  const path = await home(); await loadOrCreateDeviceKeys(path, 'machine');
+  await writeFile(join(path, (await readdir(path))[0], 'keys.json'), '{}');
+  const error = await loadOrCreateDeviceKeys(path, 'machine').then(() => null, (failure: Error) => failure);
+  expect(error?.message).toMatch(/reapproval/i);
+  expect(error?.cause).toBeInstanceOf(Error);
+});
 it.skipIf(process.platform === 'win32')('rejects permissions widened after creation and symbolic links', async () => {
   const path = await home(); await loadOrCreateDeviceKeys(path, 'machine');
   const directory = join(path, (await readdir(path))[0]);

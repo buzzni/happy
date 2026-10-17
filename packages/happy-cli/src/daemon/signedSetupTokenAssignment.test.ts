@@ -1,15 +1,16 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { mkdtemp, rm, readdir, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
+import { createHash } from 'node:crypto';
 import nacl from 'tweetnacl';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { canonicalOrgSetupTokenJson, signOrgSetupTokenDocument, orgSetupTokenKeyId } from '@slopus/happy-wire';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
-import { createDeviceOrgPinStore } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
 import { createSetupTokenAssignmentRecipient, sealSetupTokenAssignment } from './setupTokenAssignmentWire';
 import { createSignedSetupTokenVerifier, setupTokenAccountDigest } from './signedSetupTokenAssignment';
 
+vi.mock('node:fs/promises', async (importOriginal) => { const actual = await importOriginal<typeof import('node:fs/promises')>(); return { ...actual, rename: vi.fn(actual.rename) }; });
 const homes: string[] = [];
 afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
 const b64 = (value: Uint8Array) => Buffer.from(value).toString('base64url');
@@ -130,6 +131,32 @@ it('remembers accepted revisions across restarts and rejects replay of an older 
         .rejects.toThrow('REVISION_CONFLICT');
 });
 
+// The device directory is ~206 chars deep on Windows and its PowerShell ACL check opens every entry, so
+// any name past ~50 chars puts that entry beyond MAX_PATH and fails every later key load and pin read.
+const DEVICE_ENTRY_NAME_BUDGET = 40;
+it('keeps assignment state names short enough that the device directory stays under the Windows path limit', async () => {
+    const f = await fixture();
+    const accounts = [account(idA, tokenA)];
+    vi.mocked(rename).mockClear();
+    await f.verifier().verify(f.request(accounts, [await f.assignment(accounts)]));
+    const directory = join(f.home, 'device-' + createHash('sha256').update('machine').digest('hex'));
+    const names = [...await readdir(directory), ...vi.mocked(rename).mock.calls.flatMap(call => call.map(path => basename(String(path))))];
+    expect(names.some(name => name.startsWith('assignments-'))).toBe(true);
+    for (const name of names) expect(name.length, name).toBeLessThanOrEqual(DEVICE_ENTRY_NAME_BUDGET);
+});
+it('keeps accepted revisions saved under the legacy long state name after the rename at daemon start', async () => {
+    const f = await fixture();
+    const accounts = [account(idA, tokenA)];
+    await f.verifier().verify(f.request(accounts, [await f.assignment(accounts, { assignmentRevision: 2, credentialGroupRevision: 4 })]));
+    const directory = join(f.home, 'device-' + createHash('sha256').update('machine').digest('hex'));
+    const companyHash = createHash('sha256').update('company').digest('hex');
+    const [stored] = (await readdir(directory)).filter(name => name.startsWith('assignments-'));
+    await rename(join(directory, stored), join(directory, 'assignments-' + companyHash + '.json'));
+    await migrateLegacyOrgPinNames(f.home, 'machine');
+    expect(await readdir(directory)).not.toContain('assignments-' + companyHash + '.json');
+    await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts)]))).rejects.toThrow('REVISION_STALE');
+});
+
 it('verifies before opening nothing when the kill switch is on', async () => {
     const f = await fixture();
     const accounts = [account(idA, tokenA)];
@@ -145,7 +172,7 @@ it('reports a corrupt revision file and an unencodable account as verification f
     const signed = await f.assignment(accounts);
     await expect(f.verifier().verify(f.request([account(idA, tokenA, 1, '\ud800')], [signed]))).rejects.toThrow('ASSIGNMENT_CONTENT_MISMATCH');
     const sha = (value: string) => createHash('sha256').update(value).digest('hex');
-    await writeFile(join(f.home, 'device-' + sha('machine'), 'assignments-' + sha('company') + '.json'), '{"version":1,"accepted":{"x":{"revision":"a"}}}', { mode: 0o600 });
+    await writeFile(join(f.home, 'device-' + sha('machine'), 'assignments-' + sha('company').slice(0, 16) + '.json'), '{"version":1,"accepted":{"x":{"revision":"a"}}}', { mode: 0o600 });
     await expect(f.verifier().verify(f.request(accounts, [signed]))).rejects.toThrow('ASSIGNMENT_STATE_INVALID');
 });
 
@@ -153,6 +180,6 @@ it('reports an unreadable organization pin by its code, not by a parser or files
     const f = await fixture();
     const accounts = [account(idA, tokenA)];
     const sha = (value: string) => createHash('sha256').update(value).digest('hex');
-    await writeFile(join(f.home, 'device-' + sha('machine'), 'org-' + sha('company') + '.json'), '{not json', { mode: 0o600 });
+    await writeFile(join(f.home, 'device-' + sha('machine'), 'org-' + sha('company').slice(0, 16) + '.json'), '{not json', { mode: 0o600 });
     await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts)]))).rejects.toThrow(/^ORG_PIN_INVALID$/);
 });

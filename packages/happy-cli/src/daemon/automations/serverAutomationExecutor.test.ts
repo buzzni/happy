@@ -4178,6 +4178,21 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
     if (!discards) expect(fixture.store.state().githubWorktrees).toEqual([journaled])
   })
 
+  // review #856 — worktrees put back for resumed Chats are removed on the same tick, under the same gate.
+  it.each([
+    { hostCommandsAllowed: undefined, sweeps: true },
+    { hostCommandsAllowed: false, sweeps: false },
+  ])('sweeps restored worktrees only when host commands are allowed ($hostCommandsAllowed)', async ({ hostCommandsAllowed, sweeps }) => {
+    const fixture = setup()
+    if (hostCommandsAllowed !== undefined) fixture.input.hostCommandsAllowed = hostCommandsAllowed
+    const sweepRestoredWorktrees = vi.fn(async () => {})
+    fixture.input.sweepRestoredWorktrees = sweepRestoredWorktrees
+
+    await runServerAutomationTick(fixture.input)
+
+    expect(sweepRestoredWorktrees).toHaveBeenCalledTimes(sweeps ? 1 : 0)
+  })
+
   it('reports a GitHub trigger as unsupported without querying GitHub or preparing a worktree', async () => {
     const fixture = setup(claimed)
     fixture.input.hostCommandsAllowed = false
@@ -4284,3 +4299,335 @@ describe('ordinary scheduled conversation execution', () => {
     expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }]); expect(f.spawnSession).not.toHaveBeenCalled();
   });
 });
+
+// specs/automation-unreachable-retry — 프롬프트가 세션에 닿기 전 연결 실패는 같은 run 으로
+// 서버 run lease(5분) 안에서 약 1·2·4분 뒤 다시 시도하고, 재시도가 남은 동안은 실패를 보고하지 않는다.
+describe('unreachable pre-model retry', () => {
+  const MINUTE = 60_000
+  const LEASE = 5 * MINUTE
+  const unreachableGrant = { ok: false as const, error: 'caller grant exchange failed', unreachable: 'ENOTFOUND' }
+  const okGrant = { ok: true as const, value: {
+    mcpCallerGrant: 'SIGNED-GRANT', mcpConfigProjectId: 'P-1', bindingStatus: 'BOUND' as const,
+    connectorPolicy: 'required' as const, requiredConnectors: ['gmail'],
+  } }
+  const settle = () => new Promise((resolve) => setImmediate(resolve))
+
+  /**
+   * serverReachable: 데몬↔Saycode 서버 소켓은 살아 있어 heartbeat 가 lease 를 잇는다(Studio 만 VPN 뒤).
+   * false 면 heartbeat 도 실패해 lease 가 start 시각 + 5분에 끝난다.
+   */
+  function retrySetup(intervalMinutes = 120, options: { serverReachable?: boolean } = {}) {
+    const f = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-1' } } })
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...base, schedule: { kind: 'interval' as const, minutes: intervalMinutes } })
+    f.transport.start.mockImplementation(async () => ({ ok: true, value: { runLeaseExpiresAt: f.input.now + LEASE } }))
+    f.transport.heartbeat.mockImplementation(async () => (options.serverReachable === false
+      ? { ok: false, error: 'run-not-running' }
+      : { ok: true, value: { runLeaseExpiresAt: f.input.now + LEASE } }))
+    const grantCalledAt: number[] = []
+    const tickAt = async (offsetMs: number) => {
+      f.input.now = f.now + offsetMs
+      const outcomes = await runServerAutomationTick(f.input)
+      await settle()
+      return outcomes
+    }
+    f.resolveMcpSpawnContext.mockImplementation(async () => {
+      grantCalledAt.push(f.input.now - f.now)
+      return unreachableGrant
+    })
+    return { ...f, tickAt, grantCalledAt }
+  }
+
+  it('runs the same run once the VPN comes up a couple of minutes after the laptop wakes', async () => {
+    const f = retrySetup()
+    // 깨어난 직후 Studio 이름 풀이 실패 두 번, 2분째 VPN 이 붙는다.
+    f.resolveMcpSpawnContext
+      .mockResolvedValueOnce(unreachableGrant)
+      .mockResolvedValueOnce(unreachableGrant)
+      .mockResolvedValue(okGrant)
+
+    await expect(f.tickAt(0)).resolves.toEqual([])
+    expect(f.transport.report).not.toHaveBeenCalled()
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({
+      automationId: 'automation-1', attempt: 1, retryAt: f.now + MINUTE, leaseExpiresAt: f.now + LEASE,
+      report: expect.objectContaining({ runId: 'run-1', status: 'FAILED', failureCode: 'GRANT_EXCHANGE_FAILED' }),
+    })])
+
+    await f.tickAt(30_000)
+    expect(f.transport.heartbeat).toHaveBeenCalledWith({ runId: 'run-1', claimToken: 'claim-1' })
+    // 서버가 돌려준 새 만료 시각을 기억한다.
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ leaseExpiresAt: f.now + 30_000 + LEASE })])
+
+    await expect(f.tickAt(MINUTE)).resolves.toEqual([])
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ attempt: 2, retryAt: f.now + 2 * MINUTE })])
+
+    await expect(f.tickAt(2 * MINUTE)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+    expect(f.transport.start).toHaveBeenCalledTimes(1)
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(3)
+    expect(f.resolveMcpSpawnContext).toHaveBeenLastCalledWith({ runId: 'run-1', claimToken: 'claim-1' })
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'COMPLETED', outcome: 'WOKE', sessionId: 'session-1',
+    }))
+    const state = f.store.state()
+    expect(state.unreachableRetries).toEqual([])
+    // 재시도 성공이 정규 주기를 재시도 시각 기준으로 밀지 않는다.
+    expect(state.schedules[0]).toMatchObject({ nextRunAt: f.now + 120 * MINUTE, lastSessionId: 'session-1' })
+
+    await f.tickAt(3 * MINUTE)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+  })
+
+  it('takes the third retry four minutes in while heartbeats keep the lease alive', async () => {
+    const f = retrySetup()
+    for (const offset of [0, 1, 2]) await f.tickAt(offset * MINUTE)
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ attempt: 3, retryAt: f.now + 4 * MINUTE })])
+  })
+
+  it('finishes every retry inside the lease when the server cannot be reached either', async () => {
+    const f = retrySetup(120, { serverReachable: false })
+
+    for (const offset of [0, 1, 2]) {
+      await expect(f.tickAt(offset * MINUTE)).resolves.toEqual([])
+      expect(f.transport.report).not.toHaveBeenCalled()
+    }
+    // heartbeat 가 lease 를 잇지 못하면 마지막 재시도를 lease 만료 1분 30초 전으로 당긴다.
+    const lastRetryAt = LEASE - 90_000
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ attempt: 3, retryAt: f.now + lastRetryAt })])
+
+    await expect(f.tickAt(lastRetryAt)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.grantCalledAt).toEqual([0, MINUTE, 2 * MINUTE, lastRetryAt])
+    expect(Math.max(...f.grantCalledAt)).toBeLessThan(LEASE)
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'FAILED', outcome: 'ERROR', failureCode: 'GRANT_EXCHANGE_FAILED_AFTER_3_RETRIES',
+    }))
+    expect(f.store.state().unreachableRetries).toEqual([])
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('unreachable after 3 automatic retries'))
+  })
+
+  it('keeps a due retry alive while the previous session of the automation is still running', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValueOnce(unreachableGrant).mockResolvedValue(okGrant)
+    await f.tickAt(0)
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [{ ...state.schedules[0]!, lastSessionId: 'previous-session' }] })
+    let previousRunning = true
+    f.input.isSessionRunning = vi.fn(() => previousRunning)
+
+    await f.tickAt(MINUTE)
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.transport.heartbeat).toHaveBeenLastCalledWith({ runId: 'run-1', claimToken: 'claim-1' })
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ attempt: 1 })])
+    expect(f.store.state().schedules[0]!.nextRunAt).toBe(f.now + 120 * MINUTE)
+
+    previousRunning = false
+    await f.tickAt(2 * MINUTE)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', outcome: 'WOKE' }))
+  })
+
+  it('leaves the retry to the regular run when that run comes first', async () => {
+    const f = retrySetup(2)
+
+    await f.tickAt(0)
+    expect(f.transport.report).not.toHaveBeenCalled()
+    // 1분 재시도도 실패하면 다음 재시도(+2분)가 정규 실행(+2분)과 겹치므로 지금 기록한다.
+    await expect(f.tickAt(MINUTE)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'GRANT_EXCHANGE_FAILED_AFTER_1_RETRIES' }))
+    expect(f.store.state().unreachableRetries).toEqual([])
+
+    const short = retrySetup(1)
+    await expect(short.tickAt(0)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(short.transport.report).toHaveBeenCalledWith(expect.objectContaining({ failureCode: 'GRANT_EXCHANGE_FAILED' }))
+    expect(short.store.state().unreachableRetries ?? []).toEqual([])
+  })
+
+  it.each([
+    ['a grant refusal that is not a connectivity failure', (f: ReturnType<typeof retrySetup>) => {
+      f.resolveMcpSpawnContext.mockResolvedValue({ ok: false, error: 'caller grant exchange returned 400' })
+    }],
+    ['a spawn failure, after which the prompt may already be in flight', (f: ReturnType<typeof retrySetup>) => {
+      f.resolveMcpSpawnContext.mockResolvedValue(okGrant)
+      f.spawnSession.mockResolvedValue({ ok: false, error: 'connect ECONNREFUSED' })
+    }],
+    ['a script automation, whose script already ran', (f: ReturnType<typeof retrySetup>) => {
+      const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+      f.input.decryptPayload = () => ({ ...base, scriptCommand: 'check.sh' })
+      f.runScript.mockResolvedValue({ ok: true, stdout: '{"wakeAgent":true}' })
+    }],
+    ['a server that sent no lease deadline', (f: ReturnType<typeof retrySetup>) => {
+      f.transport.start.mockResolvedValue({ ok: true })
+    }],
+  ])('reports immediately for %s', async (_label, arrange) => {
+    const f = retrySetup()
+    arrange(f)
+
+    await expect(f.tickAt(0)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ status: 'FAILED', outcome: 'ERROR' }))
+    expect(f.store.state().unreachableRetries ?? []).toEqual([])
+  })
+
+  it('retries a scheduled conversation whose target could not be confirmed for lack of a network', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValue({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } })
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' })); f.input.deliverConversation = deliver
+    f.input.resolveProjectEnvironment = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: 'project environment request failed', unreachable: 'ECONNREFUSED' })
+      .mockResolvedValue({ ok: true, environmentVariables: {} })
+
+    await f.tickAt(0)
+    expect(deliver).not.toHaveBeenCalled()
+    expect(f.transport.report).not.toHaveBeenCalled()
+
+    await f.tickAt(MINUTE)
+    expect(deliver).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', outcome: 'WOKE' }))
+  })
+
+  it('discards a retry the previous daemon process held and records its failure with the retries it ran', async () => {
+    const f = retrySetup()
+    const state = f.store.read()
+    f.store.write({
+      ...state,
+      schedules: [{ ...state.schedules[0]!, nextRunAt: f.now + 60 * MINUTE }],
+      unreachableRetries: [{
+        ownerId: 'previous-daemon', automationId: 'automation-1', generation: 2, attempt: 2, retryAt: f.now,
+        leaseExpiresAt: f.now + LEASE,
+        report: {
+          runId: 'run-0', claimToken: 'claim-0', reportId: 'report-0', status: 'FAILED', outcome: 'ERROR',
+          sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
+        },
+      }],
+    })
+
+    await f.tickAt(0)
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    expect(f.resolveMcpSpawnContext).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-0', reportId: 'report-0', status: 'FAILED', failureCode: 'GRANT_EXCHANGE_FAILED_AFTER_1_RETRIES',
+    }))
+    expect(f.store.state()).toMatchObject({ unreachableRetries: [], pendingReports: [] })
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('because the daemon restarted'))
+  })
+
+  it('records the held failure instead of retrying once the user pauses the automation', async () => {
+    const f = retrySetup()
+    await f.tickAt(0)
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [{ ...cacheRecord(), paused: true }] })
+
+    await f.tickAt(MINUTE)
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', status: 'FAILED' }))
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('because the automation was paused'))
+  })
+
+  it('records the held failure once the run lease has run out', async () => {
+    const f = retrySetup(120, { serverReachable: false })
+    await f.tickAt(0)
+    // 틱이 오래 멈춰(잠자기 등) 재시도 시각을 놓치고 lease 도 지났다 — 서버가 거절할 재시도는 하지 않는다.
+    await f.tickAt(LEASE)
+    expect(f.resolveMcpSpawnContext).toHaveBeenCalledTimes(1)
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1', failureCode: 'GRANT_EXCHANGE_FAILED' }))
+    expect(f.store.state().unreachableRetries).toEqual([])
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('because the run lease ran out'))
+  })
+
+  it('drops a held failure the server refuses because the run was already cancelled', async () => {
+    const f = retrySetup()
+    await f.tickAt(0)
+    // 대화 보관·삭제로 서버가 run 을 CANCELLED 로 바꾸고 자동화도 목록에서 빠졌다.
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [] })
+    f.transport.report.mockResolvedValueOnce({ ok: false, error: 'run-not-running' })
+
+    await f.tickAt(30_000)
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+    expect(f.store.state()).toMatchObject({ unreachableRetries: [], pendingReports: [] })
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('run-not-running'))
+  })
+
+  it('keeps the regular run due until the server has taken the held failure', async () => {
+    const f = retrySetup()
+    await f.tickAt(0)
+    // 정규 시각이 보류 중에 다가왔다(예: 일정 재계산).
+    const state = f.store.read()
+    f.store.write({ ...state, schedules: [{ ...state.schedules[0]!, nextRunAt: f.now + 30_000 }] })
+    f.transport.report.mockResolvedValueOnce({ ok: false, error: 'invalid-input' })
+
+    await expect(f.tickAt(30_000)).resolves.toEqual([])
+    // 보류 run 이 서버에서 아직 RUNNING 이므로 claim 하면 active-run 으로 회차를 넘겨 버린다.
+    expect(f.transport.claim).toHaveBeenCalledTimes(1)
+    expect(f.store.state().schedules[0]!.nextRunAt).toBe(f.now + 30_000)
+    expect(f.store.state().unreachableRetries).toEqual([expect.objectContaining({ releasing: true })])
+
+    f.transport.claim.mockResolvedValue({ ok: true, value: { runId: 'run-2', claimToken: 'claim-2' } })
+    f.resolveMcpSpawnContext.mockResolvedValue(okGrant)
+    await expect(f.tickAt(60_000)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(f.transport.report.mock.calls.map(([report]) => [report.runId, report.status])).toEqual([
+      ['run-1', 'FAILED'], ['run-1', 'FAILED'], ['run-2', 'COMPLETED'],
+    ])
+    expect(f.transport.claim).toHaveBeenLastCalledWith(expect.objectContaining({ scheduledFor: f.now + 30_000 }))
+    expect(f.store.state().unreachableRetries).toEqual([])
+  })
+
+  it('gives a run-now request a fresh run without running the held one again', async () => {
+    const f = retrySetup()
+    f.resolveMcpSpawnContext.mockResolvedValueOnce(unreachableGrant).mockResolvedValue(okGrant)
+    await f.tickAt(0)
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({
+      ...cache,
+      automations: [{ ...cacheRecord(), revision: 3, runRequestedAt: f.now + 30_000 }],
+    })
+    f.transport.claim.mockResolvedValue({ ok: true, value: { runId: 'run-2', claimToken: 'claim-2' } })
+
+    await f.tickAt(30_000)
+    // 보류한 실패가 먼저 기록되어 서버의 active run 이 비워진 뒤 새 run 을 claim 한다.
+    expect(f.transport.report.mock.calls.map(([report]) => [report.runId, report.status])).toEqual([
+      ['run-1', 'FAILED'], ['run-2', 'COMPLETED'],
+    ])
+    expect(f.transport.report.mock.invocationCallOrder[0]).toBeLessThan(f.transport.claim.mock.invocationCallOrder[1]!)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+
+    await f.tickAt(MINUTE)
+    expect(f.spawnSession).toHaveBeenCalledTimes(1)
+    expect(f.transport.claim).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('pending report queue', () => {
+  it('drops a report the server refuses for good and still sends the reports queued behind it', async () => {
+    const f = setup()
+    const state = f.store.read()
+    const report = (id: string) => ({
+      runId: `run-${id}`, claimToken: `claim-${id}`, reportId: `report-${id}`, status: 'FAILED' as const,
+      outcome: 'ERROR' as const, sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
+    })
+    f.store.write({ ...state, pendingReports: [report('cancelled'), report('gone'), report('ok'), report('later')] })
+    f.transport.report.mockImplementation(async (input: { runId: string }) => (
+      input.runId === 'run-cancelled' ? { ok: false, error: 'run-not-running' }
+        : input.runId === 'run-gone' ? { ok: false, error: 'claim-not-found' }
+          : input.runId === 'run-later' ? { ok: false, error: 'invalid-input' }
+            : { ok: true, value: { idempotent: false } }))
+
+    await runServerAutomationTick(f.input)
+    expect(f.transport.report.mock.calls.map(([input]) => input.runId).slice(0, 4))
+      .toEqual(['run-cancelled', 'run-gone', 'run-ok', 'run-later'])
+    // 일시 실패는 다음 틱에 다시 보낸다.
+    expect(f.store.state().pendingReports.map((item) => item.runId)).toEqual(['run-later'])
+    expect(f.logDebug).toHaveBeenCalledWith(expect.stringContaining('run=run-cancelled'))
+  })
+})

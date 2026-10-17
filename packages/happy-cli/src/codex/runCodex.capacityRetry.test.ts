@@ -34,6 +34,8 @@ vi.mock('@/memory/codexRecallHost', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/memory/codexRecallHost')>(),
     prepareCodexRecallHost: vi.fn(async () => null),
 }));
+const reportCapacityFailure = vi.hoisted(() => vi.fn(async () => true));
+vi.mock('@/codex/reportAgentTaskCapacityFailure', () => ({ reportAgentTaskCapacityFailure: reportCapacityFailure }));
 /** Real policy, shorter waits: the scenarios are about what is sent, not how long it waits. */
 vi.mock('@/codex/codexCapacityRetry', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/codex/codexCapacityRetry')>(),
@@ -154,7 +156,7 @@ const closeQueue = () => { queues[0]!.close(); };
 
 describe('automatic continuation after a capacity failure', () => {
     beforeEach(() => {
-        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null; onUserMessage = null;
+        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null; onUserMessage = null; reportCapacityFailure.mockClear();
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-1' };
         // Run from inside a Saycode session, the runner would otherwise pick up that
         // session's own lesson host, reconnect target and sandbox settings, and never exit.
@@ -350,4 +352,99 @@ describe('automatic continuation after a capacity failure', () => {
         expect(continuations()).toHaveLength(0);
     }, 60_000);
 
+    describe('in an automation run-once session', () => {
+        // The daemon's automation marker: the session exits after its turn instead of waiting for input.
+        const runOnce = () => run(async () => {});
+        beforeEach(() => {
+            vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
+            vi.stubEnv('HAPPY_INITIAL_PROMPT', 'review the pull request');
+        });
+
+        it('continues a turn that ended at capacity before exiting', async () => {
+            script = [{ outcome: 'overloaded' }, { outcome: 'ok' }];
+            await runOnce();
+
+            expect(turnsSent).toHaveLength(2);
+            expect(turnsSent[0]).toContain('review the pull request');
+            expect(turnsSent[1]).toContain(CODEX_CAPACITY_CONTINUE_PROMPT);
+            expect(notices()).toHaveLength(1);
+        }, 60_000);
+
+        it('exits once the retry budget is spent, telling the AgentTask server it can retry', async () => {
+            script = [{ outcome: 'overloaded' }, { outcome: 'overloaded' }, { outcome: 'overloaded' }];
+            await runOnce();
+
+            expect(turnsSent).toHaveLength(3);
+            expect(continuations()).toHaveLength(2);
+            expect(reportCapacityFailure).toHaveBeenCalledTimes(1);
+        }, 60_000);
+
+        it('does not report a failure for a run that recovered', async () => {
+            script = [{ outcome: 'overloaded' }, { outcome: 'ok' }];
+            await run(async () => {});
+
+            expect(reportCapacityFailure).not.toHaveBeenCalled();
+        }, 60_000);
+
+        it('exits without continuing when stopped while the continuation waits', async () => {
+            script = [{ outcome: 'overloaded', after: () => { setTimeout(() => { void rpc.get('abort')?.({}); }, 0); } }];
+            await runOnce();
+
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+        }, 60_000);
+
+        it('exits instead of idling when input that starts no turn replaces the continuation', async () => {
+            // `/clear` cancels the continuation like any input, but resets the thread without a turn.
+            script = [{ outcome: 'overloaded', after: () => { setTimeout(() => { void onUserMessage!({ content: { type: 'text', text: '/clear' } }); }, 0); } }];
+            await runOnce();
+
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+            expect(sessionEvents.some(e => e.message === 'Context was reset')).toBe(true);
+        }, 60_000);
+
+        it('exits without continuing when stopped after the continuation was dequeued', async () => {
+            script = [{ outcome: 'overloaded' }];
+            let collected = false;
+            await run(async () => {
+                const queue = queues[0]!;
+                const collect = queue.waitForMessagesAndGetAsString.bind(queue);
+                vi.spyOn(queue, 'waitForMessagesAndGetAsString').mockImplementation(async (...args) => {
+                    const batch = await collect(...args);
+                    if (batch?.message === CODEX_CAPACITY_CONTINUE_PROMPT) {
+                        collected = true;
+                        await rpc.get('abort')?.({});
+                    }
+                    return batch;
+                });
+            });
+
+            expect(collected).toBe(true);
+            expect(continuations()).toHaveLength(0);
+        }, 60_000);
+
+        it('exits when the continuation is skipped because late work reopened the turn', async () => {
+            // Work Codex reports after turn/completed reopens the lifecycle while the continuation waits.
+            script = [{
+                outcome: 'overloaded',
+                after: () => {
+                    setTimeout(() => {
+                        eventHandler?.({ type: 'task_started', turn_id: 'turn-1' });
+                        setTimeout(() => { eventHandler?.({ type: 'task_complete', status: 'completed', turn_id: 'turn-1' }); }, 100);
+                    }, 5);
+                },
+            }];
+            const exited = runOnce().then(() => true);
+            const settled = await Promise.race([exited, sleep(3_000).then(() => false)]);
+            if (!settled) { closeQueue(); await exited; }
+
+            expect(settled).toBe(true);
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+        }, 60_000);
+    });
 });

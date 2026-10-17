@@ -1,4 +1,4 @@
-import { createDeviceOrgPinStore } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
@@ -226,6 +226,12 @@ import {
   prepareGithubTriggerWorktree,
   removeGithubTriggerWorktree,
 } from './automations/githubTriggerWorktree';
+import {
+  createGithubWorktreeTombstoneStore,
+  readWorktreeHead,
+  rememberGithubWorktreeRemoval,
+  sweepRestoredGithubWorktrees,
+} from './automations/githubWorktreeTombstones';
 import {
   createGithubIssueProgressMarker,
   removeGithubIssueProgressMarker,
@@ -1101,8 +1107,8 @@ export async function startDaemon(): Promise<void> {
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
-    worktreeRemovalReservations.setLiveDirectories(() => [...pidToTrackedSession.values()]
-      .map((session) => session.directory ?? session.happySessionMetadataFromLocalWebhook?.path));
+    worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
+      .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
     let writeScopeRuntime: SessionWriteScopeRuntime | null = null;
     /**
      * Generations this daemon launched through the supervisor, by pid.
@@ -2655,6 +2661,16 @@ export async function startDaemon(): Promise<void> {
       };
     };
 
+    // Where the daemon's removed automation worktrees came from, so a Chat replied to after its run-once
+    // session exited can resume in the same directory (2026-10-17).
+    const githubWorktreeTombstones = createGithubWorktreeTombstoneStore({
+      filePath: join(configuration.happyHomeDir, 'automation-worktree-tombstones.json'),
+    });
+    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(removeGithubTriggerWorktree, {
+      readHead: readWorktreeHead,
+      record: (removed) => githubWorktreeTombstones.record(removed),
+    });
+
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
@@ -2695,25 +2711,6 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `Session ${happySessionId} has no stored encryption data. It was likely started before this feature was available. Restart the daemon and start a new session to enable resume.`,
           };
         }
-        if (!options?.checkpointRestart) {
-          const checkpointAuthority = await resolveCheckpointSessionAuthority({
-            sessionId: happySessionId,
-            trackedSession: tracked,
-            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
-            platform: process.platform,
-          });
-          if (
-            checkpointAuthority?.protection.status === 'unavailable'
-            && checkpointAuthority.protection.reason === 'excluded-path'
-          ) {
-            return {
-              type: 'error',
-              code: 'SESSION_RESUME_FAILED',
-              errorMessage: `Session ${happySessionId} requires the dedicated checkpoint restart action.`,
-            };
-          }
-        }
-
         // 2026-07-23 incident: pin preflight and child to ONE identity.
         // A child that syncs under a different account than the session owner
         // gets identical-looking 404s and exits — never spawn that child.
@@ -2811,12 +2808,38 @@ export async function startDaemon(): Promise<void> {
           readBranchHint: async () => claudeSessionId
             ? readClaudeTranscriptBranch(join(getProjectPath(launch.cwd), `${claudeSessionId}.jsonl`))
             : null,
+          findRemovedAutomationWorktree: async (cwd) => githubWorktreeTombstones.find(cwd),
         });
         if (restoredWorktree.kind === 'recreated' || restoredWorktree.kind === 'failed') {
           logger.debug(`[DAEMON RUN] Missing worktree for resumed session ${happySessionId}`, restoredWorktree);
         }
         if (restoredWorktree.kind === 'failed') {
           throw new Error(`session directory ${launch.cwd} was removed and could not be recreated (${restoredWorktree.reason})`);
+        }
+        if (restoredWorktree.kind === 'recreated' && restoredWorktree.source === 'recorded-head') {
+          // Owned again by the daemon: removed once no session works in it, even if this resume is refused below.
+          githubWorktreeTombstones.markRestored({ worktreePath: restoredWorktree.worktreePath, directory: launch.cwd });
+        }
+
+        // After the restore: this resolves the session directory, which a
+        // removed worktree no longer has (2026-10-17, ENOENT before restore ran).
+        if (!options?.checkpointRestart) {
+          const checkpointAuthority = await resolveCheckpointSessionAuthority({
+            sessionId: happySessionId,
+            trackedSession: tracked,
+            checkpointRoot: join(configuration.happyHomeDir, 'checkpoints'),
+            platform: process.platform,
+          });
+          if (
+            checkpointAuthority?.protection.status === 'unavailable'
+            && checkpointAuthority.protection.reason === 'excluded-path'
+          ) {
+            return {
+              type: 'error',
+              code: 'SESSION_RESUME_FAILED',
+              errorMessage: `Session ${happySessionId} requires the dedicated checkpoint restart action.`,
+            };
+          }
         }
 
         if (options?.model) {
@@ -3909,6 +3932,9 @@ export async function startDaemon(): Promise<void> {
     });
 
     // Create realtime machine session
+    // Before the key load runs its ACL check over the device directory (see migrateLegacyOrgPinNames).
+    // Best effort: if it fails, the key load below still fails closed and logs why.
+    if (!managedRuntimeActive) await migrateLegacyOrgPinNames(configuration.happyHomeDir, machine.id).catch((error) => logger.debug('[DAEMON RUN] Legacy org pin rename failed', error));
     const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);
     if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
       store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }) });
@@ -4663,7 +4689,15 @@ export async function startDaemon(): Promise<void> {
           ...input,
           managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
         }),
-        discardGithubWorktree: removeGithubTriggerWorktree,
+        discardGithubWorktree: discardRememberedGithubWorktree,
+        sweepRestoredWorktrees: () => sweepRestoredGithubWorktrees({
+          store: githubWorktreeTombstones,
+          now: Date.now,
+          isDirectoryInUse: isAutomationDirectoryInUse,
+          discard: discardRememberedGithubWorktree,
+        }).catch((error) => {
+          logger.debug(`[DAEMON RUN] Restored automation worktree sweep failed: ${error instanceof Error ? error.message : error}`);
+        }),
         isSessionRunning: isAutomationSessionRunning,
         stopSession: (sessionId) => {
           stopSession(sessionId, {

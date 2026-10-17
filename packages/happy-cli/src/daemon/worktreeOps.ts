@@ -1033,7 +1033,19 @@ async function purgeProject(guard: PathGuard, ticket: WorktreeTicket & { op: 'pu
         const native = await stopNative({ projectId: ticket.projectId, machineId, dryRun: params.dryRun });
         const processes = { verified: native.verified, unverified: native.unverified, pending: native.pending };
         const base = { path, managed, exists: folder !== null, entries, containers: containerIds.length, volumes: volumes.length, processes };
-        if (params.dryRun) return { ...base, outcome: { processes: 'skipped' as const, containers: 'skipped' as const, folder: 'skipped' as const } };
+        if (params.dryRun) {
+            // What the run would decide, where it is known now: processes that cannot be proven keep a
+            // managed folder (the confirm dialog shows only what the machine answered).
+            const inDoubt = PROCESSES_IN_DOUBT.has(native.reason);
+            return {
+                ...base,
+                outcome: {
+                    processes: inDoubt ? native.reason : 'skipped' as const,
+                    containers: 'skipped' as const,
+                    folder: inDoubt && params.purgeFolder && managed && folder ? 'blocked' as const : 'skipped' as const,
+                },
+            };
+        }
 
         let containers: 'none' | 'removed' | 'failed' = 'none';
         if (listed.code !== 0 && listed.code !== -2) containers = 'failed';

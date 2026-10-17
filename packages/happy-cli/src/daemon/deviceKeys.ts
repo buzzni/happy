@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 
 export type DeviceKeys = { signing: nacl.SignKeyPair; recipient: nacl.BoxKeyPair };
-const reapproval = () => new Error('Device key unavailable; reapproval required');
+const reapproval = (cause?: unknown) => new Error('Device key unavailable; reapproval required', cause === undefined ? undefined : { cause });
 const binary = z.string().regex(/^[A-Za-z0-9_-]{43}$/).refine(value => Buffer.from(value, 'base64url').toString('base64url') === value);
 const recordSchema = z.object({ version: z.literal(1), machineId: z.string(), signingSeed: binary, signingPublic: binary, recipientSecret: binary, recipientPublic: binary }).strict();
 
@@ -85,7 +85,7 @@ export async function loadOrCreateDeviceKeys(home: string, machineId: string): P
             await lstat(join(directory, 'keys.json'));
             return await readKeys(directory, machineId);
         } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || Date.now() >= deadline) throw reapproval();
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || Date.now() >= deadline) throw reapproval(error);
             await delay(20);
         }
     }

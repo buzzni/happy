@@ -64,6 +64,25 @@ export interface PendingAutomationReport {
   createdAt?: number
 }
 
+/**
+ * 모델 호출 전 연결 실패로 보고를 보류하고 재시도를 기다리는 run (automationUnreachableRetry).
+ * report 는 재시도를 포기할 때 그대로 보낼 실패 보고다.
+ */
+export interface UnreachableRetryState {
+  /** 이 run 을 붙잡은 데몬 프로세스. 다르면 재시작으로 보고 재시도를 버린다. */
+  ownerId: string
+  automationId: string
+  generation: number
+  /** 이미 예약한 재시도 횟수(1부터). */
+  attempt: number
+  retryAt: number
+  /** 서버가 마지막으로 알려 준 run lease 만료 시각. 재시도는 이 안에서 끝나야 한다. */
+  leaseExpiresAt: number
+  /** 재시도를 포기했고 report 를 서버가 받기를 기다린다. 그동안 같은 자동화의 새 claim 을 미룬다. */
+  releasing?: boolean
+  report: PendingAutomationReport
+}
+
 export interface ServerAutomationRuntimeState {
   schedules: ServerAutomationScheduleState[]
   githubTriggers?: Array<{
@@ -84,6 +103,7 @@ export interface ServerAutomationRuntimeState {
   }>
   githubIssueProgressMarkers?: GithubIssueProgressMarkerState[]
   githubWorktrees?: GithubAutomationWorktreeState[]
+  unreachableRetries?: UnreachableRetryState[]
   pendingReports: PendingAutomationReport[]
 }
 
@@ -188,6 +208,40 @@ function parseGithubState(value: unknown): GithubTriggerRuntimeState {
   }
 }
 
+const REPORT_OUTCOMES = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
+
+function parsePendingReport(value: unknown): PendingAutomationReport {
+  const row = record(value)
+  if ((row.status !== 'COMPLETED' && row.status !== 'FAILED')
+    || !REPORT_OUTCOMES.has(row.outcome as ServerAutomationReportOutcome)) invalid()
+  return {
+    runId: text(row.runId, 200),
+    claimToken: text(row.claimToken),
+    reportId: text(row.reportId, 200),
+    status: row.status as 'COMPLETED' | 'FAILED',
+    outcome: row.outcome as ServerAutomationReportOutcome,
+    sessionId: nullableText(row.sessionId),
+    detailCiphertext: nullableText(row.detailCiphertext),
+    ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
+    ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
+    ...(row.notificationOnly !== undefined ? {
+      notificationOnly: row.notificationOnly === true,
+    } : {}),
+    ...(row.queueDepth !== undefined ? {
+      queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
+    } : {}),
+    ...(row.queuePosition !== undefined ? {
+      queuePosition: row.queuePosition === null ? null : integer(row.queuePosition),
+    } : {}),
+    ...(row.queueTotal !== undefined ? {
+      queueTotal: row.queueTotal === null ? null : integer(row.queueTotal),
+    } : {}),
+    ...(row.queueEstimatedAt !== undefined ? {
+      queueEstimatedAt: row.queueEstimatedAt === null ? null : integer(row.queueEstimatedAt),
+    } : {}),
+  }
+}
+
 function parse(raw: string): ServerAutomationRuntimeState {
   try {
     const disk = record(JSON.parse(raw))
@@ -206,38 +260,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
         } : {}),
       }
     })
-    const outcomes = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
-    const pendingReports = disk.pendingReports.map((value) => {
-      const row = record(value)
-      if ((row.status !== 'COMPLETED' && row.status !== 'FAILED')
-        || !outcomes.has(row.outcome as ServerAutomationReportOutcome)) invalid()
-      return {
-        runId: text(row.runId, 200),
-        claimToken: text(row.claimToken),
-        reportId: text(row.reportId, 200),
-        status: row.status as 'COMPLETED' | 'FAILED',
-        outcome: row.outcome as ServerAutomationReportOutcome,
-        sessionId: nullableText(row.sessionId),
-        detailCiphertext: nullableText(row.detailCiphertext),
-        ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
-        ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
-        ...(row.notificationOnly !== undefined ? {
-          notificationOnly: row.notificationOnly === true,
-        } : {}),
-        ...(row.queueDepth !== undefined ? {
-          queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
-        } : {}),
-        ...(row.queuePosition !== undefined ? {
-          queuePosition: row.queuePosition === null ? null : integer(row.queuePosition),
-        } : {}),
-        ...(row.queueTotal !== undefined ? {
-          queueTotal: row.queueTotal === null ? null : integer(row.queueTotal),
-        } : {}),
-        ...(row.queueEstimatedAt !== undefined ? {
-          queueEstimatedAt: row.queueEstimatedAt === null ? null : integer(row.queueEstimatedAt),
-        } : {}),
-      }
-    })
+    const pendingReports = disk.pendingReports.map(parsePendingReport)
     const githubRows = disk.githubTriggers === undefined ? [] : disk.githubTriggers
     if (!Array.isArray(githubRows)) invalid()
     const githubTriggers = githubRows.map((value) => {
@@ -311,9 +334,24 @@ function parse(raw: string): ServerAutomationRuntimeState {
         }),
       }
     })
+    const retryRows = disk.unreachableRetries === undefined ? [] : disk.unreachableRetries
+    if (!Array.isArray(retryRows)) invalid()
+    const unreachableRetries = retryRows.map((value) => {
+      const row = record(value)
+      return {
+        ownerId: text(row.ownerId, 200),
+        automationId: text(row.automationId, 200),
+        generation: integer(row.generation, 1),
+        attempt: integer(row.attempt, 1),
+        retryAt: integer(row.retryAt),
+        leaseExpiresAt: integer(row.leaseExpiresAt),
+        ...(row.releasing === true ? { releasing: true } : {}),
+        report: parsePendingReport(row.report),
+      }
+    })
     return {
       schedules, githubTriggers, githubActiveSessions, githubQueueProgress,
-      githubIssueProgressMarkers, githubWorktrees, pendingReports,
+      githubIssueProgressMarkers, githubWorktrees, unreachableRetries, pendingReports,
     }
   } catch (error) {
     if (error instanceof Error && error.message === 'automation-runtime-invalid') throw error
@@ -332,7 +370,7 @@ export function createServerAutomationRuntimeStore(options: { filePath: string }
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
           return {
             schedules: [], githubTriggers: [], githubActiveSessions: [], githubQueueProgress: [],
-            githubIssueProgressMarkers: [], githubWorktrees: [], pendingReports: [],
+            githubIssueProgressMarkers: [], githubWorktrees: [], unreachableRetries: [], pendingReports: [],
           }
         }
         throw error

@@ -26,9 +26,16 @@ export type MissingWorktreeRestoreResult =
         kind: 'recreated';
         worktreePath: string;
         branch: string | null;
-        source: 'existing-branch' | 'remote-branch' | 'new-branch' | 'detached';
+        source: 'existing-branch' | 'remote-branch' | 'new-branch' | 'detached' | 'recorded-head';
     }
     | { kind: 'failed'; reason: string };
+
+/** What the daemon recorded when it removed an automation worktree (see githubWorktreeTombstones). */
+export interface RemovedAutomationWorktree {
+    repositoryRoot: string;
+    worktreePath: string;
+    headSha: string;
+}
 
 type Recreated = Extract<MissingWorktreeRestoreResult, { kind: 'recreated' }>;
 
@@ -80,12 +87,17 @@ export async function restoreMissingManagedWorktree(input: {
     cwd: string;
     /** The branch the agent last worked on, from its own transcript. Only read when the directory is missing. */
     readBranchHint: () => Promise<string | null>;
+    /** The daemon's record of an automation worktree it removed that contains `cwd`, if any. */
+    findRemovedAutomationWorktree?: (cwd: string) => Promise<RemovedAutomationWorktree | null>;
 }): Promise<MissingWorktreeRestoreResult> {
     const cwd = resolve(input.cwd);
     if (await exists(cwd)) return { kind: 'present' };
 
     const marker = cwd.indexOf(MANAGED_SEGMENT);
-    if (marker <= 0) return { kind: 'not-managed' };
+    if (marker <= 0) {
+        const removed = await input.findRemovedAutomationWorktree?.(cwd).catch(() => null);
+        return removed ? restoreRemovedAutomationWorktree(cwd, removed) : { kind: 'not-managed' };
+    }
     const root = cwd.slice(0, marker);
     const managedRoot = join(root, '.aplus', 'worktrees');
     if (!await exists(root)) return { kind: 'failed', reason: 'repository root is missing' };
@@ -125,6 +137,44 @@ export async function restoreMissingManagedWorktree(input: {
         return { kind: 'failed', reason: 'session directory is not part of the recreated worktree' };
     }
     return plan.result;
+}
+
+/*
+ * A GitHub-triggered run works in a detached worktree outside the repository
+ * and the daemon removes it once the run-once session exits — yet the Chat
+ * stays open and the user can reply to it (2026-10-17: "Failed to resume
+ * session: ENOENT ... realpath"). The agent usually pushes with
+ * `HEAD:<branch>` and never checks a branch out, so its transcript only says
+ * `HEAD`; the commit recorded at removal is what puts the same tree back.
+ */
+async function restoreRemovedAutomationWorktree(
+    cwd: string,
+    removed: RemovedAutomationWorktree,
+): Promise<MissingWorktreeRestoreResult> {
+    const worktreePath = resolve(removed.worktreePath);
+    const inside = relative(worktreePath, cwd);
+    if (inside.startsWith('..') || resolve(worktreePath, inside) !== cwd) {
+        return { kind: 'failed', reason: 'recorded worktree does not contain the session directory' };
+    }
+    if (await exists(worktreePath)) {
+        return { kind: 'failed', reason: 'session directory is inside an existing worktree' };
+    }
+    const root = removed.repositoryRoot;
+    if (!await exists(root)) return { kind: 'failed', reason: 'repository root is missing' };
+    const toplevel = await git(root, ['rev-parse', '--show-toplevel']);
+    if (!toplevel.ok) return { kind: 'failed', reason: `repository lookup failed: ${toplevel.error}` };
+    if (!/^[0-9a-f]{40,64}$/.test(removed.headSha) || !await refExists(root, `${removed.headSha}^{commit}`)) {
+        return { kind: 'failed', reason: 'the commit the worktree had when removed is no longer in the repository' };
+    }
+
+    await git(root, ['worktree', 'prune']);
+    const added = await git(root, ['worktree', 'add', '--detach', '--', worktreePath, removed.headSha]);
+    if (!added.ok) return { kind: 'failed', reason: `worktree add failed: ${added.error}` };
+    if (!await exists(cwd)) {
+        await git(root, ['worktree', 'remove', '--force', '--', worktreePath]);
+        return { kind: 'failed', reason: 'session directory is not part of the recreated worktree' };
+    }
+    return { kind: 'recreated', worktreePath, branch: null, source: 'recorded-head' };
 }
 
 async function chooseCheckout(

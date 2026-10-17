@@ -76,16 +76,37 @@ describe('conversations inside a worktree', () => {
     it('sees running sessions and launches in progress inside the worktree only', async () => {
         const { root, path } = worktree();
         const reservations = new WorktreeRemovalReservations();
-        let live: string[] = [];
-        reservations.setLiveDirectories(() => live);
+        let live: Array<{ pid: number; directory?: string }> = [];
+        reservations.setLiveSessions(() => live);
         expect(await reservations.inUse(path)).toBe(false);
-        live = [join(path, 'app')];
+        live = [{ pid: 1, directory: join(path, 'app') }];
         expect(await reservations.inUse(path)).toBe(true);
-        live = [root];
+        live = [{ pid: 1, directory: root }];
         expect(await reservations.inUse(path)).toBe(false);
         const done = await reservations.beginLaunch(join(path, 'app'));
         expect(await reservations.inUse(path)).toBe(true);
         done();
         expect(await reservations.inUse(path)).toBe(false);
+    });
+
+    // A session started from a terminal has no recorded folder until its webhook arrives: the process's
+    // own working folder decides. One that cannot be read does not count.
+    it('reads the working folder of a session whose folder is not recorded', async () => {
+        const { root, path } = worktree();
+        const cwds = new Map<number, string | null>([[7, join(path, 'app')], [8, root], [9, null]]);
+        const reservations = new WorktreeRemovalReservations({ processCwd: async (pid) => cwds.get(pid) ?? null });
+        reservations.setLiveSessions(() => [{ pid: 8 }, { pid: 9 }]);
+        expect(await reservations.inUse(path)).toBe(false);
+        reservations.setLiveSessions(() => [{ pid: 8 }, { pid: 7 }]);
+        expect(await reservations.inUse(path)).toBe(true);
+    });
+});
+
+describe('the default working folder lookup', () => {
+    // The test process itself works in a real folder; Linux reads /proc, macOS asks lsof.
+    it.skipIf(process.platform !== 'linux' && process.platform !== 'darwin')('reads a live process', async () => {
+        const reservations = new WorktreeRemovalReservations();
+        reservations.setLiveSessions(() => [{ pid: process.pid }]);
+        expect(await reservations.inUse(process.cwd())).toBe(true);
     });
 });
