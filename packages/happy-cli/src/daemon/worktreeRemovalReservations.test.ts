@@ -33,6 +33,8 @@ describe('WorktreeRemovalReservations', () => {
         const reservations = new WorktreeRemovalReservations({ ttlMs: 60_000 });
         await reservations.reserve(path, 1_000);
         expect(await reservations.covers(join(link, 'app'), 2_000)).toBe(true);
+        // A folder the session would create first, through the same link.
+        expect(await reservations.covers(join(link, 'not-yet', 'deeper'), 2_000)).toBe(true);
     });
 
     it('ends at the removal, or when it expires', async () => {
@@ -51,7 +53,39 @@ describe('spawnRefusalForRemoval', () => {
         const { root, path } = worktree();
         const reservations = new WorktreeRemovalReservations({ ttlMs: 60_000 });
         await reservations.reserve(path);
-        expect(await spawnRefusalForRemoval(join(path, 'app'), reservations)).toBe('이 작업 트리를 정리하는 중이라 대화를 시작할 수 없습니다.');
+        expect(await spawnRefusalForRemoval(join(path, 'app'), reservations)).toMatch(/정리하는 중/);
         expect(await spawnRefusalForRemoval(root, reservations)).toBeNull();
+    });
+});
+
+describe('reservation window', () => {
+    // A removal the browser gave up on (the preview did not stop, the tab closed) cannot tell the
+    // daemon; the window is only as long as the preview stop needs, as the server's dry run hold.
+    it('lasts five minutes by default', async () => {
+        const { path } = worktree();
+        const reservations = new WorktreeRemovalReservations();
+        await reservations.reserve(path, 0);
+        expect(await reservations.covers(path, 5 * 60_000)).toBe(true);
+        expect(await reservations.covers(path, 5 * 60_000 + 1)).toBe(false);
+    });
+});
+
+// Review (F2 #3): a conversation already running inside the worktree, or one being started there, keeps
+// a non-forced removal from going ahead; the spawn check alone runs too early to see the reservation.
+describe('conversations inside a worktree', () => {
+    it('sees running sessions and launches in progress inside the worktree only', async () => {
+        const { root, path } = worktree();
+        const reservations = new WorktreeRemovalReservations();
+        let live: string[] = [];
+        reservations.setLiveDirectories(() => live);
+        expect(await reservations.inUse(path)).toBe(false);
+        live = [join(path, 'app')];
+        expect(await reservations.inUse(path)).toBe(true);
+        live = [root];
+        expect(await reservations.inUse(path)).toBe(false);
+        const done = await reservations.beginLaunch(join(path, 'app'));
+        expect(await reservations.inUse(path)).toBe(true);
+        done();
+        expect(await reservations.inUse(path)).toBe(false);
     });
 });
