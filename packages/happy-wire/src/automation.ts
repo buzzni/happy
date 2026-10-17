@@ -64,8 +64,33 @@ export const automationScheduleSchema = z.discriminatedUnion('kind', [
     hour: z.number().int().min(0).max(23),
     minute: z.number().int().min(0).max(59),
   }),
+  // once/weekly are wall-clock times on the executing machine, like daily. Older
+  // daemons fail to parse these kinds and skip the automation rather than run it.
+  z.object({
+    kind: z.literal('once'),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isCalendarDate, 'not a calendar date'),
+    hour: z.number().int().min(0).max(23),
+    minute: z.number().int().min(0).max(59),
+  }),
+  z.object({
+    kind: z.literal('weekly'),
+    // 0 = Sunday, as Date#getDay.
+    days: z.array(z.number().int().min(0).max(6)).min(1).max(7)
+      .refine((days) => new Set(days).size === days.length, 'duplicate day'),
+    hour: z.number().int().min(0).max(23),
+    minute: z.number().int().min(0).max(59),
+  }),
 ]);
 export type AutomationSchedule = z.infer<typeof automationScheduleSchema>;
+
+/** Prompt schedule kinds a daemon advertises as `automationSupport.scheduleKinds` (github is a trigger, not listed). */
+export const AUTOMATION_SCHEDULE_KINDS = ['interval', 'daily', 'once', 'weekly'] as const;
+
+function isCalendarDate(value: string): boolean {
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year!, month! - 1, day!));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month! - 1 && date.getUTCDate() === day;
+}
 
 export const githubTriggerEventSchema = z.enum(['opened', 'ready_for_review', 'merged', 'closed', 'issue_opened']);
 export type GithubTriggerEvent = z.infer<typeof githubTriggerEventSchema>;

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   appendRunRecord,
   buildAutomationPrompt,
@@ -167,6 +167,79 @@ describe('schedule computation', () => {
     // 정확히 그 시각이면 다음 발화는 내일 — 같은 시각 재발화 금지.
     expect(computeNextRunAt(schedule, atNine)).toBe(new Date(2026, 0, 16, 9, 0).getTime())
     expect(computeNextRunAt(schedule, afterNine)).toBe(new Date(2026, 0, 16, 9, 0).getTime())
+  })
+})
+
+describe('once and weekly wall-clock schedules', () => {
+  it('runs a one-time schedule at its local date and time, then never again', () => {
+    const schedule = { kind: 'once', date: '2026-01-15', hour: 9, minute: 0 } as const
+    const atNine = new Date(2026, 0, 15, 9, 0).getTime()
+    expect(computeNextRunAt(schedule, new Date(2026, 0, 14, 23, 59).getTime())).toBe(atNine)
+    // 그 시각(=from)이면 이미 소진 — 매일 예약의 같은 시각 재발화 금지와 같은 규칙.
+    expect(computeNextRunAt(schedule, atNine)).toBeNull()
+    expect(computeNextRunAt(schedule, atNine + 1)).toBeNull()
+  })
+
+  it('places a one-time schedule on a leap day and across a month end', () => {
+    expect(computeNextRunAt({ kind: 'once', date: '2028-02-29', hour: 0, minute: 0 }, new Date(2028, 1, 28, 23, 0).getTime()))
+      .toBe(new Date(2028, 1, 29, 0, 0).getTime())
+    expect(computeNextRunAt({ kind: 'once', date: '2026-02-01', hour: 0, minute: 5 }, new Date(2026, 0, 31, 23, 59).getTime()))
+      .toBe(new Date(2026, 1, 1, 0, 5).getTime())
+  })
+
+  it('picks the next selected weekday, later today when still ahead', () => {
+    // 2026-01-15 is a Thursday (4).
+    const thursdayMorning = new Date(2026, 0, 15, 8, 0).getTime()
+    expect(computeNextRunAt({ kind: 'weekly', days: [4], hour: 9, minute: 0 }, thursdayMorning))
+      .toBe(new Date(2026, 0, 15, 9, 0).getTime())
+    expect(computeNextRunAt({ kind: 'weekly', days: [4], hour: 9, minute: 0 }, new Date(2026, 0, 15, 9, 0).getTime()))
+      .toBe(new Date(2026, 0, 22, 9, 0).getTime())
+    expect(computeNextRunAt({ kind: 'weekly', days: [1, 5], hour: 9, minute: 0 }, thursdayMorning + 2 * 3_600_000))
+      .toBe(new Date(2026, 0, 16, 9, 0).getTime())
+  })
+
+  it('crosses midnight and a month end to reach the selected weekday', () => {
+    // Saturday 2026-01-31 23:59 → Sunday 2026-02-01 00:00.
+    expect(computeNextRunAt({ kind: 'weekly', days: [0], hour: 0, minute: 0 }, new Date(2026, 0, 31, 23, 59).getTime()))
+      .toBe(new Date(2026, 1, 1, 0, 0).getTime())
+    // Friday 2026-01-30 → Monday 2026-02-02.
+    expect(computeNextRunAt({ kind: 'weekly', days: [1], hour: 9, minute: 0 }, new Date(2026, 0, 30, 10, 0).getTime()))
+      .toBe(new Date(2026, 1, 2, 9, 0).getTime())
+  })
+
+  it('leaves interval and daily results unchanged', () => {
+    const from = new Date(2026, 0, 15, 8, 30).getTime()
+    expect(computeNextRunAt({ kind: 'interval', minutes: 15 }, from)).toBe(from + 15 * 60_000)
+    expect(computeNextRunAt({ kind: 'daily', hour: 8, minute: 30 }, from)).toBe(new Date(2026, 0, 16, 8, 30).getTime())
+  })
+})
+
+describe('once and weekly schedules across a DST change (America/New_York)', () => {
+  const previousTz = process.env.TZ
+  beforeAll(() => { process.env.TZ = 'America/New_York' })
+  afterAll(() => {
+    if (previousTz === undefined) delete process.env.TZ
+    else process.env.TZ = previousTz
+  })
+
+  it('moves a time inside the spring-forward gap forward, as daily does', () => {
+    // 2026-03-08 02:00 EST jumps to 03:00 EDT; 02:30 does not exist.
+    const from = Date.UTC(2026, 2, 7, 12, 0)
+    const daily = computeNextRunAt({ kind: 'daily', hour: 2, minute: 30 }, from)
+    expect(computeNextRunAt({ kind: 'once', date: '2026-03-08', hour: 2, minute: 30 }, from)).toBe(Date.UTC(2026, 2, 8, 7, 30))
+    expect(computeNextRunAt({ kind: 'weekly', days: [0], hour: 2, minute: 30 }, from)).toBe(daily)
+    // The week after, the same wall-clock time is 02:30 EDT again.
+    expect(computeNextRunAt({ kind: 'weekly', days: [0], hour: 2, minute: 30 }, Date.UTC(2026, 2, 8, 8, 0))).toBe(Date.UTC(2026, 2, 15, 6, 30))
+  })
+
+  it('takes the first of the repeated fall-back hour, once', () => {
+    // 2026-11-01 02:00 EDT falls back to 01:00 EST; 01:30 happens twice.
+    const firstHalfPast = Date.UTC(2026, 10, 1, 5, 30)
+    const schedule = { kind: 'weekly', days: [0], hour: 1, minute: 30 } as const
+    expect(computeNextRunAt({ kind: 'once', date: '2026-11-01', hour: 1, minute: 30 }, Date.UTC(2026, 9, 31, 12, 0))).toBe(firstHalfPast)
+    expect(computeNextRunAt(schedule, Date.UTC(2026, 9, 31, 12, 0))).toBe(firstHalfPast)
+    // After the first 01:30 the repeat is not a second run; the next one is a week later.
+    expect(computeNextRunAt(schedule, firstHalfPast)).toBe(Date.UTC(2026, 10, 8, 6, 30))
   })
 })
 
