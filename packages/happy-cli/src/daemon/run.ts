@@ -229,6 +229,7 @@ import {
   createGithubWorktreeTombstoneStore,
   readWorktreeHead,
   rememberGithubWorktreeRemoval,
+  sweepRestoredGithubWorktrees,
 } from './automations/githubWorktreeTombstones';
 import {
   createGithubIssueProgressMarker,
@@ -2664,6 +2665,10 @@ export async function startDaemon(): Promise<void> {
     const githubWorktreeTombstones = createGithubWorktreeTombstoneStore({
       filePath: join(configuration.happyHomeDir, 'automation-worktree-tombstones.json'),
     });
+    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(removeGithubTriggerWorktree, {
+      readHead: readWorktreeHead,
+      record: (removed) => githubWorktreeTombstones.record(removed),
+    });
 
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
@@ -2809,6 +2814,10 @@ export async function startDaemon(): Promise<void> {
         }
         if (restoredWorktree.kind === 'failed') {
           throw new Error(`session directory ${launch.cwd} was removed and could not be recreated (${restoredWorktree.reason})`);
+        }
+        if (restoredWorktree.kind === 'recreated' && restoredWorktree.source === 'recorded-head') {
+          // Owned again by the daemon: removed once no session works in it, even if this resume is refused below.
+          githubWorktreeTombstones.markRestored({ worktreePath: restoredWorktree.worktreePath, directory: launch.cwd });
         }
 
         // After the restore: this resolves the session directory, which a
@@ -4669,9 +4678,14 @@ export async function startDaemon(): Promise<void> {
           ...input,
           managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
         }),
-        discardGithubWorktree: rememberGithubWorktreeRemoval(removeGithubTriggerWorktree, {
-          readHead: readWorktreeHead,
-          record: (removed) => githubWorktreeTombstones.record(removed),
+        discardGithubWorktree: discardRememberedGithubWorktree,
+        sweepRestoredWorktrees: () => sweepRestoredGithubWorktrees({
+          store: githubWorktreeTombstones,
+          now: Date.now,
+          isDirectoryInUse: isAutomationDirectoryInUse,
+          discard: discardRememberedGithubWorktree,
+        }).catch((error) => {
+          logger.debug(`[DAEMON RUN] Restored automation worktree sweep failed: ${error instanceof Error ? error.message : error}`);
         }),
         isSessionRunning: isAutomationSessionRunning,
         stopSession: (sessionId) => {

@@ -15,17 +15,26 @@ import type { RemovedAutomationWorktree } from '../missingWorktreeRestore'
  */
 
 const RETENTION_MS = 30 * 24 * 60 * 60_000
+// A resumed child is tracked by its directory only once it has spawned; until
+// then (and after a resume refused right after the restore) nothing says the
+// restored worktree is in use.
+const RESTORED_GRACE_MS = 10 * 60_000
 const MAX_ENTRIES = 500
 const execFileAsync = promisify(execFile)
 
 interface Tombstone extends RemovedAutomationWorktree {
   removedAt: number
+  /** Set while the worktree is back on disk for a resumed Chat; it is then this daemon's to remove again. */
+  restored?: { at: number; directory: string }
 }
 
 export interface GithubWorktreeTombstoneStore {
   record(removed: RemovedAutomationWorktree): void
   /** The removed worktree that is, or contains, `directory`. */
   find(directory: string): RemovedAutomationWorktree | null
+  /** The worktree at `worktreePath` was put back for a session working in `directory`. */
+  markRestored(restored: { worktreePath: string; directory: string }): void
+  restored(): Array<RemovedAutomationWorktree & { restoredAt: number; directory: string }>
 }
 
 function isTombstone(value: unknown): value is Tombstone {
@@ -35,6 +44,8 @@ function isTombstone(value: unknown): value is Tombstone {
     && typeof row.worktreePath === 'string'
     && typeof row.headSha === 'string'
     && typeof row.removedAt === 'number'
+    && (row.restored === undefined
+      || (typeof row.restored?.at === 'number' && typeof row.restored?.directory === 'string'))
 }
 
 export function createGithubWorktreeTombstoneStore(options: {
@@ -55,31 +66,70 @@ export function createGithubWorktreeTombstoneStore(options: {
     }
   }
 
-  const live = (entries: Tombstone[]) => entries.filter((entry) => now() - entry.removedAt < RETENTION_MS)
+  const live = (entries: Tombstone[]) => entries.filter((entry) => (
+    now() - (entry.restored?.at ?? entry.removedAt) < RETENTION_MS
+  ))
+
+  const write = (entries: Tombstone[]) => {
+    mkdirSync(dirname(options.filePath), { recursive: true })
+    const tmp = `${options.filePath}.${process.pid}.${now()}.tmp`
+    writeFileSync(tmp, JSON.stringify({ version: 1, entries: entries.slice(-maxEntries) }), { encoding: 'utf8', mode: 0o600 })
+    renameSync(tmp, options.filePath)
+    chmodSync(options.filePath, 0o600)
+  }
+
+  const removedWorktree = (entry: Tombstone): RemovedAutomationWorktree => (
+    { repositoryRoot: entry.repositoryRoot, worktreePath: entry.worktreePath, headSha: entry.headSha }
+  )
 
   return {
     record(removed) {
       const worktreePath = resolve(removed.worktreePath)
-      const entries = [
+      write([
         ...live(read()).filter((entry) => resolve(entry.worktreePath) !== worktreePath),
         { repositoryRoot: removed.repositoryRoot, worktreePath, headSha: removed.headSha, removedAt: now() },
-      ].slice(-maxEntries)
-      mkdirSync(dirname(options.filePath), { recursive: true })
-      const tmp = `${options.filePath}.${process.pid}.${now()}.tmp`
-      writeFileSync(tmp, JSON.stringify({ version: 1, entries }), { encoding: 'utf8', mode: 0o600 })
-      renameSync(tmp, options.filePath)
-      chmodSync(options.filePath, 0o600)
+      ])
     },
     find(directory) {
       const target = resolve(directory)
       const match = live(read()).reverse().find((entry) => {
+        if (entry.restored) return false
         const inside = relative(resolve(entry.worktreePath), target)
         return inside === '' || (!inside.startsWith('..') && !isAbsolute(inside))
       })
-      return match
-        ? { repositoryRoot: match.repositoryRoot, worktreePath: match.worktreePath, headSha: match.headSha }
-        : null
+      return match ? removedWorktree(match) : null
     },
+    markRestored(restored) {
+      const worktreePath = resolve(restored.worktreePath)
+      write(live(read()).map((entry) => (resolve(entry.worktreePath) === worktreePath
+        ? { ...entry, restored: { at: now(), directory: restored.directory } }
+        : entry)))
+    },
+    restored() {
+      return live(read()).flatMap((entry) => (entry.restored
+        ? [{ ...removedWorktree(entry), restoredAt: entry.restored.at, directory: entry.restored.directory }]
+        : []))
+    },
+  }
+}
+
+/**
+ * Removes worktrees put back for resumed Chats once no session works in them.
+ * The removal goes through the remembering wrapper, so the next reply to the
+ * Chat restores it again — the same lifecycle as the original run.
+ */
+export async function sweepRestoredGithubWorktrees(deps: {
+  store: GithubWorktreeTombstoneStore
+  now: () => number
+  isDirectoryInUse: (directory: string) => boolean
+  discard: (input: { repositoryRoot: string; worktreePath: string }) => Promise<Removal>
+}): Promise<void> {
+  for (const worktree of deps.store.restored()) {
+    if (deps.now() - worktree.restoredAt < RESTORED_GRACE_MS) continue
+    if (deps.isDirectoryInUse(worktree.directory)) continue
+    const removed = await deps.discard({ repositoryRoot: worktree.repositoryRoot, worktreePath: worktree.worktreePath })
+    // Kept (dirty or failed): try again after another grace period rather than every tick.
+    if (!removed.ok) deps.store.markRestored({ worktreePath: worktree.worktreePath, directory: worktree.directory })
   }
 }
 

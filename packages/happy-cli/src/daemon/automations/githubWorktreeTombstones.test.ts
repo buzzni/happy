@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createGithubWorktreeTombstoneStore,
   rememberGithubWorktreeRemoval,
+  sweepRestoredGithubWorktrees,
 } from './githubWorktreeTombstones'
 
 const garbage: string[] = []
@@ -76,6 +77,76 @@ describe('createGithubWorktreeTombstoneStore', () => {
     expect(store.find('/wt/a')).toBeNull()
     store.record({ repositoryRoot: '/repo', worktreePath: '/wt/a', headSha: SHA })
     expect(store.find('/wt/a')).not.toBeNull()
+  })
+})
+
+describe('restored automation worktrees', () => {
+  // review #856 — a worktree put back for a resumed Chat had no owner, so it
+  // stayed on disk forever (a whole checkout per resumed Chat), including when
+  // the resume was refused right after the restore.
+  async function restoredStore(now: () => number) {
+    const store = createGithubWorktreeTombstoneStore({ filePath: await storeFile(), now })
+    store.record({ repositoryRoot: '/repo', worktreePath: '/wt/a', headSha: SHA })
+    store.markRestored({ worktreePath: '/wt/a', directory: '/wt/a/packages/web' })
+    return store
+  }
+
+  it('no longer offers a restored worktree for another restore', async () => {
+    const store = await restoredStore(() => 1_000)
+
+    expect(store.find('/wt/a')).toBeNull()
+  })
+
+  it('removes a restored worktree once no session uses it, recording it again for the next resume', async () => {
+    let now = 0
+    const store = await restoredStore(() => now)
+    const discard = vi.fn(async () => {
+      store.record({ repositoryRoot: '/repo', worktreePath: '/wt/a', headSha: 'b'.repeat(40) })
+      return { ok: true as const }
+    })
+    now = 11 * 60_000
+
+    await sweepRestoredGithubWorktrees({ store, now: () => now, isDirectoryInUse: () => false, discard })
+
+    expect(discard).toHaveBeenCalledWith({ repositoryRoot: '/repo', worktreePath: '/wt/a' })
+    expect(store.find('/wt/a')?.headSha).toBe('b'.repeat(40))
+  })
+
+  it('leaves a restored worktree alone while a session works in it', async () => {
+    let now = 0
+    const store = await restoredStore(() => now)
+    const discard = vi.fn(async () => ({ ok: true as const }))
+    const isDirectoryInUse = vi.fn(() => true)
+    now = 11 * 60_000
+
+    await sweepRestoredGithubWorktrees({ store, now: () => now, isDirectoryInUse, discard })
+
+    expect(isDirectoryInUse).toHaveBeenCalledWith('/wt/a/packages/web')
+    expect(discard).not.toHaveBeenCalled()
+  })
+
+  it('gives the resumed session time to start before treating the worktree as unused', async () => {
+    let now = 0
+    const store = await restoredStore(() => now)
+    const discard = vi.fn(async () => ({ ok: true as const }))
+    now = 9 * 60_000
+
+    await sweepRestoredGithubWorktrees({ store, now: () => now, isDirectoryInUse: () => false, discard })
+
+    expect(discard).not.toHaveBeenCalled()
+  })
+
+  it('waits another grace period after a removal that kept the worktree', async () => {
+    let now = 0
+    const store = await restoredStore(() => now)
+    const discard = vi.fn(async () => ({ ok: false as const, dirty: true, error: 'dirty' }))
+    now = 11 * 60_000
+    await sweepRestoredGithubWorktrees({ store, now: () => now, isDirectoryInUse: () => false, discard })
+    now += 60_000
+    await sweepRestoredGithubWorktrees({ store, now: () => now, isDirectoryInUse: () => false, discard })
+
+    expect(discard).toHaveBeenCalledTimes(1)
+    expect(store.find('/wt/a')).toBeNull()
   })
 })
 

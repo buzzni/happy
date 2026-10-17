@@ -36,6 +36,18 @@ describe('resume of a session whose worktree was removed', () => {
 
   it('records every automation worktree removal so it can be put back', async () => {
     const source = await runSource()
-    expect(source).toContain('discardGithubWorktree: rememberGithubWorktreeRemoval(removeGithubTriggerWorktree,')
+    expect(source).toContain('const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(removeGithubTriggerWorktree,')
+    expect(source).toContain('discardGithubWorktree: discardRememberedGithubWorktree,')
+  })
+
+  // review #856 — a restored worktree had no owner and stayed on disk forever.
+  it('hands a worktree it put back to the sweep that removes it again', async () => {
+    const source = await runSource()
+    const resume = resumeBody(source)
+    const afterRestore = resume.slice(resume.indexOf('await restoreMissingManagedWorktree('))
+    const markRestored = afterRestore.indexOf('githubWorktreeTombstones.markRestored(')
+    expect(markRestored).toBeGreaterThan(0)
+    expect(markRestored).toBeLessThan(afterRestore.indexOf('resolveCheckpointSessionAuthority('))
+    expect(source).toContain('sweepRestoredWorktrees: () => sweepRestoredGithubWorktrees({')
   })
 })
