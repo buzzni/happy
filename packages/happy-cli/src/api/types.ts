@@ -167,6 +167,11 @@ export const MachineMetadataSchema = z.object({
     protocolVersion: z.number().int().min(1).optional(),
     /** false: 스크립트 조건·GitHub 트리거처럼 Job 밖 명령이 필요한 자동화는 실행하지 않는다(Windows 정식 빌드). */
     hostCommands: z.boolean().optional(),
+    /**
+     * Saycode specs/desktop-schedule-kinds — prompt schedule kinds this daemon computes. Absent means
+     * interval/daily only. Plain strings so a newer daemon's kind never makes an older client drop the field.
+     */
+    scheduleKinds: z.array(z.string().max(40)).max(20).optional(),
     /** aplus-dev-studio specs/e2ee-machine-control-boundary R12/R15 — seal with this sender, to this key. */
     authenticatedEnvelopes: authenticatedEnvelopesCapabilitySchema.optional(),
     /** Why this machine does or does not run script automations. Enums and a short fingerprint only (specs/script-runtime-readiness). */

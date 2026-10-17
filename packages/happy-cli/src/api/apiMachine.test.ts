@@ -1608,6 +1608,9 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(machine.metadata?.automationSupport?.hostCommands).toBe(expected);
         expect(machine.metadata?.automationSupport?.conversation).toBe(true);
         expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.conversation).toBe(true);
+        // Desktop은 이 목록에 없는 일정 종류(once/weekly)를 저장하지 않는다 — 스키마가 걸러내면 기능이 조용히 꺼진다.
+        expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.scheduleKinds)
+            .toEqual(['interval', 'daily', 'once', 'weekly']);
         client.shutdown();
     });
 
