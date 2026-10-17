@@ -160,6 +160,7 @@ import {
   type StopSessionContext,
   type StopSessionResult,
 } from './sessionIdleReaper';
+import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
@@ -3918,6 +3919,13 @@ export async function startDaemon(): Promise<void> {
       host: difficultyRoutingHost,
       baseMetadata: difficultyRoutingMachineMetadata,
     });
+    // A capability refresh over metadata this key could not open drops host/platform/homeDir, and an existing
+    // machine never republishes its first registration: restore the missing identity fields. A managed runtime's
+    // identity is registered by its parent (web-ui cloudMachineBootstrapCaller), so it is left as the parent wrote it.
+    if (!managedRuntimeActive && machineIdentityMetadataUpdate(machine.metadata, difficultyRoutingMachineMetadata)) {
+      void apiMachine.updateMachineMetadata((metadata) => machineIdentityMetadataUpdate(metadata, difficultyRoutingMachineMetadata) ?? metadata!)
+        .catch((error) => logger.debug('[DAEMON RUN] machine identity metadata not restored', error));
+    }
     // An existing machine keeps the metadata it first registered with: publish the agent browser capability
     // (Studio sends session-user attestations only to machines that report it).
     if (agentBrowserMetadataUpdate(machine.metadata, agentBrowserMachineCapability())) {
