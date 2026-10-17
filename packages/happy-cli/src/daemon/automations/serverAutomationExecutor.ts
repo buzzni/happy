@@ -30,6 +30,7 @@ import {
   readWorkspaceHeadSha,
 } from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
+import { AGENT_TASK_CLIENT_PATH } from './agentTaskClient'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
@@ -353,9 +354,19 @@ function buildAgentTaskPrompt(
       ? ['', AGENT_TASK_QUALITY_CONTRACTS[dispatch.type]]
       : []),
     '',
-    'Use APLUS_AGENT_TASK_URL and the capability environment variables. Never print or echo the token values.',
-    '1. POST $APLUS_AGENT_TASK_URL/$APLUS_AGENT_TASK_ID/start with version=1, token=$APLUS_AGENT_TASK_CLAIM_TOKEN, agentRunId=$APLUS_AGENT_TASK_RUN_ID, and a stable idempotencyKey.',
-    '2. Keep the lease alive while working by POSTing /heartbeat at least every 30 seconds with the claim token.',
+    // 2026-10-17 프로덕션 — 리뷰·테스트를 끝낸 워커 4건이 curl 을 손으로 짜며 봉투
+    // (version·token·agentRunId·idempotencyKey) 없이 결과 JSON 만 보내 /complete 가
+    // 400 UNSUPPORTED_VERSION 으로 거절됐다. 지시문에는 version=1 이 맞게 적혀 있었다 —
+    // 봉투를 매 실행 모델의 즉흥 구현에 맡긴 것이 원인이다. 봉투는 데몬이 넘긴
+    // 클라이언트(bin/happy-agent-task.mjs)가 채우고 워커는 결과 파일만 만든다.
+    'Send every protocol call with the AgentTask client the platform provides:'
+      + ' "$APLUS_AGENT_TASK_NODE" "$APLUS_AGENT_TASK_CLIENT" <operation>'
+      + ' (PowerShell: & $env:APLUS_AGENT_TASK_NODE $env:APLUS_AGENT_TASK_CLIENT <operation>).'
+      + ' It fills version, token, agentRunId, and idempotencyKey itself, applies a request timeout, and retries'
+      + ' network failures and 5xx responses with the same idempotencyKey; it does not retry 4xx responses.'
+      + ' Never send these requests any other way, and never print or echo the capability environment variables.',
+    '1. Run start before working.',
+    '2. The platform keeps the lease alive with heartbeats while this session runs; do not send them yourself.',
     // 2026-09-01 프로덕션 — worktree 를 받고도 vitest 를 못 찾아 검사를 전부 포기했다.
     // 이유는 워커가 지시를 정확히 지켰기 때문이다: "PR review is read-only" 라고만
     // 하면 빈 worktree 에 의존성을 설치해도 되는지 알 수 없다. 무엇이 금지인지를
@@ -367,35 +378,27 @@ function buildAgentTaskPrompt(
       + ' targeted checks, and if the install fails record the affected check as not_run with the reason instead of dropping it.'
       + ' Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed'
       + ' without mutating. review_apply may then edit, test, commit to its review-fix branch, push it, and open the stacked pull request; testing runs checks only.',
-    `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
-    '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
+    `4. Produce exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
+    '5. Run complete <result-file>: "$APLUS_AGENT_TASK_NODE" "$APLUS_AGENT_TASK_CLIENT" complete <result-file>.'
+      + ' The file holds only the result object above, not a request envelope.',
     // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
     // 지시가 "POST ... and result" 뿐이라 워커가 셸에서 JSON 을 조립했고, 리뷰 본문의
     // 따옴표·백틱·$ 가 보간을 타며 본문이 깨져 400 이 났다. 바로 아래 "4xx 는 재시도
     // 금지" 규칙까지 정확히 지켜 조용히 끝났다 — 워커 잘못이 아니라 방법을 안 정해준
     // 탓이다. 리뷰 본문은 임의의 코드 조각을 담으므로 셸을 거치면 언제든 깨진다.
-    'Write every request body to a file and send it with curl --data-binary @<file>'
-      + ' (or an equivalent that reads the file directly). Never build the JSON inline in a'
-      + ' shell argument such as -d \'{...}\' — findings quote code, so backticks, quotes,'
-      + ' and $ get interpolated and the body arrives corrupted.',
-    'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
-    // 2026-09-12 프로덕션 — 워커가 /complete 를 보낸 python 이 urlopen 에 timeout 을
-    // 주지 않아, 결과가 HTTP 200 으로 접수된 뒤에도 stalled 연결에서 영원히 블록됐다.
-    // 그 명령이 끝나지 않으니 턴도 세션도 끝나지 않아 24시간을 붙들고 있었다. 지시에
-    // 없으면 워커는 timeout 을 쓰지 않는다 — urllib 도 curl 도 기본값이 무제한이다.
-    'Give every one of these HTTP calls an explicit timeout (curl --max-time 30, or the'
-      + ' timeout argument of whatever client you use) — a stalled connection otherwise blocks'
-      + ' the command forever and the session can never finish.',
+    'Write the result JSON to a file with a file-writing tool and validate it parses.'
+      + ' Never build or echo the JSON through a shell argument or heredoc — findings quote code, so backticks,'
+      + ' quotes, and $ get interpolated and the result arrives corrupted.',
     // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
     // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
     // 2026-09-03 프로덕션 — 워커가 리뷰를 끝내고 /complete 에서 409 를 받자 이 지시대로
     // /fail 을 불러 task 를 failed 로 닫았다. pr_review 는 maxAttempts 1 이고 dedupe 가
     // cycle-1 이라 그 PR 은 다시 리뷰되지 않았다. /fail 은 "결과를 못 만들었다" 는 뜻이지
     // "제출이 막혔다" 는 뜻이 아니다 — 둘을 섞으면 끝낸 작업을 워커가 스스로 파괴한다.
-    'If /complete returns 4xx, report the status code and response body in your final message and stop.'
-      + ' Do not POST /fail when the work finished and only the submission was refused — that discards a'
+    'If complete reports a 4xx, report the status code and response body in your final message and stop.'
+      + ' Do not run fail when the work finished and only the submission was refused — that discards a'
       + ' completed result the task cannot produce again. Leave the task for the server to reconcile.',
-    'POST /fail with the complete token and a concise reason only when you could not produce a result at all.'
+    'Run fail <concise reason> only when you could not produce a result at all.'
       + ' Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
@@ -1437,6 +1440,8 @@ async function executeStartedRun(
         APLUS_AGENT_TASK_RUN_ID: bridged.dispatch.agentRunId,
         APLUS_AGENT_TASK_CLAIM_TOKEN: bridged.dispatch.claimToken,
         APLUS_AGENT_TASK_COMPLETE_TOKEN: bridged.dispatch.completeToken,
+        APLUS_AGENT_TASK_CLIENT: AGENT_TASK_CLIENT_PATH,
+        APLUS_AGENT_TASK_NODE: process.execPath,
       }
     } else {
       if (!planned.event) {

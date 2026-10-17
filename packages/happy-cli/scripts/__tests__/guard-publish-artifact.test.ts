@@ -78,6 +78,7 @@ function createPublishTarball(
     const nativeHelper = join(packageRoot, 'bin', 'happy-browser-native-host.mjs')
     writeFixtureFile(packageRoot, 'bin/happy-browser-native-host.mjs', '#!/usr/bin/env node\n')
     chmodSync(nativeHelper, options.nativeHelperExecutable === false ? 0o644 : 0o755)
+    writeFixtureFile(packageRoot, 'bin/happy-agent-task.mjs', '#!/usr/bin/env node\n')
     writeFixtureFile(packageRoot, 'dist/browserNativeMessagingHost.mjs', 'export {}\n')
     if (!options.omitSaycodeAgent) {
         writeFixtureFile(packageRoot, 'node_modules/@buzzni/saycode-cli/package.json', JSON.stringify({
