@@ -395,6 +395,17 @@ describe('automatic continuation after a capacity failure', () => {
             expect(turnsSent).toHaveLength(1);
         }, 60_000);
 
+        it('exits instead of idling when input that starts no turn replaces the continuation', async () => {
+            // `/clear` cancels the continuation like any input, but resets the thread without a turn.
+            script = [{ outcome: 'overloaded', after: () => { setTimeout(() => { void onUserMessage!({ content: { type: 'text', text: '/clear' } }); }, 0); } }];
+            await runOnce();
+
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+            expect(sessionEvents.some(e => e.message === 'Context was reset')).toBe(true);
+        }, 60_000);
+
         it('exits without continuing when stopped after the continuation was dequeued', async () => {
             script = [{ outcome: 'overloaded' }];
             let collected = false;
