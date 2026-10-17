@@ -366,7 +366,10 @@ function buildAgentTaskPrompt(
       + ' network failures and 5xx responses with the same idempotencyKey; it does not retry 4xx responses.'
       + ' Never send these requests any other way, and never print or echo the capability environment variables.',
     '1. Run start before working.',
-    '2. The platform keeps the lease alive with heartbeats while this session runs; do not send them yourself.',
+    // 데몬의 heartbeat 타이머는 프로세스 메모리에만 있어 데몬이 재시작되면 이어받은
+    // 워커 세션의 lease 를 아무도 갱신하지 않는다. 워커 쪽 heartbeat 를 안전망으로 둔다.
+    '2. Keep the lease alive while working: run heartbeat at least every 30 seconds'
+      + ' (between steps, or in the background during a long command). The platform also sends heartbeats, but it cannot after a restart.',
     // 2026-09-01 프로덕션 — worktree 를 받고도 vitest 를 못 찾아 검사를 전부 포기했다.
     // 이유는 워커가 지시를 정확히 지켰기 때문이다: "PR review is read-only" 라고만
     // 하면 빈 worktree 에 의존성을 설치해도 되는지 알 수 없다. 무엇이 금지인지를

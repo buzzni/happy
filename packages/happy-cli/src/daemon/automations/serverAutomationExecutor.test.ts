@@ -2939,6 +2939,8 @@ describe('runServerAutomationTick', () => {
       expect(spawnedEnvironment.APLUS_AGENT_TASK_NODE).toBe(process.execPath)
       expect(spawned.initialPrompt).toContain('"$APLUS_AGENT_TASK_NODE" "$APLUS_AGENT_TASK_CLIENT" complete <result-file>')
       expect(spawned.initialPrompt).not.toMatch(/curl/i)
+      // 데몬 재시작 뒤에는 데몬 타이머가 없으므로 워커 heartbeat 가 lease 의 안전망이다.
+      expect(spawned.initialPrompt).toMatch(/run heartbeat at least every 30 seconds/i)
       expect(spawned.initialPrompt).toMatch(/write the result json to a file.*never (build|assemble|echo).*shell/i)
       // 4xx 는 재시도로 풀리지 않지만 조용히 끝나서도 안 된다. 이번 사고에서 400 은
       // 워커 세션 안에서만 보였고 서버·데몬 로그에는 아무 흔적이 없었다.
