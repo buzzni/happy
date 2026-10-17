@@ -36,6 +36,10 @@ export interface OwnedFileLockDeps {
     onStaleJudged?: () => Promise<void>;
     /** Test seam: runs after the lock file is created, before its owner is recorded. */
     onLockCreated?: () => Promise<void>;
+    /** Test seam: runs inside the reclaim guard once the judged lock is confirmed unchanged, before it is removed. */
+    onReclaimConfirmed?: () => Promise<void>;
+    /** Test seam: runs once the lock is held, before `work`. */
+    onAcquired?: () => Promise<void>;
 }
 
 interface LockOwner { version: 1; pid: number; startedAt: number; token: string; acquiredAt: number }
@@ -55,6 +59,7 @@ type Verdict = { stale: true; why: 'owner-exited' | 'pid-reused' | 'unowned-aban
 export async function withOwnedFileLock<T>(path: string, work: () => Promise<T>, deps: OwnedFileLockDeps = {}): Promise<T> {
     const held = await acquire(path, 0, deps);
     try {
+        await deps.onAcquired?.();
         return await work();
     } finally {
         await release(path, held, deps);
@@ -114,6 +119,7 @@ async function reclaim(path: string, judged: LockSnapshot, depth: number, deps: 
     try {
         const current = await inspect(path);
         if (!current || instanceKey(current) !== instanceKey(judged)) return false; // Someone else got there first.
+        await deps.onReclaimConfirmed?.();
         await unlink(path);
         return true;
     } finally {

@@ -2,7 +2,7 @@ import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { FileLockHeldError, withOwnedFileLock } from './ownedFileLock';
+import { FileLockHeldError, withOwnedFileLock, type OwnedFileLockDeps } from './ownedFileLock';
 
 const amount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const entrySchema = z.object({
@@ -20,7 +20,8 @@ export type ReviewBudgetResult = { ok: true } | { ok: false; reason: 'busy' | 'd
 
 /** One machine-wide ledger, shared by projects. Unknown charges survive restart/day rollover. */
 export class LessonReviewBudget {
-    constructor(private readonly path: string, private readonly now: () => number = Date.now) {}
+    constructor(private readonly path: string, private readonly now: () => number = Date.now,
+        private readonly lockDeps: OwnedFileLockDeps = {}) {}
 
     private async transaction<T>(work: (entries: Entry[]) => T): Promise<T> {
         await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -41,7 +42,7 @@ export class LessonReviewBudget {
             } finally {
                 if (temp) await unlink(temp).catch(() => {});
             }
-        });
+        }, this.lockDeps);
     }
 
     /** Foreground work has already consumed the session's normal usage. This is a
