@@ -1948,6 +1948,41 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
+    /**
+     * `/btw` 곁질문 사용량 (src/claude/claudeSideQuestion.ts). transcript 에 assistant 메시지가
+     * 남지 않아 위 경로로는 잡히지 않는다 — 곁질문마다 고유 id 로 한 번 보고한다.
+     */
+    reportSideQuestionUsage(input: {
+        requestId: string;
+        usage: Usage;
+        model: string | null;
+        quality: 'exact' | 'estimated';
+    }, observedAiAuthSource?: ObservedAiAuthSource) {
+        let sourceEventId: string | undefined;
+        try {
+            const providerUsageEvent = createClaudeUsageEvent({
+                sessionId: this.sessionId,
+                occurredAt: Date.now(),
+                messageId: `btw:${input.requestId}`,
+                transcriptUuid: input.requestId,
+                model: input.model,
+                usage: input.usage,
+                quality: input.quality,
+                observedAiAuthSource,
+            });
+            sourceEventId = providerUsageEvent.sourceEventId;
+            this.sendProviderUsageEvent(providerUsageEvent);
+        } catch (error) {
+            logger.warn('[SOCKET] Failed to normalize side question usage data:', error);
+            return;
+        }
+        try {
+            this.sendUsageData(input.usage, input.model ?? undefined, sourceEventId);
+        } catch (error) {
+            logger.debug('[SOCKET] Failed to send side question usage data:', error);
+        }
+    }
+
     sendUsageData(usage: Usage, model?: string, sourceEventId?: string) {
         // Calculate total tokens
         const totalTokens = usage.input_tokens + usage.output_tokens + (usage.cache_creation_input_tokens || 0) + (usage.cache_read_input_tokens || 0);
