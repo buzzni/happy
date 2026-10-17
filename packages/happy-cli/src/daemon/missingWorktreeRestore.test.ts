@@ -183,6 +183,85 @@ describe('restoreMissingManagedWorktree', () => {
     });
 });
 
+describe('restoreMissingManagedWorktree for daemon-removed automation worktrees', () => {
+    // GitHub-triggered runs work in a detached worktree outside the repository
+    // (`~/.happy*/automation-worktrees/<hash>`), and the daemon removes it once
+    // the run-once session exits. Nothing in the path names the repository, so
+    // the removal leaves a record of where it came from.
+    async function removedAutomationWorktree() {
+        const { root } = await fixture();
+        const managedRoot = join(root, '..', 'automation-worktrees');
+        const worktree = join(managedRoot, '29ecc3d2ea1da5067b7b649a');
+        await git(root, 'worktree', 'add', '--detach', worktree, 'HEAD');
+        await writeFile(join(worktree, 'fix.txt'), 'pushed fix\n');
+        await git(worktree, 'add', 'fix.txt');
+        await git(worktree, 'commit', '-m', 'fix');
+        const headSha = await git(worktree, 'rev-parse', 'HEAD');
+        await git(root, 'worktree', 'remove', '--force', worktree);
+        return { root, worktree, headSha };
+    }
+
+    it('recreates it at the same path, detached at the HEAD it had when removed', async () => {
+        const { root, worktree, headSha } = await removedAutomationWorktree();
+
+        const result = await restoreMissingManagedWorktree({
+            cwd: worktree,
+            readBranchHint: async () => null,
+            findRemovedAutomationWorktree: async () => ({ repositoryRoot: root, worktreePath: worktree, headSha }),
+        });
+
+        expect(result).toEqual({ kind: 'recreated', worktreePath: worktree, branch: null, source: 'recorded-head' });
+        expect(await git(worktree, 'rev-parse', 'HEAD')).toBe(headSha);
+        expect(await exists(join(worktree, 'fix.txt'))).toBe(true);
+    });
+
+    it('restores a session whose cwd was a project subdirectory of the removed worktree', async () => {
+        const { root, worktree, headSha } = await removedAutomationWorktree();
+        const cwd = join(worktree, 'packages/web');
+
+        const result = await restoreMissingManagedWorktree({
+            cwd,
+            readBranchHint: async () => null,
+            findRemovedAutomationWorktree: async (path) => (path === cwd
+                ? { repositoryRoot: root, worktreePath: worktree, headSha }
+                : null),
+        });
+
+        expect(result).toMatchObject({ kind: 'recreated', worktreePath: worktree, source: 'recorded-head' });
+        expect(await exists(cwd)).toBe(true);
+    });
+
+    it('fails without leaving a worktree behind when the recorded commit is gone', async () => {
+        const { root, worktree } = await removedAutomationWorktree();
+
+        const result = await restoreMissingManagedWorktree({
+            cwd: worktree,
+            readBranchHint: async () => null,
+            findRemovedAutomationWorktree: async () => ({
+                repositoryRoot: root,
+                worktreePath: worktree,
+                headSha: 'f'.repeat(40),
+            }),
+        });
+
+        expect(result.kind).toBe('failed');
+        expect(await exists(worktree)).toBe(false);
+    });
+
+    it('leaves a missing directory alone when no removal was recorded for it', async () => {
+        const { worktree } = await removedAutomationWorktree();
+
+        const result = await restoreMissingManagedWorktree({
+            cwd: worktree,
+            readBranchHint: async () => null,
+            findRemovedAutomationWorktree: async () => null,
+        });
+
+        expect(result).toEqual({ kind: 'not-managed' });
+        expect(await exists(worktree)).toBe(false);
+    });
+});
+
 describe('readClaudeTranscriptBranch', () => {
     it('returns the branch recorded by the latest transcript entry', async () => {
         const dir = await realpath(await mkdtemp(join(tmpdir(), 'transcript-branch-')));

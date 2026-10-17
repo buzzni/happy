@@ -4178,6 +4178,21 @@ describe('host commands disallowed (Windows standalone runtime)', () => {
     if (!discards) expect(fixture.store.state().githubWorktrees).toEqual([journaled])
   })
 
+  // review #856 — worktrees put back for resumed Chats are removed on the same tick, under the same gate.
+  it.each([
+    { hostCommandsAllowed: undefined, sweeps: true },
+    { hostCommandsAllowed: false, sweeps: false },
+  ])('sweeps restored worktrees only when host commands are allowed ($hostCommandsAllowed)', async ({ hostCommandsAllowed, sweeps }) => {
+    const fixture = setup()
+    if (hostCommandsAllowed !== undefined) fixture.input.hostCommandsAllowed = hostCommandsAllowed
+    const sweepRestoredWorktrees = vi.fn(async () => {})
+    fixture.input.sweepRestoredWorktrees = sweepRestoredWorktrees
+
+    await runServerAutomationTick(fixture.input)
+
+    expect(sweepRestoredWorktrees).toHaveBeenCalledTimes(sweeps ? 1 : 0)
+  })
+
   it('reports a GitHub trigger as unsupported without querying GitHub or preparing a worktree', async () => {
     const fixture = setup(claimed)
     fixture.input.hostCommandsAllowed = false

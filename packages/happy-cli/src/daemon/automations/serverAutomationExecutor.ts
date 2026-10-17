@@ -230,6 +230,8 @@ export interface ServerAutomationExecutorInput {
   stopSession?: (sessionId: string) => void
   cancelScheduledSession?: (input: { sessionId: string; directory: string }) => Promise<boolean>
   isDirectoryInUse: (directory: string) => boolean
+  /** 재개된 Chat 을 위해 되살린 worktree 중 더 쓰지 않는 것을 지운다(githubWorktreeTombstones). */
+  sweepRestoredWorktrees?: () => Promise<void>
   /**
    * false 면 스크립트 조건과 GitHub 트리거를 실행하지 않고 HOST_COMMANDS_UNSUPPORTED 로
    * 보고한다. Windows 정식 빌드의 데몬은 세션만 Job 런처로 묶을 수 있고, 이 두 기능은
@@ -1759,7 +1761,10 @@ export async function runServerAutomationTick(
   }
   await flushPendingReports(input)
   // Cleanup runs git outside the Windows Job; keep the journal until a runtime that may run it.
-  if (input.hostCommandsAllowed !== false) await cleanupInactiveGithubWorktrees(input)
+  if (input.hostCommandsAllowed !== false) {
+    await cleanupInactiveGithubWorktrees(input)
+    await input.sweepRestoredWorktrees?.()
+  }
   const cache = input.cache.read()
   if (cache.cursor === 0n) return []
   const now = serverNow(cache, input.now)
