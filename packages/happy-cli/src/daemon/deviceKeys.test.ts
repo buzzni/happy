@@ -52,6 +52,14 @@ it('keeps the underlying failure as the cause of a reapproval error', async () =
   const error = await loadOrCreateDeviceKeys(path, 'machine').then(() => null, (failure: Error) => failure);
   expect(error?.message).toMatch(/reapproval/i);
   expect(error?.cause).toBeInstanceOf(Error);
+  expect((error?.cause as Error).message).not.toMatch(/reapproval/i);
+});
+it('names a key file that belongs to another machine as the cause', async () => {
+  const path = await home(); await loadOrCreateDeviceKeys(path, 'machine');
+  const file = join(path, (await readdir(path))[0], 'keys.json');
+  await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file, 'utf8')), machineId: 'other' }));
+  const error = await loadOrCreateDeviceKeys(path, 'machine').then(() => null, (failure: Error) => failure);
+  expect((error?.cause as Error | undefined)?.message).toMatch(/another machine/);
 });
 it.skipIf(process.platform === 'win32')('rejects permissions widened after creation and symbolic links', async () => {
   const path = await home(); await loadOrCreateDeviceKeys(path, 'machine');

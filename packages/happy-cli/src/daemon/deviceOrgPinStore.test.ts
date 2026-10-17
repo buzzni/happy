@@ -1,12 +1,12 @@
 import { mkdtemp, rm, readFile, writeFile, link, symlink, rename, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import nacl from 'tweetnacl';
 import { afterEach, expect, it, vi } from 'vitest';
 import { signOrgSetupTokenDocument, orgSetupTokenKeyId } from '@slopus/happy-wire';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
-import { createDeviceOrgPinStore, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, DEVICE_ENTRY_NAME_BUDGET, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
 vi.mock('node:fs/promises',async(importOriginal)=>{const actual=await importOriginal<typeof import('node:fs/promises')>();return {...actual,link:vi.fn(actual.link)};});
 const homes: string[] = [];
 afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, {recursive:true,force:true}))); });
@@ -19,7 +19,7 @@ async function fixture() {
  const deps={home,machineId:'machine',keys};
  const directory=join(home,'device-'+createHash('sha256').update('machine').digest('hex'));
  const companyHash=createHash('sha256').update('company').digest('hex');
- const path=join(directory,'org-'+companyHash.slice(0,16)+'.json');
+ const path=join(directory,'o-'+companyHash.slice(0,8)+'.json');
  const legacyPath=join(directory,'org-'+companyHash+'.json');
  return {signer,deps,store:createDeviceOrgPinStore(deps),candidate:{publicKey,approval},path,legacyPath,directory};
 }
@@ -65,8 +65,10 @@ it('rejects symlinked pin files rather than following them',async()=>{
 
 // Windows PowerShell ACL checks cannot open entries past MAX_PATH; a 64-hex pin name put them ~279 chars deep.
 it('names pins short enough that the device directory stays under the Windows path limit',async()=>{
- const f=await fixture();await f.store.pin(f.candidate);
+ const f=await fixture();vi.mocked(link).mockClear();await f.store.pin(f.candidate);
  expect((await readdir(f.directory)).sort()).toEqual(['keys.json',f.path.slice(f.directory.length+1)].sort());
+ const written=vi.mocked(link).mock.calls.flatMap(call=>call.map(path=>basename(String(path))));
+ for(const name of written)expect(name.length,name).toBeLessThanOrEqual(DEVICE_ENTRY_NAME_BUDGET);
 });
 it('moves a pin saved under the legacy long name so it loads again after restart',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);await rename(f.path,f.legacyPath);
@@ -74,11 +76,23 @@ it('moves a pin saved under the legacy long name so it loads again after restart
  expect(await readdir(f.directory)).not.toContain(f.legacyPath.slice(f.directory.length+1));
  expect(await createDeviceOrgPinStore(f.deps).get('company')).toMatchObject({...f.candidate,policy:'signed-required'});
 });
-it('leaves a legacy pin that disagrees with the short one in place instead of replacing either',async()=>{
+// Left in place, the long file would fail the directory check on every start, so it is set aside under a short name
+// the stores never open; the short pin stays authoritative and the legacy contents are never trusted.
+it('sets a legacy pin that disagrees with the short one aside under a short name, keeping the short one',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);const stored=await readFile(f.path,'utf8');
  await writeFile(f.legacyPath,'{}');
- await migrateLegacyOrgPinNames(f.deps.home,'machine');
- expect(await readFile(f.path,'utf8')).toBe(stored);expect(await readFile(f.legacyPath,'utf8')).toBe('{}');
+ expect(await migrateLegacyOrgPinNames(f.deps.home,'machine')).toEqual([{name:f.legacyPath.slice(f.directory.length+1),outcome:'quarantined'}]);
+ const names=await readdir(f.directory);
+ expect(names).not.toContain(f.legacyPath.slice(f.directory.length+1));
+ const aside=names.filter(name=>name.startsWith('q-'));expect(aside).toHaveLength(1);
+ expect(aside[0]!.length).toBeLessThanOrEqual(DEVICE_ENTRY_NAME_BUDGET);
+ expect(await readFile(join(f.directory,aside[0]!),'utf8')).toBe('{}');
+ expect(await readFile(f.path,'utf8')).toBe(stored);expect(await f.store.get('company')).toMatchObject(f.candidate);
+});
+it.skipIf(process.platform==='win32')('does not follow or move a legacy-named symlink',async()=>{
+ const f=await fixture();const target=join(f.deps.home,'external.json');await writeFile(target,'{}');await symlink(target,f.legacyPath);
+ expect(await migrateLegacyOrgPinNames(f.deps.home,'machine')).toEqual([{name:f.legacyPath.slice(f.directory.length+1),outcome:'skipped'}]);
+ expect(await readdir(f.directory)).toContain(f.legacyPath.slice(f.directory.length+1));
 });
 it('drops a legacy pin that duplicates the short one',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);await link(f.path,f.legacyPath);
@@ -88,5 +102,5 @@ it('drops a legacy pin that duplicates the short one',async()=>{
 });
 it('does nothing when the device has no key directory yet',async()=>{
  const home=await mkdtemp(join(tmpdir(),'device-pin-'));homes.push(home);
- await expect(migrateLegacyOrgPinNames(home,'machine')).resolves.toBeUndefined();
+ await expect(migrateLegacyOrgPinNames(home,'machine')).resolves.toEqual([]);
 });
