@@ -1,6 +1,6 @@
 import { mkdtemp,readFile,writeFile,mkdir,chmod,rename,rm,readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { execFile as exec,execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { describe,expect,it,vi } from 'vitest'
@@ -67,12 +67,12 @@ describe('provider group custody removal',()=>{
   it('includes a live personal identity encoded in a JWT and fails closed for unidentifiable auth',async()=>{
     const token='header.'+Buffer.from(JSON.stringify({'https://api.openai.com/auth':{chatgpt_account_id:'personal'}})).toString('base64url')+'.signature'
     const read=vi.fn(async(path:string)=>{
-      if(path.endsWith('auth.json'))return JSON.stringify({tokens:{access_token:token,refresh_token:'test'}})
+      if(basename(path)==='auth.json')return JSON.stringify({tokens:{access_token:token,refresh_token:'test'}})
       throw Object.assign(new Error('missing'),{code:'ENOENT'})
     })
     const adapter=createGroupProviderAdapters({homeDir:'/fixture',env:{},readFile:read} as unknown as AiCredentialRuntimeDependencies)
     expect(await adapter.snapshot('codex')).toEqual([groupAccountIdentity('codex',{accountId:'personal'})])
-    read.mockImplementation(async(path:string)=>{if(path.endsWith('/auth.json'))return JSON.stringify({tokens:{access_token:'unidentifiable'}});throw Object.assign(new Error('missing'),{code:'ENOENT'})})
+    read.mockImplementation(async(path:string)=>{if(basename(path)==='auth.json')return JSON.stringify({tokens:{access_token:'unidentifiable'}});throw Object.assign(new Error('missing'),{code:'ENOENT'})})
     await expect(adapter.snapshot('codex')).rejects.toThrow('AI_GROUP_ACCOUNT_IDENTITY_UNAVAILABLE')
   })
   it('refuses Codex removal while a live proxy route is using credentials',async()=>{

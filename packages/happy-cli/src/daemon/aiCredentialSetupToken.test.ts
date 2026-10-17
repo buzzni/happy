@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { spawnHappyCLI } from '../utils/spawnHappyCLI'
 import { TmuxUtilities } from '../utils/tmux'
@@ -117,7 +118,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
     return { stdout: '', stderr: '' }
   })
   const runtime = createAiCredentialRuntime({
-    homeDir: '/home/operator', platform: options.platform, machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
+    homeDir: join('/home', 'operator'), platform: options.platform, machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier() }),
     ...(options.durability === 'missing' ? {} : {
       syncFile: async (path: string) => { syncEvents.push('file:' + path); if (options.durability === 'file-fails') throw new Error('sync failed') },
@@ -312,14 +313,14 @@ describe('managed Claude setup-token runtime', () => {
     // The production machine-personal path intentionally skips sessionEnvironment.
     const personal = honorsManagedAiCredentials({ kind: 'machine-personal' }) ? await runtime.sessionEnvironment('claude') : {}
     const codex = await runtime.sessionEnvironment('codex')
-    files.set('/home/operator/.happy/trial-ai-credential-leases.json', JSON.stringify({ version: 1,
+    files.set(join('/home', 'operator', '.happy', 'trial-ai-credential-leases.json'), JSON.stringify({ version: 1,
       leases: { zai: { leaseId: 'synthetic', contentHash: 'a'.repeat(64), bundleVersion: 1 } } }))
-    files.set('/home/operator/.happy/zai-claude-env.json', JSON.stringify({ ANTHROPIC_AUTH_TOKEN: 'synthetic-zai',
+    files.set(join('/home', 'operator', '.happy', 'zai-claude-env.json'), JSON.stringify({ ANTHROPIC_AUTH_TOKEN: 'synthetic-zai',
       ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', API_TIMEOUT_MS: '3000000',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3', ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7' }))
     const zai = await runtime.sessionEnvironment('claude')
     // The lease is removed before the organization assignment is installed.
-    files.delete('/home/operator/.happy/trial-ai-credential-leases.json')
+    files.delete(join('/home', 'operator', '.happy', 'trial-ai-credential-leases.json'))
     await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
     for (const env of [personal, codex, zai]) {
       await runtime.launchSession(env, () => spawnHappyCLI(['claude'], { env }))
@@ -469,8 +470,8 @@ describe('managed Claude setup-token runtime', () => {
   // 2026-10-12 hmrepo: the live Claude login was a managed account whose cswap slot was gone; the personal capture
   // re-added it without managed metadata and every later group apply refused it as managed-id-mismatch.
   it('does not capture a live managed login as a personal account; the group installs it as managed', async () => {
-    const files = new Map<string, string>([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: managedSetupTokenEmail(A) } })],
-      ['/home/operator/.claude/.credentials.json', JSON.stringify({ claudeAiOauth: { accessToken: fakeToken('live') } })]])
+    const files = new Map<string, string>([[join('/home', 'operator', '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: managedSetupTokenEmail(A) } })],
+      [join('/home', 'operator', '.claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: fakeToken('live') } })]])
     const { runtime, state, calls } = fakeMachine([], null, { files })
     await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))
     expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
@@ -479,12 +480,12 @@ describe('managed Claude setup-token runtime', () => {
 
   it('applies a Windows organization account despite an orphaned personal identity, without deleting settings', async () => {
     const config = JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' }, theme: 'dark' })
-    const files = new Map([['/home/operator/.claude.json', config]])
+    const files = new Map([[join('/home', 'operator', '.claude.json'), config]])
     const { runtime, state, calls } = fakeMachine([], null, { files, platform: 'win32' })
     await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).resolves.toMatchObject({ reconciled: true })
     expect(state.slots).toEqual([expect.objectContaining({ managedAccountId: A })])
     expect(calls.some(call => call.command === 'cswap' && call.args[0] === 'add')).toBe(false)
-    expect(files.get('/home/operator/.claude.json')).toBe(config)
+    expect(files.get(join('/home', 'operator', '.claude.json'))).toBe(config)
   })
 
   it.each([
@@ -492,11 +493,11 @@ describe('managed Claude setup-token runtime', () => {
     { platform: 'win32' as const, env: { ANTHROPIC_API_KEY: 'test-key' } },
     { platform: 'win32' as const, credential: JSON.stringify({ claudeAiOauth: { accessToken: 'personal' } }) },
     { platform: 'win32' as const, credential: '{}' },
-    { platform: 'win32' as const, env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '/secure' }, secureCredential: '{}' },
+    { platform: 'win32' as const, env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: join('/secure') }, secureCredential: '{}' },
   ])('still requires personal capture when absence is not proven: %j', async options => {
-    const files = new Map([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })]])
-    if (options.credential) files.set('/home/operator/.claude/.credentials.json', options.credential)
-    if (options.secureCredential) files.set('/secure/.credentials.json', options.secureCredential)
+    const files = new Map([[join('/home', 'operator', '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })]])
+    if (options.credential) files.set(join('/home', 'operator', '.claude', '.credentials.json'), options.credential)
+    if (options.secureCredential) files.set(join('/secure', '.credentials.json'), options.secureCredential)
     const { runtime, calls, state } = fakeMachine([], null, { files, ...options })
     // The fake add cannot save the personal account: applying must stop before importing.
     await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
@@ -506,25 +507,25 @@ describe('managed Claude setup-token runtime', () => {
 
   it('respects an explicitly default secure store without deleting a custom profile', async () => {
     const config = JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })
-    const files = new Map([['/profile/.claude.json', config], ['/profile/.credentials.json', '{}']])
+    const files = new Map([[join('/profile', '.claude.json'), config], [join('/profile', '.credentials.json'), '{}']])
     const { runtime, calls } = fakeMachine([], null, { files, platform: 'win32',
-      env: { CLAUDE_CONFIG_DIR: '/profile', CLAUDE_SECURESTORAGE_CONFIG_DIR: '' } })
+      env: { CLAUDE_CONFIG_DIR: join('/profile'), CLAUDE_SECURESTORAGE_CONFIG_DIR: '' } })
     await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).resolves.toMatchObject({ reconciled: true })
     expect(calls.some(call => call.args[0] === 'add')).toBe(false)
-    expect(files.get('/profile/.credentials.json')).toBe('{}')
-    expect(files.get('/profile/.claude.json')).toBe(config)
+    expect(files.get(join('/profile', '.credentials.json'))).toBe('{}')
+    expect(files.get(join('/profile', '.claude.json'))).toBe(config)
   })
 
   it('does not treat malformed credentials as absent', async () => {
-    const files = new Map([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })],
-      ['/home/operator/.claude/.credentials.json', '{broken']])
+    const files = new Map([[join('/home', 'operator', '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })],
+      [join('/home', 'operator', '.claude', '.credentials.json'), '{broken']])
     const { runtime, state } = fakeMachine([], null, { files, platform: 'win32' })
     await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow()
     expect(state.slots).toEqual([])
   })
 
   it.each(['EACCES', 'EPERM'])('does not treat unreadable credentials as absent (%s)', async readError => {
-    const files = new Map([['/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })]])
+    const files = new Map([[join('/home', 'operator', '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'old@example.com' } })]])
     const { runtime, state } = fakeMachine([], null, { files, platform: 'win32', readError })
     await expect(runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('org')))))).rejects.toThrow()
     expect(state.slots).toEqual([])
@@ -705,7 +706,7 @@ describe('managed Claude setup-token runtime', () => {
 
     it.each([[], { unexpected: NOW + 60_000 }, { [A]: -1 }])('refuses malformed nonce ledger entries: %j', async (nonces) => {
       const { runtime, files } = await assigned()
-      const path = '/home/operator/.happy/setup-token-binding-nonces.json'
+      const path = join('/home', 'operator', '.happy', 'setup-token-binding-nonces.json')
       const corrupt = JSON.stringify({ version: 1, nonces })
       files.set(path, corrupt)
       await expect(runtime.sessionEnvironment('claude', selection())).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_LEDGER_INVALID')
@@ -716,9 +717,9 @@ describe('managed Claude setup-token runtime', () => {
       const { runtime, syncEvents } = await assigned()
       await runtime.sessionEnvironment('claude', selection())
       expect(syncEvents).toEqual([
-        'file:/home/operator/.happy/setup-token-binding-nonces.json.happy-tmp',
-        'rename:/home/operator/.happy/setup-token-binding-nonces.json',
-        'directory:/home/operator/.happy', 'directory:/home/operator',
+        'file:' + join('/home', 'operator', '.happy', 'setup-token-binding-nonces.json.happy-tmp'),
+        'rename:' + join('/home', 'operator', '.happy', 'setup-token-binding-nonces.json'),
+        'directory:' + join('/home', 'operator', '.happy'), 'directory:' + join('/home', 'operator'),
       ])
     })
 
@@ -726,12 +727,12 @@ describe('managed Claude setup-token runtime', () => {
       const { runtime, files, state } = await assigned({ durability })
       const chosen = selection()
       await expect(runtime.sessionEnvironment('claude', chosen)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
-      expect(files.has('/home/operator/.happy/setup-token-binding-nonces.json.happy-tmp')).toBe(false)
+      expect(files.has(join('/home', 'operator', '.happy', 'setup-token-binding-nonces.json.happy-tmp'))).toBe(false)
       const restarted = fakeMachine(state.slots, state.active, { files })
       if (durability === 'directory-fails') {
         await expect(restarted.runtime.sessionEnvironment('claude', chosen)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_REPLAYED')
       } else {
-        expect(files.has('/home/operator/.happy/setup-token-binding-nonces.json')).toBe(false)
+        expect(files.has(join('/home', 'operator', '.happy', 'setup-token-binding-nonces.json'))).toBe(false)
         await expect(restarted.runtime.sessionEnvironment('claude', chosen)).resolves.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN')
       }
     })
@@ -741,7 +742,7 @@ describe('managed Claude setup-token runtime', () => {
       const { runtime, files } = await assigned({ clock, advanceOnExport: 60_000 })
       const chosen = selection()
       await expect(runtime.sessionEnvironment('claude', chosen)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_EXPIRED')
-      expect(files.has('/home/operator/.happy/setup-token-binding-nonces.json')).toBe(false)
+      expect(files.has(join('/home', 'operator', '.happy', 'setup-token-binding-nonces.json'))).toBe(false)
     })
 
     it('rejects a grant that expires during the nonce write: the nonce is burned and no token env is returned', async () => {
@@ -905,7 +906,7 @@ describe('managed Claude setup-token runtime', () => {
     })
 
     // A journal written before the `managed` projection existed.
-    const JOURNAL = '/home/operator/.happy/ai-credential-groups.json'
+    const JOURNAL = join('/home', 'operator', '.happy', 'ai-credential-groups.json')
     const legacyJournal = (desired: string[], pending = false) => new Map([[JOURNAL, JSON.stringify({ version: 1, entries: [{ scope: 'company-1', userId: 'user-1',
       provider: 'claude', generation: 1, fingerprint: '1'.padStart(64, '0'), desired, owned: pending ? [] : desired, pending, payloadDigest: null }] })]])
     const legacyHash = (email: string) => createHash('sha256').update(JSON.stringify(['claude', email, ''])).digest('hex')
@@ -937,7 +938,7 @@ describe('managed Claude setup-token runtime', () => {
 
     it('refuses an unknown old assignment when the roster cannot be read, even with a personal login, and does not migrate', async () => {
       const files = legacyJournal([legacyHash('shared@example.com')])
-      files.set('/home/operator/.claude.json', JSON.stringify({ oauthAccount: { emailAddress: 'me@example.com' } }))
+      files.set(join('/home', 'operator', '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'me@example.com' } }))
       const { runtime } = fakeMachine([personalSlot], 1, { files, listFails: true })
       await expect(runtime.sessionEnvironment('claude')).rejects.toThrow('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
       expect(JSON.parse(files.get(JOURNAL)!).entries[0]).not.toHaveProperty('managed')
