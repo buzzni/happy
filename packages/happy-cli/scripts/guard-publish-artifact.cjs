@@ -14,6 +14,7 @@ const DEPENDENCY_FIELDS = [
 
 const EXPECTED_BUNDLED_FILES = [
     'package/bin/happy-browser-native-host.mjs',
+    'package/bin/happy-agent-task.mjs',
     'package/dist/browserNativeMessagingHost.mjs',
     'package/browser-extension/src/nativePairing.js',
     'package/node_modules/@buzzni/saycode-cli/package.json',
