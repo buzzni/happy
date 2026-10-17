@@ -1,4 +1,4 @@
-import { createDeviceOrgPinStore } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
@@ -3909,6 +3909,9 @@ export async function startDaemon(): Promise<void> {
     });
 
     // Create realtime machine session
+    // Before the key load runs its ACL check over the device directory (see migrateLegacyOrgPinNames).
+    // Best effort: if it fails, the key load below still fails closed and logs why.
+    if (!managedRuntimeActive) await migrateLegacyOrgPinNames(configuration.happyHomeDir, machine.id).catch((error) => logger.debug('[DAEMON RUN] Legacy org pin rename failed', error));
     const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);
     if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
       store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }) });
