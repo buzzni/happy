@@ -127,7 +127,11 @@ async function protectDirectory(directory: string, initialize = false, archiveId
           windowsHide: true, timeout: 15000, maxBuffer: 32768,
           env: { ...process.env, SAYCODE_ACL_PATH: Buffer.from(directory).toString('base64'), SAYCODE_ACL_INITIALIZE: initialize ? '1' : '0', SAYCODE_ACL_ARCHIVE_ID: archiveId },
         });
-    } catch (error) { throw new Error('Standalone journal ACL protection failed', { cause: error }); }
+    } catch (error) {
+      // Keep only what explains the refusal: the execFile error's own message and cmd carry the whole encoded script.
+      const { code, killed, signal, stderr } = error as { code?: unknown; killed?: unknown; signal?: unknown; stderr?: unknown };
+      throw new Error('Standalone journal ACL protection failed', { cause: { code, killed, signal, stderr: String(stderr ?? '').trim().slice(0, 2000) } });
+    }
     finally { logger.debug(`[timing] windows-acl dir=${win32.basename(directory)} initialize=${initialize} ${Date.now() - startedAt}ms`); }
   } else {
     try { if (initialize) mkdirSync(directory, { mode: 0o700 }); }

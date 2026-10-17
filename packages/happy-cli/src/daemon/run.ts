@@ -3934,7 +3934,9 @@ export async function startDaemon(): Promise<void> {
     // Create realtime machine session
     // Before the key load runs its ACL check over the device directory (see migrateLegacyOrgPinNames).
     // Best effort: if it fails, the key load below still fails closed and logs why.
-    if (!managedRuntimeActive) await migrateLegacyOrgPinNames(configuration.happyHomeDir, machine.id).catch((error) => logger.debug('[DAEMON RUN] Legacy org pin rename failed', error));
+    if (!managedRuntimeActive) await migrateLegacyOrgPinNames(configuration.happyHomeDir, machine.id)
+      .then((renamed) => { if (renamed.length > 0) logger.debug('[DAEMON RUN] Legacy device state names', renamed); })
+      .catch((error) => logger.debug('[DAEMON RUN] Legacy device state rename failed', error));
     const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);
     if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
       store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }) });
