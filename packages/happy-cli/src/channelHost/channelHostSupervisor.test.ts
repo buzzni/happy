@@ -329,6 +329,19 @@ describe('createChannelHostSupervisor', () => {
         expect(logs.join(' ')).not.toContain('SECRET');
     });
 
+    it('logs the closed diagnostic codes the host reports on stderr, and nothing else', async () => {
+        // The host writes `[channel-host] CODE` for each refusal; without these a channel that
+        // answered "check permissions" left no trace of why.
+        const supervisor = make();
+        supervisor.start();
+        children[0].stderr.write('[channel-host] CHANNEL_REQUEST_REFUSED_SESSION_NOT_RUNNING\n');
+        children[0].stderr.write('[channel-host] leaked SECRET-TOKEN\n');
+        children[0].stderr.write('Error: boom at /Users/someone/secret/path.js:1\n');
+        await flush();
+        expect(logs).toContain('diagnostic:CHANNEL_REQUEST_REFUSED_SESSION_NOT_RUNNING');
+        expect(logs.join(' ')).not.toMatch(/SECRET|someone|boom/);
+    });
+
     it('stops by asking the child, and does not restart it', async () => {
         const supervisor = make();
         supervisor.start();

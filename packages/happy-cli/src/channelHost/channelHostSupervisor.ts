@@ -10,8 +10,9 @@
  * child's exit.
  *
  * Nothing the host sends or receives is logged. Settings calls are sealed to the host's key and the
- * init carries the daemon's credential, so diagnostics are closed codes only; the child's stderr is
- * drained and dropped.
+ * init carries the daemon's credential, so diagnostics are closed codes only. The child's stderr is
+ * drained; the one line shape kept from it is the host's own report, `[channel-host] CODE` with a
+ * closed upper-case code, and every other line is dropped unread.
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -24,6 +25,9 @@ import type { MachineMetadata } from '@/api/types';
 import { scrubSessionLineageEnv } from '@/daemon/sessionEnv';
 
 export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
+
+/** The host's diagnostic line. Anchored and closed, so a crash trace or a quoted value never matches. */
+const HOST_DIAGNOSTIC_LINE = /^\[channel-host\] ([A-Z][A-Z0-9_]{0,95})$/;
 
 /**
  * The host's state lives in the happy home (sealed keys and credential; the adapter sandbox denies it).
@@ -321,7 +325,12 @@ export function createChannelHostSupervisor(deps: {
             onExit();
         });
         child.stdin?.on('error', () => undefined);
-        child.stderr?.resume();
+        if (child.stderr) {
+            createInterface({ input: child.stderr, crlfDelay: Infinity }).on('line', (line) => {
+                const code = HOST_DIAGNOSTIC_LINE.exec(line)?.[1];
+                if (code) deps.log(`diagnostic:${code}`);
+            });
+        }
         if (child.stdout) {
             createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', (line) => onLine(target, line));
         }
