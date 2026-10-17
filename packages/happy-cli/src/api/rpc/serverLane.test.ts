@@ -11,7 +11,7 @@ import { machineServerLane, SERVER_LANE_METHODS } from './serverLane';
 
 const CONTENT_CAPABLE = [
     'bash', 'readFile', 'readFileChunk', 'writeFile', 'deleteFile', 'renameFile', 'copyFile', 'ensureDirectory',
-    'listDirectory', 'getDirectoryTree', 'listWorkspaceDirectory', 'readWorkspaceFile', 'ripgrep', 'difftastic',
+    'listDirectory', 'getDirectoryTree', 'listWorkspaceDirectory', 'readWorkspaceFile', 'writeWorkspaceFile', 'ripgrep', 'difftastic',
     'file-discovery', 'worktree-dependencies:reclaim', 'spawn-with-sealed-env',
     'worktree:capability', 'worktree:prepare', 'worktree:create', 'worktree:status', 'worktree:remove',
     'worktree:apply', 'worktree:update', 'worktree:recover', 'worktree:adopt-check', 'worktree:publish', 'worktree:reconcile',
