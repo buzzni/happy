@@ -47,7 +47,9 @@ export function createGroupProviderAdapters(deps:AiCredentialRuntimeDependencies
     if(provider==='claude'){
       const list=await claude(),accounts=[...list.accounts]
       const config=await optional(deps.env.CLAUDE_CONFIG_DIR?join(deps.env.CLAUDE_CONFIG_DIR,'.claude.json'):join(deps.homeDir,'.claude.json'))
-      if(config?.oauthAccount?.emailAddress)accounts.push({email:config.oauthAccount.emailAddress,organizationUuid:config.oauthAccount.organizationUuid??''})
+      // A managed login marker survives a pool reset but carries no stored slot,
+      // generation or token. Only cswap can prove that managed credential exists.
+      if(config?.oauthAccount?.emailAddress&&!managedSetupTokenId(config.oauthAccount.emailAddress))accounts.push({email:config.oauthAccount.emailAddress,organizationUuid:config.oauthAccount.organizationUuid??''})
       return [...new Set(accounts.map(a=>groupAccountIdentity(provider,a)))]
     }
     const pool=await optional(poolPath)
