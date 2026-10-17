@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     debug: vi.fn(), key: vi.fn(), verifier: vi.fn(), verify: vi.fn(), snapshot: vi.fn(),
     close: vi.fn(), open: vi.fn(), user: vi.fn(), turn: vi.fn(),
-    host: vi.fn(), issuer: vi.fn(),
+    host: vi.fn(), issuer: vi.fn(), authorize: vi.fn(), review: vi.fn(),
 }));
 vi.mock('@/ui/logger', () => ({ logger: { debug: mocks.debug } }));
 vi.mock('./lessonHostRuntime', () => ({ fetchLessonGrantPublicKey: mocks.key, requestLessonSnapshotGrant: mocks.snapshot }));
@@ -15,10 +15,10 @@ vi.mock('./lessonHostSupervisor', () => ({ createLessonHostSupervisor: (options:
         if (!verified.ok || verified.claims.projectId !== 'private-project') return null;
         return mocks.open();
     },
-    close: mocks.close, openedUserId: mocks.user, authorize: async () => 'private-user',
+    close: mocks.close, openedUserId: mocks.user, authorize: mocks.authorize,
 }) }));
 vi.mock('./lessonTurnHost', () => ({ createLessonTurnHost: mocks.turn }));
-vi.mock('./lessonReviewWorker', () => ({ createLessonReviewWorker: () => ({}), lessonCandidateEnvelope: vi.fn() }));
+vi.mock('./lessonReviewWorker', () => ({ createLessonReviewWorker: mocks.review, lessonCandidateEnvelope: vi.fn() }));
 vi.mock('./lessonSettingsStore', () => ({
     createLessonSettingsStore: () => ({}), createLessonReviewOutcomeStore: () => ({}),
     lessonReviewLedgerPath: () => '/unused', lessonReviewOutcomePath: () => '/unused', lessonSettingsPath: () => '/unused',
@@ -55,6 +55,7 @@ beforeEach(() => {
     mocks.host.mockReturnValue({}); mocks.issuer.mockReturnValue({});
     mocks.user.mockReturnValue('private-user'); mocks.close.mockResolvedValue(undefined);
     mocks.turn.mockReturnValue({});
+    mocks.authorize.mockResolvedValue('private-user'); mocks.review.mockReturnValue({});
 });
 
 describe('lesson host safe diagnostics', () => {
@@ -107,6 +108,19 @@ describe('lesson host safe diagnostics', () => {
     });
 });
 
+
+describe('lease renewal budget', () => {
+    /** A studio that answers a renewal in 1.7 s, as observed in production. */
+    const slowRenewal = async (_projectId: string, budgetMs: number) => (budgetMs >= 1_726 ? 'private-user' : null);
+
+    it('keeps the turn path short but lets a finished turn wait out a slow renewal', async () => {
+        mocks.authorize.mockImplementation(slowRenewal);
+        expect(await createLessonSessionHost(input())).not.toBeNull();
+        const { identity } = mocks.review.mock.calls[0][0];
+        expect(await identity('prepare')).toBeNull();
+        expect(await identity('finished')).toMatchObject({ projectId: 'private-project', userId: 'private-user' });
+    });
+});
 
 describe('production lazy host diagnostics', () => {
     it('distinguishes a refused snapshot from no_match and recovers on a later turn', async () => {
