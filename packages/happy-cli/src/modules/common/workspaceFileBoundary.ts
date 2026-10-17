@@ -107,8 +107,10 @@ export async function writeWorkspaceFile(allowedRoot: string, workspaceRoot: str
     if (![allowedRoot, workspaceRoot, target].every(validPath)) throw denied();
     const root = resolve(workspaceRoot);
     const path = resolve(target);
-    if (relative(root, path) === '' || !within(root, path)) throw denied();
-    if (relative(resolve(allowedRoot), path).split(sep).length > 128) throw denied();
+    const allowed = resolve(allowedRoot);
+    // Bound the root before probing anything, so lstat errors never describe paths outside it.
+    if (!within(allowed, root) || relative(root, path) === '' || !within(root, path)) throw denied();
+    if (relative(allowed, path).split(sep).length > 128) throw denied();
     const missing: string[] = [];
     let ancestor = dirname(path);
     // relative(), not string equality: Windows compares paths case-insensitively.
@@ -144,24 +146,31 @@ export async function writeWorkspaceFile(allowedRoot: string, workspaceRoot: str
         handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0));
     } catch (error) {
         if (errorCode(error) !== 'EEXIST') throw error;
-        // O_EXCL also refuses a link at the leaf, dangling or not; name it as a link.
+        // O_EXCL also refuses a link at the leaf, dangling or not; only an existing
+        // regular file is "already exists", anything else at the leaf is refused.
         const existing = await lstat(path).catch(() => undefined);
-        if (!existing || existing.isSymbolicLink()) throw denied();
+        if (!existing?.isFile()) throw denied();
         throw Object.assign(new Error('Workspace file already exists'), { code: 'EEXIST' });
     }
-    let opened: BigIntStats | undefined;
+    let opened: BigIntStats;
     try {
         opened = await handle.stat({ bigint: true });
-        await handle.writeFile(content);
     } catch (error) {
-        await handle.close();
-        // A short write must not survive as a file the next create-only attempt
-        // would report as already written. Remove it only while it is still ours.
-        const current = opened && await lstat(path, { bigint: true }).catch(() => undefined);
-        if (opened && current && current.dev === opened.dev && current.ino === opened.ino) await unlink(path).catch(() => undefined);
+        await handle.close().catch(() => undefined);
+        await unlink(path).catch(() => undefined);
         throw error;
     }
-    await handle.close();
+    try {
+        await handle.writeFile(content);
+        await handle.close();
+    } catch (error) {
+        await handle.close().catch(() => undefined);
+        // A short write must not survive as a file the next create-only attempt
+        // would report as already existing. Remove it only while it is still ours.
+        const current = await lstat(path, { bigint: true }).catch(() => undefined);
+        if (current && current.dev === opened.dev && current.ino === opened.ino) await unlink(path).catch(() => undefined);
+        throw error;
+    }
     const written = await lstat(path, { bigint: true });
     if (!written.isFile() || written.dev !== opened.dev || written.ino !== opened.ino) throw denied();
     for (const entry of [...snapshot.snapshots, ...created]) {

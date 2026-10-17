@@ -116,6 +116,11 @@ test('refuses a linked final file, even a dangling one, without following it', a
   assert.equal(await readFile(join(outside, 'secret.md'), 'utf8'), 'outside');
   assert.deepEqual(await readdir(outside), ['secret.md']);
 });
+test('refuses a non-file at the leaf instead of calling it an existing file', async (t) => {
+  const { base, root } = await fixture(t);
+  await mkdir(join(root, 'index.md'));
+  await assert.rejects(writeWorkspaceFile(base, root, join(root, 'index.md'), Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
+});
 test('refuses a non-directory ancestor', async (t) => {
   const { base, root } = await fixture(t);
   await assert.rejects(writeWorkspaceFile(base, root, join(root, '기획.md', 'child.md'), Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
@@ -127,6 +132,7 @@ test('refuses paths outside the project, the project root itself, and a linked p
   await assert.rejects(writeWorkspaceFile(base, root, join(root, '..', 'outside', 'new.md'), Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
   await assert.rejects(writeWorkspaceFile(base, root, root, Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
   await assert.rejects(writeWorkspaceFile(base, '.', join(root, 'new.md'), Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
+  await assert.rejects(writeWorkspaceFile(root, outside, join(outside, 'missing', 'new.md'), Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
   const linkedRoot = join(base, 'linked-root');
   await symlink(outside, linkedRoot, dirLink);
   await assert.rejects(writeWorkspaceFile(base, linkedRoot, join(linkedRoot, 'new.md'), Buffer.from('x')), { code: 'WORKSPACE_PATH_DENIED' });
