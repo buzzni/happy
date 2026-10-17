@@ -22,6 +22,7 @@ const RUN_ONCE_BACKGROUND_WAIT_BUDGET_MS = 60 * 60_000;
 import { spawn } from 'node:child_process';
 import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
+import { sideQuestionRequestOf, type ClaudeSideQuestionChannel } from './claudeSideQuestion'
 import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
@@ -241,6 +242,8 @@ export async function claudeRemote(opts: {
     exitAfterFirstTurn?: boolean,
     /** Receives this query's launch options so an off-turn title runs with the same payer and sandbox. */
     offTurnTitle?: ClaudeTitleBridge,
+    /** The live query's `/btw` side-question channel, then `null` once the query ends. */
+    onSideQuestionChannelReady?: (channel: ClaudeSideQuestionChannel | null) => void,
     /** How long a run-once result may wait on background work before ending anyway. */
     backgroundWaitBudgetMs?: number,
 }) {
@@ -730,6 +733,9 @@ function readTurnText(content: unknown): string {
     // boundary is the outer process wrapper or the approved plan, which a
     // second query would not share.
     if (!processSandbox && opts.managedRun !== true) opts.offTurnTitle?.provide(sdkOptions);
+    // A managed run answers only the prompt its envelope admitted; a side question would be a second one.
+    const sideQuestionRequest = opts.managedRun === true ? null : sideQuestionRequestOf(response);
+    if (sideQuestionRequest) opts.onSideQuestionChannelReady?.({ request: sideQuestionRequest, isTurnInProgress: () => thinking });
     const mcpRecovery = new McpRuntimeRecovery(response, { onStatus: opts.onMcpStatus });
     opts.onMcpStatusReaderReady?.(mcpRecovery);
     const mcpConfigSynchronizer = opts.mcpConfig
@@ -887,6 +893,11 @@ function readTurnText(content: unknown): string {
             if (message.type === 'stream_event') {
                 if (isTopLevelTextDelta(message)) finishTurnLatency('text');
                 opts.onStreamEvent?.(message);
+                continue;
+            }
+
+            // `/btw` progress belongs to the side question's RPC reply, not to the transcript.
+            if (message.type === 'system' && (message as { subtype?: unknown }).subtype === 'control_request_progress') {
                 continue;
             }
 
@@ -1248,6 +1259,7 @@ function readTurnText(content: unknown): string {
         queryClosed = true;
         acceptsActiveInput = false;
         opts.onActiveInputReady?.(null);
+        opts.onSideQuestionChannelReady?.(null);
         opts.onMcpControllerReady?.(null);
         opts.onMcpStatusReaderReady?.(null);
         updateThinking(false);

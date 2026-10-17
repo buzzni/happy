@@ -73,6 +73,8 @@ export function createClaudeUsageEvent(input: {
     usage: ClaudeUsage;
     env?: UsageEventEnvironment;
     observedAiAuthSource?: ObservedAiAuthSource;
+    /** 측정값이 아니라 다른 사용량을 빼서 얻은 값이면 'estimated' (claudeSideQuestion). */
+    quality?: ProviderUsageEventV1['quality'];
 }): ProviderUsageEventV1 {
     const providerEventId = input.messageId?.trim() || input.transcriptUuid.trim();
     const cacheRead = input.usage.cache_read_input_tokens ?? 0;
@@ -98,7 +100,7 @@ export function createClaudeUsageEvent(input: {
             total,
         },
         cost: null,
-        quality: 'exact',
+        quality: input.quality ?? 'exact',
         aiAuth: aiAuthReport(input.env ?? process.env, input.observedAiAuthSource),
     });
 }

@@ -861,6 +861,34 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await client.close();
     });
 
+    it('meters a /btw side question as its own usage event with the quality it was measured at', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.reportSideQuestionUsage({
+            requestId: 'btw-req-1',
+            usage: { input_tokens: 30, output_tokens: 8, cache_creation_input_tokens: 2, cache_read_input_tokens: 400 },
+            model: 'claude-opus-5-5',
+            quality: 'estimated',
+        });
+
+        const events = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, unknown]) => event);
+        expect(events).toEqual([expect.objectContaining({
+            sourceEventId: 'test-session-id:anthropic:btw:btw-req-1',
+            model: 'claude-opus-5-5',
+            quality: 'estimated',
+            tokens: expect.objectContaining({ input: 30, output: 8, cacheWrite: 2, cacheRead: 400, total: 440 }),
+        })]);
+        const legacyEvents = mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'usage-report')
+            .map(([, event]: [string, any]) => event);
+        expect(legacyEvents).toEqual([expect.objectContaining({
+            sourceEventId: 'test-session-id:anthropic:btw:btw-req-1',
+            tokens: expect.objectContaining({ total: 440 }),
+        })]);
+        await client.close();
+    });
+
     it('does not emit a turn usage event when assistant messages already carried tokens', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => ({
