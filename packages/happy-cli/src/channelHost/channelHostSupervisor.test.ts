@@ -342,6 +342,24 @@ describe('createChannelHostSupervisor', () => {
         expect(logs.join(' ')).not.toMatch(/SECRET|someone|boom/);
     });
 
+    it('holds at most one short line of stderr, and drops an overlong one whole', async () => {
+        const supervisor = make();
+        supervisor.start();
+        // A line split across writes is still read as one line.
+        children[0].stderr.write('[channel-host] CHANNEL_HOST_');
+        children[0].stderr.write('TICK_FAILED\n');
+        // A line that never ends is not buffered without bound, and its tail is not mistaken for a
+        // line of its own once it finally ends.
+        children[0].stderr.write('x'.repeat(1_000_000));
+        children[0].stderr.write('\n[channel-host] CHANNEL_HOST_RESUME_FAILED\n');
+        children[0].stderr.write(`${'y'.repeat(300)}[channel-host] CHANNEL_HOST_STORES_UNAVAILABLE\n`);
+        await flush();
+        expect(logs.filter((line) => line.startsWith('diagnostic:'))).toEqual([
+            'diagnostic:CHANNEL_HOST_TICK_FAILED',
+            'diagnostic:CHANNEL_HOST_RESUME_FAILED',
+        ]);
+    });
+
     it('stops by asking the child, and does not restart it', async () => {
         const supervisor = make();
         supervisor.start();

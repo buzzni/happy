@@ -28,6 +28,40 @@ export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
 
 /** The host's diagnostic line. Anchored and closed, so a crash trace or a quoted value never matches. */
 const HOST_DIAGNOSTIC_LINE = /^\[channel-host\] ([A-Z][A-Z0-9_]{0,95})$/;
+/** Longer than any line the pattern can match; anything past it is dropped, never buffered. */
+const HOST_DIAGNOSTIC_LINE_MAX = 128;
+
+/**
+ * Reads the host's diagnostic codes off its stderr while holding at most one short line.
+ *
+ * `readline` would buffer a line that never ends without bound. Here a line that outgrows the cap
+ * is discarded whole — including the tail that arrives after it — and the stream keeps draining.
+ */
+function readHostDiagnostics(stream: Readable, onCode: (code: string) => void): void {
+    let pending = '';
+    let overlong = false;
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk: string) => {
+        let rest = chunk;
+        for (let newline = rest.indexOf('\n'); newline !== -1; newline = rest.indexOf('\n')) {
+            const head = rest.slice(0, newline);
+            rest = rest.slice(newline + 1);
+            if (!overlong && pending.length + head.length <= HOST_DIAGNOSTIC_LINE_MAX) {
+                const code = HOST_DIAGNOSTIC_LINE.exec((pending + head).replace(/\r$/, ''))?.[1];
+                if (code) onCode(code);
+            }
+            pending = '';
+            overlong = false;
+        }
+        if (overlong) return;
+        if (pending.length + rest.length > HOST_DIAGNOSTIC_LINE_MAX) {
+            pending = '';
+            overlong = true;
+        } else {
+            pending += rest;
+        }
+    });
+}
 
 /**
  * The host's state lives in the happy home (sealed keys and credential; the adapter sandbox denies it).
@@ -325,12 +359,7 @@ export function createChannelHostSupervisor(deps: {
             onExit();
         });
         child.stdin?.on('error', () => undefined);
-        if (child.stderr) {
-            createInterface({ input: child.stderr, crlfDelay: Infinity }).on('line', (line) => {
-                const code = HOST_DIAGNOSTIC_LINE.exec(line)?.[1];
-                if (code) deps.log(`diagnostic:${code}`);
-            });
-        }
+        if (child.stderr) readHostDiagnostics(child.stderr, (code) => deps.log(`diagnostic:${code}`));
         if (child.stdout) {
             createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', (line) => onLine(target, line));
         }
