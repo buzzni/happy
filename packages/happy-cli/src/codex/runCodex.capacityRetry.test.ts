@@ -34,6 +34,8 @@ vi.mock('@/memory/codexRecallHost', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/memory/codexRecallHost')>(),
     prepareCodexRecallHost: vi.fn(async () => null),
 }));
+const reportCapacityFailure = vi.hoisted(() => vi.fn(async () => true));
+vi.mock('@/codex/reportAgentTaskCapacityFailure', () => ({ reportAgentTaskCapacityFailure: reportCapacityFailure }));
 /** Real policy, shorter waits: the scenarios are about what is sent, not how long it waits. */
 vi.mock('@/codex/codexCapacityRetry', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/codex/codexCapacityRetry')>(),
@@ -154,7 +156,7 @@ const closeQueue = () => { queues[0]!.close(); };
 
 describe('automatic continuation after a capacity failure', () => {
     beforeEach(() => {
-        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null; onUserMessage = null;
+        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null; onUserMessage = null; reportCapacityFailure.mockClear();
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-1' };
         // Run from inside a Saycode session, the runner would otherwise pick up that
         // session's own lesson host, reconnect target and sandbox settings, and never exit.
@@ -368,12 +370,20 @@ describe('automatic continuation after a capacity failure', () => {
             expect(notices()).toHaveLength(1);
         }, 60_000);
 
-        it('exits once the retry budget is spent', async () => {
+        it('exits once the retry budget is spent, telling the AgentTask server it can retry', async () => {
             script = [{ outcome: 'overloaded' }, { outcome: 'overloaded' }, { outcome: 'overloaded' }];
             await runOnce();
 
             expect(turnsSent).toHaveLength(3);
             expect(continuations()).toHaveLength(2);
+            expect(reportCapacityFailure).toHaveBeenCalledTimes(1);
+        }, 60_000);
+
+        it('does not report a failure for a run that recovered', async () => {
+            script = [{ outcome: 'overloaded' }, { outcome: 'ok' }];
+            await run(async () => {});
+
+            expect(reportCapacityFailure).not.toHaveBeenCalled();
         }, 60_000);
 
         it('exits without continuing when stopped while the continuation waits', async () => {
@@ -383,6 +393,17 @@ describe('automatic continuation after a capacity failure', () => {
             expect(notices()).toHaveLength(1);
             expect(continuations()).toHaveLength(0);
             expect(turnsSent).toHaveLength(1);
+        }, 60_000);
+
+        it('exits instead of idling when input that starts no turn replaces the continuation', async () => {
+            // `/clear` cancels the continuation like any input, but resets the thread without a turn.
+            script = [{ outcome: 'overloaded', after: () => { setTimeout(() => { void onUserMessage!({ content: { type: 'text', text: '/clear' } }); }, 0); } }];
+            await runOnce();
+
+            expect(notices()).toHaveLength(1);
+            expect(continuations()).toHaveLength(0);
+            expect(turnsSent).toHaveLength(1);
+            expect(sessionEvents.some(e => e.message === 'Context was reset')).toBe(true);
         }, 60_000);
 
         it('exits without continuing when stopped after the continuation was dequeued', async () => {

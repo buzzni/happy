@@ -95,6 +95,7 @@ import {
     CodexMcpRuntimeRecovery,
 } from './codexMcpRuntimeRecovery';
 import { emitReadyIfIdle } from './emitReadyIfIdle';
+import { reportAgentTaskCapacityFailure } from './reportAgentTaskCapacityFailure';
 import { enqueueCodexUserText, isCodexClearText, shouldHandleCodexClear } from './codexClearCommand';
 import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
@@ -2572,6 +2573,12 @@ export async function runCodex(opts: {
                     const retry = message.channelRequestId !== undefined ? null : capacityRetry.afterTurn(
                         !result.aborted && turnServerOverloaded && turnCapacityRetryGeneration === capacityRetryGeneration,
                     );
+                    // The budget is spent and the run is about to end without an answer: say so, or the
+                    // AgentTask server can only wait out its deadline.
+                    if (!retry && exitAfterFirstTurn && !result.aborted && turnServerOverloaded
+                        && turnCapacityRetryGeneration === capacityRetryGeneration) {
+                        await reportAgentTaskCapacityFailure();
+                    }
                     if (retry) {
                         const notice = `Model at capacity — continuing automatically in ${Math.round(retry.delayMs / 1000)}s (${retry.attempt}/${retry.maxAttempts}).`;
                         messageBuffer.addMessage(notice, 'status');
