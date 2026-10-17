@@ -14,21 +14,21 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
  * MAX_PATH. The directory itself is ~200 chars deep on Windows, so pin names stay short: 64 bits of the
  * company hash (a collision only fails closed, because the stored approval names its company). */
 const pinName = (companyId: string) => 'org-' + hash(companyId).slice(0, 16) + '.json';
-const LEGACY_PIN_NAME = /^org-([0-9a-f]{16})[0-9a-f]{48}\.json$/;
+const LEGACY_LONG_NAME = /^(org|assignments)-([0-9a-f]{16})[0-9a-f]{48}\.json$/;
 
-/** CLI ≤ 1.1.10-aplus.338 named pins with the full company hash, ~279 chars deep on every Windows install,
- * which made the next daemon start fail its ACL check as "reapproval required". Rename them before the
- * device directory is checked. A legacy pin that disagrees with an existing short one is left in place
- * (fail closed); its contents are never trusted here, only compared. */
+/** CLI ≤ 1.1.10-aplus.338 named pins and the signed assignment state with the full company hash, ~279 chars
+ * deep on every Windows install, which made the next daemon start fail its ACL check as "reapproval required".
+ * Rename them before the device directory is checked. A legacy file that disagrees with an existing short one
+ * is left in place (fail closed); its contents are never trusted here, only compared. */
 export async function migrateLegacyOrgPinNames(home: string, machineId: string): Promise<void> {
     const directory = join(home, 'device-' + hash(machineId));
     let names: string[];
     try { names = await readdir(directory); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
     for (const name of names) {
-        const short = LEGACY_PIN_NAME.exec(name)?.[1];
-        if (!short) continue;
-        const legacy = join(directory, name), target = join(directory, 'org-' + short + '.json');
+        const match = LEGACY_LONG_NAME.exec(name);
+        if (!match) continue;
+        const legacy = join(directory, name), target = join(directory, match[1] + '-' + match[2] + '.json');
         try { await link(legacy, target); }
         catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
