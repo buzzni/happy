@@ -51,8 +51,12 @@ export interface LessonReviewWorkerDeps {
      * `machineId` is the daemon's real machine, not a placeholder: the binding
      * issuer records it and CML stores it on the trace, so an empty string
      * would attribute every candidate to no machine at all.
+     *
+     * `phase` says whether the caller is still on the turn's path (`prepare`)
+     * or after the turn ended (`finished`), so the host can choose how long a
+     * lease renewal may take.
      */
-    identity(): Promise<{ projectId: string; userId: string; machineId: string } | null>
+    identity(phase: 'prepare' | 'finished'): Promise<{ projectId: string; userId: string; machineId: string } | null>
         | { projectId: string; userId: string; machineId: string } | null;
     /** `reason` names which eligibility rule refused a `not-eligible` turn. */
     onOutcome?(outcome: LessonReviewOutcome, reason?: string): void;
@@ -151,7 +155,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                     logger.debug('[lesson-review-prepare] unsupported');
                     return null;
                 }
-                if (!(await deps.identity())) {
+                if (!(await deps.identity('prepare'))) {
                     logger.debug('[lesson-review-prepare] permission_denied');
                     return null;
                 }
@@ -177,7 +181,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
             let releaseOnAbort: (() => void) | undefined;
             let issued: Awaited<ReturnType<LessonBindingIssuer['issue']>> | undefined;
             try {
-                const identity = await deps.identity();
+                const identity = await deps.identity('finished');
                 if (!identity) return report('permission_denied');
                 const proposalSubmitted = proposal !== undefined && proposal !== null;
                 const decision = evaluateLessonTurn(record, identity.projectId, { agentProposal: proposalSubmitted });
@@ -218,7 +222,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                         if ((await deps.issuer!.resolve(binding)).generation !== plannedRevision) return false;
                         const current = await deps.settings.read();
                         if (!current.reviewEnabled || current.revision !== plannedRevision) return false;
-                        const actor = await deps.identity();
+                        const actor = await deps.identity('finished');
                         return !signal.aborted && actor?.projectId === identity.projectId && actor.userId === identity.userId
                             && actor.machineId === identity.machineId;
                     } catch { return false; }
