@@ -15,6 +15,7 @@ import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { FileLockHeldError, withOwnedFileLock } from './ownedFileLock';
 
 /** The one directory these files live in, under the daemon's home. */
 export const LESSON_SETTINGS_DIR = 'lesson-host';
@@ -166,7 +167,7 @@ export class LessonSettingsError extends Error {
 
 export type LessonSettingsWrite =
     | { ok: true; settings: LessonSettings }
-    | { ok: false; reason: 'revision_conflict' | 'invalid_request' | 'settings_unreadable' | 'runtime_error' };
+    | { ok: false; reason: 'revision_conflict' | 'invalid_request' | 'settings_unreadable' | 'settings_busy' | 'runtime_error' };
 
 export interface LessonSettingsStore {
     read(): Promise<LessonSettings>;
@@ -212,48 +213,48 @@ export function createLessonSettingsStore(path: string): LessonSettingsStore {
                 return { ok: false, reason: 'invalid_request' };
             }
             await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-            let lock: Awaited<ReturnType<typeof open>>;
             try {
-                // Never steal a lock by guessing process liveness; a crashed
-                // lock fails closed, matching the review budget ledger.
-                lock = await open(`${path}.lock`, 'wx', 0o600);
-            } catch {
-                return { ok: false, reason: 'runtime_error' };
-            }
-            let temp: string | undefined;
-            try {
-                let current: LessonSettings;
-                try {
-                    current = await load();
-                } catch (error) {
-                    // Refuse to overwrite a file we could not read: its real
-                    // contents may be stricter than what is being written.
-                    return {
-                        ok: false,
-                        reason: error instanceof LessonSettingsError ? 'settings_unreadable' : 'runtime_error',
-                    };
-                }
-                if (current.revision !== expectedRevision) {
-                    return { ok: false, reason: 'revision_conflict' };
-                }
-                const settings: LessonSettings = { ...next.data, revision: current.revision + 1 };
-                temp = `${path}.${randomUUID()}.tmp`;
-                const file = await open(temp, 'wx', 0o600);
-                try {
-                    await file.writeFile(JSON.stringify(settings));
-                    await file.sync();
-                } finally {
-                    await file.close();
-                }
-                await rename(temp, path);
-                temp = undefined;
-                return { ok: true, settings };
-            } catch {
-                return { ok: false, reason: 'runtime_error' };
-            } finally {
-                if (temp) await unlink(temp).catch(() => {});
-                await lock.close();
-                await unlink(`${path}.lock`).catch(() => {});
+                // A live writer's lock is never taken; one left by a crashed
+                // writer is reclaimed, matching the review budget ledger.
+                return await withOwnedFileLock(`${path}.lock`, async (): Promise<LessonSettingsWrite> => {
+                    let temp: string | undefined;
+                    try {
+                        let current: LessonSettings;
+                        try {
+                            current = await load();
+                        } catch (error) {
+                            // Refuse to overwrite a file we could not read: its real
+                            // contents may be stricter than what is being written.
+                            return {
+                                ok: false,
+                                reason: error instanceof LessonSettingsError ? 'settings_unreadable' : 'runtime_error',
+                            };
+                        }
+                        if (current.revision !== expectedRevision) {
+                            return { ok: false, reason: 'revision_conflict' };
+                        }
+                        const settings: LessonSettings = { ...next.data, revision: current.revision + 1 };
+                        temp = `${path}.${randomUUID()}.tmp`;
+                        const file = await open(temp, 'wx', 0o600);
+                        try {
+                            await file.writeFile(JSON.stringify(settings));
+                            await file.sync();
+                        } finally {
+                            await file.close();
+                        }
+                        await rename(temp, path);
+                        temp = undefined;
+                        return { ok: true, settings };
+                    } catch {
+                        return { ok: false, reason: 'runtime_error' };
+                    } finally {
+                        if (temp) await unlink(temp).catch(() => {});
+                    }
+                });
+            } catch (error) {
+                // Another writer is mid-write, or a lock whose owner cannot be
+                // proven gone: retrying later can succeed, unlike runtime_error.
+                return { ok: false, reason: error instanceof FileLockHeldError ? 'settings_busy' : 'runtime_error' };
             }
         },
     };
