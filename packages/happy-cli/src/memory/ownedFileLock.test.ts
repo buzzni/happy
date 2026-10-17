@@ -111,11 +111,57 @@ describe('withOwnedFileLock', () => {
         expect(await readFile(path, 'utf8')).toBe(other);
     });
 
-    it('lets exactly one contender in when several reclaim the same dead lock at once', async () => {
+    it('sees a live process of another pid as live through its real start time', async () => {
+        const path = await lockPath();
+        const live = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+        try {
+            await new Promise(resolve => live.once('spawn', resolve));
+            const now = Date.now();
+            await writeFile(path, JSON.stringify({ version: 1, pid: live.pid, startedAt: now, token: '22222222-2222-4222-8222-222222222222', acquiredAt: now }));
+            await expect(withOwnedFileLock(path, async () => 'ran', quiet().deps)).rejects.toMatchObject({ holder: 'live' });
+        } finally {
+            live.kill();
+        }
+    });
+
+    it('does not run when its fresh lock was reclaimed before it could record itself', async () => {
+        const path = await lockPath();
+        let release!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        let other: Promise<unknown> | undefined;
+        const stalled: OwnedFileLockDeps = {
+            log: () => {},
+            // Stalls past the ownerless limit; meanwhile another contender reclaims and holds it.
+            onLockCreated: async () => {
+                const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
+                await utimes(path, old, old);
+                let entered!: () => void;
+                const inside = new Promise<void>(resolve => { entered = resolve; });
+                other = withOwnedFileLock(path, async () => { entered(); await held; }, { log: () => {} });
+                await inside;
+            },
+        };
+        let ran = false;
+        await expect(withOwnedFileLock(path, async () => { ran = true; }, stalled)).rejects.toBeInstanceOf(FileLockHeldError);
+        expect(ran).toBe(false);
+        expect(JSON.parse(await readFile(path, 'utf8')).pid).toBe(process.pid);
+        release();
+        await other;
+        expect(await readdir(join(path, '..'))).toEqual([]);
+    });
+
+    it.each([
+        ['an exited owner', async (path: string) => { await writeFile(path, owner(await deadPid())); }],
+        ['an abandoned ownerless (older version)', async (path: string) => {
+            await writeFile(path, '');
+            const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
+            await utimes(path, old, old);
+        }],
+    ])('lets exactly one contender in when several reclaim the lock of %s at once', async (_kind, leave) => {
         const path = await lockPath();
         const counter = join(path, '..', 'counter');
         await writeFile(counter, '0');
-        await writeFile(path, owner(await deadPid()));
+        await leave(path);
         const contenders = 6;
         // Barrier 1: every contender judges the same dead lock stale before anyone reclaims.
         // Barrier 2: only the first goes on; the rest act on that stale judgment once it already

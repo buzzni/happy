@@ -34,6 +34,8 @@ export interface OwnedFileLockDeps {
     log?: (message: string) => void;
     /** Test seam: runs after a contender has judged a lock abandoned, before it reclaims. */
     onStaleJudged?: () => Promise<void>;
+    /** Test seam: runs after the lock file is created, before its owner is recorded. */
+    onLockCreated?: () => Promise<void>;
 }
 
 interface LockOwner { version: 1; pid: number; startedAt: number; token: string; acquiredAt: number }
@@ -78,15 +80,22 @@ async function acquire(path: string, depth: number, deps: OwnedFileLockDeps): Pr
             }
             continue;
         }
+        let ours: boolean;
         try {
+            await deps.onLockCreated?.();
             await file.writeFile(JSON.stringify(owner));
+            // Until the owner is recorded the file looks ownerless. A holder stalled that
+            // long (sleep, SIGSTOP) may have had it reclaimed and replaced; then it is not ours.
+            ours = await stillAt(path, await file.stat());
         } catch (error) {
+            const mine = await file.stat().catch(() => null);
             await file.close().catch(() => {});
-            await unlink(path).catch(() => {});
+            if (mine && await stillAt(path, mine)) await unlink(path).catch(() => {});
             throw error;
         }
         await file.close();
-        return owner;
+        if (ours) return owner;
+        (deps.log ?? logDebug)(`[owned-file-lock] ${path} was reclaimed before its owner was recorded; retrying`);
     }
     throw new FileLockHeldError('contended');
 }
@@ -143,6 +152,11 @@ async function judge(seen: LockSnapshot, deps: OwnedFileLockDeps): Promise<Verdi
     // same wall clock `ps` reports, not the recorded start: that one comes from
     // process.uptime(), which on macOS stops while the machine sleeps.
     return startedAt > owner.acquiredAt + REUSED_PID_SLACK_MS ? { stale: true, why: 'pid-reused' } : { stale: false, holder: 'live' };
+}
+
+async function stillAt(path: string, mine: { ino: number; dev: number }): Promise<boolean> {
+    const there = await stat(path).catch(() => null);
+    return there !== null && there.ino === mine.ino && there.dev === mine.dev;
 }
 
 async function inspect(path: string): Promise<LockSnapshot | null> {
