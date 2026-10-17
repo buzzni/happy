@@ -1101,8 +1101,8 @@ export async function startDaemon(): Promise<void> {
     // Setup state - key by PID
     const pidToTrackedSession = new Map<number, TrackedSession>();
     // aplus-dev-studio strict-followup-plan F2 — a non-forced worktree removal waits for these to leave.
-    worktreeRemovalReservations.setLiveDirectories(() => [...pidToTrackedSession.values()]
-      .map((session) => session.directory ?? session.happySessionMetadataFromLocalWebhook?.path));
+    worktreeRemovalReservations.setLiveSessions(() => [...pidToTrackedSession.values()]
+      .map((session) => ({ pid: session.pid, directory: session.directory ?? session.happySessionMetadataFromLocalWebhook?.path })));
     let writeScopeRuntime: SessionWriteScopeRuntime | null = null;
     /**
      * Generations this daemon launched through the supervisor, by pid.

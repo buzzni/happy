@@ -378,7 +378,7 @@ describe('worktree:remove', () => {
     // ahead, and every removal ends the reservation, also one that finds the worktree already gone.
     it('refuses a non-forced removal while a conversation works inside, and leaves nothing reserved', async () => {
         const { result } = await call('create', create());
-        worktreeRemovalReservations.setLiveDirectories(() => [result.path]);
+        worktreeRemovalReservations.setLiveSessions(() => [{ pid: 1, directory: result.path }]);
         try {
             expect(await call('remove', remove(result.path, { dryRun: true }))).toMatchObject({ success: false, errorCode: 'WORKTREE_IN_USE' });
             expect(await worktreeRemovalReservations.covers(result.path)).toBe(false);
@@ -386,7 +386,7 @@ describe('worktree:remove', () => {
             expect(existsSync(result.path)).toBe(true);
             expect((await call('remove', remove(result.path, { force: true }))).result).toEqual({ outcome: 'removed' });
         } finally {
-            worktreeRemovalReservations.setLiveDirectories(() => []);
+            worktreeRemovalReservations.setLiveSessions(() => []);
         }
     });
 
@@ -868,6 +868,18 @@ describe('worktree:purge-project', () => {
         expect(existsSync(dir)).toBe(true);
         expect(nativeCalls).toEqual([expect.objectContaining({ dryRun: true })]);
         expect(dockerCalls.every((args) => args[0] === 'ps' || (args[0] === 'volume' && args[1] === 'ls'))).toBe(true);
+    });
+
+    // aplus-dev-studio review: the confirm dialog shows what the machine answered. A dry run that already
+    // knows the folder will stay (processes it cannot prove) says so, as the real run would.
+    it('says on a dry run that the folder will stay when processes cannot be proven', async () => {
+        const dir = managedFolder();
+        const { set } = purgeSet({ native: { reason: 'proc-unavailable' } });
+        const answer = await call('purge-project', purge(dir, { dryRun: true }), {}, set);
+        expect(answer.result.outcome).toEqual({ processes: 'proc-unavailable', containers: 'skipped', folder: 'blocked' });
+        expect(existsSync(dir)).toBe(true);
+        const kept = await call('purge-project', purge(dir, { dryRun: true, purgeFolder: false }), {}, set);
+        expect(kept.result.outcome).toEqual({ processes: 'proc-unavailable', containers: 'skipped', folder: 'skipped' });
     });
 
     it('stops the project\'s resources and removes its managed folder', async () => {
