@@ -51,7 +51,7 @@ export async function captureWorkspacePath(allowedRoot: string, workspaceRoot: s
         if (await realpath(root) !== realRoot || await realpath(path) !== realTarget) throw denied();
     };
     await verify();
-    return { path, info: snapshots[snapshots.length - 1].info, verify };
+    return { path, info: snapshots[snapshots.length - 1].info, verify, snapshots, realPath: realTarget };
 }
 
 export async function listWorkspaceDirectory(allowedRoot: string, workspaceRoot: string, path: string) {
