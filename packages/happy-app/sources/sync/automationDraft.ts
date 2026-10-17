@@ -1,13 +1,22 @@
 import type { AutomationPayload, AutomationSchedule } from '@slopus/happy-wire';
 import type { AutomationProject, ServerAutomationItem } from './serverAutomations';
 
+/**
+ * Schedules this editor cannot represent. Editing them here would rewrite them as daily ones,
+ * so they are listed read-only and managed in Desktop (Saycode specs/desktop-schedule-kinds).
+ */
+export type DesktopOnlyScheduleKind = 'github' | 'once' | 'weekly';
+export function isDesktopOnlySchedule(schedule: AutomationSchedule): schedule is Extract<AutomationSchedule, { kind: DesktopOnlyScheduleKind }> {
+    return schedule.kind === 'github' || schedule.kind === 'once' || schedule.kind === 'weekly';
+}
+
 export interface AutomationDraft {
     projectId: string;
     item: ServerAutomationItem | null;
     name: string;
     prompt: string;
     directory: string;
-    scheduleKind: Exclude<AutomationSchedule['kind'], 'github'>;
+    scheduleKind: Exclude<AutomationSchedule['kind'], DesktopOnlyScheduleKind>;
     intervalMinutes: string;
     dailyTime: string;
     scriptCommand: string;
@@ -17,8 +26,11 @@ export interface AutomationDraft {
 
 export function automationDraftFor(project: AutomationProject, item: ServerAutomationItem | null): AutomationDraft {
     const payload = item?.payload;
-    if (payload?.schedule.kind === 'github') {
-        throw new Error('GitHub trigger automations must be edited in Desktop.');
+    const schedule = payload?.schedule;
+    if (schedule && isDesktopOnlySchedule(schedule)) {
+        throw new Error(schedule.kind === 'github'
+            ? 'GitHub trigger automations must be edited in Desktop.'
+            : 'One-time and weekly schedules must be edited in Desktop.');
     }
     return {
         projectId: project.id,
@@ -26,10 +38,10 @@ export function automationDraftFor(project: AutomationProject, item: ServerAutom
         name: payload?.name ?? '',
         prompt: payload?.prompt ?? '',
         directory: payload?.directory ?? project.config?.workspaceDir ?? '',
-        scheduleKind: payload?.schedule.kind ?? 'interval',
-        intervalMinutes: payload?.schedule.kind === 'interval' ? String(payload.schedule.minutes) : '30',
-        dailyTime: payload?.schedule.kind === 'daily'
-            ? `${String(payload.schedule.hour).padStart(2, '0')}:${String(payload.schedule.minute).padStart(2, '0')}`
+        scheduleKind: schedule?.kind ?? 'interval',
+        intervalMinutes: schedule?.kind === 'interval' ? String(schedule.minutes) : '30',
+        dailyTime: schedule?.kind === 'daily'
+            ? `${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`
             : '09:00',
         scriptCommand: payload?.scriptCommand ?? '',
         suppressSilent: payload?.suppressSilent ?? true,
