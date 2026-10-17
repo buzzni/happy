@@ -9,6 +9,7 @@ import {
   computeNextRunAt,
   shouldWakeFromScriptOutput,
   type AutomationAgent,
+  type AutomationSchedule,
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
 import type {
@@ -510,6 +511,17 @@ async function settleReleasedUnreachableRetries(input: ServerAutomationExecutorI
   }
 }
 
+/**
+ * 다시 실행하지 않는 소진된 1회 예약의 nextRunAt. 런타임 상태 파일의 nextRunAt 은 정수로
+ * 남겨야 한다 — 구 데몬 파서는 정수가 아니면 상태 파일 전체를 버려 보류 중인 보고까지 잃는다.
+ * 도달할 수 없는 시각이라 due 판정·claim·재시도 계획이 별도 분기 없이 그대로 동작한다.
+ */
+export const NEVER_RUN_AT = Number.MAX_SAFE_INTEGER
+
+function nextScheduledAt(schedule: AutomationSchedule, from: number): number {
+  return computeNextRunAt(schedule, from) ?? NEVER_RUN_AT
+}
+
 function reconcileSchedules(
   cache: ServerAutomationCacheState,
   state: ServerAutomationRuntimeState,
@@ -532,7 +544,7 @@ function reconcileSchedules(
     byId.set(automation.automationId, {
       automationId: automation.automationId,
       generation: automation.generation,
-      nextRunAt: automation.runRequestedAt ?? computeNextRunAt(
+      nextRunAt: automation.runRequestedAt ?? nextScheduledAt(
         payload.schedule,
         Math.max(now, automation.enabledAt),
       ),
@@ -602,7 +614,7 @@ function advanceSchedule(
     ...state,
     schedules: state.schedules.map((schedule) => schedule.automationId === automationId ? {
       ...schedule,
-      nextRunAt: computeNextRunAt(payload.schedule, now),
+      nextRunAt: nextScheduledAt(payload.schedule, now),
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
     } : schedule),
   })
@@ -889,7 +901,7 @@ function deferInactiveGithubIssueProgressMarkerCleanup(
   deferGithubIssueProgressMarkerCleanup(
     input,
     markers,
-    computeNextRunAt(payload.schedule, input.now),
+    nextScheduledAt(payload.schedule, input.now),
   )
 }
 
@@ -899,7 +911,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
   payload: ServerAutomationPayload,
   githubEnvironment?: { GH_TOKEN: string; GH_REPO: string },
 ): Promise<string | undefined> {
-  const cleanupRetryAt = computeNextRunAt(payload.schedule, input.now)
+  const cleanupRetryAt = nextScheduledAt(payload.schedule, input.now)
   const stale = inactiveGithubIssueProgressMarkersDue(input, automation)
   if (stale.length === 0) return undefined
 
