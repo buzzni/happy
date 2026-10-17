@@ -124,11 +124,46 @@ describe('ClaudeSideQuestionBridge', () => {
     });
 
     it('shouldNotCountMainMessagesSeenOutsideAMeasurementWindow', async () => {
-        const bridge = new ClaudeSideQuestionBridge();
+        let now = 0;
+        const bridge = new ClaudeSideQuestionBridge(() => now);
         bridge.noteMainMessage({ type: 'assistant', message: { id: 'before', usage: { input_tokens: 50, output_tokens: 50 } } });
+        now = 60_000;
         bridge.provide(channelWith({ usage: [usageReply(0, 0, 0, 0), usageReply(10, 10, 0, 0)] }).channel);
 
         expect(await bridge.ask('q')).toMatchObject({ usageQuality: 'exact', usage: { input_tokens: 10, output_tokens: 10 } });
+    });
+
+    it('shouldCallUsageEstimatedRightAfterTheMainConversationMoved', async () => {
+        let now = 0;
+        const bridge = new ClaudeSideQuestionBridge(() => now);
+        // A turn just ended: Claude's own follow-up calls (prompt suggestion) can land in the same totals.
+        bridge.noteMainMessage({ type: 'result', subtype: 'success' });
+        now = 3_000;
+        bridge.provide(channelWith({ usage: [usageReply(0, 0, 0, 0), usageReply(10, 10, 0, 0)] }).channel);
+
+        expect(await bridge.ask('q')).toMatchObject({ usageQuality: 'estimated', usage: { input_tokens: 10, output_tokens: 10 } });
+    });
+
+    it('shouldStillMeasureUsageWhenTheAnswerUsedUpTheQuestionTimeout', async () => {
+        const bridge = new ClaudeSideQuestionBridge();
+        let usageCalls = 0;
+        let afterReadSignalAborted: boolean | undefined;
+        bridge.provide({
+            request: async (request, { signal }) => {
+                if (request.subtype === 'get_usage') {
+                    if (usageCalls++ === 0) return usageReply(0, 0, 0, 0);
+                    afterReadSignalAborted = signal.aborted;
+                    return usageReply(5, 5, 0, 0);
+                }
+                // The answer arrives just after the question window closed.
+                await new Promise((resolve) => setTimeout(resolve, 40));
+                return { response: 'A', synthetic: false };
+            },
+            isTurnInProgress: () => false,
+        });
+
+        expect(await bridge.ask('q', { timeoutMs: 20 })).toMatchObject({ ok: true, usage: { input_tokens: 5, output_tokens: 5 } });
+        expect(afterReadSignalAborted).toBe(false);
     });
 
     it('shouldStillAnswerWhenUsageCannotBeMeasured', async () => {
@@ -254,10 +289,11 @@ describe('createSideQuestionRpcHandler', () => {
         const closed = deps({ gate: () => ({ isClosed: () => true, admit: vi.fn() }) });
         expect(await createSideQuestionRpcHandler(closed)({ question: 'q' })).toEqual({ success: false, error: 'side-question:shutting-down' });
 
-        let admitted = 0;
-        const open = deps({ gate: () => ({ isClosed: () => false, admit: <T,>(work: () => Promise<T>) => { admitted++; return work(); } }) });
+        const kinds: Array<string | undefined> = [];
+        const open = deps({ gate: () => ({ isClosed: () => false, admit: <T,>(work: () => Promise<T>, kind?: 'input' | 'writer') => { kinds.push(kind); return work(); } }) });
         expect(await createSideQuestionRpcHandler(open)({ question: 'q' })).toMatchObject({ success: true });
-        expect(admitted).toBe(1);
+        // Tracked for cleanup, but not as conversation input that would hold off a drain.
+        expect(kinds).toEqual(['writer']);
     });
 
     it('shouldTurnBridgeFailuresIntoCodedErrorsWithTheirDetail', async () => {

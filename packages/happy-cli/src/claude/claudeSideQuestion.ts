@@ -13,6 +13,13 @@ import type { ClaudeUsageLike } from '@/usage/claudeTurnUsage';
 
 export const SIDE_QUESTION_MAX_CHARS = 8000;
 export const SIDE_QUESTION_TIMEOUT_MS = 100_000;
+/** 답을 받은 뒤의 사용량 읽기는 답 시간과 별개로 짧게 기다린다 — 답 직후 시간이 다 돼 계량이 빠지지 않게. */
+const USAGE_READ_TIMEOUT_MS = 10_000;
+/**
+ * 본 대화가 이만큼 안에 움직였으면 Claude 의 턴 뒤 보조 호출(추천 질문 생성 등)이 같은 누적에
+ * 섞였을 수 있어 'estimated' 로 표시한다.
+ */
+const RECENT_MAIN_ACTIVITY_MS = 15_000;
 
 /** 실행 중인 query 에서 곁질문에 필요한 두 가지. */
 export type ClaudeSideQuestionChannel = {
@@ -95,6 +102,9 @@ export class ClaudeSideQuestionBridge {
     private inFlight = false;
     /** 측정 구간 동안 본 턴 assistant 메시지별 마지막 usage (스트리밍 조각은 같은 id 로 온다). */
     private observedMain: Map<string, ClaudeUsageLike> | null = null;
+    private lastMainActivityAt = Number.NEGATIVE_INFINITY;
+
+    constructor(private readonly now: () => number = Date.now) {}
 
     provide(channel: ClaudeSideQuestionChannel): void {
         this.channel = channel;
@@ -106,6 +116,7 @@ export class ClaudeSideQuestionBridge {
 
     /** 원격 런처의 onMessage 가 본 턴 메시지마다 부른다. 측정 중이 아니면 아무것도 하지 않는다. */
     noteMainMessage(message: unknown): void {
+        this.lastMainActivityAt = this.now();
         if (!this.observedMain) return;
         const body = message as { type?: unknown; uuid?: unknown; message?: { id?: unknown; usage?: unknown } };
         if (body?.type !== 'assistant' || !body.message?.usage || typeof body.message.usage !== 'object') return;
@@ -126,7 +137,7 @@ export class ClaudeSideQuestionBridge {
         this.observedMain = observed;
         try {
             const before = await this.readUsage(channel, signal);
-            let overlapped = channel.isTurnInProgress();
+            let overlapped = channel.isTurnInProgress() || this.now() - this.lastMainActivityAt < RECENT_MAIN_ACTIVITY_MS;
             let response: unknown;
             try {
                 response = await channel.request({ subtype: 'side_question', question }, { signal });
@@ -136,7 +147,7 @@ export class ClaudeSideQuestionBridge {
                     : { ok: false, error: 'failed', detail: errorText(error) };
             }
             overlapped ||= channel.isTurnInProgress();
-            const after = before ? await this.readUsage(channel, signal) : null;
+            const after = before ? await this.readUsage(channel, AbortSignal.timeout(USAGE_READ_TIMEOUT_MS)) : null;
             const body = response as { response?: unknown; synthetic?: unknown } | null;
             const answer = typeof body?.response === 'string' ? body.response.trim() : '';
             if (!answer) return { ok: false, error: 'failed', detail: 'empty side question answer' };
@@ -197,7 +208,7 @@ export type SideQuestionRpcReply =
     }
     | { success: false; error: string };
 
-type DrainGate = { isClosed(): boolean; admit<T>(work: () => Promise<T>): Promise<T> };
+type DrainGate = { isClosed(): boolean; admit<T>(work: () => Promise<T>, kind?: 'input' | 'writer'): Promise<T> };
 
 export function createSideQuestionRpcHandler(deps: {
     bridge: Pick<ClaudeSideQuestionBridge, 'ask'>;
@@ -239,6 +250,8 @@ export function createSideQuestionRpcHandler(deps: {
                 model: outcome.model,
             };
         };
-        return gate ? gate.admit(run) : run();
+        // Tracked so loop cleanup waits for it, but as a writer: it adds no input to the
+        // conversation, so a pending side question must not hold off a standalone drain.
+        return gate ? gate.admit(run, 'writer') : run();
     };
 }
