@@ -28,6 +28,7 @@ import type { AutomationMcpCallerGrantResult } from './automationMcpCallerGrant'
 import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
 import { MAX_WORKTREE_CLEANUP_ATTEMPTS } from './worktreeCleanupGiveUp'
+import { AGENT_TASK_CLIENT_SCRIPT } from './agentTaskClientScript'
 import { buildSandboxRuntimeConfig } from '@/sandbox/config'
 
 function cacheRecord(generation = 2, migrationPending = false) {
@@ -2320,10 +2321,10 @@ describe('runServerAutomationTick', () => {
     expect(bodyLine).toMatch(/closing keyword/i)
     expect(spawned.initialPrompt).toContain('"fixBranch"')
     expect(spawned.initialPrompt).toContain('"fixPrUrl"')
-    expect(spawned.initialPrompt).toContain('Retry network failures and 5xx responses')
+    expect(spawned.initialPrompt).toContain('retries network failures and 5xx with the same idempotencyKey')
     // 2026-09-12 프로덕션 — 워커가 urlopen 에 timeout 을 주지 않아 stalled 연결에서
-    // 영원히 블록됐고, 결과 제출(HTTP 200) 뒤에도 세션이 24시간 살아 있었다. 지시에
-    // 없으면 워커는 timeout 을 쓰지 않는다.
+    // 영원히 블록됐고, 결과 제출(HTTP 200) 뒤에도 세션이 24시간 살아 있었다. timeout 은
+    // 이제 클라이언트가 건다 (agentTaskClientScript.test.ts).
     expect(spawned.initialPrompt).toMatch(/timeout/i)
     expect(spawned.initialPrompt).not.toContain('claim-secret')
     expect(spawned.initialPrompt).not.toContain('complete-secret')
@@ -2930,8 +2931,17 @@ describe('runServerAutomationTick', () => {
       // 조립했고, 리뷰 본문의 따옴표·백틱·$ 가 보간을 타며 본문이 깨졌다. 바로 다음
       // 줄의 "4xx 는 재시도하지 말라" 규칙까지 정확히 지켜 조용히 끝났다.
       // 제출 방법을 못박아 셸을 경유하지 않게 한다.
-      expect(spawned.initialPrompt).toContain('--data-binary @')
-      expect(spawned.initialPrompt).toMatch(/never (build|assemble).*(shell|inline)|do not .*inline .*-d/i)
+      expect(spawned.initialPrompt).toMatch(/never build the JSON inline in a shell argument/i)
+      // 2026-10-17 프로덕션 — 봉투 필드를 글로만 적어 두자 워커 4건이 결과 JSON 만 보내
+      // /complete 가 400 UNSUPPORTED_VERSION 으로 거절됐다. 봉투는 데몬이 넘긴
+      // 클라이언트가 채우고, 워커는 result 파일 경로만 넘긴다.
+      expect(spawnedEnvironment.APLUS_AGENT_TASK_CLIENT).toBe(AGENT_TASK_CLIENT_SCRIPT)
+      expect(spawned.initialPrompt).toContain('sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task complete <path-to-result.json>')
+      expect(spawned.initialPrompt).toContain('sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task start')
+      expect(spawned.initialPrompt).not.toMatch(/version=1, token=/)
+      // sh 가 없는 워커(Windows)는 클라이언트를 못 쓴다. 그때 받는 봉투도 version 을 빠뜨리지 않는다.
+      const fallbackLine = spawned.initialPrompt.split('\n').find((line) => line.startsWith('Only if no POSIX sh is available'))
+      expect(fallbackLine).toContain('{"version":1,"token":"<token>"')
       // 4xx 는 재시도로 풀리지 않지만 조용히 끝나서도 안 된다. 이번 사고에서 400 은
       // 워커 세션 안에서만 보였고 서버·데몬 로그에는 아무 흔적이 없었다.
       expect(spawned.initialPrompt).toMatch(/4xx.*status code and response body/i)
@@ -2939,8 +2949,8 @@ describe('runServerAutomationTick', () => {
     // /fail 을 불러 task 를 failed 로 닫았다. pr_review 는 maxAttempts 1 이고 dedupe 가
     // cycle-1 이라 그 PR 은 다시 리뷰되지 않았다. 지시가 워커에게 자기 작업을 파괴하게
     // 시킨 것이다 — 결과가 유효하면 /fail 은 하지 말아야 한다.
-    expect(spawned.initialPrompt).toMatch(/do not POST \/fail (if|when) (the )?(work|result)/i)
-    const failLine = spawned.initialPrompt.split('\n').find((line) => line.startsWith('POST /fail'))
+    expect(spawned.initialPrompt).toMatch(/do not run fail (if|when) (the )?(work|result)/i)
+    const failLine = spawned.initialPrompt.split('\n').find((line) => line.startsWith('Run sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task fail'))
     expect(failLine).toMatch(/only when you could not produce a result/i)
       if (taskType === 'pr_review.v1') {
         // 2026-09-01 검증 — 리뷰 워커가 대상 SHA worktree 에서 돌기 시작하자 그 다음

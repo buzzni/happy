@@ -30,6 +30,7 @@ import {
   readWorkspaceHeadSha,
 } from './agentTaskReviewObjects'
 import { shouldGiveUpWorktreeCleanup } from './worktreeCleanupGiveUp'
+import { AGENT_TASK_CLIENT_SCRIPT } from './agentTaskClientScript'
 import type { GithubTriggerWorktreePlan } from './githubTriggerWorktree'
 import type {
   AutomationAgentTaskDispatch,
@@ -353,9 +354,22 @@ function buildAgentTaskPrompt(
       ? ['', AGENT_TASK_QUALITY_CONTRACTS[dispatch.type]]
       : []),
     '',
-    'Use APLUS_AGENT_TASK_URL and the capability environment variables. Never print or echo the token values.',
-    '1. POST $APLUS_AGENT_TASK_URL/$APLUS_AGENT_TASK_ID/start with version=1, token=$APLUS_AGENT_TASK_CLAIM_TOKEN, agentRunId=$APLUS_AGENT_TASK_RUN_ID, and a stable idempotencyKey.',
-    '2. Keep the lease alive while working by POSTing /heartbeat at least every 30 seconds with the claim token.',
+    // 2026-10-17 프로덕션 — 봉투 필드를 글로 적어 두기만 하자 워커 4건이 결과 JSON 만
+    // 보내 /complete 가 400 UNSUPPORTED_VERSION 으로 거절됐다. 봉투는 클라이언트가
+    // 채운다 (agentTaskClientScript.ts).
+    'Send every protocol call with the AgentTask client: sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task <action>.'
+      + ' It fills version, token, agentRunId, and a stable idempotencyKey from the capability environment variables,'
+      + ' sends with a timeout, and retries network failures and 5xx with the same idempotencyKey.'
+      + ' Never build protocol request bodies or curl calls yourself, and never print or echo the token values.',
+    // Windows 데몬도 자동화를 돌린다. POSIX sh 가 없는 워커는 클라이언트를 못 쓰므로,
+    // 그때만 봉투를 글자 그대로 적어 준다 — 필드 이름이 아니라 모양 전체를 준다.
+    'Only if no POSIX sh is available (for example Windows without Git Bash), send each call yourself:'
+      + ' POST $APLUS_AGENT_TASK_URL/$APLUS_AGENT_TASK_ID/<action> with the body read from a file, a 30-second timeout,'
+      + ' and the retry rules below. The body must be exactly {"version":1,"token":"<token>","agentRunId":"<APLUS_AGENT_TASK_RUN_ID>",'
+      + '"idempotencyKey":"<APLUS_AGENT_TASK_RUN_ID>:<action>"} plus "result":<result object> for complete or "reason":"..." for fail;'
+      + ' <token> is APLUS_AGENT_TASK_CLAIM_TOKEN for start and heartbeat and APLUS_AGENT_TASK_COMPLETE_TOKEN for complete and fail.',
+    '1. Start: sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task start',
+    '2. Keep the lease alive while working by running sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task heartbeat at least every 30 seconds.',
     // 2026-09-01 프로덕션 — worktree 를 받고도 vitest 를 못 찾아 검사를 전부 포기했다.
     // 이유는 워커가 지시를 정확히 지켰기 때문이다: "PR review is read-only" 라고만
     // 하면 빈 worktree 에 의존성을 설치해도 되는지 알 수 없다. 무엇이 금지인지를
@@ -367,35 +381,33 @@ function buildAgentTaskPrompt(
       + ' targeted checks, and if the install fails record the affected check as not_run with the reason instead of dropping it.'
       + ' Before review_apply, verify the PR is open and current HEAD equals reviewedHeadSha; otherwise return stale/failed'
       + ' without mutating. review_apply may then edit, test, commit to its review-fix branch, push it, and open the stacked pull request; testing runs checks only.',
-    `4. Complete with exactly this result shape: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
-    '5. POST /complete with version=1, token=$APLUS_AGENT_TASK_COMPLETE_TOKEN, agentRunId, a stable idempotencyKey, and result.',
+    `4. Write the result, exactly this shape and nothing around it, to a JSON file: ${AGENT_TASK_RESULT_CONTRACTS[dispatch.type]}`,
+    '5. Submit it: sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task complete <path-to-result.json>'
+      + ' — the client wraps the file in the protocol envelope; do not add version, token, or other envelope fields to it.',
     // 2026-08-31 프로덕션 — pr_review 워커가 리뷰를 끝내고도 결과를 제출하지 못했다.
     // 지시가 "POST ... and result" 뿐이라 워커가 셸에서 JSON 을 조립했고, 리뷰 본문의
     // 따옴표·백틱·$ 가 보간을 타며 본문이 깨져 400 이 났다. 바로 아래 "4xx 는 재시도
     // 금지" 규칙까지 정확히 지켜 조용히 끝났다 — 워커 잘못이 아니라 방법을 안 정해준
     // 탓이다. 리뷰 본문은 임의의 코드 조각을 담으므로 셸을 거치면 언제든 깨진다.
-    'Write every request body to a file and send it with curl --data-binary @<file>'
-      + ' (or an equivalent that reads the file directly). Never build the JSON inline in a'
-      + ' shell argument such as -d \'{...}\' — findings quote code, so backticks, quotes,'
-      + ' and $ get interpolated and the body arrives corrupted.',
-    'Retry network failures and 5xx responses with the same idempotencyKey; do not retry 4xx responses.',
+    // 봉투는 이제 클라이언트가 만들지만 result 파일은 여전히 워커가 쓴다.
+    'Write the result file with your file-editing tool (or another method that writes the text verbatim).'
+      + ' Never build the JSON inline in a shell argument such as echo \'{...}\' — findings quote code,'
+      + ' so backticks, quotes, and $ get interpolated and the result arrives corrupted.',
     // 2026-09-12 프로덕션 — 워커가 /complete 를 보낸 python 이 urlopen 에 timeout 을
     // 주지 않아, 결과가 HTTP 200 으로 접수된 뒤에도 stalled 연결에서 영원히 블록됐다.
-    // 그 명령이 끝나지 않으니 턴도 세션도 끝나지 않아 24시간을 붙들고 있었다. 지시에
-    // 없으면 워커는 timeout 을 쓰지 않는다 — urllib 도 curl 도 기본값이 무제한이다.
-    'Give every one of these HTTP calls an explicit timeout (curl --max-time 30, or the'
-      + ' timeout argument of whatever client you use) — a stalled connection otherwise blocks'
-      + ' the command forever and the session can never finish.',
+    // 그 timeout(curl --max-time 30)과 5xx 재시도는 이제 클라이언트가 건다.
+    'If the client still reports a network failure or 5xx after its own retries, run the same command again;'
+      + ' it reuses the same idempotencyKey. Do not retry 4xx responses.',
     // 손상된 본문은 재시도로 풀리지 않지만, 조용히 끝나서도 안 된다. 4xx 를 만나면
     // 상태 코드와 응답 본문을 남겨 왜 제출이 실패했는지 사람이 볼 수 있게 한다.
     // 2026-09-03 프로덕션 — 워커가 리뷰를 끝내고 /complete 에서 409 를 받자 이 지시대로
     // /fail 을 불러 task 를 failed 로 닫았다. pr_review 는 maxAttempts 1 이고 dedupe 가
     // cycle-1 이라 그 PR 은 다시 리뷰되지 않았다. /fail 은 "결과를 못 만들었다" 는 뜻이지
     // "제출이 막혔다" 는 뜻이 아니다 — 둘을 섞으면 끝낸 작업을 워커가 스스로 파괴한다.
-    'If /complete returns 4xx, report the status code and response body in your final message and stop.'
-      + ' Do not POST /fail when the work finished and only the submission was refused — that discards a'
+    'If complete reports HTTP 4xx, report the status code and response body in your final message and stop.'
+      + ' Do not run fail when the work finished and only the submission was refused — that discards a'
       + ' completed result the task cannot produce again. Leave the task for the server to reconcile.',
-    'POST /fail with the complete token and a concise reason only when you could not produce a result at all.'
+    'Run sh -c "$APLUS_AGENT_TASK_CLIENT" agent-task fail "<concise reason>" only when you could not produce a result at all.'
       + ' Do not put capabilities in output, commits, or PR text.',
   ].join('\n')
 }
@@ -1437,6 +1449,7 @@ async function executeStartedRun(
         APLUS_AGENT_TASK_RUN_ID: bridged.dispatch.agentRunId,
         APLUS_AGENT_TASK_CLAIM_TOKEN: bridged.dispatch.claimToken,
         APLUS_AGENT_TASK_COMPLETE_TOKEN: bridged.dispatch.completeToken,
+        APLUS_AGENT_TASK_CLIENT: AGENT_TASK_CLIENT_SCRIPT,
       }
     } else {
       if (!planned.event) {
