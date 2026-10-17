@@ -1,0 +1,192 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { claudeRemoteLauncher } from './claudeRemoteLauncher';
+import type { Session } from './session';
+import type { EnhancedMode } from './loop';
+import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { hashObject } from '@/utils/deterministicJson';
+import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
+
+vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
+    ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
+    query: vi.fn(),
+}));
+vi.mock('./utils/claudeCheckSession', () => ({ claudeCheckSession: () => true }));
+// Real ladder, test-sized waits. `delay` is read when a test configures it.
+const ladder = vi.hoisted(() => ({ delays: [20, 20, 20, 20, 20] as number[] }));
+vi.mock('./claudeTransientRetry', async (original) => {
+    const actual = await original<typeof import('./claudeTransientRetry')>();
+    return { ...actual, get CLAUDE_TRANSIENT_RETRY_DELAYS_MS() { return ladder.delays; } };
+});
+
+afterEach(() => {
+    ladder.delays = [20, 20, 20, 20, 20];
+    vi.clearAllMocks();
+});
+
+const MODE: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Shapes the bundled CLI produced against a server answering 503 (specs/claude-transient-retry).
+const apiErrorMessage = { type: 'assistant', uuid: 'api-error', session_id: 'claude-1', parent_tool_use_id: null,
+    error: 'server_error', is_api_error_message: true,
+    message: { id: 'synthetic', role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'API Error: 503 boom' }],
+        usage: { input_tokens: 0, output_tokens: 0 } } };
+const failedResult = (uuid: string) => ({ type: 'result', subtype: 'success', is_error: true, api_error_status: 503, api_error: null,
+    terminal_reason: 'api_error', result: 'API Error: 503 boom', total_cost_usd: 0, num_turns: 1, duration_ms: 10,
+    usage: { input_tokens: 0, output_tokens: 0 }, uuid, session_id: 'claude-1' });
+const answer = (id: string) => ({ type: 'assistant', uuid: `uuid-${id}`, session_id: 'claude-1', parent_tool_use_id: null,
+    message: { id, role: 'assistant', model: 'claude-sonnet-5', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 5, output_tokens: 3 } } });
+const okResult = (uuid: string) => ({ type: 'result', subtype: 'success', is_error: false, result: 'hi', uuid, session_id: 'claude-1',
+    total_cost_usd: 0.001, num_turns: 1, duration_ms: 10, usage: { input_tokens: 5, output_tokens: 3 } });
+
+type Step = (prompt: string, index: number) => Promise<'fail' | 'answer' | 'answer-then-fail'>;
+
+/**
+ * Runs the real launcher against a scripted provider. `step` decides each turn's outcome and
+ * may act on the session meanwhile; the launcher is ended with `switch` once `done` resolves.
+ */
+async function runLauncher(step: Step, done: (prompts: string[]) => boolean, settleMs = 0) {
+    const queue = new MessageQueue2<EnhancedMode>(hashObject);
+    const handlers = new Map<string, () => Promise<unknown>>();
+    const agentState: Record<string, unknown> = {};
+    const client = {
+        sessionId: 'happy-session-1',
+        rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+        updateAgentState: vi.fn((update: (current: Record<string, unknown>) => Record<string, unknown>) => {
+            Object.assign(agentState, update({ ...agentState }));
+        }),
+        updateMetadata: vi.fn(), getMetadata: () => ({}),
+        sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+        setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+        applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        failClaudeLaunchTurn: vi.fn(),
+    };
+    const sendSessionNotification = vi.fn();
+    const prompts: string[] = [];
+    let generations = 0;
+    vi.mocked(query).mockImplementation(({ prompt }) => {
+        generations += 1;
+        const response = (async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                const content = message.message.content;
+                prompts.push(typeof content === 'string' ? content : JSON.stringify(content));
+                const outcome = await step(prompts.at(-1)!, prompts.length - 1);
+                if (outcome === 'answer-then-fail') yield answer(`partial-${prompts.length}`);
+                if (outcome !== 'answer') {
+                    yield apiErrorMessage;
+                    yield failedResult(`result-${prompts.length}`);
+                } else {
+                    yield answer(`msg-${prompts.length}`);
+                    yield okResult(`result-${prompts.length}`);
+                }
+                if (done(prompts)) {
+                    await sleep(settleMs);
+                    void handlers.get('switch')!();
+                    return;
+                }
+            }
+        })();
+        return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+    });
+    queue.push('hello', MODE);
+    const session: Record<string, unknown> = {
+        lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+        cancelLessonReview: vi.fn(), onAbort: vi.fn(),
+        sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+        api: { push: () => ({ sendSessionNotification }) },
+        consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+    };
+    const run = claudeRemoteLauncher(session as unknown as Session);
+    return { run, queue, handlers, client, agentState, prompts, sendSessionNotification, generations: () => generations };
+}
+
+const retryStates = (client: { updateAgentState: ReturnType<typeof vi.fn> }) =>
+    client.updateAgentState.mock.calls
+        .map(([update]) => (update as (current: Record<string, unknown>) => Record<string, unknown>)({}))
+        .filter((state) => 'transientRetry' in state)
+        .map((state) => state.transientRetry as { attempt: number } | null);
+
+describe('Claude transient API failure retry in the remote launcher (specs/claude-transient-retry)', () => {
+    it('asks the same conversation again after a 503 that produced nothing, without resending the request', async () => {
+        const harness = await runLauncher(async (_prompt, index) => index < 2 ? 'fail' : 'answer', (prompts) => prompts.length === 3);
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['hello', CLAUDE_TRANSIENT_CONTINUE_PROMPT, CLAUDE_TRANSIENT_CONTINUE_PROMPT]);
+        // Same provider process and conversation: a retry is not a restart.
+        expect(harness.generations()).toBe(1);
+        expect(retryStates(harness.client)).toEqual([
+            expect.objectContaining({ provider: 'claude', attempt: 1, maxAttempts: 5, reason: 'server_error', status: 503 }),
+            null,
+            expect.objectContaining({ attempt: 2 }),
+            null,
+        ]);
+        expect(harness.client.sendSessionEvent).toHaveBeenCalledWith({
+            type: 'message', message: expect.stringContaining('retrying automatically'),
+        });
+        // A failed attempt with a retry waiting is not "done"; only the answered turn notifies.
+        expect(harness.sendSessionNotification).toHaveBeenCalledTimes(1);
+        // Cost: the failed attempts carry zero usage and the answer is reported once with its own.
+        expect(harness.client.applyClaudeTurnResult.mock.calls.map(([result]) => (result as { usage: unknown }).usage)).toEqual([
+            { input_tokens: 0, output_tokens: 0 }, { input_tokens: 0, output_tokens: 0 }, { input_tokens: 5, output_tokens: 3 },
+        ]);
+    });
+
+    it('lets a message the user sends during the wait replace the retry', async () => {
+        ladder.delays = [5_000];
+        let queueRef: MessageQueue2<EnhancedMode> | null = null;
+        const harness = await runLauncher(async (_prompt, index) => {
+            if (index === 0) {
+                setTimeout(() => queueRef!.push('actually, do this instead', MODE), 30);
+                return 'fail';
+            }
+            return 'answer';
+        }, (prompts) => prompts.length === 2);
+        queueRef = harness.queue;
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['hello', 'actually, do this instead']);
+        expect(retryStates(harness.client)).toEqual([expect.objectContaining({ attempt: 1 }), null]);
+    });
+
+    it('sends only the user message when it is queued as the retry falls due', async () => {
+        // Barrier: the retry is due immediately and the user message is already waiting.
+        ladder.delays = [0];
+        let queueRef: MessageQueue2<EnhancedMode> | null = null;
+        const harness = await runLauncher(async (_prompt, index) => {
+            if (index === 0) {
+                queueRef!.push('queued while failing', MODE);
+                return 'fail';
+            }
+            // Room for a stray retry to arrive before the launcher is ended.
+            await sleep(50);
+            return 'answer';
+        }, (prompts) => prompts.length === 2);
+        queueRef = harness.queue;
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['hello', 'queued while failing']);
+    });
+
+    it('drops a waiting retry when the user stops the session', async () => {
+        ladder.delays = [100];
+        const harness = await runLauncher(async () => 'fail', () => false);
+        await vi.waitFor(() => expect(retryStates(harness.client)).toHaveLength(1));
+        await harness.handlers.get('abort')!();
+        await sleep(200);
+        await harness.handlers.get('switch')!();
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['hello']);
+        expect(retryStates(harness.client).at(-1)).toBeNull();
+    });
+
+    it('does not retry a turn that already answered before the API failed', async () => {
+        const harness = await runLauncher(async () => 'answer-then-fail', (prompts) => prompts.length === 1, 100);
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['hello']);
+        expect(retryStates(harness.client)).toEqual([]);
+    });
+});

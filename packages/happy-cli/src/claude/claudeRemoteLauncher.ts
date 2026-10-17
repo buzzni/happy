@@ -56,6 +56,11 @@ interface PermissionsField {
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
 import { createSetupTokenAccountSwitching, CONTINUE_PROMPT } from './setupTokenAccountSwitching';
 import { reportSetupTokenUsage, requestSetupTokenRebind } from '@/daemon/controlClient';
+import {
+    CLAUDE_TRANSIENT_CONTINUE_PROMPT,
+    CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
+    createClaudeTransientRetry,
+} from './claudeTransientRetry';
 import { SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
@@ -132,6 +137,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     async function abort() {
         session.cancelLessonReview();
+        // Stop means stop: a retry waiting to fire must not restart the work (and exit/switch end it too).
+        transientRetry.cancel();
         if (abortController && !abortController.signal.aborted) {
             /*
              * Recorded before the abort, not after. A provider that handles
@@ -300,6 +307,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let lastResultSucceeded = true;
     /** The drain reads it: after its interrupt Claude Code exits 1, which only an interrupted turn explains. */
     let lastResultInterrupted = false;
+    /*
+     * Saycode specs/claude-transient-retry — a turn a temporary API failure ended before it produced
+     * anything is asked again after a short wait, unless the user acts first. Survives provider
+     * restarts: a checkpoint-protected session ends its provider at every turn.
+     */
+    const transientRetry = createClaudeTransientRetry<{ mode: EnhancedMode; hash: string | null }>({
+        delaysMs: CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
+        onState: (state) => session.client.updateAgentState((current) => ({ ...current, transientRetry: state })),
+    });
+    /** Whether the last turn was a slash command: a note in its place would not re-run it. */
+    let lastTurnCommand = false;
+    const isCommandText = (content: unknown) => typeof content === 'string' && /^\/\S/.test(content.trimStart());
     let ongoingToolCalls = new Map<string, { parentToolCallId: string | null }>();
     let notifiedQuestionToolCalls = new Set<string>();
 
@@ -337,6 +356,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     function onMessage(message: SDKMessage) {
         sideQuestion.noteMainMessage(message);
+        transientRetry.observe(message);
         if ((message as { type?: unknown }).type === 'rate_limit_event') {
             setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
         }
@@ -767,6 +787,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // becomes the running turn.
                             messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
                             lastTurnChannel = Boolean(p.channelRequestId);
+                            lastTurnCommand = isCommandText(p.message);
+                            transientRetry.userTurnStarted();
                             // This message starts the new provider. Seed its comparison
                             // baseline too, or the next model/effort change is missed.
                             modeHash = p.hash;
@@ -824,10 +846,41 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // never started, nothing reads it.
                             if (proof) proof.inputExhausted = true;
                             exitReason = 'exit';
+                            transientRetry.cancel();
                             return null;
                         }
 
-                        let msg = await session.queue.waitForMessagesAndGetAsString(controller.signal, drain ? () => drain.claimTurn() : undefined);
+                        /*
+                         * Waits for the user and, alongside, for a retry to fall due
+                         * (specs/claude-transient-retry). Whatever comes first wins: a
+                         * queued message is collected before a due retry is looked at, so
+                         * the two never both go out.
+                         */
+                        let msg: Awaited<ReturnType<typeof session.queue.waitForMessagesAndGetAsString>>;
+                        while (true) {
+                            const retryWake = transientRetry.waitSignal();
+                            msg = await session.queue.waitForMessagesAndGetAsString(
+                                retryWake ? AbortSignal.any([controller.signal, retryWake]) : controller.signal,
+                                drain ? () => drain.claimTurn() : undefined,
+                            );
+                            if (msg || !retryWake || controller.signal.aborted) break;
+                            const due = transientRetry.takeDue();
+                            // Cancelled rather than due: keep waiting for the user.
+                            if (!due) continue;
+                            if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
+                            messageQueue.enqueue(pendingRequestItem(null));
+                            lastTurnChannel = false;
+                            lastTurnCommand = false;
+                            // The failed turn's own settings, unchanged — no provider restart.
+                            mode = due.mode.mode;
+                            modeHash = due.mode.hash ?? modeHash;
+                            permissionHandler.handleModeChange(mode.permissionMode);
+                            logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
+                            dispatchTurn();
+                            return { message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode };
+                        }
+                        // The user's own input replaces a waiting retry.
+                        if (msg) transientRetry.userTurnStarted();
                         if (msg === null && gracefulStop?.requested() && !controller.signal.aborted) {
                             /*
                              * Woken by the stop rather than aborted — and the
@@ -882,6 +935,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // inherits an id.
                             messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
                             lastTurnChannel = Boolean(msg.channelRequestId);
+                            lastTurnCommand = isCommandText(msg.message);
                             permissionHandler.handleModeChange(mode.permissionMode);
                             const latency = toTurnLatency(msg);
 
@@ -1027,7 +1081,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     claudeArgs: session.claudeArgs,
                     onMessage,
                     onAiAuthObservationReady: (observation) => { aiAuthObservation = observation; },
-                    onStreamEvent: streamRelay.handleStreamEvent,
+                    onStreamEvent: (message) => {
+                        transientRetry.observe(message);
+                        streamRelay.handleStreamEvent(message);
+                    },
                     onTurnLatency: (diagnostic) => session.client.sendTurnLatency(diagnostic),
                     onCompletionEvent: (message: string) => {
                         logger.debug(`[remote]: Completion event: ${message}`);
@@ -1044,7 +1101,21 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // turn that has not received its text yet, and the later flush opens a
                         // second, unrelated one.
                         messageQueue.enqueue(turnEndItem(lastResultSucceeded ? 'completed' : 'failed'));
-                        if (!pending && session.queue.size() === 0) {
+                        const turnMode = mode ?? lastTurnMode;
+                        // Channel requests are terminal after their turn; a managed or run-once turn
+                        // answers only its admitted prompt; a note in its place cannot re-run a command.
+                        const retry = transientRetry.afterTurn(turnMode && !lastTurnChannel && !lastTurnCommand
+                            && !session.managedRun && !session.exitAfterFirstTurn && !controller.signal.aborted
+                            ? { mode: turnMode, hash: modeHash } : null);
+                        if (retry) {
+                            const notice = retry.kind === 'scheduled'
+                                ? `Temporary API error${retry.state.status === null ? '' : ` (${retry.state.status})`} — retrying automatically in ${Math.round((retry.state.retryAt - retry.state.scheduledAt) / 1000)}s (${retry.state.attempt}/${retry.state.maxAttempts}). Send a message or stop to cancel.`
+                                : `Automatic retry gave up after ${retry.maxAttempts} attempts — the API is still unavailable.`;
+                            messageBuffer.addMessage(notice, 'status');
+                            session.client.sendSessionEvent({ type: 'message', message: notice });
+                        }
+                        // Not done while a retry waits: the turn will be answered after all.
+                        if (retry?.kind !== 'scheduled' && !pending && session.queue.size() === 0) {
                             // Same reason as the question notification above.
                             // This one matters more: `onReady` fires on ANY SDK
                             // result and fires *after* the turn finished, so a
@@ -1189,6 +1260,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
         activeInputSender = null;
         streamRelay.dispose();
+        // Nothing will run it now; a state left behind would show a countdown to nothing.
+        transientRetry.cancel();
 
         // Clean up permission handler
         permissionHandler.reset();
