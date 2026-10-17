@@ -83,14 +83,16 @@ describe('withOwnedFileLock', () => {
         await expect(withOwnedFileLock(path, async () => 'ran', late)).rejects.toMatchObject({ holder: 'live' });
     });
 
-    it('keeps a live pid it cannot verify until the lock is long abandoned', async () => {
+    it('never takes a live owner\'s lock whose start time it cannot verify, however old the lock', async () => {
         const path = await lockPath();
         await writeFile(path, owner(4242));
         const { deps } = quiet({ isAlive: () => true, getProcessStartedAt: () => undefined });
         await expect(withOwnedFileLock(path, async () => 'ran', deps)).rejects.toMatchObject({ holder: 'unverified' });
+        // A live owner may only be stalled (sleep, SIGSTOP); age alone never proves it gone.
         const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
         await utimes(path, old, old);
-        expect(await withOwnedFileLock(path, async () => 'ran', deps)).toBe('ran');
+        await expect(withOwnedFileLock(path, async () => 'ran', deps)).rejects.toMatchObject({ holder: 'unverified' });
+        expect(await readFile(path, 'utf8')).toBe(owner(4242));
     });
 
     it('treats an ownerless (older version) lock as busy until it is ten minutes old', async () => {
@@ -124,30 +126,45 @@ describe('withOwnedFileLock', () => {
         }
     });
 
-    it('does not run when its fresh lock was reclaimed before it could record itself', async () => {
+    it('never lets a reclaimer remove a lock its holder made its own after the reclaim was confirmed', async () => {
+        // The order a stall exposes: A creates the lock and stalls past the ownerless limit; B takes
+        // the reclaim guard and confirms the lock unchanged; A records itself and starts working;
+        // only then does B remove the lock and take it again.
         const path = await lockPath();
-        let release!: () => void;
-        const held = new Promise<void>(resolve => { release = resolve; });
-        let other: Promise<unknown> | undefined;
-        const stalled: OwnedFileLockDeps = {
+        const counter = join(path, '..', 'counter');
+        await writeFile(counter, '0');
+        let confirmed!: () => void; let proceed!: () => void;
+        const bConfirmed = new Promise<void>(resolve => { confirmed = resolve; });
+        const bProceeds = new Promise<void>(resolve => { proceed = resolve; });
+        let b!: Promise<unknown>;
+        let inside = 0; let maxInside = 0; let ran = 0;
+        const enter = () => { inside += 1; maxInside = Math.max(maxInside, inside); ran += 1; };
+        const a = withOwnedFileLock(path, async () => {
+            enter();
+            const value = Number(await readFile(counter, 'utf8'));
+            proceed();
+            await b;
+            await writeFile(counter, String(value + 1));
+            inside -= 1;
+        }, {
             log: () => {},
-            // Stalls past the ownerless limit; meanwhile another contender reclaims and holds it.
             onLockCreated: async () => {
                 const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
                 await utimes(path, old, old);
-                let entered!: () => void;
-                const inside = new Promise<void>(resolve => { entered = resolve; });
-                other = withOwnedFileLock(path, async () => { entered(); await held; }, { log: () => {} });
-                await inside;
+                b = withOwnedFileLock(path, async () => {
+                    enter();
+                    const value = Number(await readFile(counter, 'utf8'));
+                    await writeFile(counter, String(value + 1));
+                    inside -= 1;
+                }, { log: () => {}, onReclaimConfirmed: async () => { confirmed(); await bProceeds; } }).catch((error: unknown) => error);
+                await Promise.race([bConfirmed, b]);
             },
-        };
-        let ran = false;
-        await expect(withOwnedFileLock(path, async () => { ran = true; }, stalled)).rejects.toBeInstanceOf(FileLockHeldError);
-        expect(ran).toBe(false);
-        expect(JSON.parse(await readFile(path, 'utf8')).pid).toBe(process.pid);
-        release();
-        await other;
-        expect(await readdir(join(path, '..'))).toEqual([]);
+        });
+        await a;
+        expect(maxInside).toBe(1);
+        expect(Number(await readFile(counter, 'utf8'))).toBe(ran);
+        expect(await b).toBeInstanceOf(FileLockHeldError);
+        expect((await readdir(join(path, '..'))).sort()).toEqual(['counter']);
     });
 
     it.each([

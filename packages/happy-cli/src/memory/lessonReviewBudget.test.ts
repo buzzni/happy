@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LessonReviewBudget } from './lessonReviewBudget';
-import { UNOWNED_LOCK_STALE_MS } from './ownedFileLock';
+import { UNOWNED_LOCK_STALE_MS, type OwnedFileLockDeps } from './ownedFileLock';
 const dirs: string[] = [];
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'lesson-budget-')); dirs.push(dir);
@@ -98,6 +98,30 @@ describe('ledger lock left behind', () => {
     const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
     await utimes(`${f.path}.lock`, old, old);
     expect(await a.claimSession(input)).toEqual({ ok: true });
+    expect(await ledgerIds(f.path)).toEqual(['one']);
+  });
+
+  it('does not let a second claim write the ledger while the first still holds the lock', async () => {
+    // A stalls right after creating the lock; B confirms it abandoned and is held before removing it;
+    // A takes the lock for its own; only then does B go on.
+    const f = await fixture();
+    let confirmed!: () => void; let proceed!: () => void;
+    const bConfirmed = new Promise<void>(resolve => { confirmed = resolve; });
+    const bProceeds = new Promise<void>(resolve => { proceed = resolve; });
+    const b = new LessonReviewBudget(f.path, f.clock, { log: () => {}, onReclaimConfirmed: async () => { confirmed(); await bProceeds; } });
+    let second!: Promise<unknown>;
+    const aDeps: OwnedFileLockDeps = {
+      log: () => {},
+      onLockCreated: async () => {
+        const old = new Date(Date.now() - UNOWNED_LOCK_STALE_MS - 60_000);
+        await utimes(`${f.path}.lock`, old, old);
+        second = b.claimSession({ ...input, requestId: 'two' });
+        await Promise.race([bConfirmed, second]);
+      },
+      onAcquired: async () => { proceed(); await second; },
+    };
+    expect(await new LessonReviewBudget(f.path, f.clock, aDeps).claimSession(input)).toEqual({ ok: true });
+    expect(await second).toEqual({ ok: false, reason: 'busy' });
     expect(await ledgerIds(f.path)).toEqual(['one']);
   });
 });

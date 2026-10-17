@@ -1,15 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { open, readFile, stat, unlink } from 'node:fs/promises';
+import { link, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { logger } from '@/ui/logger';
 import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime';
 
 /**
- * How long a lock without a provable live owner must sit untouched before it is
- * taken as abandoned. Holders keep these locks for one read plus one small
- * fsync'd write (milliseconds), so ten minutes is far past any real hold, even a
- * slow disk. It covers locks written by older versions (no owner recorded), a
- * crash between creating a lock and recording its owner, and a live pid whose
- * start time the platform will not tell us.
+ * How long a lock that records no owner must sit untouched before it is taken as
+ * abandoned. Holders keep these locks for one read plus one small fsync'd write
+ * (milliseconds), so ten minutes is far past any real hold, even a slow disk.
+ * Only older versions leave such locks: this version publishes a lock with its
+ * owner already in it. A lock that names a live owner is never taken on age.
  */
 export const UNOWNED_LOCK_STALE_MS = 10 * 60_000;
 // Absorbs `ps`'s whole-second start times and small clock steps.
@@ -34,7 +33,7 @@ export interface OwnedFileLockDeps {
     log?: (message: string) => void;
     /** Test seam: runs after a contender has judged a lock abandoned, before it reclaims. */
     onStaleJudged?: () => Promise<void>;
-    /** Test seam: runs after the lock file is created, before its owner is recorded. */
+    /** Test seam: runs once the lock is published at its path, before acquiring returns. */
     onLockCreated?: () => Promise<void>;
     /** Test seam: runs inside the reclaim guard once the judged lock is confirmed unchanged, before it is removed. */
     onReclaimConfirmed?: () => Promise<void>;
@@ -52,8 +51,11 @@ type Verdict = { stale: true; why: 'owner-exited' | 'pid-reused' | 'unowned-aban
  * The file records the owner's pid and process start time. A lock whose owner has
  * provably exited (or whose pid now belongs to a later process) is reclaimed;
  * a live owner's lock is never taken, so the caller gets a FileLockHeldError.
+ * A lock is published with its owner already recorded (written aside, then
+ * hard-linked into place, which fails if the path exists), so no window exists in
+ * which a held lock looks ownerless and could be reclaimed from under its holder.
  * Reclaiming goes through a guard named after the exact lock instance judged
- * abandoned, created with O_EXCL, so two contenders cannot both remove a lock and
+ * abandoned, itself such a lock, so two contenders cannot both remove a lock and
  * then both create one.
  */
 export async function withOwnedFileLock<T>(path: string, work: () => Promise<T>, deps: OwnedFileLockDeps = {}): Promise<T> {
@@ -70,39 +72,35 @@ async function acquire(path: string, depth: number, deps: OwnedFileLockDeps): Pr
     const now = deps.now ?? Date.now;
     for (let attempt = 0; attempt < ACQUIRE_ATTEMPTS; attempt += 1) {
         const owner: LockOwner = { version: 1, pid: process.pid, startedAt: SELF_STARTED_AT, token: randomUUID(), acquiredAt: now() };
-        let file;
-        try {
-            file = await open(path, 'wx', 0o600);
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-            const seen = await inspect(path);
-            if (!seen) continue; // Released meanwhile.
-            const verdict = await judge(seen, deps);
-            if (!verdict.stale) throw new FileLockHeldError(verdict.holder);
-            await deps.onStaleJudged?.();
-            if (await reclaim(path, seen, depth, deps)) {
-                (deps.log ?? logDebug)(`[owned-file-lock] reclaimed ${path} (${verdict.why}; owner pid=${seen.owner?.pid ?? 'unknown'})`);
-            }
-            continue;
-        }
-        let ours: boolean;
-        try {
+        if (await publish(path, owner)) {
             await deps.onLockCreated?.();
-            await file.writeFile(JSON.stringify(owner));
-            // Until the owner is recorded the file looks ownerless. A holder stalled that
-            // long (sleep, SIGSTOP) may have had it reclaimed and replaced; then it is not ours.
-            ours = await stillAt(path, await file.stat());
-        } catch (error) {
-            const mine = await file.stat().catch(() => null);
-            await file.close().catch(() => {});
-            if (mine && await stillAt(path, mine)) await unlink(path).catch(() => {});
-            throw error;
+            return owner;
         }
-        await file.close();
-        if (ours) return owner;
-        (deps.log ?? logDebug)(`[owned-file-lock] ${path} was reclaimed before its owner was recorded; retrying`);
+        const seen = await inspect(path);
+        if (!seen) continue; // Released meanwhile.
+        const verdict = await judge(seen, deps);
+        if (!verdict.stale) throw new FileLockHeldError(verdict.holder);
+        await deps.onStaleJudged?.();
+        if (await reclaim(path, seen, depth, deps)) {
+            (deps.log ?? logDebug)(`[owned-file-lock] reclaimed ${path} (${verdict.why}; owner pid=${seen.owner?.pid ?? 'unknown'})`);
+        }
     }
     throw new FileLockHeldError('contended');
+}
+
+/** Puts a lock that already names its owner at `path`; false if one is there. */
+async function publish(path: string, owner: LockOwner): Promise<boolean> {
+    const pending = `${path}.${owner.token}.pending`;
+    await writeFile(pending, JSON.stringify(owner), { mode: 0o600, flag: 'wx' });
+    try {
+        await link(pending, path);
+        return true;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+        throw error;
+    } finally {
+        await unlink(pending).catch(() => {});
+    }
 }
 
 /** Removes the judged instance only, and only while holding that instance's guard. */
@@ -140,10 +138,11 @@ async function release(path: string, held: LockOwner, deps: OwnedFileLockDeps): 
 }
 
 async function judge(seen: LockSnapshot, deps: OwnedFileLockDeps): Promise<Verdict> {
-    const age = (deps.now ?? Date.now)() - seen.mtimeMs;
-    const abandoned = age > UNOWNED_LOCK_STALE_MS;
     const { owner } = seen;
-    if (!owner) return abandoned ? { stale: true, why: 'unowned-abandoned' } : { stale: false, holder: 'recent-unowned' };
+    if (!owner) {
+        const abandoned = (deps.now ?? Date.now)() - seen.mtimeMs > UNOWNED_LOCK_STALE_MS;
+        return abandoned ? { stale: true, why: 'unowned-abandoned' } : { stale: false, holder: 'recent-unowned' };
+    }
     let startedAt: number | undefined;
     if (owner.pid === process.pid) {
         startedAt = SELF_STARTED_AT;
@@ -152,17 +151,13 @@ async function judge(seen: LockSnapshot, deps: OwnedFileLockDeps): Promise<Verdi
         const lookup = deps.getProcessStartedAt ?? (process.platform === 'win32' ? getWindowsProcessStartedAt : getProcessStartedAt);
         startedAt = await lookup(owner.pid);
     }
-    if (startedAt === undefined) return abandoned ? { stale: true, why: 'unowned-abandoned' } : { stale: false, holder: 'unverified' };
+    // A live owner may just be stalled; only proof that it is gone frees its lock.
+    if (startedAt === undefined) return { stale: false, holder: 'unverified' };
     // A holder starts before it takes the lock, so a process that started after
     // the lock was taken has inherited the pid. Measured against acquiredAt, the
     // same wall clock `ps` reports, not the recorded start: that one comes from
     // process.uptime(), which on macOS stops while the machine sleeps.
     return startedAt > owner.acquiredAt + REUSED_PID_SLACK_MS ? { stale: true, why: 'pid-reused' } : { stale: false, holder: 'live' };
-}
-
-async function stillAt(path: string, mine: { ino: number; dev: number }): Promise<boolean> {
-    const there = await stat(path).catch(() => null);
-    return there !== null && there.ino === mine.ino && there.dev === mine.dev;
 }
 
 async function inspect(path: string): Promise<LockSnapshot | null> {
@@ -188,7 +183,7 @@ function parseOwner(raw: string): LockOwner | null {
             return value as LockOwner;
         }
     } catch {
-        // Empty (crashed before recording) or written by an older version.
+        // Written by an older version, which records no owner.
     }
     return null;
 }
