@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   planUnreachableRetry,
+  runLeaseExpiresAt,
   unreachableFetchFailure,
+  unreachableRetryFailureCode,
+  UNREACHABLE_RETRY_LEASE_MARGIN_MS,
   unreachableHttpStatus,
   UNREACHABLE_RETRY_DELAYS_MS,
 } from './automationUnreachableRetry'
@@ -76,18 +79,56 @@ describe('unreachableHttpStatus', () => {
 })
 
 describe('planUnreachableRetry', () => {
-  it('walks 5, 15 and 30 minutes from each failure, then stops', () => {
-    const farAway = 24 * 60 * MINUTE
-    expect(UNREACHABLE_RETRY_DELAYS_MS).toEqual([5 * MINUTE, 15 * MINUTE, 30 * MINUTE])
-    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: farAway })).toBe(5 * MINUTE)
-    expect(planUnreachableRetry({ attempt: 1, now: 5 * MINUTE, nextRegularRunAt: farAway })).toBe(20 * MINUTE)
-    expect(planUnreachableRetry({ attempt: 2, now: 20 * MINUTE, nextRegularRunAt: farAway })).toBe(50 * MINUTE)
-    expect(planUnreachableRetry({ attempt: 3, now: 50 * MINUTE, nextRegularRunAt: farAway })).toBeNull()
+  const farAway = 24 * 60 * MINUTE
+  // 서버 run lease 5분(start·heartbeat 응답의 runLeaseExpiresAt)을 그대로 쓴다 — 실패 시각 0, lease 5분.
+  const lease = 5 * MINUTE
+
+  it('walks about 1, 2 and 4 minutes from the first failure, then stops', () => {
+    expect(UNREACHABLE_RETRY_DELAYS_MS).toEqual([MINUTE, MINUTE, 2 * MINUTE])
+    // heartbeat 가 lease 를 이어 주는 동안(행복 서버는 닿고 Studio 만 막힌 경우)은 1·2·4분.
+    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: farAway, leaseExpiresAt: lease })).toBe(MINUTE)
+    expect(planUnreachableRetry({ attempt: 1, now: MINUTE, nextRegularRunAt: farAway, leaseExpiresAt: MINUTE + lease })).toBe(2 * MINUTE)
+    expect(planUnreachableRetry({ attempt: 2, now: 2 * MINUTE, nextRegularRunAt: farAway, leaseExpiresAt: 2 * MINUTE + lease })).toBe(4 * MINUTE)
+    expect(planUnreachableRetry({ attempt: 3, now: 4 * MINUTE, nextRegularRunAt: farAway, leaseExpiresAt: 4 * MINUTE + lease })).toBeNull()
+  })
+
+  it('pulls the last retry inside the lease when heartbeats could not extend it', () => {
+    // 마지막 재시도가 틱 지연(최대 1분)과 요청 시간을 더해도 lease 만료 전에 서버에 닿게 당긴다.
+    expect(UNREACHABLE_RETRY_LEASE_MARGIN_MS).toBe(90_000)
+    expect(planUnreachableRetry({ attempt: 2, now: 2 * MINUTE, nextRegularRunAt: farAway, leaseExpiresAt: lease }))
+      .toBe(lease - UNREACHABLE_RETRY_LEASE_MARGIN_MS)
+    expect(planUnreachableRetry({ attempt: 1, now: lease - UNREACHABLE_RETRY_LEASE_MARGIN_MS, nextRegularRunAt: farAway, leaseExpiresAt: lease }))
+      .toBeNull()
+  })
+
+  it('does not retry without a lease deadline from the server', () => {
+    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: farAway, leaseExpiresAt: null })).toBeNull()
   })
 
   it('leaves the retry to the regular run when it is due at or before the retry', () => {
-    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: 5 * MINUTE })).toBeNull()
-    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: 5 * MINUTE + 1 })).toBe(5 * MINUTE)
+    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: MINUTE, leaseExpiresAt: lease })).toBeNull()
+    expect(planUnreachableRetry({ attempt: 0, now: 0, nextRegularRunAt: MINUTE + 1, leaseExpiresAt: lease })).toBe(MINUTE)
+  })
+})
+
+describe('runLeaseExpiresAt', () => {
+  it('reads the lease deadline the server sends with start and heartbeat', () => {
+    expect(runLeaseExpiresAt({ runLeaseExpiresAt: 1_700_000_300_000 })).toBe(1_700_000_300_000)
+    expect(runLeaseExpiresAt({ runLeaseExpiresAt: '2026-10-17T00:05:00.000Z' })).toBe(Date.parse('2026-10-17T00:05:00.000Z'))
+    expect(runLeaseExpiresAt({})).toBeNull()
+    expect(runLeaseExpiresAt(undefined)).toBeNull()
+    expect(runLeaseExpiresAt({ runLeaseExpiresAt: 'soon' })).toBeNull()
+  })
+})
+
+describe('unreachableRetryFailureCode', () => {
+  it('names how many automatic retries ran before the failure was recorded', () => {
+    expect(unreachableRetryFailureCode('GRANT_EXCHANGE_FAILED', 3)).toBe('GRANT_EXCHANGE_FAILED_AFTER_3_RETRIES')
+    expect(unreachableRetryFailureCode('GRANT_EXCHANGE_FAILED', 0)).toBe('GRANT_EXCHANGE_FAILED')
+    expect(unreachableRetryFailureCode(null, 2)).toBeNull()
+    // 서버의 failureCode 규칙(^[A-Z][A-Z0-9_]{0,63}$)을 넘기면 원래 코드를 둔다.
+    const long = `A${'B'.repeat(60)}`
+    expect(unreachableRetryFailureCode(long, 1)).toBe(long)
   })
 })
 

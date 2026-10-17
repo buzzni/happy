@@ -23,11 +23,16 @@ import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from '
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
 import {
+  forgetUnreachableRetry,
   hasDueUnreachableRetry,
+  hasUnsettledUnreachableRetry,
   holdUnreachableRetry,
   maintainUnreachableRetries,
+  releasedUnreachableRetries,
   rememberRetrySession,
+  runLeaseExpiresAt,
   takeDueUnreachableRetry,
+  unreachableRetryFailureCode,
 } from './automationUnreachableRetry'
 import {
   ensureAgentTaskReviewObjects,
@@ -454,10 +459,25 @@ function logLinkOutcome(
   }
 }
 
+/**
+ * 다시 보내도 받아 줄 수 없는 보고 거절. run 이 취소·만료·다른 보고로 끝났거나(run-not-running)
+ * 토큰에 맞는 run 이 없다(claim-not-found). report-conflict 는 아직 동기화되지 않은 세션
+ * 때문일 수도 있고, invalid-input 은 서버 내부 오류도 덮으므로 일시 실패로 둔다.
+ */
+function isPermanentReportRejection(error: string | undefined): boolean {
+  return error === 'run-not-running' || error === 'claim-not-found'
+}
+
 async function flushPendingReports(input: ServerAutomationExecutorInput): Promise<void> {
   const pending = input.runtimeStore.read().pendingReports
   for (const report of pending) {
     const result = await input.transport.report(report)
+    if (!result.ok && isPermanentReportRejection(result.error)) {
+      // 막아 두면 뒤에 쌓인 보고까지 영영 못 보낸다.
+      input.logDebug?.(`[server-automation] run=${report.runId} report dropped: server refused it for good (${result.error})`)
+      writeWithoutReport(input.runtimeStore, report.reportId)
+      continue
+    }
     if (!result.ok) return
     if (report.sessionId) {
       const linked = await input.linkSession({
@@ -470,6 +490,21 @@ async function flushPendingReports(input: ServerAutomationExecutorInput): Promis
       if (stillRetrying) return
     }
     writeWithoutReport(input.runtimeStore, report.reportId)
+  }
+}
+
+/** maintainUnreachableRetries 가 포기한 보류 run 의 실패를 보낸다. 받거나 영구 거절되면 항목을 지운다. */
+async function settleReleasedUnreachableRetries(input: ServerAutomationExecutorInput): Promise<void> {
+  for (const entry of releasedUnreachableRetries(input.runtimeStore.read())) {
+    const result = await input.transport.report(entry.report)
+    if (result.ok) {
+      forgetUnreachableRetry(input.runtimeStore, entry.report.runId)
+    } else if (isPermanentReportRejection(result.error)) {
+      input.logDebug?.(
+        `[server-automation] run=${entry.report.runId} held failure dropped: server refused it for good (${result.error})`,
+      )
+      forgetUnreachableRetry(input.runtimeStore, entry.report.runId)
+    }
   }
 }
 
@@ -1798,13 +1833,14 @@ export async function runServerAutomationTick(
     input.runtimeStore.write(reconciled)
   }
   // 정규 실행·즉시 실행과 겹친 보류 run 은 claim 전에 실패로 마감해야 서버의 active run 이 빈다.
-  if (maintainUnreachableRetries({
+  maintainUnreachableRetries({
     runtimeStore: input.runtimeStore,
     automations: cache.automations,
     now,
     heartbeat: (run) => input.transport.heartbeat(run),
     logDebug: input.logDebug,
-  })) await flushPendingReports(input)
+  })
+  await settleReleasedUnreachableRetries(input)
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
   let githubEventsProcessed = 0
@@ -1832,6 +1868,8 @@ export async function runServerAutomationTick(
     const schedule = runtimeState.schedules.find((item) => item.automationId === automation.automationId)
     const immediateWorker = immediateWorkerIds.delete(automation.automationId)
     if (!schedule || schedule.generation !== automation.generation) continue
+    // 마감을 확인받지 못한 보류 run 이 있으면 due 를 그대로 두고 다음 틱에 다시 본다.
+    if (hasUnsettledUnreachableRetry(runtimeState, automation.automationId)) continue
     const retryDue = hasDueUnreachableRetry(runtimeState, automation, now)
     if (schedule.nextRunAt > now && !immediateWorker && !retryDue) continue
     const payload = payloads.get(automation.automationId)!
@@ -1868,8 +1906,10 @@ export async function runServerAutomationTick(
     const retry = retryDue ? takeDueUnreachableRetry(input.runtimeStore, automation, now, input.logDebug) : null
     let runId: string
     let claimToken: string
+    let leaseExpiresAt: number | null
     if (retry) {
       ({ runId, claimToken } = retry.report)
+      leaseExpiresAt = retry.leaseExpiresAt
     } else {
       const claim = await input.transport.claim({
         automationId: automation.automationId,
@@ -1894,10 +1934,13 @@ export async function runServerAutomationTick(
         deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
         continue
       }
+      leaseExpiresAt = runLeaseExpiresAt(started.value)
     }
 
     const heartbeat = setInterval(() => {
-      void input.transport.heartbeat({ runId, claimToken }).catch((error) => {
+      void input.transport.heartbeat({ runId, claimToken }).then((renewed) => {
+        if (renewed.ok) leaseExpiresAt = runLeaseExpiresAt(renewed.value) ?? leaseExpiresAt
+      }).catch((error) => {
         input.logDebug?.(`[server-automation] heartbeat failed: ${error}`)
       })
     }, HEARTBEAT_MS)
@@ -1953,7 +1996,7 @@ export async function runServerAutomationTick(
       || (result.outcome === 'SKIPPED_GATE' && result.sessionId !== null))) {
       scheduleNextTick(input, automation.automationId, now, githubEventsProcessed + 1)
     }
-    const report: PendingAutomationReport = {
+    let report: PendingAutomationReport = {
       runId,
       claimToken,
       reportId: (input.randomId ?? randomUUID)(),
@@ -1973,8 +2016,11 @@ export async function runServerAutomationTick(
     // 스크립트 조건은 사용자 코드가 이미 돈 것이고 GitHub 트리거는 매 틱 스스로 다시 폴링한다.
     if (result.unreachable && !payload.scriptCommand && !payload.githubTrigger
       && holdUnreachableRetry(input.runtimeStore, {
-        automation, report, attempt: retry?.attempt ?? 0, now, logDebug: input.logDebug,
+        automation, report, attempt: retry?.attempt ?? 0, now, leaseExpiresAt, logDebug: input.logDebug,
       })) continue
+    if (retry && result.outcome === 'ERROR') {
+      report = { ...report, failureCode: unreachableRetryFailureCode(report.failureCode, retry.attempt) }
+    }
     const state = input.runtimeStore.read()
     input.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
     const reported = await input.transport.report(report)

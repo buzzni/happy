@@ -76,6 +76,10 @@ export interface UnreachableRetryState {
   /** 이미 예약한 재시도 횟수(1부터). */
   attempt: number
   retryAt: number
+  /** 서버가 마지막으로 알려 준 run lease 만료 시각. 재시도는 이 안에서 끝나야 한다. */
+  leaseExpiresAt: number
+  /** 재시도를 포기했고 report 를 서버가 받기를 기다린다. 그동안 같은 자동화의 새 claim 을 미룬다. */
+  releasing?: boolean
   report: PendingAutomationReport
 }
 
@@ -340,6 +344,8 @@ function parse(raw: string): ServerAutomationRuntimeState {
         generation: integer(row.generation, 1),
         attempt: integer(row.attempt, 1),
         retryAt: integer(row.retryAt),
+        leaseExpiresAt: integer(row.leaseExpiresAt),
+        ...(row.releasing === true ? { releasing: true } : {}),
         report: parsePendingReport(row.report),
       }
     })

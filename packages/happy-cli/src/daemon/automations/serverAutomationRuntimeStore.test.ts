@@ -54,6 +54,7 @@ describe('serverAutomationRuntimeStore', () => {
       }],
       unreachableRetries: [{
         ownerId: 'daemon-a', automationId: 'automation-1', generation: 2, attempt: 1, retryAt: 400,
+        leaseExpiresAt: 500, releasing: true,
         report: {
           runId: 'run-3', claimToken: 'claim-3', reportId: 'report-3', status: 'FAILED',
           outcome: 'ERROR', sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
@@ -85,6 +86,7 @@ describe('serverAutomationRuntimeStore', () => {
       }],
       unreachableRetries: [{
         ownerId: 'daemon-a', automationId: 'automation-1', generation: 2, attempt: 1, retryAt: 400,
+        leaseExpiresAt: 500, releasing: true,
         report: {
           runId: 'run-3', claimToken: 'claim-3', reportId: 'report-3', status: 'FAILED',
           outcome: 'ERROR', sessionId: null, detailCiphertext: null, failureCode: 'GRANT_EXCHANGE_FAILED',
