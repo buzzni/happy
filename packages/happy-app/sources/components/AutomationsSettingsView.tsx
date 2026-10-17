@@ -20,6 +20,7 @@ import { automationErrorMessage } from '@/sync/automationError';
 import { subscribeAutomationUpdates } from '@/sync/automationUpdates';
 import {
     automationDraftFor,
+    isDesktopOnlySchedule,
     automationPayloadFromDraft,
     type AutomationDraft,
 } from '@/sync/automationDraft';
@@ -34,9 +35,14 @@ const AUTOMATION_AGENTS: Array<{ value: AutomationPayload['agent']; label: strin
     { value: 'opencode', label: 'OpenCode' },
 ];
 
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
 function scheduleLabel(schedule: AutomationSchedule): string {
     if (schedule.kind === 'interval') return `Every ${schedule.minutes} minutes`;
     if (schedule.kind === 'github') return 'GitHub event trigger';
+    const time = `${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
+    if (schedule.kind === 'once') return `Once on ${schedule.date} at ${time}`;
+    if (schedule.kind === 'weekly') return `Weekly (${schedule.days.map((day) => WEEKDAYS[day]).join(', ')}) at ${time}`;
     return `Daily at ${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
 }
 
@@ -175,9 +181,9 @@ export function AutomationsSettingsView() {
                             <Item
                                 key={item.row.id}
                                 title={item.payload.name}
-                                subtitle={`${scheduleLabel(item.payload.schedule)} · ${item.row.paused ? 'Paused' : item.row.appliedRevision >= item.row.revision ? 'Synced' : 'Pending daemon sync'}${item.payload.schedule.kind === 'github' ? ' · Manage in Desktop' : ''}\n${runLabel(item)}`}
+                                subtitle={`${scheduleLabel(item.payload.schedule)} · ${item.row.paused ? 'Paused' : item.row.appliedRevision >= item.row.revision ? 'Synced' : 'Pending daemon sync'}${isDesktopOnlySchedule(item.payload.schedule) ? ' · Manage in Desktop' : ''}\n${runLabel(item)}`}
                                 subtitleLines={8}
-                                onPress={editable && item.payload.schedule.kind !== 'github'
+                                onPress={editable && !isDesktopOnlySchedule(item.payload.schedule)
                                     ? () => { setDraft(automationDraftFor(project, item)); setDraftError(null); }
                                     : undefined}
                                 rightElement={editable ? (

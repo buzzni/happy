@@ -33,4 +33,13 @@ describe('automation draft', () => {
             runs: [],
         })).toThrow('must be edited in Desktop');
     });
+
+    it.each([
+        { kind: 'once', date: '2026-10-19', hour: 9, minute: 0 },
+        { kind: 'weekly', days: [1, 3], hour: 9, minute: 0 },
+    ])('does not silently convert a $kind schedule into a daily one', (schedule) => {
+        const project = { id: 'project-1', name: 'Project', membership: 'owner' as const, config: null };
+        expect(() => automationDraftFor(project, { row: {} as never, payload: { schedule } as never, runs: [] }))
+            .toThrow('must be edited in Desktop');
+    });
 });
