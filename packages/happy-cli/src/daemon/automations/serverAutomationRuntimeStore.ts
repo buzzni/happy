@@ -188,6 +188,40 @@ function parseGithubState(value: unknown): GithubTriggerRuntimeState {
   }
 }
 
+const REPORT_OUTCOMES = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
+
+function parsePendingReport(value: unknown): PendingAutomationReport {
+  const row = record(value)
+  if ((row.status !== 'COMPLETED' && row.status !== 'FAILED')
+    || !REPORT_OUTCOMES.has(row.outcome as ServerAutomationReportOutcome)) invalid()
+  return {
+    runId: text(row.runId, 200),
+    claimToken: text(row.claimToken),
+    reportId: text(row.reportId, 200),
+    status: row.status as 'COMPLETED' | 'FAILED',
+    outcome: row.outcome as ServerAutomationReportOutcome,
+    sessionId: nullableText(row.sessionId),
+    detailCiphertext: nullableText(row.detailCiphertext),
+    ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
+    ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
+    ...(row.notificationOnly !== undefined ? {
+      notificationOnly: row.notificationOnly === true,
+    } : {}),
+    ...(row.queueDepth !== undefined ? {
+      queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
+    } : {}),
+    ...(row.queuePosition !== undefined ? {
+      queuePosition: row.queuePosition === null ? null : integer(row.queuePosition),
+    } : {}),
+    ...(row.queueTotal !== undefined ? {
+      queueTotal: row.queueTotal === null ? null : integer(row.queueTotal),
+    } : {}),
+    ...(row.queueEstimatedAt !== undefined ? {
+      queueEstimatedAt: row.queueEstimatedAt === null ? null : integer(row.queueEstimatedAt),
+    } : {}),
+  }
+}
+
 function parse(raw: string): ServerAutomationRuntimeState {
   try {
     const disk = record(JSON.parse(raw))
@@ -206,38 +240,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
         } : {}),
       }
     })
-    const outcomes = new Set<ServerAutomationReportOutcome>(['WOKE', 'SILENT', 'SKIPPED_GATE', 'ERROR'])
-    const pendingReports = disk.pendingReports.map((value) => {
-      const row = record(value)
-      if ((row.status !== 'COMPLETED' && row.status !== 'FAILED')
-        || !outcomes.has(row.outcome as ServerAutomationReportOutcome)) invalid()
-      return {
-        runId: text(row.runId, 200),
-        claimToken: text(row.claimToken),
-        reportId: text(row.reportId, 200),
-        status: row.status as 'COMPLETED' | 'FAILED',
-        outcome: row.outcome as ServerAutomationReportOutcome,
-        sessionId: nullableText(row.sessionId),
-        detailCiphertext: nullableText(row.detailCiphertext),
-        ...(row.failureCode !== undefined ? { failureCode: nullableText(row.failureCode) } : {}),
-        ...(row.degradedCode !== undefined ? { degradedCode: nullableText(row.degradedCode) } : {}),
-        ...(row.notificationOnly !== undefined ? {
-          notificationOnly: row.notificationOnly === true,
-        } : {}),
-        ...(row.queueDepth !== undefined ? {
-          queueDepth: row.queueDepth === null ? null : integer(row.queueDepth),
-        } : {}),
-        ...(row.queuePosition !== undefined ? {
-          queuePosition: row.queuePosition === null ? null : integer(row.queuePosition),
-        } : {}),
-        ...(row.queueTotal !== undefined ? {
-          queueTotal: row.queueTotal === null ? null : integer(row.queueTotal),
-        } : {}),
-        ...(row.queueEstimatedAt !== undefined ? {
-          queueEstimatedAt: row.queueEstimatedAt === null ? null : integer(row.queueEstimatedAt),
-        } : {}),
-      }
-    })
+    const pendingReports = disk.pendingReports.map(parsePendingReport)
     const githubRows = disk.githubTriggers === undefined ? [] : disk.githubTriggers
     if (!Array.isArray(githubRows)) invalid()
     const githubTriggers = githubRows.map((value) => {
