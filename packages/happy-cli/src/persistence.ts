@@ -18,6 +18,7 @@ import type { SaycodeAgentEnvironment } from '@/daemon/sessionEnv';
 import { logger } from '@/ui/logger';
 import { parseMachineIdentity, type MachineIdentity } from '@/machineIdentity';
 import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime';
+import { windowsPrivateFile, WindowsPrivateFileError } from '@/utils/windowsPrivateFile';
 
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(true),
@@ -163,13 +164,9 @@ export interface DaemonLocallyPersistedState {
 }
 
 export async function readSettings(): Promise<Settings> {
-  if (!existsSync(configuration.settingsFile)) {
-    return { ...defaultSettings }
-  }
-
   try {
     // Read raw settings
-    const content = await readFile(configuration.settingsFile, 'utf8')
+    const content = await readPrivateFile(configuration.settingsFile)
     const raw = JSON.parse(content)
 
     // Check schema version (default to 1 if missing)
@@ -198,6 +195,9 @@ export async function readSettings(): Promise<Settings> {
     // Merge with defaults to ensure all required fields exist
     return { ...defaultSettings, ...migrated };
   } catch (error: any) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if (error.code === 'ENOENT') return { ...defaultSettings };
+    if (process.platform === 'win32') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
     logger.warn(`Failed to read settings: ${error.message}`);
     // Return defaults on any error
     return { ...defaultSettings }
@@ -215,7 +215,7 @@ export async function writeSettings(settings: Settings): Promise<void> {
     schemaVersion: settings.schemaVersion ?? SUPPORTED_SCHEMA_VERSION
   };
 
-  await writeFile(configuration.settingsFile, JSON.stringify(settingsWithVersion, null, 2))
+  await replacePrivateFile(configuration.settingsFile, JSON.stringify(settingsWithVersion, null, 2))
 }
 
 /**
@@ -232,7 +232,6 @@ export async function updateSettings(
   const STALE_LOCK_TIMEOUT_MS = 10000; // Consider lock stale after 10 seconds
 
   const lockFile = configuration.settingsFile + '.lock';
-  const tmpFile = configuration.settingsFile + '.tmp';
   let fileHandle;
   let attempts = 0;
 
@@ -278,8 +277,7 @@ export async function updateSettings(
     }
 
     // Write atomically using rename
-    await writeFile(tmpFile, JSON.stringify(updated, null, 2));
-    await rename(tmpFile, configuration.settingsFile); // Atomic on POSIX
+    await replacePrivateFile(configuration.settingsFile, JSON.stringify(updated, null, 2));
 
     return updated;
   } finally {
@@ -302,8 +300,31 @@ export async function updateSettings(
 const PRIVATE_FILE_MODE = 0o600;
 const PRIVATE_DIR_MODE = 0o700;
 
-export async function writePrivateFile(path: string, content: string): Promise<void> {
-  await writeFile(path, content, { encoding: 'utf-8', mode: PRIVATE_FILE_MODE });
+export async function readPrivateFile(path: string, bindingPath = path): Promise<string> {
+  try { return process.platform === 'win32' ? windowsPrivateFile.read(path, bindingPath) : windowsPrivateFile.decode(await readFile(path, 'utf8'), bindingPath); }
+  catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
+    throw error;
+  }
+}
+
+export function readPrivateFileSync(path: string, bindingPath = path): string {
+  try { return process.platform === 'win32' ? windowsPrivateFile.read(path, bindingPath) : windowsPrivateFile.decode(readFileSync(path, 'utf8'), bindingPath); }
+  catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
+    throw error;
+  }
+}
+
+function encodePrivateFile(content: string, bindingPath: string): string {
+  return windowsPrivateFile.encode(content, bindingPath);
+}
+
+export async function writePrivateFile(path: string, content: string, bindingPath = path): Promise<void> {
+  if (process.platform === 'win32') return windowsPrivateFile.write(path, content, bindingPath);
+  await writeFile(path, encodePrivateFile(content, bindingPath), { encoding: 'utf-8', mode: PRIVATE_FILE_MODE });
   await chmod(path, PRIVATE_FILE_MODE);
 }
 
@@ -314,15 +335,24 @@ export async function writePrivateFile(path: string, content: string): Promise<v
  * then created exclusively.
  */
 export async function replacePrivateFile(path: string, content: string): Promise<void> {
+  if (process.platform === 'win32') return windowsPrivateFile.write(path, content);
   const tmp = `${path}.tmp`;
   await rm(tmp, { force: true });
-  await writeFile(tmp, content, { encoding: 'utf-8', mode: PRIVATE_FILE_MODE, flag: 'wx' });
+  await writeFile(tmp, encodePrivateFile(content, path), { encoding: 'utf-8', mode: PRIVATE_FILE_MODE, flag: 'wx' });
   await rename(tmp, path);
 }
 
-export function writePrivateFileSync(path: string, content: string): void {
-  writeFileSync(path, content, { encoding: 'utf-8', mode: PRIVATE_FILE_MODE });
+export function writePrivateFileSync(path: string, content: string, bindingPath = path): void {
+  if (process.platform === 'win32') return windowsPrivateFile.write(path, content, bindingPath);
+  writeFileSync(path, encodePrivateFile(content, bindingPath), { encoding: 'utf-8', mode: PRIVATE_FILE_MODE });
   chmodSync(path, PRIVATE_FILE_MODE);
+}
+
+export function replacePrivateFileSync(path: string, content: string): void {
+  if (process.platform === 'win32') return windowsPrivateFile.write(path, content);
+  const temporary = `${path}.tmp`;
+  writePrivateFileSync(temporary, content, path);
+  renameSync(temporary, path);
 }
 
 /**
@@ -430,13 +460,14 @@ export function parseCredentials(raw: unknown): Credentials | null {
 }
 
 export async function readCredentials(): Promise<Credentials | null> {
-  if (!existsSync(configuration.privateKeyFile)) {
-    return null
-  }
   try {
-    const keyBase64 = (await readFile(configuration.privateKeyFile, 'utf8'));
-    return parseCredentials(JSON.parse(keyBase64));
-  } catch {
+    const keyBase64 = await readPrivateFile(configuration.privateKeyFile);
+    const credentials = parseCredentials(JSON.parse(keyBase64));
+    if (!credentials && process.platform === 'win32') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
+    return credentials;
+  } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
     return null
   }
 }
@@ -570,15 +601,19 @@ export function machineIdentityFile(): string {
 
 export function readMachineIdentity(): MachineIdentity | null {
   try {
-    return parseMachineIdentity(JSON.parse(readFileSync(machineIdentityFile(), 'utf8')));
-  } catch {
+    const identity = parseMachineIdentity(JSON.parse(readPrivateFileSync(machineIdentityFile())));
+    if (!identity && process.platform === 'win32') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
+    return identity;
+  } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
     return null; // Absent or unreadable: behave as before and register a new machine.
   }
 }
 
 export function writeMachineIdentity(identity: MachineIdentity): void {
   mkdirSync(configuration.happyHomeDir, { recursive: true });
-  writeFileSync(machineIdentityFile(), JSON.stringify(identity, null, 2), { mode: 0o600 });
+  writePrivateFileSync(machineIdentityFile(), JSON.stringify(identity, null, 2));
 }
 
 export function clearMachineIdentity(): void {
@@ -594,7 +629,7 @@ export async function clearMachineId(): Promise<void> {
 
 export interface DaemonStateSnapshot {
   state: DaemonLocallyPersistedState | null;
-  /** Exact file contents `state` was parsed from — the token for {@link writeDaemonStateIfUnchanged}. */
+  /** Exact decoded contents `state` was parsed from — the token for {@link writeDaemonStateIfUnchanged}. */
   raw: string | null;
 }
 
@@ -604,12 +639,12 @@ export interface DaemonStateSnapshot {
  */
 export async function readDaemonStateSnapshot(): Promise<DaemonStateSnapshot> {
   try {
-    if (!existsSync(configuration.daemonStateFile)) {
-      return { state: null, raw: null };
-    }
-    const raw = await readFile(configuration.daemonStateFile, 'utf-8');
+    const raw = await readPrivateFile(configuration.daemonStateFile);
     return { state: JSON.parse(raw) as DaemonLocallyPersistedState, raw };
   } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { state: null, raw: null };
+    if (process.platform === 'win32') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
     // State corrupted somehow :(
     console.error(`[PERSISTENCE] Daemon state file corrupted: ${configuration.daemonStateFile}`, error);
     return { state: null, raw: null };
@@ -632,8 +667,7 @@ export async function readDaemonState(): Promise<DaemonLocallyPersistedState | n
  * otherwise created with a looser mode) needs an explicit chmod too.
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
-  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  chmodSync(configuration.daemonStateFile, 0o600);
+  writePrivateFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2));
 }
 
 /**
@@ -648,9 +682,9 @@ export function writeDaemonState(state: DaemonLocallyPersistedState): void {
  * @returns true if the write happened, false if someone else owns the file now
  */
 export function writeDaemonStateIfUnchanged(expectedRaw: string | null, state: DaemonLocallyPersistedState): boolean {
-  const current = existsSync(configuration.daemonStateFile)
-    ? readFileSync(configuration.daemonStateFile, 'utf-8')
-    : null;
+  let current: string | null;
+  try { current = readPrivateFileSync(configuration.daemonStateFile); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; current = null; }
   if (current !== expectedRaw) {
     return false;
   }
@@ -713,10 +747,11 @@ export function isPidAlive(pid: number): boolean {
 export async function clearDaemonState(): Promise<void> {
   if (existsSync(configuration.daemonStateFile)) {
     try {
-      const content = readFileSync(configuration.daemonStateFile, 'utf-8');
+      const content = readPrivateFileSync(configuration.daemonStateFile);
       const current = JSON.parse(content) as DaemonLocallyPersistedState;
       writeDaemonState({ ...current, state: 'stopped' });
-    } catch {
+    } catch (error) {
+      if (error instanceof WindowsPrivateFileError) throw error;
       // State corrupted, just remove it
       await unlink(configuration.daemonStateFile);
     }
@@ -930,11 +965,12 @@ type SessionsFile = {
 
 export function readPersistedSessions(): Record<string, PersistedSession> {
   try {
-    if (!existsSync(configuration.sessionsFile)) return {};
-    const data = JSON.parse(readFileSync(configuration.sessionsFile, 'utf-8')) as SessionsFile;
+    const data = JSON.parse(readPrivateFileSync(configuration.sessionsFile)) as SessionsFile;
     if (!data?.sessions || typeof data.sessions !== 'object') return {};
     return data.sessions;
-  } catch {
+  } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error;
+    if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw new WindowsPrivateFileError('WINDOWS_SECRET_READ_FAILED');
     return {};
   }
 }
@@ -943,9 +979,7 @@ export function persistSession(sessionId: string, session: PersistedSession): vo
   try {
     const existing = readPersistedSessions();
     existing[sessionId] = session;
-    const tmpFile = configuration.sessionsFile + '.tmp';
-    writePrivateFileSync(tmpFile, JSON.stringify({ sessions: existing }, null, 2));
-    renameSync(tmpFile, configuration.sessionsFile);
+    replacePrivateFileSync(configuration.sessionsFile, JSON.stringify({ sessions: existing }, null, 2));
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);
   }

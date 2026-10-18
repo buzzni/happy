@@ -25,7 +25,7 @@ const fs = require('fs');
 const os = require('os');
 const { spawnSync } = require('child_process');
 const path = require('path');
-const { decideGlobalInstall } = require('./globalInstallGuard.cjs');
+const { decideGlobalInstall, readInstallDaemonState } = require('./globalInstallGuard.cjs');
 
 const PACKAGE_DIR = path.resolve(__dirname, '..');
 const PACKAGE_NAME = JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, 'package.json'), 'utf8')).name;
@@ -187,12 +187,11 @@ function happyHomeDir() {
 }
 
 function readDaemonState() {
-    try {
-        return JSON.parse(fs.readFileSync(path.join(happyHomeDir(), 'daemon.state.json'), 'utf8'));
-    } catch {
-        // No daemon has ever run here, or the file is unreadable — nothing to protect.
-        return null;
-    }
+    return readInstallDaemonState({
+        filePath: path.join(happyHomeDir(), 'daemon.state.json'),
+        isWindows: IS_WINDOWS,
+        loadWindowsStorage: () => require(path.join(PACKAGE_DIR, 'dist', 'windowsPrivateStorage.cjs')).createWindowsPrivateStorage(),
+    });
 }
 
 function isPidAlive(pid) {

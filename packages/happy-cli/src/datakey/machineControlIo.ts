@@ -6,11 +6,12 @@
  */
 import axios from 'axios'
 import { randomBytes } from 'node:crypto'
-import { readFile, rm } from 'node:fs/promises'
+import { rm } from 'node:fs/promises'
 import { configuration } from '@/configuration'
 import { buildMachineIdentity } from '@/machineIdentity'
 import {
   readMachineIdentity,
+  readPrivateFile,
   replaceCredentialsDataKey,
   replacePrivateFile,
   writeMachineIdentity,
@@ -31,7 +32,7 @@ export function createMachineControlIo(input: { token: string; machineId: string
     readPending: async () => {
       let text: string
       try {
-        text = await readFile(file, 'utf8')
+        text = await readPrivateFile(file)
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
         throw error

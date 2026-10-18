@@ -33,7 +33,11 @@ permissions:
   issues: write
 
 jobs:
+  windows-user-protection:
+    uses: ./.github/workflows/windows-user-protection.yml
+
   check-and-bump:
+    needs: windows-user-protection
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -126,6 +130,13 @@ jobs:
       # packages/happy-cli/browser-extension build output, so after vitest runs,
       # prepare-publish-package.cjs dies with "Required publish input is
       # missing" — a packaging failure that has nothing to do with the bump.
+      - name: Download Windows user-protected storage helper
+        if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-user-protection
+          path: packages/happy-cli/native/windows-x64
+
       - name: Guard the publish artifact
         if: steps.versions.outputs.up_to_date == 'false' && steps.existing.outputs.exists == 'false'
         run: |

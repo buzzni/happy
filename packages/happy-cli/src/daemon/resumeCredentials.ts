@@ -13,7 +13,8 @@
  * to spawn a child that would sync under a different account.
  */
 
-import { promises as fs } from 'node:fs';
+import { readPrivateFile } from '@/persistence';
+import { WindowsPrivateFileError } from '@/utils/windowsPrivateFile';
 import { join } from 'node:path';
 
 /** Best-effort account subject from a JWT-shaped token; null when opaque. */
@@ -81,10 +82,11 @@ export function decideResumeCredentials(input: {
 /** Read the token from a staged `<homeDir>/access.key`; null when missing/invalid. */
 export async function readStagedTokenFromHomeDir(homeDir: string): Promise<string | null> {
     try {
-        const raw = await fs.readFile(join(homeDir, 'access.key'), 'utf8');
+        const raw = await readPrivateFile(join(homeDir, 'access.key'));
         const parsed = JSON.parse(raw) as { token?: unknown };
         return typeof parsed.token === 'string' && parsed.token.length > 0 ? parsed.token : null;
-    } catch {
+    } catch (error) {
+        if (error instanceof WindowsPrivateFileError) throw error;
         return null;
     }
 }

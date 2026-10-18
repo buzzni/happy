@@ -9,18 +9,20 @@
 import chalk from 'chalk'
 import axios from 'axios'
 import { existsSync } from 'node:fs'
-import { readFile, rename, rm } from 'node:fs/promises'
+import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { configuration } from '@/configuration'
 import {
   acquireDaemonLock,
   parseCredentials,
   readSettings,
+  readPrivateFile,
   releaseDaemonLock,
   replaceCredentialsDataKey,
   updateSettings,
-  writePrivateFile,
+  replacePrivateFile,
 } from '@/persistence'
+import { WindowsPrivateFileError } from '@/utils/windowsPrivateFile'
 import {
   planDataKeyActivation,
   planDataKeyDeactivation,
@@ -38,17 +40,16 @@ const backupFile = () => join(configuration.happyHomeDir, 'access.key.legacy-bac
 async function readRawJson(path: string): Promise<unknown | null> {
   if (!existsSync(path)) return null
   try {
-    return JSON.parse(await readFile(path, 'utf8'))
-  } catch {
+    return JSON.parse(await readPrivateFile(path))
+  } catch (error) {
+    if (error instanceof WindowsPrivateFileError) throw error
     return null
   }
 }
 
 /** 임시 파일 + rename — 전원 차단에도 반쪽 파일이 남지 않게. 소유자 전용(0600). */
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-  const tmp = `${path}.tmp`
-  await writePrivateFile(tmp, JSON.stringify(value, null, 2))
-  await rename(tmp, path)
+  await replacePrivateFile(path, JSON.stringify(value, null, 2))
 }
 
 type ServerMachineEnvelopes = {
