@@ -316,7 +316,8 @@ export function createChannelHostSupervisor(deps: {
             // A refusal proves nothing was sent; only its closed code is kept.
             const code = typeof message.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(message.code) ? message.code : 'UNKNOWN';
             deps.log(`deliver-refused:${code}`);
-            resolve('failed');
+            // NOT_READY: the host is up but its runtime is not open yet — as good as no host, retried.
+            resolve(code === 'NOT_READY' ? 'unsupported' : 'failed');
         } else if (message.t === 'request' && isNonEmptyString(message.id)) {
             void answerRequest(target, message.id, message.method, message.params);
         }

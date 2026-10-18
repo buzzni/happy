@@ -342,6 +342,13 @@ describe('createChannelHostSupervisor', () => {
         children[0].send({ t: 'deliver-result', id: second.id, status: 'refused', code: 'TARGET_GONE' });
         await expect(refused).resolves.toBe('failed');
         expect(logs).toContain('deliver-refused:TARGET_GONE');
+
+        // A host whose runtime has not opened yet is not there to send: the caller may try again.
+        const early = supervisor.deliver({ ...deliverRequest, dedupeKey: 'run-3:result' });
+        await flush();
+        const third = children[0].written.filter((entry) => entry.t === 'deliver')[2]!;
+        children[0].send({ t: 'deliver-result', id: third.id, status: 'refused', code: 'NOT_READY' });
+        await expect(early).resolves.toBe('unsupported');
     });
 
     it('treats a delivery whose answer never came as possibly sent', async () => {

@@ -21,6 +21,11 @@
  * A message is sent at most once per run and kind. The key is recorded before the send and an
  * ambiguous outcome is not retried: a duplicate alert is worse than a missing one here, because
  * the next run is minutes or hours away and says the same thing.
+ *
+ * One exception: a result the channel host could not take because it was not there — restarting
+ * after a crash or an update, or not up yet after the daemon started — is tried again a few times
+ * a minute apart. Unlike a failure, which the next failing run alerts again, a result belongs to
+ * this run only. The tries live in memory: a daemon restart in between drops them.
  */
 
 import type { AutomationDeliveryTarget } from '@slopus/happy-wire'
@@ -40,6 +45,9 @@ const CLOSED_CODE = /^[A-Z][A-Z0-9_]{0,63}$/
 /** A turn can end before its run is recorded as started; such results wait this long, in memory. */
 const EARLY_RESULT_MS = 5 * 60_000
 const EARLY_RESULTS_MAX = 50
+/** Covers the host supervisor's restart backoff (up to a minute) a few times over. */
+export const AUTOMATION_RESULT_RETRIES = 5
+const RESULT_RETRY_MS = 60_000
 
 export interface AutomationFailureIncident {
   signature: string
@@ -187,7 +195,10 @@ export function createAutomationDeliveryCoordinator(deps: {
   send(request: AutomationDeliveryRequest): Promise<AutomationDeliveryOutcome>
   now(): number
   logDebug?(message: string): void
+  /** Defaults to an unref'd timer. */
+  schedule?(run: () => void, ms: number): void
 }): AutomationDeliveryCoordinator {
+  const schedule = deps.schedule ?? ((run: () => void, ms: number) => { setTimeout(run, ms).unref?.() })
   const update = (change: (state: AutomationDeliveryState) => AutomationDeliveryState) => {
     const now = deps.now()
     const next = change(deps.store.read())
@@ -263,11 +274,29 @@ export function createAutomationDeliveryCoordinator(deps: {
     const payload = deps.payloadFor(entry.automationId)
     if (result.status === 'failed') return alertFailure(entry.automationId, entry.runId, payload, TURN_FAILED)
     closeIncident(entry.automationId)
+    if (result.silent || !result.finalAnswer) return 'skipped'
+    return deliverResult(entry, result.finalAnswer, 0)
+  }
+
+  const deliverResult = async (
+    entry: { runId: string; automationId: string },
+    answer: string,
+    retries: number,
+  ): Promise<AutomationDeliveryOutcome | 'skipped'> => {
+    // Read again on every try, so a delivery turned off in between is respected.
+    const payload = deps.payloadFor(entry.automationId)
     const target = resultTarget(payload)
-    if (!payload || !target || result.silent || !result.finalAnswer) return 'skipped'
-    return deliver(target, 'result', entry.runId, buildAutomationDeliveryText({
-      kind: 'result', locale: payload.delivery?.locale, name: payload.name, answer: result.finalAnswer,
+    if (!payload || !target) return 'skipped'
+    const outcome = await deliver(target, 'result', entry.runId, buildAutomationDeliveryText({
+      kind: 'result', locale: payload.delivery?.locale, name: payload.name, answer,
     }))
+    if (outcome === 'unsupported' && retries < AUTOMATION_RESULT_RETRIES) {
+      schedule(() => {
+        void deliverResult(entry, answer, retries + 1)
+          .catch((error) => deps.logDebug?.(`[automation-delivery] run=${entry.runId} result retry not handled: ${error}`))
+      }, RESULT_RETRY_MS)
+    }
+    return outcome
   }
 
   const early = new Map<string, { sessionId: string; result: AutomationTurnResult; at: number }>()

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   AUTOMATION_FAILURE_REPEAT_MS,
+  AUTOMATION_RESULT_RETRIES,
   buildAutomationDeliveryText,
   createAutomationDeliveryCoordinator,
   decideFailureAlert,
@@ -31,15 +32,19 @@ function harness(options: { delivery?: AutomationDelivery; outcome?: 'sent' | 'f
   const sent: AutomationDeliveryRequest[] = []
   let current = payload(options.delivery ?? { version: 1, locale: 'en', result: target, failure: 'same' })
   const h = { outcome: options.outcome ?? 'sent' as 'sent' | 'failed' | 'unknown' | 'unsupported' }
+  const timers: Array<{ run: () => void; ms: number }> = []
   const coordinator = createAutomationDeliveryCoordinator({
     machineId: 'machine-1',
     store: { read: () => state, write: (next) => { state = JSON.parse(JSON.stringify(next)) } },
     payloadFor: () => current,
     send: async (request) => { sent.push(request); return h.outcome },
     now: () => now,
+    schedule: (run, ms) => { timers.push({ run, ms }) },
   })
   return {
-    coordinator, sent,
+    coordinator, sent, timers,
+    /** Runs every timer due so far, as the clock would. */
+    runTimers: async () => { for (const timer of timers.splice(0)) { now += timer.ms; timer.run() } await new Promise((resolve) => setTimeout(resolve, 0)) },
     setOutcome: (outcome: typeof h.outcome) => { h.outcome = outcome },
     state: () => state,
     advance: (ms: number) => { now += ms },
@@ -195,6 +200,42 @@ describe('createAutomationDeliveryCoordinator', () => {
     expect(h.state().incidents['automation-1']).toMatchObject({ signature: 'GRANT_EXCHANGE_FAILED' })
     await h.fail('run-4')
     expect(h.sent).toHaveLength(3)
+  })
+
+  it('sends a result again while the channel host is away, and gives up after a bounded number of tries', async () => {
+    const h = harness({ outcome: 'unsupported' })
+    h.start('run-1')
+    await h.finish('run-1', 'completed', 'Three new issues.')
+    expect(h.sent).toHaveLength(1)
+    expect(h.timers).toHaveLength(1)
+    // The host comes back: the next try sends it, once.
+    h.setOutcome('sent')
+    await h.runTimers()
+    expect(h.sent.map((request) => request.dedupeKey)).toEqual(['run-1:result', 'run-1:result'])
+    expect(h.timers).toHaveLength(0)
+
+    const away = harness({ outcome: 'unsupported' })
+    away.start('run-1')
+    await away.finish('run-1', 'completed', 'Three new issues.')
+    for (let tries = 0; tries < 10 && away.timers.length > 0; tries++) await away.runTimers()
+    expect(away.sent).toHaveLength(1 + AUTOMATION_RESULT_RETRIES)
+    expect(away.timers).toHaveLength(0)
+  })
+
+  it('does not try a result again after a definite or ambiguous answer, or once delivery was turned off', async () => {
+    for (const outcome of ['failed', 'unknown'] as const) {
+      const h = harness({ outcome })
+      h.start('run-1')
+      await h.finish('run-1', 'completed', 'Three new issues.')
+      expect(h.timers).toHaveLength(0)
+    }
+    const h = harness({ outcome: 'unsupported' })
+    h.start('run-1')
+    await h.finish('run-1', 'completed', 'Three new issues.')
+    h.setPayload(payload({ version: 1, locale: 'en', result: null, failure: elsewhere }))
+    h.setOutcome('sent')
+    await h.runTimers()
+    expect(h.sent).toHaveLength(1)
   })
 
   it('keeps a turn result that arrives before its run is recorded as started', async () => {
