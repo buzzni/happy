@@ -602,6 +602,17 @@ describe('managed Claude setup-token runtime', () => {
     expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', B])
   })
 
+  // PR #874 review: the same assignment again finds its slot without managed metadata; it must restore it, not reuse the receipt.
+  it('restores a slot that lost its managed metadata when the same assignment is synced again', async () => {
+    const { runtime, state } = fakeMachine([], null)
+    const request = sync(1, payload(managed(A, 1, fakeToken('a'))))
+    await runtime.groupSync(request)
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = state.slots[0]!
+    state.slots[0] = bare as typeof state.slots[0]
+    await expect(runtime.groupSync(request)).resolves.toMatchObject({ reconciled: true, appliedCredentials: [{ managedAccountId: A, credentialGeneration: 1 }] })
+    expect(state.slots).toEqual([expect.objectContaining({ email: managedSetupTokenEmail(A), credentialType: 'setup_token', managedAccountId: A, credentialGeneration: 1 })])
+  })
+
   it('removes orphaned managed-format slots after a setup-token apply but keeps personal and bare synthetic slots', async () => {
     const C = '0b6f2c1e-1111-4a2b-8c3d-000000000003'
     const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }

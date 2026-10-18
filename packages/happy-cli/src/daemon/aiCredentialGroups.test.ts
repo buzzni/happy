@@ -343,3 +343,25 @@ describe('orphan managed setup-token sweep', () => {
     expect(await sync.receipt('company', 'claude')).toMatchObject({ reconciled: false })
   })
 })
+
+// PR #874 review: a reused receipt must not trust the synthetic email alone.
+describe('managed setup-token receipt reuse', () => {
+  it('applies again when a desired managed slot lost its managed metadata, instead of reusing the receipt', async () => {
+    const { sync, input, deps, metadata } = managedSetup()
+    const request = input(1, '["managed-a","shared"]')
+    await sync.sync(request)
+    // Same email, no managed metadata: a personal import or a slot that lost it.
+    metadata.delete('managed-a')
+    await expect(sync.sync(request)).resolves.toMatchObject({ reconciled: true })
+    expect(deps.apply).toHaveBeenCalledTimes(2)
+    expect(metadata.has('managed-a')).toBe(true)
+  })
+
+  it('still reuses the receipt while every desired managed slot carries its metadata', async () => {
+    const { sync, input, deps } = managedSetup()
+    const request = input(1, '["managed-a"]')
+    await sync.sync(request)
+    await sync.sync(request)
+    expect(deps.apply).toHaveBeenCalledTimes(1)
+  })
+})

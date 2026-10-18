@@ -132,7 +132,11 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
       // A reinstall can preserve the journal while losing the account manager's pool.
       // Reuse the receipt only when its desired accounts still exist locally.
       const installed=new Set(prior.desired.length?await deps.snapshot(normalized.provider):[])
-      if(prior.desired.every(identity=>installed.has(identity))){
+      // A managed slot counts only with its managed metadata: the synthetic email alone may be a personal import or a
+      // slot that lost it, which the full apply restores or refuses.
+      const desiredManaged=(prior.managed??[]).filter(identity=>prior.desired.includes(identity))
+      const verified=desiredManaged.length&&deps.managedInstalled?new Set((await deps.managedInstalled(normalized.provider)).map(item=>item.identity)):null
+      if(prior.desired.every(identity=>installed.has(identity))&&(!verified||desiredManaged.every(identity=>verified.has(identity)))){
         prior.generation=normalized.generation;prior.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;prior.leaseId=normalized.leaseId
         // A removal deferred for a running session, or an orphan left meanwhile, is retried by any later sync.
         if(setupTokenEntry(prior))await reclaim(journal,normalized.provider,prior.desired.length?installed:new Set(await deps.snapshot(normalized.provider)),true)
