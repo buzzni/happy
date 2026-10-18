@@ -7,6 +7,7 @@ import { McpConfigSynchronizer } from './mcpConfigSynchronizer';
 import { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { query } from '@/claude/sdk';
 import type { EnhancedMode } from './loop';
+import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
 
 vi.mock('@/claude/sdk', () => ({
     query: vi.fn(),
@@ -1431,6 +1432,22 @@ describe('lessons at the provider boundary', () => {
             lessons: { sessionId: 'happy-session', sessionKind: 'foreground', review, turn },
         }));
         expect(turns[0].sent).toBe(command);
+        expect(review.prepareReviewTurn).not.toHaveBeenCalled();
+    });
+
+    it('sends the transient retry note bare, without recalling lessons or a review instruction for it', async () => {
+        const proposalTurn = createLessonProposalTurn();
+        const review = { prepareReviewTurn: vi.fn(async () => ({ revision: 4 })), reviewFinishedTurn: vi.fn(async () => 'reviewed' as const) };
+        const turn = { recall: vi.fn(async () => ({ outcome: 'selected' as const, block: 'REFERENCE', ticket })), acknowledge: vi.fn(async () => true) };
+        const turns = providerCapturing(async push => { push({ type: 'result', subtype: 'success' }); });
+        await claudeRemote(baseOptions({
+            exitAfterFirstTurn: true, nextMessage: async () => ({ message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode }),
+            lessonProposalTurn: proposalTurn,
+            lessons: { sessionId: 'happy-session', sessionKind: 'foreground', review, turn },
+        }));
+        // The CLI merges it into the original request, which already carried both.
+        expect(turns[0].sent).toBe(CLAUDE_TRANSIENT_CONTINUE_PROMPT);
+        expect(turn.recall).not.toHaveBeenCalled();
         expect(review.prepareReviewTurn).not.toHaveBeenCalled();
     });
 

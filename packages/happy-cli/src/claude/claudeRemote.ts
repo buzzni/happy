@@ -60,6 +60,7 @@ import {
     type LessonTurnObservations,
 } from '@/memory/lessonTurnObservations';
 import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
+import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
 
 export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
 
@@ -668,8 +669,9 @@ function readTurnText(content: unknown): string {
     const isCommandInput = (content: unknown) => /^\/\S/.test(readTurnText(content).trimStart());
     let queryClosed = false;
     const withLessons = async (content: string | ContentBlockParam[], spans?: PreparationSpan[]) => {
-        // Native slash commands must remain the first provider input token.
-        if (isCommandInput(content)) {
+        // Native slash commands must remain the first provider input token. The transient retry note
+        // joins the failed request, which already carries its lessons (specs/claude-transient-retry D2).
+        if (isCommandInput(content) || content === CLAUDE_TRANSIENT_CONTINUE_PROMPT) {
             pendingLessonTicket = null;
             opts.lessonProposalTurn?.cancel();
             return content;

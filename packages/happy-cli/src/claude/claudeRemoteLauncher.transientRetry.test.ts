@@ -6,6 +6,8 @@ import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
+import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
+import { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -40,13 +42,18 @@ const answer = (id: string) => ({ type: 'assistant', uuid: `uuid-${id}`, session
 const okResult = (uuid: string) => ({ type: 'result', subtype: 'success', is_error: false, result: 'hi', uuid, session_id: 'claude-1',
     total_cost_usd: 0.001, num_turns: 1, duration_ms: 10, usage: { input_tokens: 5, output_tokens: 3 } });
 
-type Step = (prompt: string, index: number) => Promise<'fail' | 'answer' | 'answer-then-fail'>;
+type Step = (prompt: string, index: number) => Promise<'fail' | 'fail-then-exit' | 'answer' | 'answer-then-fail'>;
+type Options = {
+    /** Queues the first input; a plain 'hello' otherwise. */
+    first?: (queue: MessageQueue2<EnhancedMode>) => void;
+    session?: (queue: MessageQueue2<EnhancedMode>) => Record<string, unknown>;
+};
 
 /**
  * Runs the real launcher against a scripted provider. `step` decides each turn's outcome and
  * may act on the session meanwhile; the launcher is ended with `switch` once `done` resolves.
  */
-async function runLauncher(step: Step, done: (prompts: string[]) => boolean, settleMs = 0) {
+async function runLauncher(step: Step, done: (prompts: string[]) => boolean, settleMs = 0, options: Options = {}) {
     const queue = new MessageQueue2<EnhancedMode>(hashObject);
     const handlers = new Map<string, () => Promise<unknown>>();
     const agentState: Record<string, unknown> = {};
@@ -77,6 +84,8 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
                 if (outcome !== 'answer') {
                     yield apiErrorMessage;
                     yield failedResult(`result-${prompts.length}`);
+                    // The provider process ends on its own while the retry waits.
+                    if (outcome === 'fail-then-exit') return;
                 } else {
                     yield answer(`msg-${prompts.length}`);
                     yield okResult(`result-${prompts.length}`);
@@ -90,13 +99,14 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
         })();
         return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
     });
-    queue.push('hello', MODE);
+    if (options.first) options.first(queue); else queue.push('hello', MODE);
     const session: Record<string, unknown> = {
         lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
         cancelLessonReview: vi.fn(), onAbort: vi.fn(),
         sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
         api: { push: () => ({ sendSessionNotification }) },
         consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        ...options.session?.(queue),
     };
     const run = claudeRemoteLauncher(session as unknown as Session);
     return { run, queue, handlers, client, agentState, prompts, sendSessionNotification, generations: () => generations };
@@ -180,6 +190,85 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
 
         expect(harness.prompts).toEqual(['hello']);
         expect(retryStates(harness.client).at(-1)).toBeNull();
+        // Only the wait was running: the idle provider is kept, and no turn is reported cancelled.
+        expect(harness.generations()).toBe(1);
+        expect(harness.client.closeClaudeSessionTurn).not.toHaveBeenCalledWith('cancelled');
+        expect(harness.client.sendSessionEvent).not.toHaveBeenCalledWith({ type: 'message', message: 'Aborted by user' });
+    });
+
+    it('ends a standalone drain that stops input while a retry waits, without retrying', async () => {
+        ladder.delays = [5_000];
+        let gate!: RuntimeProducerGate;
+        let waits = 0;
+        const harness = await runLauncher(async (_prompt, index) => {
+            // The daemon drains the runtime during the wait.
+            if (index === 0) setTimeout(() => gate.freeze(), 30);
+            return 'fail';
+        }, () => false, 0, {
+            session: (queue) => {
+                let drain!: ClaudeStandaloneDrain;
+                gate = new RuntimeProducerGate({
+                    hasUndeliveredInput: () => queue.size() > 0,
+                    canFreezeInbound: () => true,
+                    freezeInbound: () => true,
+                    stopLoop: () => { drain.providerDeps().requestEndInput(); },
+                });
+                drain = new ClaudeStandaloneDrain(gate);
+                const wait = queue.waitForMessagesAndGetAsString.bind(queue);
+                // Safety valve: a spin on the closed queue starves every timer, this test's included.
+                queue.waitForMessagesAndGetAsString = (signal, claim) => {
+                    if (++waits > 50) throw new Error('wait loop spins on the closed queue');
+                    return wait(signal, claim);
+                };
+                return { standaloneDrain: drain };
+            },
+        });
+
+        await expect(harness.run).resolves.toBe('exit');
+        expect(waits).toBeLessThan(10);
+        expect(harness.prompts).toEqual(['hello']);
+        expect(retryStates(harness.client).at(-1)).toBeNull();
+    });
+
+    it('keeps a waiting retry across a provider that exits on its own, and runs it in the next one', async () => {
+        const harness = await runLauncher(async (_prompt, index) => index === 0 ? 'fail-then-exit' : 'answer',
+            (prompts) => prompts.length === 2);
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['hello', CLAUDE_TRANSIENT_CONTINUE_PROMPT]);
+        expect(harness.generations()).toBe(2);
+    });
+
+    it('does not retry a channel request', async () => {
+        const harness = await runLauncher(async () => 'fail', (prompts) => prompts.length === 1, 100, {
+            first: (queue) => queue.pushIsolated('from slack', MODE, undefined, undefined, 'channel-req-1'),
+            // The session admits the channel request, as runClaude does.
+            session: () => ({ prepareChannelExecution: async () => true, beginChannelExecution: () => true }),
+        });
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['from slack']);
+        expect(retryStates(harness.client)).toEqual([]);
+    });
+
+    it('does not retry a slash command', async () => {
+        const harness = await runLauncher(async () => 'fail', (prompts) => prompts.length === 1, 100, {
+            first: (queue) => queue.push('/compact', MODE),
+        });
+        await harness.run;
+
+        expect(harness.prompts).toEqual(['/compact']);
+        expect(retryStates(harness.client)).toEqual([]);
+    });
+
+    it('does not retry a run-once turn', async () => {
+        const harness = await runLauncher(async () => 'fail', () => false, 0, {
+            session: () => ({ exitAfterFirstTurn: true }),
+        });
+
+        await expect(harness.run).resolves.toBe('exit');
+        expect(harness.prompts).toEqual(['hello']);
+        expect(retryStates(harness.client)).toEqual([]);
     });
 
     it('does not retry a turn that already answered before the API failed', async () => {

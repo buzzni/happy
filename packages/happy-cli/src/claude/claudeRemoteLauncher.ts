@@ -155,6 +155,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     async function doAbort() {
         logger.debug('[remote]: doAbort');
         session.onAbort();
+        /*
+         * Only a retry was waiting (specs/claude-transient-retry R5a): the stop ends the wait. The
+         * provider is idle, so killing it would only restart it, and its failed turn is already closed.
+         */
+        if (transientRetry.cancel() && !session.thinking) {
+            session.cancelLessonReview();
+            return;
+        }
         await abort();
     }
 
@@ -675,6 +683,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             previousSessionId = session.sessionId;
             const controller = new AbortController();
             abortController = controller;
+            /** This generation's provider has ended; a wait it left behind must not take a due retry. */
+            let providerEnded = false;
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
@@ -863,7 +873,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 retryWake ? AbortSignal.any([controller.signal, retryWake]) : controller.signal,
                                 drain ? () => drain.claimTurn() : undefined,
                             );
-                            if (msg || !retryWake || controller.signal.aborted) break;
+                            // Anything but the retry's own wake (a closed queue, a refused claim, an
+                            // abort) is handled below, as it would be without a retry waiting.
+                            if (msg || !retryWake?.aborted || controller.signal.aborted) break;
+                            // The next generation runs it.
+                            if (providerEnded) return null;
                             const due = transientRetry.takeDue();
                             // Cancelled rather than due: keep waiting for the user.
                             if (!due) continue;
@@ -1163,6 +1177,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     continue;
                 }
             } finally {
+                providerEnded = true;
                 if (backgroundTasks) {
                     publishBackgroundTasks({ ...backgroundTasks, available: false });
                     backgroundTasks = undefined;
