@@ -9,13 +9,13 @@ function setup() {
   return {deps,installed,sync,input,restart:()=>createCredentialGroupSync(deps)}
 }
 /** Org-managed setup-tokens are the `managed-*` identities; `metadata` holds the local slots that carry managed metadata. */
-function managedSetup() {
+function managedSetup(extra:{inUse?:(provider:string)=>Promise<string[]>}={}) {
   const base=setup()
   const metadata=new Set<string>()
   const managedDeps={...base.deps,
     managedIdentities:(_provider:string,payload:string)=>(JSON.parse(payload) as string[]).filter(id=>id.startsWith('managed-')),
     managedInstalled:vi.fn(async()=>[...base.installed].filter(id=>metadata.has(id)).map(identity=>({identity,aliases:[] as string[]}))),
-    apply:vi.fn(async(provider:string,payload:string,owned:string[])=>{await base.deps.apply(provider,payload);for(const id of JSON.parse(payload) as string[])if(id.startsWith('managed-'))metadata.add(id);return owned})}
+    apply:vi.fn(async(provider:string,payload:string,owned:string[])=>{await base.deps.apply(provider,payload);for(const id of JSON.parse(payload) as string[])if(id.startsWith('managed-'))metadata.add(id);return owned}),...extra}
   const create=()=>createCredentialGroupSync(managedDeps)
   return {...base,deps:managedDeps,metadata,sync:create(),restart:create}
 }
@@ -274,5 +274,72 @@ describe('managed setup-token ownership re-acquisition', () => {
     await sync.invalidate('claude', null)
     await sync.sync(input(3, null))
     expect([...installed]).toEqual(['personal'])
+  })
+})
+
+// Saycode specs/claude-setup-token-managed-sync R1/R2: the managed setup-token slots match the assigned set exactly.
+describe('orphan managed setup-token sweep', () => {
+  it('replaces {A,B} by {B,C}: A removed, B kept, C added, personal and bare slots untouched', async () => {
+    const { sync, input, installed } = managedSetup()
+    installed.add('managed-bare')
+    await sync.sync(input(1, '["managed-a","managed-b"]'))
+    await sync.sync(input(2, '["managed-b","managed-c"]'))
+    expect([...installed].sort()).toEqual(['managed-b', 'managed-bare', 'managed-c', 'personal'])
+  })
+
+  it('removes managed-format slots no journal entry desires after a setup-token apply', async () => {
+    const { sync, input, installed, metadata, deps } = managedSetup()
+    for (const id of ['managed-orphan', 'managed-bare']) installed.add(id)
+    metadata.add('managed-orphan')
+    await expect(sync.sync(input(1, '["managed-a"]'))).resolves.toMatchObject({ reconciled: true })
+    expect([...installed].sort()).toEqual(['managed-a', 'managed-bare', 'personal'])
+    expect(deps.remove).toHaveBeenCalledWith('claude', ['managed-orphan'])
+  })
+
+  it('keeps managed slots another scope, principal or older identity form still desires', async () => {
+    const { sync, input, installed, metadata, deps } = managedSetup()
+    const machine = { version: 1 as const, scope: 'company', principalType: 'machine' as const, machineId: 'machine-1', provider: 'claude' as const, generation: 1, fingerprint: 'c'.repeat(64), payload: '["managed-m"]' }
+    await sync.sync(machine)
+    await sync.sync(input(1, '["managed-o"]', 'other'))
+    // An entry of an older daemon that still names a slot by its older identity form.
+    const journal = JSON.parse((await deps.read())!)
+    journal.entries.push({ scope: 'legacy', principalType: 'user', userId: 'user', provider: 'claude', generation: 1, fingerprint: 'd'.repeat(64), payloadDigest: null, desired: ['legacy-hash-l'], owned: [], pending: false })
+    await deps.write(JSON.stringify(journal))
+    installed.add('managed-l'); metadata.add('managed-l')
+    deps.managedInstalled.mockImplementation(async () => [...installed].filter(id => metadata.has(id)).map(identity => ({ identity, aliases: identity === 'managed-l' ? ['legacy-hash-l'] : [] })))
+    await sync.sync(input(1, '["managed-a"]'))
+    expect([...installed].sort()).toEqual(['managed-a', 'managed-l', 'managed-m', 'managed-o', 'personal'])
+  })
+
+  it('does not sweep after an assignment without setup-tokens', async () => {
+    const { sync, input, installed, metadata, deps } = managedSetup()
+    installed.add('managed-orphan'); metadata.add('managed-orphan')
+    await sync.sync(input(1, '["shared"]'))
+    expect(installed.has('managed-orphan')).toBe(true)
+    expect(deps.managedInstalled).not.toHaveBeenCalled()
+  })
+
+  it('defers removing a slot a running session is bound to, without failing the receipt, and removes it on a later sync', async () => {
+    const busy = new Set(['managed-a', 'managed-orphan'])
+    const inUse = vi.fn(async () => [...busy])
+    const { sync, input, installed, metadata, deps } = managedSetup({ inUse })
+    installed.add('managed-orphan'); metadata.add('managed-orphan')
+    await sync.sync(input(1, '["managed-a"]'))
+    await expect(sync.sync(input(2, '["managed-b"]'))).resolves.toMatchObject({ reconciled: true })
+    expect([...installed].sort()).toEqual(['managed-a', 'managed-b', 'managed-orphan', 'personal'])
+    expect(inUse).toHaveBeenCalledWith('claude')
+    busy.clear()
+    // The same assignment again (a Desktop retry): the deferred removals happen now.
+    await expect(sync.sync(input(2, '["managed-b"]'))).resolves.toMatchObject({ reconciled: true })
+    expect([...installed].sort()).toEqual(['managed-b', 'personal'])
+    expect(deps.apply).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not acknowledge an orphan that could not be removed', async () => {
+    const { sync, input, installed, metadata, deps } = managedSetup()
+    installed.add('managed-orphan'); metadata.add('managed-orphan')
+    deps.remove.mockResolvedValue(undefined)
+    await expect(sync.sync(input(1, '["managed-a"]'))).rejects.toThrow('AI_GROUP_REMOVAL_INCOMPLETE')
+    expect(await sync.receipt('company', 'claude')).toMatchObject({ reconciled: false })
   })
 })

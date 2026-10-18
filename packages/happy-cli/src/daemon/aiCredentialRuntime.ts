@@ -137,6 +137,8 @@ export type AiCredentialRuntimeDependencies = {
   codexProxyStatus?: () => { activeRoutes: number }
   /** Present only when the daemon has a trusted Studio origin configured. */
   setupTokenBinding?: Pick<SetupTokenBindingVerifier, 'verify' | 'available'>
+  /** Managed account IDs the daemon's running sessions are bound to; a group sync leaves their slots for a later sync. */
+  setupTokenAccountsInUse?(): string[]
 }
 
 export class AiCredentialRuntimeError extends Error {
@@ -1736,6 +1738,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     read: async () => { try { return await deps.readFile(groupJournalPath) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error } },
     write: async content => { await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 }); await deps.chmod(join(deps.homeDir, '.happy'), 0o700); await writeAtomicFile(deps, groupJournalPath, content) },
     snapshot: groupAdapters.snapshot, managedInstalled: groupAdapters.managedInstalled, incoming: groupPayloadIdentities, remove: groupAdapters.remove, appliedMachineId: deps.machineId,
+    inUse: async selected => selected !== 'claude' ? [] : (deps.setupTokenAccountsInUse?.() ?? []).map(setupTokenGroupIdentity),
     managedIdentities: (selected, payload) => selected !== 'claude' ? [] : (JSON.parse(payload).accounts as Array<Record<string, unknown>>)
       .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string')
       .map(account => setupTokenGroupIdentity(account.managedAccountId as string)),
@@ -2882,7 +2885,7 @@ export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
   homeDir: string = homedir(),
-  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'> = {},
+  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'|'setupTokenAccountsInUse'> = {},
 ) {
   return createAiCredentialRuntime({
     ...options,

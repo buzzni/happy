@@ -52,7 +52,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean } } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[] } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -120,6 +120,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
   const runtime = createAiCredentialRuntime({
     homeDir: join('/home', 'operator'), platform: options.platform, machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier() }),
+    ...(options.inUse ? { setupTokenAccountsInUse: options.inUse } : {}),
     ...(options.durability === 'missing' ? {} : {
       syncFile: async (path: string) => { syncEvents.push('file:' + path); if (options.durability === 'file-fails') throw new Error('sync failed') },
       syncDirectory: async (path: string) => { syncEvents.push('directory:' + path); if (options.durability === 'directory-fails') throw new Error('sync failed') },
@@ -599,6 +600,27 @@ describe('managed Claude setup-token runtime', () => {
     // Owned again: the next assignment change replaces it.
     await runtime.groupSync(sync(3, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
     expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', B])
+  })
+
+  it('removes orphaned managed-format slots after a setup-token apply but keeps personal and bare synthetic slots', async () => {
+    const C = '0b6f2c1e-1111-4a2b-8c3d-000000000003'
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = stored(C, 1, fakeToken('bare'), { number: 3 })
+    const { runtime, state, calls } = fakeMachine([personal, stored(B, 4, fakeToken('orphan')), bare as Slot], 1)
+    await expect(runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 4 })))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', managedSetupTokenEmail(C), A])
+    expect(state.active).toBe(1)
+    expect(calls.filter(call => call.args[0] === 'remove').map(call => call.args[1])).toEqual(['2'])
+  })
+
+  it('leaves an orphaned slot a running session is bound to for a later sync', async () => {
+    const inUse = vi.fn(() => [B])
+    const { runtime, state } = fakeMachine([stored(B, 4, fakeToken('orphan'))], null, { inUse })
+    await expect(runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 4 })))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId)).toEqual([B, A])
+    inUse.mockReturnValue([])
+    await expect(runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 4 })))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A])
   })
 
   it.each(['replace', 'merge'] as const)('keeps its managed setup-tokens owned through a manual OAuth %s apply and still revokes them', async applyMode => {

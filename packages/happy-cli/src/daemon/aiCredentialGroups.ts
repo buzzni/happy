@@ -32,6 +32,8 @@ export type CredentialGroupDeps = {
    * identity plus older identity forms a journal may still hold for them. Nothing else is ever re-acquired.
    */
   managedInstalled?(provider:GroupProvider):Promise<Array<{identity:string;aliases:string[]}>>
+  /** Identities a running session is bound to: their removal waits for a later sync instead of failing this one. */
+  inUse?(provider:GroupProvider):Promise<string[]>
   /** Secret-free receipt projection for setup-token rows applied by this operation. */
   appliedCredentials?(provider:GroupProvider,payload:string,applied:unknown):AppliedCredentialReceipt[]
   /** `owned` are identities this scope installed earlier: the only slots it may replace. */
@@ -59,6 +61,8 @@ function request(value:CredentialGroupRequest):NormalizedRequest {
   return {...value,principalType,userId:userId as string}
 }
 const principalType=(entry:Pick<Entry,'principalType'>)=>entry.principalType??'user'
+/** An entry that desires or still holds org-managed setup-tokens: its syncs keep the managed slots exact. */
+const setupTokenEntry=(entry:Pick<Entry,'managed'|'managedHeld'>)=>(entry.managed??[]).length>0||(entry.managedHeld??[]).length>0
 const samePrincipal=(entry:Pick<Entry,'principalType'|'userId'|'machineId'>, request:Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) => principalType(entry)===request.principalType && (request.principalType==='machine' ? entry.machineId===request.machineId : entry.userId===request.userId)
 /** One user assignment per scope and provider (a new userId replaces it); machine assignments are kept per machine. */
 const sameSlot=(entry:Pick<Entry,'principalType'|'machineId'>, request:Pick<NormalizedRequest,'principalType'|'machineId'>) => principalType(entry)===request.principalType && (request.principalType!=='machine' || entry.machineId===request.machineId)
@@ -97,6 +101,23 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   async function readReceipt(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) {
     return parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&(principal?samePrincipal(e,principal):principalType(e)==='user'))
   }
+  /**
+   * Removes what no entry desires any more: what an entry installed or applied (owned, managedHeld) and, after a
+   * setup-token apply, every slot in Saycode's managed format no entry desires (left by a lost or older journal).
+   * Slots without managed metadata are never swept. A slot a running session is bound to waits for a later sync.
+   */
+  async function reclaim(journal:Journal,provider:GroupProvider,current:Set<string>,sweep:boolean) {
+    const related=journal.entries.filter(e=>e.provider===provider)
+    const wanted=new Set(related.flatMap(e=>e.desired))
+    const orphans=sweep&&deps.managedInstalled?(await deps.managedInstalled(provider)).filter(item=>![item.identity,...item.aliases].some(value=>wanted.has(value))).map(item=>item.identity):[]
+    const candidates=[...new Set([...related.flatMap(e=>[...e.owned,...(e.managedHeld??[])]),...orphans])].filter(value=>!wanted.has(value)&&current.has(value))
+    const busy=new Set(candidates.length&&deps.inUse?await deps.inUse(provider):[])
+    const removable=candidates.filter(value=>!busy.has(value))
+    if(removable.length)await deps.remove(provider,removable)
+    const installed=new Set(await deps.snapshot(provider))
+    if(removable.some(value=>installed.has(value)))fail('AI_GROUP_REMOVAL_INCOMPLETE')
+    for(const other of related){other.owned=other.owned.filter(value=>installed.has(value));if(other.managedHeld)other.managedHeld=other.managedHeld.filter(value=>installed.has(value))}
+  }
   async function sync(input:CredentialGroupRequest) {
     const normalized=request(input)
     const journal=parse(await deps.read())
@@ -111,7 +132,12 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
       // A reinstall can preserve the journal while losing the account manager's pool.
       // Reuse the receipt only when its desired accounts still exist locally.
       const installed=new Set(prior.desired.length?await deps.snapshot(normalized.provider):[])
-      if(prior.desired.every(identity=>installed.has(identity))){prior.generation=normalized.generation;prior.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;prior.leaseId=normalized.leaseId;await deps.write(JSON.stringify(journal));return receipt(prior)}
+      if(prior.desired.every(identity=>installed.has(identity))){
+        prior.generation=normalized.generation;prior.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;prior.leaseId=normalized.leaseId
+        // A removal deferred for a running session, or an orphan left meanwhile, is retried by any later sync.
+        if(setupTokenEntry(prior))await reclaim(journal,normalized.provider,prior.desired.length?installed:new Set(await deps.snapshot(normalized.provider)),true)
+        await deps.write(JSON.stringify(journal));return receipt(prior)
+      }
     }
     const payloadDigest=normalized.payload===null?null:createHash('sha256').update(normalized.payload).digest('hex')
     if(prior&&normalized.fingerprint===prior.fingerprint&&payloadDigest!==prior.payloadDigest)fail('AI_GROUP_PAYLOAD_CONFLICT')
@@ -140,13 +166,7 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     }
     const after=new Set(await deps.snapshot(normalized.provider))
     if(desired.some(identity=>!after.has(identity)))fail('AI_GROUP_INSTALL_INCOMPLETE')
-    const related=journal.entries.filter(e=>e.provider===normalized.provider)
-    const wanted=new Set(related.flatMap(e=>e.desired))
-    const removable=[...new Set(related.flatMap(e=>[...e.owned,...(e.managedHeld??[])]))].filter(value=>!wanted.has(value)&&after.has(value))
-    if(removable.length)await deps.remove(normalized.provider,removable)
-    const installed=new Set(await deps.snapshot(normalized.provider))
-    if(removable.some(value=>installed.has(value)))fail('AI_GROUP_REMOVAL_INCOMPLETE')
-    for(const other of related){other.owned=other.owned.filter(value=>installed.has(value));if(other.managedHeld)other.managedHeld=other.managedHeld.filter(value=>installed.has(value))}
+    await reclaim(journal,normalized.provider,after,setupTokenEntry(entry)||Boolean(slot&&setupTokenEntry(slot)))
     entry.pending=false
     await deps.write(JSON.stringify(journal))
     return receipt(entry)

@@ -4362,6 +4362,11 @@ export async function startDaemon(): Promise<void> {
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor, process.env, os.homedir(), {
       machineId,
       setupTokenBinding: trustedStudioOrigin ? createSetupTokenBindingVerifier({ origin: trustedStudioOrigin, machineId }) : undefined,
+      // A group sync never removes the organization account a live session runs on; it waits for a later sync.
+      setupTokenAccountsInUse: () => getCurrentChildren().flatMap(session => {
+        // A corrupt record cannot be resumed anyway, so it holds no slot back.
+        try { const bound = readSetupTokenResumeSelection(session.agentEnvironment); return bound ? [bound.binding.managedAccountId] : []; } catch { return []; }
+      }),
     });
     const personalProbeTimer = setInterval(() => {
       void aiCredentialRuntime.personalSchedulerTick({
