@@ -1005,10 +1005,10 @@ export class ApiSessionClient extends EventEmitter {
             const userMessage = automationRunId
                 ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text) } }
                 : incoming;
-            const replacedAutomationTurn = automationRunId
+            const settledAutomationTurns = automationRunId
                 ? this.automationTurns.arm(automationRunId)
                 : this.automationTurns.userInput();
-            if (replacedAutomationTurn) this.reportAutomationTurn(replacedAutomationTurn);
+            for (const settled of settledAutomationTurns) this.reportAutomationTurn(settled);
             this.inputObservedForNextTurn = true;
             if (userMessage.meta?.sentFrom !== 'daemon') {
                 this.lastUserInteractionAt = Date.now();
@@ -1583,9 +1583,16 @@ export class ApiSessionClient extends EventEmitter {
         // The launcher says whether the retry runs right after clearing the wait.
         setTimeout(() => {
             if (this.transientRetryPending || this.transientRetryDispatched) return;
-            const settled = this.automationTurns.userInput();
-            if (settled) this.reportAutomationTurn(settled);
+            for (const settled of this.automationTurns.retryAbandoned()) this.reportAutomationTurn(settled);
         }, 0);
+    }
+
+    /**
+     * The engine has no input waiting (Claude after a turn with an empty queue, Codex when idle).
+     * Until it says so, a scheduled prompt behind other input is not tracked — see AutomationTurnTracker.
+     */
+    noteInputQueueEmpty(): void {
+        this.automationTurns.inputQueueEmpty();
     }
 
     /** The waiting retry is being sent now; its turn settles any carried scheduled run. */

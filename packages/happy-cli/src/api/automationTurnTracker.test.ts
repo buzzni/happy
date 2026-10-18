@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { AutomationTurnTracker, automationRunIdFromLocalKey, AUTOMATION_TURN_ANSWER_MAX_CHARS } from './automationTurnTracker';
 
 const start = (turn: string): SessionEnvelope => createEnvelope('agent', { t: 'turn-start' }, { turn });
+const cancelled = (runId: string) => ({ runId, status: 'cancelled', finalAnswer: null, silent: false });
 const end = (turn: string, status: 'completed' | 'failed' | 'cancelled' = 'completed'): SessionEnvelope =>
     createEnvelope('agent', { t: 'turn-end', status }, { turn });
 
@@ -74,12 +75,60 @@ describe('AutomationTurnTracker', () => {
         expect(tracker.observe(end('t1'))).toEqual({ runId: 'run-1', status: 'completed', finalAnswer: null, silent: false });
     });
 
-    it('keeps following the newest scheduled prompt when another arrives first', () => {
+    it('sends neither of two scheduled prompts that queue up before either one starts — one turn may answer both', () => {
         const tracker = new AutomationTurnTracker();
-        tracker.arm('run-1');
-        tracker.arm('run-2');
+        expect(tracker.arm('run-1')).toEqual([]);
+        expect(tracker.arm('run-2')).toEqual([cancelled('run-1'), cancelled('run-2')]);
         tracker.observe(start('t1'));
-        expect(tracker.observe(end('t1'))?.runId).toBe('run-2');
+        tracker.noteFinalAnswer('both answered together');
+        expect(tracker.observe(end('t1'))).toBeNull();
+    });
+
+    it('does not take a turn that answers user input queued ahead of the scheduled prompt for the scheduled run', () => {
+        const tracker = new AutomationTurnTracker();
+        tracker.observe(start('busy'));
+        expect(tracker.userInput()).toEqual([]);
+        // The scheduled prompt waits behind the user's message; which turn answers it is unknowable.
+        expect(tracker.arm('run-1')).toEqual([cancelled('run-1')]);
+        tracker.observe(end('busy'));
+        tracker.observe(start('t2'));
+        tracker.noteFinalAnswer("the answer to the user's own message");
+        expect(tracker.observe(end('t2'))).toBeNull();
+    });
+
+    it('drops the scheduled run when user input arrives before its turn starts, since both may go in one turn', () => {
+        const tracker = new AutomationTurnTracker();
+        tracker.observe(start('busy'));
+        tracker.arm('run-1');
+        expect(tracker.userInput()).toEqual([cancelled('run-1')]);
+        tracker.observe(end('busy'));
+        tracker.observe(start('t2'));
+        expect(tracker.observe(end('t2'))).toBeNull();
+    });
+
+    it('tracks scheduled prompts again once the engine says no input is waiting', () => {
+        const tracker = new AutomationTurnTracker();
+        // Two messages answered in one turn: the tracker cannot tell the queue is empty by itself.
+        tracker.userInput();
+        tracker.userInput();
+        tracker.observe(start('t1'));
+        tracker.observe(end('t1'));
+        expect(tracker.arm('run-1')).toEqual([cancelled('run-1')]);
+        tracker.inputQueueEmpty();
+        expect(tracker.arm('run-2')).toEqual([]);
+        tracker.observe(start('t2'));
+        tracker.noteFinalAnswer('the scheduled answer');
+        expect(tracker.observe(end('t2'))?.runId).toBe('run-2');
+    });
+
+    it('tracks a scheduled prompt normally after earlier user input already started its own turn', () => {
+        const tracker = new AutomationTurnTracker();
+        tracker.userInput();
+        tracker.observe(start('t1'));
+        expect(tracker.arm('run-1')).toEqual([]);
+        tracker.observe(end('t1'));
+        tracker.observe(start('t2'));
+        expect(tracker.observe(end('t2'))?.runId).toBe('run-1');
     });
 
     it('follows a failed turn into the automatic retry of a temporary API failure (H9a)', () => {
@@ -98,14 +147,14 @@ describe('AutomationTurnTracker', () => {
         tracker.arm('run-1');
         tracker.observe(start('t1'));
         tracker.carry(tracker.observe(end('t1', 'failed'))!);
-        expect(tracker.userInput()).toEqual({ runId: 'run-1', status: 'failed', finalAnswer: null, silent: false });
-        expect(tracker.userInput()).toBeNull();
+        expect(tracker.userInput()).toEqual([{ runId: 'run-1', status: 'failed', finalAnswer: null, silent: false }]);
+        expect(tracker.userInput()).toEqual([]);
+        tracker.inputQueueEmpty();
 
         tracker.arm('run-2');
         tracker.observe(start('t2'));
         tracker.carry(tracker.observe(end('t2', 'failed'))!);
-        expect(tracker.arm('run-3')).toEqual({ runId: 'run-2', status: 'failed', finalAnswer: null, silent: false });
-        expect(tracker.userInput()).toBeNull();
+        expect(tracker.arm('run-3')).toEqual([{ runId: 'run-2', status: 'failed', finalAnswer: null, silent: false }]);
     });
 });
 

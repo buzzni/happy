@@ -1139,6 +1139,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onReady: () => {
                         drain?.turnEnded();
+                        // Nothing waiting: a scheduled prompt that arrives next is the next turn (specs/automation-result-delivery).
+                        if (!pending && session.queue.size() === 0) session.client.noteInputQueueEmpty?.();
                         // Queued, not called: a terminal emitted ahead of the transcript closes a
                         // turn that has not received its text yet, and the later flush opens a
                         // second, unrelated one.

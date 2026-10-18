@@ -8,6 +8,14 @@
  * that opens after it is that run's turn, and its `turn-end` settles it. A turn that was already
  * open when the prompt arrived belongs to whatever came before.
  *
+ * That holds only while the prompt is the next input to run. When other input is still waiting
+ * ahead of it, or arrives before its turn opens, the next turn may answer that input instead, or
+ * both at once (engines batch queued input). Which turn is the run's cannot be told from here, so
+ * such a run is dropped as `cancelled` and nothing is sent for it: a missing result is better
+ * than someone's own conversation reaching a messenger as the scheduled answer. The tracker counts
+ * input that has not started a turn yet; batching makes that count high, never low, and the
+ * engine resets it when it says nothing is waiting (`inputQueueEmpty`).
+ *
  * A failed turn the engine is about to retry on its own (a temporary API failure, specs
  * claude-transient-retry) is not the run's outcome yet: the caller `carry`s it, and the retry's
  * turn settles the run instead. Input from anyone else replaces that retry, so it settles the
@@ -48,16 +56,25 @@ function cutAnswer(text: string): string {
     return `${characters.slice(0, AUTOMATION_TURN_ANSWER_MAX_CHARS - 1).join('').trimEnd()}…`;
 }
 
+function dropped(runId: string): AutomationTurnResult {
+    return { runId, status: 'cancelled', finalAnswer: null, silent: false };
+}
+
 export class AutomationTurnTracker {
     private openTurn: string | null = null;
     private armed: { runId: string; behindTurn: string | null; carried: boolean } | null = null;
     private active: { runId: string; turn: string; finalAnswer: string | null } | null = null;
+    /** Input received that has not opened a turn yet — at least this many, never fewer. */
+    private waitingInputs = 0;
 
-    /** A scheduled prompt for `runId` reached the session. Returns a carried run this one replaced. */
-    arm(runId: string): AutomationTurnResult | null {
-        const replaced = this.userInput();
+    /** A scheduled prompt for `runId` reached the session. Returns the runs this settled. */
+    arm(runId: string): AutomationTurnResult[] {
+        const settled = this.anotherInput();
+        const ahead = this.waitingInputs;
+        this.waitingInputs += 1;
+        if (ahead > 0) return [...settled, dropped(runId)];
         this.armed = { runId, behindTurn: this.openTurn, carried: false };
-        return replaced;
+        return settled;
     }
 
     /** A failed run the engine retries by itself: the next turn answers it. */
@@ -65,12 +82,32 @@ export class AutomationTurnTracker {
         this.armed = { runId: failed.runId, behindTurn: this.openTurn, carried: true };
     }
 
-    /** Someone else's input arrived. Returns the carried run it replaced, settled as failed. */
-    userInput(): AutomationTurnResult | null {
-        if (!this.armed?.carried) return null;
-        const { runId } = this.armed;
+    /** Someone else's input arrived. Returns the runs it settled. */
+    userInput(): AutomationTurnResult[] {
+        const settled = this.anotherInput();
+        this.waitingInputs += 1;
+        return settled;
+    }
+
+    /** The engine's own retry of a carried failure will not run after all: it settles as failed. */
+    retryAbandoned(): AutomationTurnResult[] {
+        return this.armed?.carried ? this.anotherInput() : [];
+    }
+
+    /** The engine has no input waiting: every input so far has had its turn. */
+    inputQueueEmpty(): void {
+        this.waitingInputs = 0;
+    }
+
+    /**
+     * Input other than a waiting run's own prompt. A carried failure's retry is replaced, so it
+     * settles as the failure it was; a prompt whose turn has not opened may now share it, so it is dropped.
+     */
+    private anotherInput(): AutomationTurnResult[] {
+        const armed = this.armed;
+        if (!armed) return [];
         this.armed = null;
-        return { runId, status: 'failed', finalAnswer: null, silent: false };
+        return [armed.carried ? { runId: armed.runId, status: 'failed', finalAnswer: null, silent: false } : dropped(armed.runId)];
     }
 
     /** The engine's final answer for the turn that is open now. */
@@ -84,6 +121,7 @@ export class AutomationTurnTracker {
         const { ev, turn } = envelope;
         if (ev.t === 'turn-start') {
             this.openTurn = turn;
+            if (this.waitingInputs > 0) this.waitingInputs -= 1;
             if (this.armed && turn !== this.armed.behindTurn) {
                 this.active = { runId: this.armed.runId, turn, finalAnswer: null };
                 this.armed = null;
