@@ -66,6 +66,7 @@ beforeEach(async () => {
     await client.sessionMessage.create({ data: { sessionId: 'session-1', seq: 1, localId: 'existing', content: { t: 'encrypted', c: 'old' } } });
 });
 afterEach(async () => {
+    delete process.env.HAPPY_OBSERVATION_COHORT;
     await client?.$disconnect();
     if (admin && schema) { await admin.$executeRawUnsafe(`DROP SCHEMA "${schema}" CASCADE`); await admin.$disconnect(); admin = undefined; schema = undefined; }
     await pg?.close();
@@ -160,3 +161,65 @@ describe('message batch writes against the stored rows', () => {
         expect(state.emitted).toHaveLength(2);
     });
 });
+
+async function observe(query = 'observation_version=1&after_seq=0&limit=1', accountId = 'account-1') {
+    const app = fastify(); app.setValidatorCompiler(validatorCompiler); app.setSerializerCompiler(serializerCompiler);
+    const typed = app.withTypeProvider<ZodTypeProvider>() as unknown as Fastify;
+    const authenticate = async (request: any) => { request.userId = accountId; };
+    typed.decorate('authenticate', authenticate); typed.decorate('authenticateSessionScope', authenticate);
+    v3SessionRoutes(typed); await typed.ready();
+    try { return await typed.inject({ method: 'GET', url: '/v3/sessions/session-1/messages?' + query }); }
+    finally { await typed.close(); }
+}
+it('refuses observation until all writers are explicitly opted into a cohort', async () => {
+    const response = await observe(); expect(response.statusCode).toBe(503);
+})
+it('fixes a committed upper bound, includes revisions, and fences encryption generations', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    const response = await observe(); expect(response.statusCode).toBe(200);
+    const first = response.json();
+    expect(first.observation).toMatchObject({ version: 1, coveredThroughSeq: 1, retention: 'full' });
+    expect(first.messages[0].contentRevision).toMatch(/^[a-f0-9]{64}$/);
+    await send([{ localId: 'new', content: 'new' }]);
+    const fixed = (await observe('observation_version=1&after_seq=1&through_seq=1')).json();
+    expect(fixed.messages).toEqual([]); expect(fixed.hasMore).toBe(false);
+    expect(fixed.observation.coveredThroughSeq).toBe(1);
+    await client.session.update({ where: { id: 'session-1' }, data: { dataEncryptionKey: new Uint8Array([1, 2, 3]) } });
+    expect((await observe()).json().observation.generation).not.toBe(first.observation.generation);
+})
+it('does not expose coverage of another account and preserves the legacy response', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    expect((await observe(undefined, 'other')).statusCode).toBe(404);
+    const legacy = (await observe('after_seq=0&limit=1')).json();
+    expect(legacy.observation).toBeUndefined(); expect(legacy.messages[0].contentRevision).toBeUndefined();
+})
+
+it('changes a same-seq content revision without declaring response finality', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    const first = (await observe()).json();
+    await client.sessionMessage.updateMany({ where: { sessionId: 'session-1', seq: 1 }, data: { content: { t: 'encrypted', c: 'final' } } });
+    const next = (await observe()).json();
+    expect(next.messages[0].contentRevision).not.toBe(first.messages[0].contentRevision);
+    expect(next.observation.responseFinality).toBe('unknown');
+    expect((await observe('observation_version=1&after_seq=0&through_seq=9')).statusCode).toBe(409);
+})
+it('does not expose an allocated watermark before its message transaction commits', async () => {
+    process.env.HAPPY_OBSERVATION_COHORT = 'test-cohort';
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const write = client.$transaction(async tx => {
+        await tx.session.update({ where: { id: 'session-1' }, data: { seq: { increment: 1 } } });
+        entered(); await barrier;
+        await tx.sessionMessage.create({ data: { sessionId: 'session-1', seq: 2, content: { t: 'encrypted', c: 'committed' } } });
+    });
+    await started;
+    let observed = false;
+    const read = observe().then(response => { observed = true; return response; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(observed).toBe(false);
+    release(); await write;
+    const result = (await read).json();
+    expect(result.observation.coveredThroughSeq).toBe(2);
+    expect(result.hasMore).toBe(true);
+})
