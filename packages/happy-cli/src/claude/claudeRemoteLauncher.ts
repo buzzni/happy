@@ -869,10 +869,30 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         let msg: Awaited<ReturnType<typeof session.queue.waitForMessagesAndGetAsString>>;
                         while (true) {
                             const retryWake = transientRetry.waitSignal();
+                            // A refused turn waiting for an organization account in the background
+                            // (Saycode specs/claude-setup-token-managed-sync R7).
+                            const switchWake = setupTokenSwitching?.backgroundSignal() ?? null;
+                            const wakes = [retryWake, switchWake].filter((signal): signal is AbortSignal => signal !== null);
                             msg = await session.queue.waitForMessagesAndGetAsString(
-                                retryWake ? AbortSignal.any([controller.signal, retryWake]) : controller.signal,
+                                wakes.length ? AbortSignal.any([controller.signal, ...wakes]) : controller.signal,
                                 drain ? () => drain.claimTurn() : undefined,
                             );
+                            if (!msg && switchWake?.aborted && !controller.signal.aborted) {
+                                // A wait an ended provider left behind leaves the finished switch to the live generation.
+                                if (providerEnded) return null;
+                                // The switch finished while nobody typed: continue the refused turn on the new account,
+                                // exactly like a switch made at the turn boundary.
+                                const accountSwitch = await setupTokenSwitching!.switchIfWanted();
+                                if (accountSwitch.switched && accountSwitch.continueAfter && !lastResultSucceeded && !lastTurnChannel) {
+                                    continuation = mode ?? lastTurnMode;
+                                }
+                                if (providerStale()) return null;
+                                if (!providerRunning && continuation) {
+                                    if (!session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                                    continuation = null;
+                                }
+                                continue;
+                            }
                             // Anything but the retry's own wake (a closed queue, a refused claim, an
                             // abort) is handled below, as it would be without a retry waiting.
                             if (msg || !retryWake?.aborted || controller.signal.aborted) break;
@@ -893,8 +913,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             dispatchTurn();
                             return { message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode };
                         }
-                        // The user's own input replaces a waiting retry.
-                        if (msg) transientRetry.userTurnStarted();
+                        // The user's own input replaces a waiting retry, and a background wait for an account.
+                        if (msg) { transientRetry.userTurnStarted(); setupTokenSwitching?.cancelBackground(); }
                         if (msg === null && gracefulStop?.requested() && !controller.signal.aborted) {
                             /*
                              * Woken by the stop rather than aborted — and the
@@ -1279,6 +1299,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         streamRelay.dispose();
         // Nothing will run it now; a state left behind would show a countdown to nothing.
         transientRetry.cancel();
+        setupTokenSwitching?.dispose();
 
         // Clean up permission handler
         permissionHandler.reset();

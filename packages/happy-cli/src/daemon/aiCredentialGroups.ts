@@ -16,13 +16,24 @@ type NormalizedRequest = { version:1; scope:string; principalType:'user'|'machin
 export type AppliedCredentialReceipt = { managedAccountId:string; credentialGeneration:number }
 /** `managed`: the desired identities that are org-managed setup-tokens (absent in older journals). */
 /** `appliedMachineId`: the daemon's PC identity that wrote the entry (absent in older journals). */
-type Entry = Omit<NormalizedRequest,'version'|'payload'> & { desired:string[]; owned:string[]; pending:boolean; payloadDigest:string|null; managed?:string[]; appliedCredentials?:AppliedCredentialReceipt[]; appliedMachineId?:string }
+/**
+ * `managedHeld`: org-managed setup-token identities this entry applied and has not removed yet (absent in older
+ * journals). Unlike `owned` it survives a manual OAuth apply: such an apply never adopts a managed slot.
+ */
+type Entry = Omit<NormalizedRequest,'version'|'payload'> & { desired:string[]; owned:string[]; pending:boolean; payloadDigest:string|null; managed?:string[]; managedHeld?:string[]; appliedCredentials?:AppliedCredentialReceipt[]; appliedMachineId?:string }
 type Journal = { version:1; entries:Entry[] }
 export type CredentialGroupDeps = {
   read():Promise<string|null>; write(value:string):Promise<void>
   snapshot(provider:GroupProvider):Promise<string[]>
   incoming(provider:GroupProvider,payload:string):string[]
   managedIdentities?(provider:GroupProvider,payload:string):string[]
+  /**
+   * Local slots in Saycode's own managed setup-token format (synthetic email and managed metadata), as their
+   * identity plus older identity forms a journal may still hold for them. Nothing else is ever re-acquired.
+   */
+  managedInstalled?(provider:GroupProvider):Promise<Array<{identity:string;aliases:string[]}>>
+  /** Identities a running session is bound to: their removal waits for a later sync instead of failing this one. */
+  inUse?(provider:GroupProvider):Promise<string[]>
   /** Secret-free receipt projection for setup-token rows applied by this operation. */
   appliedCredentials?(provider:GroupProvider,payload:string,applied:unknown):AppliedCredentialReceipt[]
   /** `owned` are identities this scope installed earlier: the only slots it may replace. */
@@ -50,6 +61,8 @@ function request(value:CredentialGroupRequest):NormalizedRequest {
   return {...value,principalType,userId:userId as string}
 }
 const principalType=(entry:Pick<Entry,'principalType'>)=>entry.principalType??'user'
+/** An entry that desires or still holds org-managed setup-tokens: its syncs keep the managed slots exact. */
+const setupTokenEntry=(entry:Pick<Entry,'managed'|'managedHeld'>)=>(entry.managed??[]).length>0||(entry.managedHeld??[]).length>0
 const samePrincipal=(entry:Pick<Entry,'principalType'|'userId'|'machineId'>, request:Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) => principalType(entry)===request.principalType && (request.principalType==='machine' ? entry.machineId===request.machineId : entry.userId===request.userId)
 /** One user assignment per scope and provider (a new userId replaces it); machine assignments are kept per machine. */
 const sameSlot=(entry:Pick<Entry,'principalType'|'machineId'>, request:Pick<NormalizedRequest,'principalType'|'machineId'>) => principalType(entry)===request.principalType && (request.principalType!=='machine' || entry.machineId===request.machineId)
@@ -68,7 +81,7 @@ function parse(raw:string|null):Journal {
       const candidate = principalType(entry)==='machine' ? {...entry,userId:undefined} : entry
       request({...candidate,version:1,payload:null} as CredentialGroupRequest)
       if (principalType(entry)==='machine' && !id(entry.machineId)) fail('AI_GROUP_JOURNAL_INVALID')
-      if(!(entry.payloadDigest===null||typeof entry.payloadDigest==='string'&&/^[a-f0-9]{64}$/.test(entry.payloadDigest))||typeof entry.pending!=='boolean'||![entry.desired,entry.owned,entry.managed??[]].every(items=>Array.isArray(items)&&items.length<=1000&&items.every(id)))fail('AI_GROUP_JOURNAL_INVALID')
+      if(!(entry.payloadDigest===null||typeof entry.payloadDigest==='string'&&/^[a-f0-9]{64}$/.test(entry.payloadDigest))||typeof entry.pending!=='boolean'||![entry.desired,entry.owned,entry.managed??[],entry.managedHeld??[]].every(items=>Array.isArray(items)&&items.length<=1000&&items.every(id)))fail('AI_GROUP_JOURNAL_INVALID')
       if(entry.appliedCredentials!==undefined&&!validAppliedCredentials(entry.appliedCredentials))fail('AI_GROUP_JOURNAL_INVALID')
       if(entry.appliedMachineId!==undefined&&!id(entry.appliedMachineId))fail('AI_GROUP_JOURNAL_INVALID')
     }
@@ -88,6 +101,36 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   async function readReceipt(scope:string,provider:GroupProvider, principal?: Pick<NormalizedRequest,'principalType'|'userId'|'machineId'>) {
     return parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&(principal?samePrincipal(e,principal):principalType(e)==='user'))
   }
+  /**
+   * Removes what no entry desires any more: what an entry installed or applied (owned, managedHeld) and, after a
+   * setup-token apply, every slot in Saycode's managed format no entry desires (left by a lost or older journal).
+   * Slots without managed metadata are never swept. A slot a running session is bound to waits for a later sync.
+   */
+  async function reclaim(journal:Journal,provider:GroupProvider,current:Set<string>,sweep:boolean) {
+    const related=journal.entries.filter(e=>e.provider===provider)
+    const wanted=new Set(related.flatMap(e=>e.desired))
+    const orphans=sweep&&deps.managedInstalled?(await deps.managedInstalled(provider)).filter(item=>![item.identity,...item.aliases].some(value=>wanted.has(value))).map(item=>item.identity):[]
+    const candidates=[...new Set([...related.flatMap(e=>[...e.owned,...(e.managedHeld??[])]),...orphans])].filter(value=>!wanted.has(value)&&current.has(value))
+    const busy=new Set(candidates.length&&deps.inUse?await deps.inUse(provider):[])
+    const removable=candidates.filter(value=>!busy.has(value))
+    if(removable.length)await deps.remove(provider,removable)
+    const installed=new Set(await deps.snapshot(provider))
+    if(removable.some(value=>installed.has(value)))fail('AI_GROUP_REMOVAL_INCOMPLETE')
+    for(const other of related){other.owned=other.owned.filter(value=>installed.has(value));if(other.managedHeld)other.managedHeld=other.managedHeld.filter(value=>installed.has(value))}
+  }
+  /**
+   * A running session that held back a removal ended (`released`: the identities it was bound to). Desktop sees a complete
+   * receipt and may never sync again, so the removal and the orphan sweep are retried here; receipts are left as they are.
+   */
+  async function reclaimDeferred(provider:GroupProvider,released:string[]) {
+    const journal=parse(await deps.read())
+    const related=journal.entries.filter(e=>e.provider===provider)
+    const wanted=new Set(related.flatMap(e=>e.desired))
+    if(!related.some(setupTokenEntry)||released.every(identity=>wanted.has(identity)))return false
+    await reclaim(journal,provider,new Set(await deps.snapshot(provider)),true)
+    await deps.write(JSON.stringify(journal))
+    return true
+  }
   async function sync(input:CredentialGroupRequest) {
     const normalized=request(input)
     const journal=parse(await deps.read())
@@ -102,7 +145,16 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
       // A reinstall can preserve the journal while losing the account manager's pool.
       // Reuse the receipt only when its desired accounts still exist locally.
       const installed=new Set(prior.desired.length?await deps.snapshot(normalized.provider):[])
-      if(prior.desired.every(identity=>installed.has(identity))){prior.generation=normalized.generation;prior.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;prior.leaseId=normalized.leaseId;await deps.write(JSON.stringify(journal));return receipt(prior)}
+      // A managed slot counts only with its managed metadata: the synthetic email alone may be a personal import or a
+      // slot that lost it, which the full apply restores or refuses.
+      const desiredManaged=(prior.managed??[]).filter(identity=>prior.desired.includes(identity))
+      const verified=desiredManaged.length&&deps.managedInstalled?new Set((await deps.managedInstalled(normalized.provider)).map(item=>item.identity)):null
+      if(prior.desired.every(identity=>installed.has(identity))&&(!verified||desiredManaged.every(identity=>verified.has(identity)))){
+        prior.generation=normalized.generation;prior.assignmentGeneration=normalized.assignmentGeneration??normalized.generation;prior.leaseId=normalized.leaseId
+        // A removal deferred for a running session, or an orphan left meanwhile, is retried by any later sync.
+        if(setupTokenEntry(prior))await reclaim(journal,normalized.provider,prior.desired.length?installed:new Set(await deps.snapshot(normalized.provider)),true)
+        await deps.write(JSON.stringify(journal));return receipt(prior)
+      }
     }
     const payloadDigest=normalized.payload===null?null:createHash('sha256').update(normalized.payload).digest('hex')
     if(prior&&normalized.fingerprint===prior.fingerprint&&payloadDigest!==prior.payloadDigest)fail('AI_GROUP_PAYLOAD_CONFLICT')
@@ -110,33 +162,40 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     const desired=normalized.payload===null?[]:[...new Set(deps.incoming(normalized.provider,normalized.payload))]
     if(desired.length>500||desired.some(value=>!id(value)))fail('AI_GROUP_INVALID_INPUT')
     const managed=normalized.payload===null?[]:(deps.managedIdentities?.(normalized.provider,normalized.payload)??[]).filter(value=>desired.includes(value))
+    // A desired managed slot already installed in Saycode's managed format is this entry's again unless another entry
+    // claims it: a lost journal, an older repair or an older identity format must not strand it (specs/claude-setup-token-managed-sync R2).
+    const claimed=new Set(journal.entries.filter(e=>e.provider===normalized.provider&&e!==slot).flatMap(e=>[...e.owned,...(e.managedHeld??[])]))
+    const unclaimed=managed.filter(value=>before.has(value)&&!(slot?.owned??[]).includes(value)&&!claimed.has(value))
+    const local=unclaimed.length&&deps.managedInstalled?await deps.managedInstalled(normalized.provider):[]
+    const reacquired=unclaimed.filter(value=>local.some(item=>item.identity===value&&!item.aliases.some(alias=>claimed.has(alias))))
+    const replaceable=[...new Set([...(slot?.owned??[]),...reacquired])]
     const entry:Entry={scope:normalized.scope,principalType:normalized.principalType,userId:normalized.userId,...(normalized.machineId?{machineId:normalized.machineId}:{}),provider:normalized.provider,generation:normalized.generation,assignmentGeneration:normalized.assignmentGeneration??normalized.generation,leaseId:normalized.leaseId,fingerprint:normalized.fingerprint,payloadDigest,desired,managed,appliedCredentials:[],
-      owned:[...new Set([...(slot?.owned??[]),...desired.filter(value=>!before.has(value))])],pending:true,...(deps.appliedMachineId?{appliedMachineId:deps.appliedMachineId}:{})}
+      owned:[...new Set([...replaceable,...desired.filter(value=>!before.has(value))])],managedHeld:[...(slot?.managedHeld??[])],pending:true,...(deps.appliedMachineId?{appliedMachineId:deps.appliedMachineId}:{})}
     journal.entries=journal.entries.filter(e=>!(e.scope===normalized.scope&&e.provider===normalized.provider&&sameSlot(e,normalized)))
     journal.entries.push(entry)
     await deps.write(JSON.stringify(journal))
     if(normalized.payload!==null) {
-      const applied=await deps.apply(normalized.provider,normalized.payload,slot?.owned??[])
+      const applied=await deps.apply(normalized.provider,normalized.payload,replaceable)
       const appliedCredentials=deps.appliedCredentials?.(normalized.provider,normalized.payload,applied)??[]
       if(!validAppliedCredentials(appliedCredentials))fail('AI_GROUP_INVALID_PAYLOAD')
       entry.appliedCredentials=appliedCredentials
+      entry.managedHeld=[...new Set([...(entry.managedHeld??[]),...managed])]
     }
     const after=new Set(await deps.snapshot(normalized.provider))
     if(desired.some(identity=>!after.has(identity)))fail('AI_GROUP_INSTALL_INCOMPLETE')
-    const related=journal.entries.filter(e=>e.provider===normalized.provider)
-    const wanted=new Set(related.flatMap(e=>e.desired))
-    const removable=[...new Set(related.flatMap(e=>e.owned))].filter(value=>!wanted.has(value)&&after.has(value))
-    if(removable.length)await deps.remove(normalized.provider,removable)
-    const installed=new Set(await deps.snapshot(normalized.provider))
-    if(removable.some(value=>installed.has(value)))fail('AI_GROUP_REMOVAL_INCOMPLETE')
-    for(const other of related)other.owned=other.owned.filter(value=>installed.has(value))
+    await reclaim(journal,normalized.provider,after,setupTokenEntry(entry)||Boolean(slot&&setupTokenEntry(slot)))
     entry.pending=false
     await deps.write(JSON.stringify(journal))
     return receipt(entry)
   }
   async function invalidate(provider:GroupProvider,touched:string[]|null) {
     const journal=parse(await deps.read());let changed=false
-    for(const entry of journal.entries.filter(e=>e.provider===provider)){entry.pending=true;entry.owned=touched===null?[]:entry.owned.filter(id=>!touched.includes(id));changed=true}
+    // A manual OAuth apply (repair, merge, replace) can take over OAuth slots, never an org-managed setup-token:
+    // those stay this entry's to replace and revoke (specs/claude-setup-token-managed-sync R4).
+    for(const entry of journal.entries.filter(e=>e.provider===provider)){
+      const managed=new Set([...(entry.managed??[]),...(entry.managedHeld??[])])
+      entry.pending=true;entry.owned=entry.owned.filter(id=>managed.has(id)||(touched!==null&&!touched.includes(id)));changed=true
+    }
     if(changed)await deps.write(JSON.stringify(journal))
   }
   /** Who a scope's applied assignment belongs to and what it installed: the local ownership proof. */
@@ -172,7 +231,7 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     }
     return receipt(entry)
   }
-  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:currentReceipt}
+  return {sync,reclaimDeferred,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:currentReceipt}
 }
 
 function effectivePrincipal(entry:Pick<Entry,'principalType'|'userId'|'machineId'>):Pick<NormalizedRequest,'principalType'|'userId'|'machineId'> {

@@ -6,7 +6,7 @@ import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenRebind, reportSetupTokenUsage } from '@/daemon/controlClient';
-import { CONTINUE_PROMPT, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
+import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -203,5 +203,133 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
         expect(generations[0].prompts.join()).not.toContain('try again');
         expect(generations[1].prompts.join()).toContain('try again');
+    });
+    // Saycode specs/claude-setup-token-managed-sync R7: the newly assigned account is applied to this PC after the refusal.
+    it('continues a refused turn by itself once a background retry binds an account applied meanwhile', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+        try {
+            vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'APPLY_REQUIRED' });
+            const queue = new MessageQueue2<EnhancedMode>(hashObject);
+            const handlers = new Map<string, () => Promise<unknown>>();
+            const client = {
+                sessionId: 'happy-session-1',
+                rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+                updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+                sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+                setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+                applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            };
+            const generations: Array<{ token?: string; prompts: string[] }> = [];
+            vi.mocked(query).mockImplementation(({ prompt, options }) => {
+                const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, prompts: [] as string[] };
+                generations.push(generation);
+                const first = generations.length === 1;
+                const response = (async function* () {
+                    yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                    for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                        generation.prompts.push(JSON.stringify(message.message.content));
+                        if (first) {
+                            yield refused;
+                            yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                            continue;
+                        }
+                        yield assistant('msg-2');
+                        yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-2' };
+                        void handlers.get('switch')!();
+                        return;
+                    }
+                })();
+                return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+            });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            const session: Record<string, unknown> = {
+                lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+                cancelLessonReview: vi.fn(),
+                sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+                api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            };
+
+            const launched = claudeRemoteLauncher(session as unknown as Session);
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: APPLY_REQUIRED_NOTICE }));
+            expect(generations).toHaveLength(1);
+            // Nobody writes; a minute later the retry finds the account applied.
+            await vi.advanceTimersByTimeAsync(60_000);
+            await launched;
+
+            expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
+            expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+            expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
+            expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+    it('continues the refused turn in the live provider when the refused provider exited while the background wait was pending', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+        try {
+            // Refused at the turn boundary and again when the next provider starts; the background retry then succeeds.
+            vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'APPLY_REQUIRED' }).mockResolvedValueOnce({ ok: false, reason: 'APPLY_REQUIRED' });
+            const queue = new MessageQueue2<EnhancedMode>(hashObject);
+            const handlers = new Map<string, () => Promise<unknown>>();
+            const client = {
+                sessionId: 'happy-session-1',
+                rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+                updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+                sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+                setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+                applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            };
+            const generations: Array<{ token?: string; prompts: string[] }> = [];
+            vi.mocked(query).mockImplementation(({ prompt, options }) => {
+                const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, prompts: [] as string[] };
+                generations.push(generation);
+                const index = generations.length;
+                const response = (async function* () {
+                    // Like the real CLI, a provider reports `init` only once its first message arrived.
+                    const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                    for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                        if (generation.prompts.length === 0) yield init;
+                        generation.prompts.push(JSON.stringify(message.message.content));
+                        if (index === 1) {
+                            yield refused;
+                            yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                            // The refused provider process ends on its own while the background wait is pending.
+                            return;
+                        }
+                        yield assistant(`msg-${index}`);
+                        yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${index}` };
+                        void handlers.get('switch')!();
+                        return;
+                    }
+                })();
+                return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+            });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            const session: Record<string, unknown> = {
+                lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+                cancelLessonReview: vi.fn(),
+                sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+                api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            };
+
+            const launched = claudeRemoteLauncher(session as unknown as Session);
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: APPLY_REQUIRED_NOTICE }));
+            // The loop has started the next provider, which waits for its first input next to the wait the exited one left behind.
+            for (let tick = 0; tick < 50; tick++) await new Promise(resolve => setImmediate(resolve));
+            expect(generations).toHaveLength(1);
+            await vi.advanceTimersByTimeAsync(60_000);
+            // Lost to the exited provider's wait, the continuation never starts a provider on the new account.
+            await vi.waitFor(() => expect(generations).toHaveLength(2), { timeout: 3_000 });
+            await launched;
+
+            expect(requestSetupTokenRebind).toHaveBeenCalledTimes(3);
+            const continued = generations.find(generation => generation.prompts.some(prompt => prompt.includes(CONTINUE_PROMPT)));
+            expect(continued?.token).toBe('sk-ant-oat01-second');
+            expect(continued?.prompts[0]).toContain(CONTINUE_PROMPT);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });

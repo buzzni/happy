@@ -13,6 +13,10 @@ export function groupAccountIdentity(provider:GroupProvider,account:Account):str
   if(!email&&!accountId)throw new Error('AI_GROUP_ACCOUNT_IDENTITY_UNAVAILABLE')
   return createHash('sha256').update(JSON.stringify(provider==='claude'?['claude',email,account.organizationUuid??'']:['codex',accountId?'id':'email',accountId||email])).digest('hex')
 }
+/** The email-hash identity older daemons recorded for a managed slot before the managed-ID identity existed. */
+export function legacyClaudeIdentity(email:string):string {
+  return createHash('sha256').update(JSON.stringify(['claude',email.trim().toLowerCase(),''])).digest('hex')
+}
 export function groupPayloadIdentities(provider:GroupProvider,payload:string):string[] {
   const value=JSON.parse(payload)
   const accounts=provider==='claude'?value.accounts:value.accounts?.accounts
@@ -60,6 +64,21 @@ export function createGroupProviderAdapters(deps:AiCredentialRuntimeDependencies
     if(accountId)accounts.push({accountId})
     return [...new Set(accounts.map(a=>groupAccountIdentity(provider,a)))]
   }
+  /**
+   * Slots in Saycode's managed setup-token format: the synthetic email and the managed metadata the token runtime
+   * writes on import (`cswap list` omits that metadata, so it is read from the export; tokens never leave here).
+   * Each carries the older email-hash identity a journal may still hold for it.
+   */
+  async function managedInstalled(provider:GroupProvider) {
+    if(provider!=='claude'||!(await claude()).accounts.some(account=>managedSetupTokenId(account.email)!==null))return []
+    const exported=JSON.parse((await deps.execFile('cswap',['export','-'],{timeoutMs:120_000,maxOutputBytes:1024*1024})).stdout)
+    if(exported?.version!==1||exported.encrypted===true||!Array.isArray(exported.accounts))throw new Error('AI_GROUP_SNAPSHOT_FAILED')
+    return (exported.accounts as Account[]).flatMap(account=>{
+      const managedAccountId=managedSetupTokenId(account.email)
+      if(managedAccountId===null||account.credentialType!=='setup_token'||account.managedAccountId!==managedAccountId)return []
+      return [{identity:setupTokenGroupIdentity(managedAccountId),aliases:[legacyClaudeIdentity(account.email as string)]}]
+    })
+  }
   async function remove(provider:GroupProvider,identities:string[]) {
     const unwanted=new Set(identities)
     if(provider==='claude'){
@@ -94,5 +113,5 @@ await s.withAccountStorageTransaction(async(current,persist)=>{if(!current)retur
       else await deps.rm(livePath,{force:true})
     }
   }
-  return {snapshot,remove}
+  return {snapshot,managedInstalled,remove}
 }

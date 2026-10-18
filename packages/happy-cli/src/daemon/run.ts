@@ -1754,6 +1754,8 @@ export async function startDaemon(): Promise<void> {
     ): Promise<Record<string, string>> => ({});
 
     let launchManagedAiCredentialSession = async <T>(_env: Record<string, string>, start: () => T | Promise<T>): Promise<T> => start();
+    /** Set once the AI credential runtime exists: a bound session's end retries a group-sync removal deferred for it. */
+    let releaseSetupTokenAccounts = (_managedAccountIds: string[]): void => {};
 
     const launchReadiness = createLaunchReadinessGate();
     const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;
@@ -3553,6 +3555,11 @@ export async function startDaemon(): Promise<void> {
         removeDeferredContinuationContextFile(tracked?.deferredContinuationContextFile);
       }
       pidToTrackedSession.delete(pid);
+      // No longer in use: an organization account a group sync kept for this session may go now (specs/claude-setup-token-managed-sync).
+      try {
+        const bound = readSetupTokenResumeSelection(tracked?.agentEnvironment);
+        if (bound) releaseSetupTokenAccounts([bound.binding.managedAccountId]);
+      } catch { /* a corrupt record held nothing back */ }
       recoveredPendingSpawnStartedAt.delete(pid);
       sessionStartTimes.delete(pid);
       pidToAdoptedAt.delete(pid);
@@ -4362,6 +4369,11 @@ export async function startDaemon(): Promise<void> {
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor, process.env, os.homedir(), {
       machineId,
       setupTokenBinding: trustedStudioOrigin ? createSetupTokenBindingVerifier({ origin: trustedStudioOrigin, machineId }) : undefined,
+      // A group sync never removes the organization account a live session runs on; it waits for a later sync.
+      setupTokenAccountsInUse: () => getCurrentChildren().flatMap(session => {
+        // A corrupt record cannot be resumed anyway, so it holds no slot back.
+        try { const bound = readSetupTokenResumeSelection(session.agentEnvironment); return bound ? [bound.binding.managedAccountId] : []; } catch { return []; }
+      }),
     });
     const personalProbeTimer = setInterval(() => {
       void aiCredentialRuntime.personalSchedulerTick({
@@ -4389,6 +4401,13 @@ export async function startDaemon(): Promise<void> {
       },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
+    releaseSetupTokenAccounts = (managedAccountIds) => {
+      void aiCredentialRuntime.releaseSetupTokenAccounts(managedAccountIds).catch((error: unknown) => {
+        // Codes only; the next group sync retries the removal.
+        const kind = (error as { kind?: unknown } | null)?.kind;
+        logger.debug(`[DAEMON RUN] Deferred setup-token slot removal failed: ${typeof kind === 'string' ? kind : 'unknown'}`);
+      });
+    };
     let activeServerAutomationLeaseCount = 0;
     let scriptRuntime: ReturnType<typeof createScriptRuntimeSupervisor> | null = null;
     let scriptProtocolVersion: number = AUTOMATION_PROTOCOL_VERSION;

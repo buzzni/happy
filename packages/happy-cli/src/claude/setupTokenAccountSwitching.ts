@@ -6,6 +6,10 @@
  * 95% or a request is refused, the next turn boundary asks the daemon for another account; Studio
  * chooses it and the daemon verifies the grant like a launch. The launcher then restarts the provider
  * on the same Claude conversation with the new token. A refused turn is continued automatically.
+ *
+ * When a refused turn finds no usable account yet (the newly assigned one is still being applied to this PC, or
+ * none has quota), it keeps asking in the background for a while and continues once one is bound
+ * (Saycode specs/claude-setup-token-managed-sync R7).
  */
 import type { SetupTokenUsageObservation } from '@/daemon/setupTokenAccountSwitch'
 import { createSetupTokenUsageTracker } from './setupTokenUsageTracker'
@@ -21,6 +25,9 @@ export type SetupTokenAccountSwitchingDeps = {
   applyEnvironment(environment: Record<string, string>): void
   notify(message: string): void
   now?: () => number
+  /** Background retry cadence and how long a refused turn waits for an account; injectable for tests. */
+  retryIntervalMs?: number
+  retryWindowMs?: number
 }
 
 const REPORT_INTERVAL_MS = 60_000
@@ -28,46 +35,116 @@ const REPORT_INTERVAL_MS = 60_000
 const MAX_SWITCHES = 5
 /** Failures that will not pass by asking again with the same binding. */
 const PERMANENT = new Set(['FORBIDDEN', 'NOT_BOUND', 'STUDIO_UNAVAILABLE'])
+/** Failures a refused turn waits out in the background: no applied account usable yet, or none with quota. */
+const AWAITED = new Set(['APPLY_REQUIRED', 'NO_ACCOUNT', 'BINDING_REJECTED'])
+/** Once a minute stays far below Studio's 30 grants a minute per machine. */
+const RETRY_INTERVAL_MS = 60_000
+const RETRY_WINDOW_MS = 30 * 60_000
 export const SWITCHED_NOTICE = 'This organization Claude account reached its usage limit, so the session moved to another organization account.'
 export const NO_ACCOUNT_NOTICE = 'This organization Claude account reached its usage limit and no other organization account has quota left.'
+export const APPLY_REQUIRED_NOTICE = 'This organization Claude account reached its usage limit. A newly assigned organization account is being applied to this PC; the session continues automatically once it is ready.'
 export const FORBIDDEN_NOTICE = 'Saycode can no longer manage this session\'s organization Claude account, so it will not switch accounts. Start a new conversation to use the organization accounts assigned to you now.'
 export const CONTINUE_PROMPT = 'The previous request stopped because the organization Claude account reached its usage limit. The session now uses another account — continue from where you stopped.'
 
 export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchingDeps) {
   const now = deps.now ?? Date.now
+  const retryIntervalMs = deps.retryIntervalMs ?? RETRY_INTERVAL_MS
+  const retryWindowMs = deps.retryWindowMs ?? RETRY_WINDOW_MS
   const tracker = createSetupTokenUsageTracker(now)
   let lastReportAt = -Infinity, lastReportedExhausted = false
-  let wanted = false, refused = false, switches = 0, toldNoAccount = false, stopped = false
+  let wanted = false, refused = false, switches = 0, stopped = false
+  /** The session ended: nothing switches, retries or speaks any more, not even an attempt already in flight. */
+  let disposed = false
+  /** Notices already given since the last switch: each is said once. */
+  const told = new Set<string>()
   let inFlight: Promise<{ switched: boolean; continueAfter: boolean }> | null = null
+  /**
+   * A refused turn waiting in the background for an account. `done`: a finished switch the launcher has not taken
+   * yet. `shared`: a turn boundary awaits the running attempt too, so its result is handed over there, not twice.
+   */
+  let background: { deadline: number; timer: ReturnType<typeof setTimeout> | null; wake: AbortController; shared: boolean; done: { switched: true; continueAfter: boolean } | null } | null = null
+  const endBackground = () => {
+    if (background?.timer) clearTimeout(background.timer)
+    background = null
+  }
+  const tell = (notice: string) => {
+    if (told.has(notice)) return
+    told.add(notice)
+    deps.notify(notice)
+  }
   const stop = () => {
     if (stopped) return
     stopped = true
+    endBackground()
     deps.notify(FORBIDDEN_NOTICE)
   }
 
   async function switchOnce(sessionId: string, binding: string) {
     const result = await deps.rebind(sessionId, binding).catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
+    if (disposed) return { switched: false, continueAfter: false }
     if (!result.ok) {
       logger.debug(`[setup-token-switch] session ${sessionId} could not switch accounts: ${result.reason}`)
       if (result.reason === 'NO_ACCOUNT') {
         wanted = false
-        if (!toldNoAccount) { toldNoAccount = true; deps.notify(NO_ACCOUNT_NOTICE) }
+        tell(NO_ACCOUNT_NOTICE)
       } else if (PERMANENT.has(result.reason)) {
         wanted = false
         if (result.reason === 'FORBIDDEN') stop()
       }
-      // Anything else may pass: the next turn boundary asks again.
+      if (AWAITED.has(result.reason) && refused) {
+        if (result.reason !== 'NO_ACCOUNT') tell(APPLY_REQUIRED_NOTICE)
+        startBackground()
+      }
+      // Asking again with this binding cannot help: no background attempt either.
+      if (PERMANENT.has(result.reason) || result.reason === 'STALE') endBackground()
+      // Anything else may pass: the next turn boundary (or background attempt) asks again.
       return { switched: false, continueAfter: false }
     }
     wanted = false
     deps.applyEnvironment(result.environment)
     tracker.reset()
-    switches++; toldNoAccount = false; lastReportAt = -Infinity; lastReportedExhausted = false
+    switches++; told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
     logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${switches} of ${MAX_SWITCHES})`)
     const continueAfter = refused
     refused = false
     deps.notify(SWITCHED_NOTICE)
     return { switched: true, continueAfter }
+  }
+
+  /** One switch per session at a time: a turn boundary and a background attempt share it. */
+  function attempt(sessionId: string, binding: string) {
+    inFlight ??= switchOnce(sessionId, binding).finally(() => { inFlight = null })
+    return inFlight
+  }
+
+  function startBackground() {
+    if (background || stopped || disposed) return
+    background = { deadline: now() + retryWindowMs, timer: null, wake: new AbortController(), shared: false, done: null }
+    scheduleBackground(background)
+  }
+
+  function scheduleBackground(current: NonNullable<typeof background>) {
+    if (now() + retryIntervalMs > current.deadline) { endBackground(); return }
+    current.timer = setTimeout(() => { void retryInBackground(current) }, retryIntervalMs)
+    current.timer.unref?.()
+  }
+
+  async function retryInBackground(current: NonNullable<typeof background>) {
+    current.timer = null
+    const sessionId = deps.sessionId(), binding = deps.binding()
+    if (background !== current) return
+    // Failed attempts bind nothing and do not count; only switches do.
+    if (stopped || !sessionId || !binding || switches >= MAX_SWITCHES) { endBackground(); return }
+    current.shared = inFlight !== null
+    const result = await attempt(sessionId, binding)
+    if (background !== current) return
+    if (result.switched) {
+      if (current.shared) { endBackground(); return }
+      current.done = { switched: true, continueAfter: result.continueAfter }
+      current.wake.abort()
+      return
+    }
+    scheduleBackground(current)
   }
 
   return {
@@ -86,13 +163,38 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
         .then(outcome => { if (!outcome.ok && outcome.reason === 'FORBIDDEN') { wanted = false; stop() } })
         .catch(() => undefined)
     },
-    /** Called at a turn boundary; concurrent boundaries share one switch. `continueAfter`: the last turn was refused. */
+    /**
+     * Called at a turn boundary; concurrent boundaries share one switch. `continueAfter`: the last turn was refused.
+     * A switch finished in the background is handed over here, once.
+     */
     switchIfWanted(): Promise<{ switched: boolean; continueAfter: boolean }> {
-      if (inFlight) return inFlight
+      if (inFlight) {
+        if (background) background.shared = true
+        return inFlight
+      }
+      if (background?.done) {
+        const done = background.done
+        endBackground()
+        return Promise.resolve(done)
+      }
       const sessionId = deps.sessionId(), binding = deps.binding()
-      if (stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
-      inFlight = switchOnce(sessionId, binding).finally(() => { inFlight = null })
-      return inFlight
+      if (disposed || stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
+      return attempt(sessionId, binding).then(result => {
+        // Switched at this boundary: nothing is left to wait for.
+        if (result.switched) endBackground()
+        return result
+      })
+    },
+    /** Aborted when a background switch finished: the launcher stops waiting for input and takes it with `switchIfWanted`. */
+    backgroundSignal(): AbortSignal | null {
+      return background?.wake.signal ?? null
+    },
+    /** The user's own message replaces the automatic continuation: the background wait ends. */
+    cancelBackground: endBackground,
+    /** The session ended: terminal, including for an attempt still in flight. */
+    dispose() {
+      disposed = true
+      endBackground()
     },
   }
 }

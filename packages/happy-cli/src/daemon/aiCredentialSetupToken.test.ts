@@ -52,7 +52,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean } } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[] } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -120,6 +120,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
   const runtime = createAiCredentialRuntime({
     homeDir: join('/home', 'operator'), platform: options.platform, machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier() }),
+    ...(options.inUse ? { setupTokenAccountsInUse: options.inUse } : {}),
     ...(options.durability === 'missing' ? {} : {
       syncFile: async (path: string) => { syncEvents.push('file:' + path); if (options.durability === 'file-fails') throw new Error('sync failed') },
       syncDirectory: async (path: string) => { syncEvents.push('directory:' + path); if (options.durability === 'directory-fails') throw new Error('sync failed') },
@@ -577,11 +578,116 @@ describe('managed Claude setup-token runtime', () => {
     expect(installs(calls)).toEqual([])
   })
 
-  it('never takes over a personally imported slot with the same synthetic email', async () => {
-    const { runtime, state, calls } = fakeMachine([stored(A, 1, fakeToken('personal'))], 2)
+  it('never takes over a personally imported slot with the same synthetic email but no managed metadata', async () => {
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = stored(A, 1, fakeToken('personal'))
+    const { runtime, state, calls } = fakeMachine([bare as Slot], 2)
     // 2026-10-12 hmrepo: the conflict did not say which check refused, so the daemon log could not tell a takeover from a stale journal.
     await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')))))).rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
     expect(state.slots[0]!.credentials).toEqual(managed(A, 1, fakeToken('personal')).credentials)
+    expect(calls.some(call => call.args[0] === 'import')).toBe(false)
+  })
+
+  // Saycode specs/claude-setup-token-managed-sync R1/R2: a slot in the managed format is organization material, not personal:
+  // the assignment that desires it owns it again after its journal was lost, and replaces it by generation.
+  it('re-acquires a managed-format slot after the group journal was lost and replaces it by generation', async () => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { runtime, state, files } = fakeMachine([personal], 1)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('one')))))
+    files.delete(join('/home', 'operator', '.happy', 'ai-credential-groups.json'))
+    await expect(runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('two')))))).resolves.toMatchObject({ reconciled: true,
+      appliedCredentials: [{ managedAccountId: A, credentialGeneration: 2 }] })
+    expect(state.slots).toEqual([personal, expect.objectContaining({ managedAccountId: A, credentialGeneration: 2, credentials: managed(A, 2, fakeToken('two')).credentials })])
+    // Owned again: the next assignment change replaces it.
+    await runtime.groupSync(sync(3, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', B])
+  })
+
+  // PR #874 review: the same assignment again finds its slot without managed metadata; it must restore it, not reuse the receipt.
+  it('restores a slot that lost its managed metadata when the same assignment is synced again', async () => {
+    const { runtime, state } = fakeMachine([], null)
+    const request = sync(1, payload(managed(A, 1, fakeToken('a'))))
+    await runtime.groupSync(request)
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = state.slots[0]!
+    state.slots[0] = bare as typeof state.slots[0]
+    await expect(runtime.groupSync(request)).resolves.toMatchObject({ reconciled: true, appliedCredentials: [{ managedAccountId: A, credentialGeneration: 1 }] })
+    expect(state.slots).toEqual([expect.objectContaining({ email: managedSetupTokenEmail(A), credentialType: 'setup_token', managedAccountId: A, credentialGeneration: 1 })])
+  })
+
+  it('removes orphaned managed-format slots after a setup-token apply but keeps personal and bare synthetic slots', async () => {
+    const C = '0b6f2c1e-1111-4a2b-8c3d-000000000003'
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = stored(C, 1, fakeToken('bare'), { number: 3 })
+    const { runtime, state, calls } = fakeMachine([personal, stored(B, 4, fakeToken('orphan')), bare as Slot], 1)
+    await expect(runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 4 })))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', managedSetupTokenEmail(C), A])
+    expect(state.active).toBe(1)
+    expect(calls.filter(call => call.args[0] === 'remove').map(call => call.args[1])).toEqual(['2'])
+  })
+
+  it('leaves an orphaned slot a running session is bound to for a later sync', async () => {
+    const inUse = vi.fn(() => [B])
+    const { runtime, state } = fakeMachine([stored(B, 4, fakeToken('orphan'))], null, { inUse })
+    await expect(runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 4 })))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId)).toEqual([B, A])
+    inUse.mockReturnValue([])
+    await expect(runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 4 })))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A])
+  })
+
+  // PR #874 review: Desktop sees a complete receipt and never syncs again, so the session's end retries the removal.
+  it('removes a slot kept for a running session once that session ended, leaving personal slots and the receipt alone', async () => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const inUse = vi.fn(() => [A])
+    const { runtime, state } = fakeMachine([personal], 1, { inUse })
+    await runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 2 })))
+    await runtime.groupSync(sync(2, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', A, B])
+    inUse.mockReturnValue([])
+    await runtime.releaseSetupTokenAccounts([A])
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', B])
+    expect(state.active).toBe(1)
+    await expect(runtime.groupReceipt('company-1', 'claude')).resolves.toMatchObject({ reconciled: true, generation: 2 })
+  })
+
+  it('does not reclaim on a session end while the assignment kill switch is on', async () => {
+    const inUse = vi.fn(() => [A])
+    const { runtime, state } = fakeMachine([], null, { inUse, env: { APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH: '1' } })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    await runtime.groupSync(sync(2, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
+    inUse.mockReturnValue([])
+    await runtime.releaseSetupTokenAccounts([A])
+    expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A, B])
+  })
+
+  it.each(['replace', 'merge'] as const)('keeps its managed setup-tokens owned through a manual OAuth %s apply and still revokes them', async applyMode => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { runtime, state } = fakeMachine([personal], 1)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('one')))))
+    // The manual apply invalidates the group journal first; whether its own import then succeeds does not matter here.
+    await runtime.apply({ provider: 'claude', applyMode, payload: payload() }).catch(() => undefined)
+    await expect(runtime.groupSync(sync(2, null))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com'])
+  })
+
+  // Saycode specs/claude-setup-token-managed-sync R3: a refused apply must not have imported its new accounts first.
+  it('refuses an unowned managed slot before importing any new account of the same payload', async () => {
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = stored(A, 1, fakeToken('personal'))
+    const { runtime, state, calls } = fakeMachine([bare as Slot], 2)
+    const before = structuredClone(state.slots)
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')), { ...managed(B, 1, fakeToken('b')), number: 3 }))))
+      .rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
+    expect(state.slots).toEqual(before)
+    expect(calls.some(call => call.args[0] === 'import')).toBe(false)
+  })
+
+  it('refuses a stale managed generation before importing any new account of the same payload', async () => {
+    const { runtime, state, calls } = fakeMachine([], null)
+    await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('two')))))
+    const before = structuredClone(state.slots)
+    calls.length = 0
+    await expect(runtime.groupSync(sync(3, payload(managed(A, 1, fakeToken('one')), { ...managed(B, 1, fakeToken('b')), number: 3 }))))
+      .rejects.toThrow('AI_GROUP_GENERATION_STALE')
+    expect(state.slots).toEqual(before)
     expect(calls.some(call => call.args[0] === 'import')).toBe(false)
   })
 
