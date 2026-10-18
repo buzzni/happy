@@ -2,6 +2,7 @@ import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
+import { createEnvelope } from '@slopus/happy-wire';
 import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
@@ -18,6 +19,7 @@ const {
     mockDelay,
     mockShouldReconnect,
     mockNotifyDaemonSessionRuntime,
+    mockNotifyDaemonAutomationTurnResult,
     sessionRpcConfigs,
     registeredCommonHandlers,
 } = vi.hoisted(() => ({
@@ -39,6 +41,7 @@ const {
     mockDelay: vi.fn(async () => undefined),
     mockShouldReconnect: vi.fn(() => true),
     mockNotifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
+    mockNotifyDaemonAutomationTurnResult: vi.fn(async () => ({ status: 'ok' })),
     sessionRpcConfigs: [] as Array<{ requireBoundRequests?: boolean }>,
     registeredCommonHandlers: vi.fn(),
 }));
@@ -99,7 +102,8 @@ vi.mock('@/utils/lidState', () => ({
 }));
 
 vi.mock('@/daemon/controlClient', () => ({
-    notifyDaemonSessionRuntime: mockNotifyDaemonSessionRuntime
+    notifyDaemonSessionRuntime: mockNotifyDaemonSessionRuntime,
+    notifyDaemonAutomationTurnResult: mockNotifyDaemonAutomationTurnResult,
 }));
 
 type SocketHandler = (...args: any[]) => void;
@@ -1626,6 +1630,57 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(onUserMessage.mock.calls[1][0].content.text).toBe(original.content.text);
         (client as any).routeIncomingMessage({ ...original, localKey: 'manual-message' });
         expect(onUserMessage.mock.calls[2][0].content.text).toBe(original.content.text);
+    });
+
+    // Saycode specs/automation-result-delivery D1
+    it('reports the turn that answered a scheduled prompt to the daemon, with its final answer only', () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.onUserMessage(vi.fn());
+        mockNotifyDaemonAutomationTurnResult.mockClear();
+        (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'Report' }, localKey: 'happy-automation:run-7', meta: { sentFrom: 'automation' } });
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-1' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'text', text: 'Let me check the tracker…' }, { turn: 'turn-1' }));
+        client.sendFinalAnswerForChannelTurn('Two new issues.');
+        expect(mockNotifyDaemonAutomationTurnResult).not.toHaveBeenCalled();
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: 'turn-1' }));
+        expect(mockNotifyDaemonAutomationTurnResult).toHaveBeenCalledExactlyOnceWith('test-session-id', {
+            runId: 'run-7', status: 'completed', finalAnswer: 'Two new issues.', silent: false,
+        });
+
+        // An ordinary turn reports nothing.
+        (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'hi' }, localKey: 'happy-automation:run-8', meta: { sentFrom: 'web' } });
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-2' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: 'turn-2' }));
+        expect(mockNotifyDaemonAutomationTurnResult).toHaveBeenCalledTimes(1);
+    });
+
+    it('waits for the automatic retry of a temporary API failure before reporting a scheduled turn', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.onUserMessage(vi.fn());
+        mockNotifyDaemonAutomationTurnResult.mockClear();
+        (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'Report' }, localKey: 'happy-automation:run-9', meta: { sentFrom: 'automation' } });
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-1' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'failed' }, { turn: 'turn-1' }));
+        client.setTransientRetryPending(true);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(mockNotifyDaemonAutomationTurnResult).not.toHaveBeenCalled();
+
+        client.setTransientRetryPending(false);
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-2' }));
+        client.sendFinalAnswerForChannelTurn('Recovered.');
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: 'turn-2' }));
+        expect(mockNotifyDaemonAutomationTurnResult).toHaveBeenCalledExactlyOnceWith('test-session-id', {
+            runId: 'run-9', status: 'completed', finalAnswer: 'Recovered.', silent: false,
+        });
+
+        // Without a retry the failure is reported once the launcher had its say.
+        (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'Report' }, localKey: 'happy-automation:run-10', meta: { sentFrom: 'automation' } });
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-3' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'failed' }, { turn: 'turn-3' }));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(mockNotifyDaemonAutomationTurnResult).toHaveBeenLastCalledWith('test-session-id', {
+            runId: 'run-10', status: 'failed', finalAnswer: null, silent: false,
+        });
     });
 
     it('preserves effort in user message metadata after schema parsing', async () => {

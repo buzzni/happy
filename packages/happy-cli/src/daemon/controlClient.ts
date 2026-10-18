@@ -3,6 +3,7 @@
  * Used by CLI commands to interact with running daemon
  */
 
+import type { AutomationTurnResult } from '@/api/automationTurnTracker';
 import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState, readDaemonStateSnapshot, writeDaemonStateIfUnchanged } from '@/persistence';
 import { Metadata } from '@/api/types';
@@ -263,6 +264,17 @@ export async function notifyDaemonSessionRuntime(
   // report; taking the PID from a persisted record instead would risk acting on a
   // recycled PID.
   return daemonPost('/session-runtime', { sessionId, ...runtime, hostPid: process.pid }, 'session-runtime');
+}
+
+/**
+ * The turn that answered a scheduled prompt (Saycode specs/automation-result-delivery D1). Only the
+ * cut answer goes, and only for a turn the daemon's own prompt opened.
+ */
+export async function notifyDaemonAutomationTurnResult(
+  sessionId: string,
+  result: AutomationTurnResult,
+): Promise<{ error?: string } | any> {
+  return daemonPost('/session-automation-turn', { sessionId, ...result });
 }
 
 export async function listDaemonSessions(): Promise<any[]> {

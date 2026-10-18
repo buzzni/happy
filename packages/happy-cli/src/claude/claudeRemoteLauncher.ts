@@ -322,7 +322,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      */
     const transientRetry = createClaudeTransientRetry<{ mode: EnhancedMode; hash: string | null }>({
         delaysMs: CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
-        onState: (state) => session.client.updateAgentState((current) => ({ ...current, transientRetry: state })),
+        onState: (state) => {
+            // A scheduled run's failed turn is not final while its retry waits (specs/automation-result-delivery).
+            session.client.setTransientRetryPending(state !== null);
+            session.client.updateAgentState((current) => ({ ...current, transientRetry: state }));
+        },
     });
     /** Whether the last turn was a slash command: a note in its place would not re-run it. */
     let lastTurnCommand = false;
