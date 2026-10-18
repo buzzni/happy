@@ -177,6 +177,8 @@ export interface LessonHostHandle {
      */
     projectPath?: string;
     hashCandidatePayload(payload: unknown): string;
+    /** The installed store advertises `lessonUpdates`: a candidate may carry `updatesLesson`. Its schema is strict, so never send the field otherwise. */
+    supportsLessonUpdates?: boolean;
     close(): Promise<void>;
 }
 
@@ -214,6 +216,9 @@ export async function openLessonHost(input: {
                 projectHash: opened.projectHash,
                 projectPath: input.workspaceDir,
                 hashCandidatePayload: (payload) => loaded.modules.hashLessonCandidatePayload(payload),
+                supportsLessonUpdates: (loaded.modules as { LESSON_HOST_CAPABILITIES?: { version?: unknown; lessonUpdates?: unknown } })
+                    .LESSON_HOST_CAPABILITIES?.version === 1
+                    && (loaded.modules as { LESSON_HOST_CAPABILITIES?: { lessonUpdates?: unknown } }).LESSON_HOST_CAPABILITIES?.lessonUpdates === true,
                 close: () => opened.close(),
             },
         };
