@@ -19,6 +19,7 @@ import type {
   ServerAutomationReportOutcome,
   ServerAutomationRuntimeState,
   ServerAutomationRuntimeStore,
+  ServerAutomationScheduleState,
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
@@ -522,6 +523,25 @@ function nextScheduledAt(schedule: AutomationSchedule, from: number): number {
   return computeNextRunAt(schedule, from) ?? NEVER_RUN_AT
 }
 
+/**
+ * 1회 예약을 새 generation 으로 처음 볼 때 지난 시각을 얼마나 거슬러 실행할지. 동기화(keepAlive 20초)와
+ * 틱(60초) 때문에 시각 직전에 저장한 예약을 시각 뒤에야 처음 볼 수 있다. 서버 claim 창(−90초)보다 짧다.
+ */
+const ONCE_FIRST_SIGHT_GRACE_MS = 60_000
+
+/** 새 generation 의 첫 다음 실행 시각. 서버는 enabledAt 이전 회차를 거절하므로 그 앞으로는 가지 않는다. */
+function firstScheduledAt(
+  schedule: AutomationSchedule,
+  now: number,
+  enabledAt: number,
+  previous: ServerAutomationScheduleState | undefined,
+): number {
+  // 이전 generation 이 이미 소진(실행 또는 지남)한 1회 예약에는 유예를 주지 않는다. 서버의 같은 회차
+  // 거절은 generation 단위라, 실행 직후의 편집·재개가 같은 시각을 새 generation 으로 claim 하면 두 번 돈다.
+  const grace = schedule.kind === 'once' && previous?.nextRunAt !== NEVER_RUN_AT ? ONCE_FIRST_SIGHT_GRACE_MS : 0
+  return nextScheduledAt(schedule, Math.max(now - grace, enabledAt))
+}
+
 function reconcileSchedules(
   cache: ServerAutomationCacheState,
   state: ServerAutomationRuntimeState,
@@ -544,10 +564,7 @@ function reconcileSchedules(
     byId.set(automation.automationId, {
       automationId: automation.automationId,
       generation: automation.generation,
-      nextRunAt: automation.runRequestedAt ?? nextScheduledAt(
-        payload.schedule,
-        Math.max(now, automation.enabledAt),
-      ),
+      nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload.schedule, now, automation.enabledAt, current),
       lastSessionId: null,
       ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
     })
