@@ -247,7 +247,11 @@ describe('Claude model changes across provider restarts', () => {
         await vi.waitFor(() => expect(warn.mock.calls.some(([message]) => /OAuth token refresh failed/.test(String(message)))).toBe(true));
         void handlers.get('switch')!();
         await running;
+        const logged = warn.mock.calls.map(([message]) => String(message)).find((message) => /OAuth token refresh failed/.test(message))!;
         warn.mockRestore();
+        expect(logged).toContain(`session process ${process.pid}`);
+        // The raw result text never reaches the log.
+        expect(logged).not.toContain(text);
         expect(order.some((entry) => entry.startsWith('event:Claude Code is not signed in'))).toBe(false);
     });
 

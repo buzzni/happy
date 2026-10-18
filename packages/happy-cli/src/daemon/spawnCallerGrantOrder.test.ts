@@ -22,7 +22,8 @@ describe('spawn checks the caller grant before launching anything', () => {
     const spawn = await spawnSource()
     const consume = spawn.indexOf('mcpCallerGrantConsumer.consume(')
     expect(consume).toBeGreaterThan(-1)
-    for (const launch of ['tmux.spawnInTmux(', 'spawnHappyCLI(', 'pidToTrackedSession.set(']) {
+    // spawnTrackedHappyProcess( is the regular path's call site; spawnHappyCLI( sits inside that helper.
+    for (const launch of ['tmux.spawnInTmux(', 'spawnTrackedHappyProcess(', 'spawnHappyCLI(', 'pidToTrackedSession.set(']) {
       const at = spawn.indexOf(launch)
       expect(at, launch).toBeGreaterThan(-1)
       expect(consume, launch).toBeLessThan(at)
