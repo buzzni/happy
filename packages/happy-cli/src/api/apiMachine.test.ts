@@ -14,6 +14,7 @@ import { AI_AUTH_SELECTION_CAPABILITY } from '@/daemon/sessionEnv';
 import { createAiCredentialRuntime } from '@/daemon/aiCredentialRuntime';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
+import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
 import { join } from 'node:path';
 
 const {
@@ -1085,6 +1086,47 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.advanceTimersByTimeAsync(5 * 60_000);
 
         expect(mockSocket.connect).not.toHaveBeenCalled();
+    });
+
+    it('publishes the current process caller-grant key after a daemon-state CAS conflict', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(0);
+        const currentKey = nacl.box.keyPair();
+        const previousKey = nacl.box.keyPair();
+        const machine = makeMachine();
+        machine.daemonState = { status: 'offline', mcpCallerGrantPublicKey: encodeBase64(currentKey.publicKey) };
+        let stateUpdates = 0;
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-state') {
+                if (++stateUpdates === 1) return {
+                    result: 'version-mismatch', version: 1,
+                    daemonState: encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, {
+                        status: 'running', mcpCallerGrantPublicKey: encodeBase64(previousKey.publicKey),
+                    })),
+                };
+                return { result: 'success', version: 2, daemonState: data.daemonState };
+            }
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            return { result: 'success' };
+        });
+        const client = new ApiMachineClient('fake-token', machine);
+        try {
+            client.connect();
+            emitSocketEvent('connect');
+            await vi.advanceTimersByTimeAsync(1_000);
+            expect(stateUpdates).toBe(2);
+            // Desktop seals a fresh project grant to the advertised key; the running daemon must open it.
+            const grant = Buffer.from(JSON.stringify({ version: 1, userId: 'fixture-user', machineId: machine.id,
+                projectId: 'fixture-project', iat: 0, exp: 60_000, nonce: 'fixture-nonce' })).toString('base64url') + '.fixture-signature';
+            const ephemeral = nacl.box.keyPair();
+            const nonce = nacl.randomBytes(nacl.box.nonceLength);
+            const advertisedKey = new Uint8Array(Buffer.from(machine.daemonState!.mcpCallerGrantPublicKey!, 'base64'));
+            const cipher = nacl.box(new TextEncoder().encode(grant), nonce, advertisedKey, ephemeral.secretKey);
+            const envelope = Buffer.concat([Buffer.from(ephemeral.publicKey), Buffer.from(nonce), Buffer.from(cipher)]).toString('base64');
+            const consumer = new McpCallerGrantEnvelopeConsumer({ machineId: machine.id, secretKey: currentKey.secretKey, now: () => 0 });
+            expect(consumer.consume(envelope, { projectId: 'fixture-project' })).toEqual({ ok: true, grant });
+            expect(machine.daemonState!.mcpCallerGrantPublicKey).toBe(encodeBase64(currentKey.publicKey));
+        } finally { client.shutdown(); }
     });
 
     it('publishes runtime activity on the encrypted daemon heartbeat', async () => {
