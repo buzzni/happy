@@ -181,8 +181,10 @@ failed against the final child implementation; recovery now clears pending inten
 and raises NO_ACCOUNT without returning the old token, and only a refused turn starts
 the fixed retry deadline. Child observation hashing and currentOperationId are retained.
 The corrected runtime/controller/launcher suites pass 64 tests. CLI typecheck and
-pkgroll rebuild pass. The earlier prepared artifact predates these final two fixes;
-it is not a deployable acceptance artifact for the final source.
+pkgroll rebuild pass. A fresh final-source package at `/tmp/claude/happy-machine-rotation-final-20261019`
+passes the structural guard (13 bundled files, unchanged 1.1.10-aplus.341).
+The isolated version/preflight evidence above predates these two fixes; the final
+artifact has not undergone installed-artifact or live acceptance.
 
 Server unique-key HTTP verification is integrated. Server/wire source identity was
 checked against the server review checkout, where all 39 selected server tests and
