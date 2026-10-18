@@ -31,8 +31,11 @@ export type SetupTokenAccountSwitchDeps = {
   /** Records the new binding as the session's resume authority. */
   recordAgentEnvironment(session: TrackedSession, binding: string): void
 }
-/** FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking. */
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED'
+/**
+ * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
+ * APPLY_REQUIRED: the account Studio would choose is not applied on this PC yet (specs/claude-setup-token-managed-sync R6).
+ */
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -84,6 +87,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       const response = await post('rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce })
       const body = await response.json().catch(() => null) as Record<string, unknown> | null
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return { ok: false, reason: 'NO_ACCOUNT' }
+      if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED') return { ok: false, reason: 'APPLY_REQUIRED' }
       if (!response.ok || !body) return failure(refusal(response.status), `rebind ${response.status} ${String(body?.error ?? '')}`)
       grant = body
     } catch (error) { return failure('REQUEST_FAILED', `rebind ${(error as Error)?.name ?? 'error'}`) }

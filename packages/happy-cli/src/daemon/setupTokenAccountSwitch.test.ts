@@ -60,6 +60,13 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(deps.sessionEnvironment).not.toHaveBeenCalled()
   })
 
+  // Saycode specs/claude-setup-token-managed-sync R6/R7: Studio picks only accounts this PC applied; a newer assignment must land first.
+  it('answers APPLY_REQUIRED when Studio has an account this PC has not applied yet', async () => {
+    const { switcher, deps } = setup({ fetch: vi.fn(async () => Response.json({ error: 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED' }, { status: 409 })) as unknown as typeof fetch })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'APPLY_REQUIRED' })
+    expect(deps.sessionEnvironment).not.toHaveBeenCalled()
+  })
+
   it('refuses a grant that would hand the session to another member', async () => {
     const { switcher, deps } = setup({ sessionEnvironment: vi.fn(async () => ({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B, 'user-b')) })) })
     expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'BINDING_REJECTED' })
