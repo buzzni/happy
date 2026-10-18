@@ -4743,6 +4743,44 @@ describe('one-time and weekly schedules (desktop-schedule-kinds)', () => {
     expect(fixture.store.state().schedules[0]).toMatchObject({ generation: 3, nextRunAt: NEVER_RUN_AT })
   })
 
+  it('does not run the same one-time occurrence again when the previous generation spent it', async () => {
+    const fixture = setup({ generation: 2, claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    fixture.store.write({ ...fixture.store.read(), schedules: [] })
+    const once = justPassedOnce(fixture.now)
+    withSchedule(fixture, once.schedule)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.transport.claim).toHaveBeenCalledTimes(1)
+
+    fixture.input.cache = { read: () => ({
+      cursor: 1n, serverTime: fixture.now, syncedAt: fixture.now, pendingAcknowledgements: [],
+      automations: [cacheRecord(3)],
+    }) }
+    await runServerAutomationTick(fixture.input)
+
+    expect(fixture.transport.claim).toHaveBeenCalledTimes(1)
+    expect(fixture.store.state().schedules[0]).toMatchObject({ generation: 3, nextRunAt: NEVER_RUN_AT })
+  })
+
+  it('claims a re-armed one-time schedule first seen shortly after its new time', async () => {
+    // 지난주에 끝났거나 지난 시각으로 저장돼 소진된 1회 예약을, 시각 직전에 새 시각으로 고친 경우다.
+    const fixture = setup({ generation: 2, claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
+    fixture.store.write({ ...fixture.store.read(), schedules: [] })
+    withSchedule(fixture, pastOnce)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.store.state().schedules[0]).toMatchObject({ generation: 2, nextRunAt: NEVER_RUN_AT })
+
+    const once = justPassedOnce(fixture.now)
+    withSchedule(fixture, once.schedule)
+    fixture.input.cache = { read: () => ({
+      cursor: 1n, serverTime: fixture.now, syncedAt: fixture.now, pendingAcknowledgements: [],
+      automations: [cacheRecord(3)],
+    }) }
+    await runServerAutomationTick(fixture.input)
+
+    expect(fixture.transport.claim).toHaveBeenCalledTimes(1)
+    expect(fixture.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ generation: 3, scheduledFor: once.at }))
+  })
+
   it('does not reach back before the automation was enabled', async () => {
     const fixture = setup({ generation: 3, claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
     fixture.store.write({ ...fixture.store.read(), schedules: [] })

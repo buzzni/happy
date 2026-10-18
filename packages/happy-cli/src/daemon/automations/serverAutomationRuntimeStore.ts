@@ -17,6 +17,8 @@ export interface ServerAutomationScheduleState {
   nextRunAt: number
   lastSessionId: string | null
   runRequestRevision?: number | null
+  /** nextRunAt 이 NEVER_RUN_AT 인 1회 예약이 소진한 회차의 시각. 다음 generation 이 같은 회차인지 가린다. */
+  spentOnceAt?: number
 }
 
 export interface GithubIssueProgressMarkerState {
@@ -258,6 +260,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
             ? null
             : integer(row.runRequestRevision, 1),
         } : {}),
+        ...(row.spentOnceAt !== undefined ? { spentOnceAt: integer(row.spentOnceAt) } : {}),
       }
     })
     const pendingReports = disk.pendingReports.map(parsePendingReport)

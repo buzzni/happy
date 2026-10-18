@@ -523,6 +523,24 @@ function nextScheduledAt(schedule: AutomationSchedule, from: number): number {
   return computeNextRunAt(schedule, from) ?? NEVER_RUN_AT
 }
 
+/** 1회 예약 회차의 시각. 다른 종류는 회차가 하나로 정해지지 않으므로 null. */
+function onceOccurrenceAt(schedule: AutomationSchedule): number | null {
+  return schedule.kind === 'once' ? computeNextRunAt(schedule, Number.NEGATIVE_INFINITY) : null
+}
+
+/**
+ * 다음 실행 시각과, 소진된 1회 예약이면 그 회차. NEVER_RUN_AT 만으로는 어느 회차를 소진했는지 몰라
+ * 지난주에 끝난 예약을 새 시각으로 고친 편집과 방금 실행한 같은 회차의 편집을 구분하지 못한다.
+ */
+function scheduledRun(
+  schedule: AutomationSchedule,
+  from: number,
+): Pick<ServerAutomationScheduleState, 'nextRunAt' | 'spentOnceAt'> {
+  const nextRunAt = nextScheduledAt(schedule, from)
+  const spentOnceAt = nextRunAt === NEVER_RUN_AT ? onceOccurrenceAt(schedule) : null
+  return spentOnceAt === null ? { nextRunAt } : { nextRunAt, spentOnceAt }
+}
+
 /**
  * 1회 예약을 새 generation 으로 처음 볼 때 지난 시각을 얼마나 거슬러 실행할지. 동기화(keepAlive 20초)와
  * 틱(60초) 때문에 시각 직전에 저장한 예약을 시각 뒤에야 처음 볼 수 있다. 서버 claim 창(−90초)보다 짧다.
@@ -535,11 +553,14 @@ function firstScheduledAt(
   now: number,
   enabledAt: number,
   previous: ServerAutomationScheduleState | undefined,
-): number {
-  // 이전 generation 이 이미 소진(실행 또는 지남)한 1회 예약에는 유예를 주지 않는다. 서버의 같은 회차
+): Pick<ServerAutomationScheduleState, 'nextRunAt' | 'spentOnceAt'> {
+  // 이전 generation 이 이미 소진(실행 또는 지남)한 같은 회차에는 유예를 주지 않는다. 서버의 같은 회차
   // 거절은 generation 단위라, 실행 직후의 편집·재개가 같은 시각을 새 generation 으로 claim 하면 두 번 돈다.
-  const grace = schedule.kind === 'once' && previous?.nextRunAt !== NEVER_RUN_AT ? ONCE_FIRST_SIGHT_GRACE_MS : 0
-  return nextScheduledAt(schedule, Math.max(now - grace, enabledAt))
+  // 소진한 회차를 모르는 행(spentOnceAt 이전)은 같은 회차로 본다.
+  const spentSameOccurrence = previous?.nextRunAt === NEVER_RUN_AT
+    && (previous.spentOnceAt === undefined || previous.spentOnceAt === onceOccurrenceAt(schedule))
+  const grace = schedule.kind === 'once' && !spentSameOccurrence ? ONCE_FIRST_SIGHT_GRACE_MS : 0
+  return scheduledRun(schedule, Math.max(now - grace, enabledAt))
 }
 
 function reconcileSchedules(
@@ -564,7 +585,9 @@ function reconcileSchedules(
     byId.set(automation.automationId, {
       automationId: automation.automationId,
       generation: automation.generation,
-      nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload.schedule, now, automation.enabledAt, current),
+      ...(automation.runRequestedAt == null
+        ? firstScheduledAt(payload.schedule, now, automation.enabledAt, current)
+        : { nextRunAt: automation.runRequestedAt }),
       lastSessionId: null,
       ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
     })
@@ -631,7 +654,7 @@ function advanceSchedule(
     ...state,
     schedules: state.schedules.map((schedule) => schedule.automationId === automationId ? {
       ...schedule,
-      nextRunAt: nextScheduledAt(payload.schedule, now),
+      ...scheduledRun(payload.schedule, now),
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
     } : schedule),
   })

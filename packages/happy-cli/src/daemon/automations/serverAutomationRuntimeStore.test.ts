@@ -15,6 +15,18 @@ describe('serverAutomationRuntimeStore', () => {
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
+  it('keeps the spent one-time occurrence across a write and read', () => {
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    store.write({
+      schedules: [{
+        automationId: 'automation-1', generation: 2, nextRunAt: Number.MAX_SAFE_INTEGER, lastSessionId: null, spentOnceAt: 100,
+      }],
+      pendingReports: [],
+    })
+
+    expect(store.read().schedules[0]).toMatchObject({ nextRunAt: Number.MAX_SAFE_INTEGER, spentOnceAt: 100 })
+  })
+
   it('atomically persists schedule state and pending idempotent reports as owner-only', () => {
     const store = createServerAutomationRuntimeStore({ filePath: file })
     store.write({
