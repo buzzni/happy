@@ -58,6 +58,7 @@ import {
   persistSession,
   readCredentials,
 } from '@/persistence';
+import { persistSetupTokenBinding } from './setupTokenBindingPersistence';
 import { decideResumeCredentials, readStagedTokenFromHomeDir, tokensShareIdentity } from './resumeCredentials';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
@@ -97,7 +98,6 @@ import {
   type AiAuthSelection,
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
-  SETUP_TOKEN_BINDING_ENV,
 } from './sessionEnv';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
@@ -2555,30 +2555,6 @@ export async function startDaemon(): Promise<void> {
      */
     const resumeCursorPersistedAt = new Map<string, number>();
 
-    /** A changed resume authority (a switched setup-token account) must reach disk now, not with the next cursor. */
-    const persistAgentEnvironment = (session: TrackedSession): void => {
-      const sessionId = session.happySessionId;
-      const metadata = session.happySessionMetadataFromLocalWebhook;
-      if (!sessionId || !session.encryption || !metadata) {
-        // Kept in memory only: a daemon restart before the next persisted record resumes on the previous binding.
-        logger.debug(`[DAEMON RUN] Switched binding for ${sessionId ?? 'unknown session'} not persisted: session record incomplete`);
-        return;
-      }
-      persistSession(sessionId, {
-        encryptionKey: encodeBase64(session.encryption.encryptionKey),
-        encryptionVariant: session.encryption.encryptionVariant,
-        seq: session.encryption.seq,
-        metadataVersion: session.encryption.metadataVersion,
-        agentStateVersion: session.encryption.agentStateVersion,
-        metadata,
-        savedAt: Date.now(),
-        userHomeDir: session.userHomeDir,
-        lastProcessedSeq: session.persistedLastProcessedSeq,
-        agentEnvironment: session.agentEnvironment,
-        deferredContinuationContextFile: session.deferredContinuationContextFile,
-      });
-    };
-
     /**
      * Keeps the on-disk resume cursor current while the session is running.
      *
@@ -4430,10 +4406,7 @@ export async function startDaemon(): Promise<void> {
       fetch,
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
-      recordAgentEnvironment: (session, binding) => {
-        session.agentEnvironment = { ...session.agentEnvironment, [SETUP_TOKEN_BINDING_ENV]: binding };
-        persistAgentEnvironment(session);
-      },
+      recordAgentEnvironment: persistSetupTokenBinding,
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     releaseSetupTokenAccounts = (managedAccountIds) => {

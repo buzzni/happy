@@ -97,6 +97,19 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}');
         expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }));
         expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE });
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+        expect(generations[0].prompts).toHaveLength(1);
+        expect(generations[1].prompts).toHaveLength(2);
+        // A restarted provider is not enough: both replies must reach the user's session once.
+        const replies = client.sendClaudeSessionMessage.mock.calls.flatMap(([body]) =>
+            body.type === 'assistant' ? [body.message] : []);
+        expect(replies).toEqual([
+            expect.objectContaining({ id: 'msg-2', content: [{ type: 'text', text: 'hi' }] }),
+            expect.objectContaining({ id: 'msg-3', content: [{ type: 'text', text: 'hi' }] }),
+        ]);
+        const successfulResults = client.applyClaudeTurnResult.mock.calls.flatMap(([result]) =>
+            result.is_error === false ? [result.uuid] : []);
+        expect(successfulResults).toEqual(['result-2', 'result-3']);
     });
 
     it('hands a message that arrives after a switch to a provider restarted on the new account', async () => {

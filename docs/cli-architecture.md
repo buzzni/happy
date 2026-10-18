@@ -750,3 +750,16 @@ The daemon owns trusted viewer-scoped browser setup, single-use operation IDs, p
 The same extension is also published on the Chrome Web Store (`oonefemjapkafdiibkllemkjdlmmblbc`). The native host allows both the bundled and store extension origins, the loopback setup exchange accepts either origin, and `begin` takes an optional `extensionId` (bundled or store only) so the setup page opens in the install the user actually has. The daemon cannot read the installed store version, so the caller owns that gate: Desktop sends the store `extensionId` only when the profile has store version 0.2.0 or newer (earlier store builds cannot complete setup pairing), and otherwise sends the user to the store listing. A daemon-side constant would need a Happy release every time the store listing changes. Setup pairings use a credential derived from the shared bridge token, viewer key and pairing id (`deriveBrowserSetupPairingToken`). A scope with a setup policy entry admits only that live pairing; a daemon whose home has no entry (another `HAPPY_HOME_DIR`, a lost policy file) falls back to the plain viewer credential, which a revoked pairing token never matches. Setup is offered only while this daemon owns the bridge port. A consumed pairing whose Chrome is offline reports `waiting`, not `expired`. An unreadable policy disables the bridge with a `BROWSER_SETUP_POLICY_CORRUPT` warning; writes fsync before rename. The session MCP availability probe is bounded to 2s. A revoke whose durable write fails is denied in memory but reloads after a daemon restart until Desktop's journal retry succeeds.
 
 `localToolAgentRelay` discovers the running Desktop broker through authenticated daemon control routes with a 30-second lease and rejects takeover of a live relay. Discovery grants no caller authority. Happy MCP advertises `local_tool_capabilities` and `local_tool_control` only when available at session startup, outside mandatory sandbox/browser-task runtimes. Each invocation fixes launcher machine/session/caller context, carries MCP cancellation, and asks Desktop to verify the live caller and separate computer-control consent. Cloud requires a signed Studio caller grant; only the trusted loopback Standalone configuration may use local Happy credentials. No arbitrary executable/argv or raw CUA MCP is exposed. Revisit this boundary when adding another provider or headless host; keep custody and permission enforcement with the trusted broker.
+
+## Setup-token rotation persistence acknowledgement
+
+회전의 resume authority는 `setupTokenBindingPersistence`가 metadata/암호화 정보를 확인한 뒤
+`persistSessionDurably`의 명시적 ACK를 받아 메모리에 반영한다. 파일 쓰기·sync·rename 이전
+실패는 이전 record를 보존하며, rename 뒤 directory sync 실패는 결과 불확실로 취급한다.
+그 프로세스에서는 해당 저장소의 읽기/일반 쓰기를 차단해 이전 메모리로 새 binding을 덮지 않는다.
+Windows에서는 Node의 directory fsync를 사용할 수 없어 file sync와 rename까지 적용한다.
+
+저장 재시도는 비밀 없는 binding만 유지하고 현재 로컬 배정·slot을 다시 확인한다. 종료된 세션에는
+토큰을 반환하지 않는다. 이 처리는 같은 프로세스의 저장 실패 복구이며 nonce 소비 직후 crash의
+멱등 복구는 아니다. 신규 machine-v2 operation journal이 도입되면 이 process-local pending과
+저장소 복구 경계를 다시 검토한다. 기존 일반 session 저장 호출은 best-effort 계약을 유지한다.

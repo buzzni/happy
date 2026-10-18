@@ -10,6 +10,7 @@
 import type { AiAuthSelection, SetupTokenBinding } from './sessionEnv'
 import { readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
 import type { TrackedSession } from './types'
+import type { SessionPersistenceResult } from '@/persistence'
 import { logger } from '@/ui/logger'
 
 export type SetupTokenUsageObservation = {
@@ -28,14 +29,14 @@ export type SetupTokenAccountSwitchDeps = {
   fetch: typeof fetch
   /** A new grant (a switch), or the daemon's recorded binding (catching up a session that missed a switch). */
   sessionEnvironment(agent: string, selection: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>>
-  /** Records the new binding as the session's resume authority. */
-  recordAgentEnvironment(session: TrackedSession, binding: string): void
+  /** Durable ACK required; change committed memory only after publication succeeds. */
+  recordAgentEnvironment(session: TrackedSession, binding: string): SessionPersistenceResult | Promise<SessionPersistenceResult>
 }
 /**
  * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
  * APPLY_REQUIRED: the account Studio would choose is not applied on this PC yet (specs/claude-setup-token-managed-sync R6).
  */
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED'
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -68,11 +69,59 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     headers: { Authorization: `Bearer ${deps.bearer()}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
   const inFlight = new Map<string, Promise<RebindResult>>()
+  // Retain a consumed grant's verified result until saved; retrying storage must not mint more grants.
+  // This is process-local recovery only. A crash between nonce consumption and publication needs
+  // the future server operation journal, not an invented rollback guarantee here.
+  const pendingSaves = new WeakMap<TrackedSession, { running: string; committed: string; nextBinding: string; indeterminate: boolean }>()
+
+  async function savePending(sessionId: string, session: TrackedSession, prepared?: Record<string, string>): Promise<RebindResult> {
+    const pending = pendingSaves.get(session)!
+    if (pending.indeterminate) return failure('PERSISTENCE_INDETERMINATE', 'resume authority requires recovery')
+    let environment = prepared
+    if (!environment) {
+      // Retain only secret-free authority across retries. Custody may have changed while disk was unavailable.
+      const next = parseBinding(pending.nextBinding)!
+      try { environment = await deps.sessionEnvironment('claude', next.selection, next.binding) }
+      catch { return failure('BINDING_REJECTED', 'pending binding is no longer usable') }
+      if (environment[SETUP_TOKEN_BINDING_ENV] !== pending.nextBinding || !environment.CLAUDE_CODE_OAUTH_TOKEN) {
+        return failure('BINDING_REJECTED', 'pending binding revalidation changed authority')
+      }
+    }
+    if (deps.findSession(sessionId) !== session) {
+      pendingSaves.delete(session)
+      return failure('NOT_BOUND', 'session ended before publication')
+    }
+    if (session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV] !== pending.committed) return failure('STALE', 'committed binding changed before publication')
+    let result: SessionPersistenceResult | undefined
+    try { result = await deps.recordAgentEnvironment(session, pending.nextBinding) }
+    catch {
+      // An unexpected throw does not prove that publication never happened.
+      pending.indeterminate = true
+      return failure('PERSISTENCE_INDETERMINATE', 'recorder did not establish publication outcome')
+    }
+    if (deps.findSession(sessionId) !== session) {
+      pendingSaves.delete(session)
+      return failure('NOT_BOUND', 'session ended while awaiting publication')
+    }
+    if (result?.status !== 'committed') {
+      pending.indeterminate = result?.status !== 'failed'
+      return failure(pending.indeterminate ? 'PERSISTENCE_INDETERMINATE' : 'PERSISTENCE_FAILED', 'no durable ACK')
+    }
+    pendingSaves.delete(session)
+    return { ok: true, environment }
+  }
 
   async function rebindOnce(sessionId: string, running: string): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
     const { session, recorded } = bound
+    const committed = session.agentEnvironment![SETUP_TOKEN_BINDING_ENV]!
+    const pending = pendingSaves.get(session)
+    if (pending) {
+      // Do not apply a retained grant to a replacement session or a different running authority.
+      if (pending.running !== running || pending.committed !== session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return failure('STALE', 'pending save belongs to another session authority')
+      return savePending(sessionId, session)
+    }
     // Never move a session back onto a binding older than the one it runs.
     if (bound.state === 'daemon-behind') return failure('STALE', `session ${sessionId} runs a newer binding than this daemon records`)
     // The session missed a switch this daemon finished (its request timed out): catch it up, no new grant.
@@ -103,8 +152,8 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     if (!next || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN) {
       return failure('BINDING_REJECTED', 'the new binding changes member, machine or organization')
     }
-    deps.recordAgentEnvironment(session, environment[SETUP_TOKEN_BINDING_ENV])
-    return { ok: true, environment }
+    pendingSaves.set(session, { running, committed, nextBinding: environment[SETUP_TOKEN_BINDING_ENV], indeterminate: false })
+    return savePending(sessionId, session, environment)
   }
 
   return {

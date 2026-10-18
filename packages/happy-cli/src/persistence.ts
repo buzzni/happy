@@ -6,8 +6,8 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat, chmod, rm } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync, statSync, lstatSync, openSync, closeSync, mkdirSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync, statSync, lstatSync, openSync, closeSync, mkdirSync, rmSync, fsyncSync, fchmodSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
@@ -929,6 +929,7 @@ type SessionsFile = {
 };
 
 export function readPersistedSessions(): Record<string, PersistedSession> {
+  if (indeterminateSessionStores.has(configuration.sessionsFile)) return {};
   try {
     if (!existsSync(configuration.sessionsFile)) return {};
     const data = JSON.parse(readFileSync(configuration.sessionsFile, 'utf-8')) as SessionsFile;
@@ -940,6 +941,8 @@ export function readPersistedSessions(): Record<string, PersistedSession> {
 }
 
 export function persistSession(sessionId: string, session: PersistedSession): void {
+  // A failed directory flush can leave a newer binding visible. Never replace it with old memory.
+  if (indeterminateSessionStores.has(configuration.sessionsFile)) return;
   try {
     const existing = readPersistedSessions();
     existing[sessionId] = session;
@@ -948,5 +951,77 @@ export function persistSession(sessionId: string, session: PersistedSession): vo
     renameSync(tmpFile, configuration.sessionsFile);
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);
+  }
+}
+
+/** No ACK on failure. After rename, visibility alone does not establish durability or rollback. */
+export type SessionPersistenceResult = { status: 'committed' | 'failed' | 'indeterminate' };
+
+// Process-local quarantine: no reader or best-effort writer may adopt/replace an unacknowledged store.
+// Recovery requires restarting and inspecting the surviving record; no disk rollback is promised.
+const indeterminateSessionStores = new Set<string>();
+
+// Validate the resume-critical record shape, retaining unknown metadata/envelope fields for older/newer callers.
+const persistedSessionSchema = z.object({
+  encryptionKey: z.string().min(1),
+  encryptionVariant: z.enum(['legacy', 'dataKey']),
+  seq: z.number().int().nonnegative(),
+  metadataVersion: z.number().int().nonnegative(),
+  agentStateVersion: z.number().int().nonnegative(),
+  metadata: z.object({ path: z.string(), host: z.string() }).passthrough(),
+  savedAt: z.number(),
+  userHomeDir: z.string().optional(),
+  lastProcessedSeq: z.number().int().nonnegative().optional(),
+  agentEnvironment: z.record(z.string(), z.string().optional()).optional(),
+  deferredContinuationContextFile: z.string().optional(),
+}).passthrough();
+const sessionsFileSchema = z.object({ sessions: z.record(z.string(), persistedSessionSchema) }).passthrough();
+
+/**
+ * Strict, synchronous publication for resume authority changes. The daemon serializes these writes
+ * in one process; this is not a cross-process transaction or grant-consumption journal.
+ * Windows does not support opening/fsyncing directories through Node; file sync and rename still apply.
+ */
+export function persistSessionDurably(sessionId: string, session: PersistedSession): SessionPersistenceResult {
+  const path = configuration.sessionsFile;
+  if (indeterminateSessionStores.has(path)) return { status: 'indeterminate' };
+  const temporary = `${path}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`;
+  let renamed = false;
+  let created = false;
+  try {
+    let stored: unknown;
+    try { stored = JSON.parse(readFileSync(path, 'utf-8')); }
+    catch (error) {
+      // Corruption, permissions and IO errors must never become an empty store.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      stored = { sessions: {} };
+    }
+    sessionsFileSchema.parse(stored);
+    persistedSessionSchema.parse(session);
+    const data = stored as SessionsFile;
+    const contents = JSON.stringify({ ...data, sessions: { ...data.sessions, [sessionId]: session } }, null, 2);
+    const fd = openSync(temporary, 'wx', PRIVATE_FILE_MODE);
+    created = true;
+    try {
+      writeFileSync(fd, contents, 'utf-8');
+      if (process.platform !== 'win32') fchmodSync(fd, PRIVATE_FILE_MODE);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temporary, path);
+    renamed = true;
+    if (process.platform !== 'win32') {
+      const directory = openSync(dirname(path), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
+    return { status: 'committed' };
+  } catch {
+    if (renamed) indeterminateSessionStores.add(path);
+    // Codes only: exceptions can contain serialized session/key material.
+    logger.debug(`[PERSISTENCE] Durable session write ${renamed ? 'indeterminate' : 'failed'}`);
+    return { status: renamed ? 'indeterminate' : 'failed' };
+  } finally {
+    if (created && !renamed) {
+      try { unlinkSync(temporary); } catch { /* Clean up only our own temporary. */ }
+    }
   }
 }
