@@ -60,6 +60,14 @@ describe('setup-token account switching in a running session', () => {
     expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: true })
   })
 
+  it.each(['seven_day_opus', 'throttle', 'authentication'])('does not continue a %s rejection as an account-wide refusal', async rateLimitType => {
+    const { switching } = setup()
+    switching.onRateLimitEvent(near)
+    switching.onRateLimitEvent({ status: 'rejected', rateLimitType,
+      unifiedWindows: { five_hour: { utilization: 0.97, resetsAt: reset } } })
+    expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: false })
+  })
+
   it('stays on the account and says so once when no other account has quota', async () => {
     const { deps, switching } = setup({ rebind: vi.fn(async () => ({ ok: false as const, reason: 'NO_ACCOUNT' })) })
     switching.onRateLimitEvent(refused)
@@ -104,6 +112,21 @@ describe('setup-token account switching in a running session', () => {
     expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
     expect(deps.rebind).not.toHaveBeenCalled()
     expect(deps.notify).toHaveBeenCalledOnce()
+  })
+
+  it('ignores late usage refusals and new provider events after disposal', async () => {
+    let finish!: (result: { ok: false; reason: string }) => void
+    const report = vi.fn(() => new Promise<{ ok: false; reason: string }>(resolve => { finish = resolve }))
+    const { deps, switching, advance } = setup({ report })
+    switching.onRateLimitEvent(near)
+    switching.dispose()
+    finish({ ok: false, reason: 'FORBIDDEN' })
+    await Promise.resolve()
+    advance(60_000)
+    switching.onRateLimitEvent(refused)
+    expect(report).toHaveBeenCalledOnce()
+    expect(deps.notify).not.toHaveBeenCalled()
+    expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
   })
 
   it('stops after Studio refuses a switch for this binding', async () => {

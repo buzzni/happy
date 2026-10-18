@@ -755,3 +755,13 @@ No provider branch push, GitHub Release, PyPI publish, Happy push/merge, tag pus
 or npm publish has been performed. Those external mutations remain a separate
 approval checkpoint; the artifact and tag must be verified again immediately
 before execution.
+
+## Shared-machine rotation controller prerequisite — 2026-10-19
+
+The controller now uses the tracker's account-wide refusal classification before
+automatically continuing a rejected turn. Model-only, throttle and authentication
+rejections do not authorize continuation, even when the same event contains a
+95%-full account window. Disposal also suppresses late usage-denial notices and
+further provider reports. Four regression cases failed before the fix; the related
+controller/tracker suites passed 39 tests and CLI typecheck passed afterwards.
+This is a local prerequisite, not machine-v2 integration or deployed acceptance.

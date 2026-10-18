@@ -12,7 +12,7 @@
  * (Saycode specs/claude-setup-token-managed-sync R7).
  */
 import type { SetupTokenUsageObservation } from '@/daemon/setupTokenAccountSwitch'
-import { createSetupTokenUsageTracker } from './setupTokenUsageTracker'
+import { createSetupTokenUsageTracker, isSetupTokenAccountRefusal } from './setupTokenUsageTracker'
 import { logger } from '@/ui/logger'
 
 type Outcome = { ok: true } | { ok: false; reason: string }
@@ -73,7 +73,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     deps.notify(notice)
   }
   const stop = () => {
-    if (stopped) return
+    if (stopped || disposed) return
     stopped = true
     endBackground()
     deps.notify(FORBIDDEN_NOTICE)
@@ -149,9 +149,10 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
 
   return {
     onRateLimitEvent(info: unknown) {
+      if (disposed || stopped) return
       // The latest word decides: a refusal later followed by allowed requests cut nothing short.
       const status = (info as { status?: unknown } | null)?.status
-      if (status !== undefined) refused = status === 'rejected'
+      if (status !== undefined) refused = isSetupTokenAccountRefusal(info as Parameters<typeof isSetupTokenAccountRefusal>[0])
       const update = tracker.observe(info as Parameters<typeof tracker.observe>[0])
       if (!update || stopped) return
       if (update.exhausted) wanted = true
