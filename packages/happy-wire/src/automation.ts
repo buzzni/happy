@@ -137,6 +137,29 @@ export const automationSealSchema = z.object({
 });
 export type AutomationSeal = z.infer<typeof automationSealSchema>;
 
+/**
+ * Saycode specs/automation-result-delivery — a paired messenger conversation on the machine that
+ * runs the automation. `grantKey` is an opaque handle the channel host minted for one pairing; the
+ * host looks the conversation up again at send time, so nothing here names a recipient directly.
+ */
+export const automationDeliveryTargetSchema = z.object({
+  machineId: z.string().min(1).max(200),
+  connectionId: z.string().min(1).max(200),
+  grantKey: z.string().min(1).max(128),
+});
+export type AutomationDeliveryTarget = z.infer<typeof automationDeliveryTargetSchema>;
+
+export const automationDeliverySchema = z.object({
+  version: z.literal(1),
+  /** The editor's language when it was saved; the daemon words the fixed messages in it. */
+  locale: z.string().min(2).max(16).optional(),
+  /** Where the final answer goes; null sends none. */
+  result: automationDeliveryTargetSchema.nullable(),
+  /** Where a failure alert goes: the result's target ('same'), another one, or nowhere (null). */
+  failure: z.union([z.literal('same'), automationDeliveryTargetSchema]).nullable(),
+});
+export type AutomationDelivery = z.infer<typeof automationDeliverySchema>;
+
 export const automationPayloadSchema = z.object({
   name: z.string().trim().min(1).max(200),
   schedule: automationScheduleSchema,
@@ -151,6 +174,8 @@ export const automationPayloadSchema = z.object({
   effort: z.string().nullable().optional(),
   githubTrigger: githubTriggerSchema.optional(),
   conversation: z.object({ sessionId: z.string().trim().min(1).max(200) }).optional(),
+  // A delivery this daemon cannot read is dropped, never a reason to skip the run itself.
+  delivery: automationDeliverySchema.optional().catch(undefined),
   seal: automationSealSchema.optional(),
 }).superRefine((payload, context) => {
   if (payload.conversation && payload.githubTrigger) context.addIssue({ code: 'custom', path: ['conversation'], message: 'conversation delivery cannot use GitHub triggers' });
