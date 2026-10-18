@@ -1,3 +1,7 @@
+import { createMachineSetupTokenProtocol, readMachineRotationConfig, MachineRotationError } from './machineSetupTokenProtocol';
+import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
+import { createMachineSetupTokenJournal } from './machineSetupTokenJournal';
+import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
@@ -56,9 +60,13 @@ import {
   readPersistedSessions,
   hardenHappyHomePermissions,
   persistSession,
+  persistPreparedMachineLaunch,
+  recoverPreparedMachineLaunch,
+  preparedMachineLaunchHomeDirs,
   readCredentials,
+  parseCredentials,
 } from '@/persistence';
-import { persistSetupTokenBinding } from './setupTokenBindingPersistence';
+import { persistSetupTokenBinding, recoverSetupTokenBindingPersistence } from './setupTokenBindingPersistence';
 import { decideResumeCredentials, readStagedTokenFromHomeDir, tokensShareIdentity } from './resumeCredentials';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
@@ -98,6 +106,7 @@ import {
   type AiAuthSelection,
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
+  isMachineSetupTokenBinding,
 } from './sessionEnv';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
@@ -1292,6 +1301,7 @@ export async function startDaemon(): Promise<void> {
         ...liveHomeDirs,
         ...unverifiedRecoveredHomeDirs,
         ...resumableHomeDirs,
+        ...preparedMachineLaunchHomeDirs(),
       ]);
       if (removed.length > 0) {
         logger.debug(`[DAEMON RUN] Swept ${removed.length} orphan user home dir(s) from /tmp`);
@@ -1473,7 +1483,8 @@ export async function startDaemon(): Promise<void> {
       pidToAdoptedAt.delete(pid);
       persistTrackedSessions();
       logger.debug(`[DAEMON RUN] Released recovered pending spawn after PID reuse was detected (pid ${pid})`);
-      if (stalePending?.userHomeDir) {
+      const recoverableTarget = stalePending?.resumeTargetSessionId && readPersistedSessions()[stalePending.resumeTargetSessionId];
+      if (stalePending?.userHomeDir && !recoverableTarget) {
         void unstageUserCredentials(stalePending.userHomeDir).then(
           () => logger.debug(`[DAEMON RUN] Unstaged reused-PID pending home dir ${stalePending.userHomeDir}`),
           (error) => logger.debug(
@@ -1502,6 +1513,12 @@ export async function startDaemon(): Promise<void> {
       // rewrite drops it, and a child that dies inside that window would resume
       // from the server head again — swallowing the very messages it was
       // resumed to deliver (2026-08-05 incident).
+      const expected = pidToTrackedSession.get(pid);
+      const bound = readSetupTokenResumeSelection(expected?.agentEnvironment);
+      if (bound && isMachineSetupTokenBinding(bound.binding)
+        && (bound.binding.execution.sessionId !== sessionId || expected?.resumeTargetSessionId !== sessionId)) {
+        throw new MachineRotationError('SESSION_MISMATCH');
+      }
       const preserved = sessionIdToFinishedSession.get(sessionId);
       const inheritedLastProcessedSeq = preserved?.runtime?.lastProcessedSeq ?? preserved?.persistedLastProcessedSeq;
       let existingSession = pidToTrackedSession.get(pid);
@@ -1785,6 +1802,32 @@ export async function startDaemon(): Promise<void> {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
 
+    let machineSetupTokenRuntime: MachineSetupTokenRuntime | null = null;
+    let machineRotationConfigurationError: unknown;
+    let sharedMachineScope = async (): Promise<string | null> => null;
+    const pendingMachineStarts = new Set<string>();
+    const channelSessionKeys = new WeakMap<SpawnSessionOptions, { key: Uint8Array; wrapped: Uint8Array }>();
+    const requiresMachineRotation = async (options: SpawnSessionOptions) => {
+      if (process.env.HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED !== 'true' || (options.agent && options.agent !== 'claude')
+        || !honorsManagedAiCredentials(options.aiAuthSelection)) return false;
+      const scope = await sharedMachineScope();
+      if (!scope) return false;
+      // Explicit user-v1 grants keep their existing verifier. A machine-v2 document cannot pass it.
+      if (options.aiAuthSelection?.kind === 'claude-setup-token') return false;
+      if (!machineSetupTokenRuntime) throw machineRotationConfigurationError ?? new MachineRotationError('CONFIGURATION_REQUIRED');
+      if (scope !== process.env.HAPPY_SETUP_TOKEN_MACHINE_V2_COMPANY_ID) throw new MachineRotationError('FORBIDDEN');
+      for (const recovered of await machineSetupTokenRuntime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
+      return true;
+    };
+    const authenticatedAccountId = async (token: string): Promise<string> => {
+      const response = await fetch(`${configuration.serverUrl}/v1/account/profile`, { headers: { Authorization: `Bearer ${token}` },
+        redirect: 'error', signal: AbortSignal.timeout(15000) });
+      if (!response.ok) throw new MachineRotationError('FORBIDDEN');
+      const value = await response.json() as { id?: unknown };
+      if (typeof value.id !== 'string' || !value.id || value.id.length > 128) throw new MachineRotationError('FORBIDDEN');
+      return value.id;
+    };
+
     const spawnSessionUnchecked = async (
       options: SpawnSessionOptions,
       trustedMcpContext?: AutomationMcpSpawnContext,
@@ -1849,6 +1892,7 @@ export async function startDaemon(): Promise<void> {
         }
       }
 
+      let preparedMachineSessionId: string | undefined;
       let stagedDeferredContinuationContextFile: string | undefined;
       let browserTaskRegistration: { registrationId: string; sessionSecret: string } | undefined;
       const releaseBrowserTaskRegistration = async (): Promise<void> => {
@@ -1902,7 +1946,7 @@ export async function startDaemon(): Promise<void> {
             cleanupStagedDeferredContinuationContext();
             await releaseBrowserTaskRegistration();
             throw error;
-          }
+          } finally { if (preparedMachineSessionId) pendingMachineStarts.delete(preparedMachineSessionId); }
         };
 
         if (trustedMcpContext && options.mcpCallerGrantEnvelope) {
@@ -1982,9 +2026,31 @@ export async function startDaemon(): Promise<void> {
         // 해석해 두면 overlayManagedCredentialEnvironment 가 마지막에 덮어 항상
         // 이긴다 — 그래서 해석 자체를 하지 않는다.
         const credentialStartedAt = Date.now();
-        const managedAiCredentialEnvironment = honorsManagedAiCredentials(options.aiAuthSelection)
+        let preparedMachineLaunch: Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>> | undefined;
+        if (await requiresMachineRotation(options)) {
+          if (options.reconnectEnvironment) throw new MachineRotationError('UNBOUND_PRECREATED_SESSION');
+          const ownerCredentials = stagedUserHomeDir
+            ? parseCredentials(JSON.parse(await fs.readFile(join(stagedUserHomeDir, 'access.key'), 'utf8')))
+            : credentials;
+          if (!ownerCredentials) throw new MachineRotationError('FORBIDDEN');
+          const ownerApi = await ApiClient.create(ownerCredentials);
+          const [ownerAccountId, machineOwnerAccountId] = await Promise.all([
+            authenticatedAccountId(ownerCredentials.token), authenticatedAccountId(credentials.token),
+          ]);
+          preparedMachineLaunch = await machineSetupTokenRuntime!.prepareLaunch({ ownerAccountId, machineOwnerAccountId, userHomeDir: stagedUserHomeDir,
+            metadata: { path: directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
+              homeDir: os.homedir(), happyHomeDir: stagedUserHomeDir ?? configuration.happyHomeDir, happyLibDir: projectPath(),
+              happyToolsDir: join(projectPath(), 'tools', 'unpacked'), flavor: 'claude', startedFromDaemon: true, startedBy: 'daemon',
+              lifecycleState: 'running', lifecycleStateSince: Date.now(),
+              ...(options.createdByAccountId ? { createdBy: { accountId: options.createdByAccountId } } : {}) },
+            createSession: input => ownerApi.getOrCreateSession({ ...input, dataKey: channelSessionKeys.get(options) }),
+          });
+          preparedMachineSessionId = preparedMachineLaunch.session.id;
+          pendingMachineStarts.add(preparedMachineSessionId);
+        }
+        const managedAiCredentialEnvironment = preparedMachineLaunch?.environment ?? (honorsManagedAiCredentials(options.aiAuthSelection)
           ? await resolveManagedAiCredentialEnvironment(options.agent, options.aiAuthSelection)
-          : {};
+          : {});
         logger.debug(`[timing] spawn managed-credential-environment ${Date.now() - credentialStartedAt}ms`);
         let extraEnv: Record<string, string> = injectMcpCallerGrant(
           stripManagedCredentialConflicts(
@@ -2148,9 +2214,8 @@ export async function startDaemon(): Promise<void> {
         // Channel host spawn: the daemon created this session and holds its key. Set after the
         // caller's environment was scrubbed of lineage and expanded, so only this internal option
         // can attach a child to an existing session.
-        if (options.reconnectEnvironment) {
-          Object.assign(extraEnv, options.reconnectEnvironment);
-        }
+        if (preparedMachineLaunch) Object.assign(extraEnv, preparedMachineLaunch.reconnectEnvironment);
+        else if (options.reconnectEnvironment) Object.assign(extraEnv, options.reconnectEnvironment);
         if (options.saycodeSystemPromptEnabled !== undefined) {
           extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
             options.saycodeSystemPromptEnabled,
@@ -2304,6 +2369,7 @@ export async function startDaemon(): Promise<void> {
               tmuxSessionId: tmuxResult.sessionId,
               directoryCreated,
               userHomeDir: stagedUserHomeDir,
+              ...(tmuxEnv.HAPPY_RECONNECT_SESSION_ID ? { resumeTargetSessionId: tmuxEnv.HAPPY_RECONNECT_SESSION_ID } : {}),
               ...(agentEnvironment ? { agentEnvironment } : {}),
               ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
               message: directoryCreated
@@ -2405,6 +2471,7 @@ export async function startDaemon(): Promise<void> {
           errorMessage: 'Unexpected error in session spawning'
         }));
       } catch (error) {
+        if (preparedMachineSessionId) pendingMachineStarts.delete(preparedMachineSessionId);
         cleanupStagedDeferredContinuationContext();
         await releaseBrowserTaskRegistration();
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -2473,7 +2540,7 @@ export async function startDaemon(): Promise<void> {
         directoryCreated,
         message,
         userHomeDir,
-        ...(resumeTargetSessionId ? { resumeTargetSessionId } : {}),
+        ...((resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID) ? { resumeTargetSessionId: resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID } : {}),
         ...(agentEnvironment ? { agentEnvironment } : {}),
         ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
       };
@@ -2513,10 +2580,32 @@ export async function startDaemon(): Promise<void> {
       for (const session of pidToTrackedSession.values()) {
         if (session.happySessionId === happySessionId) return session;
       }
-      return sessionIdToFinishedSession.get(happySessionId);
+      const finished = sessionIdToFinishedSession.get(happySessionId);
+      if (finished) return finished;
+      const saved = readPersistedSessions()[happySessionId];
+      if (!saved) return undefined;
+      const recovered: TrackedSession = { ...hydrateTrackedSessionFromPersisted(saved), startedBy: 'persisted', happySessionId, pid: 0 };
+      sessionIdToFinishedSession.set(happySessionId, recovered);
+      return recovered;
     };
 
     const preserveSessionForResume = (session: TrackedSession, reason: string): boolean => {
+      // Precreated machine executions already have durable ownership/encryption even if the child
+      // dies before its startup webhook. Keep that original staged identity and zero cursor.
+      if (!session.happySessionId && session.resumeTargetSessionId) {
+        const saved = readPersistedSessions()[session.resumeTargetSessionId];
+        try {
+          const binding = saved && readSetupTokenResumeSelection(saved.agentEnvironment)?.binding;
+          if (saved && binding && isMachineSetupTokenBinding(binding) && binding.execution.sessionId === session.resumeTargetSessionId) {
+            sessionIdToFinishedSession.set(session.resumeTargetSessionId, { ...hydrateTrackedSessionFromPersisted(saved),
+              happySessionId: session.resumeTargetSessionId, startedBy: 'persisted', pid: 0 });
+            return true;
+          }
+        } catch {
+          // Preserve uncertain custody for explicit recovery; a corrupt record authorizes no launch.
+          if (saved?.metadata.setupTokenRotation?.bindingVersion === 2) return true;
+        }
+      }
       // Silence here hid the whole 2026-08-15 failure: the reaper logged a clean
       // stop while this bailed, so nothing recorded that the session had just
       // been killed in a state no resume could recover from.
@@ -2660,6 +2749,7 @@ export async function startDaemon(): Promise<void> {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
+      if (pendingMachineStarts.has(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The execution-bound session is still starting; retry shortly.' };
       let endResumeLaunch: (() => void) | undefined;
       try {
         if (hasLiveDaemonChild(happySessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob)) {
@@ -2768,12 +2858,21 @@ export async function startDaemon(): Promise<void> {
           baselineSeq,
         });
 
+        const resumeBinding = readSetupTokenResumeSelection(tracked.agentEnvironment);
+        const recoveredMachineEnvironment = resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding)
+          ? await (() => { if (!machineSetupTokenRuntime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
+            return machineSetupTokenRuntime.resume(tracked, resumeBinding.binding); })()
+          : undefined;
+        const currentMachineBinding = recoveredMachineEnvironment ? readSetupTokenResumeSelection(recoveredMachineEnvironment)?.binding : undefined;
+        const unstartedMachineExecution = currentMachineBinding && isMachineSetupTokenBinding(currentMachineBinding) && !metadata.claudeSessionId
+          && await machineSetupTokenRuntime!.canStartWithoutConversation(currentMachineBinding);
         const launch = buildResumeLaunch(
           { id: happySessionId, active: true, metadata },
           {
             startedBy: 'daemon',
             claudeStartingMode: 'remote',
             emptyCodexSession: { serverSeq: serverSnapshot.seq, processedSeq: baselineSeq },
+            ...(unstartedMachineExecution ? { emptyMachineClaudeSession: { sessionId: happySessionId, serverSeq: serverSnapshot.seq, processedSeq: baselineSeq, startNeverSubmitted: true as const } } : {}),
           },
         );
 
@@ -2866,8 +2965,7 @@ export async function startDaemon(): Promise<void> {
         });
         const priorCheckpointContext = readCheckpointSpawnContext(tracked.agentEnvironment ?? {});
         // A setup-token-bound session resumes on exactly its recorded generation or not at all.
-        const resumeBinding = readSetupTokenResumeSelection(tracked.agentEnvironment);
-        const managedAiCredentialEnvironment = await resolveManagedAiCredentialEnvironment(
+        const managedAiCredentialEnvironment = recoveredMachineEnvironment ?? await resolveManagedAiCredentialEnvironment(
           resumeAgent,
           resumeBinding?.selection,
           resumeBinding?.binding,
@@ -4379,6 +4477,14 @@ export async function startDaemon(): Promise<void> {
     const trustedStudioOrigin = readTrustedStudioOrigin(process.env);
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor, process.env, os.homedir(), {
       machineId,
+      machineSetupTokenStart: async binding => {
+        if (!machineSetupTokenRuntime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
+        await machineSetupTokenRuntime.recordProviderStart(binding);
+      },
+      machineSetupTokenAuthority: async binding => {
+        if (!machineSetupTokenRuntime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
+        await machineSetupTokenRuntime.validateAuthority(binding);
+      },
       setupTokenBinding: trustedStudioOrigin ? createSetupTokenBindingVerifier({ origin: trustedStudioOrigin, machineId }) : undefined,
       // A group sync never removes the organization account a live session runs on; it waits for a later sync.
       setupTokenAccountsInUse: () => getCurrentChildren().flatMap(session => {
@@ -4397,6 +4503,25 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor = () => { stopPersonalProbes(); claudeSwapSupervisor.shutdown(); };
 
     resolveManagedAiCredentialEnvironment = (agent, selection, recorded) => aiCredentialRuntime.sessionEnvironment(agent, selection, recorded);
+    sharedMachineScope = aiCredentialRuntime.sharedMachineSetupTokenScope;
+    try {
+      // Existing v2 records retain their recovery configuration when new issuance is OFF.
+      const config = readMachineRotationConfig({ ...process.env, HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED: 'true' }, machineId, new URL(configuration.serverUrl).origin);
+      if (config && deviceKeys && deviceEnrollment) machineSetupTokenRuntime = createMachineSetupTokenRuntime({
+        allowInitialIssue: () => process.env.HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED === 'true',
+        protocol: createMachineSetupTokenProtocol({ config, keys: deviceKeys, pin: companyId => deviceEnrollment!.orgPin(companyId), bearer: () => credentials.token }),
+        journal: createMachineSetupTokenJournal(configuration.happyHomeDir),
+        savePrepared: persistPreparedMachineLaunch, loadPrepared: recoverPreparedMachineLaunch,
+        discoverSession: async (state, snapshot, executionProof) => {
+          const ownerCredentials = snapshot.userHomeDir ? parseCredentials(JSON.parse(await fs.readFile(join(snapshot.userHomeDir, 'access.key'), 'utf8'))) : credentials;
+          if (!ownerCredentials) throw new MachineRotationError('FORBIDDEN');
+          return discoverMachineSetupTokenSession({ happyOrigin: config.happyOrigin, state, executionProof, ownerBearer: ownerCredentials.token, machineBearer: credentials.token });
+        },
+        sessionEnvironment: aiCredentialRuntime.sessionEnvironment, persist: persistSetupTokenBinding, recoverPersistence: recoverSetupTokenBindingPersistence,
+        findSession: id => getCurrentChildren().find(session => session.happySessionId === id),
+      });
+      if (machineSetupTokenRuntime) for (const recovered of await machineSetupTokenRuntime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
+    } catch (error) { machineRotationConfigurationError = error; }
     // Saycode specs/claude-setup-token-account-selection — a bound session moves off a used-up account.
     setupTokenAccountSwitch = createSetupTokenAccountSwitch({
       findSession: (sessionId) => getCurrentChildren().find(session => session.happySessionId === sessionId),
@@ -4407,6 +4532,7 @@ export async function startDaemon(): Promise<void> {
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
       recordAgentEnvironment: persistSetupTokenBinding,
+      machineRuntime: () => machineSetupTokenRuntime,
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     releaseSetupTokenAccounts = (managedAccountIds) => {
@@ -4915,6 +5041,11 @@ export async function startDaemon(): Promise<void> {
         },
         createSession: (input) => api.getOrCreateSession({ ...input, state: { controlledByUser: false } }),
         spawnSession: (options) => spawnSession(options),
+        spawnWithSessionKey: async (options, dataKey) => {
+          if (!await requiresMachineRotation(options)) return null;
+          channelSessionKeys.set(options, dataKey);
+          try { return await spawnSession(options); } finally { channelSessionKeys.delete(options); }
+        },
       });
       const channelHostDirs = channelHostDirectories(configuration.happyHomeDir);
       channelHost = createChannelHostSupervisor({

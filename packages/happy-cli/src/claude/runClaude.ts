@@ -1,3 +1,4 @@
+import { readSetupTokenResumeSelection, isMachineSetupTokenBinding, SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 import { initializeScopeReportSigner, takeScopeLaunchBootstrap } from '@/daemon/sessionWriteScopeReports';
 import { takeScopeConfirmation } from '@/daemon/sessionWriteScopeConfirmation';
 import { prepareSessionWriteScopeClaude } from '@/daemon/sessionWriteScopeClaude';
@@ -1674,6 +1675,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             },
         },
         reportStarted: async () => {
+            if (process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED === '1' && !process.env[SETUP_TOKEN_BINDING_ENV]) {
+                metadata.setupTokenRotation = { version: 1, principalType: 'machine', bindingVersion: 0 };
+                session.updateMetadata(current => ({ ...current, setupTokenRotation: metadata.setupTokenRotation }));
+            }
+            const startupBinding = readSetupTokenResumeSelection(process.env)?.binding;
+            const requiresMachineAck = !!startupBinding && isMachineSetupTokenBinding(startupBinding);
             try {
                 logger.debug(`[START] Reporting session ${response.id} to daemon`);
                 const result = await notifyDaemonSessionStarted(response.id, metadata, {
@@ -1683,6 +1690,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                     metadataVersion: response.metadataVersion,
                     agentStateVersion: response.agentStateVersion,
                 });
+                if (result.error && requiresMachineAck) throw new Error('Machine execution startup was not acknowledged');
                 if (result.error) {
                     logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
                 } else {
@@ -1690,6 +1698,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                     logger.debug(`[timing] child reported-to-daemon uptime=${Math.round(process.uptime() * 1000)}ms`);
                 }
             } catch (error) {
+                if (requiresMachineAck) throw new Error('Machine execution startup was not acknowledged');
                 logger.debug('[START] Failed to report to daemon (may not be running):', error);
             }
         },

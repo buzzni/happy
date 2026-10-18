@@ -57,7 +57,7 @@ export function createSetupTokenUsageTracker(now: () => number = Date.now) {
       const retryAt = rejected ? seconds(info.resetsAt) ?? null : null
       if (!read && !rejected) return null
       const current = (['unified5h', 'unified7d'] as const).filter(kind => windows.has(kind))
-      if (!current.length) return rejected ? { exhausted: true, observation: null } : null
+      if (!current.length && !rejected) return null
       return {
         exhausted: rejected || current.some(kind => windows.get(kind)!.pct >= EXHAUSTED_PCT),
         observation: {

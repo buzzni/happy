@@ -21,7 +21,7 @@ function openEnvelope(envelope: Uint8Array, secretKey: Uint8Array): Uint8Array |
     return opened ? new Uint8Array(opened) : null;
 }
 
-function setup(options: { legacy?: boolean; spawnedId?: string } = {}) {
+function setup(options: { legacy?: boolean; spawnedId?: string; prepared?: 'allow' | 'deny' } = {}) {
     const account = tweetnacl.box.keyPair();
     const created: Array<{ tag: string; metadata: Metadata; dataKey: { key: Uint8Array; wrapped: Uint8Array } }> = [];
     const spawned: SpawnSessionOptions[] = [];
@@ -43,6 +43,11 @@ function setup(options: { legacy?: boolean; spawnedId?: string } = {}) {
         machine,
         createSession,
         spawnSession,
+        ...(options.prepared ? { spawnWithSessionKey: async (_options, dataKey) => {
+            if (options.prepared === 'deny') return { type: 'error' as const, errorMessage: 'FORBIDDEN' };
+            expect(dataKey.key).toHaveLength(32);
+            return { type: 'success' as const, sessionId: 'bound-session' };
+        } } : {}),
     });
     return { sessions, account, created, spawned, createSession, spawnSession };
 }
@@ -57,6 +62,19 @@ const spawnParams = {
 };
 
 describe('createChannelHostSessions — spawn', () => {
+    it('uses the trusted v2 prepare hook and returns its exact key without an unbound precreate', async () => {
+        const { sessions, createSession, spawnSession, account } = setup({ prepared: 'allow' });
+        const result = await sessions.handle('spawn', { ...spawnParams, agent: 'claude' }) as { sessionId: string; dek: string; dataEncryptionKey: string };
+        expect(result.sessionId).toBe('bound-session');
+        expect(openEnvelope(decodeBase64(result.dataEncryptionKey), account.secretKey)).toEqual(decodeBase64(result.dek));
+        expect(createSession).not.toHaveBeenCalled(); expect(spawnSession).not.toHaveBeenCalled();
+    });
+    it('does not fall back to unbound creation or provider spawn after v2 denial', async () => {
+        const { sessions, createSession, spawnSession } = setup({ prepared: 'deny' });
+        await expect(sessions.handle('spawn', { ...spawnParams, agent: 'claude' })).rejects.toThrow();
+        expect(createSession).not.toHaveBeenCalled(); expect(spawnSession).not.toHaveBeenCalled();
+    });
+
     it('creates the session with a key it generated and hands the same key to the session child', async () => {
         const { sessions, account, created, spawned } = setup();
 

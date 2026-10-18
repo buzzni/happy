@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ApiClient } from './api';
 import axios from 'axios';
+import { sharedMachineRotationFixture, HappySessionExecutionProofSchema } from '@slopus/happy-wire';
 import { connectionState } from '@/utils/serverConnectionErrors';
 
 // Use vi.hoisted to ensure mock functions are available when vi.mock factory runs
@@ -301,6 +302,42 @@ describe('Api server error handling', () => {
                 dataKey: { key: new Uint8Array(32), wrapped: new Uint8Array(4) },
             })).rejects.toThrow('legacy');
             expect(mockPost).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('execution-bound session creation', () => {
+        const proof = HappySessionExecutionProofSchema.parse(sharedMachineRotationFixture.executionProof);
+        it('signs the exact immutable encrypted body once and retains the session owner bearer', async () => {
+            const prepare = vi.fn(async (body: Readonly<Record<string, unknown>>) => {
+                expect(Object.isFrozen(body)).toBe(true);
+                expect(body).toEqual({ tag: 'tag-v2', metadata: testMetadata, agentState: null, dataEncryptionKey: null });
+                return proof;
+            });
+            mockPost.mockResolvedValue({ data: { session: { id: 'v2', seq: 0, metadata: testMetadata, metadataVersion: 0, agentState: null, agentStateVersion: 0 } } });
+            const session = await api.getOrCreateSession({ tag: 'tag-v2', metadata: testMetadata, state: null, executionProof: prepare });
+            expect(prepare).toHaveBeenCalledOnce();
+            expect(mockPost.mock.calls[0][1]).toEqual({ ...prepare.mock.calls[0][0], executionProof: proof });
+            expect(mockPost.mock.calls[0][2].headers.Authorization).toBe('Bearer fake-token');
+            expect(session?.id).toBe('v2');
+        });
+        it('does not send a create request when proof preparation fails', async () => {
+            await expect(api.getOrCreateSession({ tag: 'tag-v2', metadata: testMetadata, state: null,
+                executionProof: async () => { throw new Error('issue denied'); },
+            })).rejects.toThrow('issue denied');
+            expect(mockPost).not.toHaveBeenCalled();
+        });
+        it.each([undefined, null])('rejects a missing proof result before unsigned serialization', async invalid => {
+            await expect(api.getOrCreateSession({ tag: 'tag-v2', metadata: testMetadata, state: null,
+                executionProof: async () => invalid as never,
+            })).rejects.toThrow();
+            expect(mockPost).not.toHaveBeenCalled();
+        });
+        it.each([{ code: 'ECONNREFUSED' }, { response: { status: 503 } }])('never falls back to an offline session after a proof create fails', async error => {
+            mockPost.mockRejectedValue(error);
+            await expect(api.getOrCreateSession({ tag: 'tag-v2', metadata: testMetadata, state: null,
+                executionProof: async () => proof,
+            })).rejects.toThrow('Execution-bound session creation failed');
+            expect(mockPost).toHaveBeenCalledOnce();
         });
     });
 

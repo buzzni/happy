@@ -7,6 +7,9 @@
  * goes through exactly the verification a new launch does — signature, machine, account generation, nonce,
  * group journal and the token slot — so a switch can never bind what a launch could not.
  */
+import { MachineRotationError } from './machineSetupTokenProtocol'
+import type { MachineSetupTokenRuntime } from './machineSetupTokenRuntime'
+import { isMachineSetupTokenBinding } from './sessionEnv'
 import type { AiAuthSelection, SetupTokenBinding } from './sessionEnv'
 import { readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
 import type { TrackedSession } from './types'
@@ -14,12 +17,14 @@ import type { SessionPersistenceResult } from '@/persistence'
 import { logger } from '@/ui/logger'
 
 export type SetupTokenUsageObservation = {
+  observationId?: string
   observedAt: number
   windows: Array<{ kind: 'unified5h' | 'unified7d'; pct: number | null; resetsAt: number | null }>
   reason: 'ok' | 'rate-limited'
   retryAt: number | null
 }
 export type SetupTokenAccountSwitchDeps = {
+  machineRuntime?(): MachineSetupTokenRuntime | null
   findSession(sessionId: string): TrackedSession | undefined
   /** The daemon's single trusted Studio origin (HAPPY_APLUS_STUDIO_ORIGIN). */
   studioOrigin: string | null
@@ -36,7 +41,7 @@ export type SetupTokenAccountSwitchDeps = {
  * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
  * APPLY_REQUIRED: the account Studio would choose is not applied on this PC yet (specs/claude-setup-token-managed-sync R6).
  */
-export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE'
+export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -53,8 +58,11 @@ function boundSession(deps: SetupTokenAccountSwitchDeps, sessionId: string, runn
   const recorded = parseBinding(session?.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV])
   const current = parseBinding(running)
   if (!session || !recorded || !current) return null
+  if (isMachineSetupTokenBinding(current.binding) !== isMachineSetupTokenBinding(recorded.binding)) return null
+  const recordedRevision = isMachineSetupTokenBinding(recorded.binding) ? recorded.binding.bindingRevision : recorded.binding.issuedAt
+  const runningRevision = isMachineSetupTokenBinding(current.binding) ? current.binding.bindingRevision : current.binding.issuedAt
   const state = current.binding.nonce === recorded.binding.nonce ? 'same' as const
-    : recorded.binding.issuedAt > current.binding.issuedAt ? 'session-behind' as const : 'daemon-behind' as const
+    : recordedRevision > runningRevision ? 'session-behind' as const : 'daemon-behind' as const
   return { session, recorded, state }
 }
 const failure = (reason: SwitchFailure, detail: string) => {
@@ -149,7 +157,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     } catch (error) { return failure('BINDING_REJECTED', `grant verification: ${(error as Error)?.message}`) }
     // The session stays with its member and organization; only the account changes.
     const next = parseBinding(environment[SETUP_TOKEN_BINDING_ENV])?.binding
-    if (!next || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN) {
+    if (!next || isMachineSetupTokenBinding(next) || isMachineSetupTokenBinding(binding) || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN) {
       return failure('BINDING_REJECTED', 'the new binding changes member, machine or organization')
     }
     pendingSaves.set(session, { running, committed, nextBinding: environment[SETUP_TOKEN_BINDING_ENV], indeterminate: false })
@@ -158,7 +166,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
 
   return {
     /** `running`: the binding record the session itself runs with, so usage is never booked to another account. */
-    async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
+    async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
+      const parsed = parseBinding(running)
+      if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
+        try { const runtime = deps.machineRuntime?.(); if (!runtime) return failure('STUDIO_UNAVAILABLE', 'machine runtime absent')
+          return await runtime.reportUsage(sessionId, running, observation, signal) }
+        catch (error) { return machineFailure(error) }
+      }
       const bound = boundSession(deps, sessionId, running)
       if (!bound) return failure('NOT_BOUND', `usage: no binding recorded for session ${sessionId}`)
       if (bound.state !== 'same') return failure('STALE', `usage: session ${sessionId} runs another binding than this daemon records`)
@@ -171,7 +185,13 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     },
 
     /** One switch per session at a time; a second request while one runs gets that one's answer. */
-    rebind(sessionId: string, running: string): Promise<RebindResult> {
+    rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<RebindResult> {
+      const parsed = parseBinding(running)
+      if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
+        const runtime = deps.machineRuntime?.()
+        if (!runtime) return Promise.resolve(failure('STUDIO_UNAVAILABLE', 'machine runtime absent'))
+        return runtime.rebind(sessionId, running, observation, signal).then(environment => ({ ok: true as const, environment }), machineFailure)
+      }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
       const started = rebindOnce(sessionId, running).finally(() => inFlight.delete(sessionId))
@@ -180,5 +200,6 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     },
   }
 }
-type RebindResult = { ok: true; environment: Record<string, string> } | { ok: false; reason: SwitchFailure }
+function machineFailure(error: unknown) { return { ok: false as const, reason: (error instanceof MachineRotationError ? error.reason : 'REQUEST_FAILED') as SwitchFailure, ...(error instanceof MachineRotationError && error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {}) } }
+type RebindResult = { ok: true; environment: Record<string, string> } | { ok: false; reason: SwitchFailure; retryAfterMs?: number }
 export type SetupTokenAccountSwitch = ReturnType<typeof createSetupTokenAccountSwitch>

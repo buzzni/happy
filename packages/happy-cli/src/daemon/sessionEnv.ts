@@ -1,3 +1,5 @@
+import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
+import { z } from 'zod'
 /**
  * Session lineage environment variables must never be inherited implicitly.
  *
@@ -278,24 +280,37 @@ const BINDING_KEYS = ['version', 'managedAccountId', 'credentialGeneration', 'gr
  * The immutable, signed facts a bound session keeps: who the server said may bind
  * which managed account at which generation. No token and no grant envelope.
  */
-export type SetupTokenBinding = {
+export type UserSetupTokenBinding = {
+    principalType?: 'user'
     managedAccountId: string; credentialGeneration: number; groupScope: string; companyId: string
     userId: string; machineId: string; keyId: string; nonce: string; issuedAt: number
 }
 
+const executionSchema = z.object({ sessionId: z.string().min(1).max(128), initialNonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    issueOperationId: z.string().min(1).max(128), sessionOwnerAccountId: z.string().min(1).max(128), machineOwnerAccountId: z.string().min(1).max(128) }).strict()
+export type MachineSetupTokenBindingRecord = MachineSetupTokenBindingV2 & { execution: z.infer<typeof executionSchema> }
+export type SetupTokenBinding = UserSetupTokenBinding | MachineSetupTokenBindingRecord
+export const isMachineSetupTokenBinding = (binding: SetupTokenBinding): binding is MachineSetupTokenBindingRecord => binding.principalType === 'machine'
+
 export function formatSetupTokenBinding(binding: SetupTokenBinding): string {
+    if (isMachineSetupTokenBinding(binding)) return JSON.stringify(binding)
     return JSON.stringify(Object.fromEntries(BINDING_KEYS.map((key) => [key, key === 'version' ? 1 : binding[key]])))
 }
 
 function parseSetupTokenBinding(value: string): SetupTokenBinding | null {
     try {
-        const parsed = JSON.parse(value)
+        if (value.length > 8192) return null
+        const parsed = parseCanonicalOrgSetupTokenJson(value) as Record<string, unknown>
+        if (parsed?.version === 2) {
+            const { execution, ...body } = parsed
+            return { ...MachineSetupTokenBindingV2Schema.parse(body), execution: executionSchema.parse(execution) }
+        }
         if (parsed?.version !== 1 || Object.keys(parsed).length !== BINDING_KEYS.length
             || typeof parsed.managedAccountId !== 'string' || !MANAGED_ACCOUNT_ID.test(parsed.managedAccountId)
             || typeof parsed.nonce !== 'string' || !MANAGED_ACCOUNT_ID.test(parsed.nonce)
             || ![parsed.groupScope, parsed.companyId, parsed.userId, parsed.machineId].every((id) => typeof id === 'string' && GROUP_SCOPE.test(id))
             || typeof parsed.keyId !== 'string' || !/^[a-f0-9]{64}$/.test(parsed.keyId)
-            || ![parsed.credentialGeneration, parsed.issuedAt].every((n) => Number.isSafeInteger(n) && n >= 1)) return null
+            || ![parsed.credentialGeneration, parsed.issuedAt].every((n) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 1)) return null
         const { version: _version, ...binding } = parsed
         return binding as SetupTokenBinding
     } catch { return null }

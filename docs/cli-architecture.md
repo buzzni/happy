@@ -713,6 +713,71 @@ before submission; explicit machine-personal, non-Claude and prepared ZAI enviro
 retain their bypass. A bound child restarting the daemon loses both its binding marker
 and bearer at the daemon spawn boundary.
 
+## Shared-machine setup-token rotation v2
+
+Core owns this boundary because it controls credential custody and authoritative execution.
+`machineSetupTokenProtocol.ts` uses the approved persistent device signing key and the
+pinned organization approval, exact company/machine allowlist and Studio/Happy origins.
+New issuance requires explicit local `HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED=true` plus the
+matching local company, allowlist and raw Studio Ed25519 key; Studio independently enables
+and allowlists the same pair. An enabled shared launch fails closed on configuration,
+network, authority or receipt failure. Existing user-v1, personal, OAuth and Codex paths
+retain their verifiers. External spawn environment/selection cannot supply a machine record.
+
+`run.ts` precreates machine-v2 Claude sessions as the original selected Happy account,
+including staged personal accounts. `ApiClient.getOrCreateSession` freezes the encrypted
+create body before its trusted proof callback. The callback also receives the local
+encryption context so it can durably retain a preparation in the existing private session
+store before issuing. Channel host passes its chosen key through this same transaction;
+new children/automation receive fresh launch/operation IDs. Only a verified Studio ticket
+and device signature bind the exact encrypted create body to Happy's immutable execution
+relation. The daemon supplies the existing reconnect encryption envelope and checks the
+startup webhook's exact session ID before the provider runs.
+
+`machineSetupTokenRuntime.ts` coordinates issue/claim/persist/commit. The private
+`machine-rotation` journal stores public request/proof bodies, encrypted create bytes,
+binding bodies, action IDs and digests; it stores no signatures, grants, tickets, setup
+tokens or bearers. Encryption snapshots stay in `sessions.json` under
+`preparedMachineLaunches`, outside resumable sessions. Staged identity custody survives
+pending creates and pre-webhook process exits. File/rename/directory sync ACK precedes
+Studio commit and token return. Uncertain publication requires authenticated operation
+query and exact read+sync recovery; cursor writers cannot roll back a newer machine revision.
+Current-operation queries revalidate the exact committed binding and execution on resume.
+
+Initial response loss is recovered through the original owner's paginated session API and
+the machine-authenticated execution-owner API. A still-fresh create can replay only the
+original encrypted body and deterministically reconstructed original proof. An expired
+uncertain create with no recoverable registered relation remains blocked, retaining its
+journal/custody; it never substitutes a new selection. Initial issue replay when the
+server has no operation is disabled with new issuance OFF. This is deliberately stricter
+than legacy offline session creation.
+
+Provider-start submission is durably fenced under the existing serialized credential
+launch queue, alongside approval, assignment receipt/fingerprint, generation and actual
+slot revalidation. A machine execution with no Claude conversation ID can start only when
+that journal proves no provider start was submitted and its processed cursor is zero.
+Otherwise missing context remains an error. New starts and resumes cannot race the initial
+commit/webhook wait. Existing unbound sessions never acquire a machine-v2 binding.
+
+The launcher attaches its final account refusal atomically to rebind, including refusals
+without utilization. Observations keep the original running account/generation, ID and
+time. Same-operation timeout/crash recovery converges on the daemon binding. Five successful
+switches are allowed; failures do not count. Retries use a fixed thirty-minute deadline,
+sixty-second cadence, Studio Retry-After and budget jitter; the machine request queue is
+FIFO and does not hold a slot while waiting. Stop/disposal cancels transport and suppresses
+late apply/notification/continuation; a new user message replaces automatic continuation.
+The same Claude conversation resumes once after a refused turn, including a provider exit
+following a known account-wide refusal.
+
+A single secret-free message event can include
+`setupTokenRotation:{version:1,state}`. Session metadata is optional and records machine
+binding version 2 only for verified executions, or 0 only for a daemon-confirmed legacy
+shared setup-token path. Absence is unknown. The cswap global autoRotation setting is not
+part of this mechanism. See [runtime contract](../specs/shared-machine-rotation-runtime/contract.md)
+for configuration, evidence and acceptance limits. Revisit the preparation store and
+recovery scan if Happy gains a versioned authenticated lookup by launch; never relax
+message ACL, exact proof replay or the original staged-account boundary to simplify recovery.
+
 ## Organization Claude collector boundary
 
 Desktop owns authenticated Studio discovery/reserve/publish and OFF-default scheduling.
@@ -759,7 +824,9 @@ The same extension is also published on the Chrome Web Store (`oonefemjapkafdiib
 그 프로세스에서는 해당 저장소의 읽기/일반 쓰기를 차단해 이전 메모리로 새 binding을 덮지 않는다.
 Windows에서는 Node의 directory fsync를 사용할 수 없어 file sync와 rename까지 적용한다.
 
-저장 재시도는 비밀 없는 binding만 유지하고 현재 로컬 배정·slot을 다시 확인한다. 종료된 세션에는
-토큰을 반환하지 않는다. 이 처리는 같은 프로세스의 저장 실패 복구이며 nonce 소비 직후 crash의
-멱등 복구는 아니다. 신규 machine-v2 operation journal이 도입되면 이 process-local pending과
-저장소 복구 경계를 다시 검토한다. 기존 일반 session 저장 호출은 best-effort 계약을 유지한다.
+사용자 v1의 저장 재시도는 process-local pending에 비밀 없는 binding만 유지하고 현재 로컬
+배정·slot을 다시 확인한다. v1은 nonce 소비 직후 crash의 멱등 복구를 보장하지 않는다.
+machine-v2는 위의 영속 operation journal과 인증된 operation/execution 조회로 정확한
+record를 확인한 뒤 read+sync ACK와 Studio commit을 복구한다. 두 경로 모두 종료된 세션에
+전환 토큰을 반환하지 않는다. 기존 일반 session 저장은 best-effort 계약을 유지하며 최신
+machine-v2 binding을 보존한다. v1에 서버 operation 계약을 추가할 때 복구 경계를 재검토한다.

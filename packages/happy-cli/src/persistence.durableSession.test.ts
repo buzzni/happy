@@ -7,7 +7,7 @@ import { persistSetupTokenBinding } from './daemon/setupTokenBindingPersistence'
 import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, type SetupTokenBinding } from './daemon/sessionEnv'
 import type { TrackedSession } from './daemon/types'
 import { configuration } from './configuration'
-import { persistSession, persistSessionDurably, readPersistedSessions, type PersistedSession } from './persistence'
+import { persistSession, persistSessionDurably, recoverPersistedSessionDurably, persistPreparedMachineLaunch, recoverPreparedMachineLaunch, preparedMachineLaunchHomeDirs, readPersistedSessions, type PersistedSession } from './persistence'
 
 vi.mock('node:fs', async (original) => {
   const fs = await original<typeof import('node:fs')>()
@@ -60,6 +60,33 @@ describe('durable session persistence', () => {
     if (process.platform !== 'win32') expect(statSync(configuration.sessionsFile).mode & 0o777).toBe(0o600)
     expect(readdirSync(directory)).toEqual(['sessions.json'])
   })
+
+  it('durably retains the original encryption snapshot without exposing a pending launch as a resumable session', () => {
+    const snapshot = { ...old, agentEnvironment: undefined, userHomeDir: '/staged-original' };
+    expect(persistPreparedMachineLaunch('launch', 'create-digest', snapshot)).toEqual({ status: 'committed' });
+    expect(readPersistedSessions()).toEqual({ target: old, other: old });
+    expect(recoverPreparedMachineLaunch('launch', 'wrong-digest')).toBeNull();
+    expect(recoverPreparedMachineLaunch('launch', 'create-digest')).toEqual(snapshot);
+    expect(preparedMachineLaunchHomeDirs()).toEqual(['/staged-original']);
+    persistSession('other', next);
+    expect(recoverPreparedMachineLaunch('launch', 'create-digest')).toEqual(snapshot);
+  });
+
+  it('refuses durable machine revision rollback and preserves the newest binding across stale webhook writes', () => {
+    const machineBinding = (revision: number) => JSON.stringify({ version: 2, type: 'claude-setup-token-binding', audience: 'saycode-daemon', principalType: 'machine',
+      companyId: 'company', machineId: 'machine', groupScope: 'company', assignmentGeneration: 1, assignmentFingerprint: 'a'.repeat(64),
+      managedAccountId: 'account', credentialGeneration: 1, approvalId: 'approval', deviceKeyId: 'b'.repeat(64), launchId: 'launch', bindingRevision: revision,
+      nonce: Buffer.alloc(32, revision).toString('base64url'), previousNonce: revision === 1 ? null : Buffer.alloc(32, revision - 1).toString('base64url'),
+      issuedAt: 1000, expiresAt: 61000, keyId: 'c'.repeat(64), execution: { sessionId: 'machine-session', initialNonce: Buffer.alloc(32, 1).toString('base64url'),
+        issueOperationId: 'issue', sessionOwnerAccountId: 'owner', machineOwnerAccountId: 'machine-owner' } });
+    const first = record(machineBinding(1)), second = record(machineBinding(2));
+    expect(persistSessionDurably('machine-session', first).status).toBe('committed');
+    expect(persistSessionDurably('machine-session', second).status).toBe('committed');
+    expect(persistSessionDurably('machine-session', first).status).toBe('failed');
+    persistSession('machine-session', { ...first, lastProcessedSeq: 10 });
+    expect(readPersistedSessions()['machine-session'].agentEnvironment).toEqual(second.agentEnvironment);
+    expect(readPersistedSessions()['machine-session'].lastProcessedSeq).toBe(10);
+  });
 
   it('creates an absent store and ignores a stale shared .tmp without following it', () => {
     rmSync(configuration.sessionsFile)
@@ -121,6 +148,18 @@ describe('durable session persistence', () => {
       const restarted = await import('./persistence')
       expect(restarted.readPersistedSessions()).toEqual({ target: next, other: old })
     } finally { vi.doUnmock('./configuration') }
+  })
+
+  it.skipIf(process.platform === 'win32')('re-ACKs only the exact journal binding after uncertain publication, preserving other sessions', () => {
+    vi.mocked(fsyncSync).mockImplementation(fd => { if (fstatSync(fd).isDirectory()) throw ioError('EIO'); originalFs.fsyncSync(fd) })
+    expect(persistSessionDurably('target', next)).toEqual({ status: 'indeterminate' })
+    expect(recoverPersistedSessionDurably('target', 'binding-a')).toEqual({ status: 'indeterminate' })
+    expect(readPersistedSessions()).toEqual({})
+    vi.resetAllMocks()
+    expect(recoverPersistedSessionDurably('target', 'binding-a')).toEqual({ status: 'indeterminate' })
+    expect(recoverPersistedSessionDurably('target', 'binding-b')).toEqual({ status: 'committed' })
+    expect(readPersistedSessions()).toEqual({ target: next, other: old })
+    expect(JSON.parse(readFileSync(configuration.sessionsFile, 'utf8')).futureField).toBe(true)
   })
 
   it('keeps ordinary persistSession best effort on an unrelated store', () => {

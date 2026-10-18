@@ -139,6 +139,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         session.cancelLessonReview();
         // Stop means stop: a retry waiting to fire must not restart the work (and exit/switch end it too).
         transientRetry.cancel();
+        setupTokenSwitching?.cancelForStop();
         if (abortController && !abortController.signal.aborted) {
             /*
              * Recorded before the abort, not after. A provider that handles
@@ -155,6 +156,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     async function doAbort() {
         logger.debug('[remote]: doAbort');
         session.onAbort();
+        setupTokenSwitching?.cancelForStop();
         /*
          * Only a retry was waiting (specs/claude-transient-retry R5a): the stop ends the wait. The
          * provider is idle, so killing it would only restart it, and its failed turn is already closed.
@@ -346,6 +348,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         rebind: requestSetupTokenRebind,
         applyEnvironment: (environment) => { for (const [key, value] of Object.entries(environment)) process.env[key] = value; },
         notify: (message) => session.client.sendSessionEvent({ type: 'message', message }),
+        notifyState: (message, state) => session.client.sendSessionEvent({ type: 'message', message, setupTokenRotation: { version: 1, state } }),
     }) : null;
     /** Whether this generation's provider process has started (its `system/init` arrived). */
     let providerRunning = false;
@@ -791,7 +794,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (providerStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
-                            if (!session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                            if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
                             continuation = null;
                         }
                         if (pending) {
@@ -895,7 +898,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 if (providerStale()) return null;
                                 if (!providerRunning && continuation) {
-                                    if (!session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                                    if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
                                     continuation = null;
                                 }
                                 continue;
@@ -922,7 +925,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             return { message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode };
                         }
                         // The user's own input replaces a waiting retry, and a background wait for an account.
-                        if (msg) { transientRetry.userTurnStarted(); setupTokenSwitching?.cancelBackground(); }
+                        if (msg) { transientRetry.userTurnStarted(); setupTokenSwitching?.userTurnStarted(); }
                         if (msg === null && gracefulStop?.requested() && !controller.signal.aborted) {
                             /*
                              * Woken by the stop rather than aborted — and the
@@ -1205,7 +1208,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 if (!exitReason) {
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
-                    launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
+                    if (setupTokenSwitching?.hasAccountRefusal()) {
+                        lastResultSucceeded = false;
+                        const switched = await setupTokenSwitching.switchIfWanted();
+                        if (switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
+                        launchFailure = null;
+                    } else launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     continue;
                 }
             } finally {

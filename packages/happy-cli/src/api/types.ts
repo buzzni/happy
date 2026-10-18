@@ -1,3 +1,4 @@
+export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | 'apply-required' | 'forbidden' | 'unsupported' | 'retrying' | 'retry-expired' | 'failed';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
@@ -482,6 +483,7 @@ export type Metadata = {
   path: string,
   host: string,
   version?: string,
+  setupTokenRotation?: { version: 1; principalType: 'machine'; bindingVersion: 0 | 2 },
   runtimeCapabilities?: {
     saycodeSystemPromptPreference?: boolean,
   },

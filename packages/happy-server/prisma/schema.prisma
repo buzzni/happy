@@ -138,6 +138,9 @@ model Session {
     usageReports      UsageReport[]
     accessKeys        AccessKey[]
 
+    executionBinding SessionExecutionBinding?
+
+    @@unique([id, accountId])
     @@unique([accountId, tag])
     @@index([accountId, updatedAt(sort: Desc)])
 }
@@ -317,7 +320,10 @@ model Machine {
     automationProtocolVersion Int  @default(1)
     automations        Automation[] @relation("AutomationTargetMachine")
 
+    executionBindings SessionExecutionBinding[]
+
     @@unique([accountId, id])
+    @@unique([id, accountId])
     @@index([accountId])
 }
 
@@ -1130,4 +1136,35 @@ model ManagedDaemonGrant {
     @@unique([renewalRequestId])
     @@index([accountId, machineId])
     @@index([workspaceId, epoch])
+}
+
+// Immutable replay evidence survives session/machine deletion. Nullable row links
+// permit existing delete flows; the recorded identities and uniqueness remain.
+model SessionExecutionBinding {
+    sessionId                 String   @id
+    sessionRowId              String?  @unique
+    sessionRowOwnerAccountId  String?
+    session                   Session? @relation(fields: [sessionRowId, sessionRowOwnerAccountId], references: [id, accountId], onDelete: SetNull, onUpdate: Restrict)
+    companyId                 String
+    machineId                 String
+    machineOwnerAccountId     String
+    machineRowId              String?
+    machineRowOwnerAccountId  String?
+    machine                   Machine? @relation(fields: [machineRowId, machineRowOwnerAccountId], references: [id, accountId], onDelete: SetNull, onUpdate: Restrict)
+    sessionOwnerAccountId     String
+    launchId                  String
+    initialNonce              String
+    operationId               String
+    approvalId                String
+    deviceKeyId               String
+    sessionTagHash            String
+    sessionCreateBodyHash     String
+    ticketDigest              String
+    createProofDigest         String
+    createdAt                 DateTime @default(now())
+
+    @@unique([sessionRowId, sessionRowOwnerAccountId])
+    @@unique([companyId, machineId, launchId])
+    @@unique([companyId, initialNonce])
+    @@unique([companyId, machineId, operationId])
 }

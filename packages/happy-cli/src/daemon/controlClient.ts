@@ -133,6 +133,7 @@ async function daemonPost(
   reportKind?: ManagedReportKind,
   /** A call the daemon answers only after its own outbound work; defaults to the usual HTTP timeout. */
   timeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<{ error?: string } | any> {
   if (reportKind) {
     const signer = await managedReportSigner();
@@ -182,7 +183,7 @@ async function daemonPost(
       },
       body: JSON.stringify(body || {}),
       // Mostly increased for stress test
-      signal: AbortSignal.timeout(timeout)
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout)
     });
     
     if (!response.ok) {
@@ -509,15 +510,15 @@ export async function confirmDeviceOrganization(input: { companyId: string; mach
  * Saycode specs/claude-setup-token-account-selection — a setup-token-bound session's usage, and its request
  * to move off a used-up organization account. The daemon resolves the account from the session's own binding.
  */
-export async function reportSetupTokenUsage(sessionId: string, binding: string, observation: SetupTokenUsageObservation): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const result = await daemonPost('/setup-token/usage', { sessionId, binding, observation });
+export async function reportSetupTokenUsage(sessionId: string, binding: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const result = await daemonPost('/setup-token/usage', { sessionId, binding, observation }, undefined, undefined, signal);
   return result?.ok === true ? { ok: true } : { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED' };
 }
 /** Longer than the daemon's whole switch (Studio call, grant verification, token slot reads). */
 const SETUP_TOKEN_REBIND_TIMEOUT_MS = 90_000;
-export async function requestSetupTokenRebind(sessionId: string, binding: string): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }> {
-  const result = await daemonPost('/setup-token/rebind', { sessionId, binding }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS);
+export async function requestSetupTokenRebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }> {
+  const result = await daemonPost('/setup-token/rebind', { sessionId, binding, ...(observation ? { observation } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS, signal);
   if (result?.ok === true && result.environment && typeof result.environment === 'object'
     && Object.values(result.environment).every((value) => typeof value === 'string')) return { ok: true, environment: result.environment };
-  return { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED' };
+  return { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED', ...(Number.isSafeInteger(result?.retryAfterMs) && result.retryAfterMs > 0 && result.retryAfterMs <= 1800000 ? { retryAfterMs: result.retryAfterMs } : {}) };
 }

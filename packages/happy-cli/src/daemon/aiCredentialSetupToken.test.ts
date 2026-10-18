@@ -9,7 +9,7 @@ import { createAiCredentialRuntime, type AiCredentialCommandResult } from './aiC
 import { groupAccountIdentity } from './aiCredentialGroupAdapters'
 import {
   applyAppliedAiAuthSourceEnv, buildManagedSessionSpawnEnvironment, buildResumedSessionSpawnEnvironment, buildSpawnRequestEnvironment,
-  captureSaycodeAgentEnvironment, honorsManagedAiCredentials, overlayManagedCredentialEnvironment, readSetupTokenResumeSelection, verifyAiAuthSelection,
+  captureSaycodeAgentEnvironment, honorsManagedAiCredentials, isMachineSetupTokenBinding, overlayManagedCredentialEnvironment, readSetupTokenResumeSelection, verifyAiAuthSelection,
 } from './sessionEnv'
 import { managedSetupTokenEmail, managedSetupTokenId, setupTokenGroupIdentity, setupTokenRuntimeStatus } from './claudeSetupToken'
 import { createSetupTokenAssignmentRecipient, sealSetupTokenAssignment } from './setupTokenAssignmentWire'
@@ -52,7 +52,7 @@ type Slot = { number: number; email: string; organizationUuid?: string; usageSta
 
 // A stateful stand-in for cswap. `marked` keeps managed metadata like the token runtime; an
 // unmarked build drops it, as upstream does.
-function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[] } = {}) {
+function fakeMachine(initial: Slot[], activeAccountNumber: number | null, options: { runtime?: 'marked' | 'unmarked' | 'missing'; ignoreForce?: boolean; tokenRuntimeStatus?: string; files?: Map<string, string>; binding?: false; env?: Record<string, string | undefined>; capabilities?: Record<string, unknown>; listFails?: boolean; clock?: { now: number }; advanceOnExport?: number; advanceOnNonceWrite?: number; durability?: 'missing' | 'file-fails' | 'directory-fails'; machineId?: string; machineAuthority?: () => Promise<void>; machineStart?: () => Promise<void>; cswapVersion?: string; noUvPython?: boolean; platform?: NodeJS.Platform; readError?: string; overlap?: { exportStarted: boolean; listSawExport: boolean[] }; hangingExport?: { cancelled: boolean }; inUse?: () => string[] } = {}) {
   const kind = options.runtime ?? 'marked'
   const state = { slots: [...initial], active: activeAccountNumber }
   const calls: Array<{ command: string; args: string[] }> = []
@@ -118,6 +118,8 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
     return { stdout: '', stderr: '' }
   })
   const runtime = createAiCredentialRuntime({
+    machineSetupTokenStart: options.machineStart ?? (async () => {}),
+    machineSetupTokenAuthority: options.machineAuthority ?? (async () => {}),
     homeDir: join('/home', 'operator'), platform: options.platform, machineId: options.machineId, now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier() }),
     ...(options.inUse ? { setupTokenAccountsInUse: options.inUse } : {}),
@@ -272,6 +274,46 @@ describe('managed Claude setup-token runtime', () => {
     expect(command.mock.calls.some(([args]) => args[0] === 'new-window')).toBe(false)
     await expect(runtime.launchSession(env, spawn)).rejects.toThrow('CLAUDE_SETUP_TOKEN_SELECTION_REQUIRED')
   })
+
+  it('prepares a machine-v2 binding only against its exact machine receipt and rechecks custody at launch', async () => {
+    let failStart = true;
+    const marker = vi.fn(async () => { if (failStart) throw new Error('journal sync failed') });
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1', machineStart: marker })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, assignmentGeneration: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('shared'))) })
+    const record = { version: 2, type: 'claude-setup-token-binding', audience: 'saycode-daemon', principalType: 'machine',
+      companyId: 'company-1', machineId: 'machine-1', groupScope: 'company-1', assignmentGeneration: 1, assignmentFingerprint: '1'.padStart(64, '0'),
+      managedAccountId: A, credentialGeneration: 1, approvalId: 'approved', deviceKeyId: 'd'.repeat(64), launchId: 'launch', bindingRevision: 1,
+      nonce: Buffer.alloc(32, 1).toString('base64url'), previousNonce: null, issuedAt: NOW, expiresAt: NOW + 60000, keyId: 'e'.repeat(64),
+      execution: { sessionId: 'session', initialNonce: Buffer.alloc(32, 1).toString('base64url'), issueOperationId: 'issue', sessionOwnerAccountId: 'personal', machineOwnerAccountId: 'company' } }
+    const parsed = readSetupTokenResumeSelection({ HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: JSON.stringify(record) })!
+    expect(parsed.binding).not.toHaveProperty('userId')
+    const env = await runtime.sessionEnvironment('claude', parsed.selection, parsed.binding)
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(fakeToken('shared'))
+    if (!isMachineSetupTokenBinding(parsed.binding)) throw new Error('machine expected');
+    await expect(runtime.sessionEnvironment('claude', parsed.selection, { ...parsed.binding, assignmentFingerprint: 'f'.repeat(64) })).rejects.toThrow('BINDING_UNAVAILABLE');
+    await expect(runtime.sessionEnvironment('claude', parsed.selection, { ...parsed.binding, assignmentGeneration: 2 })).rejects.toThrow('BINDING_UNAVAILABLE');
+    expect(() => readSetupTokenResumeSelection({ HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: JSON.stringify({ ...parsed.binding, userId: 'machine-1' }) })).toThrow();
+    const acceptedStart = vi.fn(() => 'provider');
+    await expect(runtime.launchSession(env, acceptedStart)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE');
+    expect(acceptedStart).not.toHaveBeenCalled(); failStart = false;
+    await expect(runtime.launchSession(env, acceptedStart)).resolves.toBe('provider');
+    expect(marker).toHaveBeenCalledTimes(2);
+    const stale = await runtime.sessionEnvironment('claude', parsed.selection, parsed.binding);
+    const start = vi.fn(() => 'provider')
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 2, fingerprint: '2'.padStart(64, '0'), payload: null })
+    await expect(runtime.launchSession(stale, start)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
+    expect(start).not.toHaveBeenCalled()
+  })
+
+  it('rejects an externally supplied machine principal grant through the existing user-v1 launch consumer', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' });
+    await expect(runtime.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: A, groupScope: 'company-1', credentialGeneration: 1,
+      bindingGrant: bindingGrant({ principalType: 'machine' }) })).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE');
+    await expect(runtime.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: A, groupScope: 'company-1', credentialGeneration: 1,
+      bindingGrant: JSON.stringify({ version: 2, principalType: 'machine' }) })).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE');
+  });
 
   it('launches an unbound session on a shared machine with the setup-token assigned to that machine', async () => {
     const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
@@ -963,6 +1005,7 @@ describe('managed Claude setup-token runtime', () => {
       const { runtime } = await assigned()
       const env = await runtime.sessionEnvironment('claude', selection())
       const resume = readSetupTokenResumeSelection(captureSaycodeAgentEnvironment(env))!
+      if (isMachineSetupTokenBinding(resume.binding)) throw new Error('expected user binding')
       await expect(runtime.sessionEnvironment('claude', resume.selection, { ...resume.binding, userId: 'user-2' })).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
       await expect(runtime.sessionEnvironment('claude', resume.selection, { ...resume.binding, credentialGeneration: 2 })).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
     })

@@ -1,0 +1,329 @@
+{
+  "description": "PUBLIC TEST KEYS ONLY. Generated independently with Node Ed25519; epoch-ms.",
+  "createBody": {
+    "tag": "launch-한글-1",
+    "metadata": "encrypted-metadata",
+    "dataEncryptionKey": "AQID"
+  },
+  "sessionTagHash": "6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3",
+  "sessionCreateBodyHash": "6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd",
+  "executionProof": {
+    "ticket": {
+      "body": {
+        "version": 1,
+        "type": "saycode-session-execution",
+        "audience": "https://happy.example",
+        "studioOrigin": "https://studio.example",
+        "keyId": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "companyId": "company-1",
+        "machineId": "machine-1",
+        "approvalId": "approval-1",
+        "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "launchId": "launch-1",
+        "machineOwnerAccountId": "company-account",
+        "sessionOwnerAccountId": "personal-account",
+        "initialNonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+        "operationId": "operation-issue-1",
+        "deviceSigningPublicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "sessionTagHash": "6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3",
+        "sessionCreateBodyHash": "6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd",
+        "issuedAt": 1800000000000,
+        "expiresAt": 1800000060000
+      },
+      "signature": "iICtPavClUKWBbM8XBTtku73P1JJO0OBmsWxRxx-v7fMC9qPh0hIeybp6JmiqYZUpjZ1BK3578ksfD2a6_aMAQ"
+    },
+    "deviceProof": {
+      "body": {
+        "version": 1,
+        "type": "happy-session-create-proof",
+        "audience": "https://happy.example",
+        "method": "POST",
+        "path": "/v1/sessions",
+        "ticketDigest": "25f86239e4dd362c2a4ca1b5e952cbfc82dcfdc9816ec0462c18bfeb59c42c07",
+        "sessionOwnerAccountId": "personal-account",
+        "sessionTagHash": "6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3",
+        "sessionCreateBodyHash": "6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd",
+        "issuedAt": 1800000000000,
+        "expiresAt": 1800000060000
+      },
+      "signature": "YbKgJkPuDwoE7ZVQ5B9WZFgEx6NgAgr5iRRUxiREAXa4ns2qh8C0z9EK5lwCJXkaQNMGV6_fFTZahTEryFMKCw"
+    }
+  },
+  "vectors": [
+    {
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "canonical": "{\"approvalId\":\"approval-1\",\"assignmentFingerprint\":\"ce7a7c10b0dfd96808cca64c88cf5c5e13b7775283bdc924767887bfa32c8fa1\",\"assignmentGeneration\":1,\"audience\":\"saycode-daemon\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"credentialGeneration\":1,\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"groupScope\":\"machine:machine-1\",\"issuedAt\":1800000000000,\"keyId\":\"34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e\",\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"managedAccountId\":\"managed-1\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"previousNonce\":null,\"principalType\":\"machine\",\"type\":\"claude-setup-token-binding\",\"version\":2}",
+      "digest": "168eb28ab0d29844255c10c4789e69fdf33dbdfa12e0d18b713710768659cf63",
+      "signingText": "saycode/claude-setup-token-binding/v2\n{\"approvalId\":\"approval-1\",\"assignmentFingerprint\":\"ce7a7c10b0dfd96808cca64c88cf5c5e13b7775283bdc924767887bfa32c8fa1\",\"assignmentGeneration\":1,\"audience\":\"saycode-daemon\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"credentialGeneration\":1,\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"groupScope\":\"machine:machine-1\",\"issuedAt\":1800000000000,\"keyId\":\"34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e\",\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"managedAccountId\":\"managed-1\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"previousNonce\":null,\"principalType\":\"machine\",\"type\":\"claude-setup-token-binding\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "claude-setup-token-binding",
+          "audience": "saycode-daemon",
+          "principalType": "machine",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "groupScope": "machine:machine-1",
+          "assignmentGeneration": 1,
+          "assignmentFingerprint": "ce7a7c10b0dfd96808cca64c88cf5c5e13b7775283bdc924767887bfa32c8fa1",
+          "managedAccountId": "managed-1",
+          "credentialGeneration": 1,
+          "bindingRevision": 1,
+          "nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "previousNonce": null,
+          "keyId": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000
+        },
+        "signature": "Qv1YY1IpHidsJjpnp_-x3HIKZr2UqhTfvXOiY58ojKWxNUQhjAi5oGYWY_lsM8kDdODbg7PPXWx8l6kaWtJxDQ"
+      }
+    },
+    {
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "canonical": "{\"approvalId\":\"approval-1\",\"audience\":\"https://happy.example\",\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"deviceSigningPublicKey\":\"gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\",\"expiresAt\":1800000060000,\"initialNonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"issuedAt\":1800000000000,\"keyId\":\"34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e\",\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"machineOwnerAccountId\":\"company-account\",\"operationId\":\"operation-issue-1\",\"sessionCreateBodyHash\":\"6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd\",\"sessionOwnerAccountId\":\"personal-account\",\"sessionTagHash\":\"6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3\",\"studioOrigin\":\"https://studio.example\",\"type\":\"saycode-session-execution\",\"version\":1}",
+      "digest": "83c2a4f5d29d80f2c7eef4b53bf9a28f8bbfb7084dd276bade430093da25391d",
+      "signingText": "saycode/saycode-session-execution/v1\n{\"approvalId\":\"approval-1\",\"audience\":\"https://happy.example\",\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"deviceSigningPublicKey\":\"gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\",\"expiresAt\":1800000060000,\"initialNonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"issuedAt\":1800000000000,\"keyId\":\"34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e\",\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"machineOwnerAccountId\":\"company-account\",\"operationId\":\"operation-issue-1\",\"sessionCreateBodyHash\":\"6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd\",\"sessionOwnerAccountId\":\"personal-account\",\"sessionTagHash\":\"6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3\",\"studioOrigin\":\"https://studio.example\",\"type\":\"saycode-session-execution\",\"version\":1}",
+      "document": {
+        "body": {
+          "version": 1,
+          "type": "saycode-session-execution",
+          "audience": "https://happy.example",
+          "studioOrigin": "https://studio.example",
+          "keyId": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "machineOwnerAccountId": "company-account",
+          "sessionOwnerAccountId": "personal-account",
+          "initialNonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "operationId": "operation-issue-1",
+          "deviceSigningPublicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+          "sessionTagHash": "6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3",
+          "sessionCreateBodyHash": "6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000
+        },
+        "signature": "iICtPavClUKWBbM8XBTtku73P1JJO0OBmsWxRxx-v7fMC9qPh0hIeybp6JmiqYZUpjZ1BK3578ksfD2a6_aMAQ"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"audience\":\"https://happy.example\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"method\":\"POST\",\"path\":\"/v1/sessions\",\"sessionCreateBodyHash\":\"6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd\",\"sessionOwnerAccountId\":\"personal-account\",\"sessionTagHash\":\"6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3\",\"ticketDigest\":\"25f86239e4dd362c2a4ca1b5e952cbfc82dcfdc9816ec0462c18bfeb59c42c07\",\"type\":\"happy-session-create-proof\",\"version\":1}",
+      "digest": "609afdfa1e4783a7d4d9c65676e0e1f292dccb52b1804c679ea38306cadc76b6",
+      "signingText": "saycode/happy-session-create-proof/v1\n{\"audience\":\"https://happy.example\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"method\":\"POST\",\"path\":\"/v1/sessions\",\"sessionCreateBodyHash\":\"6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd\",\"sessionOwnerAccountId\":\"personal-account\",\"sessionTagHash\":\"6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3\",\"ticketDigest\":\"25f86239e4dd362c2a4ca1b5e952cbfc82dcfdc9816ec0462c18bfeb59c42c07\",\"type\":\"happy-session-create-proof\",\"version\":1}",
+      "document": {
+        "body": {
+          "version": 1,
+          "type": "happy-session-create-proof",
+          "audience": "https://happy.example",
+          "method": "POST",
+          "path": "/v1/sessions",
+          "ticketDigest": "25f86239e4dd362c2a4ca1b5e952cbfc82dcfdc9816ec0462c18bfeb59c42c07",
+          "sessionOwnerAccountId": "personal-account",
+          "sessionTagHash": "6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3",
+          "sessionCreateBodyHash": "6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000
+        },
+        "signature": "YbKgJkPuDwoE7ZVQ5B9WZFgEx6NgAgr5iRRUxiREAXa4ns2qh8C0z9EK5lwCJXkaQNMGV6_fFTZahTEryFMKCw"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"action\":\"issue\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"operationId\":\"operation-issue-1\",\"path\":\"/api/claude-setup-token/daemon/v2/issue\",\"sessionCreateBodyHash\":\"6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd\",\"sessionOwnerAccountId\":\"personal-account\",\"sessionTagHash\":\"6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "digest": "1f0dfa5b26a148afbe4c04b925ace003931c696182e6bd720f305ca96f3815df",
+      "signingText": "saycode/setup-token-daemon-request/v2\n{\"action\":\"issue\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"operationId\":\"operation-issue-1\",\"path\":\"/api/claude-setup-token/daemon/v2/issue\",\"sessionCreateBodyHash\":\"6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd\",\"sessionOwnerAccountId\":\"personal-account\",\"sessionTagHash\":\"6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "setup-token-daemon-request",
+          "audience": "https://studio.example",
+          "method": "POST",
+          "path": "/api/claude-setup-token/daemon/v2/issue",
+          "action": "issue",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "operationId": "operation-issue-1",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000,
+          "sessionOwnerAccountId": "personal-account",
+          "sessionTagHash": "6fad154114cddaed5c0f9fed3a3dd401cf287bf6f501bfa36c4f8da112aab0f3",
+          "sessionCreateBodyHash": "6e9e70299ebf25703f8fc108b6fdae4c11be704ec93faeaaff6ed44b45308bcd"
+        },
+        "signature": "aj3XABrS2fwb8pXVKBDCycYcPPrE3jvhh3UqROzygniHWudWR0DXGNYj-0gY12SxbwktZYGbGJ_LsYUp2pEYBg"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"action\":\"claim\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"operationId\":\"operation-claim-1\",\"path\":\"/api/claude-setup-token/daemon/v2/claim\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "digest": "d8fdbc8fff337b4b793eb6e0c0b0521e80938bdf614162d6da10cb43efacbb05",
+      "signingText": "saycode/setup-token-daemon-request/v2\n{\"action\":\"claim\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"operationId\":\"operation-claim-1\",\"path\":\"/api/claude-setup-token/daemon/v2/claim\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "setup-token-daemon-request",
+          "audience": "https://studio.example",
+          "method": "POST",
+          "path": "/api/claude-setup-token/daemon/v2/claim",
+          "action": "claim",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "operationId": "operation-claim-1",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000,
+          "sessionId": "session-1",
+          "nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "bindingRevision": 1
+        },
+        "signature": "Z5NMCctSbxP30KhHLDY8xbDcU0-r8tfB6XG8L43l_YRqunM6l7chWr9Z44BV5crfaa2BKB3xfZ5ZMp4iUCTQAQ"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"action\":\"commit\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingDigest\":\"3083d004e6bd4368921e4681248ac5608ae1d9b4548c7d0d077c40e60ad09798\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"operationId\":\"operation-commit-1\",\"path\":\"/api/claude-setup-token/daemon/v2/commit\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "digest": "b3c9392524af930ad4d5545d5b32d3c3646cb738d3d22bcd6365bca24cfca327",
+      "signingText": "saycode/setup-token-daemon-request/v2\n{\"action\":\"commit\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingDigest\":\"3083d004e6bd4368921e4681248ac5608ae1d9b4548c7d0d077c40e60ad09798\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"operationId\":\"operation-commit-1\",\"path\":\"/api/claude-setup-token/daemon/v2/commit\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "setup-token-daemon-request",
+          "audience": "https://studio.example",
+          "method": "POST",
+          "path": "/api/claude-setup-token/daemon/v2/commit",
+          "action": "commit",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "operationId": "operation-commit-1",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000,
+          "sessionId": "session-1",
+          "nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "bindingRevision": 1,
+          "bindingDigest": "3083d004e6bd4368921e4681248ac5608ae1d9b4548c7d0d077c40e60ad09798"
+        },
+        "signature": "Kgg9NOi609cNN7MLmV2Z_rG_MOAKcqJMyYlGpXNX4ltwiutnjsFoqDLrAcICLH13ex1uzBeu9guXP2GvOKDFAQ"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"action\":\"usage\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"observation\":{\"accountWideRefusal\":\"account_limit\",\"credentialGeneration\":1,\"managedAccountId\":\"managed-1\",\"observationId\":\"observation-1\",\"observedAt\":1800000000000,\"windows\":[]},\"operationId\":\"operation-usage-1\",\"path\":\"/api/claude-setup-token/daemon/v2/usage\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "digest": "db954d8884061eac3f1e6ec5b6db679393289cb8576db658862169d28d495afd",
+      "signingText": "saycode/setup-token-daemon-request/v2\n{\"action\":\"usage\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"observation\":{\"accountWideRefusal\":\"account_limit\",\"credentialGeneration\":1,\"managedAccountId\":\"managed-1\",\"observationId\":\"observation-1\",\"observedAt\":1800000000000,\"windows\":[]},\"operationId\":\"operation-usage-1\",\"path\":\"/api/claude-setup-token/daemon/v2/usage\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "setup-token-daemon-request",
+          "audience": "https://studio.example",
+          "method": "POST",
+          "path": "/api/claude-setup-token/daemon/v2/usage",
+          "action": "usage",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "operationId": "operation-usage-1",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000,
+          "sessionId": "session-1",
+          "nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "bindingRevision": 1,
+          "observation": {
+            "observationId": "observation-1",
+            "observedAt": 1800000000000,
+            "managedAccountId": "managed-1",
+            "credentialGeneration": 1,
+            "windows": [],
+            "accountWideRefusal": "account_limit"
+          }
+        },
+        "signature": "JXqe9DZUh5ino9Jiw7_xm6AFgQiTZICxRyH3oNLXfkpLutMIPoxb-P8ld53WH79Rk7FfqnF1dNvs6uzJ211oCA"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"action\":\"rebind\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"observation\":{\"accountWideRefusal\":\"account_limit\",\"credentialGeneration\":1,\"managedAccountId\":\"managed-1\",\"observationId\":\"observation-1\",\"observedAt\":1800000000000,\"windows\":[]},\"operationId\":\"operation-rebind-1\",\"path\":\"/api/claude-setup-token/daemon/v2/rebind\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "digest": "1ae7f758f213791ef0d3699e49d4ddf068bc19d09ac7ff04b1b3023a5e81efca",
+      "signingText": "saycode/setup-token-daemon-request/v2\n{\"action\":\"rebind\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"bindingRevision\":1,\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\",\"observation\":{\"accountWideRefusal\":\"account_limit\",\"credentialGeneration\":1,\"managedAccountId\":\"managed-1\",\"observationId\":\"observation-1\",\"observedAt\":1800000000000,\"windows\":[]},\"operationId\":\"operation-rebind-1\",\"path\":\"/api/claude-setup-token/daemon/v2/rebind\",\"sessionId\":\"session-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "setup-token-daemon-request",
+          "audience": "https://studio.example",
+          "method": "POST",
+          "path": "/api/claude-setup-token/daemon/v2/rebind",
+          "action": "rebind",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "operationId": "operation-rebind-1",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000,
+          "sessionId": "session-1",
+          "nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "bindingRevision": 1,
+          "observation": {
+            "observationId": "observation-1",
+            "observedAt": 1800000000000,
+            "managedAccountId": "managed-1",
+            "credentialGeneration": 1,
+            "windows": [],
+            "accountWideRefusal": "account_limit"
+          }
+        },
+        "signature": "vAHT-mU5nGHoKIVSoxZmaR7ehBpppuDKj6e0JAqWy__VnwMn9XdtzzCXWoKPPFfrcU-Ad88KQS0K4nV86nWsAQ"
+      }
+    },
+    {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "canonical": "{\"action\":\"operation\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"operationId\":\"operation-operation-1\",\"path\":\"/api/claude-setup-token/daemon/v2/operation\",\"targetOperationId\":\"operation-issue-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "digest": "01029e5121232ac701e2148c0ea2a68dbbd1be932052395529c54241aa92b38a",
+      "signingText": "saycode/setup-token-daemon-request/v2\n{\"action\":\"operation\",\"approvalId\":\"approval-1\",\"audience\":\"https://studio.example\",\"companyId\":\"company-1\",\"deviceKeyId\":\"6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827\",\"expiresAt\":1800000060000,\"issuedAt\":1800000000000,\"launchId\":\"launch-1\",\"machineId\":\"machine-1\",\"method\":\"POST\",\"operationId\":\"operation-operation-1\",\"path\":\"/api/claude-setup-token/daemon/v2/operation\",\"targetOperationId\":\"operation-issue-1\",\"type\":\"setup-token-daemon-request\",\"version\":2}",
+      "document": {
+        "body": {
+          "version": 2,
+          "type": "setup-token-daemon-request",
+          "audience": "https://studio.example",
+          "method": "POST",
+          "path": "/api/claude-setup-token/daemon/v2/operation",
+          "action": "operation",
+          "companyId": "company-1",
+          "machineId": "machine-1",
+          "approvalId": "approval-1",
+          "deviceKeyId": "6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "launchId": "launch-1",
+          "operationId": "operation-operation-1",
+          "issuedAt": 1800000000000,
+          "expiresAt": 1800000060000,
+          "targetOperationId": "operation-issue-1"
+        },
+        "signature": "Lcv265SAt3hx2IazAL6EtTdNXFrfxtgvQXJEHnvg_xdgCUezhOh8w8FPwffqUih3as3DVFZtdjgYSleP9lNSDg"
+      }
+    }
+  ]
+}

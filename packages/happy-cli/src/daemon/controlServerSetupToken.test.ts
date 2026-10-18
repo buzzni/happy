@@ -26,11 +26,33 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}' }, false)).status).toBe(401)
       expect(switcher.rebind).not.toHaveBeenCalled()
       expect(await (await post('/setup-token/usage', { sessionId: 'session-a', binding: '{}', observation })).json()).toEqual({ ok: true })
-      expect(switcher.reportUsage).toHaveBeenCalledWith('session-a', '{}', observation)
+      expect(switcher.reportUsage).toHaveBeenCalledWith('session-a', '{}', observation, expect.any(AbortSignal))
       expect(await (await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}' })).json()).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })
+      const finalRefusal = { observedAt: 10, reason: 'rate-limited', retryAt: null, windows: [] };
+      expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', observation: finalRefusal })).status).toBe(200);
+      expect(switcher.rebind).toHaveBeenLastCalledWith('session-a', '{}', finalRefusal, expect.any(AbortSignal));
       expect((await post('/setup-token/usage', { sessionId: 'session-a', binding: '{}', observation: { ...observation, windows: [{ kind: 'unified5h', pct: 101, resetsAt: 20 }] } })).status).toBe(400)
     } finally { await server.stop() }
   })
+
+  it('cancels a machine rebind when the launcher closes its stopped request', async () => {
+    let cancelled = false;
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve });
+    const switcher = { reportUsage: vi.fn(), rebind: vi.fn<SetupTokenAccountSwitch['rebind']>(async (_id, _binding, _observation, signal) => {
+      started();
+      await new Promise<void>(resolve => signal!.addEventListener('abort', () => { cancelled = true; resolve() }, { once: true }));
+      return { ok: false, reason: 'REQUEST_FAILED' };
+    }) };
+    const server = await control(switcher);
+    const stop = new AbortController();
+    try {
+      const response = fetch(`http://127.0.0.1:${server.port}/setup-token/rebind`, { method: 'POST', signal: stop.signal,
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${server.controlSecret}` }, body: JSON.stringify({ sessionId: 'session', binding: '{}' }) }).catch(() => null);
+      await ready; stop.abort(); await response;
+      await vi.waitFor(() => expect(cancelled).toBe(true));
+    } finally { await server.stop() }
+  });
 
   it('answers unavailable when this daemon cannot switch accounts', async () => {
     const server = await control(null)

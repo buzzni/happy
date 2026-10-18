@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+import { parseCanonicalOrgSetupTokenJson } from "@slopus/happy-wire";
 import { eventRouter, buildNewSessionUpdate } from "@/app/events/eventRouter";
 import { type Fastify } from "../types";
 import { db } from "@/storage/db";
@@ -8,7 +10,8 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 import { sessionArchive } from "@/app/session/sessionArchive";
-import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { requireSessionScopeAuth, requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
+import { createExecutionBoundSession, ExecutionBindingError } from "@/app/session/sessionExecutionBinding";
 
 export function sessionRoutes(app: Fastify) {
 
@@ -358,18 +361,59 @@ export function sessionRoutes(app: Fastify) {
 
     // Create or load session by tag
     app.post('/v1/sessions', {
+        // Inspect signed requests before Fastify's JSON parser collapses repeated
+        // keys. Legacy payloads retain the existing parser and body-size limit.
+        preParsing: async (request, _reply, payload) => {
+            const chunks: Buffer[] = [];
+            let size = 0;
+            for await (const chunk of payload) {
+                const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                size += bytes.length;
+                if (size > (request.server.initialConfig.bodyLimit ?? 1048576)) {
+                    throw Object.assign(new Error('Request body too large'), { statusCode: 413 });
+                }
+                chunks.push(bytes);
+            }
+            const raw = Buffer.concat(chunks);
+            try {
+                const parsed: unknown = JSON.parse(raw.toString('utf8'));
+                if (parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'executionProof')) {
+                    parseCanonicalOrgSetupTokenJson(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+                }
+            } catch { throw new ExecutionBindingError(400, 'Invalid session execution JSON'); }
+            return Object.assign(Readable.from([raw]), { receivedEncodedLength: size });
+        },
         schema: {
             body: z.object({
                 tag: z.string(),
                 metadata: z.string(),
                 agentState: z.string().nullish(),
-                dataEncryptionKey: z.string().nullish()
-            })
+                dataEncryptionKey: z.string().nullish(),
+                executionProof: z.unknown().optional(),
+            }).passthrough()
         },
         preHandler: app.authenticate
     }, async (request, reply) => {
         const userId = request.userId;
         const { tag, metadata, dataEncryptionKey } = request.body;
+
+        if (Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {
+            if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+            const { executionProof, ...createBody } = request.body;
+            try {
+                const session = await createExecutionBoundSession(userId, createBody, executionProof);
+                return reply.send({ session: {
+                    id: session.id, seq: session.seq, metadata: session.metadata, metadataVersion: session.metadataVersion,
+                    agentState: session.agentState, agentStateVersion: session.agentStateVersion,
+                    dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
+                    active: session.active, activeAt: session.lastActiveAt.getTime(),
+                    createdAt: session.createdAt.getTime(), updatedAt: session.updatedAt.getTime(), lastMessage: null,
+                } });
+            } catch (error) {
+                if (error instanceof ExecutionBindingError) return reply.code(error.statusCode).send({ error: error.message });
+                throw error;
+            }
+        }
 
         const session = await db.session.findFirst({
             where: {

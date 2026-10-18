@@ -1,6 +1,6 @@
 /** Publishes a session's setup-token resume authority before changing its committed in-memory binding. */
 import { encodeBase64 } from '@/api/encryption'
-import { persistSessionDurably, type SessionPersistenceResult } from '@/persistence'
+import { persistSessionDurably, recoverPersistedSessionDurably, type SessionPersistenceResult } from '@/persistence'
 import { SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
 import type { TrackedSession } from './types'
 
@@ -24,5 +24,13 @@ export function persistSetupTokenBinding(session: TrackedSession, binding: strin
     deferredContinuationContextFile: session.deferredContinuationContextFile,
   })
   if (result.status === 'committed') session.agentEnvironment = agentEnvironment
+  return result
+}
+
+/** Called only after authenticated operation/execution query; re-ACKs an uncertain existing publication. */
+export function recoverSetupTokenBindingPersistence(session: TrackedSession, binding: string): SessionPersistenceResult {
+  if (!session.happySessionId) return { status: 'failed' }
+  const result = recoverPersistedSessionDurably(session.happySessionId, binding)
+  if (result.status === 'committed') session.agentEnvironment = { ...session.agentEnvironment, [SETUP_TOKEN_BINDING_ENV]: binding }
   return result
 }

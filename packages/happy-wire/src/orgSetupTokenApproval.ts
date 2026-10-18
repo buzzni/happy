@@ -172,3 +172,5 @@ export async function orgDeviceEnrollmentDigest(value: unknown): Promise<string>
   const transcript = enrollmentSchema.parse(value);
   return sha256(encoder.encode(bounded(`saycode/device-enrollment/v1\n${canonicalOrgSetupTokenJson(transcript)}`)));
 }
+
+export { parseUniqueJson as parseCanonicalOrgSetupTokenJson };
