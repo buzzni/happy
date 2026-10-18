@@ -441,6 +441,24 @@ describe('lesson update candidates over lesson-host-v1', () => {
         await rm(dir, { recursive: true, force: true });
     });
 
+    it('carries the current state of the replaced lesson, and only a well-formed one', async () => {
+        const row = (updateTarget: unknown) => ({
+            candidateId: 'c1', revision: 3, payloadHash: 'h', status: 'reviewed', evidenceKey: 'e', updateTarget,
+            candidate: { name: 'n', trigger: 'tr', steps: ['s1'], sourceEventIds: ['e1'], sourceSessionIds: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [], updatesLesson: target },
+        });
+        const current = { available: true, lessonId: 'l1', currentRevision: 2, name: 'old name', trigger: 'old when', steps: ['old step'], failureModes: [], scope: 'old scope', validation: ['old check'], reconsiderWhen: null, validVersions: [], recallEnabled: true };
+        const updating = fakeHost({
+            listCandidates: async () => ({ outcome: 'ok', nextOffset: null, candidates: [row(current), { ...row({ available: false, lessonId: 'l1' }), candidateId: 'c2' }, { ...row({ available: 'yes' }), candidateId: 'c3' }] }),
+        });
+        const { handle, dir } = await harness({ host: updating.handle } as any);
+        const result = await handle({ ...snapshotRequest, grantEnvelope: grantFor(snapshotRequest, ['lesson.read']) }) as any;
+        expect(result.snapshot.candidates[0].updateTarget).toMatchObject({ available: true, currentRevision: 2, name: 'old name', steps: ['old step'], scope: 'old scope' });
+        expect(result.snapshot.candidates[1].updateTarget).toEqual({ available: false, lessonId: 'l1' });
+        // Malformed: shown as unavailable so a client never offers approval on a guess.
+        expect(result.snapshot.candidates[2].updateTarget).toEqual({ available: false, lessonId: 'l1' });
+        await rm(dir, { recursive: true, force: true });
+    });
+
     it('passes a signed confirmation of the replaced lesson through to the store', async () => {
         const h = await harness();
         const approve = {
@@ -466,7 +484,7 @@ describe('lesson update candidates over lesson-host-v1', () => {
 
     it.each([
         ['lesson_not_found', 'not_found'],
-        ['lesson_revision_conflict', 'revision_conflict'],
+        ['lesson_revision_conflict', 'lesson_changed'],
         ['update_confirmation_required', 'update_confirmation_required'],
     ])('maps the store code %s to %s', async (code, reason) => {
         const failing = fakeHost({

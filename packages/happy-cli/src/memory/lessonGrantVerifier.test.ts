@@ -89,6 +89,18 @@ describe('createLessonGrantVerifier', () => {
             .toEqual({ ok: false, reason: 'payload-mismatch' });
     });
 
+    // CML lessonUpdates: the confirmation of which lesson approval replaces is
+    // part of what the person signed; dropping or retargeting it is a different request.
+    it('refuses an approval whose replaced-lesson confirmation changed after signing', () => {
+        const { publicKeyBase64, sign } = issuer();
+        const confirmed = { ...approve, confirmUpdatesLesson: { lessonId: 'l1', revision: 2 } };
+        const envelope = sign(claimsFor(confirmed));
+        expect(verifierFor(publicKeyBase64).verify({ envelope, request: confirmed }).ok).toBe(true);
+        for (const request of [approve, { ...approve, confirmUpdatesLesson: { lessonId: 'l2', revision: 2 } }, { ...approve, confirmUpdatesLesson: { lessonId: 'l1', revision: 3 } }]) {
+            expect(verifierFor(publicKeyBase64).verify({ envelope, request })).toEqual({ ok: false, reason: 'payload-mismatch' });
+        }
+    });
+
     it('refuses a grant minted for another machine', () => {
         const { publicKeyBase64, sign } = issuer();
         const envelope = sign(claimsFor(snapshot, { machineId: 'other' }));

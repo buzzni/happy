@@ -50,6 +50,8 @@ export type LessonHostFailure =
     | 'merge_required'
     /** Approving this candidate replaces an existing lesson; the request must confirm which one. */
     | 'update_confirmation_required'
+    /** The lesson an update candidate replaces changed since it was proposed; reject and propose again. */
+    | 'lesson_changed'
     | 'candidate_cap_reached'
     | 'evidence_conflict'
     | 'not_found'
@@ -142,6 +144,7 @@ function flattenCandidate(row: unknown): unknown | null {
     const duplicateLessonIds = strings(record.duplicateLessonIds);
     // The lesson approval would replace. Without it an update reads as a new lesson.
     const updatesLesson = readUpdateTarget(payload.updatesLesson);
+    const updateTarget = updatesLesson ? readCurrentTarget(record.updateTarget, updatesLesson.lessonId) : undefined;
     return {
         candidateId,
         revision,
@@ -161,7 +164,33 @@ function flattenCandidate(row: unknown): unknown | null {
         // deciding on less than the record holds.
         failureModes: strings(payload.failureModes),
         ...(validVersions.length > 0 ? { validVersions } : {}),
-        ...(updatesLesson ? { updatesLesson } : {}),
+        ...(updatesLesson ? { updatesLesson, updateTarget } : {}),
+    };
+}
+
+/**
+ * The replaced lesson as it is now, for a side-by-side review. Anything not
+ * well-formed is reported unavailable: a client then withholds approval
+ * rather than letting a person replace a lesson they could not see.
+ */
+function readCurrentTarget(value: unknown, lessonId: string): Record<string, unknown> {
+    const unavailable = { available: false, lessonId };
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+    const target = value as Record<string, unknown>;
+    const texts = (item: unknown): string[] | null =>
+        Array.isArray(item) && item.every((entry) => typeof entry === 'string') ? item as string[] : null;
+    const optionalText = (item: unknown): string | null | undefined =>
+        item === null || item === undefined ? null : typeof item === 'string' ? item : undefined;
+    if (target.available !== true || target.lessonId !== lessonId) return unavailable;
+    const steps = texts(target.steps); const failureModes = texts(target.failureModes);
+    const validation = texts(target.validation); const validVersions = texts(target.validVersions ?? []);
+    const scope = optionalText(target.scope); const reconsiderWhen = optionalText(target.reconsiderWhen);
+    if (typeof target.currentRevision !== 'number' || !Number.isInteger(target.currentRevision) || target.currentRevision < 1
+        || typeof target.name !== 'string' || typeof target.trigger !== 'string' || typeof target.recallEnabled !== 'boolean'
+        || !steps || !failureModes || !validation || !validVersions || scope === undefined || reconsiderWhen === undefined) return unavailable;
+    return {
+        available: true, lessonId, currentRevision: target.currentRevision, name: target.name, trigger: target.trigger,
+        steps, failureModes, scope, validation, reconsiderWhen, validVersions, recallEnabled: target.recallEnabled,
     };
 }
 
@@ -239,7 +268,8 @@ const CODE_FAILURES: Readonly<Record<string, LessonHostFailure>> = {
     merge_required: 'merge_required',
     update_confirmation_required: 'update_confirmation_required',
     lesson_not_found: 'not_found',
-    lesson_revision_conflict: 'revision_conflict',
+    // Not revision_conflict: re-reading the candidate cannot fix a target that moved.
+    lesson_revision_conflict: 'lesson_changed',
     candidate_cap_reached: 'candidate_cap_reached',
     evidence_conflict: 'evidence_conflict',
     revision_conflict: 'revision_conflict',
