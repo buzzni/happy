@@ -652,6 +652,40 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       maxOutputBytes: MAX_PAYLOAD_BYTES, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
     })).stdout)
     let before = await list()
+    // cswap storage is authoritative for managed metadata. A managed slot is replaced only
+    // when this deployment proves it owns the slot; a personal import of the same synthetic
+    // email is a conflict, never a silent takeover. --force drops `disabled`, so restore it.
+    const exportedAccounts = async () => {
+      const exported = JSON.parse((await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })).stdout)
+      if (exported.version !== 1 || exported.encrypted === true || !Array.isArray(exported.accounts)) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
+      return exported.accounts as Array<Record<string, unknown>>
+    }
+    const owns = (account: Record<string, unknown> & { email: string }) => groupOwned.has(setupTokenGroupIdentity(account.managedAccountId as string))
+      || [...knownCompanyIdentities].some(identity => JSON.parse(identity)[0] === account.email)
+    // Every ownership and generation check runs before anything is captured, repaired or imported:
+    // a refused apply leaves the account pool exactly as it was (specs/claude-setup-token-managed-sync R3).
+    const managedInstalled = managed.filter(account => before.accounts.some(local => claudeListAccountIdentity(local) === claudeListAccountIdentity(account)))
+    let changed: typeof managed = []
+    const restored: typeof managed = []
+    if (managedInstalled.length > 0) {
+      const local = await exportedAccounts()
+      changed = managedInstalled.filter(account => !sameManagedSetupToken(local.find(slot => slot.email === account.email), account))
+      for (const account of changed) {
+        const stored = local.find(slot => slot.email === account.email)
+        // This scope installed that managed account (owned) and the slot only lost its managed metadata: restore it.
+        if (stored && stored.managedAccountId === undefined && owns(account)) { restored.push(account); continue }
+        if (!owns(account) || !stored || stored.managedAccountId !== account.managedAccountId) {
+          // Which check refused, without any account detail: the daemon log otherwise cannot tell a takeover attempt
+          // from a slot missing in cswap or a changed managed id (2026-10-12 hmrepo).
+          const conflict = new AiCredentialRuntimeError('AI_GROUP_CREDENTIAL_CONFLICT')
+          conflict.failureCause = !owns(account) ? 'not-owned' : !stored ? 'slot-missing' : 'managed-id-mismatch'
+          throw conflict
+        }
+        const storedGeneration = Number(stored.credentialGeneration)
+        if (storedGeneration > Number(account.credentialGeneration)) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_STALE')
+        if (storedGeneration === account.credentialGeneration) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_CONFLICT')
+      }
+    }
     const config = await readOptionalJson(deps.env.CLAUDE_CONFIG_DIR
       ? join(deps.env.CLAUDE_CONFIG_DIR, '.claude.json') : join(deps.homeDir, '.claude.json'))
     const liveIdentity = isObject(config?.oauthAccount) ? config.oauthAccount : null
@@ -738,39 +772,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         await deps.rm(tempDir, { recursive: true, force: true })
       }
     }
-    // cswap storage is authoritative for managed metadata. A managed slot is replaced only
-    // when this deployment proves it owns the slot; a personal import of the same synthetic
-    // email is a conflict, never a silent takeover. --force drops `disabled`, so restore it.
-    const exportedAccounts = async () => {
-      const exported = JSON.parse((await deps.execFile('cswap', ['export', '-'], { maxOutputBytes: MAX_PAYLOAD_BYTES })).stdout)
-      if (exported.version !== 1 || exported.encrypted === true || !Array.isArray(exported.accounts)) throw new AiCredentialRuntimeError('CLAUDE_APPLY_VERIFICATION_FAILED')
-      return exported.accounts as Array<Record<string, unknown>>
-    }
-    const owns = (account: Record<string, unknown> & { email: string }) => groupOwned.has(setupTokenGroupIdentity(account.managedAccountId as string))
-      || [...knownCompanyIdentities].some(identity => JSON.parse(identity)[0] === account.email)
     const managedExisting = managed.filter(account => existing.has(claudeListAccountIdentity(account)))
     // Slots removed and imported again to restore their managed metadata: prior slot number -> current one.
     const renumbered = new Map<number, number>()
     const expectedNumber = (number: number) => renumbered.get(number) ?? number
     if (managedExisting.length > 0) {
-      const local = await exportedAccounts()
-      const changed = managedExisting.filter(account => !sameManagedSetupToken(local.find(slot => slot.email === account.email), account))
-      const restored: typeof changed = []
-      for (const account of changed) {
-        const stored = local.find(slot => slot.email === account.email)
-        // This scope installed that managed account (owned) and the slot only lost its managed metadata: restore it.
-        if (stored && stored.managedAccountId === undefined && owns(account)) { restored.push(account); continue }
-        if (!owns(account) || !stored || stored.managedAccountId !== account.managedAccountId) {
-          // Which check refused, without any account detail: the daemon log otherwise cannot tell a takeover attempt
-          // from a slot missing in cswap or a changed managed id (2026-10-12 hmrepo).
-          const conflict = new AiCredentialRuntimeError('AI_GROUP_CREDENTIAL_CONFLICT')
-          conflict.failureCause = !owns(account) ? 'not-owned' : !stored ? 'slot-missing' : 'managed-id-mismatch'
-          throw conflict
-        }
-        const storedGeneration = Number(stored.credentialGeneration)
-        if (storedGeneration > Number(account.credentialGeneration)) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_STALE')
-        if (storedGeneration === account.credentialGeneration) throw new AiCredentialRuntimeError('AI_GROUP_GENERATION_CONFLICT')
-      }
+      // Checked above against the pool before anything changed; only slots still installed are replaced in place.
+      changed = changed.filter(account => managedExisting.includes(account))
+      const restoring = restored.filter(account => changed.includes(account))
       const importAccounts = async (accounts: typeof changed, force: boolean) => {
         const tempDir = await deps.makeTempDir()
         const file = join(tempDir, 'claude-swap.json')
@@ -782,16 +791,16 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           await deps.rm(tempDir, { recursive: true, force: true })
         }
       }
-      const replaced = changed.filter(account => !restored.includes(account))
+      const replaced = changed.filter(account => !restoring.includes(account))
       if (replaced.length > 0) await importAccounts(replaced, true)
-      if (restored.length > 0) {
+      if (restoring.length > 0) {
         // cswap refuses any import that would make a bare slot of that email managed, --force included ('managed
         // identity conflict', 2026-10-12 hmrepo: every apply failed as COMMAND_FAILED). Remove the bare slot, import it again.
-        for (const account of restored) {
+        for (const account of restoring) {
           const prior = before.accounts.find(slot => claudeListAccountIdentity(slot) === claudeListAccountIdentity(account))
           if (prior) await deps.execFile('cswap', ['remove', String(prior.number)], { input: 'y\n', timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         }
-        await importAccounts(restored, false)
+        await importAccounts(restoring, false)
       }
       if (changed.length > 0) {
         const current = await list()
@@ -805,7 +814,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           }
         }
         // A restored slot that was active stays active under whatever number the import gave it.
-        if (before.activeAccountNumber !== null && restored.some(account => before.accounts.find(slot => slot.number === before.activeAccountNumber
+        if (before.activeAccountNumber !== null && restoring.some(account => before.accounts.find(slot => slot.number === before.activeAccountNumber
           && claudeListAccountIdentity(slot) === claudeListAccountIdentity(account))) && current.activeAccountNumber !== expectedNumber(before.activeAccountNumber)) {
           await deps.execFile('cswap', ['switch', String(expectedNumber(before.activeAccountNumber)), '--force', '--json'], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
         }

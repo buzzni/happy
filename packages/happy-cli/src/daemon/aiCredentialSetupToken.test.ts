@@ -585,6 +585,28 @@ describe('managed Claude setup-token runtime', () => {
     expect(calls.some(call => call.args[0] === 'import')).toBe(false)
   })
 
+  // Saycode specs/claude-setup-token-managed-sync R3: a refused apply must not have imported its new accounts first.
+  it('refuses an unowned managed slot before importing any new account of the same payload', async () => {
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = stored(A, 1, fakeToken('personal'))
+    const { runtime, state, calls } = fakeMachine([bare as Slot], 2)
+    const before = structuredClone(state.slots)
+    await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')), { ...managed(B, 1, fakeToken('b')), number: 3 }))))
+      .rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
+    expect(state.slots).toEqual(before)
+    expect(calls.some(call => call.args[0] === 'import')).toBe(false)
+  })
+
+  it('refuses a stale managed generation before importing any new account of the same payload', async () => {
+    const { runtime, state, calls } = fakeMachine([], null)
+    await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('two')))))
+    const before = structuredClone(state.slots)
+    calls.length = 0
+    await expect(runtime.groupSync(sync(3, payload(managed(A, 1, fakeToken('one')), { ...managed(B, 1, fakeToken('b')), number: 3 }))))
+      .rejects.toThrow('AI_GROUP_GENERATION_STALE')
+    expect(state.slots).toEqual(before)
+    expect(calls.some(call => call.args[0] === 'import')).toBe(false)
+  })
+
   it('fences stale and conflicting generations against stored metadata', async () => {
     const { runtime, state } = fakeMachine([], null)
     await runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('two')))))
