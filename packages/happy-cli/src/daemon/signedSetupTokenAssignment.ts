@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { canonicalOrgSetupTokenJson, verifyOrgSetupTokenDocument, type OrgSetupTokenDocument } from '@slopus/happy-wire';
-import type { DeviceKeys } from './deviceKeys';
+import { deviceDirectory, type DeviceKeys } from './deviceKeys';
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 import { deviceStateName, deviceTempName } from './deviceOrgPinStore';
@@ -62,7 +62,7 @@ export function createSignedSetupTokenVerifier(deps: {
     now: () => number;
     killSwitch?: () => boolean;
 }) {
-    const directory = join(deps.home, 'device-' + hash(deps.machineId));
+    const directory = deviceDirectory(deps.home, deps.machineId);
     let queue: Promise<unknown> = Promise.resolve();
 
     async function readState(companyId: string) {

@@ -46,11 +46,21 @@ async function readKeys(directory: string, machineId: string): Promise<DeviceKey
  * Missing/corrupt keys require explicit re-enrollment; this does not load or preserve an old approval.
  * The caller supplies HAPPY_HOME and the authenticated local machine ID, never a remote path.
  */
+/** The per-machine key directory under HAPPY_HOME; org pins and assignment state live beside keys.json.
+ * Short because Desktop's homes are already deep on Windows (%LOCALAPPDATA%\Saycode-Secrets-<SID>\machine-links\machines\<64 hex>)
+ * and the ACL check opens every entry, which fails past MAX_PATH. 64 bits of the hash: one machine per home. */
+export const deviceDirectory = (home: string, machineId: string) => join(home, 'd-' + createHash('sha256').update(machineId).digest('hex').slice(0, 16));
+/** CLI ≤ 1.1.10-aplus.339 named it device-<64 hex>; migrateLegacyDeviceState renames it. */
+export const legacyDeviceDirectoryName = (machineId: string) => 'device-' + createHash('sha256').update(machineId).digest('hex');
+
 export async function loadOrCreateDeviceKeys(home: string, machineId: string): Promise<DeviceKeys> {
     if (!isAbsolute(home) || !machineId || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(machineId) || /[\u0000-\u001f\u007f-\u009f]/.test(machineId)) throw reapproval(new Error('invalid key home or machine id'));
     const root = await lstat(home);
     if (!root.isDirectory() || root.isSymbolicLink() || (process.platform !== 'win32' && (root.uid !== process.getuid?.() || (root.mode & 0o022) !== 0))) throw reapproval(new Error('key home is not a private directory'));
-    const directory = join(home, 'device-' + createHash('sha256').update(machineId).digest('hex'));
+    const directory = deviceDirectory(home, machineId);
+    // Approved keys still under the legacy name (their rename failed or has not run): minting new ones would orphan them.
+    const legacyKeys = await lstat(join(home, legacyDeviceDirectoryName(machineId), 'keys.json')).then(() => true, (error: NodeJS.ErrnoException) => error.code !== 'ENOENT');
+    if (legacyKeys && !await lstat(directory).then(() => true, () => false)) throw reapproval(new Error('legacy device key directory not migrated'));
     let created = false;
     try { await mkdir(directory, { mode: 0o700 }); created = true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }

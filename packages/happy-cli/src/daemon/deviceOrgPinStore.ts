@@ -1,18 +1,18 @@
 import { constants } from 'node:fs';
-import { open, link, lstat, readdir, readFile, unlink } from 'node:fs/promises';
+import { open, link, lstat, readdir, readFile, rename, rmdir, unlink } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { canonicalOrgSetupTokenJson, verifyOrgSetupTokenDocument, type OrgSetupTokenDocument } from '@slopus/happy-wire';
-import type { DeviceKeys } from './deviceKeys';
+import { deviceDirectory, legacyDeviceDirectoryName, type DeviceKeys } from './deviceKeys';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 
 export type DeviceOrgPin = { publicKey: string; approval: OrgSetupTokenDocument };
 const schema = z.object({ version: z.literal(1), policy: z.literal('signed-required'), publicKey: z.string().regex(/^[A-Za-z0-9_-]{43}$/), approval: z.unknown() }).strict();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 /** Windows PowerShell ACL checks open every entry of the device directory and cannot open a path past MAX_PATH.
- * The deepest Desktop root is C:\ProgramData\Saycode-Secrets-<SID>\machine-links\machines\<64 hex>\device-<64 hex>,
- * about 241 chars with a 50-char SID, so every entry name stays within this budget. */
+ * The deepest Desktop root is %LOCALAPPDATA%\Saycode-Secrets-<SID>\machine-links\machines\<64 hex>\d-<16 hex>, about 229 chars
+ * with a 50-char SID and a 32-char profile folder, so every entry name stays within this budget. */
 export const DEVICE_ENTRY_NAME_BUDGET = 16;
 /** Per-company state in the device directory: 32 bits of the company hash. A collision only fails closed, because
  * the stored approval and assignment statements name their company and are re-checked on read. */
@@ -28,12 +28,24 @@ export type LegacyDeviceStateRename = { name: string; outcome: 'renamed' | 'dupl
  * the device directory is checked. Contents are never trusted here, only compared: a legacy file that disagrees with an
  * existing short one is set aside under a short name no store opens (left in place it would fail every start), and
  * anything that is not a plain file of pin size is left alone so the directory check still fails closed. */
-export async function migrateLegacyOrgPinNames(home: string, machineId: string): Promise<LegacyDeviceStateRename[]> {
-    const directory = join(home, 'device-' + hash(machineId));
+export async function migrateLegacyDeviceState(home: string, machineId: string): Promise<LegacyDeviceStateRename[]> {
+    const directory = deviceDirectory(home, machineId), results: LegacyDeviceStateRename[] = [];
+    const missing = (error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; };
+    // The directory first: under the deepest roots its legacy name alone pushed keys.json past MAX_PATH. Only a directory
+    // with a published keys.json carries an approval; a rename keeps it, so the approval still matches. An empty one is an
+    // initialization that never finished and is removed. Anything else (a link, a partial init, a short one already there)
+    // is left alone; while approved keys stay there, loadOrCreateDeviceKeys refuses to mint new ones.
+    const legacyName = legacyDeviceDirectoryName(machineId), legacyPath = join(home, legacyName), legacy = await lstat(legacyPath).catch(missing);
+    if (legacy) {
+        const real = legacy.isDirectory() && !legacy.isSymbolicLink(), keys = real && !!await lstat(join(legacyPath, 'keys.json')).catch(missing);
+        const outcome = !real ? 'skipped' : !keys ? ((await readdir(legacyPath)).length === 0 ? 'removed' : 'skipped') : await lstat(directory).catch(missing) ? 'skipped' : 'renamed';
+        if (outcome === 'removed') await rmdir(legacyPath);
+        if (outcome === 'renamed') await rename(legacyPath, directory);
+        results.push({ name: legacyName, outcome });
+    }
     let names: string[];
     try { names = await readdir(directory); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
-    const results: LegacyDeviceStateRename[] = [];
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return results; throw error; }
     for (const name of names) {
         const match = LEGACY_LONG_NAME.exec(name), temp = LEGACY_TEMP_NAME.test(name);
         if (!match && !temp) continue;
@@ -58,7 +70,7 @@ export async function migrateLegacyOrgPinNames(home: string, machineId: string):
  * Only the enrollment coordinator calls pin after both confirmations. No trust in remote flags.
  */
 export function createDeviceOrgPinStore(deps: { home: string; machineId: string; keys: DeviceKeys }) {
-    const directory = join(deps.home, 'device-' + hash(deps.machineId));
+    const directory = deviceDirectory(deps.home, deps.machineId);
     async function validate(value: unknown, companyId?: string) {
         const record = schema.parse(value);
         const publicKey = Buffer.from(record.publicKey, 'base64url');
