@@ -878,6 +878,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 drain ? () => drain.claimTurn() : undefined,
                             );
                             if (!msg && switchWake?.aborted && !controller.signal.aborted) {
+                                // A wait an ended provider left behind leaves the finished switch to the live generation.
+                                if (providerEnded) return null;
                                 // The switch finished while nobody typed: continue the refused turn on the new account,
                                 // exactly like a switch made at the turn boundary.
                                 const accountSwitch = await setupTokenSwitching!.switchIfWanted();
