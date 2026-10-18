@@ -111,6 +111,41 @@ async function unchanged() {
 }
 
 describe('Happy execution create / lookup boundary against isolated PostgreSQL', () => {
+  it.skipIf(!process.env.ROTATION_PRODUCER_FIXTURE)('cross-repository: accepts actual Studio and CLI output without re-signing', async () => {
+    const artifact = JSON.parse(await readFile(process.env.ROTATION_PRODUCER_FIXTURE!, 'utf8')) as {
+      publicKey: string; body: SessionExecutionCreateBody; proof: HappySessionExecutionProof;
+    };
+    const ticket = artifact.proof.ticket.body;
+    process.env.HAPPY_EXECUTION_STUDIO_ORIGIN = ticket.studioOrigin;
+    process.env.HAPPY_EXECUTION_AUDIENCE = ticket.audience;
+    process.env.HAPPY_EXECUTION_STUDIO_PUBLIC_KEY = artifact.publicKey;
+    vi.spyOn(Date, 'now').mockReturnValue(ticket.issuedAt);
+    for (const id of new Set([ticket.sessionOwnerAccountId, ticket.machineOwnerAccountId])) {
+      await client.account.create({ data: { id, publicKey: id } });
+    }
+    await client.machine.create({ data: { id: ticket.machineId, accountId: ticket.machineOwnerAccountId, metadata: 'synthetic-encrypted' } });
+    const first = await create(artifact.proof, artifact.body, ticket.sessionOwnerAccountId);
+    expect(first.statusCode, first.body).toBe(200);
+    const id = first.json().session.id;
+    const retry = await create(artifact.proof, artifact.body, ticket.sessionOwnerAccountId);
+    expect(retry.statusCode, retry.body).toBe(200);
+    expect(retry.json().session.id).toBe(id);
+    expect(await client.sessionExecutionBinding.count()).toBe(1);
+    expect(state.emitted).toHaveLength(1);
+    const lookup = await app.inject({ method: 'POST', url: `/v1/machine-sessions/${id}/execution-owner`,
+      headers: { 'x-test-account': ticket.machineOwnerAccountId }, payload: {
+        companyId: ticket.companyId, machineId: ticket.machineId, launchId: ticket.launchId, initialNonce: ticket.initialNonce,
+      } });
+    expect(lookup.json().owner).toMatchObject({ sessionId: id, sessionOwnerAccountId: ticket.sessionOwnerAccountId });
+    const ordinary = await app.inject({ method: 'POST', url: `/v1/machine-sessions/${id}/owner`,
+      headers: { 'x-test-account': ticket.machineOwnerAccountId }, payload: { machineId: ticket.machineId } });
+    expect(ordinary.json()).toEqual({ owner: null });
+    expect((await create(artifact.proof, { ...artifact.body, metadata: 'tampered' }, ticket.sessionOwnerAccountId)).statusCode).toBe(403);
+    expect((await create(artifact.proof, artifact.body, ticket.machineOwnerAccountId)).statusCode).toBe(403);
+    expect(await client.sessionExecutionBinding.count()).toBe(1);
+    expect(state.emitted).toHaveLength(1);
+  });
+
   it('rejects repeated JSON keys before normalization can hide a conflicting signed claim', async () => {
     const proof = await signed();
     const raw = JSON.stringify({ ...fixture.createBody, executionProof: proof })

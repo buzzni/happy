@@ -191,3 +191,48 @@ checked against the server review checkout, where all 39 selected server tests a
 typecheck pass. The integrated checkout lacks the server Vitest executable, so no
 server test success is claimed there. Parent review is complete for local changes;
 installed-artifact, live integrated and production acceptance remain pending.
+
+## Local cross-repository acceptance — 2026-10-19
+
+This section supersedes older statements that no producer-output or browser check was run.
+No product code was changed in this verification pass. Added an opt-in cross-repository
+HTTP test and a Happy consumer test; synthetic keys/accounts only, no production calls.
+
+- Actual Studio HTTP routes, signer, authority and PGlite migration/store drove the actual
+  Happy CLI protocol/runtime/journal: issue → usage → rebind → lost commit response →
+  reconstructed runtime/resume → second-account exhaustion. No token environment was
+  returned before database commit, and exhaustion never returned the previous token.
+- The actual producer proof was exported by that test and consumed unchanged by Happy's
+  real session-create HTTP route and Prisma/PGlite store. Exact retry created one session
+  and one notification; execution-owner lookup succeeded while ordinary ownership stayed
+  isolated. Ciphertext tampering and machine-owner substitution returned 403.
+- Studio/Web related suite: 44 passed, 1 opt-in test skipped in the default run. Cross-repo
+  config: 1 passed, 36 unrelated tests filtered out. Happy session boundary: 22 passed,
+  including the producer-output case. Studio changed-file ESLint passed; type ratchet
+  matched all 492 existing diagnostics. Happy server typecheck passed in the server review
+  checkout; the identical consumer test was copied into the integrated checkout.
+- Local Chrome harness imported the actual ChatMachineStatus, event parser, Korean catalog
+  and CSS. Unknown/legacy/v2 compatibility and switching/switched/exhausted/retrying text
+  were checked. Final legacy/v2 screenshots were captured. This is component/browser
+  acceptance, not the full ChatPanel, a WebSocket feed, or a real daemon/provider run.
+- Remaining: installed CLI artifact, real shared-machine spawn/provider execution, real
+  PostgreSQL concurrency, Windows durability and production deployment/acceptance.
+
+Reproduction from Studio packages/web-ui (use the integrated Happy checkout as `$HAPPY_ROTATION_CHECKOUT`):
+
+```sh
+ROTATION_PRODUCER_FIXTURE=/tmp/rotation-producer-output.json HAPPY_ROTATION_CHECKOUT="$HAPPY_ROTATION_CHECKOUT" ./node_modules/.bin/vitest run --config vitest.rotation-integration.config.ts -t cross-repository
+./node_modules/.bin/vitest run server/claudeSetupTokenMachineRoutes.test.ts src/lib/sync/setupTokenRotation.test.ts
+./node_modules/.bin/eslint server/claudeSetupTokenMachineRoutes.test.ts vitest.rotation-integration.config.ts
+npm run typecheck:ratchet
+```
+
+Then from a Happy checkout with server dependencies installed:
+
+```sh
+ROTATION_PRODUCER_FIXTURE=/tmp/rotation-producer-output.json corepack pnpm -C packages/happy-server exec vitest run sources/app/session/sessionExecutionBinding.spec.ts
+corepack pnpm -C packages/happy-server run typecheck
+```
+
+The artifact contains only synthetic test claims/public key. Both opt-in tests skip when
+these environment inputs are absent; they must be explicitly enabled for cross-repo acceptance.
