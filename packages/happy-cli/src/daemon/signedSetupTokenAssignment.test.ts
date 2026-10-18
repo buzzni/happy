@@ -6,7 +6,7 @@ import nacl from 'tweetnacl';
 import { afterEach, expect, it, vi } from 'vitest';
 import { canonicalOrgSetupTokenJson, signOrgSetupTokenDocument, orgSetupTokenKeyId } from '@slopus/happy-wire';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
-import { createDeviceOrgPinStore, migrateLegacyOrgPinNames, DEVICE_ENTRY_NAME_BUDGET, deviceStateName } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, migrateLegacyDeviceState, DEVICE_ENTRY_NAME_BUDGET, deviceStateName } from './deviceOrgPinStore';
 import { createSetupTokenAssignmentRecipient, sealSetupTokenAssignment } from './setupTokenAssignmentWire';
 import { createSignedSetupTokenVerifier, setupTokenAccountDigest } from './signedSetupTokenAssignment';
 
@@ -149,7 +149,7 @@ it('keeps accepted revisions saved under the legacy long state name after the re
     const companyHash = createHash('sha256').update('company').digest('hex');
     const [stored] = (await readdir(directory)).filter(name => name.startsWith('a-') && name.endsWith('.json'));
     await rename(join(directory, stored), join(directory, 'assignments-' + companyHash + '.json'));
-    await migrateLegacyOrgPinNames(f.home, 'machine');
+    await migrateLegacyDeviceState(f.home, 'machine');
     expect(await readdir(directory)).not.toContain('assignments-' + companyHash + '.json');
     await expect(f.verifier().verify(f.request(accounts, [await f.assignment(accounts)]))).rejects.toThrow('REVISION_STALE');
 });

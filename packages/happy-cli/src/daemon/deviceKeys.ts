@@ -46,11 +46,14 @@ async function readKeys(directory: string, machineId: string): Promise<DeviceKey
  * Missing/corrupt keys require explicit re-enrollment; this does not load or preserve an old approval.
  * The caller supplies HAPPY_HOME and the authenticated local machine ID, never a remote path.
  */
+/** The per-machine key directory under HAPPY_HOME; org pins and assignment state live beside keys.json. */
+export const deviceDirectory = (home: string, machineId: string) => join(home, 'device-' + createHash('sha256').update(machineId).digest('hex'));
+
 export async function loadOrCreateDeviceKeys(home: string, machineId: string): Promise<DeviceKeys> {
     if (!isAbsolute(home) || !machineId || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(machineId) || /[\u0000-\u001f\u007f-\u009f]/.test(machineId)) throw reapproval(new Error('invalid key home or machine id'));
     const root = await lstat(home);
     if (!root.isDirectory() || root.isSymbolicLink() || (process.platform !== 'win32' && (root.uid !== process.getuid?.() || (root.mode & 0o022) !== 0))) throw reapproval(new Error('key home is not a private directory'));
-    const directory = join(home, 'device-' + createHash('sha256').update(machineId).digest('hex'));
+    const directory = deviceDirectory(home, machineId);
     let created = false;
     try { await mkdir(directory, { mode: 0o700 }); created = true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }

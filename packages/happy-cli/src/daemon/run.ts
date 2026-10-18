@@ -1,4 +1,4 @@
-import { createDeviceOrgPinStore, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
@@ -3932,9 +3932,9 @@ export async function startDaemon(): Promise<void> {
     });
 
     // Create realtime machine session
-    // Before the key load runs its ACL check over the device directory (see migrateLegacyOrgPinNames).
+    // Before the key load runs its ACL check over the device directory (see migrateLegacyDeviceState).
     // Best effort: if it fails, the key load below still fails closed and logs why.
-    if (!managedRuntimeActive) await migrateLegacyOrgPinNames(configuration.happyHomeDir, machine.id)
+    if (!managedRuntimeActive) await migrateLegacyDeviceState(configuration.happyHomeDir, machine.id)
       .then((renamed) => { if (renamed.length > 0) logger.debug('[DAEMON RUN] Legacy device state names', renamed); })
       .catch((error) => logger.debug('[DAEMON RUN] Legacy device state rename failed', error));
     const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);

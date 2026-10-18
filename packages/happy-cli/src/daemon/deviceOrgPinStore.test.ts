@@ -6,7 +6,7 @@ import nacl from 'tweetnacl';
 import { afterEach, expect, it, vi } from 'vitest';
 import { signOrgSetupTokenDocument, orgSetupTokenKeyId } from '@slopus/happy-wire';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
-import { createDeviceOrgPinStore, DEVICE_ENTRY_NAME_BUDGET, migrateLegacyOrgPinNames } from './deviceOrgPinStore';
+import { createDeviceOrgPinStore, DEVICE_ENTRY_NAME_BUDGET, migrateLegacyDeviceState } from './deviceOrgPinStore';
 vi.mock('node:fs/promises',async(importOriginal)=>{const actual=await importOriginal<typeof import('node:fs/promises')>();return {...actual,link:vi.fn(actual.link)};});
 const homes: string[] = [];
 afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, {recursive:true,force:true}))); });
@@ -72,7 +72,7 @@ it('names pins short enough that the device directory stays under the Windows pa
 });
 it('moves a pin saved under the legacy long name so it loads again after restart',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);await rename(f.path,f.legacyPath);
- await migrateLegacyOrgPinNames(f.deps.home,'machine');
+ await migrateLegacyDeviceState(f.deps.home,'machine');
  expect(await readdir(f.directory)).not.toContain(f.legacyPath.slice(f.directory.length+1));
  expect(await createDeviceOrgPinStore(f.deps).get('company')).toMatchObject({...f.candidate,policy:'signed-required'});
 });
@@ -81,7 +81,7 @@ it('moves a pin saved under the legacy long name so it loads again after restart
 it('sets a legacy pin that disagrees with the short one aside under a short name, keeping the short one',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);const stored=await readFile(f.path,'utf8');
  await writeFile(f.legacyPath,'{}');
- expect(await migrateLegacyOrgPinNames(f.deps.home,'machine')).toEqual([{name:f.legacyPath.slice(f.directory.length+1),outcome:'quarantined'}]);
+ expect(await migrateLegacyDeviceState(f.deps.home,'machine')).toEqual([{name:f.legacyPath.slice(f.directory.length+1),outcome:'quarantined'}]);
  const names=await readdir(f.directory);
  expect(names).not.toContain(f.legacyPath.slice(f.directory.length+1));
  const aside=names.filter(name=>name.startsWith('q-'));expect(aside).toHaveLength(1);
@@ -91,22 +91,22 @@ it('sets a legacy pin that disagrees with the short one aside under a short name
 });
 it.skipIf(process.platform==='win32')('does not follow or move a legacy-named symlink',async()=>{
  const f=await fixture();const target=join(f.deps.home,'external.json');await writeFile(target,'{}');await symlink(target,f.legacyPath);
- expect(await migrateLegacyOrgPinNames(f.deps.home,'machine')).toEqual([{name:f.legacyPath.slice(f.directory.length+1),outcome:'skipped'}]);
+ expect(await migrateLegacyDeviceState(f.deps.home,'machine')).toEqual([{name:f.legacyPath.slice(f.directory.length+1),outcome:'skipped'}]);
  expect(await readdir(f.directory)).toContain(f.legacyPath.slice(f.directory.length+1));
 });
 it('drops a legacy pin that duplicates the short one',async()=>{
  const f=await fixture();await f.store.pin(f.candidate);await link(f.path,f.legacyPath);
- await migrateLegacyOrgPinNames(f.deps.home,'machine');
+ await migrateLegacyDeviceState(f.deps.home,'machine');
  expect(await readdir(f.directory)).not.toContain(f.legacyPath.slice(f.directory.length+1));
  expect(await f.store.get('company')).toMatchObject(f.candidate);
 });
 it('does nothing when the device has no key directory yet',async()=>{
  const home=await mkdtemp(join(tmpdir(),'device-pin-'));homes.push(home);
- await expect(migrateLegacyOrgPinNames(home,'machine')).resolves.toEqual([]);
+ await expect(migrateLegacyDeviceState(home,'machine')).resolves.toEqual([]);
 });
 // A crash mid-write in CLI ≤ .338 left org-<uuid>.tmp / assignments-<uuid>.tmp (44+ chars); never published, so safe to drop.
 it('removes temp files an older CLI left behind, which were never published',async()=>{
  const f=await fixture();const leftover=join(f.directory,'assignments-'+'0123abcd-4567-89ab-cdef-0123456789ab'+'.tmp');await writeFile(leftover,'partial');
- expect(await migrateLegacyOrgPinNames(f.deps.home,'machine')).toEqual([{name:'assignments-0123abcd-4567-89ab-cdef-0123456789ab.tmp',outcome:'removed'}]);
+ expect(await migrateLegacyDeviceState(f.deps.home,'machine')).toEqual([{name:'assignments-0123abcd-4567-89ab-cdef-0123456789ab.tmp',outcome:'removed'}]);
  expect(await readdir(f.directory)).not.toContain('assignments-0123abcd-4567-89ab-cdef-0123456789ab.tmp');
 });

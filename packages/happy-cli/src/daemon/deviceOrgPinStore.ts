@@ -4,7 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { canonicalOrgSetupTokenJson, verifyOrgSetupTokenDocument, type OrgSetupTokenDocument } from '@slopus/happy-wire';
-import type { DeviceKeys } from './deviceKeys';
+import { deviceDirectory, type DeviceKeys } from './deviceKeys';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 
 export type DeviceOrgPin = { publicKey: string; approval: OrgSetupTokenDocument };
@@ -28,8 +28,8 @@ export type LegacyDeviceStateRename = { name: string; outcome: 'renamed' | 'dupl
  * the device directory is checked. Contents are never trusted here, only compared: a legacy file that disagrees with an
  * existing short one is set aside under a short name no store opens (left in place it would fail every start), and
  * anything that is not a plain file of pin size is left alone so the directory check still fails closed. */
-export async function migrateLegacyOrgPinNames(home: string, machineId: string): Promise<LegacyDeviceStateRename[]> {
-    const directory = join(home, 'device-' + hash(machineId));
+export async function migrateLegacyDeviceState(home: string, machineId: string): Promise<LegacyDeviceStateRename[]> {
+    const directory = deviceDirectory(home, machineId);
     let names: string[];
     try { names = await readdir(directory); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
@@ -58,7 +58,7 @@ export async function migrateLegacyOrgPinNames(home: string, machineId: string):
  * Only the enrollment coordinator calls pin after both confirmations. No trust in remote flags.
  */
 export function createDeviceOrgPinStore(deps: { home: string; machineId: string; keys: DeviceKeys }) {
-    const directory = join(deps.home, 'device-' + hash(deps.machineId));
+    const directory = deviceDirectory(deps.home, deps.machineId);
     async function validate(value: unknown, companyId?: string) {
         const record = schema.parse(value);
         const publicKey = Buffer.from(record.publicKey, 'base64url');
