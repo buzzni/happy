@@ -12,6 +12,10 @@ export type AutomationSchedule =
   | { kind: 'interval'; minutes: number }
   | { kind: 'github'; minutes: 15 }
   | { kind: 'daily'; hour: number; minute: number }
+  /** 실행 PC 현지 날짜(YYYY-MM-DD)·시각에 한 번. 서버 예약 payload 전용 — 레거시 RPC 파서는 받지 않는다. */
+  | { kind: 'once'; date: string; hour: number; minute: number }
+  /** 고른 요일(0=일요일, Date#getDay)의 실행 PC 현지 시각마다. 서버 예약 payload 전용. */
+  | { kind: 'weekly'; days: readonly number[]; hour: number; minute: number }
 
 export type AutomationRunOutcome = 'woke' | 'skipped-gate' | 'skipped-overlap' | 'silent' | 'error'
 
@@ -191,9 +195,30 @@ export function serializeScheduledAutomations(automations: readonly ScheduledAut
   return JSON.stringify(automations.slice(0, MAX_AUTOMATIONS))
 }
 
-export function computeNextRunAt(schedule: AutomationSchedule, from: number): number {
+/**
+ * `from` 보다 엄격히 뒤인 다음 실행 시각. 1회 예약이 이미 지났으면 null(다시 실행하지 않음).
+ * 시각은 모두 실행 PC 현지 시각이다 — 로컬 Date 생성자가 DST로 없는 시각은 앞으로 밀고,
+ * 겹친 시각은 첫 번째로 해석한다. 매일·매주·1회가 같은 규칙을 쓴다.
+ */
+export function computeNextRunAt(schedule: AutomationSchedule, from: number): number | null {
   if (schedule.kind === 'interval' || schedule.kind === 'github') return from + schedule.minutes * 60_000
+  if (schedule.kind === 'once') {
+    const [year, month, day] = schedule.date.split('-').map(Number)
+    const at = new Date(year!, month! - 1, day!, schedule.hour, schedule.minute, 0, 0).getTime()
+    return at > from ? at : null
+  }
   const base = new Date(from)
+  if (schedule.kind === 'weekly') {
+    // 오늘 포함 8일이면 고른 요일이 하나뿐이고 오늘 시각이 이미 지났어도 다음 주 같은 요일에 닿는다.
+    for (let offset = 0; offset <= 7; offset++) {
+      // 요일은 그날 정오로 판정한다 — 자정 DST 전환이 있는 시간대에서도 날짜가 바뀌지 않게.
+      const weekday = new Date(base.getFullYear(), base.getMonth(), base.getDate() + offset, 12).getDay()
+      if (!schedule.days.includes(weekday)) continue
+      const candidate = new Date(base.getFullYear(), base.getMonth(), base.getDate() + offset, schedule.hour, schedule.minute, 0, 0).getTime()
+      if (candidate > from) return candidate
+    }
+    return null
+  }
   const candidate = new Date(base.getFullYear(), base.getMonth(), base.getDate(), schedule.hour, schedule.minute, 0, 0)
   // 정확히 그 시각(=from)이면 오늘은 이미 소진 — 같은 시각 재발화를 막는다.
   if (candidate.getTime() <= from) candidate.setDate(candidate.getDate() + 1)

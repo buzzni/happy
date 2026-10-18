@@ -17,6 +17,12 @@ export interface ServerAutomationScheduleState {
   nextRunAt: number
   lastSessionId: string | null
   runRequestRevision?: number | null
+  /**
+   * 1회 예약에서 이미 실행한(claim 성공 또는 서버의 같은 회차 거절) 정규 회차 시각. generation 이 바뀌어도
+   * 넘긴다 — 서버의 같은 회차 거절은 generation 단위라, 이것 없이는 실행 직후의 편집·재개가 그 회차를
+   * 새 generation 으로 다시 claim 한다. 구 데몬 파서는 이 필드를 버릴 뿐 파일을 거부하지 않는다.
+   */
+  spentOnceAt?: number
 }
 
 export interface GithubIssueProgressMarkerState {
@@ -258,6 +264,7 @@ function parse(raw: string): ServerAutomationRuntimeState {
             ? null
             : integer(row.runRequestRevision, 1),
         } : {}),
+        ...(row.spentOnceAt !== undefined ? { spentOnceAt: integer(row.spentOnceAt) } : {}),
       }
     })
     const pendingReports = disk.pendingReports.map(parsePendingReport)

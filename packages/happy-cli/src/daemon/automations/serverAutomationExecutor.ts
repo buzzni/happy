@@ -9,6 +9,7 @@ import {
   computeNextRunAt,
   shouldWakeFromScriptOutput,
   type AutomationAgent,
+  type AutomationSchedule,
 } from './automationDomain'
 import type { EncryptedServerAutomation, ServerAutomationCacheState, ServerAutomationPayload } from './serverAutomationCache'
 import type {
@@ -18,6 +19,7 @@ import type {
   ServerAutomationReportOutcome,
   ServerAutomationRuntimeState,
   ServerAutomationRuntimeStore,
+  ServerAutomationScheduleState,
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
@@ -510,6 +512,53 @@ async function settleReleasedUnreachableRetries(input: ServerAutomationExecutorI
   }
 }
 
+/**
+ * 다시 실행하지 않는 소진된 1회 예약의 nextRunAt. 런타임 상태 파일의 nextRunAt 은 정수로
+ * 남겨야 한다 — 구 데몬 파서는 정수가 아니면 상태 파일 전체를 버려 보류 중인 보고까지 잃는다.
+ * 도달할 수 없는 시각이라 due 판정·claim·재시도 계획이 별도 분기 없이 그대로 동작한다.
+ */
+export const NEVER_RUN_AT = Number.MAX_SAFE_INTEGER
+
+function nextScheduledAt(schedule: AutomationSchedule, from: number): number {
+  return computeNextRunAt(schedule, from) ?? NEVER_RUN_AT
+}
+
+/**
+ * 1회 예약을 새 generation 으로 처음 볼 때 지난 시각을 얼마나 거슬러 실행할지. 동기화(keepAlive 20초)와
+ * 틱(60초) 때문에 시각 직전에 저장한 예약을 시각 뒤에야 처음 볼 수 있다. 서버 claim 창(−90초)보다 짧다.
+ */
+const ONCE_FIRST_SIGHT_GRACE_MS = 60_000
+
+/** 새 generation 의 첫 다음 실행 시각. 서버는 enabledAt 이전 회차를 거절하므로 그 앞으로는 가지 않는다. */
+function firstScheduledAt(
+  schedule: AutomationSchedule,
+  now: number,
+  enabledAt: number,
+  previous: ServerAutomationScheduleState | undefined,
+): number {
+  if (schedule.kind !== 'once') return nextScheduledAt(schedule, Math.max(now, enabledAt))
+  const next = nextScheduledAt(schedule, Math.max(now - ONCE_FIRST_SIGHT_GRACE_MS, enabledAt))
+  // 이미 실행한 회차는 유예로 되살리지 않는다 — 서버의 같은 회차 거절은 generation 단위라 두 번 돈다.
+  return next === previous?.spentOnceAt ? NEVER_RUN_AT : next
+}
+
+/** 1회 예약의 정규 회차(즉시 실행 시각이 아닌)를 실행했으면 기록한다. */
+function markOnceOccurrenceSpent(
+  input: ServerAutomationExecutorInput,
+  automationId: string,
+  payload: ServerAutomationPayload,
+  scheduledFor: number,
+): void {
+  if (payload.schedule.kind !== 'once' || computeNextRunAt(payload.schedule, scheduledFor - 1) !== scheduledFor) return
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((schedule) => schedule.automationId === automationId
+      ? { ...schedule, spentOnceAt: scheduledFor }
+      : schedule),
+  })
+}
+
 function reconcileSchedules(
   cache: ServerAutomationCacheState,
   state: ServerAutomationRuntimeState,
@@ -532,11 +581,9 @@ function reconcileSchedules(
     byId.set(automation.automationId, {
       automationId: automation.automationId,
       generation: automation.generation,
-      nextRunAt: automation.runRequestedAt ?? computeNextRunAt(
-        payload.schedule,
-        Math.max(now, automation.enabledAt),
-      ),
+      nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload.schedule, now, automation.enabledAt, current),
       lastSessionId: null,
+      ...(current?.spentOnceAt !== undefined ? { spentOnceAt: current.spentOnceAt } : {}),
       ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
     })
   }
@@ -602,7 +649,7 @@ function advanceSchedule(
     ...state,
     schedules: state.schedules.map((schedule) => schedule.automationId === automationId ? {
       ...schedule,
-      nextRunAt: computeNextRunAt(payload.schedule, now),
+      nextRunAt: nextScheduledAt(payload.schedule, now),
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
     } : schedule),
   })
@@ -889,7 +936,7 @@ function deferInactiveGithubIssueProgressMarkerCleanup(
   deferGithubIssueProgressMarkerCleanup(
     input,
     markers,
-    computeNextRunAt(payload.schedule, input.now),
+    nextScheduledAt(payload.schedule, input.now),
   )
 }
 
@@ -899,7 +946,7 @@ async function cleanupInactiveGithubIssueProgressMarkers(
   payload: ServerAutomationPayload,
   githubEnvironment?: { GH_TOKEN: string; GH_REPO: string },
 ): Promise<string | undefined> {
-  const cleanupRetryAt = computeNextRunAt(payload.schedule, input.now)
+  const cleanupRetryAt = nextScheduledAt(payload.schedule, input.now)
   const stale = inactiveGithubIssueProgressMarkersDue(input, automation)
   if (stale.length === 0) return undefined
 
@@ -1922,6 +1969,7 @@ export async function runServerAutomationTick(
         scheduledFor: schedule.nextRunAt,
       })
       if (!claim.ok || !claim.value) {
+        if (claim.error === 'already-claimed') markOnceOccurrenceSpent(input, automation.automationId, payload, schedule.nextRunAt)
         if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
           || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
           advanceSchedule(input, automation.automationId, payload, now)
@@ -1931,6 +1979,7 @@ export async function runServerAutomationTick(
         continue
       }
 
+      markOnceOccurrenceSpent(input, automation.automationId, payload, schedule.nextRunAt)
       advanceSchedule(input, automation.automationId, payload, now)
       runId = claim.value.runId as string
       claimToken = claim.value.claimToken as string

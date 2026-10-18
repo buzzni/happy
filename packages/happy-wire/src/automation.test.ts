@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   AutomationApiError,
+  AUTOMATION_SCHEDULE_KINDS,
   automationPayloadSchema,
   githubTriggerSchema,
   automationRunSchema,
@@ -387,5 +388,28 @@ describe('ordinary conversation automations', () => {
   it.each([{ sessionId: '' }, { sessionId: 'x'.repeat(201) }])('rejects malformed conversation targets', (conversation) => { expect(automationPayloadSchema.safeParse({ ...ordinary, conversation }).success).toBe(false); });
   it('does not combine conversation delivery with GitHub triggers', () => {
     expect(automationPayloadSchema.safeParse({ ...ordinary, schedule: { kind: 'github', minutes: 15 }, githubTrigger: { event: 'opened', action: 'start-session', githubCredentialId: null, filter: { baseBranch: null, label: null, excludeDraft: true, authors: [], paths: [] } } }).success).toBe(false);
+  });
+});
+
+describe('once and weekly schedules', () => {
+  const at = (schedule: unknown) => automationPayloadSchema.safeParse({ ...payload, schedule });
+
+  it('accepts a one-time wall-clock date and a weekly day set', () => {
+    expect(at({ kind: 'once', date: '2028-02-29', hour: 9, minute: 0 }).success).toBe(true);
+    expect(at({ kind: 'weekly', days: [1, 3], hour: 23, minute: 59 }).success).toBe(true);
+    expect(AUTOMATION_SCHEDULE_KINDS).toEqual(['interval', 'daily', 'once', 'weekly']);
+  });
+
+  it.each([
+    { kind: 'once', date: '2027-02-29', hour: 9, minute: 0 },
+    { kind: 'once', date: '2026-13-01', hour: 9, minute: 0 },
+    { kind: 'once', date: '2026-1-1', hour: 9, minute: 0 },
+    { kind: 'once', date: '2026-01-01', hour: 24, minute: 0 },
+    { kind: 'weekly', days: [], hour: 9, minute: 0 },
+    { kind: 'weekly', days: [7], hour: 9, minute: 0 },
+    { kind: 'weekly', days: [1, 1], hour: 9, minute: 0 },
+    { kind: 'weekly', days: [1], hour: 9, minute: 60 },
+  ])('rejects a schedule no daemon can place on the calendar: %j', (schedule) => {
+    expect(at(schedule).success).toBe(false);
   });
 });

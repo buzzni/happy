@@ -135,7 +135,7 @@ import {
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { decideTerminalCwd, formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -3314,6 +3314,7 @@ export class ApiMachineClient {
                 sessionFollowup: true,
                 conversation: true,
                 protocolVersion: this.automationProtocolVersion,
+                scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
                 ...this.scriptRuntimeField(),
@@ -4226,6 +4227,8 @@ export class ApiMachineClient {
                         sessionFollowup: true,
                 conversation: true,
                         protocolVersion: this.automationProtocolVersion,
+                        // 새 종류는 서버 자동화 실행기만 계산한다(레거시 RPC 저장소는 받지 않는다).
+                        ...(this.automationServerKeyVersion !== null ? { scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS] } : {}),
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
                         ...this.scriptRuntimeField(),
