@@ -206,6 +206,55 @@ describe('Claude model changes across provider restarts', () => {
         expect(client.failClaudeLaunchTurn).not.toHaveBeenCalled();
     });
 
+    it('logs a failed OAuth refresh to the session log without calling it a logout', async () => {
+        // aplus-dev-studio specs/machine-session-readiness-hardening D2: 2026-10-18 a session failed with this
+        // result while the terminal login worked; nothing recorded it, so the cause stayed a guess.
+        const { logger } = await import('@/ui/logger');
+        const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const order: string[] = [];
+        const client = {
+            sessionId: 'refresh-failed-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(),
+            closeClaudeSessionTurn: vi.fn((status: string) => order.push(`close:${status}`)),
+            failClaudeLaunchTurn: vi.fn(),
+            sendSessionEvent: vi.fn((event: { message?: string }) => order.push(`event:${event.message}`)),
+        };
+        const text = 'Failed to authenticate: OAuth session expired and could not be refreshed';
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const response = (async function* () {
+                for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                    yield { type: 'assistant', parent_tool_use_id: null, error: 'authentication_failed', message: { id: 'm1', model: '<synthetic>', role: 'assistant', type: 'message', content: [{ type: 'text', text }] } };
+                    yield { type: 'result', subtype: 'success', is_error: true, result: text };
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'bypassPermissions', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        const running = claudeRemoteLauncher(session);
+        await vi.waitFor(() => expect(warn.mock.calls.some(([message]) => /OAuth token refresh failed/.test(String(message)))).toBe(true));
+        void handlers.get('switch')!();
+        await running;
+        const logged = warn.mock.calls.map(([message]) => String(message)).find((message) => /OAuth token refresh failed/.test(message))!;
+        warn.mockRestore();
+        expect(logged).toContain(`session process ${process.pid}`);
+        // The raw result text never reaches the log.
+        expect(logged).not.toContain(text);
+        expect(order.some((entry) => entry.startsWith('event:Claude Code is not signed in'))).toBe(false);
+    });
+
     it('records turn latency for a turn held back behind a provider restart', async () => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();

@@ -76,7 +76,7 @@ import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
 import { existsSync, statSync } from 'fs';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
@@ -161,6 +161,7 @@ import {
   type StopSessionResult,
 } from './sessionIdleReaper';
 import { machineIdentityMetadataUpdate } from './machineIdentityMetadata';
+import { listMachineIdTwins } from './machineIdTwins';
 import { agentBrowserMachineCapability, agentBrowserMetadataUpdate, browserTaskLineage, createBrowserTaskSessionBroker, spawnResumedWithBrowserTaskRegistration, startBrowserTaskReconciliation, type BrowserTaskSessionBroker } from './browserTaskBroker';
 import { createHeldBrowserAttentions, findBrowserAttentionSession, startBrowserAttentionWatcher, type HeldBrowserAttention } from './browserAttentionDelivery';
 import {
@@ -850,6 +851,10 @@ export async function startDaemon(): Promise<void> {
       }
       : await authAndSetupMachineIfNeeded();
     const { machineId, serverPublicKey } = authSetup;
+    const machineIdTwins = listMachineIdTwins(configuration.happyHomeDir, machineId);
+    if (machineIdTwins.length > 0) {
+      logger.warn(`[DAEMON RUN] ${machineIdTwins.length} other daemon home(s) next to this one share its machine id: ${machineIdTwins.map((dir) => basename(dir)).join(', ')}. A daemon started from one of them overwrites this daemon's caller-grant key (invalid-envelope).`);
+    }
     // aplus-dev-studio specs/e2ee-machine-control-boundary R4 — before anything
     // can use the machine key, strict mode replaces one the server may hold,
     // and the daemon does not start when it cannot. A managed runtime
