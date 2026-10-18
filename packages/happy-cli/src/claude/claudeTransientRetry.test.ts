@@ -110,6 +110,15 @@ describe('turn observation', () => {
         for (const message of [syntheticError('API Error: 503'), failedResult(503)]) retry.observe(message);
         expect(retry.pendingFailure()).toEqual({ reason: 'server_error', status: 503, hintMs: null });
     });
+
+    it('shouldForgetATurnThatEndedWithoutAResultWhenTheNextOneStarts', () => {
+        const retry = createClaudeTransientRetry<string>({ onState: () => {} });
+        // Answered, then the provider was killed before its result.
+        retry.observe(assistantText);
+        retry.turnStarted();
+        for (const message of [syntheticError('API Error: 503'), failedResult(503)]) retry.observe(message);
+        expect(retry.pendingFailure()).toEqual({ reason: 'server_error', status: 503, hintMs: null });
+    });
 });
 
 describe('createClaudeTransientRetry', () => {

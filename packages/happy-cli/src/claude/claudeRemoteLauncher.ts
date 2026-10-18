@@ -639,7 +639,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             lastResultInterrupted: () => lastResultInterrupted,
         });
         // A dispatched turn has no result yet: an earlier turn's interrupt must not answer for it.
-        const dispatchTurn = () => { lastResultInterrupted = false; drain?.dispatched(); };
+        const dispatchTurn = () => { lastResultInterrupted = false; transientRetry.turnStarted(); drain?.dispatched(); };
 
         // Track session ID to detect when it actually changes
         // This prevents context loss when mode changes (permission mode, model, etc.)
@@ -1118,8 +1118,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         const turnMode = mode ?? lastTurnMode;
                         // Channel requests are terminal after their turn; a managed or run-once turn
                         // answers only its admitted prompt; a note in its place cannot re-run a command.
+                        // Input already waiting replaces it, so it is not announced at all.
                         const retry = transientRetry.afterTurn(turnMode && !lastTurnChannel && !lastTurnCommand
                             && !session.managedRun && !session.exitAfterFirstTurn && !controller.signal.aborted
+                            && !pending && session.queue.size() === 0 && !gracefulStop?.requested()
                             ? { mode: turnMode, hash: modeHash } : null);
                         if (retry) {
                             const notice = retry.kind === 'scheduled'

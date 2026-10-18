@@ -115,6 +115,12 @@ export function createClaudeTransientRetry<Mode>(deps: {
         due: boolean;
     } | null = null;
 
+    const resetTurn = () => {
+        turnProducedOutput = false;
+        turnDeterministicError = false;
+        turnHintMs = null;
+    };
+
     const clearWaiting = (): boolean => {
         if (!waiting) return false;
         clearTimeout(waiting.timer);
@@ -139,9 +145,13 @@ export function createClaudeTransientRetry<Mode>(deps: {
             if (message.type !== 'result') return;
             const failure = turnProducedOutput || turnDeterministicError ? null : classifyClaudeTurnFailure(message);
             lastFailure = failure ? { ...failure, hintMs: turnHintMs } : null;
-            turnProducedOutput = false;
-            turnDeterministicError = false;
-            turnHintMs = null;
+            resetTurn();
+        },
+
+        /** A turn was dispatched: what a turn that ended without a result left behind is not this one's. */
+        turnStarted(): void {
+            resetTurn();
+            lastFailure = null;
         },
 
         /** The retryable failure the last result reported, if any. */

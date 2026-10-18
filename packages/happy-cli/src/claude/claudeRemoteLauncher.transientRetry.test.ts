@@ -177,6 +177,11 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
         await harness.run;
 
         expect(harness.prompts).toEqual(['hello', 'queued while failing']);
+        // Input was already waiting at the turn end: nothing is announced for it to replace.
+        expect(retryStates(harness.client)).toEqual([]);
+        expect(harness.client.sendSessionEvent).not.toHaveBeenCalledWith({
+            type: 'message', message: expect.stringContaining('retrying automatically'),
+        });
     });
 
     it('drops a waiting retry when the user stops the session', async () => {
