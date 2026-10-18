@@ -15,6 +15,16 @@ describe('serverAutomationRuntimeStore', () => {
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
+  it('keeps a spent one-time occurrence across a reload', () => {
+    // 소진 기록을 파서가 버리면 재기동 뒤 편집·재개가 같은 회차를 두 번 실행한다.
+    const store = createServerAutomationRuntimeStore({ filePath: file })
+    store.write({
+      schedules: [{ automationId: 'automation-1', generation: 2, nextRunAt: Number.MAX_SAFE_INTEGER, lastSessionId: null, spentOnceAt: 500 }],
+      pendingReports: [],
+    })
+    expect(createServerAutomationRuntimeStore({ filePath: file }).read().schedules[0]).toMatchObject({ spentOnceAt: 500 })
+  })
+
   it('atomically persists schedule state and pending idempotent reports as owner-only', () => {
     const store = createServerAutomationRuntimeStore({ filePath: file })
     store.write({

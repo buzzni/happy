@@ -4730,17 +4730,53 @@ describe('one-time and weekly schedules (desktop-schedule-kinds)', () => {
 
   it('does not run a spent one-time schedule again when an edit or resume lands right after it ran', async () => {
     // 서버의 같은 회차 거절은 generation 단위라, 새 generation 으로 같은 시각을 claim 하면 두 번 실행된다.
-    const fixture = setup({ generation: 3, claim: { ok: true, value: { runId: 'run-2', claimToken: 'claim-token' } } })
+    const fixture = setup({ claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } })
     const once = justPassedOnce(fixture.now)
     fixture.store.write({ ...fixture.store.read(), schedules: [
-      { automationId: 'automation-1', generation: 2, nextRunAt: NEVER_RUN_AT, lastSessionId: 'session-1' },
+      { automationId: 'automation-1', generation: 2, nextRunAt: once.at, lastSessionId: null },
+    ] })
+    withSchedule(fixture, once.schedule)
+    await runServerAutomationTick(fixture.input)
+    expect(fixture.transport.claim).toHaveBeenCalledTimes(1)
+    expect(fixture.store.state().schedules[0]).toMatchObject({ nextRunAt: NEVER_RUN_AT, spentOnceAt: once.at })
+
+    // 편집·재개가 두 번 이어져도(generation 3 → 4) 소진 기록이 넘어가 같은 회차를 다시 claim 하지 않는다.
+    for (const generation of [3, 4]) {
+      fixture.input.cache = { read: () => ({
+        cursor: 1n, serverTime: fixture.now, syncedAt: fixture.now, pendingAcknowledgements: [],
+        automations: [cacheRecord(generation)],
+      }) }
+      await runServerAutomationTick(fixture.input)
+      expect(fixture.store.state().schedules[0]).toMatchObject({ generation, nextRunAt: NEVER_RUN_AT, spentOnceAt: once.at })
+    }
+    expect(fixture.transport.claim).toHaveBeenCalledTimes(1)
+  })
+
+  it('records a one-time occurrence the server already ran as spent', async () => {
+    const fixture = setup({ claim: { ok: false, error: 'already-claimed' } })
+    const once = justPassedOnce(fixture.now)
+    fixture.store.write({ ...fixture.store.read(), schedules: [
+      { automationId: 'automation-1', generation: 2, nextRunAt: once.at, lastSessionId: null },
     ] })
     withSchedule(fixture, once.schedule)
 
     await runServerAutomationTick(fixture.input)
 
-    expect(fixture.transport.claim).not.toHaveBeenCalled()
-    expect(fixture.store.state().schedules[0]).toMatchObject({ generation: 3, nextRunAt: NEVER_RUN_AT })
+    expect(fixture.store.state().schedules[0]).toMatchObject({ nextRunAt: NEVER_RUN_AT, spentOnceAt: once.at })
+  })
+
+  it('claims a spent one-time schedule re-armed to a time that passed before the daemon saw it', async () => {
+    // 다시 켜기로 1분 안쪽 시각을 골랐는데 동기화가 그 시각을 넘긴 경우 — 이전 회차와 시각이 다르면 유예한다.
+    const fixture = setup({ generation: 3, claim: { ok: true, value: { runId: 'run-2', claimToken: 'claim-token' } } })
+    const once = justPassedOnce(fixture.now)
+    fixture.store.write({ ...fixture.store.read(), schedules: [
+      { automationId: 'automation-1', generation: 2, nextRunAt: NEVER_RUN_AT, lastSessionId: 'session-1', spentOnceAt: once.at - 86_400_000 },
+    ] })
+    withSchedule(fixture, once.schedule)
+
+    await runServerAutomationTick(fixture.input)
+
+    expect(fixture.transport.claim).toHaveBeenCalledWith(expect.objectContaining({ generation: 3, scheduledFor: once.at }))
   })
 
   it('does not reach back before the automation was enabled', async () => {

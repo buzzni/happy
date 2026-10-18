@@ -1579,6 +1579,24 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // 새 일정 종류는 서버 자동화 실행기만 계산한다 — 레거시 RPC 저장소는 받지 않으므로 서버 자동화가 없으면 광고하지 않는다.
+    it('does not advertise the new schedule kinds without server-backed automations', async () => {
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(false));
+        expect(machine.metadata?.automationSupport?.scheduleKinds).toBeUndefined();
+        client.shutdown();
+    });
+
     // Windows 정식 빌드는 세션만 Job 런처로 묶는다. Desktop 이 스크립트·GitHub 트리거를
     // 막을 수 있도록 서버 자동화 광고에 hostCommands:false 를 싣는다.
     it.each([

@@ -536,10 +536,27 @@ function firstScheduledAt(
   enabledAt: number,
   previous: ServerAutomationScheduleState | undefined,
 ): number {
-  // 이전 generation 이 이미 소진(실행 또는 지남)한 1회 예약에는 유예를 주지 않는다. 서버의 같은 회차
-  // 거절은 generation 단위라, 실행 직후의 편집·재개가 같은 시각을 새 generation 으로 claim 하면 두 번 돈다.
-  const grace = schedule.kind === 'once' && previous?.nextRunAt !== NEVER_RUN_AT ? ONCE_FIRST_SIGHT_GRACE_MS : 0
-  return nextScheduledAt(schedule, Math.max(now - grace, enabledAt))
+  if (schedule.kind !== 'once') return nextScheduledAt(schedule, Math.max(now, enabledAt))
+  const next = nextScheduledAt(schedule, Math.max(now - ONCE_FIRST_SIGHT_GRACE_MS, enabledAt))
+  // 이미 실행한 회차는 유예로 되살리지 않는다 — 서버의 같은 회차 거절은 generation 단위라 두 번 돈다.
+  return next === previous?.spentOnceAt ? NEVER_RUN_AT : next
+}
+
+/** 1회 예약의 정규 회차(즉시 실행 시각이 아닌)를 실행했으면 기록한다. */
+function markOnceOccurrenceSpent(
+  input: ServerAutomationExecutorInput,
+  automationId: string,
+  payload: ServerAutomationPayload,
+  scheduledFor: number,
+): void {
+  if (payload.schedule.kind !== 'once' || computeNextRunAt(payload.schedule, scheduledFor - 1) !== scheduledFor) return
+  const state = input.runtimeStore.read()
+  input.runtimeStore.write({
+    ...state,
+    schedules: state.schedules.map((schedule) => schedule.automationId === automationId
+      ? { ...schedule, spentOnceAt: scheduledFor }
+      : schedule),
+  })
 }
 
 function reconcileSchedules(
@@ -566,6 +583,7 @@ function reconcileSchedules(
       generation: automation.generation,
       nextRunAt: automation.runRequestedAt ?? firstScheduledAt(payload.schedule, now, automation.enabledAt, current),
       lastSessionId: null,
+      ...(current?.spentOnceAt !== undefined ? { spentOnceAt: current.spentOnceAt } : {}),
       ...(automation.runRequestedAt == null ? {} : { runRequestRevision: automation.revision }),
     })
   }
@@ -1951,6 +1969,7 @@ export async function runServerAutomationTick(
         scheduledFor: schedule.nextRunAt,
       })
       if (!claim.ok || !claim.value) {
+        if (claim.error === 'already-claimed') markOnceOccurrenceSpent(input, automation.automationId, payload, schedule.nextRunAt)
         if (claim.error === 'claim-denied' || claim.error === 'already-claimed'
           || (claim.error === 'active-run' && schedule.runRequestRevision == null)) {
           advanceSchedule(input, automation.automationId, payload, now)
@@ -1960,6 +1979,7 @@ export async function runServerAutomationTick(
         continue
       }
 
+      markOnceOccurrenceSpent(input, automation.automationId, payload, schedule.nextRunAt)
       advanceSchedule(input, automation.automationId, payload, now)
       runId = claim.value.runId as string
       claimToken = claim.value.claimToken as string
