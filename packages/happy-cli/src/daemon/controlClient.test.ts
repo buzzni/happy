@@ -81,6 +81,27 @@ describe('checkIfDaemonRunningAndCleanupStaleState', () => {
     )
   })
 
+  it('preserves ownership when process liveness cannot be inspected', async () => {
+    const state = stateWithPid(process.pid)
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }) })
+    try {
+      await expect(checkIfDaemonRunningAndCleanupStaleState()).rejects.toThrow('denied')
+      expect(mocks.mockWriteDaemonStateIfUnchanged).not.toHaveBeenCalled()
+    } finally { kill.mockRestore() }
+  })
+
+  it('uses compare-and-swap if the owner exits during the health request', async () => {
+    const state = stateWithPid(process.pid), raw = JSON.stringify(state)
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw })
+    const kill = vi.spyOn(process, 'kill').mockReturnValueOnce(true).mockImplementation(() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }) })
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('connection closed'))
+    try {
+      await expect(checkIfDaemonRunningAndCleanupStaleState()).resolves.toBe(false)
+      expect(mocks.mockWriteDaemonStateIfUnchanged).toHaveBeenCalledWith(raw, { ...state, state: 'crashed', stateReason: 'Daemon PID not running' })
+    } finally { kill.mockRestore(); fetch.mockRestore() }
+  })
+
   it('returns false without writing when there is no state file', async () => {
     mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state: null, raw: null })
 
@@ -104,6 +125,19 @@ describe('checkIfDaemonRunningAndCleanupStaleState', () => {
     } finally {
       fetchSpy.mockRestore()
     }
+  })
+
+  it.each(['timeout', 'connection-refused', 'http-denied'])('preserves a live owner and stops replacement on %s', async (failure) => {
+    const state = stateWithPid(process.pid)
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    if (failure === 'http-denied') fetchSpy.mockResolvedValue({ ok: false, status: 403 } as Response)
+    else fetchSpy.mockRejectedValue(new Error(failure))
+    try {
+      await expect(checkIfDaemonRunningAndCleanupStaleState()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+      expect(mocks.mockClearDaemonState).not.toHaveBeenCalled()
+      expect(mocks.mockWriteDaemonStateIfUnchanged).not.toHaveBeenCalled()
+    } finally { fetchSpy.mockRestore() }
   })
 
   // ADR-061: the control server rejects every request without this header.

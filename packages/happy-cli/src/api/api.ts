@@ -655,8 +655,8 @@ export class ApiClient {
     return new ApiSessionClient(this.bearer(), session, undefined, options);
   }
 
-  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>): ApiMachineClient {
-    return new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment);
+  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState): ApiMachineClient {
+    return new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
   }
 
   /**

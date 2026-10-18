@@ -4,7 +4,7 @@ import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_C
 import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
 import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
-import { deriveServerRpcKey, encodeBase64, encrypt } from './encryption';
+import { deriveServerRpcKey, decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
 import { MachineMetadataSchema, type Machine } from './types';
@@ -217,6 +217,29 @@ describe('ApiMachineClient socket reconnection', () => {
     afterEach(() => {
         vi.useRealTimers();
         vi.restoreAllMocks();
+    });
+
+    it('keeps process identity across external updates and reconnect publication', async () => {
+        const machine = makeMachine();
+        const own = { pid: process.pid, httpPort: 2222, startedAt: 2000, mcpCallerGrantPublicKey: 'current-key' };
+        const old = { pid: 111, httpPort: 1111, startedAt: 1000, mcpCallerGrantPublicKey: 'old-key', status: 'shutting-down' };
+        machine.daemonState = { ...own, status: 'running' };
+        const client = new ApiMachineClient('fake-token', machine);
+        mockSocket.emitWithAck.mockImplementation(async (_event: string, request: any) => ({ result: 'success', version: request.expectedVersion + 1, daemonState: request.daemonState }));
+        client.connect();
+        try {
+            emitSocketEvent('update', { body: { t: 'update-machine', machineId: machine.id,
+                daemonState: { value: encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, old)), version: 10 } } });
+            expect(machine.daemonState).toMatchObject(own);
+            emitSocketEvent('update', { body: { t: 'update-machine', machineId: machine.id,
+                daemonState: { value: encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, { ...old, status: 'stale' })), version: 9 } } });
+            expect(machine.daemonStateVersion).toBe(10);
+            expect(machine.daemonState?.status).toBe('shutting-down');
+            emitSocketEvent('connect');
+            await vi.waitFor(() => expect(machine.daemonStateVersion).toBe(11));
+            const request = mockSocket.emitWithAck.mock.calls.find(([event]: [string]) => event === 'machine-update-state')[1];
+            expect(decrypt(machine.encryptionKey, machine.encryptionVariant, decodeBase64(request.daemonState))).toMatchObject({ ...own, status: 'running' });
+        } finally { client.shutdown(); }
     });
 
     // aplus-dev-studio strict-followup-plan F0-b (daemon 6): an update the machine key cannot open

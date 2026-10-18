@@ -63,6 +63,12 @@ describe('ensureDaemonRunning', () => {
     )
   })
 
+  it('does not spawn a replacement when a live owner has unconfirmed health', async () => {
+    mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockRejectedValue(new Error('DAEMON_HEALTH_UNCONFIRMED'))
+    await expect(ensureDaemonRunning()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
+    expect(mocks.mockSpawnHappyCLI).not.toHaveBeenCalled()
+  })
+
   it('starts the daemon and waits for readiness when the installed version is not running', async () => {
     const mockUnref = vi.fn()
     mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion.mockResolvedValue(false)
