@@ -100,6 +100,10 @@ flowchart TD
 - Ensures auth and machine setup when needed (`authAndSetupMachineIfNeeded`).
 - Starts the daemon or runs an agent directly based on subcommand/context.
 
+## Daemon caller-grant recipient
+
+The daemon's MCP caller-grant public key belongs to its current process. Machine registration seeds it before the API machine client is created; daemon-state updates reapply that recipient on every compare-and-swap retry. A conflict can return the previous process's persisted state, whose public key must not replace the running daemon's recipient: otherwise Desktop seals grants that this daemon cannot open. Revisit this ownership if the grant key is intentionally rotated within one process or runtime attachment stops seeding the current recipient.
+
 ## Local state and configuration
 
 ```mermaid

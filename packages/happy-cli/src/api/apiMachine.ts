@@ -729,6 +729,8 @@ function setupTokenAssignmentKillSwitchEnabled(): boolean {
 
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
+    // A CAS retry reads persisted state from the previous daemon; it must not replace this process's grant recipient.
+    private readonly processMcpCallerGrantPublicKey?: string;
     /** Set when the managed credential ended; suppresses every reconnect. */
     private credentialStopped = false;
     private keepAliveInterval: NodeJS.Timeout | null = null;
@@ -915,6 +917,7 @@ export class ApiMachineClient {
         private readonly deviceKeys?: DeviceKeys,
         private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>
     ) {
+        this.processMcpCallerGrantPublicKey = machine.daemonState?.mcpCallerGrantPublicKey;
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
@@ -3530,7 +3533,8 @@ export class ApiMachineClient {
      */
     async updateDaemonState(handler: (state: DaemonState | null) => DaemonState): Promise<void> {
         await backoff(async () => {
-            const updated = handler(this.machine.daemonState);
+            const updated = { ...handler(this.machine.daemonState), ...(this.processMcpCallerGrantPublicKey
+                ? { mcpCallerGrantPublicKey: this.processMcpCallerGrantPublicKey } : {}) };
 
             const answer = await this.socket.emitWithAck('machine-update-state', {
                 machineId: this.machine.id,
