@@ -354,17 +354,16 @@ describe('lesson update proposals', () => {
         expect(announced[0]).toMatchObject({ updatesLesson: update });
         await rm(h.dir, { recursive: true, force: true });
     });
-    it('files the proposal as a new lesson for a store without update support', async () => {
+    it('refuses an explicit update for a store without update support instead of filing a new lesson', async () => {
         const h = await harness();
-        reviewedAs(h);
-        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, updatesLesson: update } })).toBe('reviewed');
-        expect(h.host.calls.find((call) => call.name === 'enqueueCandidate')!.input.candidate).not.toHaveProperty('updatesLesson');
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, updatesLesson: update } })).toBe('unsupported');
+        expect(h.host.calls.some((call) => call.name === 'enqueueCandidate')).toBe(false);
         await rm(h.dir, { recursive: true, force: true });
     });
     it('refuses a malformed updatesLesson instead of filing a duplicate lesson', async () => {
         const h = await harness();
         (h.deps.host as { supportsLessonUpdates?: boolean }).supportsLessonUpdates = true;
-        for (const bad of [{ lessonId: '', revision: 2 }, { lessonId: 'lesson-1', revision: 0 }, { lessonId: 'lesson-1', revision: 1.5 }, 'lesson-1']) {
+        for (const bad of [{ lessonId: '', revision: 2 }, { lessonId: 'lesson-1', revision: 0 }, { lessonId: 'lesson-1', revision: 1.5 }, 'lesson-1', null]) {
             expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, updatesLesson: bad } })).toBe('invalid_proposal');
         }
         expect(h.host.calls.some((call) => call.name === 'enqueueCandidate')).toBe(false);

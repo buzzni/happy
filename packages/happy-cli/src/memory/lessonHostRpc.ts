@@ -29,6 +29,7 @@ import {
     type LessonBindingIssuer,
 } from './lessonBindingIssuer';
 import type { LessonSettings, LessonSettingsStore } from './lessonSettingsStore';
+import { readUpdateTarget } from './lessonUpdateTarget';
 
 export type LessonHostFailure =
     | 'invalid_request'
@@ -47,6 +48,8 @@ export type LessonHostFailure =
     | 'settings_busy'
     /** A confirmed lesson of this name already exists; a person must decide. */
     | 'merge_required'
+    /** Approving this candidate replaces an existing lesson; the request must confirm which one. */
+    | 'update_confirmation_required'
     | 'candidate_cap_reached'
     | 'evidence_conflict'
     | 'not_found'
@@ -137,6 +140,8 @@ function flattenCandidate(row: unknown): unknown | null {
     // Sibling lessons CML matched against this candidate. Shown before approval
     // so a person can see they are about to duplicate an existing rule.
     const duplicateLessonIds = strings(record.duplicateLessonIds);
+    // The lesson approval would replace. Without it an update reads as a new lesson.
+    const updatesLesson = readUpdateTarget(payload.updatesLesson);
     return {
         candidateId,
         revision,
@@ -156,6 +161,7 @@ function flattenCandidate(row: unknown): unknown | null {
         // deciding on less than the record holds.
         failureModes: strings(payload.failureModes),
         ...(validVersions.length > 0 ? { validVersions } : {}),
+        ...(updatesLesson ? { updatesLesson } : {}),
     };
 }
 
@@ -231,6 +237,9 @@ const MESSAGE_FAILURES: ReadonlyArray<readonly [string, LessonHostFailure]> = [
 
 const CODE_FAILURES: Readonly<Record<string, LessonHostFailure>> = {
     merge_required: 'merge_required',
+    update_confirmation_required: 'update_confirmation_required',
+    lesson_not_found: 'not_found',
+    lesson_revision_conflict: 'revision_conflict',
     candidate_cap_reached: 'candidate_cap_reached',
     evidence_conflict: 'evidence_conflict',
     revision_conflict: 'revision_conflict',
@@ -397,10 +406,15 @@ export function createLessonHostRpc(deps: LessonHostRpcDeps) {
                 }
 
                 case 'approve': {
+                    // Signed with the rest of the request. An app that predates
+                    // updates sends none, and CML refuses to replace a lesson then.
+                    const confirm = readUpdateTarget(request.confirmUpdatesLesson);
+                    if (confirm === null) return { ok: false, reason: 'invalid_request' };
                     await deps.host.service.approveCandidate({
                         version: 1, requestId, binding, generation,
                         candidateId: request.candidateId, expectedRevision: request.expectedRevision,
                         payloadHash: request.payloadHash,
+                        ...(confirm ? { confirmUpdatesLesson: confirm } : {}),
                     });
                     return { ok: true, snapshot: await snapshot(binding, `${requestId}:after`, FIRST_PAGE) };
                 }

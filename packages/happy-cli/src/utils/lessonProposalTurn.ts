@@ -13,7 +13,7 @@ function lessonProposalInstruction(token: string, lessonUpdates: boolean): strin
     return 'If this turn corrects an earlier mistake or verifies recovery from a failure, you may propose one reusable project lesson before finishing. '
         + 'Use mcp__happy__propose_lesson with token="' + token + '" and proposal containing name, trigger, steps (string[]), failureModes (string[]), scope, validation (string[]), reconsiderWhen, and optional validVersions (string[]). '
         + (lessonUpdates
-            ? 'If a project lesson shown or read in this turn covers the same kind of task, revise that lesson instead of adding a new one: send its full revised text with updatesLesson {lessonId, revision} copied from the lesson block or mem-lesson-get. '
+            ? 'If a project lesson shown or read in this turn covers the same kind of task, revise that lesson instead of adding a new one: read it in full with mem-lesson-get, then send its complete revised text with updatesLesson {lessonId, revision} from that lookup. '
             : '')
         + 'Name a new lesson after the kind of task it governs (for example pr-conflict-resolution), never after a PR or issue number, an error string, a date or today\'s task; keep incident detail in a step or failure mode. '
         + 'Only describe procedures actually verified in this turn. Exclude secrets, copied rules, transient environment failures and one-off narratives. '

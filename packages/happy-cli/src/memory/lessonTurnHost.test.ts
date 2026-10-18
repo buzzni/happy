@@ -355,3 +355,14 @@ describe('lesson preview review follow-ups', () => {
         expect(result.ticket.lessonIds).toEqual([uuid(1), uuid(2), uuid(3)]);
     });
 });
+
+// specs/host-lesson-matching-2026-10-18 P0: a proposal that revises a lesson
+// copies its id and revision from the block it was shown.
+describe('lesson revision in the delivered block', () => {
+    it('states each full body revision next to its lesson id', async () => {
+        const { host } = fixture();
+        const result = await host.recall({ turnId: 'rev', query: 'port already bound' });
+        if (result.outcome !== 'selected') throw new Error('expected a selected block');
+        expect(result.block).toContain('[lesson:l] (revision 1)');
+    });
+});

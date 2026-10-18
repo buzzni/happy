@@ -7,6 +7,7 @@ import type { LessonBindingIssuer } from './lessonBindingIssuer';
 import type { LessonHostHandle } from './cmlLessonHost';
 import { LessonSettingsError, type LessonSettingsStore } from './lessonSettingsStore';
 import { evaluateLessonTurn, type LessonTurnRecord } from './lessonTurnEvidence';
+import { readUpdateTarget, type LessonUpdateTarget } from './lessonUpdateTarget';
 
 export type LessonReviewOutcome =
     | 'reviewed'
@@ -67,7 +68,6 @@ export interface LessonReviewWorkerDeps {
     onCandidate?(candidate: LessonCandidateAnnouncement): void;
 }
 
-type LessonUpdateTarget = { lessonId: string; revision: number };
 type CandidatePayload = LessonCandidateAnnouncement['lesson'] & {
     confidence: number;
     skillCandidate: boolean;
@@ -76,19 +76,6 @@ type CandidatePayload = LessonCandidateAnnouncement['lesson'] & {
     updatesLesson?: LessonUpdateTarget;
 };
 
-/**
- * `undefined` when absent; `null` when present but malformed. A malformed
- * target is refused rather than dropped: dropping it would file the revision
- * as a second, near-duplicate lesson.
- */
-function readUpdateTarget(value: unknown): LessonUpdateTarget | null | undefined {
-    if (value === undefined || value === null) return undefined;
-    if (typeof value !== 'object' || Array.isArray(value)) return null;
-    const { lessonId, revision } = value as Record<string, unknown>;
-    if (typeof lessonId !== 'string' || lessonId.trim().length === 0 || lessonId.trim().length > 240) return null;
-    if (typeof revision !== 'number' || !Number.isInteger(revision) || revision < 1) return null;
-    return { lessonId: lessonId.trim(), revision };
-}
 
 /** Shapes the model's proposal into CML's candidate payload, or refuses it. */
 function toCandidate(
@@ -241,6 +228,11 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                 // Bound untrusted model output before passing it into storage.
                 let serialized: string;
                 try { serialized = JSON.stringify(proposal); } catch { return report('invalid_proposal'); }
+                // An explicit revision the installed store cannot apply is refused:
+                // filing it as a new lesson would add exactly the duplicate it meant to avoid.
+                if ((proposal as Record<string, unknown>)?.updatesLesson !== undefined
+                    && readUpdateTarget((proposal as Record<string, unknown>).updatesLesson)
+                    && deps.host.supportsLessonUpdates !== true) return report('unsupported');
                 if (!serialized || Buffer.byteLength(serialized, 'utf8') > 16_384
                     || !toCandidate(proposal, record, [], { lessonUpdates: deps.host.supportsLessonUpdates === true })) return report('invalid_proposal');
                 const plannedRevision = settings.revision;
