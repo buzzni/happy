@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 /**
@@ -21,24 +21,33 @@ export function findMachineIdTwins(input: {
     });
 }
 
+/** A settings file is a few hundred bytes; anything larger, or not a regular file, is not read at startup. */
+const MAX_SETTINGS_BYTES = 64 * 1024;
+
 /** Diagnostic only: an unreadable directory yields no twins rather than failing startup. */
 export function listMachineIdTwins(homeDir: string, machineId: string): string[] {
-    const parent = dirname(homeDir);
-    let names: string[];
+    let home: string;
+    let entries: import('node:fs').Dirent[];
     try {
-        names = readdirSync(parent);
+        home = realpathSync(homeDir);
+        entries = readdirSync(dirname(home), { withFileTypes: true });
     } catch {
         return [];
     }
-    const siblings = names
-        .filter((name) => name.startsWith('.happy') && name !== basename(homeDir))
-        .map((name) => {
-            const dir = join(parent, name);
+    const parent = dirname(home);
+    const siblings = entries
+        // Real directories only: a symlink can point anywhere and is not a copied home.
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith('.happy') && entry.name !== basename(home))
+        .map((entry) => {
+            const dir = join(parent, entry.name);
+            const file = join(dir, 'settings.json');
             try {
-                return { dir, settingsJson: readFileSync(join(dir, 'settings.json'), 'utf8') };
+                const stat = lstatSync(file);
+                if (!stat.isFile() || stat.size > MAX_SETTINGS_BYTES) return { dir, settingsJson: null };
+                return { dir, settingsJson: readFileSync(file, 'utf8') };
             } catch {
                 return { dir, settingsJson: null };
             }
         });
-    return findMachineIdTwins({ homeDir, machineId, siblings });
+    return findMachineIdTwins({ homeDir: home, machineId, siblings });
 }
