@@ -34,3 +34,13 @@ export function claudeNotSignedInNotice(result: { is_error?: unknown; result?: u
         ? CLAUDE_NOT_SIGNED_IN_NOTICE
         : null;
 }
+
+/**
+ * The stored OAuth token could not be refreshed for this turn. Unlike "Not logged in" a retry often
+ * succeeds (concurrent refreshes, a busy keychain), so it is logged for diagnosis, not shown as a logout.
+ */
+export function isClaudeTokenRefreshFailure(result: { is_error?: unknown; result?: unknown }): boolean {
+    return result.is_error === true && typeof result.result === 'string'
+        && /oauth session expired and could not be refreshed/i.test(result.result);
+}
+

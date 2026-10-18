@@ -43,7 +43,7 @@ import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
-import { claudeNotSignedInNotice, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { claudeNotSignedInNotice, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -415,6 +415,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             lastResultInterrupted = result.subtype === 'error_during_execution';
             const notSignedIn = claudeNotSignedInNotice(result);
             if (notSignedIn) session.client.sendSessionEvent({ type: 'message', message: notSignedIn });
+            if (isClaudeTokenRefreshFailure(result)) {
+                logger.warn(`[claude-auth] OAuth token refresh failed this turn (session process ${process.pid}); a retry may succeed. Concurrent refreshes or a locked keychain are the usual causes.`);
+            }
             // Only a successful result carries an answer. A failed one must not leave an earlier
             // candidate standing either — the queue marker with an empty text clears it, and the
             // terminal that follows then reports no answer rather than an old one.

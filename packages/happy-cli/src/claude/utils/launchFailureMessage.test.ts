@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_NOT_SIGNED_IN_NOTICE, claudeNotSignedInNotice, describeClaudeLaunchFailure } from './launchFailureMessage';
+import { CLAUDE_NOT_SIGNED_IN_NOTICE, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
@@ -31,3 +31,17 @@ describe('claudeNotSignedInNotice', () => {
         expect(claudeNotSignedInNotice({ is_error: true })).toBeNull();
     });
 });
+
+// aplus-dev-studio specs/machine-session-readiness-hardening D2: a failed refresh is not a logout and
+// must be findable in the session log.
+describe('isClaudeTokenRefreshFailure', () => {
+    it('recognises the failed OAuth refresh result', () => {
+        expect(isClaudeTokenRefreshFailure({ is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' })).toBe(true);
+    });
+    it('ignores a successful result, a logout and other errors', () => {
+        expect(isClaudeTokenRefreshFailure({ is_error: false, result: 'OAuth session expired and could not be refreshed' })).toBe(false);
+        expect(isClaudeTokenRefreshFailure({ is_error: true, result: 'Not logged in · Please run /login' })).toBe(false);
+        expect(isClaudeTokenRefreshFailure({ is_error: true, result: 'API Error: 401 authentication_error' })).toBe(false);
+    });
+});
+
