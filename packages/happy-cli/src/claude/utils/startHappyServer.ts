@@ -1,3 +1,4 @@
+import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
 /**
@@ -514,6 +515,7 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
+        agentControl?: boolean;
         checkpointReader?: CheckpointAgentReader;
         exitAfterFirstTurn?: boolean;
         /** Set by the daemon for a Studio Chat(beta) session (HAPPY_AUTOMATION_BROWSER_CONTINUATION). */
@@ -639,6 +641,7 @@ export async function startHappyServer(
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         throw error;
     });
+    const agentBroker = options.agentControl ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool) : null;
     const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string } = socketPath
         ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs')], env: {
             SAYCODE_MCP_SOCKET: socketPath,
@@ -657,6 +660,7 @@ export async function startHappyServer(
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {
             logger.debug(`[happyMCP] server:stop sessionId=${client.sessionId}`);
+            void agentBroker?.close();
             server.close(() => { if (privateDir) rmSync(privateDir, { recursive: true, force: true }); });
             server.closeAllConnections();
         }

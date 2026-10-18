@@ -725,6 +725,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const lessonProposalTurn = createLessonProposalTurn();
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        agentControl: principal.kind === 'account' && sandboxPolicyMode !== 'mandatory',
         exitAfterFirstTurn,
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         mandatorySandbox: sandboxPolicyMode === 'mandatory',
