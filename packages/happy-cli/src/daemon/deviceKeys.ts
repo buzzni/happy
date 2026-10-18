@@ -46,8 +46,12 @@ async function readKeys(directory: string, machineId: string): Promise<DeviceKey
  * Missing/corrupt keys require explicit re-enrollment; this does not load or preserve an old approval.
  * The caller supplies HAPPY_HOME and the authenticated local machine ID, never a remote path.
  */
-/** The per-machine key directory under HAPPY_HOME; org pins and assignment state live beside keys.json. */
-export const deviceDirectory = (home: string, machineId: string) => join(home, 'device-' + createHash('sha256').update(machineId).digest('hex'));
+/** The per-machine key directory under HAPPY_HOME; org pins and assignment state live beside keys.json.
+ * Short because Desktop's homes are already deep on Windows (%LOCALAPPDATA%\Saycode-Secrets-<SID>\machine-links\machines\<64 hex>)
+ * and the ACL check opens every entry, which fails past MAX_PATH. 64 bits of the hash: one machine per home. */
+export const deviceDirectory = (home: string, machineId: string) => join(home, 'd-' + createHash('sha256').update(machineId).digest('hex').slice(0, 16));
+/** CLI ≤ 1.1.10-aplus.339 named it device-<64 hex>; migrateLegacyDeviceState renames it. */
+export const legacyDeviceDirectoryName = (machineId: string) => 'device-' + createHash('sha256').update(machineId).digest('hex');
 
 export async function loadOrCreateDeviceKeys(home: string, machineId: string): Promise<DeviceKeys> {
     if (!isAbsolute(home) || !machineId || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(machineId) || /[\u0000-\u001f\u007f-\u009f]/.test(machineId)) throw reapproval(new Error('invalid key home or machine id'));

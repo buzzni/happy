@@ -1,18 +1,18 @@
 import { constants } from 'node:fs';
-import { open, link, lstat, readdir, readFile, unlink } from 'node:fs/promises';
+import { open, link, lstat, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { canonicalOrgSetupTokenJson, verifyOrgSetupTokenDocument, type OrgSetupTokenDocument } from '@slopus/happy-wire';
-import { deviceDirectory, type DeviceKeys } from './deviceKeys';
+import { deviceDirectory, legacyDeviceDirectoryName, type DeviceKeys } from './deviceKeys';
 import { protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 
 export type DeviceOrgPin = { publicKey: string; approval: OrgSetupTokenDocument };
 const schema = z.object({ version: z.literal(1), policy: z.literal('signed-required'), publicKey: z.string().regex(/^[A-Za-z0-9_-]{43}$/), approval: z.unknown() }).strict();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 /** Windows PowerShell ACL checks open every entry of the device directory and cannot open a path past MAX_PATH.
- * The deepest Desktop root is C:\ProgramData\Saycode-Secrets-<SID>\machine-links\machines\<64 hex>\device-<64 hex>,
- * about 241 chars with a 50-char SID, so every entry name stays within this budget. */
+ * The deepest Desktop root is %LOCALAPPDATA%\Saycode-Secrets-<SID>\machine-links\machines\<64 hex>\d-<16 hex>, about 229 chars
+ * with a 50-char SID and a 32-char profile folder, so every entry name stays within this budget. */
 export const DEVICE_ENTRY_NAME_BUDGET = 16;
 /** Per-company state in the device directory: 32 bits of the company hash. A collision only fails closed, because
  * the stored approval and assignment statements name their company and are re-checked on read. */
@@ -29,11 +29,19 @@ export type LegacyDeviceStateRename = { name: string; outcome: 'renamed' | 'dupl
  * existing short one is set aside under a short name no store opens (left in place it would fail every start), and
  * anything that is not a plain file of pin size is left alone so the directory check still fails closed. */
 export async function migrateLegacyDeviceState(home: string, machineId: string): Promise<LegacyDeviceStateRename[]> {
-    const directory = deviceDirectory(home, machineId);
+    const directory = deviceDirectory(home, machineId), results: LegacyDeviceStateRename[] = [];
+    const missing = (error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; };
+    // The directory first: under the deepest roots its legacy name alone pushed keys.json past MAX_PATH. A rename keeps
+    // keys.json, so the approval still matches. Not a real directory, or a short one already there: leave it alone.
+    const legacyName = legacyDeviceDirectoryName(machineId), legacy = await lstat(join(home, legacyName)).catch(missing);
+    if (legacy) {
+        const moved = legacy.isDirectory() && !legacy.isSymbolicLink() && !await lstat(directory).catch(missing);
+        if (moved) await rename(join(home, legacyName), directory);
+        results.push({ name: legacyName, outcome: moved ? 'renamed' : 'skipped' });
+    }
     let names: string[];
     try { names = await readdir(directory); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
-    const results: LegacyDeviceStateRename[] = [];
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return results; throw error; }
     for (const name of names) {
         const match = LEGACY_LONG_NAME.exec(name), temp = LEGACY_TEMP_NAME.test(name);
         if (!match && !temp) continue;
