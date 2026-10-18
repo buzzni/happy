@@ -519,6 +519,8 @@ export class ApiSessionClient extends EventEmitter {
     private readonly automationTurns = new AutomationTurnTracker();
     /** A temporary API failure is waiting to be retried by the engine (specs claude-transient-retry). */
     private transientRetryPending = false;
+    /** The waiting retry was just dispatched, so its turn answers a carried scheduled run. */
+    private transientRetryDispatched = false;
     /**
      * Set only when the caller says so.
      *
@@ -1567,9 +1569,28 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
-    /** Whether the engine is waiting to retry a temporary API failure by itself. */
+    /**
+     * Whether the engine is waiting to retry a temporary API failure by itself. A wait that ends
+     * without the retry being dispatched (stopped, replaced, given up) leaves a carried scheduled
+     * run with no turn to settle it, so it is settled as the failure it was.
+     */
     setTransientRetryPending(pending: boolean): void {
         this.transientRetryPending = pending;
+        if (pending) {
+            this.transientRetryDispatched = false;
+            return;
+        }
+        // The launcher says whether the retry runs right after clearing the wait.
+        setTimeout(() => {
+            if (this.transientRetryPending || this.transientRetryDispatched) return;
+            const settled = this.automationTurns.userInput();
+            if (settled) this.reportAutomationTurn(settled);
+        }, 0);
+    }
+
+    /** The waiting retry is being sent now; its turn settles any carried scheduled run. */
+    noteTransientRetryDispatched(): void {
+        this.transientRetryDispatched = true;
     }
 
     sendFinalAnswerForChannelTurn(text: string): void {

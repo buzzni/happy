@@ -1683,6 +1683,32 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
     });
 
+    it('settles a carried scheduled failure when its automatic retry is dropped without running', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.onUserMessage(vi.fn());
+        mockNotifyDaemonAutomationTurnResult.mockClear();
+        (client as any).routeIncomingMessage({ role: 'user', content: { type: 'text', text: 'Report' }, localKey: 'happy-automation:run-11', meta: { sentFrom: 'automation' } });
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-1' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'failed' }, { turn: 'turn-1' }));
+        client.setTransientRetryPending(true);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        // The retry ran: the carried run waits for its turn.
+        client.setTransientRetryPending(false);
+        client.noteTransientRetryDispatched();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(mockNotifyDaemonAutomationTurnResult).not.toHaveBeenCalled();
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 'turn-2' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-end', status: 'failed' }, { turn: 'turn-2' }));
+        client.setTransientRetryPending(true);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        // Stopped or gave up: nothing runs, so the run is the failure it was.
+        client.setTransientRetryPending(false);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(mockNotifyDaemonAutomationTurnResult).toHaveBeenCalledExactlyOnceWith('test-session-id', {
+            runId: 'run-11', status: 'failed', finalAnswer: null, silent: false,
+        });
+    });
+
     it('preserves effort in user message metadata after schema parsing', async () => {
         const client = new ApiSessionClient('fake-token', session);
         const onUserMessage = vi.fn();

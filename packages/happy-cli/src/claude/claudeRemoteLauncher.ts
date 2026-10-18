@@ -908,6 +908,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             const due = transientRetry.takeDue();
                             // Cancelled rather than due: keep waiting for the user.
                             if (!due) continue;
+                            session.client.noteTransientRetryDispatched();
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
                             messageQueue.enqueue(pendingRequestItem(null));
                             lastTurnChannel = false;

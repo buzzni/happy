@@ -36,6 +36,10 @@ const DELIVERED_KEEP_MS = 7 * 24 * 60 * 60_000
 const KEPT_ENTRIES_MAX = 200
 const TURN_FAILED = 'TURN_FAILED'
 const UNKNOWN_FAILURE = 'AUTOMATION_FAILED'
+const CLOSED_CODE = /^[A-Z][A-Z0-9_]{0,63}$/
+/** A turn can end before its run is recorded as started; such results wait this long, in memory. */
+const EARLY_RESULT_MS = 5 * 60_000
+const EARLY_RESULTS_MAX = 50
 
 export interface AutomationFailureIncident {
   signature: string
@@ -69,7 +73,9 @@ export interface AutomationDeliveryRequest {
 export type AutomationDeliveryOutcome = 'sent' | 'failed' | 'unknown' | 'unsupported'
 
 export function failureSignature(failureCode: string | null | undefined): string {
-  return failureCode ? failureCode.replace(/_AFTER_\d+_RETRIES$/, '') : UNKNOWN_FAILURE
+  const code = failureCode?.replace(/_AFTER_\d+_RETRIES$/, '')
+  // Only a closed code is a signature; anything else would also be refused by the ledger.
+  return code && CLOSED_CODE.test(code) ? code : UNKNOWN_FAILURE
 }
 
 export function decideFailureAlert(
@@ -220,6 +226,10 @@ export function createAutomationDeliveryCoordinator(deps: {
       outcome = 'unknown'
     }
     deps.logDebug?.(`[automation-delivery] run=${runId} ${kind} ${outcome}`)
+    // Definitely not sent: the key is released. Only an ambiguous send keeps it, so it is never repeated.
+    if (outcome === 'failed' || outcome === 'unsupported') {
+      update((state) => ({ ...state, delivered: state.delivered.filter((entry) => entry.key !== dedupeKey) }))
+    }
     return outcome
   }
 
@@ -233,13 +243,34 @@ export function createAutomationDeliveryCoordinator(deps: {
     if (!payload || !target) return 'skipped'
     const now = deps.now()
     const { decision, incident } = decideFailureAlert(deps.store.read().incidents[automationId], signature, now)
-    update((state) => ({ ...state, incidents: { ...state.incidents, [automationId]: incident } }))
     if (decision === 'withhold') return 'skipped'
     const repeatHours = decision === 'repeat' ? Math.round((now - incident.firstAt) / (60 * 60_000)) : undefined
-    return deliver(target, 'failure', runId, buildAutomationDeliveryText({
+    const outcome = await deliver(target, 'failure', runId, buildAutomationDeliveryText({
       kind: 'failure', locale: payload.delivery?.locale, name: payload.name, code: signature, repeatHours,
     }))
+    // Only an alert that may have reached the person starts the quiet period; an unsent one is retried next failure.
+    if (outcome === 'sent' || outcome === 'unknown') {
+      update((state) => ({ ...state, incidents: { ...state.incidents, [automationId]: incident } }))
+    }
+    return outcome
   }
+
+  const finishTurn = async (
+    entry: { runId: string; automationId: string },
+    result: AutomationTurnResult,
+  ): Promise<AutomationDeliveryOutcome | 'skipped'> => {
+    if (result.status === 'cancelled') return 'skipped'
+    const payload = deps.payloadFor(entry.automationId)
+    if (result.status === 'failed') return alertFailure(entry.automationId, entry.runId, payload, TURN_FAILED)
+    closeIncident(entry.automationId)
+    const target = resultTarget(payload)
+    if (!payload || !target || result.silent || !result.finalAnswer) return 'skipped'
+    return deliver(target, 'result', entry.runId, buildAutomationDeliveryText({
+      kind: 'result', locale: payload.delivery?.locale, name: payload.name, answer: result.finalAnswer,
+    }))
+  }
+
+  const early = new Map<string, { sessionId: string; result: AutomationTurnResult; at: number }>()
 
   return {
     runFailed: ({ automationId, runId, payload, failureCode }) =>
@@ -250,6 +281,13 @@ export function createAutomationDeliveryCoordinator(deps: {
         closeIncident(automationId)
         return
       }
+      const arrived = early.get(runId)
+      early.delete(runId)
+      if (arrived && arrived.sessionId === sessionId && deps.now() - arrived.at < EARLY_RESULT_MS) {
+        void finishTurn({ runId, automationId }, arrived.result)
+          .catch((error) => deps.logDebug?.(`[automation-delivery] run=${runId} early result not handled: ${error}`))
+        return
+      }
       update((state) => ({
         ...state,
         awaiting: [...state.awaiting.filter((entry) => entry.runId !== runId), { runId, automationId, sessionId, at: deps.now() }],
@@ -258,17 +296,14 @@ export function createAutomationDeliveryCoordinator(deps: {
 
     async turnFinished({ sessionId, result }) {
       const entry = deps.store.read().awaiting.find((item) => item.runId === result.runId && item.sessionId === sessionId)
-      if (!entry) return 'skipped'
+      if (!entry) {
+        // Possibly a turn that ended before its run was recorded as started; `runStarted` picks it up.
+        if (early.size >= EARLY_RESULTS_MAX) early.delete(early.keys().next().value!)
+        early.set(result.runId, { sessionId, result, at: deps.now() })
+        return 'skipped'
+      }
       update((state) => ({ ...state, awaiting: state.awaiting.filter((item) => item.runId !== entry.runId) }))
-      if (result.status === 'cancelled') return 'skipped'
-      const payload = deps.payloadFor(entry.automationId)
-      if (result.status === 'failed') return alertFailure(entry.automationId, entry.runId, payload, TURN_FAILED)
-      closeIncident(entry.automationId)
-      const target = resultTarget(payload)
-      if (!payload || !target || result.silent || !result.finalAnswer) return 'skipped'
-      return deliver(target, 'result', entry.runId, buildAutomationDeliveryText({
-        kind: 'result', locale: payload.delivery?.locale, name: payload.name, answer: result.finalAnswer,
-      }))
+      return finishTurn(entry, result)
     },
   }
 }

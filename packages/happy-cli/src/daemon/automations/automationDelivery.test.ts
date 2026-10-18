@@ -1,5 +1,5 @@
 import type { AutomationDelivery } from '@slopus/happy-wire'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   AUTOMATION_FAILURE_REPEAT_MS,
@@ -25,20 +25,22 @@ function payload(delivery: AutomationDelivery | undefined, name = 'Morning repor
   } as ServerAutomationPayload
 }
 
-function harness(options: { delivery?: AutomationDelivery; outcome?: 'sent' | 'failed' | 'unknown' } = {}) {
+function harness(options: { delivery?: AutomationDelivery; outcome?: 'sent' | 'failed' | 'unknown' | 'unsupported' } = {}) {
   let state: AutomationDeliveryState = { version: 1, incidents: {}, delivered: [], awaiting: [] }
   let now = 1_000_000
   const sent: AutomationDeliveryRequest[] = []
   let current = payload(options.delivery ?? { version: 1, locale: 'en', result: target, failure: 'same' })
+  const h = { outcome: options.outcome ?? 'sent' as 'sent' | 'failed' | 'unknown' | 'unsupported' }
   const coordinator = createAutomationDeliveryCoordinator({
     machineId: 'machine-1',
     store: { read: () => state, write: (next) => { state = JSON.parse(JSON.stringify(next)) } },
     payloadFor: () => current,
-    send: async (request) => { sent.push(request); return options.outcome ?? 'sent' },
+    send: async (request) => { sent.push(request); return h.outcome },
     now: () => now,
   })
   return {
     coordinator, sent,
+    setOutcome: (outcome: typeof h.outcome) => { h.outcome = outcome },
     state: () => state,
     advance: (ms: number) => { now += ms },
     setPayload: (next: ServerAutomationPayload) => { current = next },
@@ -58,6 +60,8 @@ describe('failureSignature', () => {
     expect(failureSignature('GRANT_EXCHANGE_FAILED_AFTER_3_RETRIES')).toBe('GRANT_EXCHANGE_FAILED')
     expect(failureSignature('GRANT_EXCHANGE_FAILED')).toBe('GRANT_EXCHANGE_FAILED')
     expect(failureSignature(null)).toBe('AUTOMATION_FAILED')
+    // Not a closed code: never a signature the ledger would refuse to store.
+    expect(failureSignature('connect ECONNREFUSED')).toBe('AUTOMATION_FAILED')
   })
 })
 
@@ -177,6 +181,29 @@ describe('createAutomationDeliveryCoordinator', () => {
     await h.fail('run-3')
     h.coordinator.runStarted({ automationId: 'automation-1', runId: 'run-4', payload: payload(undefined), sessionId: 'session-1', awaitsTurn: true })
     expect(h.state()).toMatchObject({ incidents: {}, awaiting: [] })
+  })
+
+  it('does not start the quiet day with an alert that was never sent', async () => {
+    const h = harness({ outcome: 'unsupported' })
+    await h.fail('run-1')
+    expect(h.state().incidents).toEqual({})
+    h.setOutcome('failed')
+    await h.fail('run-2')
+    h.setOutcome('sent')
+    await h.fail('run-3')
+    expect(h.sent.map((request) => request.dedupeKey)).toEqual(['run-1:failure', 'run-2:failure', 'run-3:failure'])
+    expect(h.state().incidents['automation-1']).toMatchObject({ signature: 'GRANT_EXCHANGE_FAILED' })
+    await h.fail('run-4')
+    expect(h.sent).toHaveLength(3)
+  })
+
+  it('keeps a turn result that arrives before its run is recorded as started', async () => {
+    const h = harness()
+    await h.finish('run-1', 'completed', 'Fast answer.')
+    expect(h.sent).toEqual([])
+    h.start('run-1')
+    await vi.waitFor(() => expect(h.sent.map((request) => request.dedupeKey)).toEqual(['run-1:result']))
+    expect(h.state().awaiting).toEqual([])
   })
 
   it('never sends the same alert twice, even when the send was ambiguous', async () => {
