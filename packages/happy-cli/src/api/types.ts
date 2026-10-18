@@ -596,4 +596,21 @@ export type AgentState = {
     }
   }
   agentGoalStatus?: AgentGoalStatus
+  /** A turn waiting to retry after a temporary API failure; `null` once it ran or was cancelled. */
+  transientRetry?: AgentTransientRetry | null
+}
+
+/**
+ * Saycode specs/claude-transient-retry — what a client needs to show a countdown. `retryAt` in the
+ * past means a runtime that stopped while waiting left it behind; treat it as gone.
+ */
+export type AgentTransientRetry = {
+  provider: 'claude'
+  attempt: number
+  maxAttempts: number
+  reason: 'overloaded' | 'server_error' | 'timeout' | 'network'
+  /** HTTP status of the final failure; `null` when no response arrived (connection, timeout). */
+  status: number | null
+  scheduledAt: number
+  retryAt: number
 }
