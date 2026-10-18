@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { open, link, lstat, readdir, readFile, rename, unlink } from 'node:fs/promises';
+import { open, link, lstat, readdir, readFile, rename, rmdir, unlink } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -31,13 +31,17 @@ export type LegacyDeviceStateRename = { name: string; outcome: 'renamed' | 'dupl
 export async function migrateLegacyDeviceState(home: string, machineId: string): Promise<LegacyDeviceStateRename[]> {
     const directory = deviceDirectory(home, machineId), results: LegacyDeviceStateRename[] = [];
     const missing = (error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; };
-    // The directory first: under the deepest roots its legacy name alone pushed keys.json past MAX_PATH. A rename keeps
-    // keys.json, so the approval still matches. Not a real directory, or a short one already there: leave it alone.
-    const legacyName = legacyDeviceDirectoryName(machineId), legacy = await lstat(join(home, legacyName)).catch(missing);
+    // The directory first: under the deepest roots its legacy name alone pushed keys.json past MAX_PATH. Only a directory
+    // with a published keys.json carries an approval; a rename keeps it, so the approval still matches. An empty one is an
+    // initialization that never finished and is removed. Anything else (a link, a partial init, a short one already there)
+    // is left alone; while approved keys stay there, loadOrCreateDeviceKeys refuses to mint new ones.
+    const legacyName = legacyDeviceDirectoryName(machineId), legacyPath = join(home, legacyName), legacy = await lstat(legacyPath).catch(missing);
     if (legacy) {
-        const moved = legacy.isDirectory() && !legacy.isSymbolicLink() && !await lstat(directory).catch(missing);
-        if (moved) await rename(join(home, legacyName), directory);
-        results.push({ name: legacyName, outcome: moved ? 'renamed' : 'skipped' });
+        const real = legacy.isDirectory() && !legacy.isSymbolicLink(), keys = real && !!await lstat(join(legacyPath, 'keys.json')).catch(missing);
+        const outcome = !real ? 'skipped' : !keys ? ((await readdir(legacyPath)).length === 0 ? 'removed' : 'skipped') : await lstat(directory).catch(missing) ? 'skipped' : 'renamed';
+        if (outcome === 'removed') await rmdir(legacyPath);
+        if (outcome === 'renamed') await rename(legacyPath, directory);
+        results.push({ name: legacyName, outcome });
     }
     let names: string[];
     try { names = await readdir(directory); }

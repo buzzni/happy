@@ -58,6 +58,9 @@ export async function loadOrCreateDeviceKeys(home: string, machineId: string): P
     const root = await lstat(home);
     if (!root.isDirectory() || root.isSymbolicLink() || (process.platform !== 'win32' && (root.uid !== process.getuid?.() || (root.mode & 0o022) !== 0))) throw reapproval(new Error('key home is not a private directory'));
     const directory = deviceDirectory(home, machineId);
+    // Approved keys still under the legacy name (their rename failed or has not run): minting new ones would orphan them.
+    const legacyKeys = await lstat(join(home, legacyDeviceDirectoryName(machineId), 'keys.json')).then(() => true, (error: NodeJS.ErrnoException) => error.code !== 'ENOENT');
+    if (legacyKeys && !await lstat(directory).then(() => true, () => false)) throw reapproval(new Error('legacy device key directory not migrated'));
     let created = false;
     try { await mkdir(directory, { mode: 0o700 }); created = true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }

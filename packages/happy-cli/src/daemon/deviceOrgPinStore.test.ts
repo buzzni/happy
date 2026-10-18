@@ -130,7 +130,7 @@ it('moves a legacy device-<64 hex> directory to the short name with its keys and
  expect(await createDeviceOrgPinStore(f.deps).get('company')).toMatchObject({...f.candidate,policy:'signed-required'});
 });
 it('leaves a legacy device directory alone when the short one already exists',async()=>{
- const f=await fixture();const legacyName='device-'+createHash('sha256').update('machine').digest('hex');await mkdir(join(f.deps.home,legacyName));
+ const f=await fixture();const legacyName='device-'+createHash('sha256').update('machine').digest('hex');await mkdir(join(f.deps.home,legacyName));await writeFile(join(f.deps.home,legacyName,'keys.json'),'{}');
  expect(await migrateLegacyDeviceState(f.deps.home,'machine')).toEqual([{name:legacyName,outcome:'skipped'}]);
  expect(await readdir(f.deps.home)).toContain(legacyName);
 });
@@ -138,4 +138,23 @@ it.skipIf(process.platform==='win32')('does not move a legacy device directory t
  const home=await mkdtemp(join(tmpdir(),'device-pin-'));homes.push(home);const target=await mkdtemp(join(tmpdir(),'device-target-'));homes.push(target);
  const legacyName='device-'+createHash('sha256').update('machine').digest('hex');await symlink(target,join(home,legacyName));
  expect(await migrateLegacyDeviceState(home,'machine')).toEqual([{name:legacyName,outcome:'skipped'}]);
+});
+// An initialization that never published keys.json (e.g. its ACL check failed under the LocalAppData root) carries no
+// approval. Moving it onto the short name would make every later key load wait for a keys.json that never comes.
+it('removes an empty legacy device directory so fresh keys can be created under the short name',async()=>{
+ const home=await mkdtemp(join(tmpdir(),'device-pin-'));homes.push(home);const legacyName='device-'+createHash('sha256').update('machine').digest('hex');await mkdir(join(home,legacyName));
+ expect(await migrateLegacyDeviceState(home,'machine')).toEqual([{name:legacyName,outcome:'removed'}]);
+ await expect(loadOrCreateDeviceKeys(home,'machine')).resolves.toBeTruthy();
+});
+it('leaves a legacy device directory without keys.json but with other files, and still creates fresh keys',async()=>{
+ const home=await mkdtemp(join(tmpdir(),'device-pin-'));homes.push(home);const legacyName='device-'+createHash('sha256').update('machine').digest('hex');await mkdir(join(home,legacyName));await writeFile(join(home,legacyName,'.keys.tmp'),'partial');
+ expect(await migrateLegacyDeviceState(home,'machine')).toEqual([{name:legacyName,outcome:'skipped'}]);
+ await expect(loadOrCreateDeviceKeys(home,'machine')).resolves.toBeTruthy();
+});
+// If the rename failed, minting new keys would orphan the approved ones for good; fail closed so the next start retries.
+it('refuses to create new keys while approved keys are still under the legacy directory',async()=>{
+ const f=await fixture();const legacyName='device-'+createHash('sha256').update('machine').digest('hex');await rename(f.directory,join(f.deps.home,legacyName));
+ const error=await loadOrCreateDeviceKeys(f.deps.home,'machine').then(()=>null,(failure:Error)=>failure);
+ expect(error?.message).toMatch(/reapproval/i);expect((error?.cause as Error|undefined)?.message).toMatch(/not migrated/);
+ expect(await readdir(f.deps.home)).not.toContain(basename(f.directory));
 });
