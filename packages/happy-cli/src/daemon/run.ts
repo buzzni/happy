@@ -3940,7 +3940,7 @@ export async function startDaemon(): Promise<void> {
     const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);
     if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
       store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }) });
-    const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined);
+    const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({
       apiMachine,

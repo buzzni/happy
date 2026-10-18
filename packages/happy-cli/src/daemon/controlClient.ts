@@ -327,7 +327,8 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
   // Check if the PID is alive
   try {
     process.kill(state.pid, 0);
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
     logger.debug('[DAEMON RUN] Daemon PID not running, marking state as crashed');
     // Guarded write: `ensureDaemonRunning()` calls us every 100ms while a daemon is
     // coming up, so the daemon may have claimed the file between our read and here.
@@ -340,8 +341,9 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
     return false;
   }
 
-  // PID is alive, but on Windows PIDs get reused after reboot.
-  // Verify it's actually our daemon by HTTP pinging its control server.
+  // A live PID is not proof of health, but an HTTP timeout is not proof of death.
+  // Preserve its ownership until it exits; otherwise a slow daemon and its replacement
+  // can both publish different process keys for the same machine.
   if (state.httpPort) {
     try {
       const response = await fetch(`http://127.0.0.1:${state.httpPort}/list`, {
@@ -357,11 +359,16 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
         return true;
       }
     } catch {
-      // HTTP check failed - the PID is not our daemon (likely reused by OS after reboot)
-      logger.debug(`[DAEMON RUN] PID ${state.pid} is alive but HTTP health check failed on port ${state.httpPort}, cleaning up stale state`);
-      await cleanupDaemonState();
-      return false;
+      // Recheck after the await: a daemon that actually exited may use the existing
+      // compare-and-swap cleanup, never an unguarded clear of a newer owner's lock.
+      try { process.kill(state.pid, 0); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+          writeDaemonStateIfUnchanged(raw, { ...state, state: 'crashed', stateReason: 'Daemon PID not running' });
+          return false;
+        }
+      }
     }
+    throw new Error(`DAEMON_HEALTH_UNCONFIRMED: PID ${state.pid} is alive but its control server could not be verified; state and lock were preserved`);
   }
 
   return true;

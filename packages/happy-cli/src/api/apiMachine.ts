@@ -729,8 +729,6 @@ function setupTokenAssignmentKillSwitchEnabled(): boolean {
 
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
-    // A CAS retry reads persisted state from the previous daemon; it must not replace this process's grant recipient.
-    private readonly processMcpCallerGrantPublicKey?: string;
     /** Set when the managed credential ended; suppresses every reconnect. */
     private credentialStopped = false;
     private keepAliveInterval: NodeJS.Timeout | null = null;
@@ -911,14 +909,23 @@ export class ApiMachineClient {
     /** When the socket was last known to be down. Null only while connected. */
     private disconnectedSince: number | null = null;
 
+    /** Process identity is not replicated state: a server conflict can contain the previous daemon. */
+    private readonly processState: Readonly<Pick<DaemonState, 'pid' | 'httpPort' | 'startedAt' | 'mcpCallerGrantPublicKey'>>;
+
     constructor(
         private token: string,
         private machine: Machine,
         private readonly deviceKeys?: DeviceKeys,
-        private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>
+        private readonly deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>,
+        processState: DaemonState | null = machine.daemonState,
     ) {
-        this.processMcpCallerGrantPublicKey = machine.daemonState?.mcpCallerGrantPublicKey;
         this.setupTokenAssignmentRecipient = createSetupTokenAssignmentRecipient(deviceKeys?.recipient.secretKey);
+        this.processState = Object.freeze({
+            pid: process.pid,
+            httpPort: processState?.httpPort,
+            startedAt: processState?.startedAt ?? Date.now(),
+            mcpCallerGrantPublicKey: processState?.mcpCallerGrantPublicKey,
+        });
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
             scopePrefix: this.machine.id,
@@ -3527,14 +3534,19 @@ export class ApiMachineClient {
         });
     }
 
+    private acceptDaemonState(state: DaemonState | null, version: number): void {
+        if (!state || version < this.machine.daemonStateVersion) return;
+        this.machine.daemonState = { ...state, ...this.processState };
+        this.machine.daemonStateVersion = version;
+    }
+
     /**
      * Update daemon state (runtime info) - similar to session updateAgentState
      * Simplified without lock - relies on backoff for retry
      */
     async updateDaemonState(handler: (state: DaemonState | null) => DaemonState): Promise<void> {
         await backoff(async () => {
-            const updated = { ...handler(this.machine.daemonState), ...(this.processMcpCallerGrantPublicKey
-                ? { mcpCallerGrantPublicKey: this.processMcpCallerGrantPublicKey } : {}) };
+            const updated = { ...handler(this.machine.daemonState), ...this.processState };
 
             const answer = await this.socket.emitWithAck('machine-update-state', {
                 machineId: this.machine.id,
@@ -3543,13 +3555,11 @@ export class ApiMachineClient {
             });
 
             if (answer.result === 'success') {
-                this.machine.daemonState = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(answer.daemonState));
-                this.machine.daemonStateVersion = answer.version;
+                this.acceptDaemonState(decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(answer.daemonState)), answer.version);
                 logger.debug('[API MACHINE] Daemon state updated successfully');
             } else if (answer.result === 'version-mismatch') {
                 if (answer.version > this.machine.daemonStateVersion) {
-                    this.machine.daemonStateVersion = answer.version;
-                    this.machine.daemonState = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(answer.daemonState));
+                    this.acceptDaemonState(decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(answer.daemonState)), answer.version);
                 }
                 throw new Error('Daemon state version mismatch'); // Triggers retry
             }
@@ -3660,8 +3670,7 @@ export class ApiMachineClient {
                 ...state,
                 status: 'running',
                 pid: process.pid,
-                httpPort: this.machine.daemonState?.httpPort,
-                startedAt: Date.now()
+                ...this.processState
             }));
             void this.registerAutomationKey().catch((error) => {
                 logger.debug(`[API MACHINE] Failed to register automation key: ${error}`);
@@ -4082,8 +4091,7 @@ export class ApiMachineClient {
                     if (daemonState === null) {
                         logger.debug('[API MACHINE] Ignored a daemon state update this machine key cannot open');
                     } else {
-                        this.machine.daemonState = daemonState as Machine['daemonState'];
-                        this.machine.daemonStateVersion = update.daemonState.version;
+                        this.acceptDaemonState(daemonState as DaemonState, update.daemonState.version);
                     }
                 }
             } else {
