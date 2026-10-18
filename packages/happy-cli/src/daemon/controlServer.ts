@@ -26,6 +26,7 @@ import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
+import type { AutomationTurnResult } from '@/api/automationTurnTracker';
 
 /**
  * The only control-server paths a managed runtime may serve, and even these
@@ -99,6 +100,7 @@ export function startDaemonControlServer({
   requestShutdown,
   onHappySessionWebhook,
   onHappySessionRuntime = () => {},
+  onAutomationTurnResult = () => {},
   portRegistry,
   browserBridge,
   allowedRoot = homedir(),
@@ -129,6 +131,12 @@ export function startDaemonControlServer({
     runtime: Partial<SessionRuntimeState> & { updatedAt: number },
     reporter?: { hostPid?: number },
   ) => void;
+  /**
+   * The turn that answered a scheduled prompt (Saycode specs/automation-result-delivery D1). Not a
+   * managed report path: a managed child holds no bearer for it, so a managed runtime never
+   * delivers. Only the cut answer travels (`automationTurnTracker`).
+   */
+  onAutomationTurnResult?: (sessionId: string, result: AutomationTurnResult) => void;
   portRegistry: PortRegistry;
   browserBridge?: BrowserBridge;
   /** `/terminal` PTY cwd fallback boundary (decideTerminalCwd) — same value
@@ -356,6 +364,24 @@ export function startDaemonControlServer({
 
       onHappySessionWebhook(sessionId, metadata, encryptionData);
 
+      return { status: 'ok' as const };
+    });
+
+    typed.post('/session-automation-turn', {
+      bodyLimit: 16_384,
+      schema: {
+        body: z.object({
+          sessionId: z.string().min(1).max(200),
+          runId: z.string().min(1).max(200),
+          status: z.enum(['completed', 'failed', 'cancelled']),
+          // Code points are cut to 1,500 upstream; UTF-16 can count a pair twice.
+          finalAnswer: z.string().max(3_000).nullable(),
+          silent: z.boolean(),
+        }).strict(),
+      },
+    }, async (request) => {
+      const { sessionId, ...result } = request.body;
+      onAutomationTurnResult(sessionId, result);
       return { status: 'ok' as const };
     });
 

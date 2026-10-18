@@ -413,3 +413,32 @@ describe('once and weekly schedules', () => {
     expect(at(schedule).success).toBe(false);
   });
 });
+
+describe('messenger delivery settings (Saycode specs/automation-result-delivery)', () => {
+  const ordinary = { name: 'Report', schedule: { kind: 'interval', minutes: 15 }, prompt: 'Report', directory: '/chat', scriptCommand: null, suppressSilent: false, agent: 'claude', conversation: { sessionId: 'chat-session' } };
+  const target = { machineId: 'machine-1', connectionId: 'connection-1', grantKey: 'g'.repeat(43) };
+
+  it('keeps a delivery choice so the daemon can see where to send', () => {
+    const delivery = { version: 1, locale: 'ko', result: target, failure: 'same' };
+    expect(automationPayloadSchema.parse({ ...ordinary, delivery }).delivery).toEqual(delivery);
+    expect(automationPayloadSchema.parse({ ...ordinary, delivery: { version: 1, result: null, failure: target } }).delivery)
+      .toEqual({ version: 1, result: null, failure: target });
+  });
+
+  it('drops a delivery it cannot read instead of refusing to run the automation', () => {
+    for (const delivery of [
+      { version: 2, result: target, failure: null },
+      { version: 1, result: { ...target, grantKey: '' }, failure: null },
+      { version: 1, result: target, failure: 'elsewhere' },
+      'all',
+    ]) {
+      const parsed = automationPayloadSchema.safeParse({ ...ordinary, delivery });
+      expect(parsed.success).toBe(true);
+      expect(parsed.success && parsed.data.delivery).toBeUndefined();
+    }
+  });
+
+  it('leaves payloads without a delivery choice exactly as they were', () => {
+    expect(automationPayloadSchema.parse(ordinary)).toEqual(ordinary);
+  });
+});

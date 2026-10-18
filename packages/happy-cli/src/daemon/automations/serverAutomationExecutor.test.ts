@@ -4607,6 +4607,67 @@ describe('unreachable pre-model retry', () => {
     expect(f.spawnSession).toHaveBeenCalledTimes(1)
     expect(f.transport.claim).toHaveBeenCalledTimes(2)
   })
+
+  // specs/automation-result-delivery R7 — 보류 중인 실패는 알리지 않고, 최종 실패가 확정될 때만 한 번 알린다.
+  function withDelivery(f: ReturnType<typeof retrySetup>) {
+    const delivery = { runFailed: vi.fn(async () => 'sent' as const), runStarted: vi.fn() }
+    f.input.delivery = delivery
+    return delivery
+  }
+
+  it('tells delivery about a failure only once it is final, after the retries ran', async () => {
+    const f = retrySetup(120, { serverReachable: false })
+    const delivery = withDelivery(f)
+    for (const offset of [0, 1, 2]) await f.tickAt(offset * MINUTE)
+    expect(delivery.runFailed).not.toHaveBeenCalled()
+
+    await f.tickAt(LEASE - 90_000)
+    expect(delivery.runFailed).toHaveBeenCalledTimes(1)
+    expect(delivery.runFailed).toHaveBeenCalledWith(expect.objectContaining({
+      automationId: 'automation-1', runId: 'run-1', failureCode: 'GRANT_EXCHANGE_FAILED_AFTER_3_RETRIES',
+      payload: expect.objectContaining({ name: 'name' }),
+    }))
+    expect(delivery.runStarted).not.toHaveBeenCalled()
+  })
+
+  it('tells delivery about a held failure when it is settled instead of retried', async () => {
+    const f = retrySetup()
+    const delivery = withDelivery(f)
+    await f.tickAt(0)
+    const cache = f.input.cache.read()
+    f.input.cache.read = () => ({ ...cache, automations: [{ ...cacheRecord(), paused: true }] })
+
+    await f.tickAt(MINUTE)
+    await f.tickAt(2 * MINUTE)
+    expect(delivery.runFailed).toHaveBeenCalledTimes(1)
+    expect(delivery.runFailed).toHaveBeenCalledWith(expect.objectContaining({ automationId: 'automation-1', runId: 'run-1', failureCode: 'GRANT_EXCHANGE_FAILED' }))
+  })
+
+  it('tells delivery a conversation run started and waits for its turn', async () => {
+    const f = retrySetup()
+    const delivery = withDelivery(f)
+    f.resolveMcpSpawnContext.mockResolvedValue({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
+    const base = f.input.decryptPayload(cacheRecord(), new Uint8Array(32))
+    f.input.decryptPayload = () => ({ ...base, conversation: { sessionId: 'ordinary' } })
+    f.input.deliverConversation = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' }))
+
+    await f.tickAt(0)
+    expect(delivery.runStarted).toHaveBeenCalledWith(expect.objectContaining({
+      automationId: 'automation-1', runId: 'run-1', sessionId: 'ordinary', awaitsTurn: true,
+    }))
+    expect(delivery.runFailed).not.toHaveBeenCalled()
+  })
+
+  it('keeps reporting the run when delivery itself breaks', async () => {
+    const f = retrySetup(1)
+    f.input.delivery = {
+      runFailed: vi.fn(async () => { throw new Error('ledger unwritable') }),
+      runStarted: vi.fn(() => { throw new Error('ledger unwritable') }),
+    }
+    await expect(f.tickAt(0)).resolves.toEqual([{ automationId: 'automation-1', outcome: 'ERROR' }])
+    expect(f.transport.report).toHaveBeenCalledTimes(1)
+  })
+
 })
 
 describe('pending report queue', () => {

@@ -60,6 +60,8 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
     const client = {
         sessionId: 'happy-session-1',
         rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+        setTransientRetryPending: vi.fn(),
+        noteTransientRetryDispatched: vi.fn(),
         updateAgentState: vi.fn((update: (current: Record<string, unknown>) => Record<string, unknown>) => {
             Object.assign(agentState, update({ ...agentState }));
         }),
@@ -132,6 +134,9 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
             expect.objectContaining({ attempt: 2 }),
             null,
         ]);
+        // A scheduled run's failed turn waits for the retry (specs/automation-result-delivery).
+        expect(harness.client.setTransientRetryPending.mock.calls).toEqual([[true], [false], [true], [false]]);
+        expect(harness.client.noteTransientRetryDispatched).toHaveBeenCalledTimes(2);
         expect(harness.client.sendSessionEvent).toHaveBeenCalledWith({
             type: 'message', message: expect.stringContaining('retrying automatically'),
         });

@@ -298,6 +298,75 @@ describe('createChannelHostSupervisor', () => {
         await expect(pending).resolves.toEqual({ error: 'CHANNEL_HOST_UNAVAILABLE', code: 'CHANNEL_HOST_UNAVAILABLE' });
     });
 
+    // Saycode specs/automation-result-delivery D3 — asking the host to send a scheduled result.
+    const deliverRequest = {
+        v: 1 as const, connectionId: 'connection-1', grantKey: 'grant-1', kind: 'result' as const,
+        text: 'Morning report', dedupeKey: 'run-1:result',
+    };
+
+    it('advertises delivery only for a host that says it can deliver', async () => {
+        const supervisor = make();
+        supervisor.start();
+        children[0].send({ ...ready, deliver: 1 });
+        await flush();
+        expect(advertisements).toEqual([{ ...advertisement, deliver: 1 }]);
+        expect(supervisor.canDeliver()).toBe(true);
+    });
+
+    it('never asks an older host to deliver, since it would drop the message without an answer', async () => {
+        const supervisor = make();
+        expect(supervisor.canDeliver()).toBe(false);
+        await expect(supervisor.deliver(deliverRequest)).resolves.toBe('unsupported');
+        supervisor.start();
+        children[0].send(ready);
+        await flush();
+        await expect(supervisor.deliver(deliverRequest)).resolves.toBe('unsupported');
+        expect(children[0].written.filter((line) => line.t === 'deliver')).toEqual([]);
+    });
+
+    it('sends a delivery and returns the host outcome, reading only closed values', async () => {
+        const supervisor = make();
+        supervisor.start();
+        children[0].send({ ...ready, deliver: 1 });
+        await flush();
+        const sent = supervisor.deliver(deliverRequest);
+        await flush();
+        const line = children[0].written.find((entry) => entry.t === 'deliver')!;
+        expect(line).toEqual({ t: 'deliver', id: expect.any(String), request: deliverRequest });
+        children[0].send({ t: 'deliver-result', id: line.id, status: 'sent' });
+        await expect(sent).resolves.toBe('sent');
+
+        const refused = supervisor.deliver({ ...deliverRequest, dedupeKey: 'run-2:result' });
+        await flush();
+        const second = children[0].written.filter((entry) => entry.t === 'deliver')[1]!;
+        children[0].send({ t: 'deliver-result', id: second.id, status: 'refused', code: 'TARGET_GONE' });
+        await expect(refused).resolves.toBe('failed');
+        expect(logs).toContain('deliver-refused:TARGET_GONE');
+
+        // A host whose runtime has not opened yet is not there to send: the caller may try again.
+        const early = supervisor.deliver({ ...deliverRequest, dedupeKey: 'run-3:result' });
+        await flush();
+        const third = children[0].written.filter((entry) => entry.t === 'deliver')[2]!;
+        children[0].send({ t: 'deliver-result', id: third.id, status: 'refused', code: 'NOT_READY' });
+        await expect(early).resolves.toBe('unsupported');
+    });
+
+    it('treats a delivery whose answer never came as possibly sent', async () => {
+        const supervisor = make();
+        supervisor.start();
+        children[0].send({ ...ready, deliver: 1 });
+        await flush();
+        const late = supervisor.deliver(deliverRequest);
+        await flush();
+        await vi.advanceTimersByTimeAsync(30_000);
+        await expect(late).resolves.toBe('unknown');
+
+        const dying = supervisor.deliver(deliverRequest);
+        await flush();
+        children[0].exit();
+        await expect(dying).resolves.toBe('unknown');
+    });
+
     it('answers host requests with the handler value or its closed code', async () => {
         handleRequest.mockImplementation(async (method: string) => {
             if (method === 'dek') throw new ChannelHostRequestError('SESSION_UNKNOWN');
