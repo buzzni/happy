@@ -6,7 +6,9 @@
  * process: it sends `init` first — on stdin only, because argv and the environment are readable by
  * other processes — turns `ready`/`unavailable` into the `channelHost` advertisement, relays sealed
  * settings calls, answers the host's requests, restarts a crashed child with a backoff, and stops
- * it on request. There is never more than one child: a restart is scheduled only from the previous
+ * it on request. It also carries the daemon's own `deliver` requests — a scheduled run's result or
+ * failure for a paired conversation (Saycode specs/automation-result-delivery) — but only to a host
+ * whose `ready` said it understands them: an older host drops an unknown message without answering. There is never more than one child: a restart is scheduled only from the previous
  * child's exit.
  *
  * Nothing the host sends or receives is logged. Settings calls are sealed to the host's key and the
@@ -22,6 +24,7 @@ import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 
 import type { MachineMetadata } from '@/api/types';
+import type { AutomationDeliveryOutcome, AutomationDeliveryRequest } from '@/daemon/automations/automationDelivery';
 import { scrubSessionLineageEnv } from '@/daemon/sessionEnv';
 
 export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
@@ -119,6 +122,10 @@ export interface ChannelHostSupervisor {
     stop(): Promise<void>;
     /** The `channel-host:call` machine RPC. Never throws. */
     call(params: unknown): Promise<ChannelHostCallResult>;
+    /** Whether the running host said it can deliver. */
+    canDeliver(): boolean;
+    /** Asks the host to send one delivery. Never throws; an answer that never came is `unknown`. */
+    deliver(request: AutomationDeliveryRequest): Promise<AutomationDeliveryOutcome>;
 }
 
 const MIN_NODE: readonly [number, number] = [22, 13];
@@ -195,8 +202,13 @@ function readAdvertisement(message: Record<string, unknown>): ChannelHostAdverti
     if (custody !== 'available') return null;
     if (isolation !== 'available' && isolation !== 'unavailable') return null;
     if (!Array.isArray(providers) || !providers.every((provider) => typeof provider === 'string')) return null;
-    return { protocolVersion: CHANNEL_HOST_PROTOCOL_VERSION, custody, isolation, providers: [...providers], hostKey, fingerprint };
+    return {
+        protocolVersion: CHANNEL_HOST_PROTOCOL_VERSION, custody, isolation, providers: [...providers], hostKey, fingerprint,
+        ...(message.deliver === 1 ? { deliver: 1 as const } : {}),
+    };
 }
+
+const DELIVERY_STATUSES = new Set<AutomationDeliveryOutcome>(['sent', 'failed', 'unknown']);
 
 const closed = (code: string) => ({ error: code, code });
 
@@ -212,19 +224,23 @@ export function createChannelHostSupervisor(deps: {
     custodyRetryMs?: number;
     stopGraceMs?: number;
     settingsTimeoutMs?: number;
+    deliverTimeoutMs?: number;
 }): ChannelHostSupervisor {
     const restartDelay = deps.restartDelayMs ?? { initial: 1_000, max: 60_000 };
     const custodyRetryMs = deps.custodyRetryMs ?? 3_600_000;
     const stopGraceMs = deps.stopGraceMs ?? 10_000;
     const settingsTimeoutMs = deps.settingsTimeoutMs ?? 30_000;
+    const deliverTimeoutMs = deps.deliverTimeoutMs ?? 30_000;
 
     type Running = {
         child: ChannelHostChild;
         startedAt: number;
         ready: boolean;
+        canDeliver: boolean;
         unavailableReason: string | null;
         exited: Promise<void>;
         pending: Map<string, (result: ChannelHostCallResult) => void>;
+        deliveries: Map<string, (outcome: AutomationDeliveryOutcome) => void>;
     };
 
     let running: Running | null = null;
@@ -242,6 +258,7 @@ export function createChannelHostSupervisor(deps: {
 
     const setReady = (target: Running, advertisement: ChannelHostAdvertisement | undefined) => {
         target.ready = advertisement !== undefined;
+        target.canDeliver = advertisement?.deliver === 1;
         deps.onAdvertisement(advertisement);
     };
 
@@ -287,6 +304,19 @@ export function createChannelHostSupervisor(deps: {
             target.pending.delete(message.id);
             const wire = readSealedWire(message.wire);
             resolve(wire ? { wire } : closed('CHANNEL_HOST_INVALID_RESULT'));
+        } else if (message.t === 'deliver-result' && isNonEmptyString(message.id)) {
+            const resolve = target.deliveries.get(message.id);
+            if (!resolve) return;
+            target.deliveries.delete(message.id);
+            const status = message.status as AutomationDeliveryOutcome;
+            if (DELIVERY_STATUSES.has(status)) {
+                resolve(status);
+                return;
+            }
+            // A refusal proves nothing was sent; only its closed code is kept.
+            const code = typeof message.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(message.code) ? message.code : 'UNKNOWN';
+            deps.log(`deliver-refused:${code}`);
+            resolve('failed');
         } else if (message.t === 'request' && isNonEmptyString(message.id)) {
             void answerRequest(target, message.id, message.method, message.params);
         }
@@ -326,9 +356,11 @@ export function createChannelHostSupervisor(deps: {
             child,
             startedAt: Date.now(),
             ready: false,
+            canDeliver: false,
             unavailableReason: null,
             exited: new Promise<void>((resolve) => { markExited = resolve; }),
             pending: new Map(),
+            deliveries: new Map(),
         };
         running = target;
         deps.log('started');
@@ -343,6 +375,9 @@ export function createChannelHostSupervisor(deps: {
                 if (target.ready) setReady(target, undefined);
                 for (const resolve of target.pending.values()) resolve(closed('CHANNEL_HOST_UNAVAILABLE'));
                 target.pending.clear();
+                // The host may have sent it before it died.
+                for (const resolve of target.deliveries.values()) resolve('unknown');
+                target.deliveries.clear();
                 // A child that ran a whole backoff ceiling was healthy; its crash starts over.
                 if (Date.now() - target.startedAt >= restartDelay.max) nextDelay = restartDelay.initial;
                 if (target.unavailableReason && PERMANENT_UNAVAILABLE_REASONS.has(target.unavailableReason)) {
@@ -422,6 +457,26 @@ export function createChannelHostSupervisor(deps: {
                     resolve(result);
                 });
                 write(target, { t: 'settings', id, wire });
+            });
+        },
+
+        canDeliver: () => Boolean(running?.ready && running.canDeliver),
+
+        async deliver(request) {
+            const target = running;
+            if (!target || !target.ready || !target.canDeliver) return 'unsupported';
+            const id = `d${(sequence += 1)}`;
+            return new Promise<AutomationDeliveryOutcome>((resolve) => {
+                const timer = setTimeout(() => {
+                    target.deliveries.delete(id);
+                    resolve('unknown');
+                }, deliverTimeoutMs);
+                timer.unref?.();
+                target.deliveries.set(id, (outcome) => {
+                    clearTimeout(timer);
+                    resolve(outcome);
+                });
+                write(target, { t: 'deliver', id, request });
             });
         },
     };

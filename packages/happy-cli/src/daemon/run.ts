@@ -252,6 +252,8 @@ import {
   trustedServerAutomationPayload,
 } from './automations/serverAutomationCache';
 import { createServerAutomationRuntimeStore } from './automations/serverAutomationRuntimeStore';
+import { createAutomationDeliveryCoordinator, type AutomationDeliveryOutcome, type AutomationDeliveryRequest } from './automations/automationDelivery';
+import { createAutomationDeliveryStore } from './automations/automationDeliveryStore';
 import { fetchAutomationProjectEnvironment } from './automations/automationProjectEnvironment';
 import {
   runServerAutomationTick,
@@ -3607,6 +3609,30 @@ export async function startDaemon(): Promise<void> {
     const serverAutomationRuntimeStore = createServerAutomationRuntimeStore({
       filePath: configuration.serverAutomationsRuntimeFile,
     });
+    // Saycode specs/automation-result-delivery — results and failure alerts for a paired messenger
+    // conversation. The channel host started further down sends them; until then nothing can.
+    let automationDeliverySend: ((request: AutomationDeliveryRequest) => Promise<AutomationDeliveryOutcome>) | null = null;
+    const automationDelivery = createAutomationDeliveryCoordinator({
+      machineId,
+      store: createAutomationDeliveryStore({ filePath: join(configuration.happyHomeDir, 'automation-delivery.json') }),
+      payloadFor: (automationId) => {
+        const automation = serverAutomationCache.read().automations.find((item) => item.automationId === automationId);
+        if (!automation) return null;
+        try {
+          return trustedServerAutomationPayload(automation, {
+            machineSecretKey: machineAutomationKey.secretKey,
+            trust: payloadTrust,
+            machineId,
+            onUnauthenticated: () => recordUnauthenticated(`automation ${automation.automationId}@${automation.revision}`),
+          });
+        } catch {
+          return null;
+        }
+      },
+      send: (request) => automationDeliverySend?.(request) ?? Promise.resolve('unsupported' as const),
+      now: () => Date.now(),
+      logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+    });
     const storedAutomations = automationStore.list();
     const rebasedAutomations = rebaseAutomationsOnLaunch(storedAutomations, Date.now());
     // 참조가 그대로면 rebase 대상이 없었다는 뜻 — 쓰지 않는다. 자동화를 쓰지 않는
@@ -3793,6 +3819,10 @@ export async function startDaemon(): Promise<void> {
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
       onHappySessionRuntime,
+      onAutomationTurnResult: (sessionId, result) => {
+        void automationDelivery.turnFinished({ sessionId, result })
+          .catch((error) => logger.debug(`[DAEMON RUN] [automation-delivery] turn result not handled: ${error}`));
+      },
       portRegistry,
       browserBridge,
       browserLocalSetup,
@@ -4588,6 +4618,7 @@ export async function startDaemon(): Promise<void> {
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
       runTick: () => runServerAutomationTick({
         hostCommandsAllowed: !standaloneWindows,
+        delivery: automationDelivery,
         cache: serverAutomationCache,
         runtimeStore: serverAutomationRuntimeStore,
         machineSecretKey: machineAutomationKey.secretKey,
@@ -4941,6 +4972,8 @@ export async function startDaemon(): Promise<void> {
         handleRequest: (method, params) => channelHostSessions.handle(method, params),
         log: (code) => logger.debug(`[channel-host] ${code}`),
       });
+      const host = channelHost;
+      automationDeliverySend = (request) => host.deliver(request);
     } else if (channelHostEntry) {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
