@@ -577,12 +577,38 @@ describe('managed Claude setup-token runtime', () => {
     expect(installs(calls)).toEqual([])
   })
 
-  it('never takes over a personally imported slot with the same synthetic email', async () => {
-    const { runtime, state, calls } = fakeMachine([stored(A, 1, fakeToken('personal'))], 2)
+  it('never takes over a personally imported slot with the same synthetic email but no managed metadata', async () => {
+    const { credentialType: _t, managedAccountId: _m, displayName: _d, credentialGeneration: _g, ...bare } = stored(A, 1, fakeToken('personal'))
+    const { runtime, state, calls } = fakeMachine([bare as Slot], 2)
     // 2026-10-12 hmrepo: the conflict did not say which check refused, so the daemon log could not tell a takeover from a stale journal.
     await expect(runtime.groupSync(sync(1, payload(managed(A, 2, fakeToken('org')))))).rejects.toMatchObject({ message: expect.stringContaining('AI_GROUP_CREDENTIAL_CONFLICT'), failureCause: 'not-owned' })
     expect(state.slots[0]!.credentials).toEqual(managed(A, 1, fakeToken('personal')).credentials)
     expect(calls.some(call => call.args[0] === 'import')).toBe(false)
+  })
+
+  // Saycode specs/claude-setup-token-managed-sync R1/R2: a slot in the managed format is organization material, not personal:
+  // the assignment that desires it owns it again after its journal was lost, and replaces it by generation.
+  it('re-acquires a managed-format slot after the group journal was lost and replaces it by generation', async () => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { runtime, state, files } = fakeMachine([personal], 1)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('one')))))
+    files.delete(join('/home', 'operator', '.happy', 'ai-credential-groups.json'))
+    await expect(runtime.groupSync(sync(2, payload(managed(A, 2, fakeToken('two')))))).resolves.toMatchObject({ reconciled: true,
+      appliedCredentials: [{ managedAccountId: A, credentialGeneration: 2 }] })
+    expect(state.slots).toEqual([personal, expect.objectContaining({ managedAccountId: A, credentialGeneration: 2, credentials: managed(A, 2, fakeToken('two')).credentials })])
+    // Owned again: the next assignment change replaces it.
+    await runtime.groupSync(sync(3, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', B])
+  })
+
+  it.each(['replace', 'merge'] as const)('keeps its managed setup-tokens owned through a manual OAuth %s apply and still revokes them', async applyMode => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const { runtime, state } = fakeMachine([personal], 1)
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('one')))))
+    // The manual apply invalidates the group journal first; whether its own import then succeeds does not matter here.
+    await runtime.apply({ provider: 'claude', applyMode, payload: payload() }).catch(() => undefined)
+    await expect(runtime.groupSync(sync(2, null))).resolves.toMatchObject({ reconciled: true })
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com'])
   })
 
   // Saycode specs/claude-setup-token-managed-sync R3: a refused apply must not have imported its new accounts first.

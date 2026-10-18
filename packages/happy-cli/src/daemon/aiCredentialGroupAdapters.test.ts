@@ -4,7 +4,7 @@ import { basename, join } from 'node:path'
 import { execFile as exec,execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { describe,expect,it,vi } from 'vitest'
-import { createGroupProviderAdapters,groupAccountIdentity } from './aiCredentialGroupAdapters'
+import { createGroupProviderAdapters,groupAccountIdentity,legacyClaudeIdentity } from './aiCredentialGroupAdapters'
 import { createCredentialGroupSync } from './aiCredentialGroups'
 import type { AiCredentialRuntimeDependencies } from './aiCredentialRuntime'
 
@@ -32,6 +32,21 @@ describe('provider group custody removal',()=>{
     expect(apply).toHaveBeenCalledTimes(2)
     expect(accounts).toEqual([account])
     expect(await groups.receipt('company','claude')).toMatchObject({reconciled:true})
+  })
+  it('lists only slots in the managed setup-token format, reading the export only when a synthetic email is installed',async()=>{
+    const managedAccountId='11111111-1111-4111-8111-111111111111',bareId='22222222-2222-4222-8222-222222222222'
+    const email=(id:string)=>`managed-${id}@setup-token.local`
+    const listed=[{number:1,email:'personal@example.test'}]
+    const exported=[{email:'personal@example.test',credentialType:'setup_token',managedAccountId},
+      {email:email(managedAccountId),credentialType:'setup_token',managedAccountId},{email:email(bareId)},
+      {email:email(bareId).replace('2222-4222','3333-4333'),credentialType:'setup_token',managedAccountId:bareId}]
+    const execFile=vi.fn(async(_command:string,args:string[])=>({stdout:JSON.stringify(args[0]==='list'?{accounts:listed,activeAccountNumber:1}:{version:1,encrypted:false,accounts:exported}),stderr:''}))
+    const adapter=createGroupProviderAdapters({homeDir:'/fixture',env:{},execFile} as unknown as AiCredentialRuntimeDependencies)
+    expect(await adapter.managedInstalled('claude')).toEqual([])
+    expect(execFile.mock.calls.some(([,args])=>args[0]==='export')).toBe(false)
+    listed.push({number:2,email:email(managedAccountId)})
+    expect(await adapter.managedInstalled('claude')).toEqual([{identity:groupAccountIdentity('claude',{email:email(managedAccountId)}),aliases:[legacyClaudeIdentity(email(managedAccountId))]}])
+    expect(await adapter.managedInstalled('codex')).toEqual([])
   })
   it('keeps a live personal Claude OAuth identity in the snapshot without a pool slot',async()=>{
     const account={email:'personal@example.test',organizationUuid:'personal-org'}

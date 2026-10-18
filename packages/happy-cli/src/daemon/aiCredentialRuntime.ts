@@ -1735,7 +1735,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   const groups = createCredentialGroupSync({
     read: async () => { try { return await deps.readFile(groupJournalPath) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error } },
     write: async content => { await deps.mkdir(join(deps.homeDir, '.happy'), { recursive: true, mode: 0o700 }); await deps.chmod(join(deps.homeDir, '.happy'), 0o700); await writeAtomicFile(deps, groupJournalPath, content) },
-    snapshot: groupAdapters.snapshot, incoming: groupPayloadIdentities, remove: groupAdapters.remove, appliedMachineId: deps.machineId,
+    snapshot: groupAdapters.snapshot, managedInstalled: groupAdapters.managedInstalled, incoming: groupPayloadIdentities, remove: groupAdapters.remove, appliedMachineId: deps.machineId,
     managedIdentities: (selected, payload) => selected !== 'claude' ? [] : (JSON.parse(payload).accounts as Array<Record<string, unknown>>)
       .filter(account => account?.credentialType === 'setup_token' && typeof account.managedAccountId === 'string')
       .map(account => setupTokenGroupIdentity(account.managedAccountId as string)),

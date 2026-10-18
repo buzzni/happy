@@ -8,6 +8,17 @@ function setup() {
   const input=(generation:number,payload:string|null,scope='company')=>({version:1 as const,provider:'claude' as const,scope,userId:'user',generation,fingerprint:String(generation).padStart(64,'a'),payload})
   return {deps,installed,sync,input,restart:()=>createCredentialGroupSync(deps)}
 }
+/** Org-managed setup-tokens are the `managed-*` identities; `metadata` holds the local slots that carry managed metadata. */
+function managedSetup() {
+  const base=setup()
+  const metadata=new Set<string>()
+  const managedDeps={...base.deps,
+    managedIdentities:(_provider:string,payload:string)=>(JSON.parse(payload) as string[]).filter(id=>id.startsWith('managed-')),
+    managedInstalled:vi.fn(async()=>[...base.installed].filter(id=>metadata.has(id)).map(identity=>({identity,aliases:[] as string[]}))),
+    apply:vi.fn(async(provider:string,payload:string,owned:string[])=>{await base.deps.apply(provider,payload);for(const id of JSON.parse(payload) as string[])if(id.startsWith('managed-'))metadata.add(id);return owned})}
+  const create=()=>createCredentialGroupSync(managedDeps)
+  return {...base,deps:managedDeps,metadata,sync:create(),restart:create}
+}
 describe('scoped credential group synchronization',()=>{
   it('does not acknowledge a preserved receipt after the account pool was cleared',async()=>{
     const {sync,input,installed,restart}=setup()
@@ -63,13 +74,23 @@ describe('scoped credential group synchronization',()=>{
     await restart().sync(input(2,null))
     expect([...installed]).toEqual(['personal'])
   })
-  it('does not revoke accounts taken over by a later manual credential apply',async()=>{
+  it('does not revoke OAuth accounts taken over by a later manual credential apply',async()=>{
     const {sync,input,installed}=setup()
     await sync.sync(input(1,'["shared"]'))
     await sync.invalidate('claude',['shared'])
     expect(await sync.receipt('company','claude')).toMatchObject({reconciled:false})
     await sync.sync(input(2,null))
     expect(installed.has('shared')).toBe(true)
+  })
+  // Saycode specs/claude-setup-token-managed-sync R4: an OAuth repair/merge/replace never adopts an org-managed setup-token.
+  it.each([['repair or replace',null],['merge touching it',['managed-a']]] as const)('still revokes its managed setup-tokens after an OAuth %s invalidated the group',async(_label,touched)=>{
+    const {sync,input,installed}=managedSetup()
+    await sync.sync(input(1,'["managed-a","shared"]'))
+    await sync.invalidate('claude',touched===null?null:[...touched])
+    expect(await sync.receipt('company','claude')).toMatchObject({reconciled:false})
+    await sync.sync(input(2,null))
+    expect(installed.has('managed-a')).toBe(false)
+    expect(installed.has('personal')).toBe(true)
   })
   it('does not acknowledge incomplete removal or replace a corrupted journal',async()=>{
     const {sync,input,deps}=setup()
@@ -215,5 +236,43 @@ describe('several Saycode PC identities on one Windows profile', () => {
     await createCredentialGroupSync(deps).sync({ ...input(23, '["shared-a"]'), userId: 'alice' })
     await expect(createCredentialGroupSync({ ...deps, appliedMachineId: 'pc-b' }).sync({ ...input(13, '["shared-b"]'), userId: 'bob' }))
       .resolves.toMatchObject({ generation: 13 })
+  })
+})
+
+// Saycode specs/claude-setup-token-managed-sync R2: ownership of an org-managed setup-token is re-acquired, never lost for good.
+describe('managed setup-token ownership re-acquisition', () => {
+  it('re-acquires a desired managed slot after the journal was lost, so a later change replaces it', async () => {
+    const { sync, input, deps, installed } = managedSetup()
+    await sync.sync(input(1, '["managed-a"]'))
+    await deps.write(JSON.stringify({ version: 1, entries: [] }))
+    await sync.sync(input(1, '["managed-a"]'))
+    expect(await sync.authorize('company', 'user', 'managed-a')).toBe(true)
+    expect(deps.apply).toHaveBeenLastCalledWith('claude', '["managed-a"]', ['managed-a'])
+    await sync.sync(input(2, '["managed-b"]'))
+    expect([...installed].sort()).toEqual(['managed-b', 'personal'])
+  })
+
+  it('does not re-acquire a managed slot another scope owns, nor a slot without managed metadata', async () => {
+    const { sync, input, installed, metadata } = managedSetup()
+    await sync.sync(input(1, '["managed-a"]', 'a'))
+    await sync.sync(input(1, '["managed-a"]', 'b'))
+    expect(await sync.authorize('b', 'user', 'managed-a')).toBe(false)
+    installed.add('managed-bare')
+    await sync.sync(input(2, '["managed-a","managed-bare"]', 'b'))
+    expect(metadata.has('managed-bare')).toBe(true)
+    expect(await sync.authorize('b', 'user', 'managed-bare')).toBe(false)
+  })
+
+  it('removes a managed setup-token it applied even when an old journal without managedHeld had lost its ownership', async () => {
+    const { sync, input, deps, installed } = managedSetup()
+    // A journal written before `managedHeld` existed, whose ownership an older repair cleared; the slot has no managed metadata yet.
+    await deps.write(JSON.stringify({ version: 1, entries: [{ scope: 'company', principalType: 'user', userId: 'user', provider: 'claude', generation: 1,
+      assignmentGeneration: 1, fingerprint: String(1).padStart(64, 'a'), payloadDigest: null, desired: ['managed-a'], managed: ['managed-a'], owned: [], pending: true }] }))
+    installed.add('managed-a')
+    await expect(sync.receipt('company', 'claude')).resolves.toMatchObject({ reconciled: false })
+    await sync.sync(input(2, '["managed-a"]'))
+    await sync.invalidate('claude', null)
+    await sync.sync(input(3, null))
+    expect([...installed]).toEqual(['personal'])
   })
 })
