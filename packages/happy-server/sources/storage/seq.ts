@@ -41,8 +41,8 @@ export async function allocateUserSeqBatch(accountId: string, count: number) {
     return Array.from({ length: count }, (_, index) => startSeq + index);
 }
 
-export async function allocateSessionSeq(sessionId: string) {
-    const session = await db.session.update({
+export async function allocateSessionSeq(sessionId: string, tx?: SeqClient) {
+    const session = await resolveClient(tx).session.update({
         where: { id: sessionId },
         select: { seq: true },
         data: { seq: { increment: 1 } }

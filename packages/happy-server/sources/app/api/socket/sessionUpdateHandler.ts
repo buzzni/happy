@@ -273,16 +273,12 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
 
                 // Resolve seq
                 const updSeq = await allocateUserSeq(userId);
-                const msgSeq = await allocateSessionSeq(sid);
-
-                // Create message
-                const msg = await db.sessionMessage.create({
-                    data: {
-                        sessionId: sid,
-                        seq: msgSeq,
-                        content: msgContent,
-                        localId: useLocalId
-                    }
+                // Session.seq and the row become visible in the same commit. Do not publish a cursor before its row.
+                const msg = await db.$transaction(async tx => {
+                    const msgSeq = await allocateSessionSeq(sid, tx);
+                    return tx.sessionMessage.create({ data: {
+                        sessionId: sid, seq: msgSeq, content: msgContent, localId: useLocalId
+                    } });
                 });
 
                 // Emit new message update to relevant clients

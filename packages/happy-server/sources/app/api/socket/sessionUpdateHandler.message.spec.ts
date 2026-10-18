@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     sessionFindUnique: vi.fn(),
+    transaction: vi.fn(),
+    transactionActive: false,
     messageFindFirst: vi.fn(),
     messageCreate: vi.fn(),
     allocateUserSeq: vi.fn(),
@@ -14,6 +16,7 @@ vi.mock('@/utils/log', () => ({ log: mocks.log }));
 
 vi.mock('@/storage/db', () => ({
     db: {
+        $transaction: mocks.transaction,
         session: { findUnique: mocks.sessionFindUnique },
         sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate },
     },
@@ -53,11 +56,21 @@ function messageHandler() {
 describe('socket message persistence', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        mocks.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+            mocks.transactionActive = true;
+            try { return await fn({ sessionMessage: { findFirst: mocks.messageFindFirst, create: mocks.messageCreate }, session: { findUnique: mocks.sessionFindUnique } }); }
+            finally { mocks.transactionActive = false; }
+        });
         mocks.sessionFindUnique.mockResolvedValue({ id: 'session-1', accountId: 'user-1' });
         mocks.messageFindFirst.mockResolvedValue(null);
         mocks.allocateUserSeq.mockResolvedValue(5);
-        mocks.allocateSessionSeq.mockResolvedValue(9);
-        mocks.messageCreate.mockImplementation(async (args: any) => ({ id: 'msg-1', ...args.data }));
+        mocks.allocateSessionSeq.mockImplementation(async (_id: string, tx: unknown) => {
+            expect(mocks.transactionActive).toBe(true); expect(tx).toBeDefined(); return 9;
+        });
+        mocks.messageCreate.mockImplementation(async (args: any) => {
+            expect(mocks.transactionActive).toBe(true);
+            return { id: 'msg-1', ...args.data };
+        });
     });
 
     afterEach(() => {
@@ -79,6 +92,7 @@ describe('socket message persistence', () => {
         });
         expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
         expect(mocks.emitUpdate.mock.calls[0][0].payload.seq).toBe(5);
+        expect(mocks.transactionActive).toBe(false);
     });
 
     it('burns no seq when the localId was already persisted', async () => {
