@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -30,7 +30,8 @@ describe('listMachineIdTwins', () => {
             mkdirSync(join(root, name));
             writeFileSync(join(root, name, 'settings.json'), JSON.stringify({ machineId: id }));
         }
-        expect(listMachineIdTwins(join(root, '.happy_remote2'), 'm-1')).toEqual([join(root, '.happy_remote2_backup')]);
+        // The scanner resolves the home first; macOS temp paths can have symlinked parents.
+        expect(listMachineIdTwins(join(root, '.happy_remote2'), 'm-1')).toEqual([realpathSync(join(root, '.happy_remote2_backup'))]);
     });
 
     it('skips symlinked homes, non-file settings and oversized settings instead of reading them', () => {
@@ -54,7 +55,7 @@ describe('listMachineIdTwins', () => {
         }
         mkdirSync(join(root, 'links'));
         symlinkSync(join(root, 'real', '.happy_remote2'), join(root, 'links', '.happy'));
-        expect(listMachineIdTwins(join(root, 'links', '.happy'), 'm-1')).toEqual([join(root, 'real', '.happy_remote2_backup')]);
+        expect(listMachineIdTwins(join(root, 'links', '.happy'), 'm-1')).toEqual([realpathSync(join(root, 'real', '.happy_remote2_backup'))]);
     });
 
     it('never throws when the parent cannot be read', () => {
