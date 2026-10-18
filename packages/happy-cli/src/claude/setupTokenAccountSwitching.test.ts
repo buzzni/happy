@@ -192,6 +192,26 @@ describe('setup-token account switching while no applied account is usable', () 
     expect(switching.backgroundSignal()).toBeNull()
   })
 
+  it.each([['an account still being applied', { ok: false as const, reason: 'APPLY_REQUIRED' }], ['a new account', ok]] as const)(
+    'stays ended when an attempt in flight at session end answers with %s', async (_label, answer) => {
+    let finish!: (value: typeof answer) => void
+    const rebind = vi.fn(() => new Promise<typeof answer>(resolve => { finish = resolve }))
+    const { deps, switching } = background(rebind)
+    switching.onRateLimitEvent(refused)
+    const boundary = switching.switchIfWanted()
+    switching.dispose()
+    finish(answer)
+    expect(await boundary).toEqual({ switched: false, continueAfter: false })
+    expect(switching.backgroundSignal()).toBeNull()
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(rebind).toHaveBeenCalledOnce()
+    expect(deps.applyEnvironment).not.toHaveBeenCalled()
+    expect(deps.notify).not.toHaveBeenCalled()
+    switching.onRateLimitEvent(refused)
+    expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
+    expect(rebind).toHaveBeenCalledOnce()
+  })
+
   it('stops retrying once Studio refuses the binding for good', async () => {
     const rebind = vi.fn().mockResolvedValueOnce({ ok: false, reason: 'APPLY_REQUIRED' }).mockResolvedValue({ ok: false, reason: 'FORBIDDEN' })
     const { deps, switching } = background(rebind)

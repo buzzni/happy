@@ -53,6 +53,8 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   const tracker = createSetupTokenUsageTracker(now)
   let lastReportAt = -Infinity, lastReportedExhausted = false
   let wanted = false, refused = false, switches = 0, stopped = false
+  /** The session ended: nothing switches, retries or speaks any more, not even an attempt already in flight. */
+  let disposed = false
   /** Notices already given since the last switch: each is said once. */
   const told = new Set<string>()
   let inFlight: Promise<{ switched: boolean; continueAfter: boolean }> | null = null
@@ -79,6 +81,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
 
   async function switchOnce(sessionId: string, binding: string) {
     const result = await deps.rebind(sessionId, binding).catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
+    if (disposed) return { switched: false, continueAfter: false }
     if (!result.ok) {
       logger.debug(`[setup-token-switch] session ${sessionId} could not switch accounts: ${result.reason}`)
       if (result.reason === 'NO_ACCOUNT') {
@@ -115,7 +118,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   }
 
   function startBackground() {
-    if (background || stopped) return
+    if (background || stopped || disposed) return
     background = { deadline: now() + retryWindowMs, timer: null, wake: new AbortController(), shared: false, done: null }
     scheduleBackground(background)
   }
@@ -175,7 +178,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
         return Promise.resolve(done)
       }
       const sessionId = deps.sessionId(), binding = deps.binding()
-      if (stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
+      if (disposed || stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
       return attempt(sessionId, binding).then(result => {
         // Switched at this boundary: nothing is left to wait for.
         if (result.switched) endBackground()
@@ -188,7 +191,10 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     },
     /** The user's own message replaces the automatic continuation: the background wait ends. */
     cancelBackground: endBackground,
-    /** The session ended. */
-    dispose: endBackground,
+    /** The session ended: terminal, including for an attempt still in flight. */
+    dispose() {
+      disposed = true
+      endBackground()
+    },
   }
 }
