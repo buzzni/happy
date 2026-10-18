@@ -118,6 +118,19 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     if(removable.some(value=>installed.has(value)))fail('AI_GROUP_REMOVAL_INCOMPLETE')
     for(const other of related){other.owned=other.owned.filter(value=>installed.has(value));if(other.managedHeld)other.managedHeld=other.managedHeld.filter(value=>installed.has(value))}
   }
+  /**
+   * A running session that held back a removal ended (`released`: the identities it was bound to). Desktop sees a complete
+   * receipt and may never sync again, so the removal and the orphan sweep are retried here; receipts are left as they are.
+   */
+  async function reclaimDeferred(provider:GroupProvider,released:string[]) {
+    const journal=parse(await deps.read())
+    const related=journal.entries.filter(e=>e.provider===provider)
+    const wanted=new Set(related.flatMap(e=>e.desired))
+    if(!related.some(setupTokenEntry)||released.every(identity=>wanted.has(identity)))return false
+    await reclaim(journal,provider,new Set(await deps.snapshot(provider)),true)
+    await deps.write(JSON.stringify(journal))
+    return true
+  }
   async function sync(input:CredentialGroupRequest) {
     const normalized=request(input)
     const journal=parse(await deps.read())
@@ -218,7 +231,7 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     }
     return receipt(entry)
   }
-  return {sync,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:currentReceipt}
+  return {sync,reclaimDeferred,invalidate,assignment,hasManagedDesired,machineManaged,unprojected,recordManaged,authorize,authorizeMachine,receipt:currentReceipt}
 }
 
 function effectivePrincipal(entry:Pick<Entry,'principalType'|'userId'|'machineId'>):Pick<NormalizedRequest,'principalType'|'userId'|'machineId'> {

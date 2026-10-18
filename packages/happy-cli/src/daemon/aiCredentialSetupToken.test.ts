@@ -634,6 +634,31 @@ describe('managed Claude setup-token runtime', () => {
     expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A])
   })
 
+  // PR #874 review: Desktop sees a complete receipt and never syncs again, so the session's end retries the removal.
+  it('removes a slot kept for a running session once that session ended, leaving personal slots and the receipt alone', async () => {
+    const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
+    const inUse = vi.fn(() => [A])
+    const { runtime, state } = fakeMachine([personal], 1, { inUse })
+    await runtime.groupSync(sync(1, payload({ ...managed(A, 1, fakeToken('a')), number: 2 })))
+    await runtime.groupSync(sync(2, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', A, B])
+    inUse.mockReturnValue([])
+    await runtime.releaseSetupTokenAccounts([A])
+    expect(state.slots.map(slot => slot.managedAccountId ?? slot.email)).toEqual(['me@example.com', B])
+    expect(state.active).toBe(1)
+    await expect(runtime.groupReceipt('company-1', 'claude')).resolves.toMatchObject({ reconciled: true, generation: 2 })
+  })
+
+  it('does not reclaim on a session end while the assignment kill switch is on', async () => {
+    const inUse = vi.fn(() => [A])
+    const { runtime, state } = fakeMachine([], null, { inUse, env: { APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH: '1' } })
+    await runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
+    await runtime.groupSync(sync(2, payload({ ...managed(B, 1, fakeToken('b')), number: 3 })))
+    inUse.mockReturnValue([])
+    await runtime.releaseSetupTokenAccounts([A])
+    expect(state.slots.map(slot => slot.managedAccountId)).toEqual([A, B])
+  })
+
   it.each(['replace', 'merge'] as const)('keeps its managed setup-tokens owned through a manual OAuth %s apply and still revokes them', async applyMode => {
     const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal', refreshToken: 'r' } } }
     const { runtime, state } = fakeMachine([personal], 1)

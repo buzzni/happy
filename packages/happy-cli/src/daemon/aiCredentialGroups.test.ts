@@ -365,3 +365,39 @@ describe('managed setup-token receipt reuse', () => {
     expect(deps.apply).toHaveBeenCalledTimes(1)
   })
 })
+
+// PR #874 review: a removal deferred for a running session must not wait for an assignment change.
+describe('removals deferred for a running session', () => {
+  it('removes them once the bound session ended, keeping receipts and personal slots', async () => {
+    const busy = new Set(['managed-a'])
+    const { sync, input, installed, metadata, deps } = managedSetup({ inUse: async () => [...busy] })
+    installed.add('managed-bare')
+    await sync.sync(input(1, '["managed-a"]'))
+    await sync.sync(input(2, '["managed-b"]'))
+    expect(installed.has('managed-a')).toBe(true)
+    busy.clear()
+    await expect(sync.reclaimDeferred('claude', ['managed-a'])).resolves.toBe(true)
+    expect([...installed].sort()).toEqual(['managed-b', 'managed-bare', 'personal'])
+    expect(metadata.has('managed-bare')).toBe(false)
+    expect(await sync.receipt('company', 'claude')).toMatchObject({ reconciled: true, generation: 2 })
+  })
+
+  it('does nothing when the ended session ran on an account that is still assigned', async () => {
+    const { sync, input, deps } = managedSetup()
+    await sync.sync(input(1, '["managed-a"]'))
+    const writes = deps.write.mock.calls.length
+    deps.managedInstalled.mockClear()
+    await expect(sync.reclaimDeferred('claude', ['managed-a'])).resolves.toBe(false)
+    expect(deps.managedInstalled).not.toHaveBeenCalled()
+    expect(deps.write).toHaveBeenCalledTimes(writes)
+  })
+
+  it('does nothing without a setup-token assignment', async () => {
+    const { sync, input, deps, installed, metadata } = managedSetup()
+    installed.add('managed-orphan'); metadata.add('managed-orphan')
+    await sync.sync(input(1, '["shared"]'))
+    await expect(sync.reclaimDeferred('claude', ['managed-orphan'])).resolves.toBe(false)
+    expect(installed.has('managed-orphan')).toBe(true)
+    expect(deps.remove).not.toHaveBeenCalled()
+  })
+})

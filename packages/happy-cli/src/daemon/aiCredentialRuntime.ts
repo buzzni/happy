@@ -1781,6 +1781,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }))
   }
 
+  /**
+   * Bound sessions on these managed accounts ended: a removal a group sync deferred for them happens now, queued behind
+   * any group sync. Off while the assignment kill switch is on; a failure is retried by the next sync.
+   */
+  async function releaseSetupTokenAccounts(managedAccountIds: string[]) {
+    if (managedAccountIds.length === 0 || ['1', 'true', 'on'].includes((deps.env.APLUS_SETUP_TOKEN_ASSIGNMENT_KILL_SWITCH ?? '').toLowerCase())) return false
+    return serialize(() => withSafeErrors('AI_GROUP_SYNC_FAILED', () => groups.reclaimDeferred('claude', managedAccountIds.map(setupTokenGroupIdentity))))
+  }
+
   /** Opens the customer-key relayed NaCl assignment and then uses the normal scoped journal path. */
   async function setupTokenGroupSync(input: unknown, machineId: string, recipient: SetupTokenAssignmentRecipient) {
     return withSafeErrors('AI_GROUP_SYNC_FAILED', async () => {
@@ -2420,7 +2429,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
-  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
