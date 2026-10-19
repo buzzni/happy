@@ -7,6 +7,7 @@ import type { LessonBindingIssuer } from './lessonBindingIssuer';
 import type { LessonHostHandle } from './cmlLessonHost';
 import { LessonSettingsError, type LessonSettingsStore } from './lessonSettingsStore';
 import { evaluateLessonTurn, type LessonTurnRecord } from './lessonTurnEvidence';
+import { readUpdateTarget, type LessonUpdateTarget } from './lessonUpdateTarget';
 
 export type LessonReviewOutcome =
     | 'reviewed'
@@ -72,13 +73,16 @@ type CandidatePayload = LessonCandidateAnnouncement['lesson'] & {
     skillCandidate: boolean;
     sourceSessionIds: string[];
     sourceEventIds: string[];
+    updatesLesson?: LessonUpdateTarget;
 };
+
 
 /** Shapes the model's proposal into CML's candidate payload, or refuses it. */
 function toCandidate(
     proposal: unknown,
     record: LessonTurnRecord,
     sourceEventIds: readonly string[],
+    options: { lessonUpdates?: boolean } = {},
 ): CandidatePayload | null {
     if (!proposal || typeof proposal !== 'object') return null;
     const value = proposal as Record<string, unknown>;
@@ -115,6 +119,8 @@ function toCandidate(
     if (!name || !trigger || !scope || !reconsiderWhen || steps.length === 0 || validation.length === 0) {
         return null;
     }
+    const updatesLesson = readUpdateTarget(value.updatesLesson);
+    if (updatesLesson === null) return null;
     return {
         name, trigger, steps, scope, validation, reconsiderWhen,
         ...(validVersions.length > 0 ? { validVersions } : {}),
@@ -125,6 +131,8 @@ function toCandidate(
         skillCandidate: false,
         sourceSessionIds: [record.sessionId],
         sourceEventIds: [...sourceEventIds],
+        // An older store rejects the unknown field outright; there the proposal stays a new lesson.
+        ...(updatesLesson && options.lessonUpdates ? { updatesLesson } : {}),
     };
 }
 
@@ -145,7 +153,7 @@ function unlessAborted<T>(pending: Promise<T> | T, signal: AbortSignal): Promise
 
 export interface LessonReviewWorker {
     /** Optional for compatibility with older provider host adapters. */
-    prepareReviewTurn?(): Promise<{ revision: number } | null>;
+    prepareReviewTurn?(): Promise<{ revision: number; lessonUpdates?: boolean } | null>;
     reviewFinishedTurn(input: {
         record: LessonTurnRecord;
         signal: AbortSignal;
@@ -179,7 +187,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                     logger.debug('[lesson-review-prepare] disabled');
                     return null;
                 }
-                return { revision: settings.revision };
+                return { revision: settings.revision, ...(deps.host.supportsLessonUpdates === true ? { lessonUpdates: true } : {}) };
             } catch (error) {
                 logger.debug(error instanceof LessonSettingsError
                     ? '[lesson-review-prepare] settings_unreadable'
@@ -220,8 +228,13 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                 // Bound untrusted model output before passing it into storage.
                 let serialized: string;
                 try { serialized = JSON.stringify(proposal); } catch { return report('invalid_proposal'); }
+                // An explicit revision the installed store cannot apply is refused:
+                // filing it as a new lesson would add exactly the duplicate it meant to avoid.
+                if ((proposal as Record<string, unknown>)?.updatesLesson !== undefined
+                    && readUpdateTarget((proposal as Record<string, unknown>).updatesLesson)
+                    && deps.host.supportsLessonUpdates !== true) return report('unsupported');
                 if (!serialized || Buffer.byteLength(serialized, 'utf8') > 16_384
-                    || !toCandidate(proposal, record, [])) return report('invalid_proposal');
+                    || !toCandidate(proposal, record, [], { lessonUpdates: deps.host.supportsLessonUpdates === true })) return report('invalid_proposal');
                 const plannedRevision = settings.revision;
                 issued = await deps.issuer.issue({
                     ...identity, sessionId: record.sessionId, capabilities: ['lesson.review'],
@@ -260,7 +273,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                     return report('not-eligible', 'evidence-refused');
                 }
                 if (!(await stillCurrent())) return stale();
-                const candidate = toCandidate(proposal, record, [appended.eventId])!;
+                const candidate = toCandidate(proposal, record, [appended.eventId], { lessonUpdates: deps.host.supportsLessonUpdates === true })!;
                 // Once enqueue starts, keep the claim even if its result is lost.
                 claimToRelease = undefined;
                 const enqueued = await deps.host.service.enqueueCandidate({
@@ -294,6 +307,7 @@ export function createLessonReviewWorker(deps: LessonReviewWorkerDeps): LessonRe
                                 failureModes: candidate.failureModes,
                                 ...(candidate.validVersions ? { validVersions: candidate.validVersions } : {}),
                             },
+                            ...(candidate.updatesLesson ? { updatesLesson: candidate.updatesLesson } : {}),
                         });
                     } catch { /* The candidate is stored; a lost announcement is not a failed review. */ }
                 }

@@ -336,3 +336,43 @@ describe('foreground lesson proposals', () => {
         await rm(h.dir, { recursive: true, force: true });
     });
 });
+
+describe('lesson update proposals', () => {
+    const update = { lessonId: 'lesson-1', revision: 2 };
+    const reviewedAs = (h: Awaited<ReturnType<typeof harness>>) => {
+        h.deps.host!.service.markReviewed = (async () => ({
+            outcome: 'reviewed', candidateId: 'c1', revision: 2, payloadHash: 'h', status: 'reviewed',
+        })) as never;
+    };
+    it('passes updatesLesson to the store and the announcement when the store applies updates', async () => {
+        const announced: Array<Record<string, unknown>> = [];
+        const h = await harness({ onCandidate: (candidate) => { announced.push(candidate as never); } });
+        (h.deps.host as { supportsLessonUpdates?: boolean }).supportsLessonUpdates = true;
+        reviewedAs(h);
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, updatesLesson: update } })).toBe('reviewed');
+        expect(h.host.calls.find((call) => call.name === 'enqueueCandidate')!.input.candidate.updatesLesson).toEqual(update);
+        expect(announced[0]).toMatchObject({ updatesLesson: update });
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('refuses an explicit update for a store without update support instead of filing a new lesson', async () => {
+        const h = await harness();
+        expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, updatesLesson: update } })).toBe('unsupported');
+        expect(h.host.calls.some((call) => call.name === 'enqueueCandidate')).toBe(false);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('refuses a malformed updatesLesson instead of filing a duplicate lesson', async () => {
+        const h = await harness();
+        (h.deps.host as { supportsLessonUpdates?: boolean }).supportsLessonUpdates = true;
+        for (const bad of [{ lessonId: '', revision: 2 }, { lessonId: 'lesson-1', revision: 0 }, { lessonId: 'lesson-1', revision: 1.5 }, 'lesson-1', null]) {
+            expect(await h.worker.reviewFinishedTurn({ ...input(), proposal: { ...proposal, updatesLesson: bad } })).toBe('invalid_proposal');
+        }
+        expect(h.host.calls.some((call) => call.name === 'enqueueCandidate')).toBe(false);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+    it('reports the store update capability while preparing a proposal turn', async () => {
+        const h = await harness();
+        (h.deps.host as { supportsLessonUpdates?: boolean }).supportsLessonUpdates = true;
+        expect(await h.worker.prepareReviewTurn!()).toMatchObject({ lessonUpdates: true });
+        await rm(h.dir, { recursive: true, force: true });
+    });
+});

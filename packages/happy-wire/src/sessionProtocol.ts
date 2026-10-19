@@ -308,6 +308,12 @@ export const sessionLessonCandidateEventSchema = z.object({
     failureModes: lessonList,
     validVersions: lessonList.optional(),
   }),
+  // Present when approving this candidate revises an existing lesson rather
+  // than adding one. Clients show it so a reviewer knows what is replaced.
+  updatesLesson: z.object({
+    lessonId: z.string().min(1).max(256),
+    revision: z.number().int().min(1),
+  }).optional(),
 });
 
 export const sessionEventSchema = z.discriminatedUnion('t', [

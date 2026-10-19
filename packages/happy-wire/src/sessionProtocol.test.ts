@@ -284,6 +284,15 @@ describe('session protocol schemas', () => {
     expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev }).success).toBe(true);
   });
 
+  it('carries the lesson an update candidate revises, and rejects a malformed target', () => {
+    const lesson = { name: 'n', trigger: 't', steps: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [] };
+    const ev = (updatesLesson: unknown) => ({ id: 's', time: 1, role: 'session', ev: { t: 'lesson-candidate', candidateId: 'c', revision: 1, payloadHash: 'h', lesson, updatesLesson } });
+    const parsed = sessionEnvelopeSchema.safeParse(ev({ lessonId: 'lesson-1', revision: 2 }));
+    expect(parsed.success && parsed.data.ev.t === 'lesson-candidate' && parsed.data.ev.updatesLesson).toEqual({ lessonId: 'lesson-1', revision: 2 });
+    expect(sessionEnvelopeSchema.safeParse(ev({ lessonId: '', revision: 2 })).success).toBe(false);
+    expect(sessionEnvelopeSchema.safeParse(ev({ lessonId: 'lesson-1', revision: 0 })).success).toBe(false);
+  });
+
   it('rejects a lesson-candidate without the identifiers approval needs', () => {
     const lesson = {
       name: 'n', trigger: 't', steps: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [],
