@@ -2,12 +2,32 @@ import { logger } from '@/ui/logger'
 import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion } from './controlClient'
 import { captureSpawnOutputStdio, spawnHappyCLI } from '@/utils/spawnHappyCLI'
 import { resolveDaemonMcpConfigEnvironment } from './daemonMcpConfig'
+import { configuration } from '@/configuration'
+import { isPidAlive, readDaemonLockHolderPid, readDaemonState } from '@/persistence'
 
 const DAEMON_READY_TIMEOUT_MS = 5000
 const DAEMON_READY_POLL_INTERVAL_MS = 100
 
+/** The online lock owner just spawned us; its authenticated session reports still apply. */
+async function isCurrentDaemonParent(): Promise<boolean> {
+  const state = await readDaemonState()
+  if (!state || state.pid <= 0 || state.pid !== process.ppid
+    || state.state !== 'running' || state.socketConnected !== true
+    || state.startedWithCliVersion !== configuration.currentCliVersion
+    || !state.httpPort || !state.controlSecret) return false
+
+  // OS parentage, version and lock ownership must agree. An online flag or
+  // --started-by argument alone cannot bypass normal daemon verification.
+  return readDaemonLockHolderPid() === state.pid && isPidAlive(state.pid)
+}
+
 export async function ensureDaemonRunning(): Promise<void> {
   logger.debug('Ensuring Happy background service is running & matches our version...')
+
+  if (await isCurrentDaemonParent()) {
+    logger.debug('[DAEMON CONTROL] Reusing the online owning daemon parent without a redundant health probe')
+    return
+  }
 
   if (await isDaemonRunningCurrentlyInstalledHappyVersion()) {
     return
