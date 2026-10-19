@@ -25,6 +25,8 @@ describe('ClaudeContextUsageTracker', () => {
     it('produces the shared contract fixture for a result, a compaction and a reset, in that order', () => {
         const { tracker, frames } = createTracker();
 
+        tracker.noteProviderModel(MODEL);
+        expect(frames).toEqual([]);
         tracker.noteMainAssistant({ model: MODEL, usage: usage(4000, 100000, 20000) });
         tracker.noteTurnResult({ [MODEL]: { inputTokens: 1, outputTokens: 1, contextWindow: 200000 } });
         expect(frames).toEqual(contract.sequences.turnResult);
@@ -126,6 +128,39 @@ describe('ClaudeContextUsageTracker', () => {
         expect(tracker.snapshot()).toMatchObject({ model: 'constructor', window: 7000 });
         tracker.noteMainAssistant({ model: '__proto__', usage: usage(100) });
         expect(tracker.snapshot()).toMatchObject({ model: '__proto__', window: 5000 });
+    });
+
+    it('pairs occupancy with the provider model, not the API id on the message (2026-10-19 measurement)', () => {
+        const { tracker } = createTracker();
+        tracker.noteProviderModel('claude-sonnet-4-5[1m]');
+        tracker.noteMainAssistant({ model: 'claude-sonnet-4-5-20250929', usage: usage(300000) });
+        // A subagent's request under the dated id reports the ordinary window beside the main one.
+        tracker.noteTurnResult({
+            'claude-sonnet-4-5[1m]': { contextWindow: 1000000 },
+            'claude-sonnet-4-5-20250929': { contextWindow: 200000 },
+        });
+        expect(tracker.snapshot()).toMatchObject({ used: 300000, window: 1000000, model: 'claude-sonnet-4-5[1m]' });
+
+        // A provider restarted on another model pairs the next response with that model.
+        tracker.noteProviderModel('claude-sonnet-4-5-20250929');
+        tracker.noteMainAssistant({ model: 'claude-sonnet-4-5-20250929', usage: usage(1000) });
+        expect(tracker.snapshot()).toMatchObject({ used: 1000, window: 200000, model: 'claude-sonnet-4-5-20250929' });
+    });
+
+    it('falls back to the message model only when no provider init was seen', () => {
+        const { tracker } = createTracker();
+        tracker.noteProviderModel('  ');
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(100) });
+        expect(tracker.snapshot().model).toBe(MODEL);
+    });
+
+    it('keeps the provider model across a reset: the process did not restart', () => {
+        const { tracker } = createTracker();
+        tracker.noteProviderModel('provider-model');
+        tracker.noteMainAssistant({ model: 'api-id', usage: usage(100) });
+        tracker.reset();
+        tracker.noteMainAssistant({ model: 'api-id', usage: usage(100) });
+        expect(tracker.snapshot()).toMatchObject({ model: 'provider-model', window: null });
     });
 
     it('a compaction hides occupancy but keeps the window cache (R5)', () => {

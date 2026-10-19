@@ -1880,6 +1880,8 @@ export class ApiSessionClient extends EventEmitter {
         if (body.type === 'assistant' && body.message?.usage
             && body.isSidechain !== true && (body as { isCompactSummary?: unknown }).isCompactSummary !== true) {
             this.contextUsage.noteMainAssistant({ model: body.message.model, usage: body.message.usage });
+        } else if (body.type === 'system' && (body as { subtype?: unknown }).subtype === 'init') {
+            this.contextUsage.noteProviderModel((body as { model?: unknown }).model);
         } else if (body.type === 'system' && (body as { subtype?: unknown }).subtype === 'compact_boundary') {
             this.contextUsage.noteCompactBoundary();
         }

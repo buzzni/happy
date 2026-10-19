@@ -11,6 +11,12 @@
  * and the consumer hides the meter rather than guessing (the same model has different windows
  * under different runtime settings, e.g. the 1M beta).
  *
+ * Which `modelUsage` entry is the main agent's: the one keyed by the provider's own model name,
+ * `system`/`init.model`. The assistant message's `message.model` is the API's id and need not
+ * match — measured 2026-10-19 (SDK 0.3.285): `model: 'claude-haiku-4-5'` gave
+ * `init.model` and the key `claude-haiku-4-5` but `message.model` `claude-haiku-4-5-20251001`,
+ * and a subagent's request added its own `claude-haiku-4-5-20251001` entry beside it.
+ *
  * - Compaction (`system`/`compact_boundary`) clears occupancy only: same session, same runtime
  *   settings, so the cached windows are still right.
  * - A reset (`/clear`, another Claude session id) clears occupancy and every cached window and
@@ -57,6 +63,8 @@ export class ClaudeContextUsageTracker {
     private seq = 0;
     private used: number | null = null;
     private model: string | null = null;
+    /** `system`/`init.model` of the running provider. Describes the process, so a reset keeps it. */
+    private providerModel: string | null = null;
     /** Model names are runtime input: a Map keeps `__proto__` and friends as plain keys. */
     private readonly windows = new Map<string, number>();
 
@@ -67,10 +75,19 @@ export class ClaudeContextUsageTracker {
         this.epoch = newEpoch();
     }
 
-    /** A main-agent assistant response. Sidechain, `/btw` and result fallback usage never come here. */
+    /** A provider process started (`system`/`init`). Its model names the main agent's `modelUsage` entry. */
+    noteProviderModel(model: unknown): void {
+        const name = typeof model === 'string' ? model.trim() : '';
+        this.providerModel = name || null;
+    }
+
+    /**
+     * A main-agent assistant response. Sidechain, `/btw` and result fallback usage never come here.
+     * `model` is the message's own and is used only when no provider init was seen.
+     */
     noteMainAssistant(input: { model: unknown; usage: unknown }): void {
         const used = readRequestSize(input.usage);
-        const model = typeof input.model === 'string' ? input.model.trim() : '';
+        const model = this.providerModel ?? (typeof input.model === 'string' ? input.model.trim() : '');
         if (used === null || !model) return;
         this.commit(() => {
             this.used = used;

@@ -8,7 +8,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Metadata } from './types';
 import { decodeBase64, decrypt } from './encryption';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { ApiSessionClient } from './apiSession';
+import { SDKToLogConverter } from '@/claude/utils/sdkToLogConverter';
 
 const { mockIo } = vi.hoisted(() => ({ mockIo: vi.fn() }));
 
@@ -246,6 +249,48 @@ describe('ApiSessionClient context-usage frames', () => {
         const afterClose = frames().length;
         await vi.advanceTimersByTimeAsync(90_000);
         expect(frames()).toHaveLength(afterClose);
+    });
+
+    /*
+     * A real Claude SDK 0.3.285 session (2026-10-19, `model: 'claude-haiku-4-5'`): one Agent
+     * subagent call, `/compact`, one more turn — trimmed to the fields this path reads. Replayed
+     * the way claudeRemoteLauncher forwards it: results to applyClaudeTurnResult, everything else
+     * through SDKToLogConverter to sendClaudeSessionMessage.
+     */
+    it('replays a recorded session with a subagent and a /compact into the expected frames', async () => {
+        const recording = readFileSync(join(__dirname, '../claude/__fixtures__/claude-sdk-task-compact-recording.v1.jsonl'), 'utf8')
+            .trim().split('\n').map((line) => JSON.parse(line));
+        const client = new ApiSessionClient('fake-token', session);
+        const converter = new SDKToLogConverter({ sessionId: 'claude-session', cwd: '/tmp', version: 'test', gitBranch: 'main' }, new Map());
+        const seen: Array<[string, number]> = [];
+        for (const message of recording) {
+            const before = frames().length;
+            if (message.type === 'result') client.applyClaudeTurnResult(message);
+            else {
+                const log = converter.convert(message);
+                if (log) client.sendClaudeSessionMessage(log);
+            }
+            if (frames().length > before) seen.push([message.label, frames().length - before]);
+        }
+
+        expect(frames().map((frame: any) => [frame.seq, frame.used, frame.window, frame.model])).toEqual([
+            // Main responses: the subagent's own requests never arrived (only its prompt, as a
+            // sidechain user message), so occupancy follows the main agent only.
+            [1, 26487, null, 'claude-haiku-4-5'],
+            [2, 29843, null, 'claude-haiku-4-5'],
+            [3, 30887, null, 'claude-haiku-4-5'],
+            // The result names the window for the provider's model key; the dated key next to it
+            // is the subagent's.
+            [4, 30887, 200000, 'claude-haiku-4-5'],
+            // compact_boundary: hidden, window kept; the compact turn's result resends it.
+            [5, null, 200000, 'claude-haiku-4-5'],
+            [5, null, 200000, 'claude-haiku-4-5'],
+            // The first response after compaction shows again before its turn ends.
+            [6, 28173, 200000, 'claude-haiku-4-5'],
+            [6, 28173, 200000, 'claude-haiku-4-5'],
+        ]);
+        expect(seen.map(([label]) => label)).toEqual(['task', 'task', 'task', 'task', 'compact', 'compact', 'after-compact', 'after-compact']);
+        await client.close();
     });
 
     it('sends nothing for a local terminal session, which has no turn result to name a window', async () => {
