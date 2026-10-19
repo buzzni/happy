@@ -281,3 +281,24 @@ CLI typecheck passed after rebuilding this checkout's wire declarations for the 
 The dependency tree was reused via a local server node_modules symlink; it is not staged.
 Studio→CLI HTTP integration also passed against this rebased source. These are local
 synthetic-account tests, not a live provider/daemon result.
+
+## Happy PR #881 review repairs — 2026-10-19
+
+Addressed all three medium findings from the review of 343e1eb77:
+- Isolate failed initial-launch recovery per journal entry. Preserve pending intent and
+  original prepared identity; healthy entries and a new launch can still proceed.
+- Restore ordinary session saves after a corrupt envelope only after a synced private
+  backup of the original bytes. Persist a quarantine marker across subsequent saves;
+  durable bindings, prepared launches and custody cleanup stay fenced until authenticated
+  operator recovery. A failed backup sync leaves the original corrupt store untouched.
+- Close a refused turn as failed if the provider throws and account rebind fails. Only a
+  successful switch suppresses the provider failure; do not replay the user's prompt.
+
+Failure-first tests reproduced the three defects (4 failing cases before implementation).
+Final directly related CLI verification: **174 tests in 10 files passed**, covering runtime,
+recovery, persistence, switch control/launcher, launch wiring and resume guards/planner.
+CLI typecheck passed using the task-local runtime-tsconfig. Actual Studio routes/signer/
+PGlite → Happy protocol/runtime/journal integration passed (1 cross-repository test; 37
+unrelated cases filtered out). `git diff --check` passed. No full CLI suite or installed/live
+artifact result is claimed. The low journal scan/retention finding remains deferred: safe
+compaction needs an authenticated session-retention policy and must not discard custody.

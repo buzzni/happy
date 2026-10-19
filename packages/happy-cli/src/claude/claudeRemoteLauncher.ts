@@ -1212,7 +1212,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         lastResultSucceeded = false;
                         const switched = await setupTokenSwitching.switchIfWanted();
                         if (switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
-                        launchFailure = null;
+                        launchFailure = switched.switched ? null : describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     } else launchFailure = describeCheckpointFailure(e) ?? describeClaudeLaunchFailure(e);
                     continue;
                 }

@@ -12,6 +12,7 @@ import { assertMachineRevision, journalCurrent, type MachineRotationJournal, typ
 import { MachineRotationError, type MachineSetupTokenProtocol, type MachineRotationResult } from './machineSetupTokenProtocol'
 import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch'
 import type { TrackedSession } from './types'
+import { logger } from '@/ui/logger'
 
 export function createMachineSetupTokenRuntime(deps: {
   allowInitialIssue?(): boolean;
@@ -122,6 +123,7 @@ export function createMachineSetupTokenRuntime(deps: {
     // original credential custody and authenticated execution relation; never select again.
     for (const id of await journal.list()) {
       if (activeLaunches.has(id)) continue;
+      try {
       const state = await journal.read(id), pending = state?.pending;
       if (!state || state.current || !pending || pending.request.action !== 'issue') continue;
       if (!pending.createBody) throw new MachineRotationError('PERSISTENCE_INDETERMINATE');
@@ -167,6 +169,11 @@ export function createMachineSetupTokenRuntime(deps: {
       await journal.write(state);
       await finish(state, tracked, true, false, false);
       recoveredSessions.push(tracked);
+      } catch (error) {
+        // Keep this launch fenced and its evidence intact; it must not block unrelated launches.
+        const code = error instanceof MachineRotationError ? error.reason : 'RECOVERY_FAILED';
+        logger.warn(`[machine-rotation] Recovery blocked for ${createHash('sha256').update(id).digest('hex').slice(0, 12)}: ${code}`);
+      }
     }
     return recoveredSessions;
   }

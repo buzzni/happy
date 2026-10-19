@@ -926,6 +926,7 @@ export type PersistedSession = {
 
 type SessionsFile = {
   preparedMachineLaunches?: Record<string, { createBodyHash: string; snapshot: PersistedSession }>;
+  corruptStoreBackup?: string;
   sessions: Record<string, PersistedSession>;
 };
 
@@ -945,10 +946,31 @@ export function persistSession(sessionId: string, session: PersistedSession): vo
   // A failed directory flush can leave a newer binding visible. Never replace it with old memory.
   if (indeterminateSessionStores.has(configuration.sessionsFile)) return;
   try {
+    let envelope: Record<string, unknown> = {};
+    if (existsSync(configuration.sessionsFile)) {
+      const raw = readFileSync(configuration.sessionsFile, 'utf8');
+      try {
+        envelope = JSON.parse(raw);
+        if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new SyntaxError('Invalid session envelope');
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        // Preserve all recovery evidence before restoring ordinary writes. Corrupt JSON cannot
+        // prove that no machine binding/preparation existed, so keep durable authority fenced.
+        const backup = `${configuration.sessionsFile}.${randomBytes(12).toString('hex')}.corrupt`;
+        const fd = openSync(backup, 'wx', PRIVATE_FILE_MODE);
+        try { writeFileSync(fd, raw, 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
+        if (process.platform !== 'win32') {
+          const directory = openSync(dirname(backup), 'r');
+          try { fsyncSync(directory); } finally { closeSync(directory); }
+        }
+        envelope = { corruptStoreBackup: backup };
+      }
+    }
+    if (envelope.corruptStoreBackup && session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return;
     const existing = readPersistedSessions();
     existing[sessionId] = retainMachineBinding(existing[sessionId], session, false);
     const tmpFile = configuration.sessionsFile + '.tmp';
-    writePrivateFileSync(tmpFile, JSON.stringify({ ...(existsSync(configuration.sessionsFile) ? JSON.parse(readFileSync(configuration.sessionsFile, 'utf8')) : {}), sessions: existing }, null, 2));
+    writePrivateFileSync(tmpFile, JSON.stringify({ ...envelope, sessions: existing }, null, 2));
     renameSync(tmpFile, configuration.sessionsFile);
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);
@@ -988,6 +1010,7 @@ export function recoverPersistedSessionDurably(sessionId: string, expectedBindin
     const info = fstatSync(fd);
     if (!info.isFile() || info.nlink !== 1 || (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_FILE_MODE))) return failure();
     const data = sessionsFileSchema.parse(JSON.parse(readFileSync(fd, 'utf8')));
+    if (data.corruptStoreBackup) return failure();
     if (data.sessions[sessionId]?.agentEnvironment?.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING !== expectedBinding) return failure();
     fsyncSync(fd);
     if (process.platform !== 'win32') {
@@ -1016,6 +1039,7 @@ export function preparedMachineLaunchHomeDirs(): string[] {
   // Failure is a reason to skip the orphan sweep, never to delete unknown custody.
   if (!existsSync(configuration.sessionsFile)) return [];
   const data = sessionsFileSchema.parse(JSON.parse(readFileSync(configuration.sessionsFile, 'utf8'))) as SessionsFile;
+  if (data.corruptStoreBackup) throw new Error('Session store recovery required before custody cleanup');
   return Object.values(data.preparedMachineLaunches ?? {}).map(p => persistedSessionSchema.parse(p.snapshot).userHomeDir).filter((p): p is string => !!p);
 }
 
@@ -1051,6 +1075,7 @@ export function recoverPreparedMachineLaunch(launchId: string, createBodyHash: s
     const info = fstatSync(fd);
     if (!info.isFile() || info.nlink !== 1 || (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_FILE_MODE))) return null;
     const data = sessionsFileSchema.parse(JSON.parse(readFileSync(fd, 'utf8'))) as SessionsFile;
+    if (data.corruptStoreBackup) return null;
     const prepared = data.preparedMachineLaunches?.[launchId];
     if (!prepared || prepared.createBodyHash !== createBodyHash) return null;
     const snapshot = persistedSessionSchema.parse(prepared.snapshot) as PersistedSession;
@@ -1078,7 +1103,8 @@ function publishSessionStoreDurably(update: (data: SessionsFile) => SessionsFile
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       stored = { sessions: {} };
     }
-    sessionsFileSchema.parse(stored);
+    const parsed = sessionsFileSchema.parse(stored);
+    if (parsed.corruptStoreBackup) return { status: 'failed' };
     const contents = JSON.stringify(update(stored as SessionsFile), null, 2);
     const fd = openSync(temporary, 'wx', PRIVATE_FILE_MODE);
     created = true;

@@ -251,10 +251,28 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
     expect([...t.disk.values()][0].current).toBeTruthy();
     expect(t.sessionEnvironment).not.toHaveBeenCalled();
   });
+  it('isolates an unrecoverable initial launch while recovering another and permitting a fresh launch', async () => {
+    const t = await setup(); t.loseIssue();
+    await expect(t.build().prepareLaunch(t.input)).rejects.toThrow();
+    const blocked = [...t.disk.keys()][0], evidence = structuredClone(t.disk.get(blocked));
+    t.drafts.delete(blocked);
+    t.loseIssue();
+    await expect(t.build().prepareLaunch(t.input)).rejects.toThrow();
+    const healthy = [...t.disk.keys()][1];
+    const recovered = await t.build().recoverLaunches();
+    expect(recovered).toHaveLength(1);
+    expect(t.disk.get(healthy)?.current).toBeTruthy();
+    expect(t.disk.get(blocked)).toEqual(evidence);
+    expect(t.requests.filter(r => r.action === 'issue' && r.launchId === blocked)).toHaveLength(1);
+    expect(t.sessionEnvironment).not.toHaveBeenCalled();
+    expect((await t.build().prepareLaunch(t.input)).environment.CLAUDE_CODE_OAUTH_TOKEN).toBeTruthy();
+  });
   it('does not issue an unreceived pending initial operation while new issuance is OFF', async () => {
     const t = await setup(); t.loseIssue(true);
     await expect(t.build().prepareLaunch(t.input)).rejects.toThrow();
-    await expect(t.build(false).recoverLaunches()).rejects.toThrow('ISSUANCE_DISABLED');
+    const evidence = structuredClone([...t.disk.values()]);
+    await expect(t.build(false).recoverLaunches()).resolves.toEqual([]);
+    expect([...t.disk.values()]).toEqual(evidence);
     expect(t.requests.filter(r => r.action === 'issue')).toHaveLength(1);
     expect(t.sessionEnvironment).not.toHaveBeenCalled();
   });
@@ -268,7 +286,11 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
   it('keeps an expired uncertain create fail-closed instead of selecting again when no registered execution is recoverable', async () => {
     const t = await setup(); t.loseIssue();
     await expect(t.build().prepareLaunch(t.input)).rejects.toThrow(); t.advance(120000);
-    await expect(t.build().recoverLaunches()).rejects.toThrow('PERSISTENCE_INDETERMINATE');
+    const evidence = structuredClone([...t.disk.values()]);
+    await expect(t.build().recoverLaunches()).resolves.toEqual([]);
+    expect([...t.disk.values()]).toMatchObject(evidence);
+    expect([...t.disk.values()][0].current).toBeUndefined();
+    expect([...t.disk.values()][0].pending?.record).toBeUndefined();
     expect(t.requests.filter(r => r.action === 'issue')).toHaveLength(1);
     expect(t.steps).not.toContain('create'); expect(t.sessionEnvironment).not.toHaveBeenCalled();
   });

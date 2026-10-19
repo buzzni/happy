@@ -111,6 +111,41 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(successfulResults).toEqual(['result-2']);
     });
 
+    it('closes a refused turn as failed when the provider throws and rebind fails', async () => {
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'FORBIDDEN' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                yield refused;
+                throw new Error('Provider exited after refusal');
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        try {
+            await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalledTimes(1));
+            expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+            expect(query).toHaveBeenCalledTimes(1);
+        } finally { await handlers.get('switch')?.(); await launched; }
+    });
+
     it('hands a message that arrives after a switch to a provider restarted on the new account', async () => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();

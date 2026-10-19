@@ -744,6 +744,13 @@ Studio commit and token return. Uncertain publication requires authenticated ope
 query and exact read+sync recovery; cursor writers cannot roll back a newer machine revision.
 Current-operation queries revalidate the exact committed binding and execution on resume.
 
+If the ordinary writer encounters a corrupt session envelope, it first syncs a private
+copy of the exact bytes, then restores ordinary cursor/session writes with a persistent
+`corruptStoreBackup` marker. That marker blocks durable binding/preparation writes,
+recovery and orphan custody cleanup even after restart; stale in-memory bindings cannot
+be imported. Authenticated operator recovery must reconcile the retained evidence before
+clearing the marker. Never infer that a corrupt store had no pending machine launch.
+
 Initial response loss is recovered through the original owner's paginated session API and
 the machine-authenticated execution-owner API. A still-fresh create can replay only the
 original encrypted body and deterministically reconstructed original proof. An expired
@@ -751,6 +758,10 @@ uncertain create with no recoverable registered relation remains blocked, retain
 journal/custody; it never substitutes a new selection. Initial issue replay when the
 server has no operation is disabled with new issuance OFF. This is deliberately stricter
 than legacy offline session creation.
+Initial recovery isolates each launch failure, preserving its evidence and denying its
+resume while continuing other recoveries and fresh launches. Diagnostics contain only a
+hashed launch identifier and a fixed error code. Journal enumeration failure still stops
+recovery; completed-entry compaction remains a separate retention decision.
 
 Provider-start submission is durably fenced under the existing serialized credential
 launch queue, alongside approval, assignment receipt/fingerprint, generation and actual
@@ -768,6 +779,8 @@ FIFO and does not hold a slot while waiting. Stop/disposal cancels transport and
 late apply/notification/continuation; a new user message replaces automatic continuation.
 The same Claude conversation resumes once after a refused turn, including a provider exit
 following a known account-wide refusal.
+If the provider throws after refusal and the switch fails, the original launch failure
+closes the turn as failed; only a successful switch suppresses that failure.
 
 A single secret-free message event can include
 `setupTokenRotation:{version:1,state}`. Session metadata is optional and records machine

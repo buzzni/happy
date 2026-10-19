@@ -162,6 +162,35 @@ describe('durable session persistence', () => {
     expect(JSON.parse(readFileSync(configuration.sessionsFile, 'utf8')).futureField).toBe(true)
   })
 
+  it.each(['{"sessions":', 'invalid json', 'null', '[]'])('restores ordinary session persistence after corrupt JSON (%s)', raw => {
+    writeFileSync(configuration.sessionsFile, raw);
+    const ordinary = { ...next, agentEnvironment: undefined };
+    persistSession('ordinary', ordinary);
+    expect(readPersistedSessions().ordinary).toEqual(ordinary);
+    const envelope = JSON.parse(readFileSync(configuration.sessionsFile, 'utf8'));
+    expect(readFileSync(envelope.corruptStoreBackup, 'utf8')).toBe(raw);
+    if (process.platform !== 'win32') expect(statSync(envelope.corruptStoreBackup).mode & 0o777).toBe(0o600);
+    expect(persistSessionDurably('target', next)).toEqual({ status: 'failed' });
+    expect(persistPreparedMachineLaunch('launch', 'digest', ordinary)).toEqual({ status: 'failed' });
+    expect(recoverPersistedSessionDurably('target', 'binding-b').status).toBe('failed');
+    expect(recoverPreparedMachineLaunch('launch', 'digest')).toBeNull();
+    expect(() => preparedMachineLaunchHomeDirs()).toThrow('recovery required');
+    persistSession('target', next);
+    expect(readPersistedSessions().target).toBeUndefined();
+    persistSession('ordinary', { ...ordinary, seq: 8 });
+    expect(readPersistedSessions().ordinary.seq).toBe(8);
+    expect(JSON.parse(readFileSync(configuration.sessionsFile, 'utf8')).corruptStoreBackup).toBe(envelope.corruptStoreBackup);
+  });
+
+  it('keeps corrupt bytes intact when the recovery backup cannot be synced', () => {
+    const raw = '{"sessions":';
+    writeFileSync(configuration.sessionsFile, raw);
+    vi.mocked(fsyncSync).mockImplementationOnce(() => { throw ioError('EIO') });
+    persistSession('ordinary', { ...next, agentEnvironment: undefined });
+    expect(readFileSync(configuration.sessionsFile, 'utf8')).toBe(raw);
+    expect(persistSessionDurably('target', next).status).toBe('failed');
+  });
+
   it('keeps ordinary persistSession best effort on an unrelated store', () => {
     vi.mocked(renameSync).mockImplementationOnce(() => { throw ioError('ENOSPC') })
     expect(() => persistSession('target', next)).not.toThrow()
