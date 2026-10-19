@@ -239,10 +239,16 @@ describe('ApiSessionClient context-usage frames', () => {
         await vi.advanceTimersByTimeAsync(30_000);
         expect(frames().slice(2).map((frame: any) => [frame.seq, frame.used])).toEqual([[2, null], [2, null]]);
 
+        // The take-down itself is repeated on the next two ticks — a lost one would leave the old
+        // numbers on screen — and then the timer stops.
         client.resetContextUsage();
-        const afterReset = frames().length;
+        const takeDown = frames().at(-1);
+        expect(takeDown).toMatchObject({ seq: 0, used: null, window: null, model: null });
         await vi.advanceTimersByTimeAsync(90_000);
-        expect(frames()).toHaveLength(afterReset);
+        expect(frames().slice(-3)).toEqual([takeDown, takeDown, takeDown]);
+        const afterRepeats = frames().length;
+        await vi.advanceTimersByTimeAsync(90_000);
+        expect(frames()).toHaveLength(afterRepeats);
 
         client.sendClaudeSessionMessage(mainAssistant(2000));
         await client.close();
@@ -291,6 +297,63 @@ describe('ApiSessionClient context-usage frames', () => {
         ]);
         expect(seen.map(([label]) => label)).toEqual(['task', 'task', 'task', 'task', 'compact', 'compact', 'after-compact', 'after-compact']);
         await client.close();
+    });
+
+    it('skips ticks while disconnected and repairs a take-down lost in the gap on reconnect', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+        client.sendClaudeSessionMessage(mainAssistant(1000));
+        socket.connected = false;
+        fire('disconnect', 'transport close');
+        // /clear while the socket is down: the take-down frame goes nowhere.
+        client.resetContextUsage();
+        const sent = frames().length;
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(frames()).toHaveLength(sent);
+
+        socket.connected = true;
+        fire('connect');
+        expect(frames().at(-1)).toMatchObject({ seq: 0, used: null, window: null, model: null });
+        // Still owed its two ticks, now that they can arrive.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(frames()).toHaveLength(sent + 3);
+        await client.close();
+    });
+
+    it('hides for a switch to local without forgetting the windows of this conversation', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.sendClaudeSessionMessage(mainAssistant(1000));
+        client.applyClaudeTurnResult(result('result-1'));
+        client.hideContextUsage();
+        expect(frames().at(-1)).toMatchObject({ used: null, window: null, model: null });
+
+        client.sendClaudeSessionMessage(mainAssistant(2000));
+        expect(frames().at(-1)).toMatchObject({ used: 2000, window: 200000 });
+        await client.close();
+    });
+
+    it('keeps two sessions in one process apart: each frame carries its own sid and state', async () => {
+        const other = { ...makeSession(), id: 'other-session-id', encryptionKey: new Uint8Array(32).fill(7) };
+        const first = new ApiSessionClient('fake-token', session);
+        const second = new ApiSessionClient('fake-token', other);
+        first.sendClaudeSessionMessage(mainAssistant(1000));
+        second.sendClaudeSessionMessage(mainAssistant(5000));
+        second.resetContextUsage();
+        first.applyClaudeTurnResult(result('result-1'));
+
+        const bySession = socket.volatile.emit.mock.calls.map(([, payload]: [string, { sid: string; data: string }]) => {
+            const key = payload.sid === other.id ? other.encryptionKey : session.encryptionKey;
+            const frame = decrypt(key, 'legacy', decodeBase64(payload.data));
+            return [payload.sid, frame.seq, frame.used, frame.window];
+        });
+        expect(bySession).toEqual([
+            ['test-session-id', 1, 1000, null],
+            ['other-session-id', 1, 5000, null],
+            ['other-session-id', 0, null, null],
+            ['test-session-id', 2, 1000, 200000],
+        ]);
+        await first.close();
+        await second.close();
     });
 
     it('sends nothing for a local terminal session, which has no turn result to name a window', async () => {

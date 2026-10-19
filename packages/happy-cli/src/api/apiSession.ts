@@ -48,6 +48,8 @@ import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
 /** Repairs a Desktop that restarted or reconnected while the meter was showing (Saycode specs/desktop-chat-context-window-meter R12). */
 const CONTEXT_USAGE_RESEND_INTERVAL_MS = 30_000;
+/** Ticks a take-down (reset, local mode) is repeated for: a lost one would leave old numbers on screen. */
+const CONTEXT_USAGE_TAKE_DOWN_REPEATS = 2;
 
 /**
  * ACP (Agent Communication Protocol) message data types.
@@ -517,10 +519,12 @@ export class ApiSessionClient extends EventEmitter {
     private providerUsageEventIds = new Set<string>();
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
     private readonly contextUsage = new ClaudeContextUsageTracker((snapshot) => {
+        this.contextUsageTakeDownRepeats = this.contextUsage.hasValue() ? 0 : CONTEXT_USAGE_TAKE_DOWN_REPEATS;
         this.emitSessionStream(snapshot);
         this.syncContextUsageResend();
     });
     private contextUsageResendTimer: ReturnType<typeof setInterval> | null = null;
+    private contextUsageTakeDownRepeats = 0;
     private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
@@ -1873,14 +1877,17 @@ export class ApiSessionClient extends EventEmitter {
      */
     private noteClaudeContextUsage(body: RawJSONLines) {
         if (this.currentMode !== 'remote') return;
-        if (body.type === 'assistant' && body.message?.usage
-            && body.isSidechain !== true && (body as { isCompactSummary?: unknown }).isCompactSummary !== true) {
-            this.contextUsage.noteMainAssistant({ model: body.message.model, usage: body.message.usage });
-        } else if (body.type === 'system' && (body as { subtype?: unknown }).subtype === 'init') {
-            this.contextUsage.noteProviderModel((body as { model?: unknown }).model);
-        } else if (body.type === 'system' && (body as { subtype?: unknown }).subtype === 'compact_boundary') {
-            this.contextUsage.noteCompactBoundary();
+        if (body.type === 'assistant') {
+            if (body.message?.usage && body.isSidechain !== true
+                && (body as { isCompactSummary?: unknown }).isCompactSummary !== true) {
+                this.contextUsage.noteMainAssistant({ model: body.message.model, usage: body.message.usage });
+            }
+            return;
         }
+        if (body.type !== 'system') return;
+        const system = body as { subtype?: unknown; model?: unknown };
+        if (system.subtype === 'init') this.contextUsage.noteProviderModel(system.model);
+        else if (system.subtype === 'compact_boundary') this.contextUsage.noteCompactBoundary();
     }
 
     /** `/clear` or another Claude session id: the new conversation may run under other settings. */
@@ -1888,14 +1895,32 @@ export class ApiSessionClient extends EventEmitter {
         this.contextUsage.reset();
     }
 
-    /** The latest snapshot again, same seq — for a reconnect, a turn result and the periodic repair. */
+    /** Local terminal mode: nothing to show, but the same conversation keeps its windows. */
+    hideContextUsage() {
+        this.contextUsage.hide();
+    }
+
+    /** Something shown, or a take-down still owed its repeats. */
+    private contextUsageOwed(): boolean {
+        return this.contextUsage.hasValue() || this.contextUsageTakeDownRepeats > 0;
+    }
+
+    /** The latest snapshot again, same seq — for a reconnect and a turn result. */
     private resendContextUsage() {
-        if (this.contextUsage.hasValue()) this.emitSessionStream(this.contextUsage.snapshot());
+        if (this.contextUsageOwed()) this.emitSessionStream(this.contextUsage.snapshot());
+    }
+
+    private tickContextUsageResend() {
+        // A volatile frame on a closed socket goes nowhere; the reconnect resends instead.
+        if (!this.socket.connected) return;
+        this.resendContextUsage();
+        if (!this.contextUsage.hasValue() && this.contextUsageTakeDownRepeats > 0) this.contextUsageTakeDownRepeats -= 1;
+        this.syncContextUsageResend();
     }
 
     private syncContextUsageResend() {
-        if (this.contextUsage.hasValue() && !this.closed) {
-            this.contextUsageResendTimer ??= setInterval(() => this.resendContextUsage(), CONTEXT_USAGE_RESEND_INTERVAL_MS);
+        if (this.contextUsageOwed() && !this.closed) {
+            this.contextUsageResendTimer ??= setInterval(() => this.tickContextUsageResend(), CONTEXT_USAGE_RESEND_INTERVAL_MS);
             this.contextUsageResendTimer.unref?.();
             return;
         }

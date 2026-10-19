@@ -16,6 +16,9 @@
  * match — measured 2026-10-19 (SDK 0.3.285): `model: 'claude-haiku-4-5'` gave
  * `init.model` and the key `claude-haiku-4-5` but `message.model` `claude-haiku-4-5-20251001`,
  * and a subagent's request added its own `claude-haiku-4-5-20251001` entry beside it.
+ * The provider's first readable response names the API id its model resolved to; a later main
+ * response under another id (fallbackModel on overload, same process, no new init) is paired by
+ * its own id instead, and stays hidden unless the runtime reported a window for exactly that id.
  *
  * - Compaction (`system`/`compact_boundary`) clears occupancy only: same session, same runtime
  *   settings, so the cached windows are still right.
@@ -65,6 +68,8 @@ export class ClaudeContextUsageTracker {
     private model: string | null = null;
     /** `system`/`init.model` of the running provider. Describes the process, so a reset keeps it. */
     private providerModel: string | null = null;
+    /** `message.model` of that provider's first readable main response. */
+    private providerApiModel: string | null = null;
     /** Model names are runtime input: a Map keeps `__proto__` and friends as plain keys. */
     private readonly windows = new Map<string, number>();
 
@@ -79,16 +84,22 @@ export class ClaudeContextUsageTracker {
     noteProviderModel(model: unknown): void {
         const name = typeof model === 'string' ? model.trim() : '';
         this.providerModel = name || null;
+        this.providerApiModel = null;
     }
 
     /**
      * A main-agent assistant response. Sidechain, `/btw` and result fallback usage never come here.
-     * `model` is the message's own and is used only when no provider init was seen.
+     * `model` is the message's own API id; see the header for when it is used instead of the provider's.
      */
     noteMainAssistant(input: { model: unknown; usage: unknown }): void {
         const used = readRequestSize(input.usage);
-        const model = this.providerModel ?? (typeof input.model === 'string' ? input.model.trim() : '');
-        if (used === null || !model) return;
+        if (used === null) return;
+        const apiModel = typeof input.model === 'string' ? input.model.trim() : '';
+        if (this.providerModel && apiModel) this.providerApiModel ??= apiModel;
+        const model = this.providerModel && (!apiModel || apiModel === this.providerApiModel)
+            ? this.providerModel
+            : apiModel;
+        if (!model) return;
         this.commit(() => {
             this.used = used;
             this.model = model;
@@ -113,6 +124,14 @@ export class ClaudeContextUsageTracker {
         this.commit(() => { this.used = null; });
     }
 
+    /** Nothing to show for now (local terminal mode), in the same conversation: windows stay cached. */
+    hide(): void {
+        this.commit(() => {
+            this.used = null;
+            this.model = null;
+        });
+    }
+
     reset(): void {
         this.windows.clear();
         // Nothing was ever shown in this epoch, so there is nothing to take back.
@@ -126,10 +145,11 @@ export class ClaudeContextUsageTracker {
 
     /**
      * Whether a consumer could be showing something from this epoch — what a resend repairs.
-     * A cached window with no main response yet is not shown, so it is not counted.
+     * `used` is only ever set together with `model`, and a cached window with no main response
+     * yet is not shown, so `model` alone decides.
      */
     hasValue(): boolean {
-        return this.used !== null || this.model !== null;
+        return this.model !== null;
     }
 
     snapshot(): ClaudeContextUsageSnapshot {

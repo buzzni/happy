@@ -147,6 +147,34 @@ describe('ClaudeContextUsageTracker', () => {
         expect(tracker.snapshot()).toMatchObject({ used: 1000, window: 200000, model: 'claude-sonnet-4-5-20250929' });
     });
 
+    it('stops naming the provider model once the provider answers under another API id', () => {
+        const { tracker } = createTracker();
+        tracker.noteProviderModel('opus[1m]');
+        tracker.noteMainAssistant({ model: 'claude-opus-dated', usage: usage(100) });
+        tracker.noteTurnResult({ 'opus[1m]': { contextWindow: 1000000 }, 'claude-sonnet-dated': { contextWindow: 200000 } });
+        expect(tracker.snapshot()).toMatchObject({ model: 'opus[1m]', window: 1000000 });
+
+        // fallbackModel on overload: same process, no new init, another model answering.
+        tracker.noteMainAssistant({ model: 'claude-sonnet-dated', usage: usage(180000) });
+        expect(tracker.snapshot()).toMatchObject({ used: 180000, model: 'claude-sonnet-dated', window: 200000 });
+        tracker.noteMainAssistant({ model: 'claude-other-dated', usage: usage(180000) });
+        expect(tracker.snapshot()).toMatchObject({ model: 'claude-other-dated', window: null });
+
+        // A new provider learns its own id again.
+        tracker.noteProviderModel('opus[1m]');
+        tracker.noteMainAssistant({ model: 'claude-opus-dated', usage: usage(100) });
+        expect(tracker.snapshot()).toMatchObject({ model: 'opus[1m]', window: 1000000 });
+    });
+
+    it('learns the provider API id only from a readable response', () => {
+        const { tracker } = createTracker();
+        tracker.noteProviderModel('opus');
+        // An API error message: zero usage under a synthetic id.
+        tracker.noteMainAssistant({ model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } });
+        tracker.noteMainAssistant({ model: 'claude-opus-dated', usage: usage(100) });
+        expect(tracker.snapshot().model).toBe('opus');
+    });
+
     it('falls back to the message model only when no provider init was seen', () => {
         const { tracker } = createTracker();
         tracker.noteProviderModel('  ');
@@ -161,6 +189,23 @@ describe('ClaudeContextUsageTracker', () => {
         tracker.reset();
         tracker.noteMainAssistant({ model: 'api-id', usage: usage(100) });
         expect(tracker.snapshot()).toMatchObject({ model: 'provider-model', window: null });
+    });
+
+    it('hiding takes the meter down in the same epoch and keeps the window cache', () => {
+        const { tracker, frames } = createTracker();
+        tracker.hide();
+        expect(frames).toEqual([]);
+
+        tracker.noteProviderModel(MODEL);
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(100) });
+        tracker.noteTurnResult({ [MODEL]: { contextWindow: 200000 } });
+        tracker.hide();
+        expect(frames.at(-1)).toEqual({ version: 1, type: 'context-usage', epoch: 'epoch-1', seq: 3, used: null, window: null, model: null });
+        expect(tracker.hasValue()).toBe(false);
+
+        // Back from the terminal: the same conversation, so the cached window still applies.
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(200) });
+        expect(frames.at(-1)).toMatchObject({ epoch: 'epoch-1', seq: 4, used: 200, window: 200000 });
     });
 
     it('a compaction hides occupancy but keeps the window cache (R5)', () => {

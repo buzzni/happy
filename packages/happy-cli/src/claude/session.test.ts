@@ -7,7 +7,8 @@ import type { EnhancedMode } from './loop';
 function createSession(overrides: { startingMode?: 'local' | 'remote' } = {}) {
     const keepAlive = vi.fn();
     const resetContextUsage = vi.fn();
-    const client = { keepAlive, resetContextUsage, updateMetadata: vi.fn() } as unknown as ApiSessionClient;
+    const hideContextUsage = vi.fn();
+    const client = { keepAlive, resetContextUsage, hideContextUsage, updateMetadata: vi.fn() } as unknown as ApiSessionClient;
     const onModeChange = vi.fn();
     const session = new Session({
         api: {} as any,
@@ -21,7 +22,7 @@ function createSession(overrides: { startingMode?: 'local' | 'remote' } = {}) {
         hookSettingsPath: '/tmp/settings.json',
         startingMode: overrides.startingMode,
     });
-    return { session, keepAlive, resetContextUsage, onModeChange };
+    return { session, keepAlive, resetContextUsage, hideContextUsage, onModeChange };
 }
 
 describe('Session mode', () => {
@@ -73,15 +74,17 @@ describe('Session context-usage resets (Saycode specs/desktop-chat-context-windo
         session.cleanup();
     });
 
-    it('takes the meter down before keepalive reports local mode', () => {
-        const { session, keepAlive, resetContextUsage } = createSession({ startingMode: 'remote' });
+    it('takes the meter down before keepalive reports local mode, without a reset', () => {
+        const { session, keepAlive, resetContextUsage, hideContextUsage } = createSession({ startingMode: 'remote' });
         keepAlive.mockClear();
         session.onModeChange('local');
-        expect(resetContextUsage).toHaveBeenCalledOnce();
-        expect(resetContextUsage.mock.invocationCallOrder[0]).toBeLessThan(keepAlive.mock.invocationCallOrder[0]);
+        expect(hideContextUsage).toHaveBeenCalledOnce();
+        expect(hideContextUsage.mock.invocationCallOrder[0]).toBeLessThan(keepAlive.mock.invocationCallOrder[0]);
+        // The same conversation continues in the terminal: its windows stay valid.
+        expect(resetContextUsage).not.toHaveBeenCalled();
 
         session.onModeChange('remote');
-        expect(resetContextUsage).toHaveBeenCalledOnce();
+        expect(hideContextUsage).toHaveBeenCalledOnce();
         session.cleanup();
     });
 });

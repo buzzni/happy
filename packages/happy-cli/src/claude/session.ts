@@ -188,7 +188,8 @@ export class Session {
     onModeChange = (mode: 'local' | 'remote') => {
         // A terminal session has no turn result to name the window; take the meter down
         // while this client still sends it (Saycode specs/desktop-chat-context-window-meter R2).
-        if (mode === 'local') this.client.resetContextUsage();
+        // Hidden, not reset: the conversation is the same, so its cached windows stay valid.
+        if (mode === 'local') this.client.hideContextUsage();
         this.mode = mode;
         this.client.keepAlive(this.thinking, mode);
         this._onModeChange(mode);
