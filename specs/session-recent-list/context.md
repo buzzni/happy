@@ -1,12 +1,12 @@
 # 최근 활동 순 세션 목록 API Context
 
-> 마지막 갱신: 2026-10-19 / 상태: 진행중 — T3~T6 구현·검증·교차 리뷰 반영 완료, T7 PR 리뷰 대기
+> 마지막 갱신: 2026-10-19 / 상태: 진행중 — T3~T6 구현·검증·교차 리뷰 반영 완료, T7 PR #884 리뷰 대기
 
 ## 현재 상태 (3~5문장)
 
 Desktop `specs/cli-agent-session-search` Phase A를 이 저장소에서 구현했다(Orca 2차 D3A).
 `GET /v2/sessions/recent`를 `sessionRoutes.ts`에 추가했고, PGlite 실제 스키마 테스트와 실제 PostgreSQL managed 스위트로 S1~S9를 검증했다.
-브랜치 `orca-d3a-sessions-recent`, base origin/main `135bf5b2f`. push·PR은 아직 하지 않았다(T7).
+브랜치 `orca-d3a-sessions-recent`, base origin/main `135bf5b2f`. PR https://github.com/buzzni/happy/pull/884 (머지·배포 전).
 
 ## 핵심 결정 로그 (누적, 최신이 위)
 
@@ -42,7 +42,7 @@ Desktop `specs/cli-agent-session-search` Phase A를 이 저장소에서 구현�
 
 ## 다음 세션 시작점
 
-1. T7: 교차 리뷰 반영 후 PR(base main). 머지·배포는 사용자/오케스트레이터 몫.
+1. PR #884 CI·리뷰 확인. 머지·서버 배포는 사용자/오케스트레이터 몫.
 2. 소비자: Desktop `cli/`의 `saycode agent search`(원본 spec Phase B, R10-b 구 서버 판별).
 
 ## 검증·승인 상태
