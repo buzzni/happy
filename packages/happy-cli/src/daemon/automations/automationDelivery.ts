@@ -1,6 +1,6 @@
 /**
  * Sending a scheduled run's result or failure to a paired messenger conversation
- * (Saycode specs/automation-result-delivery — R4~R10, plan D2·D3·D6·D7·D8).
+ * (Saycode specs/_archive/automation-result-delivery — R4~R10, plan D2·D3·D6·D7·D8).
  *
  * The daemon that ran the automation decides; the channel host on the same machine, which owns
  * the messenger connection, sends (`send`, the `deliver` message of the host protocol). This

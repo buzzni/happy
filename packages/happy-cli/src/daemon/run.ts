@@ -3609,7 +3609,7 @@ export async function startDaemon(): Promise<void> {
     const serverAutomationRuntimeStore = createServerAutomationRuntimeStore({
       filePath: configuration.serverAutomationsRuntimeFile,
     });
-    // Saycode specs/automation-result-delivery — results and failure alerts for a paired messenger
+    // Saycode specs/_archive/automation-result-delivery — results and failure alerts for a paired messenger
     // conversation. The channel host started further down sends them; until then nothing can.
     let automationDeliverySend: ((request: AutomationDeliveryRequest) => Promise<AutomationDeliveryOutcome>) | null = null;
     const automationDelivery = createAutomationDeliveryCoordinator({

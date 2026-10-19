@@ -254,7 +254,7 @@ export interface ServerAutomationExecutorInput {
    */
   hostCommandsAllowed?: boolean
   /**
-   * Told when a run's outcome is settled (Saycode specs/automation-result-delivery R7): a failure
+   * Told when a run's outcome is settled (Saycode specs/_archive/automation-result-delivery R7): a failure
    * once it is final — never while an unreachable retry still holds it — and a start. Never
    * awaited; a broken delivery never changes the run or its report.
    */
@@ -505,7 +505,7 @@ async function flushPendingReports(input: ServerAutomationExecutorInput): Promis
 }
 
 /**
- * A run's outcome is settled: a failure that is final, or a start (specs/automation-result-delivery).
+ * A run's outcome is settled: a failure that is final, or a start (specs/_archive/automation-result-delivery).
  * Delivery runs beside the tick and is never awaited, and nothing it does reaches the report.
  */
 function announceSettledRun(

@@ -298,7 +298,7 @@ describe('createChannelHostSupervisor', () => {
         await expect(pending).resolves.toEqual({ error: 'CHANNEL_HOST_UNAVAILABLE', code: 'CHANNEL_HOST_UNAVAILABLE' });
     });
 
-    // Saycode specs/automation-result-delivery D3 — asking the host to send a scheduled result.
+    // Saycode specs/_archive/automation-result-delivery D3 — asking the host to send a scheduled result.
     const deliverRequest = {
         v: 1 as const, connectionId: 'connection-1', grantKey: 'grant-1', kind: 'result' as const,
         text: 'Morning report', dedupeKey: 'run-1:result',

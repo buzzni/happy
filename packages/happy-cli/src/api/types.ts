@@ -168,12 +168,12 @@ export const MachineMetadataSchema = z.object({
     /** false: 스크립트 조건·GitHub 트리거처럼 Job 밖 명령이 필요한 자동화는 실행하지 않는다(Windows 정식 빌드). */
     hostCommands: z.boolean().optional(),
     /**
-     * Saycode specs/desktop-schedule-kinds — prompt schedule kinds this daemon computes. Absent means
+     * Saycode specs/_archive/desktop-schedule-kinds — prompt schedule kinds this daemon computes. Absent means
      * interval/daily only. Plain strings so a newer daemon's kind never makes an older client drop the field.
      */
     scheduleKinds: z.array(z.string().max(40)).max(20).optional(),
     /**
-     * Saycode specs/automation-result-delivery — this daemon reads `payload.delivery` and asks its
+     * Saycode specs/_archive/automation-result-delivery — this daemon reads `payload.delivery` and asks its
      * channel host to send results and failure alerts. Whether the host can is `channelHost.deliver`.
      */
     delivery: z.literal(1).optional(),
@@ -240,7 +240,7 @@ export const MachineMetadataSchema = z.object({
     providers: z.array(z.string()),
     hostKey: z.string(),
     fingerprint: z.string(),
-    /** The host can send a scheduled run's result to a paired conversation (Saycode specs/automation-result-delivery). */
+    /** The host can send a scheduled run's result to a paired conversation (Saycode specs/_archive/automation-result-delivery). */
     deliver: z.literal(1).optional(),
   }).optional(),
   autonomousQualityGateSupport: AutonomousQualityGateCapabilityAdvertisementSchema.optional(),

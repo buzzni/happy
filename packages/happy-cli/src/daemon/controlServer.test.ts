@@ -261,7 +261,7 @@ describe('controlServer POST /spawn-session', () => {
   })
 })
 
-// Saycode specs/automation-result-delivery D1 — the turn that answered a scheduled prompt.
+// Saycode specs/_archive/automation-result-delivery D1 — the turn that answered a scheduled prompt.
 describe('controlServer POST /session-automation-turn', () => {
   let dir: string
   let baseUrl: string

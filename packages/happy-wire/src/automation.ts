@@ -138,7 +138,7 @@ export const automationSealSchema = z.object({
 export type AutomationSeal = z.infer<typeof automationSealSchema>;
 
 /**
- * Saycode specs/automation-result-delivery — a paired messenger conversation on the machine that
+ * Saycode specs/_archive/automation-result-delivery — a paired messenger conversation on the machine that
  * runs the automation. `grantKey` is an opaque handle the channel host minted for one pairing; the
  * host looks the conversation up again at send time, so nothing here names a recipient directly.
  */

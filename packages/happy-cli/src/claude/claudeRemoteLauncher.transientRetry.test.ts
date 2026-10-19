@@ -134,7 +134,7 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
             expect.objectContaining({ attempt: 2 }),
             null,
         ]);
-        // A scheduled run's failed turn waits for the retry (specs/automation-result-delivery).
+        // A scheduled run's failed turn waits for the retry (specs/_archive/automation-result-delivery).
         expect(harness.client.setTransientRetryPending.mock.calls).toEqual([[true], [false], [true], [false]]);
         expect(harness.client.noteTransientRetryDispatched).toHaveBeenCalledTimes(2);
         expect(harness.client.sendSessionEvent).toHaveBeenCalledWith({

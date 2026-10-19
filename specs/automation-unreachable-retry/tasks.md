@@ -12,5 +12,5 @@
 - [x] 교차 리뷰 #2: 영구 거절 보고(run-not-running·claim-not-found) 정리, 뒤 보고 막지 않음
 - [x] 교차 리뷰 #3: 보류 run 마감 확인 전에는 정규 회차 claim 보류(releasing)
 - [x] 교차 리뷰 #4: 재시도 뒤 실패의 failureCode 에 횟수(`_AFTER_<n>_RETRIES`)
-- [ ] PR·리뷰 봇·CI
-- [ ] 실기기 확인: VPN 전용 Studio 주소에서 깨어난 직후 예약 실행이 1~2분 뒤 같은 run 으로 성공하는지(배포 후)
+- [x] PR #857·CI 통과, main 머지(2026-10-17), happy-cli `1.1.10-aplus.339` 발행에 포함
+- [ ] (릴리스 후 실측) 실기기 확인: VPN 전용 Studio 주소에서 깨어난 직후 예약 실행이 1~2분 뒤 같은 run 으로 성공하는지

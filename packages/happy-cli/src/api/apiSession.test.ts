@@ -1632,7 +1632,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(onUserMessage.mock.calls[2][0].content.text).toBe(original.content.text);
     });
 
-    // Saycode specs/automation-result-delivery D1
+    // Saycode specs/_archive/automation-result-delivery D1
     it('reports the turn that answered a scheduled prompt to the daemon, with its final answer only', () => {
         const client = new ApiSessionClient('fake-token', session);
         client.onUserMessage(vi.fn());

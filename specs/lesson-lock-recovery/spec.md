@@ -1,6 +1,6 @@
 # Lesson store lock recovery
 
-Status: implemented on `hermes-lesson-lock-recovery` (2026-10-17). Not released: reaching users needs a CLI release and a Desktop pin bump, both outside this change.
+Status: done — merged in #858 (2026-10-17), released in happy-cli `1.1.10-aplus.339`; the Desktop pin is at `.342` (checked 2026-10-19). Open follow-up: Desktop does not map `settings_busy` yet (see Residual risks).
 
 ## Problem
 
@@ -28,4 +28,4 @@ Both stores use one helper, `src/memory/ownedFileLock.ts` (`withOwnedFileLock`).
 - An older-version holder stalled for more than 10 minutes can still be reclaimed from under it, and if it releases while the reclaim is in flight, the reclaimer may remove the next holder's lock. Old code records no owner, so this cannot be fixed here.
 - A crash between writing and removing `<lock>.<token>.pending`, or a reclaimer dying three times in a row, leaves small files nobody removes.
 - Filesystems without hard links would fail every acquire; the store lives under the daemon home, where this is not expected.
-- Desktop maps unknown reasons to `runtime_error` and logs the original as `hostReason`, so `settings_busy` is safe but shows the generic message until Desktop maps it (with the pin bump).
+- Desktop maps unknown reasons to `runtime_error` and logs the original as `hostReason`, so `settings_busy` is safe but shows the generic message until Desktop maps it. As of 2026-10-19 the pin is bumped, but Desktop has no `settings_busy` mapping yet.
