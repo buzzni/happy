@@ -41,10 +41,13 @@ import {
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
 import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
+import { ClaudeContextUsageTracker, type ClaudeContextUsageSnapshot } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
+/** Repairs a Desktop that restarted or reconnected while the meter was showing (Saycode specs/desktop-chat-context-window-meter R12). */
+const CONTEXT_USAGE_RESEND_INTERVAL_MS = 30_000;
 
 /**
  * ACP (Agent Communication Protocol) message data types.
@@ -513,6 +516,11 @@ export class ApiSessionClient extends EventEmitter {
     private providerTokens = 0;
     private providerUsageEventIds = new Set<string>();
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
+    private readonly contextUsage = new ClaudeContextUsageTracker((snapshot) => {
+        this.sendContextUsage(snapshot);
+        this.syncContextUsageResend();
+    });
+    private contextUsageResendTimer: ReturnType<typeof setInterval> | null = null;
     private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
@@ -630,6 +638,8 @@ export class ApiSessionClient extends EventEmitter {
             this.rpcHandlerManager.onSocketConnect(this.socket);
             this.startReceivePolling();
             this.receiveSync.invalidate();
+            // Volatile frames sent while the socket was down were dropped; the snapshot repairs them.
+            this.resendContextUsage();
             // The 'archived' ephemeral is transient: archived-while-disconnected
             // is invisible to the handlers below (and archive keeps the session
             // row, so the message sync never 404s either). The durable
@@ -1434,6 +1444,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private applyClaudeSessionMessageSideEffects(body: RawJSONLines, observedAiAuthSource?: ObservedAiAuthSource) {
+        this.noteClaudeContextUsage(body);
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
             let sourceEventId: string | undefined;
@@ -1856,6 +1867,52 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
+    /**
+     * Context-window occupancy for Saycode Desktop (specs/desktop-chat-context-window-meter).
+     *
+     * Read here, on the ordered transcript path, so a compaction boundary lands after the
+     * responses that came before it. Main agent only: a subagent's request (`isSidechain`) and the
+     * `/compact` summary measure a different prompt. Remote mode only: a local terminal session
+     * never gets a turn result, so it could never name the window.
+     */
+    private noteClaudeContextUsage(body: RawJSONLines) {
+        if (this.currentMode !== 'remote') return;
+        if (body.type === 'assistant' && body.message?.usage
+            && body.isSidechain !== true && (body as { isCompactSummary?: unknown }).isCompactSummary !== true) {
+            this.contextUsage.noteMainAssistant({ model: body.message.model, usage: body.message.usage });
+        } else if (body.type === 'system' && (body as { subtype?: unknown }).subtype === 'compact_boundary') {
+            this.contextUsage.noteCompactBoundary();
+        }
+    }
+
+    /** `/clear` or another Claude session id: the new conversation may run under other settings. */
+    resetContextUsage() {
+        this.contextUsage.reset();
+    }
+
+    /** The latest snapshot again, same seq — for a reconnect, a turn result and the periodic repair. */
+    private resendContextUsage() {
+        if (this.contextUsage.hasValue()) this.sendContextUsage(this.contextUsage.snapshot());
+    }
+
+    private sendContextUsage(snapshot: ClaudeContextUsageSnapshot) {
+        this.socket.volatile.emit('session-stream', {
+            sid: this.sessionId,
+            time: Date.now(),
+            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, snapshot)),
+        });
+    }
+
+    private syncContextUsageResend() {
+        if (this.contextUsage.hasValue() && !this.closed) {
+            this.contextUsageResendTimer ??= setInterval(() => this.resendContextUsage(), CONTEXT_USAGE_RESEND_INTERVAL_MS);
+            this.contextUsageResendTimer.unref?.();
+            return;
+        }
+        if (this.contextUsageResendTimer) clearInterval(this.contextUsageResendTimer);
+        this.contextUsageResendTimer = null;
+    }
+
     /** A bounded, opt-in daemon duration record sent through the existing opaque stream relay. */
     sendTurnLatency(diagnostic: ClaudeTurnLatencyDiagnostic | CodexTurnLatencyProgress) {
         this.socket.volatile.emit('session-stream', {
@@ -1983,8 +2040,11 @@ export class ApiSessionClient extends EventEmitter {
         if (typeof result.uuid === 'string') this.lastClaudeTurnResultUuid = result.uuid;
         const usage = result.usage && typeof result.usage === 'object' ? result.usage as Usage : null;
         const modelUsage = result.modelUsage && typeof result.modelUsage === 'object'
-            ? result.modelUsage as Record<string, { inputTokens?: number; outputTokens?: number }>
+            ? result.modelUsage as Record<string, { inputTokens?: number; outputTokens?: number; contextWindow?: number }>
             : null;
+        // The only place the window size arrives. Sent whatever the fallback below decides: a
+        // metered turn makes no usage-report, and this frame is what shows its first window.
+        if (this.currentMode === 'remote' && !this.contextUsage.noteTurnResult(modelUsage)) this.resendContextUsage();
         const fallback = this.claudeTurnUsage.resolveResult({ usage, modelUsage });
         if (!fallback || typeof result.uuid !== 'string' || !result.uuid.trim()) return;
         let sourceEventId: string | undefined;
@@ -2384,6 +2444,7 @@ export class ApiSessionClient extends EventEmitter {
         this.receiveSync.stop();
         this.stopReceivePolling();
         this.stopSmartReconnect();
+        this.syncContextUsageResend();
         this.socket.close();
     }
 

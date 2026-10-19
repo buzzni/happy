@@ -26,6 +26,7 @@ describe('Claude model changes across provider restarts', () => {
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            resetContextUsage: vi.fn(),
         };
         queue.pushIsolated('/clear', { permissionMode: 'default', model: 'claude-sonnet-5' });
         const session = {
@@ -38,6 +39,8 @@ describe('Claude model changes across provider restarts', () => {
         expect(onSessionReset).not.toHaveBeenCalled();
         await claudeRemoteLauncher(session);
         expect(onSessionReset).toHaveBeenCalledOnce();
+        // The context meter forgets the old conversation's windows too (Saycode specs/desktop-chat-context-window-meter R6).
+        expect(client.resetContextUsage).toHaveBeenCalledOnce();
     });
 
     it.each(['model', 'effort', 'boundary-model', 'boundary-effort'] as const)('applies consecutive %s changes at the SDK boundary', async (field) => {

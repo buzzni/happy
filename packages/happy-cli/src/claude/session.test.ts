@@ -6,7 +6,8 @@ import type { EnhancedMode } from './loop';
 
 function createSession(overrides: { startingMode?: 'local' | 'remote' } = {}) {
     const keepAlive = vi.fn();
-    const client = { keepAlive } as unknown as ApiSessionClient;
+    const resetContextUsage = vi.fn();
+    const client = { keepAlive, resetContextUsage, updateMetadata: vi.fn() } as unknown as ApiSessionClient;
     const onModeChange = vi.fn();
     const session = new Session({
         api: {} as any,
@@ -20,7 +21,7 @@ function createSession(overrides: { startingMode?: 'local' | 'remote' } = {}) {
         hookSettingsPath: '/tmp/settings.json',
         startingMode: overrides.startingMode,
     });
-    return { session, keepAlive, onModeChange };
+    return { session, keepAlive, resetContextUsage, onModeChange };
 }
 
 describe('Session mode', () => {
@@ -51,6 +52,39 @@ describe('Session mode', () => {
     });
 });
 
+describe('Session context-usage resets (Saycode specs/desktop-chat-context-window-meter R6)', () => {
+    it('resets when Claude reports a different session id, not on the first one or the same one again', () => {
+        const { session, resetContextUsage } = createSession({ startingMode: 'remote' });
+        session.onSessionFound('claude-a');
+        session.onSessionFound('claude-a');
+        expect(resetContextUsage).not.toHaveBeenCalled();
+
+        session.onSessionFound('claude-b');
+        expect(resetContextUsage).toHaveBeenCalledOnce();
+        session.cleanup();
+    });
+
+    it('does not reset again for the new id that follows a /clear, which already reset', () => {
+        const { session, resetContextUsage } = createSession({ startingMode: 'remote' });
+        session.onSessionFound('claude-a');
+        session.clearSessionId();
+        session.onSessionFound('claude-b');
+        expect(resetContextUsage).not.toHaveBeenCalled();
+        session.cleanup();
+    });
+
+    it('takes the meter down before keepalive reports local mode', () => {
+        const { session, keepAlive, resetContextUsage } = createSession({ startingMode: 'remote' });
+        keepAlive.mockClear();
+        session.onModeChange('local');
+        expect(resetContextUsage).toHaveBeenCalledOnce();
+        expect(resetContextUsage.mock.invocationCallOrder[0]).toBeLessThan(keepAlive.mock.invocationCallOrder[0]);
+
+        session.onModeChange('remote');
+        expect(resetContextUsage).toHaveBeenCalledOnce();
+        session.cleanup();
+    });
+});
 
 describe('Session lesson lifecycle', () => {
     it('cancels pending review on new input without forgetting completed responses', () => {
