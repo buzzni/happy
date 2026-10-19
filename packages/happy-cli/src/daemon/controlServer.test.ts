@@ -261,6 +261,61 @@ describe('controlServer POST /spawn-session', () => {
   })
 })
 
+// Saycode specs/_archive/automation-result-delivery D1 — the turn that answered a scheduled prompt.
+describe('controlServer POST /session-automation-turn', () => {
+  let dir: string
+  let baseUrl: string
+  let stopServer: () => Promise<void>
+  let results: Array<{ sessionId: string; result: unknown }>
+  let controlSecret = ''
+  const fetch = makeAuthedFetch(() => controlSecret)
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
+    results = []
+    const { port, stop, controlSecret: secret } = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: () => ({ stopped: false, reason: 'not-found' }),
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused in this test' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      onAutomationTurnResult: (sessionId, result) => { results.push({ sessionId, result }) },
+      portRegistry: createPortRegistry({
+        filePath: path.join(dir, 'port-registry.json'), portMin: 30000, portMax: 30010, isPortBindable: async () => true,
+      }),
+    })
+    baseUrl = `http://127.0.0.1:${port}`
+    stopServer = stop
+    controlSecret = secret
+  })
+
+  afterEach(async () => {
+    await stopServer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const post = (body: unknown) => fetch(`${baseUrl}/session-automation-turn`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })
+
+  it('hands the settled scheduled turn to the daemon', async () => {
+    const res = await post({ sessionId: 'session-1', runId: 'run-1', status: 'completed', finalAnswer: 'Done.', silent: false })
+    expect(res.status).toBe(200)
+    expect(results).toEqual([{ sessionId: 'session-1', result: { runId: 'run-1', status: 'completed', finalAnswer: 'Done.', silent: false } }])
+  })
+
+  it('refuses a report that carries more than the cut answer', async () => {
+    for (const body of [
+      { sessionId: 'session-1', runId: 'run-1', status: 'completed', finalAnswer: 'x'.repeat(3_001), silent: false },
+      { sessionId: 'session-1', runId: 'run-1', status: 'done', finalAnswer: null, silent: false },
+      { sessionId: 'session-1', runId: 'run-1', status: 'completed', finalAnswer: null, silent: false, transcript: 'x' },
+    ]) {
+      expect((await post(body)).status).toBe(400)
+    }
+    expect(results).toEqual([])
+  })
+})
+
 describe('controlServer POST /session-runtime', () => {
   let dir: string
   let baseUrl: string

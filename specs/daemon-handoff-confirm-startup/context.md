@@ -1,6 +1,43 @@
 # context — daemon-handoff-confirm-startup
 
-## 현재 상태
+## 2026-10-19 후속: 온라인 소유 daemon이 띄운 자식의 중복 health 확인
+
+진행 중. 사용자 권한은 수정·관련 검증·main 반영이며 새 Windows Trial 빌드/설치 검증은
+이번 범위에서 제외했다. Desktop 설치판의 .342를 직접 바꾸거나, 공개 CLI release/tag를
+발행한 것으로 간주하지 않는다. 공개 릴리스는 AGENTS.md의 즉시 승인 지점에 따른다.
+PR은 https://github.com/buzzni/happy/pull/879 이다. Desktop의 공식 pin 소비를 위해
+package.json의 버전을 미발행 후보1.1.10-aplus.343으로 추가 준비한다. 이 버전의 build/
+관련 테스트/package guard 및 exact-head CI 후 main에 반영하고, tag push 직전에 별도
+승인을 받아 Actions만 publish하도록 한다. 현재 registry latest는.342이며.343 tag는 없다.
+
+- 분류: 기존 Core 프로세스 수명주기 수정. 새 공개 API·환경변수·저장 스키마·권한은 추가하지 않는다.
+- 범위: ensureDaemonRunning.ts/test, cli-architecture.md, 이 context와 release version의 기존5파일.
+- 동작: 같은 CLI 버전의 running/online daemon이 OS 부모이고 lock owner/생존 확인이
+  일치하며 control port/credential도 준비돼 있으면 중복 HTTP ping을 생략한다.
+- 보호: 플래그/온라인 표시만으로 생략하지 않는다. terminal·다른 부모·죽은/중지/오프라인
+  부모·버전/lock 불일치는 기존 확인·자동 시작을 유지한다. session report 인증은 그대로다.
+- 근거: Windows Trial58의 live PID16112에서 health 확인 예외로 새 Chat PID616이
+  provider/webhook 전 종료했다. 같은 PC의 Node fetch2초 timeout을 재현했고 후속은 정상.
+  실제 실패의 세부HTTP 원인은 공통 오류에서 버려지므로 timeout으로 확정하지 않는다.
+- TDD: 변경 전18건 중 정당한 부모 자식이 HTTP health 예외로 중단되는1건 실패/17건 통과.
+  수정 후 직접 소비자5파일65건 PASS, global setup의 CLI 타입 검사·빌드 PASS.
+- 실제 Mac 프로세스: Vitest mock이 없는 새 Node 자식에서 production ensure와 session-started
+  보고를 실행했다. OS 부모 PID와 lock owner가 맞으면 응답하지 않는 /list를 호출하지 않고
+  인증된 보고를 전달한다. lock owner 불일치에서는 실제2초 health timeout으로 차단하며
+  보고0건/state와 lock 원문 보존을 확인했다. 현재 사용자의 daemon/계정에는 접근하지 않았다.
+- 배포물 검증: prepare-publish-package와 guard-publish-artifact --install-smoke PASS.
+  로컬 검증은 npm11.12.1 및 격리된 npm cache/prefix를 사용했다. 공개 publish/tag,
+  설치판 runtime 교체 및 수정판 Windows 수락은 하지 않았다.
+- .343 미발행 후보에서도 직접65건·타입/빌드 및 prepared package의 실제 설치 smoke를
+  다시 통과했다. source PR의 최종 head CI를 별도로 확인하며 이전 head 성공을 대신 쓰지 않는다.
+- 의존성: worktree root node_modules는 원래 저장소에 symlink. 최신 wire 타입만 이
+  worktree에서 빌드/연결해 다른 worktree의 공용 캐시와 생성물을 덮어쓰지 않았다.
+- 경계: 다른 사용자 자격의 staged home에 lock이 없거나 중간 launcher가 있으면 기존
+  health 검사로 돌아간다. 이 수정으로 모든 원격/격리 spawn의 지연을 해결했다고 하지 않는다.
+- 복구: 동작4파일 변경을 revert한다. 자격증명/state/lock migration은 없다. 미발행 버전 준비는
+  package.json 한 줄이며 발행 후에는 같은 npm 버전을 재사용하지 않는다.
+
+## 기존 작업 완료 이력
 Phase 1~5 완료. 브랜치 `fix/handoff-confirm-daemon-started`, base `origin/main@f84be7bd`.
 
 ## 변경 파일

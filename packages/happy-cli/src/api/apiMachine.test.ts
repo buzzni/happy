@@ -1617,6 +1617,7 @@ describe('ApiMachineClient socket reconnection', () => {
         socketHandlers.connect![0]!();
         await vi.waitFor(() => expect(machine.metadata?.automationSupport?.serverBacked).toBe(false));
         expect(machine.metadata?.automationSupport?.scheduleKinds).toBeUndefined();
+        expect(machine.metadata?.automationSupport?.delivery).toBeUndefined();
         client.shutdown();
     });
 
@@ -1652,6 +1653,8 @@ describe('ApiMachineClient socket reconnection', () => {
         // Desktop은 이 목록에 없는 일정 종류(once/weekly)를 저장하지 않는다 — 스키마가 걸러내면 기능이 조용히 꺼진다.
         expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.scheduleKinds)
             .toEqual(['interval', 'daily', 'once', 'weekly']);
+        // Saycode specs/_archive/automation-result-delivery R3 — Desktop offers messenger delivery only on this.
+        expect(MachineMetadataSchema.parse(machine.metadata).automationSupport?.delivery).toBe(1);
         client.shutdown();
     });
 

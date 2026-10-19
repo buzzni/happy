@@ -32,7 +32,8 @@ import {
     type ClaudeSessionProtocolState,
 } from '@/claude/utils/sessionProtocolMapper';
 import { InvalidateSync } from '@/utils/sync';
-import { notifyDaemonSessionRuntime } from '@/daemon/controlClient';
+import { notifyDaemonAutomationTurnResult, notifyDaemonSessionRuntime } from '@/daemon/controlClient';
+import { AutomationTurnTracker, automationRunIdFromLocalKey, type AutomationTurnResult } from './automationTurnTracker';
 import axios from 'axios';
 import {
     ProviderUsageEventV1Schema,
@@ -514,6 +515,12 @@ export class ApiSessionClient extends EventEmitter {
     private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
+    /** The turn answering a daemon-delivered scheduled prompt (Saycode specs/_archive/automation-result-delivery). */
+    private readonly automationTurns = new AutomationTurnTracker();
+    /** A temporary API failure is waiting to be retried by the engine (specs claude-transient-retry). */
+    private transientRetryPending = false;
+    /** The waiting retry was just dispatched, so its turn answers a carried scheduled run. */
+    private transientRetryDispatched = false;
     /**
      * Set only when the caller says so.
      *
@@ -994,9 +1001,14 @@ export class ApiSessionClient extends EventEmitter {
             const incoming: UserMessage = serverMessageId
                 ? { ...userResult.data, serverMessageId }
                 : userResult.data;
-            const userMessage = incoming.meta?.sentFrom === 'automation' && incoming.localKey?.startsWith('happy-automation:')
+            const automationRunId = incoming.meta?.sentFrom === 'automation' ? automationRunIdFromLocalKey(incoming.localKey) : null;
+            const userMessage = automationRunId
                 ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text) } }
                 : incoming;
+            const settledAutomationTurns = automationRunId
+                ? this.automationTurns.arm(automationRunId)
+                : this.automationTurns.userInput();
+            for (const settled of settledAutomationTurns) this.reportAutomationTurn(settled);
             this.inputObservedForNextTurn = true;
             if (userMessage.meta?.sentFrom !== 'daemon') {
                 this.lastUserInteractionAt = Date.now();
@@ -1551,7 +1563,46 @@ export class ApiSessionClient extends EventEmitter {
      * ordinary session. Silently does nothing otherwise, which is why callers can hand it every
      * result without checking first.
      */
+    private reportAutomationTurn(result: AutomationTurnResult): void {
+        void notifyDaemonAutomationTurnResult(this.sessionId, result).catch((error) => {
+            logger.debug('[API] Scheduled turn result not reported', { error: String(error) });
+        });
+    }
+
+    /**
+     * Whether the engine is waiting to retry a temporary API failure by itself. A wait that ends
+     * without the retry being dispatched (stopped, replaced, given up) leaves a carried scheduled
+     * run with no turn to settle it, so it is settled as the failure it was.
+     */
+    setTransientRetryPending(pending: boolean): void {
+        this.transientRetryPending = pending;
+        if (pending) {
+            this.transientRetryDispatched = false;
+            return;
+        }
+        // The launcher says whether the retry runs right after clearing the wait.
+        setTimeout(() => {
+            if (this.transientRetryPending || this.transientRetryDispatched) return;
+            for (const settled of this.automationTurns.retryAbandoned()) this.reportAutomationTurn(settled);
+        }, 0);
+    }
+
+    /**
+     * The engine has no input waiting (Claude after a turn with an empty queue, Codex when idle).
+     * Until it says so, a scheduled prompt behind other input is not tracked — see AutomationTurnTracker.
+     */
+    noteInputQueueEmpty(): void {
+        this.automationTurns.inputQueueEmpty();
+    }
+
+    /** The waiting retry is being sent now; its turn settles any carried scheduled run. */
+    noteTransientRetryDispatched(): void {
+        this.transientRetryDispatched = true;
+    }
+
     sendFinalAnswerForChannelTurn(text: string): void {
+        // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
+        this.automationTurns.noteFinalAnswer(text);
         const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
     }
@@ -1684,6 +1735,16 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private applySessionProtocolRuntimeSideEffects(envelope: SessionEnvelope) {
+        const settledAutomationTurn = this.automationTurns.observe(envelope);
+        if (settledAutomationTurn?.status === 'failed') {
+            // The launcher decides on a retry right after it closes the turn; ask once it has.
+            setTimeout(() => {
+                if (this.transientRetryPending) this.automationTurns.carry(settledAutomationTurn);
+                else this.reportAutomationTurn(settledAutomationTurn);
+            }, 0);
+        } else if (settledAutomationTurn) {
+            this.reportAutomationTurn(settledAutomationTurn);
+        }
         const openToolCallCount = this.openToolCallIds.size;
         const openAskUserQuestionCount = this.openAskUserQuestionIds.size;
 

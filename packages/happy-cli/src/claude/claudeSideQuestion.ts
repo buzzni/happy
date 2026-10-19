@@ -1,5 +1,5 @@
 /**
- * `/btw` 곁질문 (Desktop specs/desktop-btw-side-question).
+ * `/btw` 곁질문 (Desktop specs/_archive/desktop-btw-side-question).
  *
  * 실행 중인 Claude SDK query 에 Claude Code 내장 `side_question` 제어 요청을 보낸다.
  * Claude 는 지금 대화의 cache-safe 포크로 한 번만 답하고(도구 거부, maxTurns 1),

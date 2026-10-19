@@ -23,6 +23,7 @@ import type {
 } from './serverAutomationRuntimeStore'
 import type { AutomationMcpCallerGrantResult, AutomationMcpSpawnContext } from './automationMcpCallerGrant'
 import type { AutomationConnectorPreflightResult } from './automationConnectorPreflight'
+import type { AutomationDeliveryCoordinator } from './automationDelivery'
 import { isPermanentGithubTriggerFailure } from './githubTriggerPermanentFailure'
 import {
   forgetUnreachableRetry,
@@ -252,6 +253,12 @@ export interface ServerAutomationExecutorInput {
    * Job 밖에서 cmd·gh·git 을 띄운다(specs/windows-build-support DRAIN-4). 기본값은 허용.
    */
   hostCommandsAllowed?: boolean
+  /**
+   * Told when a run's outcome is settled (Saycode specs/_archive/automation-result-delivery R7): a failure
+   * once it is final — never while an unreachable retry still holds it — and a start. Never
+   * awaited; a broken delivery never changes the run or its report.
+   */
+  delivery?: Pick<AutomationDeliveryCoordinator, 'runFailed' | 'runStarted'>
   randomId?: () => string
   logDebug?: (message: string) => void
 }
@@ -497,8 +504,36 @@ async function flushPendingReports(input: ServerAutomationExecutorInput): Promis
   }
 }
 
+/**
+ * A run's outcome is settled: a failure that is final, or a start (specs/_archive/automation-result-delivery).
+ * Delivery runs beside the tick and is never awaited, and nothing it does reaches the report.
+ */
+function announceSettledRun(
+  input: ServerAutomationExecutorInput,
+  settled: { automationId: string; runId: string; payload: ServerAutomationPayload | undefined }
+    & ({ failed: true; failureCode: string | null } | { failed: false; sessionId: string | null }),
+): void {
+  if (!input.delivery || !settled.payload) return
+  const { automationId, runId, payload } = settled
+  try {
+    if (settled.failed) {
+      void input.delivery.runFailed({ automationId, runId, payload, failureCode: settled.failureCode })
+        .catch((error) => input.logDebug?.(`[server-automation] run=${runId} delivery failed: ${error}`))
+    } else {
+      input.delivery.runStarted({
+        automationId, runId, payload, sessionId: settled.sessionId, awaitsTurn: Boolean(payload.conversation),
+      })
+    }
+  } catch (error) {
+    input.logDebug?.(`[server-automation] run=${runId} delivery failed: ${error}`)
+  }
+}
+
 /** maintainUnreachableRetries 가 포기한 보류 run 의 실패를 보낸다. 받거나 영구 거절되면 항목을 지운다. */
-async function settleReleasedUnreachableRetries(input: ServerAutomationExecutorInput): Promise<void> {
+async function settleReleasedUnreachableRetries(
+  input: ServerAutomationExecutorInput,
+  payloads: ReadonlyMap<string, ServerAutomationPayload>,
+): Promise<void> {
   for (const entry of releasedUnreachableRetries(input.runtimeStore.read())) {
     const result = await input.transport.report(entry.report)
     if (result.ok) {
@@ -508,7 +543,13 @@ async function settleReleasedUnreachableRetries(input: ServerAutomationExecutorI
         `[server-automation] run=${entry.report.runId} held failure dropped: server refused it for good (${result.error})`,
       )
       forgetUnreachableRetry(input.runtimeStore, entry.report.runId)
+    } else {
+      continue
     }
+    announceSettledRun(input, {
+      automationId: entry.automationId, runId: entry.report.runId, payload: payloads.get(entry.automationId),
+      failed: true, failureCode: entry.report.failureCode ?? null,
+    })
   }
 }
 
@@ -1892,7 +1933,7 @@ export async function runServerAutomationTick(
     heartbeat: (run) => input.transport.heartbeat(run),
     logDebug: input.logDebug,
   })
-  await settleReleasedUnreachableRetries(input)
+  await settleReleasedUnreachableRetries(input, payloads)
 
   const outcomes: Array<{ automationId: string; outcome: ServerAutomationReportOutcome }> = []
   let githubEventsProcessed = 0
@@ -2074,6 +2115,11 @@ export async function runServerAutomationTick(
       })) continue
     if (retry && result.outcome === 'ERROR') {
       report = { ...report, failureCode: unreachableRetryFailureCode(report.failureCode, retry.attempt) }
+    }
+    if (result.outcome === 'ERROR') {
+      announceSettledRun(input, { automationId: automation.automationId, runId, payload, failed: true, failureCode: report.failureCode ?? null })
+    } else if (result.outcome === 'WOKE') {
+      announceSettledRun(input, { automationId: automation.automationId, runId, payload, failed: false, sessionId: result.sessionId })
     }
     const state = input.runtimeStore.read()
     input.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })

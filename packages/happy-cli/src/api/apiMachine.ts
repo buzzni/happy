@@ -3315,6 +3315,7 @@ export class ApiMachineClient {
                 conversation: true,
                 protocolVersion: this.automationProtocolVersion,
                 scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS],
+                delivery: 1,
                 ...this.automationHostCommandsField(),
                 ...this.authenticatedEnvelopesField(),
                 ...this.scriptRuntimeField(),
@@ -4228,7 +4229,7 @@ export class ApiMachineClient {
                 conversation: true,
                         protocolVersion: this.automationProtocolVersion,
                         // 새 종류는 서버 자동화 실행기만 계산한다(레거시 RPC 저장소는 받지 않는다).
-                        ...(this.automationServerKeyVersion !== null ? { scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS] } : {}),
+                        ...(this.automationServerKeyVersion !== null ? { scheduleKinds: [...AUTOMATION_SCHEDULE_KINDS], delivery: 1 as const } : {}),
                         ...this.automationHostCommandsField(),
                         ...this.authenticatedEnvelopesField(),
                         ...this.scriptRuntimeField(),
