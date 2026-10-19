@@ -1,6 +1,8 @@
 import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
+import { requireAccountPrincipal } from "../utils/enableAuthentication";
+import { ExecutionOwnerRequestSchema, ExecutionOwnerResponseSchema } from "@slopus/happy-wire";
 
 /**
  * Answers "does this machine own this session?" for a session that has no automation run
@@ -52,4 +54,30 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         }
         return reply.send({ owner: { ownerAccountId: request.userId } });
     });
+
+    // Execution relation only. This grants neither session ownership nor message access.
+    app.post('/v1/machine-sessions/:sessionId/execution-owner', {
+        preHandler: [app.authenticate, requireAccountPrincipal],
+        schema: {
+            params: z.object({ sessionId: z.string().min(1).max(128) }).strict(),
+            body: ExecutionOwnerRequestSchema,
+            response: { 200: ExecutionOwnerResponseSchema },
+        },
+    }, async (request, reply) => {
+        const { companyId, machineId, launchId, initialNonce } = request.body;
+        const sessionId = request.params.sessionId;
+        const binding = await db.sessionExecutionBinding.findFirst({ where: {
+            sessionId, companyId, machineId, launchId, initialNonce,
+            machineOwnerAccountId: request.userId,
+            machine: { is: { id: machineId, accountId: request.userId } },
+            session: { is: { id: sessionId } },
+        } });
+        if (!binding) return reply.send({ owner: null });
+        return reply.send({ owner: {
+            companyId, machineId, sessionId, launchId, initialNonce,
+            machineOwnerAccountId: binding.machineOwnerAccountId,
+            sessionOwnerAccountId: binding.sessionOwnerAccountId,
+        } });
+    });
+
 }

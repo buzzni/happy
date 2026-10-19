@@ -6,15 +6,15 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat, chmod, rm } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync, statSync, lstatSync, openSync, closeSync, mkdirSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, chmodSync, statSync, lstatSync, openSync, closeSync, mkdirSync, rmSync, fsyncSync, fchmodSync, fstatSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { constants } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { configuration } from '@/configuration'
 import * as z from 'zod';
 import { encodeBase64, decodeBase64 } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
-import type { SaycodeAgentEnvironment } from '@/daemon/sessionEnv';
+import { type SaycodeAgentEnvironment, readSetupTokenResumeSelection, isMachineSetupTokenBinding, SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
 import { logger } from '@/ui/logger';
 import { parseMachineIdentity, type MachineIdentity } from '@/machineIdentity';
 import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime';
@@ -925,10 +925,13 @@ export type PersistedSession = {
 };
 
 type SessionsFile = {
+  preparedMachineLaunches?: Record<string, { createBodyHash: string; snapshot: PersistedSession }>;
+  corruptStoreBackup?: string;
   sessions: Record<string, PersistedSession>;
 };
 
 export function readPersistedSessions(): Record<string, PersistedSession> {
+  if (indeterminateSessionStores.has(configuration.sessionsFile)) return {};
   try {
     if (!existsSync(configuration.sessionsFile)) return {};
     const data = JSON.parse(readFileSync(configuration.sessionsFile, 'utf-8')) as SessionsFile;
@@ -940,13 +943,191 @@ export function readPersistedSessions(): Record<string, PersistedSession> {
 }
 
 export function persistSession(sessionId: string, session: PersistedSession): void {
+  // A failed directory flush can leave a newer binding visible. Never replace it with old memory.
+  if (indeterminateSessionStores.has(configuration.sessionsFile)) return;
   try {
+    let envelope: Record<string, unknown> = {};
+    if (existsSync(configuration.sessionsFile)) {
+      const raw = readFileSync(configuration.sessionsFile, 'utf8');
+      try {
+        envelope = JSON.parse(raw);
+        if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new SyntaxError('Invalid session envelope');
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        // Preserve all recovery evidence before restoring ordinary writes. Corrupt JSON cannot
+        // prove that no machine binding/preparation existed, so keep durable authority fenced.
+        const backup = `${configuration.sessionsFile}.${randomBytes(12).toString('hex')}.corrupt`;
+        const fd = openSync(backup, 'wx', PRIVATE_FILE_MODE);
+        try { writeFileSync(fd, raw, 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
+        if (process.platform !== 'win32') {
+          const directory = openSync(dirname(backup), 'r');
+          try { fsyncSync(directory); } finally { closeSync(directory); }
+        }
+        envelope = { corruptStoreBackup: backup };
+      }
+    }
+    if (envelope.corruptStoreBackup && session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return;
     const existing = readPersistedSessions();
-    existing[sessionId] = session;
+    existing[sessionId] = retainMachineBinding(existing[sessionId], session, false);
     const tmpFile = configuration.sessionsFile + '.tmp';
-    writePrivateFileSync(tmpFile, JSON.stringify({ sessions: existing }, null, 2));
+    writePrivateFileSync(tmpFile, JSON.stringify({ ...envelope, sessions: existing }, null, 2));
     renameSync(tmpFile, configuration.sessionsFile);
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);
+  }
+}
+
+/** No ACK on failure. After rename, visibility alone does not establish durability or rollback. */
+export type SessionPersistenceResult = { status: 'committed' | 'failed' | 'indeterminate' };
+
+// Process-local quarantine: no reader or best-effort writer may adopt/replace an unacknowledged store.
+// Recovery requires an authenticated operation journal to name the exact surviving binding and re-ACK it; no disk rollback is promised.
+const indeterminateSessionStores = new Set<string>();
+
+// Validate the resume-critical record shape, retaining unknown metadata/envelope fields for older/newer callers.
+const persistedSessionSchema = z.object({
+  encryptionKey: z.string().min(1),
+  encryptionVariant: z.enum(['legacy', 'dataKey']),
+  seq: z.number().int().nonnegative(),
+  metadataVersion: z.number().int().nonnegative(),
+  agentStateVersion: z.number().int().nonnegative(),
+  metadata: z.object({ path: z.string(), host: z.string() }).passthrough(),
+  savedAt: z.number(),
+  userHomeDir: z.string().optional(),
+  lastProcessedSeq: z.number().int().nonnegative().optional(),
+  agentEnvironment: z.record(z.string(), z.string().optional()).optional(),
+  deferredContinuationContextFile: z.string().optional(),
+}).passthrough();
+const sessionsFileSchema = z.object({ sessions: z.record(z.string(), persistedSessionSchema) }).passthrough();
+
+/** Re-ACK only the exact binding established by an authenticated recovery operation. Never rewrite disk from stale memory. */
+export function recoverPersistedSessionDurably(sessionId: string, expectedBinding: string): SessionPersistenceResult {
+  const path = configuration.sessionsFile;
+  const failure = (): SessionPersistenceResult => ({ status: indeterminateSessionStores.has(path) ? 'indeterminate' : 'failed' });
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1 || (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_FILE_MODE))) return failure();
+    const data = sessionsFileSchema.parse(JSON.parse(readFileSync(fd, 'utf8')));
+    if (data.corruptStoreBackup) return failure();
+    if (data.sessions[sessionId]?.agentEnvironment?.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING !== expectedBinding) return failure();
+    fsyncSync(fd);
+    if (process.platform !== 'win32') {
+      const directory = openSync(dirname(path), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
+    indeterminateSessionStores.delete(path);
+    return { status: 'committed' };
+  } catch { return failure(); } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+/**
+ * Strict, synchronous publication for resume authority changes. The daemon serializes these writes
+ * in one process; this is not a cross-process transaction or grant-consumption journal.
+ * Windows does not support opening/fsyncing directories through Node; file sync and rename still apply.
+ */
+export function persistSessionDurably(sessionId: string, session: PersistedSession): SessionPersistenceResult {
+  return publishSessionStoreDurably(data => {
+    persistedSessionSchema.parse(session);
+    return { ...data, sessions: { ...data.sessions, [sessionId]: retainMachineBinding(data.sessions[sessionId], session, true) } };
+  });
+}
+
+/** Keep original staged credential custody alive while initial creation is uncertain. */
+export function preparedMachineLaunchHomeDirs(): string[] {
+  // Failure is a reason to skip the orphan sweep, never to delete unknown custody.
+  if (!existsSync(configuration.sessionsFile)) return [];
+  const data = sessionsFileSchema.parse(JSON.parse(readFileSync(configuration.sessionsFile, 'utf8'))) as SessionsFile;
+  if (data.corruptStoreBackup) throw new Error('Session store recovery required before custody cleanup');
+  return Object.values(data.preparedMachineLaunches ?? {}).map(p => persistedSessionSchema.parse(p.snapshot).userHomeDir).filter((p): p is string => !!p);
+}
+
+/** Cursor/webhook writers cannot roll back a machine authority published by the durable rotation path. */
+function retainMachineBinding(previous: PersistedSession | undefined, incoming: PersistedSession, advance: boolean): PersistedSession {
+  const before = previous?.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV];
+  if (!before || before === incoming.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]) return incoming;
+  let version: unknown;
+  try { version = JSON.parse(before)?.version; } catch { return incoming; }
+  if (version !== 2) return incoming;
+  const old = readSetupTokenResumeSelection(previous!.agentEnvironment)?.binding;
+  if (!old || !isMachineSetupTokenBinding(old)) return incoming;
+  const after = readSetupTokenResumeSelection(incoming.agentEnvironment)?.binding;
+  if (advance && after && isMachineSetupTokenBinding(after) && after.launchId === old.launchId
+    && JSON.stringify(after.execution) === JSON.stringify(old.execution) && after.bindingRevision > old.bindingRevision) return incoming;
+  if (advance) throw new Error('Machine binding revision cannot move backwards or change execution');
+  return { ...incoming, agentEnvironment: { ...incoming.agentEnvironment, [SETUP_TOKEN_BINDING_ENV]: before },
+    metadata: { ...incoming.metadata, setupTokenRotation: previous!.metadata.setupTokenRotation } };
+}
+
+/** Encryption-only preparation lives in the existing private session store, never the operation journal. */
+export function persistPreparedMachineLaunch(launchId: string, createBodyHash: string, snapshot: PersistedSession): SessionPersistenceResult {
+  return publishSessionStoreDurably(data => {
+    persistedSessionSchema.parse(snapshot);
+    return { ...data, preparedMachineLaunches: { ...data.preparedMachineLaunches, [launchId]: { createBodyHash, snapshot } } };
+  });
+}
+export function recoverPreparedMachineLaunch(launchId: string, createBodyHash: string): PersistedSession | null {
+  const path = configuration.sessionsFile;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1 || (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o777) !== PRIVATE_FILE_MODE))) return null;
+    const data = sessionsFileSchema.parse(JSON.parse(readFileSync(fd, 'utf8'))) as SessionsFile;
+    if (data.corruptStoreBackup) return null;
+    const prepared = data.preparedMachineLaunches?.[launchId];
+    if (!prepared || prepared.createBodyHash !== createBodyHash) return null;
+    const snapshot = persistedSessionSchema.parse(prepared.snapshot) as PersistedSession;
+    fsyncSync(fd);
+    if (process.platform !== 'win32') {
+      const directory = openSync(dirname(path), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
+    indeterminateSessionStores.delete(path);
+    return snapshot;
+  } catch { return null; } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function publishSessionStoreDurably(update: (data: SessionsFile) => SessionsFile): SessionPersistenceResult {
+  const path = configuration.sessionsFile;
+  if (indeterminateSessionStores.has(path)) return { status: 'indeterminate' };
+  const temporary = `${path}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`;
+  let renamed = false;
+  let created = false;
+  try {
+    let stored: unknown;
+    try { stored = JSON.parse(readFileSync(path, 'utf-8')); }
+    catch (error) {
+      // Corruption, permissions and IO errors must never become an empty store.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      stored = { sessions: {} };
+    }
+    const parsed = sessionsFileSchema.parse(stored);
+    if (parsed.corruptStoreBackup) return { status: 'failed' };
+    const contents = JSON.stringify(update(stored as SessionsFile), null, 2);
+    const fd = openSync(temporary, 'wx', PRIVATE_FILE_MODE);
+    created = true;
+    try {
+      writeFileSync(fd, contents, 'utf-8');
+      if (process.platform !== 'win32') fchmodSync(fd, PRIVATE_FILE_MODE);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temporary, path);
+    renamed = true;
+    if (process.platform !== 'win32') {
+      const directory = openSync(dirname(path), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
+    return { status: 'committed' };
+  } catch {
+    if (renamed) indeterminateSessionStores.add(path);
+    // Codes only: exceptions can contain serialized session/key material.
+    logger.debug(`[PERSISTENCE] Durable session write ${renamed ? 'indeterminate' : 'failed'}`);
+    return { status: renamed ? 'indeterminate' : 'failed' };
+  } finally {
+    if (created && !renamed) {
+      try { unlinkSync(temporary); } catch { /* Clean up only our own temporary. */ }
+    }
   }
 }

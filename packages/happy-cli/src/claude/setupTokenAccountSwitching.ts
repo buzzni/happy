@@ -1,3 +1,4 @@
+import type { SetupTokenRotationState } from '@/api/types'
 /**
  * Moves a setup-token-bound Claude session off a used-up organization account (Saycode
  * specs/claude-setup-token-account-selection, stage 3).
@@ -12,7 +13,7 @@
  * (Saycode specs/claude-setup-token-managed-sync R7).
  */
 import type { SetupTokenUsageObservation } from '@/daemon/setupTokenAccountSwitch'
-import { createSetupTokenUsageTracker } from './setupTokenUsageTracker'
+import { createSetupTokenUsageTracker, isSetupTokenAccountRefusal } from './setupTokenUsageTracker'
 import { logger } from '@/ui/logger'
 
 type Outcome = { ok: true } | { ok: false; reason: string }
@@ -20,23 +21,25 @@ export type SetupTokenAccountSwitchingDeps = {
   sessionId(): string | null
   /** The binding record the running provider started with; the daemon books usage and switches against exactly it. */
   binding(): string | undefined
-  report(sessionId: string, binding: string, observation: SetupTokenUsageObservation): Promise<Outcome>
-  rebind(sessionId: string, binding: string): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }>
+  report(sessionId: string, binding: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<Outcome>
+  rebind(sessionId: string, binding: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string; retryAfterMs?: number }>
   applyEnvironment(environment: Record<string, string>): void
   notify(message: string): void
+  notifyState?(message: string, state: SetupTokenRotationState): void
   now?: () => number
   /** Background retry cadence and how long a refused turn waits for an account; injectable for tests. */
   retryIntervalMs?: number
   retryWindowMs?: number
+  retryJitterMs?: () => number
 }
 
 const REPORT_INTERVAL_MS = 60_000
 /** Enough for a few accounts; a session that keeps exhausting accounts stops trying instead of cycling. */
 const MAX_SWITCHES = 5
 /** Failures that will not pass by asking again with the same binding. */
-const PERMANENT = new Set(['FORBIDDEN', 'NOT_BOUND', 'STUDIO_UNAVAILABLE'])
+const PERMANENT = new Set(['FORBIDDEN', 'NOT_BOUND', 'STUDIO_UNAVAILABLE', 'UNSUPPORTED', 'ROTATION_LIMIT'])
 /** Failures a refused turn waits out in the background: no applied account usable yet, or none with quota. */
-const AWAITED = new Set(['APPLY_REQUIRED', 'NO_ACCOUNT', 'BINDING_REJECTED'])
+const AWAITED = new Set(['APPLY_REQUIRED', 'NO_ACCOUNT', 'BINDING_REJECTED', 'REQUEST_FAILED', 'STUDIO_BUDGET', 'PERSISTENCE_FAILED', 'PERSISTENCE_INDETERMINATE'])
 /** Once a minute stays far below Studio's 30 grants a minute per machine. */
 const RETRY_INTERVAL_MS = 60_000
 const RETRY_WINDOW_MS = 30 * 60_000
@@ -54,7 +57,14 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   let lastReportAt = -Infinity, lastReportedExhausted = false
   let wanted = false, refused = false, switches = 0, stopped = false
   /** The session ended: nothing switches, retries or speaks any more, not even an attempt already in flight. */
-  let disposed = false
+  let disposed = false, paused = false, cancelEpoch = 0, userEpoch = 0
+  let cancellation = new AbortController()
+  let latestObservation: SetupTokenUsageObservation | undefined
+  let retryDeadline: number | null = null, retryAfterMs = 0, studioBudget = false
+  const emit = (message: string, state: SetupTokenRotationState) => {
+    if (disposed || paused) return
+    if (deps.notifyState) deps.notifyState(message, state); else deps.notify(message)
+  }
   /** Notices already given since the last switch: each is said once. */
   const told = new Set<string>()
   let inFlight: Promise<{ switched: boolean; continueAfter: boolean }> | null = null
@@ -67,47 +77,55 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
     if (background?.timer) clearTimeout(background.timer)
     background = null
   }
-  const tell = (notice: string) => {
+  const tell = (notice: string, state: SetupTokenRotationState) => {
     if (told.has(notice)) return
     told.add(notice)
-    deps.notify(notice)
+    emit(notice, state)
   }
   const stop = () => {
-    if (stopped) return
+    if (stopped || disposed) return
     stopped = true
     endBackground()
-    deps.notify(FORBIDDEN_NOTICE)
+    emit(FORBIDDEN_NOTICE, 'forbidden')
   }
 
   async function switchOnce(sessionId: string, binding: string) {
-    const result = await deps.rebind(sessionId, binding).catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
-    if (disposed) return { switched: false, continueAfter: false }
+    const epoch = cancelEpoch, user = userEpoch
+    if (refused) retryDeadline ??= now() + retryWindowMs
+    if (deps.notifyState) tell('The session is switching organization Claude accounts.', 'switching')
+    const result = await deps.rebind(sessionId, binding, latestObservation, cancellation.signal).catch(() => ({ ok: false as const, reason: 'REQUEST_FAILED' }))
+    if (disposed || paused || epoch !== cancelEpoch) return { switched: false, continueAfter: false }
     if (!result.ok) {
       logger.debug(`[setup-token-switch] session ${sessionId} could not switch accounts: ${result.reason}`)
+      studioBudget = result.reason === 'STUDIO_BUDGET'
+      retryAfterMs = 'retryAfterMs' in result && typeof result.retryAfterMs === 'number' ? result.retryAfterMs : 0
       if (result.reason === 'NO_ACCOUNT') {
         wanted = false
-        tell(NO_ACCOUNT_NOTICE)
+        tell(NO_ACCOUNT_NOTICE, 'exhausted')
       } else if (PERMANENT.has(result.reason)) {
         wanted = false
         if (result.reason === 'FORBIDDEN') stop()
       }
       if (AWAITED.has(result.reason) && refused) {
-        if (result.reason !== 'NO_ACCOUNT') tell(APPLY_REQUIRED_NOTICE)
+        if (result.reason !== 'NO_ACCOUNT') tell(result.reason === 'APPLY_REQUIRED' || result.reason === 'BINDING_REJECTED' ? APPLY_REQUIRED_NOTICE : 'The organization account service is temporarily unavailable. The session will retry.', result.reason === 'APPLY_REQUIRED' || result.reason === 'BINDING_REJECTED' ? 'apply-required' : 'retrying')
         startBackground()
       }
       // Asking again with this binding cannot help: no background attempt either.
+      if (result.reason === 'UNSUPPORTED') tell('This daemon cannot rotate this organization account. Start a new conversation after updating it.', 'unsupported')
       if (PERMANENT.has(result.reason) || result.reason === 'STALE') endBackground()
+      if (result.reason === 'ROTATION_LIMIT' || result.reason === 'STALE' || result.reason === 'NOT_BOUND' || result.reason === 'STUDIO_UNAVAILABLE') tell('Organization account rotation could not continue. Retry manually or start a new conversation.', 'failed')
       // Anything else may pass: the next turn boundary (or background attempt) asks again.
       return { switched: false, continueAfter: false }
     }
     wanted = false
+    if (result.environment.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING === binding) return { switched: false, continueAfter: false }
     deps.applyEnvironment(result.environment)
     tracker.reset()
     switches++; told.clear(); lastReportAt = -Infinity; lastReportedExhausted = false
     logger.debug(`[setup-token-switch] session ${sessionId} moved to another organization account (${switches} of ${MAX_SWITCHES})`)
-    const continueAfter = refused
-    refused = false
-    deps.notify(SWITCHED_NOTICE)
+    const continueAfter = refused && user === userEpoch
+    refused = false; latestObservation = undefined; retryDeadline = null; retryAfterMs = 0
+    emit(SWITCHED_NOTICE, 'switched')
     return { switched: true, continueAfter }
   }
 
@@ -118,23 +136,26 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
   }
 
   function startBackground() {
-    if (background || stopped || disposed) return
-    background = { deadline: now() + retryWindowMs, timer: null, wake: new AbortController(), shared: false, done: null }
+    if (background || stopped || disposed || paused) return
+    background = { deadline: retryDeadline ?? now() + retryWindowMs, timer: null, wake: new AbortController(), shared: false, done: null }
     scheduleBackground(background)
   }
 
   function scheduleBackground(current: NonNullable<typeof background>) {
-    if (now() + retryIntervalMs > current.deadline) { endBackground(); return }
-    current.timer = setTimeout(() => { void retryInBackground(current) }, retryIntervalMs)
+    if (now() >= current.deadline) { tell('Organization account retry time expired. Retry manually to continue.', 'retry-expired'); endBackground(); return }
+    const jitter = studioBudget ? Math.max(0, Math.min(1000, (deps.retryJitterMs ?? (() => Math.floor(Math.random() * 1000)))())) : 0
+    const interval = Math.max(retryIntervalMs, retryAfterMs) + jitter
+    current.timer = setTimeout(() => { void retryInBackground(current) }, Math.min(interval, current.deadline - now()))
     current.timer.unref?.()
   }
 
   async function retryInBackground(current: NonNullable<typeof background>) {
     current.timer = null
+    if (now() >= current.deadline) { tell('Organization account retry time expired. Retry manually to continue.', 'retry-expired'); endBackground(); return }
     const sessionId = deps.sessionId(), binding = deps.binding()
     if (background !== current) return
     // Failed attempts bind nothing and do not count; only switches do.
-    if (stopped || !sessionId || !binding || switches >= MAX_SWITCHES) { endBackground(); return }
+    if (stopped || paused || disposed || !sessionId || !binding || switches >= MAX_SWITCHES) { endBackground(); return }
     current.shared = inFlight !== null
     const result = await attempt(sessionId, binding)
     if (background !== current) return
@@ -149,18 +170,21 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
 
   return {
     onRateLimitEvent(info: unknown) {
+      if (disposed || stopped || paused) return
       // The latest word decides: a refusal later followed by allowed requests cut nothing short.
       const status = (info as { status?: unknown } | null)?.status
-      if (status !== undefined) refused = status === 'rejected'
+      if (status !== undefined) refused = isSetupTokenAccountRefusal(info as Parameters<typeof isSetupTokenAccountRefusal>[0])
       const update = tracker.observe(info as Parameters<typeof tracker.observe>[0])
       if (!update || stopped) return
+      latestObservation = update.observation ?? latestObservation
       if (update.exhausted) wanted = true
       const sessionId = deps.sessionId(), binding = deps.binding()
       if (!update.observation || !sessionId || !binding) return
       if (now() - lastReportAt < REPORT_INTERVAL_MS && update.exhausted === lastReportedExhausted) return
       lastReportAt = now(); lastReportedExhausted = update.exhausted
-      void deps.report(sessionId, binding, update.observation)
-        .then(outcome => { if (!outcome.ok && outcome.reason === 'FORBIDDEN') { wanted = false; stop() } })
+      const reportEpoch = cancelEpoch;
+      void deps.report(sessionId, binding, update.observation, cancellation.signal)
+        .then(outcome => { if (!disposed && !paused && reportEpoch === cancelEpoch && deps.binding() === binding && !outcome.ok && outcome.reason === 'FORBIDDEN') { wanted = false; stop() } })
         .catch(() => undefined)
     },
     /**
@@ -168,6 +192,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
      * A switch finished in the background is handed over here, once.
      */
     switchIfWanted(): Promise<{ switched: boolean; continueAfter: boolean }> {
+      if (disposed || paused || stopped) return Promise.resolve({ switched: false, continueAfter: false })
       if (inFlight) {
         if (background) background.shared = true
         return inFlight
@@ -178,7 +203,7 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
         return Promise.resolve(done)
       }
       const sessionId = deps.sessionId(), binding = deps.binding()
-      if (disposed || stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
+      if (disposed || paused || stopped || !wanted || !sessionId || !binding || switches >= MAX_SWITCHES) return Promise.resolve({ switched: false, continueAfter: false })
       return attempt(sessionId, binding).then(result => {
         // Switched at this boundary: nothing is left to wait for.
         if (result.switched) endBackground()
@@ -190,10 +215,13 @@ export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchin
       return background?.wake.signal ?? null
     },
     /** The user's own message replaces the automatic continuation: the background wait ends. */
-    cancelBackground: endBackground,
+    cancelBackground() { userEpoch++; refused = false; endBackground() },
+    userTurnStarted() { if (paused) cancellation = new AbortController(); paused = false; userEpoch++; refused = false; endBackground() },
+    hasAccountRefusal() { return refused && !paused && !disposed },
+    cancelForStop() { cancellation.abort(); paused = true; cancelEpoch++; userEpoch++; wanted = false; refused = false; latestObservation = undefined; retryDeadline = null; endBackground() },
     /** The session ended: terminal, including for an attempt still in flight. */
     dispose() {
-      disposed = true
+      disposed = true; cancellation.abort(); cancelEpoch++
       endBackground()
     },
   }

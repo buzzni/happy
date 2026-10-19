@@ -25,6 +25,15 @@ describe('parseResumeCommandArgs', () => {
 });
 
 describe('buildResumeLaunch', () => {
+    it('starts an execution-bound Claude session only when the daemon proves no provider start was submitted', () => {
+        const session = { id: 'machine-session', active: true, metadata: { path: '/project', host: 'box', flavor: 'claude' } } as any;
+        expect(() => buildResumeLaunch(session)).toThrow('missing its Claude session ID');
+        expect(buildResumeLaunch(session, { startedBy: 'daemon', emptyMachineClaudeSession: { sessionId: 'machine-session', serverSeq: 0, processedSeq: 0, startNeverSubmitted: true } }).args).toEqual(['claude', '--started-by', 'daemon']);
+        expect(buildResumeLaunch(session, { startedBy: 'daemon', emptyMachineClaudeSession: { sessionId: 'machine-session', serverSeq: 3, processedSeq: 0, startNeverSubmitted: true } }).args).toEqual(['claude', '--started-by', 'daemon']);
+        expect(() => buildResumeLaunch(session, { startedBy: 'terminal', emptyMachineClaudeSession: { sessionId: 'machine-session', serverSeq: 0, processedSeq: 0, startNeverSubmitted: true } })).toThrow();
+        expect(() => buildResumeLaunch(session, { startedBy: 'daemon', emptyMachineClaudeSession: { sessionId: 'another-session', serverSeq: 0, processedSeq: 0, startNeverSubmitted: true } })).toThrow();
+    });
+
     it('starts Codex without a provider resume only for a daemon-confirmed unused Happy session', () => {
         const options = { startedBy: 'daemon' as const, emptyCodexSession: { serverSeq: 0, processedSeq: 0 } };
         expect(buildResumeLaunch({ id: 'unused', active: false, metadata: { path: '/chat', flavor: 'codex' } as never }, options)).toEqual({

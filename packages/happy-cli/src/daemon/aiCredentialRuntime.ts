@@ -34,7 +34,7 @@ import {
   serializeAppliedClaudeProvenance,
   serializeInvalidatedClaudeProvenance,
 } from './aiCredentialProvenance'
-import { SETUP_TOKEN_BINDING_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding } from './sessionEnv'
+import { SETUP_TOKEN_BINDING_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
 import { readTrustedStudioOrigin, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
@@ -137,6 +137,8 @@ export type AiCredentialRuntimeDependencies = {
   codexProxyStatus?: () => { activeRoutes: number }
   /** Present only when the daemon has a trusted Studio origin configured. */
   setupTokenBinding?: Pick<SetupTokenBindingVerifier, 'verify' | 'available'>
+  machineSetupTokenStart?(binding: MachineSetupTokenBindingRecord): Promise<void>
+  machineSetupTokenAuthority?(binding: MachineSetupTokenBindingRecord): Promise<void>
   /** Managed account IDs the daemon's running sessions are bound to; a group sync leaves their slots for a later sync. */
   setupTokenAccountsInUse?(): string[]
 }
@@ -2190,9 +2192,20 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     }
     // The signed caller must own the slot through this scope's applied assignment.
     // Personal, other-company, other-user, pending and revoked slots fail.
-    const assignment = await groups.assignment(groupScope, 'claude')
-    if (!assignment || !assignment.reconciled || assignment.userId !== binding.userId
-      || !assignment.desired.includes(setupTokenGroupIdentity(managedAccountId))) throw unavailable()
+    if (isMachineSetupTokenBinding(binding)) {
+      if (!deps.machineSetupTokenAuthority) throw unavailable()
+      await deps.machineSetupTokenAuthority(binding)
+      if (binding.machineId !== deps.machineId || binding.companyId !== groupScope) throw unavailable()
+      const receipt = await groups.receipt(groupScope, 'claude', { principalType: 'machine', machineId: binding.machineId, userId: binding.machineId })
+      if (!receipt || !receipt.reconciled || receipt.assignmentGeneration !== binding.assignmentGeneration
+        || receipt.fingerprint !== binding.assignmentFingerprint
+        || !receipt.appliedCredentials.some(row => row.managedAccountId === managedAccountId && row.credentialGeneration === credentialGeneration)
+        || !await groups.authorizeMachine(groupScope, binding.machineId, setupTokenGroupIdentity(managedAccountId))) throw unavailable()
+    } else {
+      const assignment = await groups.assignment(groupScope, 'claude')
+      if (!assignment || !assignment.reconciled || assignment.userId !== binding.userId
+        || !assignment.desired.includes(setupTokenGroupIdentity(managedAccountId))) throw unavailable()
+    }
     const email = managedSetupTokenEmail(managedAccountId)
     const { listed: roster, exported } = await readSlotRosterAndExport()
     const listed = roster.find(account => account.email === email)
@@ -2243,7 +2256,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       }).find((value): value is string => value !== null)
       if (!token) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
       const cleared = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']))
-      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle' }
+      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1' }
     })
   }
 
@@ -2353,6 +2366,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const current = await setupTokenSessionEnvironment(launch.agent, launch.selection, launch.binding)
       if (current.CLAUDE_CODE_OAUTH_TOKEN !== environment.CLAUDE_CODE_OAUTH_TOKEN) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_STALE')
       checkExpiry()
+      if (isMachineSetupTokenBinding(launch.binding)) {
+        if (!deps.machineSetupTokenStart) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE');
+        await deps.machineSetupTokenStart(launch.binding);
+      }
       launch.started = true
       // No asynchronous launch preparation belongs in start: plain spawn calls
       // spawnHappyCLI, tmux calls new-window, Windows resumes a suspended root.
@@ -2429,7 +2446,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     })
   }
 
-  return { launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  // Launch eligibility only. Authority is still checked by Studio and at token/launch under serializeLaunch.
+  const sharedMachineSetupTokenScope = () => serializeLaunch('scope', async () => {
+    if (!deps.machineId || await groups.hasManagedDesired('claude', 'user') || (await readTrialMarker()).leases.zai) return null
+    const entries = await groups.machineManaged('claude', deps.machineId)
+    if (!entries.length) return null
+    if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
+    return entries[0].scope
+  })
+  return { sharedMachineSetupTokenScope, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}
@@ -2894,7 +2919,7 @@ export function createNodeAiCredentialRuntime(
   supervisor: Supervisor,
   env: Record<string, string | undefined> = process.env,
   homeDir: string = homedir(),
-  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'|'setupTokenAccountsInUse'> = {},
+  options: Pick<AiCredentialRuntimeDependencies, 'setupTokenBinding'|'machineId'|'setupTokenAccountsInUse'|'machineSetupTokenAuthority'|'machineSetupTokenStart'> = {},
 ) {
   return createAiCredentialRuntime({
     ...options,

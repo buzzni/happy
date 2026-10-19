@@ -1,3 +1,4 @@
+import { HappySessionExecutionProofSchema, type HappySessionExecutionProof, type SessionExecutionCreateBody } from '@slopus/happy-wire';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
 import axios from 'axios'
@@ -200,6 +201,8 @@ export class ApiClient {
      * exactly these bytes instead of minting its own. Legacy accounts have no per-session key.
      */
     dataKey?: { key: Uint8Array, wrapped: Uint8Array },
+    /** Trusted daemon preparation only: prove the exact already-encrypted create payload. */
+    executionProof?: (body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }) => Promise<HappySessionExecutionProof>,
   }): Promise<Session | null> {
     if (this.principal.kind === 'managed-session') {
       // Refused here rather than at the server: a managed run that reached
@@ -235,16 +238,20 @@ export class ApiClient {
       encryptionVariant = 'legacy';
     }
 
+    // Encrypt once, then bind the device proof to these exact bytes. Preparation failure
+    // must not enter the legacy offline path or send an unsigned create request.
+    const body = Object.freeze({
+      tag: opts.tag,
+      metadata: encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata)),
+      agentState: opts.state ? encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.state)) : null,
+      dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : null,
+    });
+    const executionProof = opts.executionProof ? HappySessionExecutionProofSchema.parse(await opts.executionProof(body, { encryptionKey, encryptionVariant })) : undefined;
     // Create session
     try {
       const response = await axios.post<CreateSessionResponse>(
         `${configuration.serverUrl}/v1/sessions`,
-        {
-          tag: opts.tag,
-          metadata: encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.metadata)),
-          agentState: opts.state ? encodeBase64(encrypt(encryptionKey, encryptionVariant, opts.state)) : null,
-          dataEncryptionKey: dataEncryptionKey ? encodeBase64(dataEncryptionKey) : null,
-        },
+        opts.executionProof ? { ...body, executionProof } : body,
         {
           headers: {
             'Authorization': `Bearer ${this.bearer()}`,
@@ -269,6 +276,9 @@ export class ApiClient {
       }
       return session;
     } catch (error) {
+      // A machine-v2 launch requires the registered execution relation before provider
+      // start. Never return null (offline creation), or log request headers/proofs.
+      if (opts.executionProof) throw new Error('Execution-bound session creation failed');
       logger.debug('[API] [ERROR] Failed to get or create session:', error);
 
       // Classify on whether the server answered at all, before looking at any

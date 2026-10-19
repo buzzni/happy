@@ -15,6 +15,8 @@ export type ResumeLaunchOptions = {
     startedBy?: 'daemon' | 'terminal';
     /** Fresh authenticated server head and the prior child's processed cursor. */
     emptyCodexSession?: { serverSeq?: number; processedSeq: number };
+    /** Daemon-only durable machine execution proof: no provider start was ever submitted. */
+    emptyMachineClaudeSession?: { sessionId: string; serverSeq?: number; processedSeq: number; startNeverSubmitted: true };
 };
 
 export function parseResumeCommandArgs(args: string[]): { showHelp: boolean; sessionId: string } {
@@ -70,7 +72,10 @@ export function buildResumeLaunch(session: ResumableHappySession, options: Resum
     }
 
     if (flavor === 'claude') {
-        if (!metadata.claudeSessionId) {
+        const fresh = options.emptyMachineClaudeSession;
+        const unused = options.startedBy === 'daemon' && fresh?.startNeverSubmitted === true && fresh.sessionId === session.id
+            && Number.isSafeInteger(fresh.serverSeq) && (fresh.serverSeq ?? -1) >= 0 && fresh.processedSeq === 0;
+        if (!metadata.claudeSessionId && !unused) {
             throw new Error(`Happy session ${session.id} is missing its Claude session ID.`);
         }
         const args = ['claude'];
@@ -80,7 +85,7 @@ export function buildResumeLaunch(session: ResumableHappySession, options: Resum
         if (options.startedBy) {
             args.push('--started-by', options.startedBy);
         }
-        args.push('--resume', metadata.claudeSessionId);
+        if (metadata.claudeSessionId) args.push('--resume', metadata.claudeSessionId);
         return {
             cwd: metadata.path,
             args,

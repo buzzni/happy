@@ -39,7 +39,7 @@ const refused = { type: 'rate_limit_event', uuid: 'rl-1', session_id: 'claude-1'
     rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: Math.floor(Date.now() / 1000) + 3600 } };
 
 describe('setup-token account switch in the remote launcher (Saycode specs/claude-setup-token-account-selection)', () => {
-    it('restarts the provider on the same conversation with the new account and continues the refused turn', async () => {
+    it.each(['result', 'exception'])('restarts the same conversation after a known account refusal (%s) and prioritizes the queued user message', async failure => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const client = {
@@ -64,12 +64,13 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                         // The user queued another message while the refused turn ran.
                         queue.push('queued while refused', { permissionMode: 'default', model: 'claude-sonnet-5' });
                         yield refused;
+                        if (failure === 'exception') throw new Error('Provider exited after known account-wide quota refusal');
                         yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
                         continue;
                     }
                     yield assistant(`msg-${generation.prompts.length + 1}`);
                     yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${generation.prompts.length + 1}` };
-                    if (generation.prompts.length < 2) continue;
+                    if (generation.prompts.length < 1) continue;
                     void handlers.get('switch')!();
                     return;
                 }
@@ -83,20 +84,66 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             // Continuing an existing Claude conversation; both providers must resume it.
             sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
         };
 
         await claudeRemoteLauncher(session as unknown as Session);
 
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
         expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
-        // The continuation runs first and on its own; the user's queued message follows it.
-        expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
-        expect(generations[1].prompts[0]).not.toContain('queued while refused');
-        expect(generations[1].prompts[1]).toContain('queued while refused');
-        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}');
-        expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }));
-        expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE });
+        // A queued user turn replaces automatic continuation and runs alone on the new account.
+        expect(generations[1].prompts[0]).toContain('queued while refused');
+        expect(generations[1].prompts[0]).not.toContain(CONTINUE_PROMPT);
+        expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
+        expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', '{"account":"first"}', expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
+        expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
+        expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+        expect(generations[0].prompts).toHaveLength(1);
+        expect(generations[1].prompts).toHaveLength(1);
+        // A restarted provider is not enough: the new reply must reach the user's session once.
+        const replies = client.sendClaudeSessionMessage.mock.calls.flatMap(([body]) =>
+            body.type === 'assistant' ? [body.message] : []);
+        expect(replies).toEqual([
+            expect.objectContaining({ id: 'msg-2', content: [{ type: 'text', text: 'hi' }] }),
+        ]);
+        const successfulResults = client.applyClaudeTurnResult.mock.calls.flatMap(([result]) =>
+            result.is_error === false ? [result.uuid] : []);
+        expect(successfulResults).toEqual(['result-2']);
+    });
+
+    it('closes a refused turn as failed when the provider throws and rebind fails', async () => {
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'FORBIDDEN' });
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            failClaudeLaunchTurn: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                yield refused;
+                throw new Error('Provider exited after refusal');
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        try {
+            await vi.waitFor(() => expect(client.failClaudeLaunchTurn).toHaveBeenCalledTimes(1));
+            expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+            expect(query).toHaveBeenCalledTimes(1);
+        } finally { await handlers.get('switch')?.(); await launched; }
     });
 
     it('hands a message that arrives after a switch to a provider restarted on the new account', async () => {
@@ -142,7 +189,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             cancelLessonReview: vi.fn(),
             sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
         };
 
         await claudeRemoteLauncher(session as unknown as Session);
@@ -194,7 +241,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             cancelLessonReview: vi.fn(),
             sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
             api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
         };
 
         await claudeRemoteLauncher(session as unknown as Session);
@@ -205,7 +252,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(generations[1].prompts.join()).toContain('try again');
     });
     // Saycode specs/claude-setup-token-managed-sync R7: the newly assigned account is applied to this PC after the refusal.
-    it('continues a refused turn by itself once a background retry binds an account applied meanwhile', async () => {
+    it.each(['continue', 'stop'])('handles background rotation after account application: %s', async action => {
         vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
         try {
             vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'APPLY_REQUIRED' });
@@ -247,12 +294,22 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 cancelLessonReview: vi.fn(),
                 sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
                 api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
             };
 
             const launched = claudeRemoteLauncher(session as unknown as Session);
-            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: APPLY_REQUIRED_NOTICE }));
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: APPLY_REQUIRED_NOTICE, setupTokenRotation: { version: 1, state: 'apply-required' } }));
             expect(generations).toHaveLength(1);
+            if (action === 'stop') {
+                await handlers.get('abort')!();
+                const notices = client.sendSessionEvent.mock.calls.filter(([event]) => 'setupTokenRotation' in event).length;
+                await vi.advanceTimersByTimeAsync(5 * 60000);
+                expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
+                expect(generations).toHaveLength(1);
+                expect(client.sendSessionEvent.mock.calls.filter(([event]) => 'setupTokenRotation' in event).length).toBe(notices);
+                await handlers.get('switch')!(); await launched;
+                return;
+            }
             // Nobody writes; a minute later the retry finds the account applied.
             await vi.advanceTimersByTimeAsync(60_000);
             await launched;
@@ -260,7 +317,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
-            expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE });
+            expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
         } finally {
             vi.useRealTimers();
         }
@@ -311,11 +368,11 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 cancelLessonReview: vi.fn(),
                 sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
                 api: { push: () => ({ sendSessionNotification: vi.fn() }) },
-                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
             };
 
             const launched = claudeRemoteLauncher(session as unknown as Session);
-            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: APPLY_REQUIRED_NOTICE }));
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: APPLY_REQUIRED_NOTICE, setupTokenRotation: { version: 1, state: 'apply-required' } }));
             // The loop has started the next provider, which waits for its first input next to the wait the exited one left behind.
             for (let tick = 0; tick < 50; tick++) await new Promise(resolve => setImmediate(resolve));
             expect(generations).toHaveLength(1);

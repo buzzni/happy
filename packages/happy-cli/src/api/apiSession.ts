@@ -1,3 +1,4 @@
+import type { SetupTokenRotationState } from './types';
 import { logger } from '@/ui/logger'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { EventEmitter } from 'node:events'
@@ -51,7 +52,7 @@ const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
  */
 export type ACPMessageData =
     // Core message types
-    | { type: 'message'; message: string }
+    | { type: 'message'; message: string; setupTokenRotation?: { version: 1; state: SetupTokenRotationState } }
     | { type: 'reasoning'; message: string }
     | { type: 'thinking'; text: string }
     // Tool interactions
@@ -1824,7 +1825,7 @@ export class ApiSessionClient extends EventEmitter {
     sendSessionEvent(event: {
         type: 'switch', mode: 'local' | 'remote'
     } | {
-        type: 'message', message: string
+        type: 'message', message: string, setupTokenRotation?: { version: 1; state: SetupTokenRotationState }
     } | {
         type: 'permission-mode-changed', mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     } | {

@@ -30,7 +30,7 @@ function setup(extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
         : { version: 1, recorded: true })
     }) as unknown as typeof fetch,
     sessionEnvironment: vi.fn(async () => ({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SOURCE: 'org-bundle', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) })),
-    recordAgentEnvironment: vi.fn(),
+    recordAgentEnvironment: vi.fn(() => ({ status: 'committed' as const })),
     ...extra,
   }
   return { session, requests, deps, switcher: createSetupTokenAccountSwitch(deps) }
@@ -52,6 +52,98 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(deps.sessionEnvironment).toHaveBeenCalledWith('claude', { kind: 'claude-setup-token', managedAccountId: B, groupScope: 'org-a', credentialGeneration: 1, bindingGrant: 'claims.signature' })
     expect(result).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SOURCE: 'org-bundle', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) } })
     expect(deps.recordAgentEnvironment).toHaveBeenCalledWith(session, formatSetupTokenBinding(binding(B)))
+  })
+
+  it('treats a missing durable ACK as indeterminate and never returns a token', async () => {
+    const { switcher, session } = setup({ recordAgentEnvironment: vi.fn(() => undefined) as unknown as SetupTokenAccountSwitchDeps['recordAgentEnvironment'] })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_INDETERMINATE' })
+    expect(session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(RUNNING_A)
+  })
+
+  it('retries the same verified binding after a failed save instead of consuming another grant', async () => {
+    const record = vi.fn().mockReturnValueOnce({ status: 'failed' }).mockReturnValue({ status: 'committed' })
+    const { switcher, deps, session } = setup({ recordAgentEnvironment: record })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_FAILED' })
+    expect(session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(RUNNING_A)
+    expect(await switcher.rebind('session-a', RUNNING_A)).toMatchObject({ ok: true })
+    expect(deps.fetch).toHaveBeenCalledTimes(1)
+    expect(deps.sessionEnvironment).toHaveBeenCalledTimes(2)
+    expect(deps.sessionEnvironment).toHaveBeenLastCalledWith('claude', expect.objectContaining({ managedAccountId: B }), binding(B))
+    expect(record).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not replay a pending save over a changed committed binding', async () => {
+    const record = vi.fn(() => ({ status: 'failed' as const }))
+    const { switcher, deps, session } = setup({ recordAgentEnvironment: record })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_FAILED' })
+    session.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) }
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'STALE' })
+    expect(deps.fetch).toHaveBeenCalledTimes(1)
+    expect(record).toHaveBeenCalledTimes(1)
+  })
+
+  it('revalidates the pending account after a save failure and refuses a revoked assignment', async () => {
+    const record = vi.fn().mockReturnValueOnce({ status: 'failed' }).mockReturnValue({ status: 'committed' })
+    const { switcher, deps } = setup({ recordAgentEnvironment: record })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_FAILED' })
+    vi.mocked(deps.sessionEnvironment).mockRejectedValueOnce(new Error('assignment revoked'))
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'BINDING_REJECTED' })
+    expect(deps.fetch).toHaveBeenCalledTimes(1)
+    expect(record).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not publish or return a token if the session ends during grant preparation', async () => {
+    const { switcher, deps } = setup()
+    vi.mocked(deps.sessionEnvironment).mockImplementationOnce(async () => {
+      deps.findSession = () => undefined
+      return { CLAUDE_CODE_OAUTH_TOKEN: 'next', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding(B)) }
+    })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(deps.recordAgentEnvironment).not.toHaveBeenCalled()
+  })
+
+  it('does not return a token after the session ends while awaiting a save ACK', async () => {
+    let ack!: (result: { status: 'committed' }) => void
+    const record = vi.fn(() => new Promise<{ status: 'committed' }>(resolve => { ack = resolve }))
+    const { switcher, deps } = setup({ recordAgentEnvironment: record })
+    const pending = switcher.rebind('session-a', RUNNING_A)
+    await vi.waitFor(() => expect(record).toHaveBeenCalledTimes(1))
+    deps.findSession = () => undefined
+    ack({ status: 'committed' })
+    expect(await pending).toEqual({ ok: false, reason: 'NOT_BOUND' })
+  })
+
+  it('does not retry an indeterminate save or issue more grants', async () => {
+    const record = vi.fn(() => ({ status: 'indeterminate' as const }))
+    const { switcher, deps, session } = setup({ recordAgentEnvironment: record })
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_INDETERMINATE' })
+    }
+    expect(session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(RUNNING_A)
+    expect(deps.fetch).toHaveBeenCalledTimes(1)
+    expect(record).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats a throwing recorder as indeterminate and never returns its token', async () => {
+    const record = vi.fn(() => { throw new Error('unexpected recorder failure') })
+    const { switcher, deps } = setup({ recordAgentEnvironment: record })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_INDETERMINATE' })
+    expect(await switcher.rebind('session-a', RUNNING_A)).toEqual({ ok: false, reason: 'PERSISTENCE_INDETERMINATE' })
+    expect(deps.fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('awaits the durable ACK and shares it with concurrent requests', async () => {
+    let ack!: (result: { status: 'committed' }) => void
+    const record = vi.fn(() => new Promise<{ status: 'committed' }>(resolve => { ack = resolve }))
+    const { switcher } = setup({ recordAgentEnvironment: record })
+    let completed = false
+    const first = switcher.rebind('session-a', RUNNING_A).then(result => { completed = true; return result })
+    const second = switcher.rebind('session-a', RUNNING_A)
+    await vi.waitFor(() => expect(record).toHaveBeenCalledTimes(1))
+    expect(completed).toBe(false)
+    ack({ status: 'committed' })
+    expect(await first).toMatchObject({ ok: true })
+    expect(await second).toMatchObject({ ok: true })
   })
 
   it('stays on the current account when Studio has no better one', async () => {
@@ -150,7 +242,7 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     })
     const { switcher, requests, session } = setup({
       sessionEnvironment,
-      recordAgentEnvironment: (tracked, value) => { tracked.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: value } },
+      recordAgentEnvironment: (tracked, value) => { tracked.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: value }; return { status: 'committed' } },
     })
     expect(await switcher.rebind('session-a', RUNNING_A)).toMatchObject({ ok: true })
     expect(session.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]).toBe(formatSetupTokenBinding(binding(B)))

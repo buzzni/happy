@@ -33,8 +33,8 @@ describe('setup-token usage tracker (Saycode specs/claude-setup-token-account-se
     const rejected = createSetupTokenUsageTracker(() => NOW).observe({ status: 'rejected', rateLimitType: 'five_hour', resetsAt: inSeconds(60_000) })
     expect(rejected).toEqual({ exhausted: true, observation: { observedAt: NOW, reason: 'rate-limited', retryAt: inSeconds(60_000) * 1000,
       windows: [{ kind: 'unified5h', pct: 100, resetsAt: inSeconds(60_000) * 1000 }] } })
-    // Nothing reportable, but still a reason to move off the account.
-    expect(createSetupTokenUsageTracker(() => NOW).observe({ status: 'rejected' })).toEqual({ exhausted: true, observation: null })
+    // Refusal without utilization is still an atomic rebind observation.
+    expect(createSetupTokenUsageTracker(() => NOW).observe({ status: 'rejected' })).toEqual({ exhausted: true, observation: { observedAt: NOW, reason: 'rate-limited', retryAt: null, windows: [] } })
   })
 
   it('ignores model-specific windows and events it cannot read', () => {
@@ -74,7 +74,7 @@ describe('setup-token usage tracker (Saycode specs/claude-setup-token-account-se
       observation: { observedAt: NOW, reason: 'rate-limited', retryAt: NOW + 86_400_000, windows: [{ kind: 'unified7d', pct: 100, resetsAt: NOW + 86_400_000 }] },
     })
     const overage = createSetupTokenUsageTracker(() => NOW)
-    expect(overage.observe({ status: 'rejected', rateLimitType: 'overage', resetsAt: inSeconds(3_600_000) })).toEqual({ exhausted: true, observation: null })
+    expect(overage.observe({ status: 'rejected', rateLimitType: 'overage', resetsAt: inSeconds(3_600_000) })).toEqual({ exhausted: true, observation: { observedAt: NOW, reason: 'rate-limited', retryAt: NOW + 3_600_000, windows: [] } })
   })
 
   it('reads a utilization just above 1 as full', () => {

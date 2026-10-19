@@ -33,8 +33,30 @@ describe('setup-token account switching in a running session', () => {
     expect(deps.report).toHaveBeenCalledTimes(2)
     switching.onRateLimitEvent(near)
     expect(deps.report).toHaveBeenCalledTimes(3)
-    expect(deps.report).toHaveBeenLastCalledWith('session-a', 'binding-a', expect.objectContaining({ windows: [expect.objectContaining({ pct: 97 })] }))
+    expect(deps.report).toHaveBeenLastCalledWith('session-a', 'binding-a', expect.objectContaining({ windows: [expect.objectContaining({ pct: 97 })] }), expect.any(AbortSignal))
   })
+
+  it('aborts in-flight transport on stop and suppresses its late success, notification and continuation', async () => {
+    let finish!: (value: { ok: true; environment: Record<string, string> }) => void;
+    let signal: AbortSignal | undefined;
+    const { deps, switching } = setup({ rebind: vi.fn<SetupTokenAccountSwitchingDeps['rebind']>((_id, _binding, _observation, cancellation) => {
+      signal = cancellation; return new Promise(resolve => { finish = resolve });
+    }) });
+    switching.onRateLimitEvent(refused);
+    const result = switching.switchIfWanted();
+    switching.cancelForStop();
+    expect(signal?.aborted).toBe(true);
+    finish({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'late' } });
+    expect(await result).toEqual({ switched: false, continueAfter: false });
+    expect(deps.applyEnvironment).not.toHaveBeenCalled(); expect(deps.notify).not.toHaveBeenCalled();
+  });
+
+  it('does not count convergence on the identical binding as another successful switch', async () => {
+    const { deps, switching } = setup({ rebind: vi.fn(async () => ({ ok: true as const, environment: { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'binding-a' } })) });
+    switching.onRateLimitEvent(refused);
+    expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false });
+    expect(deps.applyEnvironment).not.toHaveBeenCalled(); expect(deps.notify).not.toHaveBeenCalled();
+  });
 
   it('does not switch while the account still has quota', async () => {
     const { deps, switching } = setup()
@@ -47,7 +69,7 @@ describe('setup-token account switching in a running session', () => {
     const { deps, switching } = setup()
     switching.onRateLimitEvent(near)
     expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: false })
-    expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a')
+    expect(deps.rebind).toHaveBeenCalledWith('session-a', 'binding-a', expect.objectContaining({ reason: 'ok', windows: [expect.objectContaining({ pct: 97 })] }), expect.any(AbortSignal))
     expect(deps.applyEnvironment).toHaveBeenCalledWith({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' })
     expect(deps.notify).toHaveBeenCalledOnce()
     expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
@@ -58,6 +80,14 @@ describe('setup-token account switching in a running session', () => {
     const { switching } = setup()
     switching.onRateLimitEvent(refused)
     expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: true })
+  })
+
+  it.each(['seven_day_opus', 'throttle', 'authentication'])('does not continue a %s rejection as an account-wide refusal', async rateLimitType => {
+    const { switching } = setup()
+    switching.onRateLimitEvent(near)
+    switching.onRateLimitEvent({ status: 'rejected', rateLimitType,
+      unifiedWindows: { five_hour: { utilization: 0.97, resetsAt: reset } } })
+    expect(await switching.switchIfWanted()).toEqual({ switched: true, continueAfter: false })
   })
 
   it('stays on the account and says so once when no other account has quota', async () => {
@@ -106,6 +136,21 @@ describe('setup-token account switching in a running session', () => {
     expect(deps.notify).toHaveBeenCalledOnce()
   })
 
+  it('ignores late usage refusals and new provider events after disposal', async () => {
+    let finish!: (result: { ok: false; reason: string }) => void
+    const report = vi.fn(() => new Promise<{ ok: false; reason: string }>(resolve => { finish = resolve }))
+    const { deps, switching, advance } = setup({ report })
+    switching.onRateLimitEvent(near)
+    switching.dispose()
+    finish({ ok: false, reason: 'FORBIDDEN' })
+    await Promise.resolve()
+    advance(60_000)
+    switching.onRateLimitEvent(refused)
+    expect(report).toHaveBeenCalledOnce()
+    expect(deps.notify).not.toHaveBeenCalled()
+    expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
+  })
+
   it('stops after Studio refuses a switch for this binding', async () => {
     const { deps, switching } = setup({ rebind: vi.fn(async () => ({ ok: false as const, reason: 'FORBIDDEN' })) })
     switching.onRateLimitEvent(near)
@@ -131,7 +176,7 @@ describe('setup-token account switching while no applied account is usable', () 
   const ok = { ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } }
   function background(rebind: SetupTokenAccountSwitchingDeps['rebind']) {
     vi.useFakeTimers({ now: NOW })
-    return setup({ rebind, now: () => Date.now() })
+    return setup({ rebind, now: () => Date.now(), retryJitterMs: () => 0 })
   }
 
   it.each([['APPLY_REQUIRED', APPLY_REQUIRED_NOTICE], ['NO_ACCOUNT', NO_ACCOUNT_NOTICE], ['BINDING_REJECTED', APPLY_REQUIRED_NOTICE]])(
@@ -168,15 +213,28 @@ describe('setup-token account switching while no applied account is usable', () 
     expect(rebind).toHaveBeenCalledOnce()
   })
 
+  it('respects Studio Retry-After without extending the original thirty minute deadline', async () => {
+    const rebind = vi.fn(async () => ({ ok: false as const, reason: 'STUDIO_BUDGET', retryAfterMs: 120000 }));
+    const { deps, switching } = background(rebind);
+    switching.onRateLimitEvent(refused); await switching.switchIfWanted();
+    await vi.advanceTimersByTimeAsync(119999); expect(rebind).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); expect(rebind).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(28 * 60000); expect(rebind).toHaveBeenCalledTimes(15);
+    expect(switching.backgroundSignal()).toBeNull();
+    expect(deps.notify).toHaveBeenCalledWith('Organization account retry time expired. Retry manually to continue.');
+    await vi.advanceTimersByTimeAsync(30 * 60000); expect(rebind).toHaveBeenCalledTimes(15);
+  });
+
   it('gives up after thirty minutes, telling the user once', async () => {
     const rebind = vi.fn(async () => ({ ok: false as const, reason: 'APPLY_REQUIRED' }))
     const { deps, switching } = background(rebind)
     switching.onRateLimitEvent(refused)
     await switching.switchIfWanted()
     await vi.advanceTimersByTimeAsync(45 * 60_000)
-    expect(rebind).toHaveBeenCalledTimes(31)
+    expect(rebind).toHaveBeenCalledTimes(30)
     expect(switching.backgroundSignal()).toBeNull()
-    expect(deps.notify).toHaveBeenCalledOnce()
+    expect(deps.notify).toHaveBeenCalledTimes(2)
+    expect(deps.notify).toHaveBeenCalledWith('Organization account retry time expired. Retry manually to continue.')
     expect(deps.notify).toHaveBeenCalledWith(APPLY_REQUIRED_NOTICE)
   })
 
@@ -265,4 +323,13 @@ describe('setup-token account switching while no applied account is usable', () 
     expect(await switching.switchIfWanted()).toEqual({ switched: false, continueAfter: false })
     expect(switching.backgroundSignal()).toBeNull()
   })
+})
+
+it('primary review: proactive warning failure does not consume a later refused-turn retry window', async () => {
+ const {switching,advance}=setup({rebind:vi.fn(async()=>({ok:false as const,reason:'NO_ACCOUNT'}))})
+ switching.onRateLimitEvent(near);await switching.switchIfWanted()
+ advance(31*60000)
+ switching.onRateLimitEvent(refused);await switching.switchIfWanted()
+ expect(switching.backgroundSignal()).not.toBeNull()
+ switching.dispose()
 })

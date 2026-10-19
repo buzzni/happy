@@ -76,6 +76,8 @@ export function createChannelHostSessions(deps: {
     };
     createSession: (input: { tag: string; metadata: Metadata; dataKey: { key: Uint8Array; wrapped: Uint8Array } }) => Promise<Session | null>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
+    /** Trusted daemon creates a proof-bound session inside its ordinary spawn boundary. Null keeps the existing path. */
+    spawnWithSessionKey?: (options: SpawnSessionOptions, dataKey: { key: Uint8Array; wrapped: Uint8Array }) => Promise<SpawnSessionResult | null>;
 }): { handle(method: string, params: unknown): Promise<unknown> } {
     const keys = new Map<string, SessionKeys>();
 
@@ -122,6 +124,13 @@ export function createChannelHostSessions(deps: {
             lifecycleStateSince: Date.now(),
             ...(request.createdByAccountId ? { createdBy: { accountId: request.createdByAccountId } } : {}),
         };
+        const prepared = await deps.spawnWithSessionKey?.(spawnOptions(request), { key, wrapped });
+        if (prepared) {
+            const sessionId = startedSessionId(prepared);
+            const sessionKeys: SessionKeys = { dataEncryptionKey: encodeBase64(wrapped), dek: encodeBase64(key) };
+            keys.set(sessionId, sessionKeys);
+            return { sessionId, ...sessionKeys };
+        }
         let session: Session | null;
         try {
             session = await deps.createSession({ tag: randomUUID(), metadata, dataKey: { key, wrapped } });
