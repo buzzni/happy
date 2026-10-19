@@ -1,6 +1,6 @@
 ---
 feature: shared-machine-rotation-runtime
-status: implemented-local-acceptance-pending
+status: pr-preparation-live-rollout-pending
 last-updated: 2026-10-19
 ---
 # Machine-v2 CLI runtime integration
@@ -236,3 +236,48 @@ corepack pnpm -C packages/happy-server run typecheck
 
 The artifact contains only synthetic test claims/public key. Both opt-in tests skip when
 these environment inputs are absent; they must be explicitly enabled for cross-repo acceptance.
+
+
+## Live failure diagnosis and rollout boundary — 2026-10-19
+
+This checkpoint supersedes the earlier local-only commit restrictions and historical
+statements about uncommitted changes. The requested production failure was inspected
+through the authenticated Web UI without changing assignments or restarting a daemon.
+
+The affected shared machine has a connected Claude setup-token assignment, but its
+read-only daemon diagnosis reports **1.1.10-aplus.330**. The UI advertises .344 as latest;
+origin/main at 24b6c3e69 does not contain machine-v2 rotation. The chat returned the
+provider's weekly-limit response without rotation. Credential delivery succeeded; that
+status does not establish execution binding or rotation capability. Updating to .344
+alone cannot provide this still-unreleased implementation.
+
+The rotation branch was rebased onto that main, excluding three unrelated observation
+commits from its inherited base. A local backup branch preserves the original history.
+No automatic promotion of legacy sessions is added: after rollout, an existing unbound
+chat still cannot acquire machine authority by resume. Validate a fresh execution bound
+under v2; preserve the original conversation and journal evidence.
+
+Rollout order (not executed by this checkpoint):
+1. Merge reviewed Happy server/wire/CLI changes; update Studio vendor/happy to the
+   reviewed Happy commit so the server image actually includes execution-proof support.
+2. Deploy the additive Happy and Studio migrations and server code with issuance OFF.
+   Pin the same trusted Studio public key and origins at both servers/daemon.
+3. Publish a new CLI version through the GitHub Actions tag workflow and install it
+   on the target machine; the local branch's old package version is not a release.
+4. Verify device approval and re-apply the current assignment to refresh receipt
+   metadata. Enable only the intended company/machine pair on Studio and daemon.
+5. Verify a fresh bound execution with two usable accounts, final account-wide refusal,
+   successful account switch/continuation, stop handling and exhaustion. Never call
+   a code merge or component test live acceptance.
+
+Main merge, release tag/publication, operational migrations, rollout flags and shared
+machine restart remain pending. Keep issuance OFF on rollback, retain v2 evidence/readers,
+and do not fall back to a legacy credential when configured v2 validation fails.
+
+Final post-rebase checks for this checkpoint: CLI rotation/resume suites **109 tests**
+passed in six files; actual Happy execution create/owner HTTP boundary **23 tests**
+passed in two files using the current integrated checkout and the Studio-produced proof.
+CLI typecheck passed after rebuilding this checkout's wire declarations for the new main.
+The dependency tree was reused via a local server node_modules symlink; it is not staged.
+Studio→CLI HTTP integration also passed against this rebased source. These are local
+synthetic-account tests, not a live provider/daemon result.
