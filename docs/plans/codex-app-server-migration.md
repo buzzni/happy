@@ -107,3 +107,30 @@ or a proxy pool is not automatically changed by a default terminal login. The ac
 change the Happy session owner or introduce another credential store. Deploy only after testing
 an actual two-account continuation and the released artifact; source-level tests are not proof
 that a running older session has this capability.
+
+## Structured user input (2026-10-19)
+
+`item/tool/requestUserInput` is a server→client request, separate from tool approval.
+`utils/codexUserInput.ts` installs the boundary used by `runCodex`: native questions become
+existing `request_user_input` permission requests with a fresh permission ID and optional
+`answerKey` carrying each native question ID. Desktop personal Chat and project conversations
+use the same question form. Approved `updatedInput.answers` are mapped back to
+`{ answers: { [id]: { answers: [text] } } }` on the original JSON-RPC ID. Commas in free text
+are not split, and equal question text does not merge answers. Ordinary approvals without
+complete answers cannot satisfy a question. Secret prompts are declined with empty answers
+because the shared question form is not a secret-entry surface.
+
+The child process alone enables `features.default_mode_request_user_input`; user config and
+collaboration mode are unchanged. Codex must provide the native question tool. No new API
+key or direct model transport is introduced.
+
+Provider `serverRequest/resolved`, matching turn completion, disconnect/process replacement,
+and shutdown abort the request-specific signal and clear only its permission. Epoch guards
+prevent an old callback from writing to a replacement process. Existing user abort/reset
+paths settle questions through the same permission handler. Start/end protocol envelopes
+retain the question in session history, attached to its mapped protocol turn.
+
+Protocol reference: https://developers.openai.com/codex/app-server#toolrequestuserinput .
+The wire shape was also checked using local Codex `app-server generate-ts` (0.163.0-alpha.10.2).
+This source candidate starts from CLI 1.1.10-aplus.342; it is not a published release.
+Desktop must consume the official CI artifact and update its pin after an approved release.

@@ -1,3 +1,4 @@
+import { installCodexUserInputBoundary } from './utils/codexUserInput';
 /** Orchestrates Codex sessions, initial prompts, MCP tools and session lifecycle. */
 import type { CodexBackgroundTask } from './codexBackgroundTasks';
 import { SessionLaunchControl } from '../sessionDrain/sessionLaunchControl';
@@ -85,6 +86,7 @@ import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirector
 import { installCodexApprovalBoundary } from './utils/codexApprovalBoundary';
 import {
     mapCodexMcpMessageToSessionEnvelopes,
+    codexProtocolTurnFor,
     type CodexTurnState,
     mapCodexProcessorMessageToSessionEnvelopes,
 } from './utils/sessionProtocolMapper';
@@ -1634,6 +1636,10 @@ export async function runCodex(opts: {
 
     // Approval handler: routes server → client approval requests to our permission handler.
     // Installed from its own module so the path an app-server request takes is the tested one.
+    installCodexUserInputBoundary({ client, permissionHandler, session,
+        protocolTurnId: nativeTurnId => codexProtocolTurnFor({ currentTurnId,
+            providerTurnToProtocol: codexProviderTurnToProtocol }, nativeTurnId)?.turnId,
+    });
     installCodexApprovalBoundary({
         // The boundary installs the handler; shutdown also needs the pending-approval
         // cancellation hook on the same install, so it is attached here.

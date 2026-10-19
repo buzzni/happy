@@ -339,7 +339,7 @@ export type JsonRpcRequest = {
 
 export type JsonRpcResponse = {
     jsonrpc?: "2.0";
-    id: number;
+    id: number | string;
     result?: unknown;
     error?: { code: number; message: string; data?: unknown };
 };

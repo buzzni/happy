@@ -850,6 +850,36 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(state.completedRequests['pending-real'].status).toBe('canceled');
     });
 
+    it('drains a native question cancellation and its final history event during shutdown', async () => {
+        const proc = createMockProcess(); mockSpawn.mockReturnValue(proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const { CodexPermissionHandler } = await import('./utils/permissionHandler');
+        const { installCodexUserInputBoundary } = await import('./utils/codexUserInput');
+        let state: any = {};
+        const history: any[] = [];
+        const session = { rpcHandlerManager: { registerHandler: vi.fn() },
+            sendSessionProtocolMessage: (event: any) => history.push(event),
+            updateAgentState: (update: (value: any) => any) => { state = update(state); } };
+        const permissions = new CodexPermissionHandler(session as any);
+        const client = new CodexAppServerClient();
+        client.setOutputStorageGate({ wait: async () => {}, onFailure: vi.fn() });
+        client.setApprovalHandler(async () => 'denied', () => permissions.closeForShutdown());
+        installCodexUserInputBoundary({ client, permissionHandler: permissions, session: session as any, protocolTurnId: () => 'protocol-turn' });
+        await client.connect(); (client as any)._threadId = 'thread';
+        pushJsonLine(proc.stdout, { id: 83, method: 'item/tool/requestUserInput', params: {
+            threadId: 'thread', turnId: 'turn', itemId: 'item', questions: [
+                { id: 'q', header: 'Task', question: 'What next?', isOther: true, isSecret: false, options: null },
+            ],
+        } });
+        await waitFor(() => Object.keys(state.requests ?? {}).length === 1);
+        expect(client.freezeInputForShutdown()).toBe(true);
+        proc.stdout.push(null); proc.exitCode = 0; proc.emit('exit', 0, null);
+        await client.waitForOutputDrain();
+        expect(state.requests).toEqual({});
+        expect(history.map(event => event.ev.t)).toEqual(['tool-call-start', 'tool-call-end']);
+        expect(Object.values(state.completedRequests)).toEqual([expect.objectContaining({ status: 'canceled' })]);
+    });
+
     it('settles an already-admitted approval that registers only after shutdown freeze', async () => {
         const proc = createMockProcess(); mockSpawn.mockReturnValue(proc);
         const { CodexAppServerClient } = await import('./codexAppServerClient');
@@ -1811,7 +1841,7 @@ describe('CodexAppServerClient sandbox integration', () => {
             else process.env.CODEX_SANDBOX = inheritedMarker;
             await client.connect();
             expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd(), 'owner-choice');
-            expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
+            expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://', '-c', 'features.default_mode_request_user_input=true']);
             expect(mockSpawn).toHaveBeenCalledWith('sh', ['-c', 'wrapped codex app-server'], expect.anything());
             const env = mockSpawn.mock.calls[0][2].env;
             if (platform === 'darwin') expect(env.CODEX_SANDBOX).toBe('seatbelt');
@@ -2122,7 +2152,7 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(mockWrapForMcpTransport).not.toHaveBeenCalled();
         expect(mockSpawn).toHaveBeenCalledWith(
             'codex',
-            ['app-server', '--listen', 'stdio://'],
+            ['app-server', '--listen', 'stdio://', '-c', 'features.default_mode_request_user_input=true'],
             expect.objectContaining({
                 env: expect.objectContaining({
                     RUST_LOG: expect.stringContaining('codex_core::rollout::list=off'),
@@ -2160,7 +2190,7 @@ describe('CodexAppServerClient sandbox integration', () => {
 
         expect(mockSpawn).toHaveBeenCalledWith(
             'codex',
-            ['app-server', '--listen', 'stdio://', '-c', 'model_provider="codex-multi-auth-runtime-proxy"'],
+            ['app-server', '--listen', 'stdio://', '-c', 'features.default_mode_request_user_input=true', '-c', 'model_provider="codex-multi-auth-runtime-proxy"'],
             expect.objectContaining({
                 env: expect.objectContaining({ OPENAI_API_KEY: 'local-client-key' }),
             }),

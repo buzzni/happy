@@ -102,6 +102,8 @@ type NativeCompletionObservation = {
 const CODEX_AGENT_MESSAGE_DELTA_FLUSH_MS = 80;
 const CODEX_AGENT_MESSAGE_DELTA_MAX_CHARS = 2_048;
 
+export type UserInputHandler = (params: unknown, signal: AbortSignal) => Promise<{ answers: Record<string, { answers: string[] }> }>;
+
 export type ApprovalHandler = (params: {
     type: 'exec' | 'patch' | 'mcp';
     callId: string;
@@ -411,6 +413,8 @@ export class CodexAppServerClient {
     // Handlers set by the consumer (runCodex.ts)
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
+    private userInputHandler: UserInputHandler | null = null;
+    private readonly userInputRequests = new Map<number | string, { controller: AbortController; threadId: string; turnId: string }>();
     private cancelPendingApprovals: (() => void | Promise<void>) | null = null;
     private approvalCancellation: Promise<void> | null = null;
     private approvalShutdownFailed = false;
@@ -491,6 +495,7 @@ export class CodexAppServerClient {
         if (this.shutdownInputFrozen || !this.outputGate || !this.process || this.disconnectOperation || this.outputFailed || this.completeTurn
             || this.initializedEpoch !== this.processEpoch || this.reconnecting > 0) return false;
         this.shutdownInputFrozen = true;
+        this.cancelUserInputRequests();
         this.shutdownObservationFinished = false;
         this.turnAdmissionAbort?.abort();
         const failed = () => { this.approvalShutdownFailed = true; this.failOutputStorage(); };
@@ -551,6 +556,16 @@ export class CodexAppServerClient {
 
     setEventHandler(handler: (msg: EventMsg) => void): void {
         this.eventHandler = handler;
+    }
+
+    setUserInputHandler(handler: UserInputHandler): void { this.userInputHandler = handler; }
+
+    private cancelUserInputRequests(turnId?: string): void {
+        for (const [id, request] of this.userInputRequests) {
+            if (turnId && request.turnId !== turnId) continue;
+            this.userInputRequests.delete(id);
+            request.controller.abort();
+        }
     }
 
     /** Replaces the handler/cancellation pair; omitting cancellation clears the old hook. */
@@ -1107,6 +1122,7 @@ export class CodexAppServerClient {
             'app-server',
             '--listen',
             'stdio://',
+            '-c', 'features.default_mode_request_user_input=true',
             ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
@@ -1176,6 +1192,7 @@ export class CodexAppServerClient {
         // one, and their responses are dropped by the epoch guard rather than
         // decrementing the count. Clear it here so the invariant holds for every
         // epoch bump, including a crash that skipped disconnectInternal.
+        this.cancelUserInputRequests();
         this.outstandingServerRequests = 0;
         // Use cross-spawn so npm-installed wrappers (codex.cmd / codex.ps1) resolve on Windows.
         // Native child_process.spawn fails with ENOENT for .cmd shims (issues #980, #1016).
@@ -1210,6 +1227,7 @@ export class CodexAppServerClient {
             }
             if (this.disconnectingEpoch === epoch) return;
             this.connected = false;
+            this.cancelUserInputRequests();
             if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
             this.backgroundTimer = null;
             this.backgroundTasks.invalidate();
@@ -1395,6 +1413,7 @@ export class CodexAppServerClient {
          */
         awaitProcessExit?: boolean;
     }): Promise<void> {
+        this.cancelUserInputRequests();
         if (this.backgroundTimer) clearTimeout(this.backgroundTimer);
         this.backgroundTimer = null;
         this.backgroundTasks.invalidate();
@@ -2070,6 +2089,7 @@ export class CodexAppServerClient {
     private resolvePendingTurn(aborted: boolean): void {
         if (this.disconnectingEpoch === this.processEpoch && this.preserveDisconnectingTurn) return;
         if (!this.pendingTurnCompletion) return;
+        this.cancelUserInputRequests(this.pendingTurnCompletion.turnId ?? undefined);
         if (this.pendingTurnCompletion.inactivityTimer) {
             clearTimeout(this.pendingTurnCompletion.inactivityTimer);
         }
@@ -2595,7 +2615,7 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] → ${method} (notification)`);
     }
 
-    private respond(id: number, result: unknown, sourceEpoch: number): void {
+    private respond(id: number | string, result: unknown, sourceEpoch: number): void {
         if (this.shutdownInputFrozen) return;
         if (sourceEpoch !== this.processEpoch) {
             logger.debug(`[CodexAppServer] Ignoring response from stale epoch for id=${id}`);
@@ -2740,9 +2760,30 @@ export class CodexAppServerClient {
         };
     }
 
-    private async handleServerRequest(id: number, method: string, params: any, sourceEpoch: number): Promise<void> {
+    private async handleServerRequest(id: number | string, method: string, params: any, sourceEpoch: number): Promise<void> {
         // A buffered approval must not create a new runtime producer after freeze.
         if (this.shutdownInputFrozen) return;
+        if (method === 'item/tool/requestUserInput') {
+            if (!this.userInputHandler || !params || params.threadId !== this._threadId
+                || typeof params.threadId !== 'string' || typeof params.turnId !== 'string'
+                || (this._turnId && params.turnId !== this._turnId)) {
+                this.respond(id, { answers: {} }, sourceEpoch);
+                return;
+            }
+            const controller = new AbortController();
+            const previous = this.userInputRequests.get(id);
+            previous?.controller.abort();
+            this.userInputRequests.set(id, { controller, threadId: params.threadId, turnId: params.turnId });
+            try {
+                const result = await this.userInputHandler(params, controller.signal);
+                if (!controller.signal.aborted) this.respond(id, result, sourceEpoch);
+            } catch {
+                if (!controller.signal.aborted) this.respond(id, { answers: {} }, sourceEpoch);
+            } finally {
+                if (this.userInputRequests.get(id)?.controller === controller) this.userInputRequests.delete(id);
+            }
+            return;
+        }
         if (method === 'mcpServer/elicitation/request') {
             const toolName = this.parseToolNameFromElicitationMessage(params?.message) ?? params?.serverName ?? 'McpTool';
             const decision = await this.handleApproval({
@@ -2812,6 +2853,18 @@ export class CodexAppServerClient {
     }
 
     private handleNotification(method: string, params: any): void {
+        if (method === 'serverRequest/resolved') {
+            const request = this.userInputRequests.get(params?.requestId);
+            if (request && request.threadId === params?.threadId) {
+                this.userInputRequests.delete(params.requestId);
+                request.controller.abort();
+            }
+            return;
+        }
+        if (method === 'turn/completed' || method === 'turn/aborted') {
+            const turnId = this.extractTurnId(params);
+            if (turnId && this.extractThreadId(params) === this._threadId) this.cancelUserInputRequests(turnId);
+        }
         this.recordPendingTurnActivity(method, params);
 
         // Memory observes only a matching authoritative success. UI final-answer/idle

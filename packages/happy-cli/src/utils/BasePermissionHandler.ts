@@ -17,6 +17,7 @@ import { AgentState } from "@/api/types";
 export interface PermissionResponse {
     id: string;
     approved: boolean;
+    updatedInput?: Record<string, unknown>;
     decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort';
 }
 
@@ -35,6 +36,7 @@ export interface PendingRequest {
  */
 export interface PermissionResult {
     decision: 'approved' | 'approved_for_session' | 'denied' | 'abort';
+    updatedInput?: Record<string, unknown>;
 }
 
 /**
@@ -126,6 +128,9 @@ export abstract class BasePermissionHandler {
                     ? { decision: response.decision === 'approved_for_session' ? 'approved_for_session' : 'approved' }
                     : { decision: response.decision === 'denied' ? 'denied' : 'abort' };
 
+                if (response.approved && response.updatedInput && typeof response.updatedInput === 'object' && !Array.isArray(response.updatedInput)) {
+                    result.updatedInput = response.updatedInput;
+                }
                 pending.resolve(result);
                 // After the request is gone and resolved, so a throwing subscriber cannot turn an
                 // answered permission into an unanswered one.
@@ -176,6 +181,24 @@ export abstract class BasePermissionHandler {
                 }
             }
         }));
+    }
+
+    /** Cancel only this provider-owned request; unrelated approvals remain pending. */
+    cancelRequest(id: string): void {
+        const pending = this.pendingRequests.get(id);
+        if (!pending) return;
+        this.pendingRequests.delete(id);
+        pending.resolve({ decision: 'abort' });
+        this.notifySettled(id, 'aborted');
+        const completedAt = Date.now();
+        this.session.updateAgentState(current => {
+            const request = current.requests?.[id];
+            if (!request) return current;
+            const { [id]: _, ...requests } = current.requests ?? {};
+            return { ...current, requests, completedRequests: {
+                ...current.completedRequests, [id]: { ...request, completedAt, status: 'canceled' },
+            } };
+        });
     }
 
     /**
