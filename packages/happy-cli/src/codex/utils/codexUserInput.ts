@@ -33,7 +33,7 @@ function questionsFromRequest(value: unknown): Question[] | null {
                 options.push({ label: option.label, ...(typeof option.description === 'string' ? { description: option.description } : {}) });
             }
         }
-        questions.push({ answerKey: raw.id, header: raw.header, question: raw.question, options });
+        questions.push({ answerKey: raw.id, header: raw.header, question: raw.question.trim(), options });
     }
     return questions;
 }
@@ -65,9 +65,13 @@ export function installCodexUserInputBoundary(options: {
             if (result.decision !== 'approved' || signal.aborted) return { answers: {} };
             const values = result.updatedInput?.answers;
             if (!record(values)) return { answers: {} };
+            const byId = questions.some(question => Object.hasOwn(values, question.answerKey));
+            // Older Desktops key answers by text. Never guess when those texts collide.
+            if (!byId && new Set(questions.map(question => question.question)).size !== questions.length) return { answers: {} };
             const entries: [string, { answers: string[] }][] = [];
             for (const question of questions) {
-                const answer = Object.hasOwn(values, question.answerKey) ? values[question.answerKey] : undefined;
+                const key = byId ? question.answerKey : question.question;
+                const answer = Object.hasOwn(values, key) ? values[key] : undefined;
                 if (typeof answer !== 'string' || !answer.trim()) return { answers: {} };
                 // One answer is one string, even when a free-text answer contains commas.
                 entries.push([question.answerKey, { answers: [answer] }]);

@@ -129,6 +129,32 @@ describe('Codex structured user input boundary', () => {
         } finally { b.permissions.abortAll(); await b.flush(); }
     });
 
+    it('accepts unique question-text keys from an older Desktop without mixing answer formats', async () => {
+        const b = boundary();
+        await b.send('item/tool/requestUserInput', { ...params, questions: questions.map((q, i) => ({ ...q, question: `질문 ${i}` })) }, 107);
+        try {
+            await b.answer(b.pending()[0], { answers: { '질문 0': '선택', '질문 1': '직접 답변' } });
+            expect(b.writes).toEqual([{ id: 107, result: { answers: { first: { answers: ['선택'] }, second: { answers: ['직접 답변'] } } } }]);
+        } finally { b.permissions.abortAll(); await b.flush(); }
+    });
+
+    it('rejects ambiguous text keys from an older Desktop rather than duplicating one answer', async () => {
+        const b = boundary(); await b.send('item/tool/requestUserInput', params, 108);
+        try {
+            await b.answer(b.pending()[0], { answers: { '진행할까요?': 'one answer' } });
+            expect(b.writes).toEqual([{ id: 108, result: { answers: {} } }]);
+        } finally { b.permissions.abortAll(); await b.flush(); }
+    });
+
+    it('rejects mixed partial ID and question-text answers', async () => {
+        const b = boundary();
+        await b.send('item/tool/requestUserInput', { ...params, questions: questions.map((q, i) => ({ ...q, question: `질문 ${i}` })) }, 109);
+        try {
+            await b.answer(b.pending()[0], { answers: { first: 'ID answer', '질문 1': 'legacy answer' } });
+            expect(b.writes).toEqual([{ id: 109, result: { answers: {} } }]);
+        } finally { b.permissions.abortAll(); await b.flush(); }
+    });
+
     it('unblocks a provider when reset rejects its pending question', async () => {
         const b = boundary(); await b.send('item/tool/requestUserInput', params, 104);
         try {

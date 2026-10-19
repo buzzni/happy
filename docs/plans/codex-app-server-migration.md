@@ -117,7 +117,8 @@ existing `request_user_input` permission requests with a fresh permission ID and
 use the same question form. Approved `updatedInput.answers` are mapped back to
 `{ answers: { [id]: { answers: [text] } } }` on the original JSON-RPC ID. Commas in free text
 are not split, and equal question text does not merge answers. Ordinary approvals without
-complete answers cannot satisfy a question. Secret prompts are declined with empty answers
+complete answers cannot satisfy a question. Older Desktop text-keyed answers are accepted only
+when question text is unique; ambiguous or mixed partial formats are declined. Secret prompts are declined with empty answers
 because the shared question form is not a secret-entry surface.
 
 The child process alone enables `features.default_mode_request_user_input`; user config and
