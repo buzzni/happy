@@ -694,11 +694,12 @@ const MAX_EPOCH_MS = 253_402_300_799_999;
 /**
  * Reads `cursor_v2_<updatedAtMs>_<id>` back into the keyset position.
  *
- * Returns null for anything else, including a time past `MAX_EPOCH_MS`, so
- * a malformed cursor is a 400 rather than a query error.
+ * Returns null for anything else, including a time past `MAX_EPOCH_MS` or
+ * an id with NUL (PostgreSQL text cannot hold it), so a malformed cursor is a
+ * 400 rather than a query error.
  */
 function parseRecentSessionsCursor(cursor: string): { updatedAt: Date; id: string } | null {
-    const match = /^cursor_v2_(\d{1,15})_(.+)$/.exec(cursor);
+    const match = /^cursor_v2_(\d{1,15})_([^\0]+)$/.exec(cursor);
     if (!match) return null;
     const updatedAtMs = Number(match[1]);
     if (updatedAtMs > MAX_EPOCH_MS) return null;

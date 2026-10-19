@@ -1,6 +1,6 @@
 # 최근 활동 순 세션 목록 API Context
 
-> 마지막 갱신: 2026-10-19 / 상태: 진행중 — T3~T6 구현·검증 완료, T7(PR)은 교차 리뷰 뒤
+> 마지막 갱신: 2026-10-19 / 상태: 진행중 — T3~T6 구현·검증·교차 리뷰 반영 완료, T7 PR 리뷰 대기
 
 ## 현재 상태 (3~5문장)
 
@@ -10,6 +10,7 @@ Desktop `specs/cli-agent-session-search` Phase A를 이 저장소에서 구현�
 
 ## 핵심 결정 로그 (누적, 최신이 위)
 
+- [2026-10-19] 교차 리뷰(codex) low 1건 반영: 커서 id에 NUL(`%00`)이 있으면 PostgreSQL이 `22021`로 질의를 거부해 500이 났다. 파서 정규식을 `([^\0]+)`로 바꿔 400으로 막는다(테스트로 500 재현 후 수정). 같은 원인 점검: `since`·`limit`은 zod 숫자 변환이라 NUL이 400으로 이미 막힌다(테스트 추가), UTF-8이 아닌 바이트(`%FF`·`%ED%A0%80`·`%C0%80`)는 500을 내지 않는다(테스트 추가). 기존 `GET /v2/sessions`의 `cursor_v1_<id>`도 NUL이면 500이지만 기존 라우트 불변 범위라 고치지 않았다(아래 열린 문제).
 - [2026-10-19] 셀프 리뷰(`/code-review high`) 7건 처리:
   반영 ① `since`·커서 시각 상한을 JS Date 한계(8.64e15)에서 9999년 마지막 ms(253402300799999)로 낮춤 — Prisma가 다섯 자리 연도를 보내지 못해 500이 났다(테스트로 재현 후 수정, 경계값 수용 테스트 추가).
   반영 ② `docs/api.md`: 페이지 중 갱신된 세션은 "중복"이 아니라 "누락"된다고 정정, `updatedAt`이 presence timeout·archive 같은 서버 쓰기에도 움직인다고 명시.
@@ -35,6 +36,7 @@ Desktop `specs/cli-agent-session-search` Phase A를 이 저장소에서 구현�
 
 ## 발견된 문제 / 열린 질문
 
+- 기존 `GET /v2/sessions?cursor=cursor_v1_s%00x`도 500을 낸다(2026-10-19 실측, PGlite). 이 작업은 기존 라우트 동작을 바꾸지 않으므로 고치지 않았다 — 별도 작은 수정 후보.
 - `Session.updatedAt`은 새 메시지뿐 아니라 presence timeout(`active=false`)·archive·rewrap 같은 서버 쓰기에도 갱신된다(`@updatedAt`). 그래서 "최근 활동"에는 이런 세션도 포함되고, 훑는 도중 갱신된 세션은 그 훑기에서 빠진다(S9). 소비자(Desktop CLI search)는 이를 알고 `meta`를 해석해야 한다 — 원본 spec Phase B에 전달할 사항.
 - `managedSessionDataRoutes.spec.ts`는 `HAPPY_MANAGED_TEST_DATABASE_URL`이 있을 때만 돈다(CI 워크플로에 설정 없음). 이번에는 로컬 임시 PostgreSQL로 실행해 46개 통과를 확인했다. 새 라우트의 managed 401은 CI에서 도는 `sessionRoutes.pglite.spec.ts`에도 있다.
 

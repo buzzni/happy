@@ -267,11 +267,27 @@ describe('GET /v2/sessions/recent', () => {
         ['since', '8640000000000000'],
         ['cursor', 'cursor_v2_253402300800000_s-a'],
         ['cursor', 'cursor_v2_8640000000000000_s-a'],
+        // PostgreSQL text cannot hold NUL, so the query itself would fail.
+        ['cursor', 'cursor_v2_1790812800123_bad\u0000id'],
+        ['cursor', 'cursor_v2_1790812800123_\u0000'],
+        ['since', '1790812800123\u0000'],
+        ['limit', '10\u0000'],
     ])('refuses %s=%j with 400', async (name, value) => {
         await seed('s-a', T0);
         const response = await get(`/v2/sessions/recent?${name}=${encodeURIComponent(value)}`);
         expect(response.statusCode).toBe(400);
         expect(response.body).not.toContain('s-a');
+    });
+
+    it.each([
+        // Bytes that are not UTF-8 reach the handler as U+FFFD or stay escaped.
+        'cursor_v2_1790812800123_bad%FFid',
+        'cursor_v2_1790812800123_bad%ED%A0%80id',
+        'cursor_v2_1790812800123_bad%C0%80id',
+    ])('answers a cursor with raw bytes %s without a server error', async (raw) => {
+        await seed('s-a', T0);
+        const response = await get(`/v2/sessions/recent?cursor=${raw}`);
+        expect(response.statusCode).toBeLessThan(500);
     });
 
     it('accepts the last millisecond of year 9999 as since and cursor', async () => {
