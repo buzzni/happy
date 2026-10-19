@@ -38,7 +38,7 @@ Desktop `specs/cli-agent-session-search` Phase A를 이 저장소에서 구현�
 
 - 기존 `GET /v2/sessions?cursor=cursor_v1_s%00x`도 500을 낸다(2026-10-19 실측, PGlite). 이 작업은 기존 라우트 동작을 바꾸지 않으므로 고치지 않았다 — 별도 작은 수정 후보.
 - `Session.updatedAt`은 새 메시지뿐 아니라 presence timeout(`active=false`)·archive·rewrap 같은 서버 쓰기에도 갱신된다(`@updatedAt`). 그래서 "최근 활동"에는 이런 세션도 포함되고, 훑는 도중 갱신된 세션은 그 훑기에서 빠진다(S9). 소비자(Desktop CLI search)는 이를 알고 `meta`를 해석해야 한다 — 원본 spec Phase B에 전달할 사항.
-- `managedSessionDataRoutes.spec.ts`는 `HAPPY_MANAGED_TEST_DATABASE_URL`이 있을 때만 돈다(CI 워크플로에 설정 없음). 이번에는 로컬 임시 PostgreSQL로 실행해 46개 통과를 확인했다. 새 라우트의 managed 401은 CI에서 도는 `sessionRoutes.pglite.spec.ts`에도 있다.
+- `managedSessionDataRoutes.spec.ts`는 `HAPPY_MANAGED_TEST_DATABASE_URL`이 있을 때만 돈다(CI 워크플로에 설정 없음). 이번에는 로컬 임시 PostgreSQL로 실행해 46개 통과를 확인했다. 새 라우트의 managed 401은 `sessionRoutes.pglite.spec.ts`에도 있지만, 이 스펙도 CI에서 돌지 않는다 — PR 워크플로(`cli-smoke-test.yml`)는 서버 패키지를 묶어 기동만 확인하고 happy-server vitest는 실행하지 않는다(PR #884 리뷰 봇 지적, 확인함). 회귀 보호는 로컬 실행에 의존한다. 서버 테스트를 CI에 넣는 것은 별도 작업 후보.
 
 ## 다음 세션 시작점
 
