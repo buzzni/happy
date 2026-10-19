@@ -133,5 +133,9 @@ retain the question in session history, attached to its mapped protocol turn.
 
 Protocol reference: https://developers.openai.com/codex/app-server#toolrequestuserinput .
 The wire shape was also checked using local Codex `app-server generate-ts` (0.163.0-alpha.10.2).
-This source candidate starts from CLI 1.1.10-aplus.342; it is not a published release.
-Desktop must consume the official CI artifact and update its pin after an approved release.
+Released in CLI 1.1.10-aplus.344 after integrating the .343 mainline. The official
+tag points to 330d0527a6499afd4c9674f8143de48fa2aa2a90; the
+[publisher and registry install verification](https://github.com/buzzni/happy/actions/runs/39211871353)
+both succeeded. Desktop consumes that exact CI artifact and pins its version/tag/commit.
+The subsequent test-only commit updates existing runner mocks to the new handler API;
+it does not change the released runtime.
