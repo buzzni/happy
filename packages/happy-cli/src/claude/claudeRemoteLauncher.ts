@@ -42,6 +42,7 @@ import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
 import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
+import { contextUsageSignalItem, withContextUsageSignals } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 import { claudeNotSignedInNotice, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
@@ -282,7 +283,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         bindChannelPermission: (permissionId, toolName, instanceSeq) =>
             bindChannelPermission(permissionId, toolName, instanceSeq),
     };
-    const messageQueue = new OutgoingMessageQueue(createOrderedTurnDispatcher(orderingTarget));
+    // The context meter's init and compaction signals ride the queue too (Saycode
+    // specs/desktop-chat-context-window-meter): it drops `system` log messages.
+    const messageQueue = new OutgoingMessageQueue(withContextUsageSignals(
+        createOrderedTurnDispatcher(orderingTarget),
+        (signal) => session.client.noteContextUsageSignal(signal),
+    ));
 
     /*
      * The prompt→turn binding and the sanitized observation. The ordering this depends on lives in
@@ -482,6 +488,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 }
             }
         }
+
+        const contextUsageSignal = contextUsageSignalItem(message);
+        if (contextUsageSignal) messageQueue.enqueue(contextUsageSignal);
 
         // Convert SDK message to log format and send to client
         const logMessage = sdkToLogConverter.convert(message);

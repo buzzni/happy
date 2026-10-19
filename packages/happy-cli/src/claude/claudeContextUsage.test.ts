@@ -1,8 +1,24 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import contract from './__fixtures__/context-usage-snapshot.v1.json';
-import { ClaudeContextUsageTracker, type ClaudeContextUsageSnapshot } from './claudeContextUsage';
+import {
+    ClaudeContextUsageTracker,
+    contextUsageSignalItem,
+    createContextUsageEpochSource,
+    withContextUsageSignals,
+    type ClaudeContextUsageSnapshot,
+} from './claudeContextUsage';
 
 const MODEL = 'claude-sonnet-4-5-20250929';
+
+/**
+ * The contract fixture is a byte copy of Saycode Desktop `tests/fixtures/context-usage-snapshot.v1.json`,
+ * the canonical one. Desktop checks the same hash: changing the file on one side only fails here.
+ */
+const CONTRACT_FIXTURE_SHA256 = '67f9210fc60d3a9fc7224b9f9a4c8ec81af14f5b4721ad339f6f95ff08f0c231';
+const EPOCH_FORMAT = /^\d{13}-[0-9a-z]+$/;
 
 function createTracker() {
     const frames: ClaudeContextUsageSnapshot[] = [];
@@ -21,25 +37,106 @@ const usage = (input: number, cacheRead = 0, cacheCreation = 0) => ({
     cache_creation_input_tokens: cacheCreation,
 });
 
+describe('context-usage contract fixture', () => {
+    it('is byte for byte the canonical Desktop fixture', () => {
+        const bytes = readFileSync(join(__dirname, '__fixtures__/context-usage-snapshot.v1.json'));
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe(CONTRACT_FIXTURE_SHA256);
+    });
+
+    it('is what the tracker sends before the first result, once the window is known, and after a reset', () => {
+        const epochs = [contract.assistantWithWindow.epoch, contract.afterReset.epoch];
+        const frames: ClaudeContextUsageSnapshot[] = [];
+        const tracker = new ClaudeContextUsageTracker((snapshot) => frames.push(snapshot), () => epochs.shift()!);
+
+        tracker.noteProviderModel(MODEL);
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(2000, 15000, 1000) });
+        expect(frames.at(-1)).toEqual(contract.assistantBeforeFirstResult);
+        tracker.noteTurnResult({ [MODEL]: { inputTokens: 1, outputTokens: 1, contextWindow: 200000 } });
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(4000, 100000, 20000) });
+        expect(frames.at(-1)).toEqual(contract.assistantWithWindow);
+        tracker.reset();
+        expect(frames.at(-1)).toEqual(contract.afterReset);
+    });
+
+    it('uses the epoch format the tracker produces', () => {
+        for (const snapshot of Object.values(contract)) expect(snapshot.epoch).toMatch(EPOCH_FORMAT);
+        expect(new ClaudeContextUsageTracker(() => {}).snapshot().epoch).toMatch(/^\d{13}-[0-9a-f]{8}$/);
+    });
+});
+
+describe('createContextUsageEpochSource', () => {
+    const timeOf = (epoch: string) => Number(epoch.slice(0, 13));
+
+    it('pads the millisecond time to 13 digits ahead of a random id', () => {
+        const next = createContextUsageEpochSource(() => 1792400000000, () => '0b6f1c9e');
+        expect(next()).toBe('1792400000000-0b6f1c9e');
+        expect(createContextUsageEpochSource(() => 42, () => 'ab')()).toBe('0000000000042-ab');
+    });
+
+    it('rises strictly within a process, in the same millisecond and with the clock stepped back', () => {
+        const clock = [1792400000000, 1792400000000, 1792399990000, 1792400000500];
+        const next = createContextUsageEpochSource(() => clock.shift()!, () => 'x');
+        expect([next(), next(), next(), next()].map(timeOf)).toEqual([1792400000000, 1792400000001, 1792400000002, 1792400000500]);
+    });
+
+    it('gives a reset a later epoch than the one it replaces', () => {
+        const frames: ClaudeContextUsageSnapshot[] = [];
+        const tracker = new ClaudeContextUsageTracker((snapshot) => frames.push(snapshot));
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(100) });
+        tracker.reset();
+        expect(timeOf(frames[1].epoch)).toBeGreaterThan(timeOf(frames[0].epoch));
+    });
+});
+
+describe('context-usage queue signals', () => {
+    it('turns only system init and compact_boundary into queue items', () => {
+        expect(contextUsageSignalItem({ type: 'system', subtype: 'init', model: 'claude-haiku-4-5' }))
+            .toEqual({ __claudeContextUsageSignal: true, signal: { kind: 'provider-model', model: 'claude-haiku-4-5' } });
+        expect(contextUsageSignalItem({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'auto' } }))
+            .toEqual({ __claudeContextUsageSignal: true, signal: { kind: 'compact-boundary' } });
+        for (const other of [null, 'init', { type: 'system', subtype: 'task_started' }, { type: 'assistant', subtype: 'init' }]) {
+            expect(contextUsageSignalItem(other)).toBeNull();
+        }
+    });
+
+    it('applies the signal items in their place and sends everything else on', () => {
+        const order: string[] = [];
+        const send = withContextUsageSignals(
+            (message) => order.push(`send:${(message as { uuid: string }).uuid}`),
+            (signal) => order.push(`signal:${signal.kind}`),
+        );
+        send({ uuid: 'a' });
+        send(contextUsageSignalItem({ type: 'system', subtype: 'compact_boundary' }));
+        send({ uuid: 'b' });
+        expect(order).toEqual(['send:a', 'signal:compact-boundary', 'send:b']);
+    });
+});
+
 describe('ClaudeContextUsageTracker', () => {
-    it('produces the shared contract fixture for a result, a compaction and a reset, in that order', () => {
+    it('emits each change as a new seq: result, compaction, reset', () => {
         const { tracker, frames } = createTracker();
+        const frame = (epoch: string, seq: number, used: number | null, window: number | null, model: string | null) =>
+            ({ version: 1, type: 'context-usage', epoch, seq, used, window, model });
 
         tracker.noteProviderModel(MODEL);
         expect(frames).toEqual([]);
         tracker.noteMainAssistant({ model: MODEL, usage: usage(4000, 100000, 20000) });
         tracker.noteTurnResult({ [MODEL]: { inputTokens: 1, outputTokens: 1, contextWindow: 200000 } });
-        expect(frames).toEqual(contract.sequences.turnResult);
-        expect(tracker.snapshot()).toEqual(contract.snapshot);
-
         tracker.noteCompactBoundary();
         tracker.noteMainAssistant({ model: MODEL, usage: usage(36000) });
-        expect(frames.slice(2)).toEqual(contract.sequences.compaction);
-
         tracker.reset();
         tracker.noteMainAssistant({ model: MODEL, usage: usage(9000) });
         tracker.noteTurnResult({ [MODEL]: { contextWindow: 200000 } });
-        expect(frames.slice(4)).toEqual(contract.sequences.reset);
+
+        expect(frames).toEqual([
+            frame('epoch-1', 1, 124000, null, MODEL),
+            frame('epoch-1', 2, 124000, 200000, MODEL),
+            frame('epoch-1', 3, null, 200000, MODEL),
+            frame('epoch-1', 4, 36000, 200000, MODEL),
+            frame('epoch-2', 0, null, null, null),
+            frame('epoch-2', 1, 9000, null, MODEL),
+            frame('epoch-2', 2, 9000, 200000, MODEL),
+        ]);
     });
 
     it('measures occupancy from the input side of one request only, never the output', () => {
@@ -149,30 +246,66 @@ describe('ClaudeContextUsageTracker', () => {
 
     it('stops naming the provider model once the provider answers under another API id', () => {
         const { tracker } = createTracker();
-        tracker.noteProviderModel('opus[1m]');
-        tracker.noteMainAssistant({ model: 'claude-opus-dated', usage: usage(100) });
-        tracker.noteTurnResult({ 'opus[1m]': { contextWindow: 1000000 }, 'claude-sonnet-dated': { contextWindow: 200000 } });
-        expect(tracker.snapshot()).toMatchObject({ model: 'opus[1m]', window: 1000000 });
+        tracker.noteProviderModel('claude-opus-4-1[1m]');
+        tracker.noteMainAssistant({ model: 'claude-opus-4-1-20250805', usage: usage(100) });
+        tracker.noteTurnResult({ 'claude-opus-4-1[1m]': { contextWindow: 1000000 }, [MODEL]: { contextWindow: 200000 } });
+        expect(tracker.snapshot()).toMatchObject({ model: 'claude-opus-4-1[1m]', window: 1000000 });
 
         // fallbackModel on overload: same process, no new init, another model answering.
-        tracker.noteMainAssistant({ model: 'claude-sonnet-dated', usage: usage(180000) });
-        expect(tracker.snapshot()).toMatchObject({ used: 180000, model: 'claude-sonnet-dated', window: 200000 });
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(180000) });
+        expect(tracker.snapshot()).toMatchObject({ used: 180000, model: MODEL, window: 200000 });
         tracker.noteMainAssistant({ model: 'claude-other-dated', usage: usage(180000) });
         expect(tracker.snapshot()).toMatchObject({ model: 'claude-other-dated', window: null });
 
         // A new provider learns its own id again.
-        tracker.noteProviderModel('opus[1m]');
-        tracker.noteMainAssistant({ model: 'claude-opus-dated', usage: usage(100) });
-        expect(tracker.snapshot()).toMatchObject({ model: 'opus[1m]', window: 1000000 });
+        tracker.noteProviderModel('claude-opus-4-1[1m]');
+        tracker.noteMainAssistant({ model: 'claude-opus-4-1-20250805', usage: usage(100) });
+        expect(tracker.snapshot()).toMatchObject({ model: 'claude-opus-4-1[1m]', window: 1000000 });
+    });
+
+    it('does not lend the init model its window when the first response is already a fallback', () => {
+        const { tracker } = createTracker();
+        tracker.noteProviderModel('claude-opus-4-1[1m]');
+        tracker.noteMainAssistant({ model: 'claude-opus-4-1-20250805', usage: usage(100) });
+        tracker.noteTurnResult({ 'claude-opus-4-1[1m]': { contextWindow: 1000000 } });
+
+        // The provider restarts on Opus, and its very first response comes from the fallback.
+        tracker.noteProviderModel('claude-opus-4-1[1m]');
+        tracker.noteMainAssistant({ model: MODEL, usage: usage(180000) });
+        // Not 18% of Opus's 1M: the window of the model that answered, or nothing.
+        expect(tracker.snapshot()).toMatchObject({ used: 180000, model: MODEL, window: null });
+        tracker.noteTurnResult({ [MODEL]: { contextWindow: 200000 } });
+        expect(tracker.snapshot()).toMatchObject({ used: 180000, model: MODEL, window: 200000 });
+
+        // Opus answering again is still recognised as the provider model.
+        tracker.noteMainAssistant({ model: 'claude-opus-4-1-20250805', usage: usage(300000) });
+        expect(tracker.snapshot()).toMatchObject({ used: 300000, model: 'claude-opus-4-1[1m]', window: 1000000 });
+    });
+
+    it('pairs an API id with the init model only by the same name or that name plus a date', () => {
+        const pairedModel = (providerModel: string, apiModel: string) => {
+            const { tracker } = createTracker();
+            tracker.noteProviderModel(providerModel);
+            tracker.noteMainAssistant({ model: apiModel, usage: usage(100) });
+            return tracker.snapshot().model;
+        };
+        expect(pairedModel('claude-haiku-4-5', 'claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5');
+        expect(pairedModel('claude-haiku-4-5-20251001', 'claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5-20251001');
+        expect(pairedModel('claude-sonnet-4-5[1m]', MODEL)).toBe('claude-sonnet-4-5[1m]');
+        expect(pairedModel('glm-4.6', 'glm-4.6')).toBe('glm-4.6');
+        // Anything it cannot confirm is paired by the message's own id (hidden until reported).
+        expect(pairedModel('claude-haiku-4', 'claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5-20251001');
+        expect(pairedModel('claude-opus-4-1', MODEL)).toBe(MODEL);
+        expect(pairedModel('us.anthropic.claude-sonnet-4-5-20250929-v1:0', MODEL)).toBe(MODEL);
     });
 
     it('learns the provider API id only from a readable response', () => {
         const { tracker } = createTracker();
-        tracker.noteProviderModel('opus');
+        tracker.noteProviderModel('claude-opus-4-1');
         // An API error message: zero usage under a synthetic id.
         tracker.noteMainAssistant({ model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } });
-        tracker.noteMainAssistant({ model: 'claude-opus-dated', usage: usage(100) });
-        expect(tracker.snapshot().model).toBe('opus');
+        tracker.noteMainAssistant({ model: 'claude-opus-4-1-20250805', usage: usage(100) });
+        expect(tracker.snapshot().model).toBe('claude-opus-4-1');
     });
 
     it('falls back to the message model only when no provider init was seen', () => {
@@ -184,11 +317,11 @@ describe('ClaudeContextUsageTracker', () => {
 
     it('keeps the provider model across a reset: the process did not restart', () => {
         const { tracker } = createTracker();
-        tracker.noteProviderModel('provider-model');
-        tracker.noteMainAssistant({ model: 'api-id', usage: usage(100) });
+        tracker.noteProviderModel('claude-haiku-4-5');
+        tracker.noteMainAssistant({ model: 'claude-haiku-4-5-20251001', usage: usage(100) });
         tracker.reset();
-        tracker.noteMainAssistant({ model: 'api-id', usage: usage(100) });
-        expect(tracker.snapshot()).toMatchObject({ model: 'provider-model', window: null });
+        tracker.noteMainAssistant({ model: 'claude-haiku-4-5-20251001', usage: usage(100) });
+        expect(tracker.snapshot()).toMatchObject({ model: 'claude-haiku-4-5', window: null });
     });
 
     it('hiding takes the meter down in the same epoch and keeps the window cache', () => {

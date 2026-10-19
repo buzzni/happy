@@ -16,22 +16,28 @@
  * match — measured 2026-10-19 (SDK 0.3.285): `model: 'claude-haiku-4-5'` gave
  * `init.model` and the key `claude-haiku-4-5` but `message.model` `claude-haiku-4-5-20251001`,
  * and a subagent's request added its own `claude-haiku-4-5-20251001` entry beside it.
- * The provider's first readable response names the API id its model resolved to; a later main
- * response under another id (fallbackModel on overload, same process, no new init) is paired by
- * its own id instead, and stays hidden unless the runtime reported a window for exactly that id.
+ * The provider's first readable response whose API id is that model's own name, or the name plus a
+ * date suffix, is what pairs the two. A response under any other id (fallbackModel on overload —
+ * possibly the very first one, after a provider restart) is paired by its own id instead, and stays
+ * hidden unless the runtime reported a window for exactly that id: a window borrowed from the init
+ * model would show 18% for a fallback that is at 90%.
  *
  * - Compaction (`system`/`compact_boundary`) clears occupancy only: same session, same runtime
  *   settings, so the cached windows are still right.
  * - A reset (`/clear`, another Claude session id) clears occupancy and every cached window and
  *   starts a new epoch: a new session may run under different settings.
  */
-import { randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 
 /** The wire contract. Keep in step with `__fixtures__/context-usage-snapshot.v1.json` and Desktop. */
 export type ClaudeContextUsageSnapshot = {
     version: 1;
     type: 'context-usage';
-    /** New per tracker (= per happy-cli process) and per reset; the consumer replaces on a new epoch. */
+    /**
+     * `<13-digit zero-padded ms>-<random id>`, new per tracker and per reset. The time part only
+     * orders epochs (it rises within a process; a restarted process starts later): the consumer
+     * drops a frame from an earlier epoch and replaces on a later one. Never shown.
+     */
     epoch: string;
     /** Rises on every change within an epoch. A resend repeats the same seq. */
     seq: number;
@@ -61,6 +67,71 @@ function readRequestSize(usage: unknown): number | null {
     return total > 0 ? total : null;
 }
 
+/**
+ * Epoch ids that rise strictly within one process (`max(now, previous + 1)`), so a reset in the
+ * same millisecond, or a clock stepped back, still produces a later epoch.
+ */
+export function createContextUsageEpochSource(
+    now: () => number = Date.now,
+    randomId: () => string = () => randomBytes(4).toString('hex'),
+): () => string {
+    let previous = -1;
+    return () => {
+        previous = Math.max(Math.floor(now()), previous + 1);
+        return `${String(previous).padStart(13, '0')}-${randomId()}`;
+    };
+}
+
+/** One source for the process: every session client's epochs rise together. */
+const processEpochSource = createContextUsageEpochSource();
+
+/**
+ * Whether a response's API id is the provider model itself: the same name, or the name (without a
+ * runtime suffix such as `[1m]`) plus the API's date — `claude-haiku-4-5` → `claude-haiku-4-5-20251001`.
+ */
+function isProviderModelApiId(providerModel: string, apiModel: string): boolean {
+    const base = providerModel.replace(/\[[^\]]*\]$/, '');
+    if (apiModel === providerModel || apiModel === base) return true;
+    return apiModel.startsWith(`${base}-`) && /^\d{8}$/.test(apiModel.slice(base.length + 1));
+}
+
+/**
+ * The two transcript signals the tracker needs, as an `OutgoingMessageQueue` item: the queue drops
+ * every `system` log message, and these must still land after the responses queued before them.
+ */
+export type ClaudeContextUsageSignal =
+    | { kind: 'provider-model'; model: unknown }
+    | { kind: 'compact-boundary' };
+
+export interface ClaudeContextUsageSignalItem {
+    __claudeContextUsageSignal: true;
+    signal: ClaudeContextUsageSignal;
+}
+
+/** The queue item for an SDK `system`/`init` or `compact_boundary` message, or null for anything else. */
+export function contextUsageSignalItem(message: unknown): ClaudeContextUsageSignalItem | null {
+    const system = message as { type?: unknown; subtype?: unknown; model?: unknown } | null;
+    if (!system || system.type !== 'system') return null;
+    if (system.subtype === 'init') return { __claudeContextUsageSignal: true, signal: { kind: 'provider-model', model: system.model } };
+    if (system.subtype === 'compact_boundary') return { __claudeContextUsageSignal: true, signal: { kind: 'compact-boundary' } };
+    return null;
+}
+
+/** Wraps the queue's send function so the signal items reach `apply` in their queued position. */
+export function withContextUsageSignals(
+    send: (message: unknown) => void,
+    apply: (signal: ClaudeContextUsageSignal) => void,
+): (message: unknown) => void {
+    return (message) => {
+        const item = message as Partial<ClaudeContextUsageSignalItem> | null;
+        if (item && item.__claudeContextUsageSignal === true && item.signal) {
+            apply(item.signal);
+            return;
+        }
+        send(message);
+    };
+}
+
 export class ClaudeContextUsageTracker {
     private epoch: string;
     private seq = 0;
@@ -68,14 +139,14 @@ export class ClaudeContextUsageTracker {
     private model: string | null = null;
     /** `system`/`init.model` of the running provider. Describes the process, so a reset keeps it. */
     private providerModel: string | null = null;
-    /** `message.model` of that provider's first readable main response. */
+    /** `message.model` of that provider's first readable main response under the provider model's own id. */
     private providerApiModel: string | null = null;
     /** Model names are runtime input: a Map keeps `__proto__` and friends as plain keys. */
     private readonly windows = new Map<string, number>();
 
     constructor(
         private readonly onChange: (snapshot: ClaudeContextUsageSnapshot) => void,
-        private readonly newEpoch: () => string = randomUUID,
+        private readonly newEpoch: () => string = processEpochSource,
     ) {
         this.epoch = newEpoch();
     }
@@ -95,7 +166,8 @@ export class ClaudeContextUsageTracker {
         const used = readRequestSize(input.usage);
         if (used === null) return;
         const apiModel = typeof input.model === 'string' ? input.model.trim() : '';
-        if (this.providerModel && apiModel) this.providerApiModel ??= apiModel;
+        if (this.providerModel && apiModel && this.providerApiModel === null
+            && isProviderModelApiId(this.providerModel, apiModel)) this.providerApiModel = apiModel;
         const model = this.providerModel && (!apiModel || apiModel === this.providerApiModel)
             ? this.providerModel
             : apiModel;

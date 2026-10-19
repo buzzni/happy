@@ -1,27 +1,29 @@
 {
-    "contract": "Saycode Desktop specs/desktop-chat-context-window-meter plan.md snapshot contract. The same JSON lives in the Desktop repository; a field renamed on one side makes the meter disappear silently.",
-    "snapshot": {
-        "version": 1,
-        "type": "context-usage",
-        "epoch": "epoch-1",
-        "seq": 2,
-        "used": 124000,
-        "window": 200000,
-        "model": "claude-sonnet-4-5-20250929"
-    },
-    "sequences": {
-        "turnResult": [
-            { "version": 1, "type": "context-usage", "epoch": "epoch-1", "seq": 1, "used": 124000, "window": null, "model": "claude-sonnet-4-5-20250929" },
-            { "version": 1, "type": "context-usage", "epoch": "epoch-1", "seq": 2, "used": 124000, "window": 200000, "model": "claude-sonnet-4-5-20250929" }
-        ],
-        "compaction": [
-            { "version": 1, "type": "context-usage", "epoch": "epoch-1", "seq": 3, "used": null, "window": 200000, "model": "claude-sonnet-4-5-20250929" },
-            { "version": 1, "type": "context-usage", "epoch": "epoch-1", "seq": 4, "used": 36000, "window": 200000, "model": "claude-sonnet-4-5-20250929" }
-        ],
-        "reset": [
-            { "version": 1, "type": "context-usage", "epoch": "epoch-2", "seq": 0, "used": null, "window": null, "model": null },
-            { "version": 1, "type": "context-usage", "epoch": "epoch-2", "seq": 1, "used": 9000, "window": null, "model": "claude-sonnet-4-5-20250929" },
-            { "version": 1, "type": "context-usage", "epoch": "epoch-2", "seq": 2, "used": 9000, "window": 200000, "model": "claude-sonnet-4-5-20250929" }
-        ]
-    }
+  "assistantWithWindow": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400000000-0b6f1c9e",
+    "seq": 3,
+    "used": 124000,
+    "window": 200000,
+    "model": "claude-sonnet-4-5-20250929"
+  },
+  "assistantBeforeFirstResult": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400000000-0b6f1c9e",
+    "seq": 1,
+    "used": 18000,
+    "window": null,
+    "model": "claude-sonnet-4-5-20250929"
+  },
+  "afterReset": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400125000-7c1d2e3f",
+    "seq": 0,
+    "used": null,
+    "window": null,
+    "model": null
+  }
 }

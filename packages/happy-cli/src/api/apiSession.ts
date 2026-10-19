@@ -41,7 +41,7 @@ import {
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
 import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
-import { ClaudeContextUsageTracker } from '@/claude/claudeContextUsage';
+import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 
@@ -1877,17 +1877,20 @@ export class ApiSessionClient extends EventEmitter {
      */
     private noteClaudeContextUsage(body: RawJSONLines) {
         if (this.currentMode !== 'remote') return;
-        if (body.type === 'assistant') {
-            if (body.message?.usage && body.isSidechain !== true
-                && (body as { isCompactSummary?: unknown }).isCompactSummary !== true) {
-                this.contextUsage.noteMainAssistant({ model: body.message.model, usage: body.message.usage });
-            }
-            return;
+        if (body.type === 'assistant' && body.message?.usage && body.isSidechain !== true
+            && (body as { isCompactSummary?: unknown }).isCompactSummary !== true) {
+            this.contextUsage.noteMainAssistant({ model: body.message.model, usage: body.message.usage });
         }
-        if (body.type !== 'system') return;
-        const system = body as { subtype?: unknown; model?: unknown };
-        if (system.subtype === 'init') this.contextUsage.noteProviderModel(system.model);
-        else if (system.subtype === 'compact_boundary') this.contextUsage.noteCompactBoundary();
+    }
+
+    /**
+     * `system`/`init` and `compact_boundary`, in their transcript position. They come as their own
+     * queue items from the launcher because the outgoing queue never forwards `system` messages.
+     */
+    noteContextUsageSignal(signal: ClaudeContextUsageSignal) {
+        if (this.currentMode !== 'remote') return;
+        if (signal.kind === 'provider-model') this.contextUsage.noteProviderModel(signal.model);
+        else this.contextUsage.noteCompactBoundary();
     }
 
     /** `/clear` or another Claude session id: the new conversation may run under other settings. */
