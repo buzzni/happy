@@ -90,6 +90,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     disconnect = fixture.disconnect;
     steerTurn = async (text: string) => { fixture.steerText = text; await fixture.onSteer?.(); };
     setApprovalHandler = vi.fn();
+    setUserInputHandler = vi.fn();
     setEventHandler = (handler: (event: unknown) => void) => { fixture.emit = handler; };
     supportsGoalActions = () => false;
     hasActiveThread = () => Boolean(this.threadId);

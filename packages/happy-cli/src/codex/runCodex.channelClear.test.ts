@@ -61,6 +61,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
     CodexAppServerClient: class {
         setEventHandler = vi.fn();
         setApprovalHandler = vi.fn();
+        setUserInputHandler = vi.fn();
         supportsGoalActions = () => false;
         hasActiveThread = () => threadId !== null;
         readThread = vi.fn(async () => ({ thread: { id: threadId ?? 'thread-x', turns: [] } }));
