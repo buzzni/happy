@@ -48,7 +48,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         const generations: Array<{ token?: string; resume?: string; prompts: string[] }> = [];
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
@@ -121,7 +121,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             failClaudeLaunchTurn: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
@@ -155,7 +155,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         const generations: Array<{ token?: string; prompts: string[] }> = [];
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
@@ -209,7 +209,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         const generations: Array<{ token?: string; prompts: string[] }> = [];
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
@@ -264,7 +264,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
                 sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-                applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+                applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
             const generations: Array<{ token?: string; prompts: string[] }> = [];
             vi.mocked(query).mockImplementation(({ prompt, options }) => {
@@ -335,7 +335,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
                 sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-                applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+                applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
             const generations: Array<{ token?: string; prompts: string[] }> = [];
             vi.mocked(query).mockImplementation(({ prompt, options }) => {

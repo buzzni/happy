@@ -186,6 +186,10 @@ export class Session {
     }
 
     onModeChange = (mode: 'local' | 'remote') => {
+        // A terminal session has no turn result to name the window; take the meter down
+        // while this client still sends it (Saycode specs/desktop-chat-context-window-meter R2).
+        // Hidden, not reset: the conversation is the same, so its cached windows stay valid.
+        if (mode === 'local') this.client.hideContextUsage();
         this.mode = mode;
         this.client.keepAlive(this.thinking, mode);
         this._onModeChange(mode);
@@ -207,6 +211,9 @@ export class Session {
      * all registered callbacks (e.g., SessionScanner) about the change.
      */
     onSessionFound = (sessionId: string) => {
+        // Another conversation, possibly under other runtime settings: its windows are not ours.
+        // The first id, the same id again, and the id after a /clear (already reset) are not a change.
+        if (this.sessionId !== null && this.sessionId !== sessionId) this.client.resetContextUsage();
         this.sessionId = sessionId;
         
         // Update metadata with Claude Code session ID

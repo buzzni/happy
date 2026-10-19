@@ -29,7 +29,7 @@ function harness() {
         updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
         sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-        applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
     };
     const session = {
         lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },

@@ -25,7 +25,8 @@ describe('Claude model changes across provider restarts', () => {
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            resetContextUsage: vi.fn(),
         };
         queue.pushIsolated('/clear', { permissionMode: 'default', model: 'claude-sonnet-5' });
         const session = {
@@ -38,6 +39,8 @@ describe('Claude model changes across provider restarts', () => {
         expect(onSessionReset).not.toHaveBeenCalled();
         await claudeRemoteLauncher(session);
         expect(onSessionReset).toHaveBeenCalledOnce();
+        // The context meter forgets the old conversation's windows too (Saycode specs/desktop-chat-context-window-meter R6).
+        expect(client.resetContextUsage).toHaveBeenCalledOnce();
     });
 
     it.each(['model', 'effort', 'boundary-model', 'boundary-effort'] as const)('applies consecutive %s changes at the SDK boundary', async (field) => {
@@ -64,7 +67,7 @@ describe('Claude model changes across provider restarts', () => {
             }), getMetadata: () => metadata,
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
             launches.push(options!);
@@ -133,7 +136,7 @@ describe('Claude model changes across provider restarts', () => {
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(),
             closeClaudeSessionTurn: vi.fn((status: string) => order.push(`close:${status}`)),
             failClaudeLaunchTurn: vi.fn(() => order.push('fail-turn')),
             sendSessionEvent: vi.fn((event: { message?: string }) => order.push(`event:${event.message}`)),
@@ -176,7 +179,7 @@ describe('Claude model changes across provider restarts', () => {
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(),
             closeClaudeSessionTurn: vi.fn((status: string) => order.push(`close:${status}`)),
             failClaudeLaunchTurn: vi.fn(),
             sendSessionEvent: vi.fn((event: { message?: string }) => order.push(`event:${event.message}`)),
@@ -220,7 +223,7 @@ describe('Claude model changes across provider restarts', () => {
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(),
             closeClaudeSessionTurn: vi.fn((status: string) => order.push(`close:${status}`)),
             failClaudeLaunchTurn: vi.fn(),
             sendSessionEvent: vi.fn((event: { message?: string }) => order.push(`event:${event.message}`)),
@@ -267,7 +270,7 @@ describe('Claude model changes across provider restarts', () => {
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(), sendTurnLatency: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt, options }) => {
             launches.push(options!);
@@ -312,7 +315,7 @@ describe('/btw side question on the live provider', () => {
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
             sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
-            applyClaudeTurnResult: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             reportSideQuestionUsage: vi.fn(),
         };
         vi.mocked(query).mockImplementation(({ prompt }) => {

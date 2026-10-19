@@ -1,0 +1,29 @@
+{
+  "assistantWithWindow": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400000000-0b6f1c9e",
+    "seq": 3,
+    "used": 124000,
+    "window": 200000,
+    "model": "claude-sonnet-4-5-20250929"
+  },
+  "assistantBeforeFirstResult": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400000000-0b6f1c9e",
+    "seq": 1,
+    "used": 18000,
+    "window": null,
+    "model": "claude-sonnet-4-5-20250929"
+  },
+  "afterReset": {
+    "version": 1,
+    "type": "context-usage",
+    "epoch": "1792400125000-7c1d2e3f",
+    "seq": 0,
+    "used": null,
+    "window": null,
+    "model": null
+  }
+}
