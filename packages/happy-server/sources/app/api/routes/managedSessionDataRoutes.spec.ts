@@ -677,6 +677,10 @@ describe.skipIf(!enabled)('managed session data routes (real Fastify + PostgreSQ
             await expectInert(() => request({
                 method: 'GET', url: '/v2/sessions', token: scopedToken,
             }), 401);
+            // The recent-activity list is account-wide like the one above.
+            await expectInert(() => request({
+                method: 'GET', url: '/v2/sessions/recent', token: scopedToken,
+            }), 401);
         });
     });
 

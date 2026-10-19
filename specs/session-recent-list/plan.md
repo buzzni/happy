@@ -17,6 +17,7 @@
 
 기존 `GET /v2/sessions` 핸들러를 선례로 같은 파일에 라우트를 하나 추가한다.
 keyset 조건은 `updatedAt < c.updatedAt OR (updatedAt = c.updatedAt AND id < c.id)`이고, `since`는 같은 `where`에 `AND updatedAt >= since`로 붙는다.
+PostgreSQL은 OR에서 인덱스 상한을 만들지 않으므로 의미가 같은 `AND updatedAt <= c.updatedAt`을 함께 건다(EXPLAIN 측정은 context).
 `updatedAt`은 밀리초 정밀도(`timestamp(3)`)라 커서의 epoch ms가 행 값과 정확히 같다(spec B5) — 동률 행이 경계에서 빠지거나 반복되지 않는다.
 커서는 `^cursor_v2_(\d+)_(.+)$`로 해석하고, 시각이 JS Date 범위(±8.64e15) 밖이면 400이다. `since`·커서 시각 상한도 같다(Invalid Date가 500이 되지 않게).
 
@@ -31,9 +32,9 @@ keyset 조건은 `updatedAt < c.updatedAt OR (updatedAt = c.updatedAt AND id < c
 
 ## 단계
 
-- [ ] Phase A-1: 문서 세트(T3)
-- [ ] Phase A-2: Red 테스트 → 최소 구현(T4), 기존 라우트 불변 회귀(T5)
-- [ ] Phase A-3: EXPLAIN 확인, `docs/api.md`(T6)
+- [x] Phase A-1: 문서 세트(T3)
+- [x] Phase A-2: Red 테스트 → 최소 구현(T4), 기존 라우트 불변 회귀(T5)
+- [x] Phase A-3: EXPLAIN 확인, `docs/api.md`(T6)
 - [ ] Phase A-4: PR(T7 — 2단계, 오케스트레이터 지시 후)
 
 ## 리스크와 대응

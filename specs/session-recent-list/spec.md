@@ -50,7 +50,7 @@ Desktop 저장소의 `saycode agent search`(에이전트용 대화 검색 CLI)�
 
 ## 완료 기준
 
-- [ ] S1~S9 라우트 테스트 통과: 정렬, keyset 커서 연속 페이지 중복·누락 없음, `since` 경계(같음 포함), 잘못된 커서·`limit` 경계 400, 계정 격리, managed 401, `agentState` 미포함, 기존 4개 라우트 불변.
-- [ ] EXPLAIN으로 인덱스 범위 스캔 확인(context에 기록).
-- [ ] `docs/api.md` 갱신.
-- [ ] typecheck 통과.
+- [x] S1~S9 라우트 테스트 통과: 정렬, keyset 커서 연속 페이지 중복·누락 없음, `since` 경계(같음 포함), 잘못된 커서·`limit` 경계 400, 계정 격리, managed 401, `agentState` 미포함, 기존 4개 라우트 불변.
+- [x] EXPLAIN으로 인덱스 범위 스캔 확인(context에 기록).
+- [x] `docs/api.md` 갱신.
+- [x] typecheck 통과.
