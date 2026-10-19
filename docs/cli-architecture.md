@@ -28,6 +28,23 @@ server naming, or stops loading unconfigured placeholders itself.
 
 ## System overview
 
+### Readiness of daemon-owned children
+
+A child launched directly by the online daemon can reuse that parent without
+another loopback health request when the OS parent PID, running state, connected
+socket, CLI version and daemon lock owner agree, and the parent is still alive.
+The state must also contain a bound control port and control credentials. An
+online UI snapshot or `--started-by daemon` argument alone is not this proof.
+This avoids a transient two-second health timeout aborting a conversation that
+the same daemon has just accepted and spawned. Authenticated session reports,
+machine/account identity and session authorization remain unchanged.
+
+Terminal launches, mismatched or incomplete records, disconnected parents and
+launchers with an intermediate parent retain normal health verification and
+automatic daemon startup. Revisit this shortcut if spawning stops preserving
+direct OS parentage; an intermediary must use the verified fallback rather than
+an environment flag that bypasses ownership checks.
+
 ```mermaid
 graph TB
     subgraph "Happy CLI"
