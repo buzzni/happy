@@ -1,13 +1,13 @@
 ---
 기능: claude-transient-retry
-상태: 진행중 — 2단계: 교차 리뷰 반영, PR 준비
-마지막 갱신: 2026-10-18
+상태: 완료 (머지됨 #871) — 릴리스 후 실측 대기 1건(실제 장애 중 실기기)
+마지막 갱신: 2026-10-19
 ---
 
 # Context
 
-- 브랜치 `hermes-claude-transient-retry`, worktree `/Users/justin/workspace/happy-wt/hermes-claude-transient-retry`
-  (base origin/main 17d63765d). hermes 오케스트레이션 H9a. Desktop 표시는 H9b.
+- hermes 오케스트레이션 H9a. PR #871이 CI 통과 후 2026-10-18 main에 머지됐다. happy-cli `1.1.10-aplus.341`부터 들어 있고, Desktop main pin은 `.342`다.
+  Desktop 표시(H9b)는 Desktop #1982로 머지됐다(Desktop `specs/_archive/desktop-transient-retry-countdown`).
 - 설계 결정은 spec.md D1~D7. 서버·Desktop 변경 없음.
 
 ## 검증 상태 (2026-10-18, 1단계)
@@ -36,5 +36,11 @@
 - 안내문이 교훈 블록·지시문에 감싸임 → 우회(D2).
 - 런처 경계 제외 테스트: 채널·슬래시 명령·run-once.
 
+## 릴리스 후 실측 대기
+- 실제 일시 장애 중 실기기 확인. 조건: H9b(#1982)를 담고 pin ≥ `.341`인 Desktop 릴리스.
+  - 확인 방법: Claude 턴을 실제 5xx로 실패시킨다(예: 503을 돌려주는 `ANTHROPIC_BASE_URL` 가짜 서버).
+  - 카운트다운이 보이고, `취소`하면 대기만 지워지고 제공자는 살아 있어야 한다. 기다리면 같은 대화에서 자동으로 이어져야 한다.
+  - `--resume` 경로(checkpoint 보호 세션)의 합성 오류 메시지 병합도 이때 함께 본다(위 열린 문제).
+
 ## 다음 시작점
-PR → 리뷰 봇 → CI. 머지는 오케스트레이터.
+구현 작업은 없다. 위 "릴리스 후 실측 대기"만 남았다.
