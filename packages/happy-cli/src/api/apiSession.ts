@@ -41,7 +41,7 @@ import {
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
 import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
-import { ClaudeContextUsageTracker, type ClaudeContextUsageSnapshot } from '@/claude/claudeContextUsage';
+import { ClaudeContextUsageTracker } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 
@@ -517,7 +517,7 @@ export class ApiSessionClient extends EventEmitter {
     private providerUsageEventIds = new Set<string>();
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
     private readonly contextUsage = new ClaudeContextUsageTracker((snapshot) => {
-        this.sendContextUsage(snapshot);
+        this.emitSessionStream(snapshot);
         this.syncContextUsageResend();
     });
     private contextUsageResendTimer: ReturnType<typeof setInterval> | null = null;
@@ -1860,11 +1860,7 @@ export class ApiSessionClient extends EventEmitter {
      * via `seq`.
      */
     sendStreamDelta(frame: StreamDeltaFrame) {
-        this.socket.volatile.emit('session-stream', {
-            sid: this.sessionId,
-            time: Date.now(),
-            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, frame)),
-        });
+        this.emitSessionStream(frame);
     }
 
     /**
@@ -1894,15 +1890,7 @@ export class ApiSessionClient extends EventEmitter {
 
     /** The latest snapshot again, same seq — for a reconnect, a turn result and the periodic repair. */
     private resendContextUsage() {
-        if (this.contextUsage.hasValue()) this.sendContextUsage(this.contextUsage.snapshot());
-    }
-
-    private sendContextUsage(snapshot: ClaudeContextUsageSnapshot) {
-        this.socket.volatile.emit('session-stream', {
-            sid: this.sessionId,
-            time: Date.now(),
-            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, snapshot)),
-        });
+        if (this.contextUsage.hasValue()) this.emitSessionStream(this.contextUsage.snapshot());
     }
 
     private syncContextUsageResend() {
@@ -1917,10 +1905,19 @@ export class ApiSessionClient extends EventEmitter {
 
     /** A bounded, opt-in daemon duration record sent through the existing opaque stream relay. */
     sendTurnLatency(diagnostic: ClaudeTurnLatencyDiagnostic | CodexTurnLatencyProgress) {
+        this.emitSessionStream(diagnostic);
+    }
+
+    /**
+     * The opaque, unpersisted relay to the session's viewers: encrypted with the session key, and
+     * volatile, so every frame on it must be safe to lose. One envelope for every frame type —
+     * a consumer that cannot read one drops the frame silently.
+     */
+    private emitSessionStream(frame: unknown) {
         this.socket.volatile.emit('session-stream', {
             sid: this.sessionId,
             time: Date.now(),
-            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, diagnostic)),
+            data: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, frame)),
         });
     }
 
