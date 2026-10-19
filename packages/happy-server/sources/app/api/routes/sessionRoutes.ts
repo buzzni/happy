@@ -359,6 +359,109 @@ export function sessionRoutes(app: Fastify) {
         });
     });
 
+    /*
+     * Account sessions by recent activity, for clients that scan a time window
+     * (specs/session-recent-list).
+     *
+     * `GET /v2/sessions` pages by id, i.e. by creation, so a scan cut off at a
+     * row limit drops a long-lived session that was active yesterday. This one
+     * pages by `(updatedAt, id)` descending with a keyset cursor. It is a new
+     * path rather than a parameter on the old one: an older server would drop
+     * an unknown parameter and answer in id order without the client noticing.
+     * An older server answers this path with 404, or — self-hosted with the web
+     * UI — with the SPA fallback's `index.html` and 200, which does not cover
+     * `/v2`. Clients tell the two apart by content type, not status alone.
+     *
+     * The server never reads metadata here — which machine or project a session
+     * belongs to is encrypted, so scoping is the caller's job after decryption.
+     * `agentState` is left out to keep wide scans small.
+     *
+     * `updatedAt` is stored with millisecond precision, so the cursor's epoch
+     * ms is the row's exact value and ties on it are split by id.
+     */
+    app.get('/v2/sessions/recent', {
+        preHandler: app.authenticate,
+        schema: {
+            querystring: z.object({
+                cursor: z.string().optional(),
+                limit: z.coerce.number().int().min(1).max(200).default(100),
+                since: z.coerce.number().int().positive().max(MAX_EPOCH_MS).optional()
+            }).optional()
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { cursor, limit = 100, since } = request.query || {};
+
+        let after: { updatedAt: Date; id: string } | null = null;
+        if (cursor !== undefined) {
+            after = parseRecentSessionsCursor(cursor);
+            if (!after) {
+                return reply.code(400).send({ error: 'Invalid cursor format' });
+            }
+        }
+
+        const where: Prisma.SessionWhereInput = { accountId: userId };
+        const and: Prisma.SessionWhereInput[] = [];
+        if (since !== undefined) {
+            and.push({ updatedAt: { gte: new Date(since) } });
+        }
+        if (after) {
+            // Implied by the OR below; stated separately because Postgres
+            // does not derive an index bound from an OR, and without it every
+            // page re-reads all newer rows of the account.
+            and.push({ updatedAt: { lte: after.updatedAt } });
+            and.push({
+                OR: [
+                    { updatedAt: { lt: after.updatedAt } },
+                    { updatedAt: after.updatedAt, id: { lt: after.id } },
+                ]
+            });
+        }
+        if (and.length > 0) {
+            where.AND = and;
+        }
+
+        const sessions = await db.session.findMany({
+            where,
+            orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+            take: limit + 1,
+            select: {
+                id: true,
+                seq: true,
+                createdAt: true,
+                updatedAt: true,
+                metadata: true,
+                metadataVersion: true,
+                dataEncryptionKey: true,
+                active: true,
+                lastActiveAt: true,
+            }
+        });
+
+        const hasNext = sessions.length > limit;
+        const resultSessions = hasNext ? sessions.slice(0, limit) : sessions;
+        const last = resultSessions[resultSessions.length - 1];
+        const nextCursor = hasNext && last
+            ? `cursor_v2_${last.updatedAt.getTime()}_${last.id}`
+            : null;
+
+        return reply.send({
+            sessions: resultSessions.map((v) => ({
+                id: v.id,
+                seq: v.seq,
+                createdAt: v.createdAt.getTime(),
+                updatedAt: v.updatedAt.getTime(),
+                active: v.active,
+                activeAt: v.lastActiveAt.getTime(),
+                metadata: v.metadata,
+                metadataVersion: v.metadataVersion,
+                dataEncryptionKey: v.dataEncryptionKey ? Buffer.from(v.dataEncryptionKey).toString('base64') : null,
+            })),
+            nextCursor,
+            hasNext
+        });
+    });
+
     // Create or load session by tag
     app.post('/v1/sessions', {
         // Inspect signed requests before Fastify's JSON parser collapses repeated
@@ -580,4 +683,25 @@ export function sessionRoutes(app: Fastify) {
 
         return reply.send({ success: true });
     });
+}
+
+/**
+ * Last millisecond of year 9999. A JS `Date` reaches further, but Prisma
+ * refuses to send a five-digit year, which would surface as a 500.
+ */
+const MAX_EPOCH_MS = 253_402_300_799_999;
+
+/**
+ * Reads `cursor_v2_<updatedAtMs>_<id>` back into the keyset position.
+ *
+ * Returns null for anything else, including a time past `MAX_EPOCH_MS` or
+ * an id with NUL (PostgreSQL text cannot hold it), so a malformed cursor is a
+ * 400 rather than a query error.
+ */
+function parseRecentSessionsCursor(cursor: string): { updatedAt: Date; id: string } | null {
+    const match = /^cursor_v2_(\d{1,15})_([^\0]+)$/.exec(cursor);
+    if (!match) return null;
+    const updatedAtMs = Number(match[1]);
+    if (updatedAtMs > MAX_EPOCH_MS) return null;
+    return { updatedAt: new Date(updatedAtMs), id: match[2] };
 }

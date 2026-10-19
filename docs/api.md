@@ -43,6 +43,14 @@ Auth flows:
 - `GET /v1/sessions`
 - `GET /v2/sessions/active?limit=...`
 - `GET /v2/sessions?cursor=cursor_v1_<id>&limit=...&changedSince=...`
+- `GET /v2/sessions/recent?cursor=cursor_v2_<updatedAtMs>_<id>&limit=...&since=...`
+  - The account's sessions by recent activity: `updatedAt` desc, ties by `id` desc. Archived sessions are included.
+  - `limit` 1–200 (default 100). `since` (epoch ms, optional) keeps rows with `updatedAt >= since`. A malformed `cursor` or an out-of-range value is `400`.
+  - Response: `{ sessions: [{ id, seq, createdAt, updatedAt, active, activeAt, metadata, metadataVersion, dataEncryptionKey }], nextCursor, hasNext }`. `agentState` is not included; `metadata` is the ciphertext as stored.
+  - Account bearer or browser-sync credential only; a managed session-scoped bearer is `401`.
+  - Not a snapshot: a session updated while a client pages moves ahead of the cursor and is missed by that scan (rows are never repeated). It is first on the next scan from the top. `updatedAt` also moves on server-side writes such as the presence timeout and archive, not only on new messages.
+  - An older server answers `404`, or, when self-hosted with the web UI, `200 text/html` from the SPA fallback (which does not reserve `/v2`). Detect support by a JSON response, not by status alone.
+  - Unlike `GET /v2/sessions` (id, i.e. creation order), a scan cut at a row limit keeps the most recently active sessions. Spec: `specs/session-recent-list/`.
 - `POST /v1/sessions` (create or load by `tag`)
 - `GET /v1/sessions/:sessionId/messages`
 - `DELETE /v1/sessions/:sessionId`
