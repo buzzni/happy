@@ -323,7 +323,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const transientRetry = createClaudeTransientRetry<{ mode: EnhancedMode; hash: string | null }>({
         delaysMs: CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
         onState: (state) => {
-            // A scheduled run's failed turn is not final while its retry waits (specs/automation-result-delivery).
+            // A scheduled run's failed turn is not final while its retry waits (specs/_archive/automation-result-delivery).
             session.client.setTransientRetryPending(state !== null);
             session.client.updateAgentState((current) => ({ ...current, transientRetry: state }));
         },
@@ -1139,7 +1139,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onReady: () => {
                         drain?.turnEnded();
-                        // Nothing waiting: a scheduled prompt that arrives next is the next turn (specs/automation-result-delivery).
+                        // Nothing waiting: a scheduled prompt that arrives next is the next turn (specs/_archive/automation-result-delivery).
                         if (!pending && session.queue.size() === 0) session.client.noteInputQueueEmpty?.();
                         // Queued, not called: a terminal emitted ahead of the transcript closes a
                         // turn that has not received its text yet, and the later flush opens a

@@ -921,7 +921,7 @@ export async function runCodex(opts: {
 
     const sendReady = () => {
         if (runtimeGate?.isClosed()) return;
-        // Only sent when idle (`emitReadyIfIdle`): no input is waiting (specs/automation-result-delivery).
+        // Only sent when idle (`emitReadyIfIdle`): no input is waiting (specs/_archive/automation-result-delivery).
         session.noteInputQueueEmpty?.();
         session.sendSessionEvent({ type: 'ready' });
         try {

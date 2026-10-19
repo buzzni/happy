@@ -132,7 +132,7 @@ export function startDaemonControlServer({
     reporter?: { hostPid?: number },
   ) => void;
   /**
-   * The turn that answered a scheduled prompt (Saycode specs/automation-result-delivery D1). Not a
+   * The turn that answered a scheduled prompt (Saycode specs/_archive/automation-result-delivery D1). Not a
    * managed report path: a managed child holds no bearer for it, so a managed runtime never
    * delivers. Only the cut answer travels (`automationTurnTracker`).
    */

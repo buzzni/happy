@@ -7,7 +7,7 @@
  * other processes — turns `ready`/`unavailable` into the `channelHost` advertisement, relays sealed
  * settings calls, answers the host's requests, restarts a crashed child with a backoff, and stops
  * it on request. It also carries the daemon's own `deliver` requests — a scheduled run's result or
- * failure for a paired conversation (Saycode specs/automation-result-delivery) — but only to a host
+ * failure for a paired conversation (Saycode specs/_archive/automation-result-delivery) — but only to a host
  * whose `ready` said it understands them: an older host drops an unknown message without answering. There is never more than one child: a restart is scheduled only from the previous
  * child's exit.
  *

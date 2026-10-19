@@ -414,7 +414,7 @@ describe('once and weekly schedules', () => {
   });
 });
 
-describe('messenger delivery settings (Saycode specs/automation-result-delivery)', () => {
+describe('messenger delivery settings (Saycode specs/_archive/automation-result-delivery)', () => {
   const ordinary = { name: 'Report', schedule: { kind: 'interval', minutes: 15 }, prompt: 'Report', directory: '/chat', scriptCommand: null, suppressSilent: false, agent: 'claude', conversation: { sessionId: 'chat-session' } };
   const target = { machineId: 'machine-1', connectionId: 'connection-1', grantKey: 'g'.repeat(43) };
 

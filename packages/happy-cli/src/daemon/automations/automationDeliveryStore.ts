@@ -1,5 +1,5 @@
 /**
- * The delivery ledger on disk (Saycode specs/automation-result-delivery — plan D2·D7).
+ * The delivery ledger on disk (Saycode specs/_archive/automation-result-delivery — plan D2·D7).
  *
  * Its own file rather than a field of the automation runtime state: an older daemon parses that
  * state strictly, and a field it does not know must never be a reason for it to drop the reports

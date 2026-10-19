@@ -4608,7 +4608,7 @@ describe('unreachable pre-model retry', () => {
     expect(f.transport.claim).toHaveBeenCalledTimes(2)
   })
 
-  // specs/automation-result-delivery R7 — 보류 중인 실패는 알리지 않고, 최종 실패가 확정될 때만 한 번 알린다.
+  // specs/_archive/automation-result-delivery R7 — 보류 중인 실패는 알리지 않고, 최종 실패가 확정될 때만 한 번 알린다.
   function withDelivery(f: ReturnType<typeof retrySetup>) {
     const delivery = { runFailed: vi.fn(async () => 'sent' as const), runStarted: vi.fn() }
     f.input.delivery = delivery

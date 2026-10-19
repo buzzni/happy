@@ -1,6 +1,6 @@
 /**
  * Which turn answered a scheduled prompt delivered into an existing conversation, and what it
- * answered (Saycode specs/automation-result-delivery — R4, plan D1).
+ * answered (Saycode specs/_archive/automation-result-delivery — R4, plan D1).
  *
  * The daemon reports a conversation run as started the moment the prompt is accepted; the answer
  * comes later, inside this session. This tracker follows the session's own protocol envelopes:

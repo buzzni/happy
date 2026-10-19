@@ -267,7 +267,7 @@ export async function notifyDaemonSessionRuntime(
 }
 
 /**
- * The turn that answered a scheduled prompt (Saycode specs/automation-result-delivery D1). Only the
+ * The turn that answered a scheduled prompt (Saycode specs/_archive/automation-result-delivery D1). Only the
  * cut answer goes, and only for a turn the daemon's own prompt opened.
  */
 export async function notifyDaemonAutomationTurnResult(

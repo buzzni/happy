@@ -515,7 +515,7 @@ export class ApiSessionClient extends EventEmitter {
     private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
-    /** The turn answering a daemon-delivered scheduled prompt (Saycode specs/automation-result-delivery). */
+    /** The turn answering a daemon-delivered scheduled prompt (Saycode specs/_archive/automation-result-delivery). */
     private readonly automationTurns = new AutomationTurnTracker();
     /** A temporary API failure is waiting to be retried by the engine (specs claude-transient-retry). */
     private transientRetryPending = false;
@@ -1601,7 +1601,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     sendFinalAnswerForChannelTurn(text: string): void {
-        // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/automation-result-delivery).
+        // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
         const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
