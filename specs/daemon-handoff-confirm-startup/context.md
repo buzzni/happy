@@ -5,9 +5,13 @@
 진행 중. 사용자 권한은 수정·관련 검증·main 반영이며 새 Windows Trial 빌드/설치 검증은
 이번 범위에서 제외했다. Desktop 설치판의 .342를 직접 바꾸거나, 공개 CLI release/tag를
 발행한 것으로 간주하지 않는다. 공개 릴리스는 AGENTS.md의 즉시 승인 지점에 따른다.
+PR은 https://github.com/buzzni/happy/pull/879 이다. Desktop의 공식 pin 소비를 위해
+package.json의 버전을 미발행 후보1.1.10-aplus.343으로 추가 준비한다. 이 버전의 build/
+관련 테스트/package guard 및 exact-head CI 후 main에 반영하고, tag push 직전에 별도
+승인을 받아 Actions만 publish하도록 한다. 현재 registry latest는.342이며.343 tag는 없다.
 
 - 분류: 기존 Core 프로세스 수명주기 수정. 새 공개 API·환경변수·저장 스키마·권한은 추가하지 않는다.
-- 범위: ensureDaemonRunning.ts/test, cli-architecture.md, 이 context의 기존4파일.
+- 범위: ensureDaemonRunning.ts/test, cli-architecture.md, 이 context와 release version의 기존5파일.
 - 동작: 같은 CLI 버전의 running/online daemon이 OS 부모이고 lock owner/생존 확인이
   일치하며 control port/credential도 준비돼 있으면 중복 HTTP ping을 생략한다.
 - 보호: 플래그/온라인 표시만으로 생략하지 않는다. terminal·다른 부모·죽은/중지/오프라인
@@ -24,11 +28,14 @@
 - 배포물 검증: prepare-publish-package와 guard-publish-artifact --install-smoke PASS.
   로컬 검증은 npm11.12.1 및 격리된 npm cache/prefix를 사용했다. 공개 publish/tag,
   설치판 runtime 교체 및 수정판 Windows 수락은 하지 않았다.
+- .343 미발행 후보에서도 직접65건·타입/빌드 및 prepared package의 실제 설치 smoke를
+  다시 통과했다. source PR의 최종 head CI를 별도로 확인하며 이전 head 성공을 대신 쓰지 않는다.
 - 의존성: worktree root node_modules는 원래 저장소에 symlink. 최신 wire 타입만 이
   worktree에서 빌드/연결해 다른 worktree의 공용 캐시와 생성물을 덮어쓰지 않았다.
 - 경계: 다른 사용자 자격의 staged home에 lock이 없거나 중간 launcher가 있으면 기존
   health 검사로 돌아간다. 이 수정으로 모든 원격/격리 spawn의 지연을 해결했다고 하지 않는다.
-- 복구: 이4파일 변경을 revert한다. 자격증명/state/lock migration은 없다.
+- 복구: 동작4파일 변경을 revert한다. 자격증명/state/lock migration은 없다. 미발행 버전 준비는
+  package.json 한 줄이며 발행 후에는 같은 npm 버전을 재사용하지 않는다.
 
 ## 기존 작업 완료 이력
 Phase 1~5 완료. 브랜치 `fix/handoff-confirm-daemon-started`, base `origin/main@f84be7bd`.
