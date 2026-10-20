@@ -353,6 +353,15 @@ pin a CLI with that option and optional-skill status output, verify hook paths
 under the restricted daemon PATH, and add the exact declaration with
 `writeScope: project`. The panel falls back to terminal instructions meanwhile.
 
+`buzzni.moai.init` (`init --no-skill --no-register`, `writeScope: project`) is
+the Moai 2.1.0 panel's button on a project without `.moai/`. v0.17.0 accepts both
+flags. It writes `.moai/`, the `AGENTS.md` guide block, `.gitattributes`,
+`.gitignore` and the merge driver in `.git/config`; run from the daemon, the
+driver names the managed binary's absolute path (no `--driver-exe` option yet),
+so a later pin move drops merges to `git merge-file` until `moai init` runs again.
+Without this entry the panel says the daemon does not offer init yet and keeps
+the terminal instruction.
+
 Release the daemon before tagging the extension bundle, then promote the
 published extension bytes into Desktop. Desktop promotion must compare its
 bundled checksum with the actual GitHub release asset; local candidate archives

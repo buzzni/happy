@@ -371,5 +371,29 @@
     "descendantAllowlist": [
       "git"
     ]
+  },
+  {
+    "id": "buzzni.moai.init",
+    "executable": "moai",
+    "argv": [
+      "--json",
+      "-C",
+      "{{workspaceRoot}}",
+      "init",
+      "--no-skill",
+      "--no-register"
+    ],
+    "parameters": {},
+    "cwd": "workspaceRoot",
+    "envAllowlist": [
+      "HOME"
+    ],
+    "timeoutMs": 120000,
+    "outputLimitBytes": 1048576,
+    "stdin": "none",
+    "writeScope": "project",
+    "descendantAllowlist": [
+      "git"
+    ]
   }
 ]
