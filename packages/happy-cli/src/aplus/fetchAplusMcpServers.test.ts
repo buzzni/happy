@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+    withoutRecoveredConfigFailure,
     fetchAplusMcpServers,
     fetchAplusMcpServersResult,
     isConnectorPlatformConfigured,
@@ -396,5 +397,22 @@ describe('isConnectorPlatformConfigured', () => {
     it('is true once the daemon injected the trusted config URL', () => {
         process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'http://aplus.test/api/me/mcp-config';
         expect(isConnectorPlatformConfigured()).toBe(true);
+    });
+});
+
+describe('withoutRecoveredConfigFailure', () => {
+    const stale = { name: 'aplus-config', status: 'config-fetch-failed' as const, error: 'mcp-config responded with 403', checkedAt: 1 };
+    const gmail = { name: 'gmail', status: 'connected' as const, checkedAt: 2 };
+
+    it('drops a config failure left by an earlier process once this process fetched the config', () => {
+        // 재개한 대화는 새 grant 로 정상인데, 이전 프로세스의 403 이 남으면
+        // Desktop 이 '새 대화 필요'를 띄운다.
+        expect(withoutRecoveredConfigFailure({ ok: true, servers: {} }, [stale, gmail])).toEqual([gmail]);
+    });
+
+    it('leaves metadata alone when there is nothing to clear or the fetch failed', () => {
+        expect(withoutRecoveredConfigFailure({ ok: true, servers: {} }, [gmail])).toBeNull();
+        expect(withoutRecoveredConfigFailure({ ok: true, servers: {} }, undefined)).toBeNull();
+        expect(withoutRecoveredConfigFailure({ ok: false, reason: 'http-error', error: 'mcp-config responded with 403' }, [stale])).toBeNull();
     });
 });

@@ -59,6 +59,7 @@ import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
+    withoutRecoveredConfigFailure,
     readExpectedConnectors,
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
@@ -1920,6 +1921,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 ...(currentMetadata.mcpServers ?? []).filter((server) => server.name !== status.name),
                 status,
             ],
+        }));
+    }
+    if (initialAplusMcpResult && withoutRecoveredConfigFailure(initialAplusMcpResult, session.getMetadata()?.mcpServers)) {
+        session.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            mcpServers: withoutRecoveredConfigFailure(initialAplusMcpResult, currentMetadata.mcpServers) ?? currentMetadata.mcpServers,
         }));
     }
     // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
