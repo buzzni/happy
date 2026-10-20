@@ -139,9 +139,11 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     }
     if (!deps.studioOrigin) return failure('STUDIO_UNAVAILABLE', 'rebind: Studio origin is not configured')
     const binding = recorded.binding
+    const tokenProof = !isMachineSetupTokenBinding(binding) && !!binding.tokenProof
     let grant: Record<string, unknown>
     try {
-      const response = await post('rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce })
+      const response = await post('rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce,
+        ...(tokenProof ? { credentialProofVersion: 1 } : {}) })
       const body = await response.json().catch(() => null) as Record<string, unknown> | null
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return { ok: false, reason: 'NO_ACCOUNT' }
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED') return { ok: false, reason: 'APPLY_REQUIRED' }
@@ -149,15 +151,17 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       grant = body
     } catch (error) { return failure('REQUEST_FAILED', `rebind ${(error as Error)?.name ?? 'error'}`) }
     if (grant.version !== 1 || typeof grant.bindingGrant !== 'string' || typeof grant.managedAccountId !== 'string' || !UUID.test(grant.managedAccountId)
-      || !Number.isSafeInteger(grant.credentialGeneration) || Number(grant.credentialGeneration) < 1) return failure('REQUEST_FAILED', 'rebind answered an unreadable grant')
+      || !Number.isSafeInteger(grant.credentialGeneration) || Number(grant.credentialGeneration) < 1
+      || (tokenProof && grant.credentialProofVersion !== 1)) return failure('REQUEST_FAILED', 'rebind answered an unreadable grant')
     let environment: Record<string, string>
     try {
       environment = await deps.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: grant.managedAccountId,
-        groupScope: binding.groupScope, credentialGeneration: grant.credentialGeneration as number, bindingGrant: grant.bindingGrant })
+        groupScope: binding.groupScope, credentialGeneration: grant.credentialGeneration as number, bindingGrant: grant.bindingGrant,
+        ...(tokenProof ? { credentialProofVersion: 1 } : {}) })
     } catch (error) { return failure('BINDING_REJECTED', `grant verification: ${(error as Error)?.message}`) }
     // The session stays with its member and organization; only the account changes.
     const next = parseBinding(environment[SETUP_TOKEN_BINDING_ENV])?.binding
-    if (!next || isMachineSetupTokenBinding(next) || isMachineSetupTokenBinding(binding) || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN) {
+    if (!next || isMachineSetupTokenBinding(next) || isMachineSetupTokenBinding(binding) || next.userId !== binding.userId || next.companyId !== binding.companyId || next.machineId !== binding.machineId || !environment.CLAUDE_CODE_OAUTH_TOKEN || (tokenProof && !next.tokenProof)) {
       return failure('BINDING_REJECTED', 'the new binding changes member, machine or organization')
     }
     pendingSaves.set(session, { running, committed, nextBinding: environment[SETUP_TOKEN_BINDING_ENV], indeterminate: false })

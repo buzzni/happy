@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
+import { createHash, createHmac, generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -7,6 +7,7 @@ import {
   createSetupTokenBindingVerifier,
   readTrustedStudioOrigin,
   verifySetupTokenBindingGrant,
+  setupTokenCredentialMatches,
 } from './setupTokenBindingProof'
 
 // Synthetic keys only. The envelope format mirrors the Studio collector signer:
@@ -33,6 +34,19 @@ const verify = (envelope: string, overrides: Partial<Parameters<typeof verifySet
   verifySetupTokenBindingGrant({ envelope, publicKey: { keyId: key.keyId, publicKeyBase64: key.publicKeyBase64 }, origin: ORIGIN, machineId: 'machine-1', now: NOW, ...overrides })
 
 describe('verifySetupTokenBindingGrant', () => {
+  it('compares the actual token with a signed nonce-bound proof independently of metadata generation', () => {
+    const token = 'sk-ant-oat01-synthetic_fixture_not_live', c = claims()
+    const tokenProof = createHmac('sha256', token).update(JSON.stringify([
+      'claude-setup-token-credential-proof-v1', c.companyId, c.userId, c.machineId, c.managedAccountId, c.nonce,
+    ])).digest('hex')
+    const verified = verify(mint(key.privateKey, { ...c, tokenProof }))!
+    expect(verified).not.toBeNull()
+    expect(setupTokenCredentialMatches(token, verified)).toBe(true)
+    expect(setupTokenCredentialMatches(token, { ...verified, credentialGeneration: 99 } as typeof verified)).toBe(true)
+    expect(setupTokenCredentialMatches(token + 'changed', verified)).toBe(false)
+    expect(setupTokenCredentialMatches(token, { ...verified, nonce: 'another-nonce' })).toBe(false)
+    for (const bad of ['', 'g'.repeat(64), [], null]) expect(verify(mint(key.privateKey, { ...c, tokenProof: bad }))).toBeNull()
+  })
   it('accepts a correctly signed, unexpired grant for this machine and audience', () => {
     expect(verify(mint(key.privateKey, claims()))).toEqual(claims())
   })

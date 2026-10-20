@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { spawnHappyCLI } from '../utils/spawnHappyCLI'
 import { TmuxUtilities } from '../utils/tmux'
-import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
+import { createHash, createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { SETUP_TOKEN_BINDING_TYPE, createSetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { createAiCredentialRuntime, type AiCredentialCommandResult } from './aiCredentialRuntime'
@@ -824,6 +824,65 @@ describe('managed Claude setup-token runtime', () => {
       await machine.runtime.groupSync(sync(1, payload(managed(A, 1, fakeToken('a')))))
       return machine
     }
+
+    function provenSelection(token = fakeToken('a'), credentialGeneration = 1) {
+      const nonce = randomUUID()
+      const tokenProof = createHmac('sha256', token).update(JSON.stringify([
+        'claude-setup-token-credential-proof-v1', 'company-1', 'user-1', 'machine-1', A, nonce,
+      ])).digest('hex')
+      return { ...selection({ nonce, tokenProof, credentialGeneration }), credentialGeneration, credentialProofVersion: 1 as const }
+    }
+
+    it('uses the same actual token despite a metadata-only generation difference and preserves its proof on resume', async () => {
+      const { runtime } = await assigned()
+      const environment = await runtime.sessionEnvironment('claude', provenSelection(fakeToken('a'), 2))
+      expect(environment.CLAUDE_CODE_OAUTH_TOKEN).toBe(fakeToken('a'))
+      const resume = readSetupTokenResumeSelection(captureSaycodeAgentEnvironment(environment))!
+      expect(resume.binding).toHaveProperty('tokenProof')
+      expect(await runtime.sessionEnvironment('claude', resume.selection, resume.binding)).toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN', fakeToken('a'))
+    })
+    it('recognizes the same token already held by this scope when a new credential set gives it another managed id', async () => {
+      const { runtime } = await assigned()
+      const nonce = randomUUID()
+      const tokenProof = createHmac('sha256', fakeToken('a')).update(JSON.stringify([
+        'claude-setup-token-credential-proof-v1', 'company-1', 'user-1', 'machine-1', B, nonce,
+      ])).digest('hex')
+      const chosen = { ...selection({ managedAccountId: B, tokenProof, nonce }), managedAccountId: B, credentialProofVersion: 1 as const }
+      const environment = await runtime.sessionEnvironment('claude', chosen)
+      expect(environment.CLAUDE_CODE_OAUTH_TOKEN).toBe(fakeToken('a'))
+      const resume = readSetupTokenResumeSelection(captureSaycodeAgentEnvironment(environment))!
+      expect(await runtime.sessionEnvironment('claude', resume.selection, resume.binding)).toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN', fakeToken('a'))
+      await runtime.groupSync(sync(2, payload(managed(B, 1, fakeToken('different')))))
+      await expect(runtime.sessionEnvironment('claude', resume.selection, resume.binding)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
+    })
+
+    it('rejects a different actual token even when its managed id and generation still match the server', async () => {
+      const { runtime, state } = await assigned()
+      state.slots[0]!.credentials = { claudeAiOauth: { accessToken: fakeToken('tampered') } }
+      await expect(runtime.sessionEnvironment('claude', provenSelection())).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
+    })
+
+    it('does not silently accept an old grant when the caller requires token-value verification', async () => {
+      const { runtime } = await assigned()
+      await expect(runtime.sessionEnvironment('claude', { ...selection(), credentialProofVersion: 1 } as never)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
+    })
+    it('rechecks a proven token at actual launch and refuses replacement without starting the process', async () => {
+      const { runtime, state } = await assigned()
+      const environment = await runtime.sessionEnvironment('claude', provenSelection())
+      state.slots[0]!.credentials = { claudeAiOauth: { accessToken: fakeToken('changed-after-prepare') } }
+      const start = vi.fn()
+      await expect(runtime.launchSession(environment, start)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
+      expect(start).not.toHaveBeenCalled()
+    })
+
+    it('does not let proof bypass disabled accounts or revoked group ownership', async () => {
+      const { runtime, state } = await assigned()
+      state.slots[0]!.disabled = true
+      await expect(runtime.sessionEnvironment('claude', provenSelection())).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
+      state.slots[0]!.disabled = false
+      await runtime.groupSync(sync(2, null))
+      await expect(runtime.sessionEnvironment('claude', provenSelection())).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE')
+    })
 
     it('binds a verified grant to only that token, records signed provenance without secrets, and never switches', async () => {
       const personal: Slot = { number: 1, email: 'me@example.com', usageStatus: 'ok', credentials: { claudeAiOauth: { accessToken: 'personal' } } }
