@@ -311,7 +311,7 @@ describe("enableMonitoring access logging", () => {
         await app.inject({ method: "GET", url: "/slow" });
 
         const message = String(warnMock.mock.calls[0]?.[1]);
-        expect(message).toMatch(/loop_lag_max \d+ms/);
+        expect(message).toMatch(/loop_lag_max_during_request \d+ms/);
     });
 
     it("attributes time to send when the handler itself was fast", async () => {
@@ -399,13 +399,54 @@ describe("enableMonitoring phase histograms", () => {
         }
     });
 
-    it("keeps the readiness control route at zero handler time when nothing stalls", async () => {
+    it("includes route-level preHandler (authentication) time in the handler phase", async () => {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        app.get("/guarded", { preHandler: async () => { now += 200; } }, async () => {
+            now += 1000;
+            return { ok: true };
+        });
+        await app.ready();
+
+        await app.inject({ method: "GET", url: "/guarded" });
+
+        expect(await phaseSums("/guarded")).toMatchObject({ prehandler: 0, handler: 1.2 });
+    });
+
+    it("charges a request rejected by validation entirely to prehandler", async () => {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        app.addHook("preValidation", async () => { now += 300; });
+        app.get("/needs-q", {
+            schema: { querystring: { type: "object", required: ["q"], properties: { q: { type: "string" } } } },
+        }, async () => ({ ok: true }));
+        await app.ready();
+
+        const response = await app.inject({ method: "GET", url: "/needs-q" });
+
+        expect(response.statusCode).toBe(400);
+        expect(await phaseSums("/needs-q")).toMatchObject({ prehandler: 0.3, handler: 0 });
+    });
+
+    it("pins unmatched paths to one not_found label instead of the raw path", async () => {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        await app.ready();
+
+        await app.inject({ method: "GET", url: "/scanner/" + Math.random().toString(36).slice(2) });
+
+        const { values } = await httpRequestPhaseDurationHistogram.get();
+        const routes = new Set(values.map((v) => String(v.labels.route)));
+        expect(routes).toEqual(new Set(["not_found"]));
+    });
+
+    it("records the readiness control route under its own template label with all four phases", async () => {
         const app = fastify({ disableRequestLogging: true });
         enableMonitoring(app as never);
         await app.ready();
 
         await app.inject({ method: "GET", url: "/ready" });
 
-        expect((await phaseSums("/ready")).handler).toBe(0);
+        expect(Object.keys(await phaseSums("/ready")).sort()).toEqual(["handler", "prehandler", "send", "serialize"]);
     });
 });
