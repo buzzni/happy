@@ -3,6 +3,7 @@ import { Readable } from "node:stream";
 import fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enableMonitoring } from "./enableMonitoring";
+import { httpRequestPhaseDurationHistogram } from "@/app/monitoring/metrics2";
 
 const { dbMock, logMock, warnMock, errorMock, debugMock } = vi.hoisted(() => ({
     dbMock: {
@@ -282,6 +283,37 @@ describe("enableMonitoring access logging", () => {
         expect(message).toContain("send 400ms");
     });
 
+    // specs/platform-architecture-roadmap S4-1 — 핸들러 앞 구간(바디 파싱·검증·전역 훅)을
+    // 따로 센다. 2026-09-20 prod 계측에서 "handler 2.3초" 가 /ready 에도 찍혔는데, 그
+    // 구간은 onRequest~preSerialization 전체라 파싱·검증·루프 정지가 한 덩어리였다.
+    it("attributes parsing and validation time to a prehandler phase", async () => {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        // preValidation 은 onRequest 와 (전역) preHandler 사이 — 바디 파싱 뒤, 핸들러 앞.
+        app.addHook("preValidation", async () => { now += 300; });
+        app.get("/phases", async () => {
+            now += 1500;
+            return { ok: true };
+        });
+        await app.ready();
+
+        await app.inject({ method: "GET", url: "/phases" });
+
+        const message = String(warnMock.mock.calls[0]?.[1]);
+        expect(message).toContain("1800ms");
+        expect(message).toContain("prehandler 300ms");
+        expect(message).toContain("handler 1500ms");
+    });
+
+    it("tags a slow request line with the event loop lag seen since the last scrape", async () => {
+        const app = await buildApp();
+
+        await app.inject({ method: "GET", url: "/slow" });
+
+        const message = String(warnMock.mock.calls[0]?.[1]);
+        expect(message).toMatch(/loop_lag_max \d+ms/);
+    });
+
     it("attributes time to send when the handler itself was fast", async () => {
         const app = fastify({ disableRequestLogging: true });
         enableMonitoring(app as never);
@@ -309,5 +341,71 @@ describe("enableMonitoring access logging", () => {
         const message = String(warnMock.mock.calls[0]?.[1]);
         expect(message).toContain("/slow");
         expect(message).toContain("2000ms");
+    });
+});
+
+describe("enableMonitoring phase histograms", () => {
+    // 느린 요청 로그(>1초)만으로는 대조군(/ready)의 구간 분포를 시계열로 볼 수 없다.
+    // 구간별 히스토그램이 있어야 "/ready 의 handler 구간이 커지는 순간 = 프로세스가
+    // 멈춘 순간" 을 event_loop_lag·CPU 스로틀 지표와 같은 시간축에 놓을 수 있다.
+    let now = 1_700_000_000_000;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        now = 1_700_000_000_000;
+        vi.spyOn(Date, "now").mockImplementation(() => now);
+        httpRequestPhaseDurationHistogram.reset();
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    async function phaseSums(route: string) {
+        const { values } = await httpRequestPhaseDurationHistogram.get();
+        const sums: Record<string, number> = {};
+        for (const v of values) {
+            if (v.metricName?.endsWith("_sum") && v.labels.route === route) {
+                sums[String(v.labels.phase)] = v.value;
+            }
+        }
+        return sums;
+    }
+
+    it("records each phase under the route template, without method/status/client labels", async () => {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        app.addHook("preValidation", async () => { now += 300; });
+        app.addHook("onSend", async (_request, _reply, payload) => { now += 400; return payload; });
+        app.get("/items/:id", async () => {
+            now += 1500;
+            return { ok: true };
+        });
+        await app.ready();
+
+        await app.inject({ method: "GET", url: "/items/42" });
+
+        expect(await phaseSums("/items/:id")).toEqual({
+            prehandler: 0.3,
+            handler: 1.5,
+            serialize: 0,
+            send: 0.4,
+        });
+        const { values } = await httpRequestPhaseDurationHistogram.get();
+        expect(values.length).toBeGreaterThan(0);
+        for (const v of values) {
+            expect(Object.keys(v.labels).every((k) => ["le", "phase", "route"].includes(k))).toBe(true);
+            expect(v.labels).toMatchObject({ route: "/items/:id" });
+        }
+    });
+
+    it("keeps the readiness control route at zero handler time when nothing stalls", async () => {
+        const app = fastify({ disableRequestLogging: true });
+        enableMonitoring(app as never);
+        await app.ready();
+
+        await app.inject({ method: "GET", url: "/ready" });
+
+        expect((await phaseSums("/ready")).handler).toBe(0);
     });
 });

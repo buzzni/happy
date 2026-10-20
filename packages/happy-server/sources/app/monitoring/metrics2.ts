@@ -146,6 +146,31 @@ export const httpRequestDurationHistogram = new Histogram({
     registers: [register]
 });
 
+/**
+ * 요청 한 건을 네 구간으로 나눠 센다 (specs/platform-architecture-roadmap S4-1).
+ *
+ * - prehandler: onRequest ~ 전역 preHandler — 바디 파싱·검증·전역 훅
+ * - handler: 전역 preHandler ~ preSerialization — 라우트 preHandler(인증) + 핸들러
+ * - serialize / send: enableMonitoring 의 기존 정의와 같다
+ *
+ * 라벨은 route·phase 만 둔다. method·status·client 까지 곱하면 시리즈가 네 배로
+ * 불어나는데, 이 지표의 용도는 대조군(/ready, DB·인증 없음)의 handler 구간을
+ * event_loop_lag·CPU 스로틀과 같은 시간축에 놓는 것이라 그 분해가 필요 없다.
+ */
+export const httpRequestPhaseDurationHistogram = new Histogram({
+    name: 'http_request_phase_duration_seconds',
+    help: 'HTTP request time per phase (prehandler, handler, serialize, send) in seconds',
+    labelNames: ['route', 'phase'] as const,
+    buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10],
+    registers: [register]
+});
+
+/** 마지막 스크레이프 이후 관측된 최대 이벤트 루프 지연(ms). 느린 요청 로그의 맥락용. */
+export function eventLoopLagMaxMsSinceScrape(): number {
+    const maxNanoseconds = eventLoopDelay.max;
+    return Number.isFinite(maxNanoseconds) ? Math.round(maxNanoseconds / 1e6) : 0;
+}
+
 // Database count metrics
 export const databaseRecordCountGauge = new Gauge({
     name: 'database_records_total',
