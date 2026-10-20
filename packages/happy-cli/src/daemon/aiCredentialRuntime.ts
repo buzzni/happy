@@ -2191,10 +2191,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         ...(claims.tokenProof ? { tokenProof: claims.tokenProof } : {}) }
       consume = { nonce, expiresAt: claims.expiresAt }
     }
+    // A recorded resume must not carry a former PC's authority into a newly registered daemon.
+    if (binding.machineId !== deps.machineId || binding.companyId !== groupScope) throw unavailable()
     const proven = !isMachineSetupTokenBinding(binding) && binding.tokenProof ? binding : null
     let tokenIdentities = new Set<string>()
-    // The signed caller must own the slot through this scope's applied assignment.
-    // Personal, other-company, other-user, pending and revoked slots fail.
+    // A current-PC proof owns the token through this user's desired assignment, irrespective of historical apply PC.
+    // Personal, other-company, other-user and revoked slots fail; legacy bindings also require a reconciled apply.
     if (isMachineSetupTokenBinding(binding)) {
       if (!deps.machineSetupTokenAuthority) throw unavailable()
       await deps.machineSetupTokenAuthority(binding)
@@ -2205,7 +2207,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         || !receipt.appliedCredentials.some(row => row.managedAccountId === managedAccountId && row.credentialGeneration === credentialGeneration)
         || !await groups.authorizeMachine(groupScope, binding.machineId, setupTokenGroupIdentity(managedAccountId))) throw unavailable()
     } else {
-      const assignment = await groups.assignment(groupScope, 'claude')
+      const assignment = await groups.assignment(groupScope, 'claude', proven ? binding.userId : undefined)
       if (!assignment || assignment.userId !== binding.userId
         || (!proven && (!assignment.reconciled || !assignment.desired.includes(setupTokenGroupIdentity(managedAccountId))))) throw unavailable()
       tokenIdentities = new Set(assignment.desired)

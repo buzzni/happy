@@ -94,7 +94,7 @@ const receipt=(entry:Entry)=>({version:1 as const,scope:entry.scope, ...(princip
 export function createCredentialGroupSync(deps:CredentialGroupDeps) {
   /**
    * The journal is shared by every daemon on one OS home, like the account manager's pool it records:
-   * removal and ownership stay journal-wide. Launch and custody decisions read only entries this PC
+   * removal and ownership stay journal-wide. Legacy launch and custody decisions read only entries this PC
    * applied; an entry written before PCs were recorded may be this PC's own and still counts.
    */
   const appliedHere=(entry:Pick<Entry,'appliedMachineId'>)=>!deps.appliedMachineId||!entry.appliedMachineId||entry.appliedMachineId===deps.appliedMachineId
@@ -198,8 +198,8 @@ export function createCredentialGroupSync(deps:CredentialGroupDeps) {
     }
     if(changed)await deps.write(JSON.stringify(journal))
   }
-  /** Who a scope's applied assignment belongs to and what it installed: the local ownership proof. */
-  async function assignment(scope:string,provider:GroupProvider){const entry=parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&principalType(e)==='user'&&appliedHere(e));return entry?{userId:entry.userId,desired:[...entry.desired],reconciled:!entry.pending}:null}
+  /** A verified current-PC token proof may read its owner's desired slots across re-registration; custody stays PC-local. */
+  async function assignment(scope:string,provider:GroupProvider,tokenProofUserId?:string){const entry=parse(await deps.read()).entries.find(e=>e.scope===scope&&e.provider===provider&&principalType(e)==='user'&&(tokenProofUserId?e.userId===tokenProofUserId:appliedHere(e)));return entry?{userId:entry.userId,desired:[...entry.desired],reconciled:!entry.pending}:null}
   /** Some current assignment (applied or in flight) desires an org-managed setup-token. Revoked entries desire nothing. */
   /** Entries written before the `managed` projection existed: unknown, never assumed unmanaged. */
   async function unprojected(provider:GroupProvider){return parse(await deps.read()).entries.filter(e=>e.provider===provider&&e.managed===undefined&&appliedHere(e)).map(e=>({scope:e.scope,desired:[...e.desired]}))}
