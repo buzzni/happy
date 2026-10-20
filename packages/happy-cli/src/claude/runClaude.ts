@@ -62,7 +62,7 @@ import {
     readExpectedConnectors,
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
-import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
+import { refreshMcpCallerGrantIfExpiring, startMcpCallerGrantRefreshTimer } from '@/aplus/refreshMcpCallerGrant';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
@@ -1937,6 +1937,16 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         } : {}),
     };
 
+    // 턴을 기다리지 않고 grant 를 미리 교환한다. 턴 경계에서만 교환하면 만료 전
+    // 2시간 동안 쉬던 세션은 grant 가 만료돼 대화를 다시 열 때까지 커넥터를
+    // 되찾지 못한다(서버는 만료된 grant 를 교환해주지 않는다).
+    const grantMachineId = machineId;
+    const stopCallerGrantRefresh = accountToken === null || !grantMachineId
+        ? () => {}
+        : startMcpCallerGrantRefreshTimer(() => refreshMcpCallerGrantIfExpiring(accountToken, grantMachineId, {
+            sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined,
+        }));
+
     // Create claude loop
     /*
      * The lesson host for this session, built once.
@@ -2073,6 +2083,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
     } finally {
+        stopCallerGrantRefresh();
         await scopeProcessSandbox?.close();
         process.removeListener('SIGTERM', closeLessonsOnSignal);
         process.removeListener('SIGINT', closeLessonsOnSignal);

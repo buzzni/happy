@@ -15,6 +15,12 @@ import { logger } from '@/ui/logger'
 const TIMEOUT_MS = 3000
 /** 이 시간 안에 만료될 grant 는 미리 교환한다. 턴 경계마다 확인하므로 넉넉히 둔다. */
 export const REFRESH_THRESHOLD_MS = 2 * 60 * 60 * 1000
+/**
+ * 턴이 없는 세션의 확인 주기. 턴 경계만 기다리면 창(2시간) 동안 쉬던 세션의
+ * grant 가 만료되고, 서버는 만료된 grant 를 되살려주지 않는다. 확인 자체는
+ * 로컬 파싱이라 창 밖에서는 네트워크를 쓰지 않는다.
+ */
+export const REFRESH_CHECK_INTERVAL_MS = 15 * 60 * 1000
 
 function readGrantExpiry(grant: string): number | null {
     const encoded = grant.split('.')[0]
@@ -111,4 +117,26 @@ export async function refreshMcpCallerGrantIfExpiring(
     } finally {
         clearTimeout(timer)
     }
+}
+
+/**
+ * 턴과 무관하게 주기적으로 `refresh` 를 부른다. 실패는 다음 주기에 다시
+ * 시도하고, 느린 교환이 끝나기 전에는 겹쳐 부르지 않는다.
+ *
+ * @returns 타이머를 멈추는 함수.
+ */
+export function startMcpCallerGrantRefreshTimer(
+    refresh: () => Promise<unknown>,
+    intervalMs = REFRESH_CHECK_INTERVAL_MS,
+): () => void {
+    let running = false
+    const timer = setInterval(() => {
+        if (running) return
+        running = true
+        void refresh()
+            .catch(() => logger.debug('[aplus] caller grant 주기 교환 실패 — 다음 주기에 재시도'))
+            .finally(() => { running = false })
+    }, intervalMs)
+    timer.unref?.()
+    return () => clearInterval(timer)
 }

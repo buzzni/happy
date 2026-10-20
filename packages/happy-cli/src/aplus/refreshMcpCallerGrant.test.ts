@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { grantExpiresWithin, refreshMcpCallerGrantIfExpiring } from './refreshMcpCallerGrant';
+import {
+    grantExpiresWithin,
+    refreshMcpCallerGrantIfExpiring,
+    REFRESH_CHECK_INTERVAL_MS,
+    REFRESH_THRESHOLD_MS,
+    startMcpCallerGrantRefreshTimer,
+} from './refreshMcpCallerGrant';
 
 function grantWithExp(exp: number, extra: Record<string, unknown> = {}): string {
     const payload = Buffer.from(JSON.stringify({ exp, ...extra })).toString('base64url');
@@ -120,5 +126,49 @@ describe('refreshMcpCallerGrantIfExpiring', () => {
         await expect(refreshMcpCallerGrantIfExpiring('happy-token', 'machine-1', { now: 99_000 }))
             .resolves.toBe(false);
         expect(fetchMock).not.toHaveBeenCalled();
+    });
+});
+
+describe('startMcpCallerGrantRefreshTimer', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('checks often enough to land several attempts inside the renewal window', () => {
+        // 턴이 없는 세션은 이 타이머가 유일한 갱신 기회다. 창 안에서 한 번 실패해도
+        // 다음 시도가 남아 있어야 한다.
+        expect(REFRESH_THRESHOLD_MS / REFRESH_CHECK_INTERVAL_MS).toBeGreaterThanOrEqual(4);
+    });
+
+    it('renews an idle session without waiting for a turn', async () => {
+        vi.useFakeTimers();
+        const refresh = vi.fn(async () => false);
+        const stop = startMcpCallerGrantRefreshTimer(refresh);
+
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS * 3);
+        expect(refresh).toHaveBeenCalledTimes(3);
+
+        stop();
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS * 3);
+        expect(refresh).toHaveBeenCalledTimes(3);
+    });
+
+    it('keeps ticking after a failed attempt and never overlaps a slow one', async () => {
+        vi.useFakeTimers();
+        let release!: () => void;
+        const refresh = vi.fn()
+            .mockImplementationOnce(async () => { throw new Error('offline'); })
+            .mockImplementationOnce(() => new Promise<boolean>((resolve) => { release = () => resolve(true); }))
+            .mockImplementation(async () => false);
+        const stop = startMcpCallerGrantRefreshTimer(refresh);
+
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS * 3);
+        // 1회차 실패 뒤에도 2회차가 돌고, 2회차가 끝나지 않은 동안 3회차는 건너뛴다.
+        expect(refresh).toHaveBeenCalledTimes(2);
+
+        release();
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS);
+        expect(refresh).toHaveBeenCalledTimes(3);
+        stop();
     });
 });
