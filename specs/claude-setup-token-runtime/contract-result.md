@@ -1,5 +1,24 @@
 # Claude setup-token runtime — Happy contract result (v1)
 
+## 2026-10-20: optional token-value proof
+
+The source adds `setupTokenCredentialProofVersion:1` beside the existing binding capability. A caller opts in with
+`credentialProofVersion:1`. Studio returns the same marker and signs one additional `tokenProof` claim. The old
+13-claim format remains unchanged for old callers. A proof-required selection refuses a grant without the proof.
+The proof is `HMAC-SHA256(token, JSON(["claude-setup-token-credential-proof-v1", companyId, userId, machineId, managedAccountId, nonce]))`.
+It changes on every nonce and exposes neither the token nor a stable token fingerprint.
+
+After signature and scope verification the daemon compares the proof against the actual tokens in the owner's
+currently desired managed slots. The signed account id can differ from the local slot id after a set copy; another
+scope, personal slot, disabled selected account, or revoked desired token cannot supply the credential. Generation
+and whole-group reconciled state do not substitute for token equality on this path. Legacy grants retain their
+generation and journal checks. Actual mismatch is `CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH` before nonce consumption
+or process creation. The final launch rechecks the token, authority and original grant expiry.
+
+User session records retain `tokenProof` for resume; a managed account switch requests and requires another proof.
+Machine-principal v2 signed assignment/rotation contracts remain unchanged. This is source validation, not a new
+CLI publication or installed-Desktop acceptance. See `../setup-token-auth-consistency/context.md` for results.
+
 Sources: Desktop `specs/claude-setup-token-usage-rotation/contract.md`, Studio server
 `specs/claude-setup-token-implementation/contract-result.md`, and cswap provider `specs/token-runtime-contract.md`
 (marker `saycode-setup-token-runtime-v1`). Base `origin/main` 33c688bb9 (.284).

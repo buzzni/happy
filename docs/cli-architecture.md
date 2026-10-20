@@ -705,9 +705,14 @@ The optional `ai-credential:group-sync` customer-lane RPC leaves the existing ap
 Managed setup-token launches retain an internal one-use launch handle after the signed
 nonce is consumed. Immediately before plain child creation, tmux `new-window`, or
 Windows suspended-root resume, the credential runtime rechecks assignment, disabled
-state, exact generation/token and fresh-grant expiry on the same serialized queue as
+state, the actual token (or generation for legacy bindings) and fresh-grant expiry on the same serialized queue as
 group sync. Preparation and webhook waits stay outside that critical section. Recorded
-resumes have no new grant expiry but still recheck custody. Default Claude environments are also recognized by
+resumes have no new grant expiry but still recheck current machine ID/company and desired ownership.
+The final user token-proof policy is current PC authorization plus actual token equality, independently
+of the historical journal applying PC ID. Only a signed current-PC user proof can read its own
+scope/user desired slots across re-registration; legacy launch, collector custody, cleanup and
+shared-machine v2 retain their existing checks. A former PC's grant or recorded binding cannot
+be reused on the new PC. [Final process](https://github.com/buzzni/aplus-dev-studio-desktop/blob/main/docs/processes/setup-token-execution.md). Default Claude environments are also recognized by
 object identity and recheck managed-assignment refusal under that queue immediately
 before submission; explicit machine-personal, non-Claude and prepared ZAI environments
 retain their bypass. A bound child restarting the daemon loses both its binding marker

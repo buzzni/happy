@@ -284,6 +284,7 @@ export type UserSetupTokenBinding = {
     principalType?: 'user'
     managedAccountId: string; credentialGeneration: number; groupScope: string; companyId: string
     userId: string; machineId: string; keyId: string; nonce: string; issuedAt: number
+    tokenProof?: string
 }
 
 const executionSchema = z.object({ sessionId: z.string().min(1).max(128), initialNonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
@@ -294,7 +295,7 @@ export const isMachineSetupTokenBinding = (binding: SetupTokenBinding): binding 
 
 export function formatSetupTokenBinding(binding: SetupTokenBinding): string {
     if (isMachineSetupTokenBinding(binding)) return JSON.stringify(binding)
-    return JSON.stringify(Object.fromEntries(BINDING_KEYS.map((key) => [key, key === 'version' ? 1 : binding[key]])))
+    return JSON.stringify({ ...Object.fromEntries(BINDING_KEYS.map((key) => [key, key === 'version' ? 1 : binding[key]])), ...(binding.tokenProof ? { tokenProof: binding.tokenProof } : {}) })
 }
 
 function parseSetupTokenBinding(value: string): SetupTokenBinding | null {
@@ -305,7 +306,9 @@ function parseSetupTokenBinding(value: string): SetupTokenBinding | null {
             const { execution, ...body } = parsed
             return { ...MachineSetupTokenBindingV2Schema.parse(body), execution: executionSchema.parse(execution) }
         }
-        if (parsed?.version !== 1 || Object.keys(parsed).length !== BINDING_KEYS.length
+        if (parsed?.version !== 1 || BINDING_KEYS.some(key => !(key in parsed))
+            || Object.keys(parsed).some(key => !(BINDING_KEYS as readonly string[]).includes(key) && key !== 'tokenProof')
+            || ('tokenProof' in parsed && (typeof parsed.tokenProof !== 'string' || !/^[a-f0-9]{64}$/.test(parsed.tokenProof)))
             || typeof parsed.managedAccountId !== 'string' || !MANAGED_ACCOUNT_ID.test(parsed.managedAccountId)
             || typeof parsed.nonce !== 'string' || !MANAGED_ACCOUNT_ID.test(parsed.nonce)
             || ![parsed.groupScope, parsed.companyId, parsed.userId, parsed.machineId].every((id) => typeof id === 'string' && GROUP_SCOPE.test(id))
@@ -328,7 +331,8 @@ export function readSetupTokenResumeSelection(agentEnvironment: SaycodeAgentEnvi
     const binding = parseSetupTokenBinding(raw)
     if (!binding) throw new Error('Recorded setup-token binding is invalid; the session is not resumed with another credential')
     const { managedAccountId, credentialGeneration, groupScope } = binding
-    return { selection: { kind: 'claude-setup-token', managedAccountId, groupScope, credentialGeneration }, binding }
+    return { selection: { kind: 'claude-setup-token', managedAccountId, groupScope, credentialGeneration,
+        ...(!isMachineSetupTokenBinding(binding) && binding.tokenProof ? { credentialProofVersion: 1 as const } : {}) }, binding }
 }
 
 function isValidAdditionalDirectories(value: string): boolean {
@@ -453,7 +457,7 @@ export type AiAuthSelectionKind = (typeof AI_AUTH_SELECTION_KINDS)[number]
 export type AiAuthSelection =
     | { kind: 'machine-personal' | 'org-bundle' }
     /** `bindingGrant` is required on a new spawn; a resume rebuilds the selection from the recorded binding. */
-    | { kind: 'claude-setup-token'; managedAccountId: string; groupScope: string; credentialGeneration: number; bindingGrant?: string }
+    | { kind: 'claude-setup-token'; managedAccountId: string; groupScope: string; credentialGeneration: number; bindingGrant?: string; credentialProofVersion?: 1 }
 
 /**
  * Advertised in `MachineMetadataSchema` so a client can tell this daemon
@@ -496,7 +500,10 @@ export function parseAiAuthSelection(value: unknown): AiAuthSelection | undefine
         if (typeof bindingGrant !== 'string' || bindingGrant.length > 4096 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(bindingGrant)) {
             throw new Error('AI auth selection claude-setup-token requires a bindingGrant')
         }
-        return { kind, managedAccountId, groupScope, credentialGeneration: Number(credentialGeneration), bindingGrant }
+        const credentialProofVersion = (value as { credentialProofVersion?: unknown }).credentialProofVersion
+        if (credentialProofVersion !== undefined && credentialProofVersion !== 1) throw new Error('Unsupported setup-token credential proof version')
+        return { kind, managedAccountId, groupScope, credentialGeneration: Number(credentialGeneration), bindingGrant,
+            ...(credentialProofVersion === 1 ? { credentialProofVersion } : {}) }
     }
     return { kind: kind as 'machine-personal' | 'org-bundle' }
 }
