@@ -14,7 +14,9 @@
 
 ## 구현 결과
 
-- 관련 `aiCredentialSetupToken` 110개, `setupTokenBindingProof` 26개, `setupTokenAccountSwitch` 24개, `sessionEnv` 89개: 총 249개 통과. 새 관리 ID/같은 토큰, 준비 이후 변조, disabled/회수, 재개·교체의 proof 보존/강등 거부를 포함한다.
+- 관련 `aiCredentialSetupToken` 112개, `setupTokenBindingProof` 26개, `setupTokenAccountSwitch` 24개, `sessionEnv` 89개: 총 251개 통과. 새 관리 ID/같은 토큰, 준비 이후 변조, disabled/회수, 재개·교체의 proof 보존/강등 거부를 포함한다.
 - 실제 CLI 빌드(global setup의 typecheck·pkgroll 포함)와 개발 CLI `--version` 통과. Studio signer/이 verifier의 합성 credential 교차 검사 12개 통과.
 - root 의존성 링크에서 오래된 happy-wire build를 읽던 문제는 이 worktree의 wire를 빌드해 링크해 해결했다. 공유 의존성/원본 소스는 변경하지 않았다.
 - lint 명령/설정이 없는 저장소여서 독립 lint 통과를 주장하지 않는다. `git diff --check` 통과. 다음은 main 대상 PR의 실제 CI·리뷰·mergeability 확인이다.
+
+- 메타데이터 pending 상태의 같은 현재 토큰은 허용하고, 실행 중 세션 때문에 로컬에 보존된 회수 토큰은 desired 후보에서 배제하는 경계도 통과했다. PR: https://github.com/buzzni/happy/pull/888 (main 대상, CI 확인 중).

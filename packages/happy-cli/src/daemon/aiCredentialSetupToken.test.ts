@@ -856,6 +856,22 @@ describe('managed Claude setup-token runtime', () => {
       await expect(runtime.sessionEnvironment('claude', resume.selection, resume.binding)).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
     })
 
+    it('accepts the current token while metadata reconciliation remains pending', async () => {
+      const { runtime, files } = await assigned()
+      const path = join('/home', 'operator', '.happy', 'ai-credential-groups.json')
+      const journal = JSON.parse(files.get(path)!)
+      journal.entries[0].pending = true
+      files.set(path, JSON.stringify(journal))
+      expect(await runtime.sessionEnvironment('claude', provenSelection())).toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN', fakeToken('a'))
+    })
+
+    it('excludes a revoked token retained by an active session from the current desired candidates', async () => {
+      const { runtime, state } = await assigned({ inUse: () => [A] })
+      await runtime.groupSync(sync(2, payload(managed(B, 1, fakeToken('b')))))
+      expect(state.slots.some(slot => slot.managedAccountId === A)).toBe(true)
+      await expect(runtime.sessionEnvironment('claude', provenSelection())).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
+    })
+
     it('rejects a different actual token even when its managed id and generation still match the server', async () => {
       const { runtime, state } = await assigned()
       state.slots[0]!.credentials = { claudeAiOauth: { accessToken: fakeToken('tampered') } }
