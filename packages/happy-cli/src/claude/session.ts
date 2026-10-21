@@ -89,6 +89,9 @@ export class Session {
      * Saycode approval card and hands `ask` to Claude's own terminal prompt instead.
      */
     policyApprover: PolicyApprover | null = null;
+
+    /** Tool policy R9: the MCP tool names of Claude's init message, for the coverage audit. */
+    policyToolsSeen: ((tools: string[]) => void) | null = null;
     
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];

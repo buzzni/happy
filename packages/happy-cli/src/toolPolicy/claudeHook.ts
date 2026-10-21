@@ -10,7 +10,12 @@
  */
 
 import { join } from 'node:path';
+import { parseMcpToolName } from './evaluate';
+import type { ToolPolicyGate } from './policyGate';
 import { BUILTIN_TABLES, type ToolPolicyTables } from './rules';
+
+/** Hook-decided calls the proxy may still be waiting for; a declined prompt never reaches it. */
+const MAX_HOOK_DECIDED_CALLS = 256;
 
 /** Above the 30-minute approval wait (R11.5), so Claude never times the hook out first. */
 export const POLICY_HOOK_TIMEOUT_SECONDS = 1900;
@@ -22,8 +27,14 @@ export function isToolPolicyEnabled(env: NodeJS.ProcessEnv): boolean {
 }
 
 /** Machine metadata `toolPolicy`; absent when the policy is switched off. */
+/**
+ * Machine metadata `toolPolicy`; absent when the policy is switched off. `enforcement` names the
+ * adapters this runtime has: every Claude `mcp__*` call (hook), cua-driver for both providers
+ * (shadow proxy) and Saycode-injected servers under Codex (stdio bridge). A user's own non-cua MCP
+ * server under Codex has no adapter (Q5) — hence no `codex-user-mcp`.
+ */
 export function toolPolicyMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforcement: string[] } | undefined {
-    return isToolPolicyEnabled(env) ? { version: 1, enforcement: ['claude-hook'] } : undefined;
+    return isToolPolicyEnabled(env) ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge'] } : undefined;
 }
 
 export function toolPolicyFilePath(happyHomeDir: string): string {
@@ -64,4 +75,35 @@ export function buildToolPolicyHookEntries(input: { forwarderCommand: string; fi
             hooks: [{ type: 'command', command: input.fileGuardCommand }],
         },
     ];
+}
+
+/**
+ * While cua-driver runs behind the shadow proxy, each of its calls is decided exactly once:
+ * - remote (SDK) mode: the proxy decides — only it saw which app an `element_token` names — and
+ *   the hook steps aside;
+ * - local (terminal) mode: the hook decides, because only it can hand `ask` to Claude's own prompt,
+ *   and the proxy then lets through exactly the call (by tool_use_id) the hook let through.
+ * A proxy call the hook did not let through is decided by the proxy, so a mode switch between the
+ * two never skips a decision.
+ */
+export function handOffCuaToShadowProxy(gate: ToolPolicyGate, options: { terminalPrompt: () => boolean; tables?: ToolPolicyTables }): ToolPolicyGate {
+    const tables = options.tables ?? BUILTIN_TABLES;
+    const decidedByHook = new Set<string>();
+    return {
+        toolsListed: gate.toolsListed,
+        decide: async (call, signal) => {
+            if (parseMcpToolName(call.toolName)?.server !== tables.cuaDriver.server) return gate.decide(call, signal);
+            if (call.origin === undefined) {
+                if (!options.terminalPrompt() || !call.toolUseId) return { kind: 'pass' };
+                const verdict = await gate.decide(call, signal);
+                if (verdict.kind !== 'deny') {
+                    decidedByHook.add(call.toolUseId);
+                    if (decidedByHook.size > MAX_HOOK_DECIDED_CALLS) decidedByHook.delete(decidedByHook.values().next().value as string);
+                }
+                return verdict;
+            }
+            if (call.origin === 'cua-proxy' && call.toolUseId && decidedByHook.delete(call.toolUseId)) return { kind: 'pass' };
+            return gate.decide(call, signal);
+        },
+    };
 }

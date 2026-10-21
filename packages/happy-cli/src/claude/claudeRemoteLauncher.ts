@@ -1092,6 +1092,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onSDKMetadata: (metadata) => {
                         logger.debug('[remote] SDK metadata received, updating session:', metadata);
+                        session.policyToolsSeen?.(metadata.tools ?? []);
                         session.client.updateMetadata((currentMetadata) => ({
                             ...currentMetadata,
                             tools: metadata.tools,

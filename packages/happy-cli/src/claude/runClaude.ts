@@ -25,8 +25,11 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
-import { isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { handOffCuaToShadowProxy, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { CUA_DRIVER_SERVER, claudeCuaShadowEntry, readClaudeCuaUpstream } from '@/toolPolicy/cuaShadow';
+import { toolPolicyAdapterEnv } from '@/toolPolicy/policyClient';
 import { createToolPolicyRuntime } from '@/toolPolicy/runtime';
+import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from '@/orchestrator/skillGovernance';
 import { REMOTE_GRANT_TTL_MS } from '@/toolPolicy/grants';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
@@ -65,6 +68,8 @@ import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { getProjectPath } from './utils/path';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { projectPath } from '@/projectPath';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
@@ -772,10 +777,23 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             grantTtlMs: REMOTE_GRANT_TTL_MS,
         })
         : null;
+    // I1b: the user's own cua-driver runs behind the shadow proxy, which then decides its calls. Only
+    // where Claude would load the user's MCP servers at all: a managed run, a scoped or mandatory
+    // process sandbox loads none (settingSources [] — measured 2026-10-22), and must not gain one.
+    const cuaUpstream = toolPolicy && managedStartup === null && !scopeLaunch && sandboxPolicyMode !== 'mandatory'
+        ? readClaudeCuaUpstream({
+            configDir: process.env.CLAUDE_CONFIG_DIR || homedir(),
+            cwd: workingDirectory,
+            settingSources: buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env)).settingSources,
+        })
+        : null;
+    const toolPolicyGate = toolPolicy && cuaUpstream
+        ? handOffCuaToShadowProxy(toolPolicy.gate, { terminalPrompt: () => currentSession?.mode === 'local' })
+        : toolPolicy?.gate;
 
     // Start Hook server for receiving Claude session notifications
     const hookServer = await startHookServer({
-        ...(toolPolicy ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicy.gate.decide } } : {}),
+        ...(toolPolicy && toolPolicyGate ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicyGate.decide, toolsListed: toolPolicyGate.toolsListed } } : {}),
         onSessionHook: (sessionId, data) => {
             logger.debug(`[START] Session hook received: ${sessionId}`, data);
 
@@ -1897,6 +1915,14 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const aplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
     const baseMcpServers = {
         'happy': happyServer.mcpConfig,
+        ...(toolPolicy && cuaUpstream ? {
+            [CUA_DRIVER_SERVER]: claudeCuaShadowEntry({
+                execPath: process.execPath,
+                bridgeEntrypoint: join(projectPath(), 'bin', 'happy-mcp.mjs'),
+                upstream: cuaUpstream,
+                policyEnv: toolPolicyAdapterEnv({ port: hookServer.port, secretFile: toolPolicy.secretFile, server: CUA_DRIVER_SERVER }),
+            }),
+        } : {}),
     };
 
     // Create claude loop
@@ -1976,6 +2002,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onSessionReady: (sessionInstance) => {
             // Store reference for hook server callback
             currentSession = sessionInstance;
+            // R9: Claude's init message names every MCP tool it loaded (no annotations).
+            sessionInstance.policyToolsSeen = toolPolicyGate ? (tools) => toolPolicyGate.toolsListed(tools.map((name) => ({ name }))) : null;
             sessionInstance.prepareChannelExecution = (requestId) => channelAcceptance.prepareExecution(requestId);
             sessionInstance.beginChannelExecution = (requestId) => channelAcceptance.beginExecution(requestId);
         },
