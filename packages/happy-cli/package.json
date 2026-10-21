@@ -82,6 +82,7 @@
     "dist",
     "bin",
     "scripts",
+    "src/toolPolicy/tables.v1.json",
     "scripts/build-windows-session-launcher.cjs",
     "native/windowsSessionLauncher.cs",
     "browser-extension",
