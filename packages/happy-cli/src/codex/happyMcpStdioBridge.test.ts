@@ -86,6 +86,27 @@ function isRunning(child: ChildProcessWithoutNullStreams) {
 }
 
 describe('Happy MCP bridge process lifetime', { timeout: 15_000 }, () => {
+  it('fails loudly when the session socket is set without its token', async () => {
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/codex/happyMcpStdioBridge.ts'), '--url', 'http://localhost/'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, SAYCODE_MCP_SOCKET: '/nonexistent/mcp.sock', SAYCODE_MCP_TOKEN: '' },
+    });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = once(child, 'exit');
+    cleanups.push(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; });
+    const [code] = await exited;
+    expect(code).toBe(2);
+    expect(stderr).toContain('SAYCODE_MCP_TOKEN');
+  });
+
+  it('fails loudly when the session socket env is missing instead of dialing localhost:80', async () => {
+    const b = bridge('http://localhost/');
+    await expect.poll(() => isRunning(b.child), { timeout: 10_000 }).toBe(false);
+    expect(b.child.exitCode).toBe(2);
+    expect(b.stderr()).toContain('SAYCODE_MCP_SOCKET');
+  });
+
   it('shares one upstream initialization across concurrent first tool requests', async () => {
     const http = await upstream({ deferInitialize: true });
     const b = bridge(http.url);

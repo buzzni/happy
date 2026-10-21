@@ -518,6 +518,9 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
     return { runtime: new RuntimeClient({ baseUrl, token }), profileId };
 }
 
+/** Env var Claude expands in the TCP MCP header; the name avoids the credential filter's `_TOKEN` suffix. */
+const MCP_BEARER_ENV = 'SAYCODE_MCP_BEARER';
+
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
@@ -571,26 +574,36 @@ export async function startHappyServer(
             const root = lstatSync('/run/abp-mcp');
             if (!root.isDirectory() || root.uid !== process.getuid?.() || root.gid !== mcpGroup || (root.mode & 0o777) !== 0o710) throw new Error('Mandatory MCP directory permissions invalid');
         }
-        privateDir = options.mandatorySandbox ? mkdtempSync(join(linuxMandatory ? '/run/abp-mcp' : tmpdir(), 'happy-mcp-')) : undefined;
+        // A 127.0.0.1 port is reachable by every local user, and the bash/browser tools behind it run as
+        // this user, so POSIX sessions use an owner-only socket. Windows, and the same-UID Linux scope
+        // (which denies AF_UNIX), keep TCP behind the bearer below.
+        const useSocket = process.platform !== 'win32' && !(process.platform === 'linux' && options.sameUidSandbox);
+        privateDir = useSocket ? mkdtempSync(join(linuxMandatory ? '/run/abp-mcp' : tmpdir(), 'happy-mcp-')) : undefined;
         if (privateDir && mcpGroup !== undefined) {
             chownSync(privateDir, process.getuid!(), mcpGroup);
             chmodSync(privateDir, 0o710);
         }
-    } catch {
+    } catch (error) {
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
-        throw new MandatorySandboxError('capability-unavailable', 'MCP socket directory or group unavailable');
+        logger.debug('[happyMCP] socket directory unavailable:', error);
+        if (options.mandatorySandbox) throw new MandatorySandboxError('capability-unavailable', 'MCP socket directory or group unavailable');
+        throw new Error('Happy MCP socket directory unavailable', { cause: error });
     }
     const socketPath = privateDir ? join(privateDir, 'mcp.sock') : undefined;
-    const token = privateDir ? randomBytes(32).toString('hex') : undefined;
+    // sun_path holds 104 bytes on macOS (108 on Linux) including the terminator; a longer TMPDIR cannot bind.
+    if (socketPath && Buffer.byteLength(socketPath) > 103) {
+        rmSync(privateDir!, { recursive: true, force: true });
+        const message = 'Happy MCP socket path too long; use a shorter TMPDIR';
+        throw options.mandatorySandbox ? new MandatorySandboxError('capability-unavailable', message) : new Error(message);
+    }
+    const token = randomBytes(32).toString('hex');
 
     const server = createServer(async (req, res) => {
-        if (token) {
-            const supplied = Buffer.from(req.headers.authorization ?? '');
-            const expected = Buffer.from(`Bearer ${token}`);
-            if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
-                res.writeHead(401).end();
-                return;
-            }
+        const supplied = Buffer.from(req.headers.authorization ?? '');
+        const expected = Buffer.from(`Bearer ${token}`);
+        if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+            res.writeHead(401).end();
+            return;
         }
         const mcp = createMcpServer({
             // Keep the advertised tools and stateless request registration in sync.
@@ -646,17 +659,23 @@ export async function startHappyServer(
             });
         }
     }).catch(error => {
+        logger.debug('[happyMCP] listen failed:', error);
         server.close();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         throw error;
     });
     const agentBroker = options.agentControl ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool) : null;
-    const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string } = socketPath
-        ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs')], env: {
-            SAYCODE_MCP_SOCKET: socketPath,
-            SAYCODE_MCP_TOKEN: token!,
-        } }
-        : { type: 'http', url: baseUrl.toString() };
+    // Env for the stdio bridge. Codex and ACP agents receive it over JSON-RPC, not argv.
+    const bridgeEnv: Record<string, string> = socketPath
+        ? { SAYCODE_MCP_SOCKET: socketPath, SAYCODE_MCP_TOKEN: token }
+        : { HAPPY_HTTP_MCP_HEADERS: JSON.stringify({ Authorization: `Bearer ${token}` }) };
+    // Claude receives this config as `--mcp-config` argv, which other local users can read. With a socket
+    // the owner-only directory is the boundary and the token is defence in depth. Over TCP the bearer is
+    // the boundary, so the config only references it and Claude expands it from its own environment.
+    if (!socketPath) process.env[MCP_BEARER_ENV] = token;
+    const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> } = socketPath
+        ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs')], env: bridgeEnv }
+        : { type: 'http', url: baseUrl.toString(), headers: { Authorization: `Bearer \${${MCP_BEARER_ENV}}` } };
 
     logger.debug(`[happyMCP] server:ready sessionId=${client.sessionId} url=${baseUrl.toString()}`);
 
@@ -664,6 +683,7 @@ export async function startHappyServer(
         url: baseUrl.toString(),
         socketPath,
         mcpConfig,
+        bridgeEnv,
         toolNames: [...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
@@ -672,6 +692,7 @@ export async function startHappyServer(
             void agentBroker?.close();
             server.close(() => { if (privateDir) rmSync(privateDir, { recursive: true, force: true }); });
             server.closeAllConnections();
+            if (process.env[MCP_BEARER_ENV] === token) delete process.env[MCP_BEARER_ENV];
         }
     }
 }

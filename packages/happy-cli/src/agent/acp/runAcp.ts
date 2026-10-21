@@ -600,6 +600,7 @@ export async function runAcp(opts: {
     happy: {
       command: process.execPath,
       args: ['--no-warnings', '--no-deprecation', bridgeCommand, '--url', happyServer.url],
+      env: happyServer.bridgeEnv,
     },
   }, aplusMcpServers);
 

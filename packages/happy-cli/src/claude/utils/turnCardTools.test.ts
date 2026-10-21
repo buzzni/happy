@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { sessionEnvelopeSchema } from '@slopus/happy-wire';
 import { startHappyServer } from './startHappyServer';
+import { unixMcpFetch } from './unixMcpFetch';
 import { createTurnCardSwitch, type TurnCardRunner } from './turnCardTools';
 import type { ApiSessionClient } from '@/api/apiSession';
 
@@ -18,8 +19,15 @@ function fakeClient() {
     } as unknown as ApiSessionClient & { sendSessionProtocolMessage: ReturnType<typeof vi.fn> };
 }
 
-async function rpc(url: string, method: string, params: Record<string, unknown>) {
-    const response = await fetch(url, {
+type McpServerHandle = { url: string; socketPath?: string; mcpConfig: { env?: Record<string, string> }; bridgeEnv: Record<string, string> };
+
+/** Authenticated request to a started server: owner-only socket on POSIX, bearer on Windows. */
+async function rpc(server: McpServerHandle, method: string, params: Record<string, unknown>) {
+    const tcpHeaders = server.socketPath ? {} : JSON.parse(server.bridgeEnv.HAPPY_HTTP_MCP_HEADERS) as Record<string, string>;
+    const send: typeof fetch = server.socketPath
+        ? unixMcpFetch(server.socketPath, server.mcpConfig.env!.SAYCODE_MCP_TOKEN)
+        : (input, init) => fetch(input, { ...init, headers: { ...init?.headers as Record<string, string>, ...tcpHeaders } });
+    const response = await send(server.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
@@ -28,17 +36,17 @@ async function rpc(url: string, method: string, params: Record<string, unknown>)
     return JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
 }
 
-const callTool = (url: string, name: string, args: Record<string, unknown>) => rpc(url, 'tools/call', { name, arguments: args });
+const callTool = (server: McpServerHandle, name: string, args: Record<string, unknown>) => rpc(server, 'tools/call', { name, arguments: args });
 /** A turn whose client said it draws the card. */
 const drawnTurn = (runner: TurnCardRunner) => { const cards = createTurnCardSwitch(runner); cards.set(true); return cards; };
-const listNames = async (url: string): Promise<string[]> => (await rpc(url, 'tools/list', {})).result.tools.map((tool: { name: string }) => tool.name);
+const listNames = async (server: McpServerHandle): Promise<string[]> => (await rpc(server, 'tools/list', {})).result.tools.map((tool: { name: string }) => tool.name);
 
 describe('next_steps tool', () => {
     it('records the card as an agent session event a client can parse', async () => {
         const client = fakeClient();
         const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
         try {
-            const reply = await callTool(server.url, 'next_steps', {
+            const reply = await callTool(server, 'next_steps', {
                 summary: 'The parser fix is in and its tests pass. Nothing is committed.',
                 question: 'Commit it now?',
                 actions: [{ kind: 'commit' }, { label: 'Not yet', message: 'Leave it uncommitted for now.' }],
@@ -62,7 +70,7 @@ describe('next_steps tool', () => {
         const client = fakeClient();
         const server = await startHappyServer(client, { turnCards: drawnTurn('codex') });
         try {
-            const reply = await callTool(server.url, 'next_steps', { summary: 'Done.', question: 'Ship?', actions: [{ kind: 'deploy' }] });
+            const reply = await callTool(server, 'next_steps', { summary: 'Done.', question: 'Ship?', actions: [{ kind: 'deploy' }] });
             expect(reply.result?.isError ?? !!reply.error).toBe(true);
             expect(JSON.stringify(reply)).toMatch(/commit/);
             expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
@@ -73,10 +81,10 @@ describe('next_steps tool', () => {
         const client = fakeClient();
         const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
         try {
-            const unanswerable = await callTool(server.url, 'next_steps', { summary: 'Done.', question: 'Which one?', actions: [] });
+            const unanswerable = await callTool(server, 'next_steps', { summary: 'Done.', question: 'Which one?', actions: [] });
             expect(unanswerable.result.isError).toBe(true);
             expect(unanswerable.result.content[0].text).toMatch(/NEXT_STEPS_QUESTION_WITHOUT_ACTIONS/);
-            const repeated = await callTool(server.url, 'next_steps', { summary: 'Done.', question: 'Merge?', actions: [{ kind: 'merge' }, { kind: 'merge', label: 'Merge now' }] });
+            const repeated = await callTool(server, 'next_steps', { summary: 'Done.', question: 'Merge?', actions: [{ kind: 'merge' }, { kind: 'merge', label: 'Merge now' }] });
             expect(repeated.result.isError).toBe(true);
             expect(repeated.result.content[0].text).toMatch(/NEXT_STEPS_DUPLICATE_ACTION/);
             expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
@@ -87,7 +95,7 @@ describe('next_steps tool', () => {
         const client = fakeClient();
         const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
         try {
-            const reply = await callTool(server.url, 'next_steps', { summary: 'Answered the question; nothing changed.', actions: [] });
+            const reply = await callTool(server, 'next_steps', { summary: 'Answered the question; nothing changed.', actions: [] });
             expect(reply.result.isError).toBeFalsy();
             expect(client.sendSessionProtocolMessage.mock.calls[0][0].ev).toEqual({ t: 'next-steps', summary: 'Answered the question; nothing changed.', actions: [] });
         } finally { server.stop(); }
@@ -97,7 +105,7 @@ describe('next_steps tool', () => {
         const client = fakeClient();
         const server = await startHappyServer(client);
         try {
-            const reply = await callTool(server.url, 'next_steps', { summary: 'Done.', actions: [] });
+            const reply = await callTool(server, 'next_steps', { summary: 'Done.', actions: [] });
             expect(reply.result.isError).toBe(true);
             expect(reply.result.content[0].text).toMatch(/NEXT_STEPS_UNSUPPORTED/);
             expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
@@ -114,15 +122,15 @@ describe('next_steps on a turn whose client does not draw the card', () => {
         const server = await startHappyServer(client, { turnCards: cards });
         try {
             const card = { summary: 'Done.', question: 'Commit it now?', actions: [{ kind: 'commit' }] };
-            const refused = await callTool(server.url, 'next_steps', card);
+            const refused = await callTool(server, 'next_steps', card);
             expect(refused.result.isError).toBe(true);
             expect(refused.result.content[0].text).toMatch(/^NEXT_STEPS_UNSUPPORTED: .*closing message/);
             expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
 
             cards.set(true);
-            expect((await callTool(server.url, 'next_steps', card)).result.isError).toBeFalsy();
+            expect((await callTool(server, 'next_steps', card)).result.isError).toBeFalsy();
             cards.set(false);
-            expect((await callTool(server.url, 'next_steps', card)).result.isError).toBe(true);
+            expect((await callTool(server, 'next_steps', card)).result.isError).toBe(true);
             expect(client.sendSessionProtocolMessage).toHaveBeenCalledTimes(1);
         } finally { server.stop(); }
     });
@@ -131,7 +139,7 @@ describe('next_steps on a turn whose client does not draw the card', () => {
         const client = fakeClient();
         const server = await startHappyServer(client, { turnCards: drawnTurn('codex') });
         try {
-            const reply = await callTool(server.url, 'next_steps', { summary: '   ', actions: [] });
+            const reply = await callTool(server, 'next_steps', { summary: '   ', actions: [] });
             expect(reply.result?.isError ?? !!reply.error).toBe(true);
             expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
         } finally { server.stop(); }
@@ -142,7 +150,7 @@ describe('next_steps description', () => {
     it('defers when to call to the per-turn guidance instead of asking for a call every turn', async () => {
         const server = await startHappyServer(fakeClient(), { turnCards: drawnTurn('claude') });
         try {
-            const tools = (await rpc(server.url, 'tools/list', {})).result.tools as Array<{ name: string; description: string }>;
+            const tools = (await rpc(server, 'tools/list', {})).result.tools as Array<{ name: string; description: string }>;
             const description = tools.find((tool) => tool.name === 'next_steps')!.description;
             expect(description).toContain('only when your instructions contain <saycode-next-steps>');
             expect(description).not.toMatch(/Call it once before you end a turn/);
@@ -157,7 +165,7 @@ describe('task list', () => {
             try {
                 expect(server.toolNames).toContain('next_steps');
                 expect(server.toolNames).not.toContain('update_plan');
-                const names = await listNames(server.url);
+                const names = await listNames(server);
                 expect(names).toContain('next_steps');
                 expect(names).not.toContain('update_plan');
             } finally { server.stop(); }

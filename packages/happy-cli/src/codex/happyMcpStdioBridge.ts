@@ -39,6 +39,17 @@ async function main() {
     ? JSON.parse(process.env.HAPPY_HTTP_MCP_HEADERS) as Record<string, string>
     : undefined;
 
+  // `http://localhost/` is the socket sentinel; without the socket env it would dial localhost:80.
+  if (!socketPath && baseUrl === 'http://localhost/') {
+    process.stderr.write('[happy-mcp] Missing SAYCODE_MCP_SOCKET for the session socket; the agent did not forward the bridge env\n');
+    process.exit(2);
+  }
+
+  if (socketPath && !process.env.SAYCODE_MCP_TOKEN) {
+    process.stderr.write('[happy-mcp] Missing SAYCODE_MCP_TOKEN for the session socket; the agent did not forward the bridge env\n');
+    process.exit(2);
+  }
+
   if (!baseUrl) {
     // Write to stderr; never stdout.
     process.stderr.write(

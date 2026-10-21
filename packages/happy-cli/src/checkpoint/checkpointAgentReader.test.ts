@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
+import { unixMcpFetch } from '@/claude/utils/unixMcpFetch';
 import { SandboxConfigSchema } from '@/persistence';
 import { createCheckpointAgentReader } from './checkpointAgentReader';
 import { CHECKPOINT_SPAWN_CONTEXT_ENV_KEY } from './checkpointSpawnContext';
@@ -87,7 +88,12 @@ describe('agent checkpoint reads in its own session', () => {
         const before = await refs();
         const server = await startHappyServer({ hasTitle: () => true } as ApiSessionClient, { checkpointReader: reader() });
         async function request(method: string, params: Record<string, unknown>) {
-            const response = await fetch(server.url, { method: 'POST', headers: {
+            // POSIX sessions serve MCP only on an owner-only socket behind the session token.
+            const tcpHeaders = server.socketPath ? {} : JSON.parse(server.bridgeEnv.HAPPY_HTTP_MCP_HEADERS) as Record<string, string>;
+            const authorizedFetch: typeof fetch = server.socketPath
+                ? unixMcpFetch(server.socketPath, server.mcpConfig.env!.SAYCODE_MCP_TOKEN)
+                : (input, init) => fetch(input, { ...init, headers: { ...init?.headers as Record<string, string>, ...tcpHeaders } });
+            const response = await authorizedFetch(server.url, { method: 'POST', headers: {
                 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
             }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
             expect(response.status).toBe(200);

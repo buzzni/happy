@@ -583,7 +583,8 @@ export async function runGemini(opts: {
   const mcpServers = mergeMcpServers({
     happy: {
       command: bridgeCommand,
-      args: ['--url', happyServer.url]
+      args: ['--url', happyServer.url],
+      env: happyServer.bridgeEnv,
     }
   }, aplusMcpServers);
 

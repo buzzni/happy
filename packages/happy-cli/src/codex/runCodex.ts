@@ -1918,7 +1918,9 @@ export async function runCodex(opts: {
     const baseMcpServers = {
         happy: {
             command: process.execPath,
-            args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url]
+            args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url],
+            // The bridge authenticates to the session MCP; never via argv.
+            env: happyServer.bridgeEnv,
         }
     };
     const bridgeOptions = { bridgeCommand: bridgeEntrypoint, nodeExecPath: process.execPath };
