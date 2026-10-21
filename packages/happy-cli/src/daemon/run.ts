@@ -46,7 +46,7 @@ import type { PayloadTrust } from '@/daemon/automations/payloadTrust';
 import { createMachineControlIo } from '@/datakey/machineControlIo';
 import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
-import { normalizeSessionSource, SESSION_SOURCE_ENV, type SessionSource } from '@/utils/sessionSource';
+import { normalizeSessionSource, type SessionSource } from '@/utils/sessionSource';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
@@ -100,6 +100,7 @@ import {
   applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
+  buildSessionRequesterEnv,
   buildSpawnRequestEnvironment,
   BROWSER_CONTINUATION_ENV,
   captureSaycodeAgentEnvironment,
@@ -2106,18 +2107,13 @@ export async function startDaemon(): Promise<void> {
         if (options.resumeCodexThreadId) {
           extraEnv.HAPPY_FORK_CODEX_THREAD_ID = options.resumeCodexThreadId;
         }
-        // Requester identity for the new session's metadata (specs/session-created-by).
+        // Requester identity and source for the new session's metadata.
         // Re-supplied on every spawn, not lineage — see SESSION_LINEAGE_ENV_PREFIXES.
-        if (options.createdByAccountId) {
-          extraEnv.HAPPY_CREATED_BY_ACCOUNT_ID = options.createdByAccountId;
-        }
-        if (options.createdByDisplayName) {
-          extraEnv.HAPPY_CREATED_BY_DISPLAY_NAME = options.createdByDisplayName;
-        }
-        // Same lineage scrub as createdBy, so a child never inherits it.
-        if (sessionSource) {
-          extraEnv[SESSION_SOURCE_ENV] = sessionSource;
-        }
+        Object.assign(extraEnv, buildSessionRequesterEnv({
+          createdByAccountId: options.createdByAccountId,
+          createdByDisplayName: options.createdByDisplayName,
+          sessionSource,
+        }));
         logger.debug(`[DAEMON RUN] Environment variable keys (before expansion) (${Object.keys(extraEnv).length}): ${Object.keys(extraEnv).join(', ')}`);
 
         // Expand ${VAR} references from daemon's process.env
