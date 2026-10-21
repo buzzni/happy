@@ -25,3 +25,18 @@ export function buildClientConnection(socket: Socket): ClientConnection {
         ? { connectionType: 'user-scoped', socket, userId, happyClient, transportOnly: true }
         : { connectionType: 'user-scoped', socket, userId, happyClient };
 }
+
+/**
+ * Whether a handshake asked for a send-only user-scoped socket.
+ *
+ * Only an exact `true` on a user-scoped (or unspecified) client counts. The
+ * value is copied to `socket.data` by the auth middleware so a socket restored
+ * by connection-state recovery, which skips the middleware, keeps it; session-
+ * and machine-scoped sockets never carry it, so no later reader of
+ * `socket.data` can misclassify a CLI or daemon socket.
+ */
+export function transportOnlyFromHandshake(auth: Record<string, unknown>): boolean {
+    const clientType = auth.clientType;
+    if (clientType !== undefined && clientType !== 'user-scoped') return false;
+    return auth.transportOnly === true;
+}

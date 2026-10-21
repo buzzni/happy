@@ -37,7 +37,7 @@ import { setManagedControlRuntime } from "@/app/api/socket/managedDaemonOutbound
 import { installManagedDaemonRpcExecutor } from "@/app/api/socket/managedDaemonRpcRelay";
 import type { ManagedDaemonClaims } from "@/app/auth/managedDaemonToken";
 import { socketCorsOrigin } from "./cors";
-import { buildClientConnection } from "@/app/api/socket/buildClientConnection";
+import { buildClientConnection, transportOnlyFromHandshake } from "@/app/api/socket/buildClientConnection";
 
 export function startSocket(app: Fastify, managedControl: ManagedControlRuntime | null = null) {
     // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
@@ -316,7 +316,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         // Send-only user-scoped sockets (desktop RPC pool, terminal relay)
         // stay out of the fan-out room. Kept on `data`, not read from the
         // handshake later, because a recovered socket skips this middleware.
-        if (socket.handshake.auth.transportOnly === true) socket.data.transportOnly = true;
+        if (transportOnlyFromHandshake(socket.handshake.auth)) socket.data.transportOnly = true;
         // Recency signal for picking between two live sockets of the same
         // daemon (a reconnect after a network flap leaves the dead one around
         // until engine.io gives up). The old code relied on Set insertion

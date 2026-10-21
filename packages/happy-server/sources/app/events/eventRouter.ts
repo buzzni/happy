@@ -25,9 +25,11 @@ export interface UserScopedConnection {
     /**
      * Opened only to send (RPC calls, a terminal relay, a title write). Keeps
      * every user-scoped handler but never joins the user-scoped fan-out room,
-     * so it receives no `update`/`ephemeral` and does not count as a human
-     * watching a screen. Opt-in by the client handshake; older clients and
-     * servers keep today's behaviour.
+     * so nothing addressed to `user-scoped-only` / `all-interested-in-session`
+     * reaches it and it does not count as a human watching a screen. It still
+     * joins the account room `user:{id}`, so an emit with the default
+     * `all-user-authenticated-connections` filter would reach it. Opt-in by the
+     * client handshake; older clients and servers keep today's behaviour.
      */
     transportOnly?: true;
 }

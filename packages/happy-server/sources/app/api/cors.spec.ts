@@ -119,6 +119,9 @@ describe('isAllowedCorsOrigin', () => {
         expect(preflight.statusCode).toBe(204);
         expect(preflight.headers['access-control-allow-origin']).toBe('app://renderer');
         expect(preflight.headers['access-control-allow-credentials']).toBeUndefined();
+        // Without a max-age Chromium remembers a preflight for 5s, so every Bearer
+        // request from the renderer would pay an extra OPTIONS round trip.
+        expect(preflight.headers['access-control-max-age']).toBe('7200');
         expect(preflight.headers['access-control-allow-headers']).toBe('authorization');
 
         for (const lookalike of ['app://renderer.evil.example.com', 'app://renderer/', 'app://other', 'APP://renderer', 'app://renderer:1']) {

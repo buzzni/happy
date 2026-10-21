@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildClientConnection } from './buildClientConnection';
+import { buildClientConnection, transportOnlyFromHandshake } from './buildClientConnection';
 
 function socketWith(data: Record<string, unknown>) {
     return { data } as any;
@@ -38,5 +38,19 @@ describe('buildClientConnection transport-only flag', () => {
         const machine = buildClientConnection(socketWith({ userId: 'u1', clientType: 'machine-scoped', machineId: 'm1', transportOnly: true }));
         expect(session).not.toHaveProperty('transportOnly');
         expect(machine).not.toHaveProperty('transportOnly');
+    });
+});
+
+describe('transportOnlyFromHandshake', () => {
+    it.each([
+        [{ transportOnly: true }, true],
+        [{ transportOnly: true, clientType: 'user-scoped' }, true],
+        [{ transportOnly: 'true', clientType: 'user-scoped' }, false],
+        [{ transportOnly: 1, clientType: 'user-scoped' }, false],
+        [{ clientType: 'user-scoped' }, false],
+        [{ transportOnly: true, clientType: 'session-scoped' }, false],
+        [{ transportOnly: true, clientType: 'machine-scoped' }, false],
+    ])('shouldReadTheFlagOnlyForUserScopedHandshakes %j', (auth, expected) => {
+        expect(transportOnlyFromHandshake(auth)).toBe(expected);
     });
 });
