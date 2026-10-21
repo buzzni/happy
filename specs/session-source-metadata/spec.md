@@ -20,7 +20,8 @@
   출처를 물려받지 않는다.
 - R4. daemon이 직접 만드는 세션도 기록한다: 로컬 예약 자동화 tick = `schedule`, 서버 자동화 실행기 =
   GitHub 트리거면 `github-trigger` 아니면 `schedule`, 채널 host = `channel`(spawn 옵션과 미리 만드는 metadata 둘 다).
-  단 review_apply가 요청자 세션을 재개하지 못해 띄우는 대체 작업자는 그 사용자 세션을 대신하므로 기록하지 않는다.
+  단 review_apply가 요청자 세션을 재개하지 못해 띄우는 대체 작업자는 그 사용자 세션을 대신하므로 자동화로 확정하지
+  않는다 — 출처를 기록하지 않아 미상이며, 클라이언트는 기존 휴리스틱으로 판별한다(이전과 같음, 보임이 보장되지는 않음).
 - R5. 재연결은 fresh metadata에 키가 없으므로 기존 값이 유지된다. 세션 복구로 새 세션을 띄울 때는 출처를 넘기지
   않는다 — 사람이 이어서 쓰는 대화를 자동화 실행으로 숨기지 않게(읽는 쪽에서는 미상).
 - R6. happy-app `MetadataSchema`가 `source`를 문자열로 선언한다 — 앱의 metadata 재기록이 zod strip으로
@@ -37,3 +38,10 @@
 - 턴 단위 trigger 태그(병행 T5) — 이 필드는 세션 단위다.
 - `happy agent spawn` 자식·메모리 lesson 리뷰 세션 등 Desktop 요구 범위 밖의 생성 경로 태깅.
 - happy-app MetadataSchema의 기존 `createdBy` 누락(같은 strip 위험) — 별도 이슈로 보고.
+- 관리형 런타임(managed principal) 실행 세션 — metadata를 서버가 정하고 러너가 `HAPPY_CREATED_BY*`를 foreign
+  lineage로 먼저 지우므로 출처가 기록되지 않는다(`createdBy`와 같은 격리). 그 세션은 계속 미상이다.
+
+## 롤아웃 주의
+
+- 이 zod 선언 이전에 배포된 happy-app 클라이언트가 metadata를 다시 쓰면 그 세션의 `source`는 strip으로 영구히 지워지고,
+  클라이언트는 휴리스틱으로 돌아간다. happy-app 배포를 데몬 배포보다 먼저 하거나 같이 한다.

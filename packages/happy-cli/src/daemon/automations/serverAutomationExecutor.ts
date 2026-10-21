@@ -1786,7 +1786,8 @@ async function executeStartedRun(
     ? { taskId: agentTaskDispatch.taskId, sessionId: agentTaskDispatch.targetSessionId, environmentVariables }
     : null
   // An apply worker started instead of the requester's own session stands in for that session, so it
-  // is not recorded as an unattended run that clients would hide.
+  // is not recorded as an unattended run. Its source stays unknown: clients fall back to their own
+  // heuristics for it (unchanged from before), which does not guarantee it stays visible.
   const workerSpawnInput = resumeTarget ? { ...spawnInput, sessionSource: undefined } : spawnInput
   if (resumeTarget && input.resumeServerChosenSession === false) {
     input.logDebug?.(
