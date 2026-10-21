@@ -293,6 +293,10 @@ jobs:
         run: |
           brew list ripgrep >/dev/null 2>&1 || brew install ripgrep
           rg --version
+      - name: Install tmux spawn test dependency
+        run: |
+          brew list tmux >/dev/null 2>&1 || brew install tmux
+          tmux -V
       - name: Install scheduled conversation integration dependencies
         run: |
           brew list postgresql@16 >/dev/null 2>&1 || brew install postgresql@16
