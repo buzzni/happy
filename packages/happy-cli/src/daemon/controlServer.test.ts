@@ -1376,7 +1376,7 @@ it('lets only the local user mark this PC shared, and shows the marker on a sepa
   expect((await send('use-as-shared',auth,{companyId:'other'})).status).toBe(409);
   expect(marker).toBeNull();
   const marked=await send('use-as-shared',auth);
-  expect(marked.status).toBe(200);expect(await marked.json()).toEqual({accepted:true,confirmed:false});
+  expect(marked.status).toBe(200);expect(await marked.json()).toEqual({accepted:true,confirmed:false,declined:false});
   expect(marker).toBe('shared');
   const again=await send('use-as-shared',auth);
   expect(again.status).toBe(409);expect(await again.json()).toEqual({code:'DEVICE_MACHINE_TYPE_SET'});

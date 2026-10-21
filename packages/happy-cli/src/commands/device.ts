@@ -2,8 +2,17 @@ import { confirmDeviceOrganization, getDeviceApprovalStatus, useDeviceAsShared }
 
 type Status = { machineId: string; companyId: string; enrollment: null | { digest: string; expiresAt: number; locallyConfirmed: boolean; administratorApproved: boolean }; pin: null | { policy: string } };
 type Deps = { status: (companyId: string) => Promise<Status>; confirm: (input: { companyId: string; machineId: string; enrollmentDigest: string }) => Promise<{ locallyConfirmed: boolean }>; print: (text: string) => void;
-    useAsShared?: (companyId: string) => Promise<{ accepted: true; confirmed: boolean }> };
+    useAsShared?: (companyId: string) => Promise<{ accepted: true; confirmed: boolean; declined: boolean }> };
 const usage = 'happy device status --company-id ID | happy device confirm --company-id ID --machine-id ID --digest FULL_SHA256 | happy device use-as-shared --company-id ID';
+const refused = '이미 공용·전용으로 표시된 PC이거나, 이 PC를 기다리는 공용 기기 승인이 없습니다. status로 상태를 확인하세요.';
+const changed = '등록 요청이 만료되었거나 바뀌었습니다. 잠시 뒤 status로 확인하세요.';
+/** The daemon's refusal codes for use-as-shared; failures after the PC was marked are told apart from refusals. */
+const useAsSharedRefusals: Record<string, string> = {
+    DEVICE_USE_AS_SHARED_REFUSED: refused, DEVICE_MACHINE_TYPE_SET: refused, DEVICE_AUTO_APPROVAL_REQUIRED: refused,
+    DEVICE_PIN_PERSIST_FAILED: '공용 PC로 표시했지만 조직 키를 저장하지 못했습니다. happy device status로 확인한 뒤 confirm하세요.',
+    DEVICE_ENROLLMENT_EXPIRED: changed, DEVICE_ENROLLMENT_REPLACED: changed,
+    DEVICE_USE_AS_SHARED_UNAVAILABLE: '이 daemon은 공용 PC 자동 확인을 할 수 없습니다(신뢰할 Studio 주소 없음). Saycode 앱으로 다시 시작해 주세요.',
+};
 export async function handleDeviceCommand(args: string[], deps: Deps = { status: getDeviceApprovalStatus, confirm: confirmDeviceOrganization, print: console.log, useAsShared: useDeviceAsShared }): Promise<void> {
     if (args.length === 1 && ['--help', '-h'].includes(args[0])) { deps.print(usage); return; }
     const command = args[0];
@@ -19,15 +28,16 @@ export async function handleDeviceCommand(args: string[], deps: Deps = { status:
     const companyId = values.get('--company-id')!;
     if (command === 'use-as-shared') {
         // aplus specs/shared-machine-server-signing S6b — the PC still pins only the key its trusted Studio origin serves.
-        let result: { accepted: true; confirmed: boolean };
+        let result: { accepted: true; confirmed: boolean; declined: boolean };
         try { result = await (deps.useAsShared ?? useDeviceAsShared)(companyId); } catch (error) {
-            if (error instanceof Error && error.message === 'DEVICE_USE_AS_SHARED_REFUSED')
-                throw new Error('이미 공용·전용으로 표시된 PC이거나, 이 PC를 기다리는 공용 기기 승인이 없습니다. status로 상태를 확인하세요.');
-            throw new Error('DEVICE_CONTROL_UNAVAILABLE');
+            const message = error instanceof Error ? useAsSharedRefusals[error.message] : undefined;
+            throw new Error(message ?? 'DEVICE_CONTROL_UNAVAILABLE');
         }
         deps.print(result.confirmed
             ? '이 PC를 조직 공용 PC로 사용합니다. 조직 키가 저장되었습니다.'
-            : '이 PC를 조직 공용 PC로 표시했습니다. 서버 승인이 오면 자동으로 확인됩니다.');
+            : result.declined
+                ? '이 PC를 조직 공용 PC로 표시했지만 자동 확인이 맞지 않았습니다(조직 키가 다르거나 Studio에 연결하지 못함). happy device status로 지문을 확인해 관리자와 대조한 뒤 confirm하세요.'
+                : '이 PC를 조직 공용 PC로 표시했습니다. 서버 승인이 오면 자동으로 확인됩니다.');
         return;
     }
     if (command === 'confirm') {

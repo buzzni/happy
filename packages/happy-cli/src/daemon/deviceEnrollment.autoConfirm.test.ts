@@ -82,14 +82,14 @@ describe('useAsShared', () => {
         const f = await sharedFixture({ marker, autoConfirm: vi.fn(async () => (await marker.read()) === 'shared') });
         await f.state.approve(f.approval);
         expect(f.state.status()?.pinned).toBe(false);
-        await expect(f.state.useAsShared({ companyId: 'company', machineId: 'machine' }, 'local')).resolves.toEqual({ accepted: true, confirmed: true });
+        await expect(f.state.useAsShared({ companyId: 'company', machineId: 'machine' }, 'local')).resolves.toEqual({ accepted: true, confirmed: true, declined: false });
         expect(await marker.read()).toBe('shared');
         expect(f.store.pin).toHaveBeenCalledTimes(1);
     });
 
     it('accepts an administrator\'s request without a waiting approval, but the PC\'s own request only while one waits', async () => {
         const remote = await sharedFixture({ marker: memoryMarker(), autoConfirm: vi.fn(async () => true) });
-        await expect(remote.state.useAsShared({ companyId: 'other-company', machineId: 'machine' }, 'remote')).resolves.toEqual({ accepted: true, confirmed: false });
+        await expect(remote.state.useAsShared({ companyId: 'other-company', machineId: 'machine' }, 'remote')).resolves.toEqual({ accepted: true, confirmed: false, declined: false });
         const local = await sharedFixture({ marker: memoryMarker(), autoConfirm: vi.fn(async () => true) });
         await expect(local.state.useAsShared({ companyId: 'other-company', machineId: 'machine' }, 'local')).rejects.toThrow('DEVICE_AUTO_APPROVAL_REQUIRED');
         const dedicated = await sharedFixture({ machineType: 'dedicated', marker: memoryMarker(), autoConfirm: vi.fn(async () => true) });
@@ -107,6 +107,14 @@ describe('useAsShared', () => {
         }
         const unable = await sharedFixture({ marker: memoryMarker() });
         await expect(unable.state.useAsShared({ companyId: 'company', machineId: 'machine' }, 'remote')).rejects.toThrow('DEVICE_USE_AS_SHARED_UNAVAILABLE');
+    });
+
+    it('says when a waiting approval was declined by the automatic check, so the PC asks for the manual comparison', async () => {
+        const f = await sharedFixture({ marker: memoryMarker(), autoConfirm: vi.fn(async () => false) });
+        await f.state.approve(f.approval);
+        await expect(f.state.useAsShared({ companyId: 'company', machineId: 'machine' }, 'local')).resolves.toEqual({ accepted: true, confirmed: false, declined: true });
+        const waiting = await sharedFixture({ marker: memoryMarker(), autoConfirm: vi.fn(async () => false) });
+        await expect(waiting.state.useAsShared({ companyId: 'company', machineId: 'machine' }, 'local')).resolves.toEqual({ accepted: true, confirmed: false, declined: false });
     });
 
     it('reports the marker and whether a shared approval waits for this PC', async () => {

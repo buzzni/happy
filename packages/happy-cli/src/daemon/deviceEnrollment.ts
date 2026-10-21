@@ -107,7 +107,7 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
          * approval is waiting, confirms it automatically. 'local' is the PC's own loopback request and needs such an
          * approval; 'remote' is an administrator's customer-key request. Never rewrites an existing marker.
          */
-        async useAsShared(input: z.input<typeof useAsSharedSchema>, origin: 'local' | 'remote'): Promise<{ accepted: true; confirmed: boolean }> {
+        async useAsShared(input: z.input<typeof useAsSharedSchema>, origin: 'local' | 'remote'): Promise<{ accepted: true; confirmed: boolean; declined: boolean }> {
             const request = useAsSharedSchema.parse(input);
             if (request.machineId !== deps.machineId) throw new Error('DEVICE_USE_AS_SHARED_MISMATCH');
             if (!deps.marker || !deps.autoConfirm) throw new Error('DEVICE_USE_AS_SHARED_UNAVAILABLE');
@@ -115,10 +115,12 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
             if (origin === 'local' && !awaitingShared(request.companyId)) throw new Error('DEVICE_AUTO_APPROVAL_REQUIRED');
             if (await deps.marker.record('shared') === 'exists') throw new Error('DEVICE_MACHINE_TYPE_SET');
             const enrollment = awaitingShared(request.companyId);
-            if (!enrollment) return { accepted: true, confirmed: false };
+            if (!enrollment) return { accepted: true, confirmed: false, declined: false };
             await confirmAutomatically(enrollment, revision);
             await persistIfReady();
-            return { accepted: true, confirmed: enrollment.pinned };
+            // A waiting approval the automatic check declined will not confirm later by itself: the marker is now set,
+            // so repeating this is refused. The user compares the fingerprint instead.
+            return { accepted: true, confirmed: enrollment.pinned, declined: !enrollment.pinned && enrollment.approval !== null };
         },
         /** What the PC shows before asking its user to use it as the organization's shared PC. */
         async sharedStatus(companyId: string) {
