@@ -503,7 +503,7 @@ describe('tmux spawn boundary', () => {
         const result = await tmux.spawnInTmux(['node', 'happy.mjs'], { sessionName: 'fixture' }, { APLUS_SESSION_ID: 'mine' });
 
         expect(result).toMatchObject({ success: true, pid: 123 });
-        const command = window[window.indexOf('-P') - 1];
+        const command = window.find((arg) => arg.endsWith('happy.mjs'));
         expect(command).toBe('env -u SAYCODE_AGENT_ROOT -u HAPPY_AI_AUTH_SETUP_TOKEN_BINDING -u CLAUDE_CODE_OAUTH_TOKEN -u HAPPY_APLUS_MCP_CALLER_GRANT node happy.mjs');
     });
 
@@ -518,6 +518,6 @@ describe('tmux spawn boundary', () => {
 
         await tmux.spawnInTmux(['node', 'happy.mjs'], { sessionName: 'fixture' }, {});
 
-        expect(window[window.indexOf('-P') - 1]).toBe('node happy.mjs');
+        expect(window.find((arg) => arg.endsWith('happy.mjs'))).toBe('node happy.mjs');
     });
 });
