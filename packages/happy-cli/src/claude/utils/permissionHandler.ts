@@ -22,6 +22,7 @@ import { Session } from "../session";
 import { EnhancedMode, PermissionMode } from "../loop";
 import { getToolDescriptor } from "./getToolDescriptor";
 import { mapToClaudeMode } from "./permissionMode";
+import type { PermissionPolicyMeta, PolicyApprovalAnswer, PolicyApprover } from "@/toolPolicy/policyGate";
 
 /**
  * What the child says it did with an answer.
@@ -52,6 +53,11 @@ interface PermissionResponse {
     mode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
     allowTools?: string[];
     updatedInput?: Record<string, unknown>;
+    /**
+     * Tool policy answer scope (aplus-dev-studio specs/agent-tool-policy R11.3). Only meaningful for
+     * a request that carried `policy`; absent (every older client) means `once`.
+     */
+    policyGrant?: 'once' | 'session';
     receivedAt?: number;
 }
 
@@ -71,7 +77,7 @@ interface PendingRequest {
     instanceSeq: number;
 }
 
-export class PermissionHandler {
+export class PermissionHandler implements PolicyApprover {
     private responses = new Map<string, PermissionResponse>();
     private pendingRequests = new Map<string, PendingRequest>();
     /**
@@ -330,13 +336,63 @@ export class PermissionHandler {
     }
 
     /**
+     * A tool policy `ask` (aplus-dev-studio specs/agent-tool-policy R11), raised from the PreToolUse
+     * hook rather than from `canUseTool`. It is an ordinary permission request — same card, push,
+     * channel binding and AI review path — that additionally carries `policy`.
+     *
+     * When the caller gives up (approval timeout, hook gone) the request is withdrawn from the
+     * agent state, so no client keeps a live button for a call that will never run.
+     */
+    async requestPolicyApproval(request: {
+        id: string;
+        toolName: string;
+        args: Record<string, unknown>;
+        policy: PermissionPolicyMeta;
+        signal: AbortSignal;
+    }): Promise<PolicyApprovalAnswer> {
+        // An already-aborted signal never fires its listener; raising now would leave an orphan card.
+        if (request.signal.aborted) throw new Error('Tool policy approval aborted before it was raised');
+        try {
+            const result = await this.handlePermissionRequest(request.id, request.toolName, request.args, request.signal, request.policy);
+            const response = this.responses.get(request.id);
+            // A messenger answer is yes/no only (R11.4); it never widens to the conversation.
+            const policyGrant = response?.policyGrant === 'session' && !response.channelClaim ? 'session' : 'once';
+            return result.behavior === 'allow'
+                ? { approved: true, policyGrant }
+                : { approved: false, policyGrant: 'once', reason: response?.reason };
+        } catch (error) {
+            this.withdrawRequest(request.id, request.signal.aborted ? 'Tool policy approval withdrawn' : 'Tool policy approval failed');
+            throw error;
+        }
+    }
+
+    /** Moves a still-open request to completed/canceled. A request already answered is left alone. */
+    private withdrawRequest(id: string, reason: string): void {
+        this.session.client.updateAgentState((currentState) => {
+            const request = currentState.requests?.[id];
+            if (!request) return currentState;
+            const requests = { ...currentState.requests };
+            delete requests[id];
+            return {
+                ...currentState,
+                requests,
+                completedRequests: {
+                    ...currentState.completedRequests,
+                    [id]: { ...request, completedAt: Date.now(), status: 'canceled', reason },
+                },
+            };
+        });
+    }
+
+    /**
      * Handles individual permission requests
      */
     private async handlePermissionRequest(
         id: string,
         toolName: string,
         input: unknown,
-        signal: AbortSignal
+        signal: AbortSignal,
+        policy?: PermissionPolicyMeta,
     ): Promise<PermissionResult> {
         return new Promise<PermissionResult>((resolve, reject) => {
             // Set up abort signal handling
@@ -394,7 +450,8 @@ export class PermissionHandler {
                     [id]: {
                         tool: toolName,
                         arguments: input,
-                        createdAt: Date.now()
+                        createdAt: Date.now(),
+                        ...(policy ? { policy } : {}),
                     }
                 }
             }));

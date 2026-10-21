@@ -141,6 +141,7 @@ export interface ChannelPermissionAnswerShape {
   allowTools?: unknown;
   updatedInput?: unknown;
   decision?: unknown;
+  policyGrant?: unknown;
 }
 
 /**
@@ -157,6 +158,8 @@ export function externalAnswerCarriesPersistentGrant(answer: ChannelPermissionAn
         if (!Array.isArray(answer.allowTools)) return true;
         if (answer.allowTools.length > 0) return true;
     }
+    // A conversation-wide tool policy grant widens scope; a messenger answer is yes/no only (R11.4).
+    if (answer.policyGrant !== undefined && answer.policyGrant !== 'once') return true;
     if (answer.decision !== undefined) {
         // Allowlist, not denylist: a future 'approved_for_project' must refuse on this build.
         if (answer.decision !== 'approved' && answer.decision !== 'denied') return true;

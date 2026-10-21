@@ -16,6 +16,7 @@ import {
     resolveMachineLockdownPolicy,
     type MachineLockdownPolicy,
 } from '@/daemon/machineLockdownPolicy';
+import { buildToolPolicyHookEntries } from '@/toolPolicy/claudeHook';
 
 /**
  * Pure settings document. `permissions.deny` always guards broad kills; under
@@ -28,6 +29,8 @@ export function buildHookSettings(input: {
     broadKillGuardCommand: string;
     policy: MachineLockdownPolicy;
     homeDir: string;
+    /** aplus-dev-studio specs/agent-tool-policy — absent when `HAPPY_TOOL_POLICY=off`. */
+    toolPolicy?: { forwarderCommand: string; fileGuardCommand: string };
 }): Record<string, unknown> {
     return {
         permissions: {
@@ -57,9 +60,22 @@ export function buildHookSettings(input: {
                             command: input.broadKillGuardCommand
                         }
                     ]
-                }
+                },
+                ...(input.toolPolicy ? buildToolPolicyHookEntries(input.toolPolicy) : [])
             ]
         }
+    };
+}
+
+/**
+ * The tool policy hook commands, exactly as Claude runs them. The gate must not depend on `node`
+ * being on the hook shell's PATH: a hook that cannot start is a non-blocking error to Claude, i.e.
+ * the call runs unchecked — so the daemon's own executable is quoted in.
+ */
+export function toolPolicyHookCommands(input: { execPath: string; scriptsDir: string; port: number; secretFile: string; policyFile: string }): { forwarderCommand: string; fileGuardCommand: string } {
+    return {
+        forwarderCommand: `"${input.execPath}" "${join(input.scriptsDir, 'policy_hook_forwarder.cjs')}" ${input.port} "${input.secretFile}"`,
+        fileGuardCommand: `"${input.execPath}" "${join(input.scriptsDir, 'tool_policy_file_guard.cjs')}" "${input.policyFile}"`,
     };
 }
 
@@ -69,7 +85,7 @@ export function buildHookSettings(input: {
  * @param port - The port where Happy server is listening
  * @returns Path to the generated settings file
  */
-export function generateHookSettingsFile(port: number): string {
+export function generateHookSettingsFile(port: number, toolPolicy?: { secretFile: string; policyFile: string }): string {
     const hooksDir = join(configuration.happyHomeDir, 'tmp', 'hooks');
     mkdirSync(hooksDir, { recursive: true });
 
@@ -91,9 +107,18 @@ export function generateHookSettingsFile(port: number): string {
         broadKillGuardCommand,
         policy: resolveMachineLockdownPolicy(process.env),
         homeDir: homedir(),
+        ...(toolPolicy ? {
+            toolPolicy: toolPolicyHookCommands({
+                execPath: process.execPath,
+                scriptsDir: resolve(projectPath(), 'scripts'),
+                port,
+                secretFile: toolPolicy.secretFile,
+                policyFile: toolPolicy.policyFile,
+            }),
+        } : {}),
     });
 
-    writeFileSync(filepath, JSON.stringify(settings, null, 2));
+    writeFileSync(filepath, JSON.stringify(settings, null, 2), { mode: 0o600 });
     logger.debug(`[generateHookSettings] Created hook settings file: ${filepath}`);
 
     return filepath;

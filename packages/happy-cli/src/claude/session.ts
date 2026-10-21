@@ -15,6 +15,7 @@ import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessio
 
 import type { LessonSessionHost } from '@/memory/lessonSessionHost';
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle';
+import type { PolicyApprover } from '@/toolPolicy/policyGate';
 
 /** Survives SDK generations, but is reset with the actual conversation. */
 export interface ClaudeLessonReviewLifecycle {
@@ -82,6 +83,12 @@ export class Session {
      *  place the default lives — before the first keepalive is sent. */
     mode: 'local' | 'remote';
     thinking: boolean = false;
+    /**
+     * Who answers a tool policy `ask` (aplus-dev-studio specs/agent-tool-policy R11). Set by the
+     * remote launcher while it runs; `null` in local (terminal) mode, where the hook cannot reach a
+     * Saycode approval card and hands `ask` to Claude's own terminal prompt instead.
+     */
+    policyApprover: PolicyApprover | null = null;
     
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];
