@@ -97,6 +97,45 @@ describe('isAllowedCorsOrigin', () => {
         await app.close();
     });
 
+    it('lets the app:// desktop renderer call the API without credentials, by exact origin only', async () => {
+        // A standard custom scheme serializes to an opaque origin in WHATWG URL (`new URL('app://renderer').origin`
+        // is "null"), so this origin can never pass the URL-based allow-list. It is matched as an exact string and
+        // treated like the file:// renderer: CORS without credentials, because the API authenticates with Bearer tokens.
+        const app = fastify();
+        const cors = (await import('@fastify/cors')).default;
+        await app.register(cors, () => fastifyCorsDelegate);
+        app.get('/v1/account/settings', async () => ({ ok: true }));
+        await app.ready();
+
+        const preflight = await app.inject({
+            method: 'OPTIONS',
+            url: '/v1/account/settings',
+            headers: {
+                origin: 'app://renderer',
+                'access-control-request-method': 'GET',
+                'access-control-request-headers': 'authorization',
+            },
+        });
+        expect(preflight.statusCode).toBe(204);
+        expect(preflight.headers['access-control-allow-origin']).toBe('app://renderer');
+        expect(preflight.headers['access-control-allow-credentials']).toBeUndefined();
+        expect(preflight.headers['access-control-allow-headers']).toBe('authorization');
+
+        for (const lookalike of ['app://renderer.evil.example.com', 'app://renderer/', 'app://other', 'APP://renderer', 'app://renderer:1']) {
+            const response = await app.inject({ method: 'GET', url: '/v1/account/settings', headers: { origin: lookalike } });
+            expect(response.headers['access-control-allow-origin'], lookalike).toBeUndefined();
+        }
+
+        await app.close();
+    });
+
+    it('keeps the app:// renderer out of the credentialed allow-list and Socket.IO CORS', () => {
+        expect(isAllowedCorsOrigin('app://renderer')).toBe(false);
+        const allowed: unknown[] = [];
+        socketCorsOrigin('app://renderer', (_error, value) => allowed.push(value));
+        expect(allowed).toEqual([false]);
+    });
+
     it('lets the packaged desktop renderer (Origin: null) call the API without credentials', async () => {
         // The packaged desktop renderer runs from file://, so its fetches carry `Origin: null`.
         // The API authenticates with Bearer tokens, so this origin gets CORS without credentials:
