@@ -68,13 +68,16 @@ describe('sanitizeChildEnv', () => {
         expect(scrubbed).toEqual({ PATH: '/usr/bin' })
     })
 
-    it('keeps the session connector grant inside the session and drops it at a session boundary', () => {
+    it('keeps the session connector grant and MCP bearer inside the session and drops them at a session boundary', () => {
         const env = {
             HAPPY_APLUS_MCP_CONFIG_URL: 'https://studio.example/api/me/mcp-config',
             HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.example',
             HAPPY_APLUS_MCP_CALLER_GRANT: 'grant',
             HAPPY_BROWSER_VIEWER_KEY: 'viewer',
             CLAUDE_MEMORY_LESSON_OWNER: 'host',
+            SAYCODE_MCP_BEARER: 'session-mcp-bearer',
+            SAYCODE_MCP_SOCKET: '/tmp/happy-mcp/s.sock',
+            SAYCODE_MCP_TOKEN: 'session-mcp-token',
             HAPPY_APLUS_EXPECTED_CONNECTORS: '["gmail"]',
             HAPPY_APLUS_EXPECTED_MCP_SERVICES: '[]',
             HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'spawn',
@@ -90,6 +93,10 @@ describe('sanitizeChildEnv', () => {
             HAPPY_APLUS_MCP_CALLER_GRANT: 'grant',
             HAPPY_BROWSER_VIEWER_KEY: 'viewer',
             CLAUDE_MEMORY_LESSON_OWNER: 'host',
+            // Claude expands the bearer from its own env; the stdio bridge reads the socket and token.
+            SAYCODE_MCP_BEARER: 'session-mcp-bearer',
+            SAYCODE_MCP_SOCKET: '/tmp/happy-mcp/s.sock',
+            SAYCODE_MCP_TOKEN: 'session-mcp-token',
         })
     })
 

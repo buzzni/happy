@@ -77,6 +77,10 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_APLUS_MCP_INITIAL_LIFECYCLE', kind: 'spawn-seed' },
     // Read by CML's native hook inside the agent, so it stays in-session.
     { prefix: 'CLAUDE_MEMORY_LESSON_OWNER', kind: 'session-scope' },
+    // The session's own MCP server: the TCP bearer the runner keeps in its env
+    // for Claude to expand, and the socket/token the stdio bridge reads. Anyone
+    // holding them reaches that session's tools, bash_stream included.
+    { prefix: 'SAYCODE_MCP_', kind: 'session-scope' },
 ]
 
 /**
