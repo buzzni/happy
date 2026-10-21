@@ -200,6 +200,22 @@ describe('createIsolatedRedisAdapter', () => {
         }
     });
 
+    it('reports every read outcome to the onRead hook so a stalled reader can be fenced', async () => {
+        const writer = redisConnection();
+        const reader = redisConnection();
+        reader.xread.mockRejectedValueOnce(new Error('Command timed out'))
+            .mockRejectedValueOnce(new Error('Command timed out')).mockResolvedValueOnce(null);
+        const onRead = vi.fn();
+        const io = new Server({ adapter: createIsolatedRedisAdapter(writer.client, reader.client, {}, { onRead }) });
+        try {
+            await flush();
+            expect(onRead.mock.calls.map(([result]) => result)).toEqual(['failure', 'failure', 'success']);
+        } finally {
+            io.of('/').adapter.close();
+            writer.client.disconnect();
+        }
+    });
+
     it('does not count the intentional shutdown rejection as a read failure', async () => {
         const writer = redisConnection();
         const reader = redisConnection();
@@ -334,5 +350,14 @@ describe('createIsolatedRedisAdapter', () => {
             reader.client.disconnect();
             writer.client.disconnect();
         }
+    });
+});
+
+describe('CLUSTER_BUS_READ_COUNT', () => {
+    it('keeps one XREAD reply small enough to finish inside the 5s command timeout on a slow path', async () => {
+        const { CLUSTER_BUS_READ_COUNT } = await import('./createIsolatedRedisAdapter');
+        // 2026-10-21 prod: COUNT 2000 replies were 6-10MB; a degraded node read them at ~0.6MB/s (10-16s).
+        const prodBytesPerEntry = 10_000_000 / 2000;
+        expect(CLUSTER_BUS_READ_COUNT * prodBytesPerEntry / 600_000).toBeLessThan(5);
     });
 });
