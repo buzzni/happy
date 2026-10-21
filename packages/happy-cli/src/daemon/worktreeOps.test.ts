@@ -107,7 +107,7 @@ describe('worktree ops tickets', () => {
         const lock = join(repo, '.git', 'saycode-desktop-write.lock');
         mkdirSync(lock);
         const head = git(repo, 'rev-parse', 'HEAD');
-        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS' });
+        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS', lockPath: lock });
         expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
         expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
         expect(existsSync(lock)).toBe(true);
@@ -960,4 +960,29 @@ describe('worktree:purge-project', () => {
         expect(nativeCalls).toEqual([]);
     });
 
+});
+
+it('drains accepted writes before daemon exit and refuses new writes while their lock is held', async () => {
+    vi.resetModules();
+    const lifecycle = await import('./worktreeOps');
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const set = lifecycle.createWorktreeOpsHandlers({ machine: () => machine, allowedRoot: root, happyHomeDir: home, now: () => NOW,
+        purge: { docker: async () => ({ code: 0, stdout: '' }), stopNative: async () => {
+            enter(); await gate;
+            return { reason: 'no-native-processes', verified: 0, unverified: 0, pending: 0, signalled: 0, escalated: 0 };
+        } },
+    });
+    const active = call('purge-project', { workspaceDir: repo, port: null, purgeFolder: false, dryRun: true }, {}, set);
+    try {
+        await entered;
+        let drained = false;
+        const closing = lifecycle.drainWorktreeOperations().then(() => { drained = true; });
+        expect(await call('create', create(), {}, set)).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS' });
+        const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+        expect(drained).toBe(false); expect(existsSync(lock)).toBe(true);
+        release(); await active; await closing;
+        expect(existsSync(lock)).toBe(false); expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+    } finally { release(); await active; }
 });

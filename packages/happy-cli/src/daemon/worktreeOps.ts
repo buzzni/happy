@@ -370,9 +370,17 @@ async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: 
 // ── Serialization ──────────────────────────────────────────────────────────────────────────────
 
 const repositoryQueues = new Map<string, Promise<unknown>>();
+let drainingRepositoryWrites = false;
+
+/** Called before daemon shutdown/handoff releases ownership; never unlock live Git children. */
+export async function drainWorktreeOperations(): Promise<void> {
+    drainingRepositoryWrites = true;
+    await Promise.allSettled([...repositoryQueues.values()]);
+}
 
 /** One operation at a time per repository, so git's own locks never race. Keyed '/'-separated, as git prints the root. */
 async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
+    if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
     const key = slashed(path);
     const previous = repositoryQueues.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(async () => {
@@ -387,7 +395,7 @@ async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
             await mkdir(lock);
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-                throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'Another Git operation is in progress. Retry after it finishes.');
+                throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', `Another Git operation is in progress. Retry after it finishes. If its process terminated, verify no Git writer is running before removing the lock: ${lock}`, { lockPath: lock });
             }
             throw error;
         }
