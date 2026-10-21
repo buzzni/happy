@@ -532,6 +532,8 @@ export async function startHappyServer(
         mandatorySandbox?: boolean;
         /** Authenticated scope launch stays at the parent UID, rather than using agent-sbx. */
         sameUidSandbox?: boolean;
+        /** The agent process runs under the sandbox-runtime wrapper, whose Linux seccomp denies AF_UNIX to the bridge. */
+        wrappedSandbox?: boolean;
         admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
         proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
         /** specs/desktop-next-steps-card — whether the running turn's client draws the card. */
@@ -575,9 +577,11 @@ export async function startHappyServer(
             if (!root.isDirectory() || root.uid !== process.getuid?.() || root.gid !== mcpGroup || (root.mode & 0o777) !== 0o710) throw new Error('Mandatory MCP directory permissions invalid');
         }
         // A 127.0.0.1 port is reachable by every local user, and the bash/browser tools behind it run as
-        // this user, so POSIX sessions use an owner-only socket. Windows, and the same-UID Linux scope
-        // (which denies AF_UNIX), keep TCP behind the bearer below.
-        const useSocket = process.platform !== 'win32' && !(process.platform === 'linux' && options.sameUidSandbox);
+        // this user, so POSIX sessions use an owner-only socket. Windows, the same-UID Linux scope, and an
+        // agent wrapped by sandbox-runtime (both deny AF_UNIX) keep TCP behind the bearer below.
+        const useSocket = process.platform !== 'win32'
+            && !(process.platform === 'linux' && options.sameUidSandbox)
+            && !(options.wrappedSandbox && !options.mandatorySandbox);
         privateDir = useSocket ? mkdtempSync(join(linuxMandatory ? '/run/abp-mcp' : tmpdir(), 'happy-mcp-')) : undefined;
         if (privateDir && mcpGroup !== undefined) {
             chownSync(privateDir, process.getuid!(), mcpGroup);
