@@ -8,9 +8,10 @@
  *
  * - `tools/call` is held until the session's policy gate decides; a refusal is answered here as a
  *   tool error (`isError`) carrying the R12 text, and the call never reaches cua-driver.
- * - Every response with `structuredContent.elements[].element_token` (a `get_window_state`
- *   snapshot) records token → pid, so a later call that names only a token is judged against the
- *   app it really acts on.
+ * - A `get_window_state` response records token → pid for its `structuredContent.elements`, so a
+ *   later call that names only a token is judged against the app it really acts on. A token lives
+ *   as long as its window's snapshot: the next snapshot of that window drops the tokens it no
+ *   longer lists, and a token the proxy does not know leaves the target unresolved (ask).
  * - `tools/list` passes through unchanged; the list is reported to the session for R9 audit.
  *
  * Fail closed: the proxy never exposes cua-driver unjudged. If the policy endpoint cannot be
@@ -25,6 +26,7 @@ import { withoutToolPolicyEnv, type ToolPolicyClient } from './policyClient';
 
 /** Snapshots are per window and superseded quickly; this bounds memory over a long session. */
 const MAX_REMEMBERED_TOKENS = 5000;
+const SNAPSHOT_TOOL = 'get_window_state';
 
 type JsonRpcId = string | number;
 
@@ -58,10 +60,13 @@ export interface CuaProxy {
 export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
     const log = options.log ?? ((message: string) => process.stderr.write(`[happy-cua-proxy] ${message}\n`));
     const child = (options.spawnUpstream ?? defaultSpawn)(options.upstream.command, options.upstream.args, options.upstream.env);
-    const tokens = new Map<string, number>();
+    const tokens = new Map<string, { pid: number; snapshot: string }>();
+    /** Window (`pid:window_id`) → the tokens its latest snapshot issued, oldest window first. */
+    const snapshots = new Map<string, string[]>();
     const held = new Map<string, AbortController>();
     const listRequests = new Set<string>();
-    const forwardedCalls = new Map<string, number | undefined>();
+    /** Forwarded `get_window_state` calls awaiting their snapshot, with the window they asked for. */
+    const forwardedSnapshots = new Map<string, { pid?: number; windowId?: unknown }>();
     let exited = false;
 
     const exit = (code: number) => {
@@ -94,9 +99,10 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
         const key = message?.id === undefined || message.id === null ? null : idKey(message.id);
         if (message && key !== null && message.method === undefined) {
             if (listRequests.delete(key)) reportTools(message.result);
-            if (forwardedCalls.has(key)) {
-                rememberTokens(message.result, forwardedCalls.get(key));
-                forwardedCalls.delete(key);
+            const snapshot = forwardedSnapshots.get(key);
+            if (snapshot) {
+                forwardedSnapshots.delete(key);
+                rememberSnapshot(message.result, snapshot);
             }
         }
         if (!exited) options.output.write(line + '\n');
@@ -123,7 +129,7 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
             const requestId = message.params?.requestId;
             if (typeof requestId === 'string' || typeof requestId === 'number') {
                 held.get(idKey(requestId))?.abort();
-                forwardedCalls.delete(idKey(requestId));
+                forwardedSnapshots.delete(idKey(requestId));
             }
         }
         toUpstream(line);
@@ -139,7 +145,7 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
         // Claude sends its tool_use id, Codex its call id: the approval card attaches to that call.
         const toolUseId = typeof meta['claudecode/toolUseId'] === 'string' ? meta['claudecode/toolUseId']
             : typeof meta.callId === 'string' ? meta.callId : undefined;
-        const elementPid = typeof args.element_token === 'string' ? tokens.get(args.element_token) : undefined;
+        const elementPid = typeof args.element_token === 'string' ? tokens.get(args.element_token)?.pid : undefined;
         const controller = new AbortController();
         held.set(key, controller);
         const verdict = options.policy
@@ -150,7 +156,7 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
         // The client gave up on this call while it waited: it must not run late.
         if (controller.signal.aborted) return;
         if (verdict.kind === 'pass' || verdict.kind === 'allow') {
-            forwardedCalls.set(key, Number.isInteger(args.pid) ? args.pid as number : undefined);
+            if (tool === SNAPSHOT_TOOL) forwardedSnapshots.set(key, { pid: Number.isInteger(args.pid) ? args.pid as number : undefined, windowId: args.window_id });
             toUpstream(line);
             return;
         }
@@ -174,18 +180,30 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
         }
     }
 
-    function rememberTokens(result: Record<string, unknown> | undefined, requestPid: number | undefined): void {
+    function rememberSnapshot(result: Record<string, unknown> | undefined, request: { pid?: number; windowId?: unknown }): void {
         const structured = isRecord(result?.structuredContent) ? result.structuredContent : null;
         if (!structured || !Array.isArray(structured.elements)) return;
-        const snapshotPid = Number.isInteger(structured.pid) ? structured.pid as number : requestPid;
+        const snapshotPid = Number.isInteger(structured.pid) ? structured.pid as number : request.pid;
+        const window = `${snapshotPid ?? '?'}:${String(structured.window_id ?? request.windowId ?? '?')}`;
+        forgetSnapshot(window);
+        const issued: string[] = [];
         for (const element of structured.elements) {
             if (!isRecord(element) || typeof element.element_token !== 'string') continue;
             const pid = Number.isInteger(element.pid) ? element.pid as number : snapshotPid;
             if (pid === undefined) continue;
-            tokens.delete(element.element_token);
-            tokens.set(element.element_token, pid);
+            tokens.set(element.element_token, { pid, snapshot: window });
+            issued.push(element.element_token);
         }
-        while (tokens.size > MAX_REMEMBERED_TOKENS) tokens.delete(tokens.keys().next().value as string);
+        snapshots.set(window, issued);
+        while (tokens.size > MAX_REMEMBERED_TOKENS && snapshots.size > 1) forgetSnapshot(snapshots.keys().next().value as string);
+    }
+
+    function forgetSnapshot(window: string): void {
+        for (const token of snapshots.get(window) ?? []) {
+            // Another window's later snapshot may have issued the same token since.
+            if (tokens.get(token)?.snapshot === window) tokens.delete(token);
+        }
+        snapshots.delete(window);
     }
 
     function reportTools(result: Record<string, unknown> | undefined): void {
@@ -195,7 +213,7 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
     }
 
     return {
-        tokenPid: (token) => tokens.get(token),
+        tokenPid: (token) => tokens.get(token)?.pid,
         stop: () => exit(0),
     };
 }

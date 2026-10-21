@@ -164,6 +164,24 @@ describe('cua-driver shadow proxy', () => {
         expect(t.asked).toMatchObject([{ toolName: 'mcp__cua-driver__click', policy: { reasonCode: 'target_unresolved' } }]);
     });
 
+    // Cross review #4: a token lives as long as its window's snapshot, and only snapshots issue tokens.
+    it('forgets a window\'s tokens when that window is snapshotted again, and records tokens from get_window_state only', async () => {
+        const t = await setup();
+        await t.call('get_window_state', { pid: 12, window_id: 7 });
+        await t.call('get_window_state', { pid: 11, window_id: 5 });
+        await t.call('get_window_state', { pid: 12, window_id: 7 });
+        expect(proxy!.tokenPid('tok-12')).toBeUndefined();
+        expect(proxy!.tokenPid('tok-12-v2')).toBe(12);
+        expect(proxy!.tokenPid('tok-11')).toBe(11);
+
+        await t.call('list_apps', {});
+        expect(proxy!.tokenPid('tok-listed')).toBeUndefined();
+
+        // A stale token names no app the proxy knows: the target is unresolved, so a person is asked.
+        await t.call('click', { element_token: 'tok-12' });
+        expect(t.asked).toMatchObject([{ toolName: 'mcp__cua-driver__click', policy: { reasonCode: 'target_unresolved' } }]);
+    });
+
     // Review #5: nothing reaches cua-driver without a decision.
     it('refuses a batch and drops a call without an id or a line it cannot read', async () => {
         const t = await setup();

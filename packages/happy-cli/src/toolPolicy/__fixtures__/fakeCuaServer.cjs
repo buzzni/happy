@@ -18,6 +18,7 @@ const SCHEMA = {
         text: { type: 'string' },
     },
 };
+const snapshots = new Map();
 let buffer = '';
 process.stdin.on('data', (data) => {
     buffer += data;
@@ -45,7 +46,15 @@ function handle(message) {
         if (process.env.FAKE_CUA_MARKER) fs.appendFileSync(process.env.FAKE_CUA_MARKER, `${name} ${JSON.stringify(args)}\n`);
         if (name === 'crash') process.exit(3);
         if (name === 'get_window_state') {
-            return send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'ok' }], structuredContent: { pid: args.pid, window_id: args.window_id, elements: [{ element_token: `tok-${args.pid}` }] } } });
+            // A window's later snapshots issue new tokens, as cua-driver's do.
+            const window = `${args.pid}:${args.window_id}`;
+            snapshots.set(window, (snapshots.get(window) || 0) + 1);
+            const token = snapshots.get(window) === 1 ? `tok-${args.pid}` : `tok-${args.pid}-v${snapshots.get(window)}`;
+            return send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'ok' }], structuredContent: { pid: args.pid, window_id: args.window_id, elements: [{ element_token: token }] } } });
+        }
+        if (name === 'list_apps') {
+            // Element-shaped data from a tool that does not issue element tokens.
+            return send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'list_apps done' }], structuredContent: { elements: [{ element_token: 'tok-listed', pid: 12 }] } } });
         }
         return send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: `${name} done` }] } });
     }
