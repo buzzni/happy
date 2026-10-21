@@ -72,4 +72,15 @@ describe('runAutomationScript', () => {
     })
     expect(result).toEqual({ ok: true, stdout: 'in-memory-token' })
   })
+
+  it('does not pass another session through explicit environment variables', async () => {
+    const result = await runAutomationScript({
+      command: 'node -e "process.stdout.write(process.env.HAPPY_RECONNECT_SESSION_ID || \'none\')"',
+      cwd: root,
+      timeout: 5_000,
+      allowedRoot: root,
+      environmentVariables: { HAPPY_RECONNECT_SESSION_ID: 'other-session' },
+    })
+    expect(result).toEqual({ ok: true, stdout: 'none' })
+  })
 })

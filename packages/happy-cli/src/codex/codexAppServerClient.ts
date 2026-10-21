@@ -1970,10 +1970,8 @@ export class CodexAppServerClient {
      */
     async prepareSideCommand(args: string[]): Promise<{ command: string; args: string[]; env: Record<string, string> } | null> {
         if (!this.connected || !this.sideCommandAllowed) return null;
-        const env: Record<string, string> = {};
-        for (const [key, value] of Object.entries(this.multiAuthProxy?.env ?? process.env)) {
-            if (typeof value === 'string') env[key] = value;
-        }
+        // The proxy env was built from the app-server's already sanitized env.
+        const env: Record<string, string> = { ...(this.multiAuthProxy?.env ?? sanitizeChildEnv(process.env, { boundary: 'in-session' })) };
         if (this.sandboxEnabled && process.platform === 'darwin') {
             env.CODEX_SANDBOX = 'seatbelt';
         } else if (this.sandboxEnabled && process.platform === 'linux' && env.CODEX_SANDBOX === 'seatbelt') {

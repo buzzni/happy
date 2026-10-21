@@ -14,6 +14,7 @@
 
 import { spawn, ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { sanitizeChildEnv } from '@/utils/childEnv'
 import { tokenizeCommand } from './tokenizeCommand'
 
 export type StartServerErrorCode =
@@ -79,7 +80,8 @@ export function startServerProcess(
         cwd: req.cwd,
         detached: true,
         stdio: 'ignore',
-        env: { ...process.env, ...(req.env ?? {}) },
+        // Like a remote terminal: the request must not carry another session in.
+        env: sanitizeChildEnv({ ...process.env, ...(req.env ?? {}) }),
       })
     } catch (e) {
       reject(new StartServerError('SPAWN_FAILED', (e as Error).message))

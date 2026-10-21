@@ -5667,6 +5667,22 @@ describe('CodexAppServerClient sandbox integration', () => {
             }
         });
 
+        it('gives the side command the agent environment of this session, not the runner seeds', async () => {
+            vi.stubEnv('HAPPY_INITIAL_PROMPT', 'runner seed');
+            vi.stubEnv('SAYCODE_AGENT_ROOT', '/session');
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient();
+            try {
+                await client.connect();
+                const launch = await client.prepareSideCommand(['exec', '-']);
+                expect(launch?.env).not.toHaveProperty('HAPPY_INITIAL_PROMPT');
+                expect(launch?.env.SAYCODE_AGENT_ROOT).toBe('/session');
+            } finally {
+                await client.disconnect();
+                vi.unstubAllEnvs();
+            }
+        });
+
         it('routes through the same multi-auth proxy account as the app-server', async () => {
             mockPrepareCodexMultiAuthProxy.mockResolvedValue({
                 args: ['-c', 'model_provider="codex-multi-auth-runtime-proxy"'],
