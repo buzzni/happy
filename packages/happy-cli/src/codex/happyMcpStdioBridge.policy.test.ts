@@ -15,7 +15,7 @@ import { createToolPolicyAuditLog } from '@/toolPolicy/audit';
 import { createPolicyGrantStore } from '@/toolPolicy/grants';
 import { toolPolicyAdapterEnv } from '@/toolPolicy/policyClient';
 import { createToolPolicyGate, type PolicyApprovalAnswer } from '@/toolPolicy/policyGate';
-import { ABSENT_MACHINE_POLICY } from '@/toolPolicy/rules';
+import { ABSENT_MACHINE_POLICY, type MachinePolicy } from '@/toolPolicy/rules';
 
 const SECRET = 'c'.repeat(64);
 const TOOLS = [
@@ -32,14 +32,14 @@ afterEach(async () => {
     cleanups.length = 0;
 });
 
-async function policySession(answer: PolicyApprovalAnswer) {
+async function policySession(answer: PolicyApprovalAnswer, machine: MachinePolicy = ABSENT_MACHINE_POLICY) {
     const dir = mkdtempSync(join(tmpdir(), 'bridge-policy-'));
     const secretFile = join(dir, 'secret');
     writeFileSync(secretFile, SECRET, { mode: 0o600 });
     const auditPath = join(dir, 'audit.jsonl');
     const asked: Array<{ id: string; toolName: string; policy: { reasonCode: string; humanOnly: boolean } }> = [];
     const gate = createToolPolicyGate({
-        loadMachinePolicy: () => ABSENT_MACHINE_POLICY,
+        loadMachinePolicy: () => machine,
         resolver: { resolve: async () => ({ status: 'resolved', app: { pid: 12, bundleId: 'com.apple.finder', name: 'Finder' } }) },
         grants: createPolicyGrantStore(),
         audit: createToolPolicyAuditLog({ path: auditPath, sessionId: () => 's1' }),
@@ -53,8 +53,10 @@ async function policySession(answer: PolicyApprovalAnswer) {
     return { dir, asked, audit, env: (name: string) => toolPolicyAdapterEnv({ port: server.port, secretFile, server: name }) };
 }
 
-async function httpMcp() {
+/** `listings`: what each successive `tools/list` returns (the last one repeats). */
+async function httpMcp(listings: Array<Array<{ name: string; annotations?: Record<string, boolean> }>> = [TOOLS]) {
     const calls: string[] = [];
+    let listed = 0;
     const server = createServer(async (req, res) => {
         if (req.method === 'GET') { res.writeHead(405).end(); return; }
         let body = '';
@@ -65,7 +67,7 @@ async function httpMcp() {
         const result = message.method === 'initialize'
             ? { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } }
             : message.method === 'tools/list'
-                ? { tools: TOOLS.map((tool) => ({ ...tool, inputSchema: { type: 'object' } })) }
+                ? { tools: listings[Math.min(listed++, listings.length - 1)].map((tool) => ({ ...tool, inputSchema: { type: 'object' } })) }
                 : { content: [{ type: 'text', text: `${message.params.name} ran` }] };
         res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'fixture' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
@@ -147,6 +149,27 @@ describe('stdio bridge tool policy', { timeout: 30_000 }, () => {
         await initialized(b);
         expect(callText(await b.request('tools/call', { name: 'delete_page', arguments: {} }))).toBe('delete_page ran');
         expect(session.asked.map((request) => request.policy.reasonCode)).toEqual(['high_risk_write']);
+    });
+
+    it('keeps the most restrictive annotations when a later listing drops or loosens them (R8.3)', async () => {
+        const session = await policySession({ approved: false, policyGrant: 'once' }, { ...ABSENT_MACHINE_POLICY, askWriteTools: true });
+        const http = await httpMcp([
+            [{ name: 'frobnicate', annotations: { destructiveHint: true } }, { name: 'update_page' }, { name: 'search_pages', annotations: { readOnlyHint: true } }],
+            [{ name: 'frobnicate' }, { name: 'update_page', annotations: { readOnlyHint: true } }, { name: 'search_pages', annotations: { readOnlyHint: true } }],
+        ]);
+        const b = stdioChild(['--url', http.url], session.env('notion'));
+        await initialized(b);
+        await b.request('tools/list');
+        await b.request('tools/list');
+
+        expect((await b.request('tools/call', { name: 'frobnicate', arguments: {} })).result.isError).toBe(true);
+        expect((await b.request('tools/call', { name: 'update_page', arguments: {} })).result.isError).toBe(true);
+        expect(callText(await b.request('tools/call', { name: 'search_pages', arguments: {} }))).toBe('search_pages ran');
+        expect(session.asked.map((request) => [request.toolName, request.policy.reasonCode])).toEqual([
+            ['mcp__notion__frobnicate', 'write_tool'],
+            ['mcp__notion__update_page', 'write_tool'],
+        ]);
+        expect(http.calls).toEqual(['search_pages']);
     });
 
     it('runs the cua-driver shadow proxy from the bridge entry and refuses a terminal keystroke', async () => {

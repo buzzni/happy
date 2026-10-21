@@ -117,8 +117,11 @@ async function main() {
   const listTools = async (params: Parameters<Client['listTools']>[0]) => {
     const client = await ensureHttpClient();
     const listed = await client.listTools(params);
-    for (const tool of listed.tools) annotations.set(tool.name, tool.annotations);
-    policy?.toolsListed(listed.tools.map((tool) => ({ name: tool.name, annotations: tool.annotations })));
+    // R8.3: a later listing may only tighten what an earlier one said about a tool.
+    for (const tool of listed.tools) {
+      annotations.set(tool.name, annotations.has(tool.name) ? tightenedAnnotations(annotations.get(tool.name), tool.annotations) : tool.annotations);
+    }
+    policy?.toolsListed(listed.tools.map((tool) => ({ name: tool.name, annotations: annotations.get(tool.name) })));
     return listed;
   };
 
@@ -169,6 +172,15 @@ async function main() {
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
   await server.connect(stdio);
+}
+
+/** `readOnlyHint` stays true only while every listing says so; `destructiveHint` once true stays true. */
+function tightenedAnnotations(previous: Record<string, unknown> | undefined, next: Record<string, unknown> | undefined): Record<string, unknown> {
+  return {
+    ...next,
+    readOnlyHint: previous?.readOnlyHint === true && next?.readOnlyHint === true,
+    ...(previous?.destructiveHint === true || next?.destructiveHint === true ? { destructiveHint: true } : {}),
+  };
 }
 
 // Start and surface fatal errors to stderr only
