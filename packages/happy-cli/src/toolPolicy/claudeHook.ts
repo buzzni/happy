@@ -11,7 +11,7 @@
 
 import { join } from 'node:path';
 import { parseMcpToolName } from './evaluate';
-import type { ToolPolicyGate } from './policyGate';
+import { snapshotContradictsTarget, type ToolPolicyGate } from './policyGate';
 import { BUILTIN_TABLES, type ToolPolicyTables } from './rules';
 
 /** Hook-decided calls the proxy may still be waiting for; a declined prompt never reaches it. */
@@ -88,7 +88,9 @@ export function buildToolPolicyHookEntries(input: { forwarderCommand: string; fi
  *   again when the call reaches the proxy (as in I1a's hook path).
  * A proxy call the hook did not let through is decided by the proxy, so a mode switch between the
  * two never skips a decision. The proxy lets through only the same tool, in the same provider run
- * (generation), as the hook's verdict.
+ * (generation), as the hook's verdict — and decides again when the call's `element_token` names an
+ * app other than the pid the hook judged (only the proxy saw that snapshot). A token-only call keeps
+ * the hook's verdict: the hook judged an unknown target and a person answered for it.
  */
 export function handOffCuaToShadowProxy(gate: ToolPolicyGate, options: { terminalPrompt: () => boolean; tables?: ToolPolicyTables }): ToolPolicyGate & {
     /**
@@ -123,7 +125,7 @@ export function handOffCuaToShadowProxy(gate: ToolPolicyGate, options: { termina
             const handed = call.origin === 'cua-proxy' && call.toolUseId ? decidedByHook.get(call.toolUseId) : undefined;
             if (handed && call.toolUseId) {
                 decidedByHook.delete(call.toolUseId);
-                if (handed.generation === generation && handed.toolName === call.toolName) return { kind: 'pass' };
+                if (handed.generation === generation && handed.toolName === call.toolName && !snapshotContradictsTarget(call, tables)) return { kind: 'pass' };
             }
             return gate.decide(call, signal);
         },

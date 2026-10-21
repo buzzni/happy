@@ -243,6 +243,16 @@ function withSnapshotPid(request: CuaTargetRequest, args: Record<string, unknown
     return { kind: 'unknown' };
 }
 
+/**
+ * The proxy knows an `element_token` names an app other than the target this call would otherwise
+ * have (another pid, or desktop scope): a verdict reached without the snapshot does not hold.
+ */
+export function snapshotContradictsTarget(call: Pick<PreToolUseCall, 'toolName' | 'toolInput' | 'elementPid'>, tables: ToolPolicyTables = BUILTIN_TABLES): boolean {
+    const args = isRecord(call.toolInput) ? call.toolInput : {};
+    const request = requiredCuaTarget(call.toolName, args, tables);
+    return request.kind !== 'unknown' && withSnapshotPid(request, args, call.elementPid).kind === 'unknown';
+}
+
 /** Shown in Claude's terminal prompt: what needs a person and why. */
 function askMessage(verdict: PolicyVerdict, toolName: string): string {
     const target = verdict.target ? ` (${verdict.target.appName}${verdict.action ? `, ${verdict.action}` : ''})` : '';

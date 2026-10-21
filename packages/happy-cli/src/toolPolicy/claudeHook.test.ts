@@ -395,6 +395,27 @@ describe('cua-driver calls while the shadow proxy runs', () => {
         expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolName}`)).toEqual(['hook mcp__cua-driver__click', 'cua-proxy mcp__cua-driver__type_text']);
     });
 
+    // Review bot (#910): the hook judged `pid`; the proxy alone knows the token's snapshot names
+    // another app. That call is decided again, there (R5.1). A token-only call keeps the hook's
+    // verdict: the hook judged an unknown target and a person answered for it.
+    it('decides again at the proxy when the element token contradicts the pid the hook judged', async () => {
+        const { gate, decided } = countingGate({ kind: 'allow' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        const typed = (origin?: 'cua-proxy', elementPid?: number, toolUseId = 'toolu_1'): PreToolUseCall => ({
+            toolName: 'mcp__cua-driver__type_text', toolInput: { pid: 12, element_token: 'tok-11', text: 'ls' }, toolUseId,
+            ...(origin ? { origin } : {}), ...(elementPid !== undefined ? { elementPid } : {}),
+        });
+        await handed.decide(typed(), signal);
+        await handed.decide(typed('cua-proxy', 11), signal);
+        // Agreeing token: the hook's verdict stands.
+        await handed.decide(typed(undefined, undefined, 'toolu_2'), signal);
+        await handed.decide(typed('cua-proxy', 12, 'toolu_2'), signal);
+        // Token only: the hook's verdict stands.
+        await handed.decide({ ...click(), toolUseId: 'toolu_3', toolInput: { element_token: 'tok-11' } }, signal);
+        await handed.decide({ ...click('cua-proxy', 'toolu_3'), toolInput: { element_token: 'tok-11' }, elementPid: 11 }, signal);
+        expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolUseId}`)).toEqual(['hook toolu_1', 'cua-proxy toolu_1', 'hook toolu_2', 'hook toolu_3']);
+    });
+
     it('leaves every other tool to the gate as before', async () => {
         const { gate, decided } = countingGate({ kind: 'pass' });
         const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => false });
