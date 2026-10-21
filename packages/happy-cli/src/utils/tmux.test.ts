@@ -475,4 +475,49 @@ describe('tmux spawn boundary', () => {
         expect(result).toMatchObject({ success: true, pid: 123 });
         expect(command.mock.calls.filter(([args]) => args[0] === 'new-window')).toHaveLength(1);
     });
+
+    it('does not let a new window inherit another session from the tmux server environment', async () => {
+        // A tmux server started from an agent shell keeps that session's grant
+        // and bound token; `-e` only adds, so whatever the spawn left out
+        // reached the new window unless it is removed explicitly.
+        const tmux = new TmuxUtilities('fixture');
+        const environments: Record<string, string> = {
+            global: [
+                'PATH=/usr/bin',
+                'SAYCODE_AGENT_ROOT=/other/session',
+                'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING={}',
+                'CLAUDE_CODE_OAUTH_TOKEN=other-sessions-bound-token',
+                'APLUS_SESSION_ID=other',
+                'HAPPY_CHECKPOINT_CONTEXT=other',
+            ].join('\n'),
+            session: ['HAPPY_APLUS_MCP_CALLER_GRANT=other-grant', '-HAPPY_CHECKPOINT_CONTEXT'].join('\n'),
+        };
+        let window: string[] = [];
+        vi.spyOn(tmux, 'ensureSessionExists').mockResolvedValue(true);
+        vi.spyOn(tmux, 'executeTmuxCommand').mockImplementation(async (args) => {
+            if (args[0] === 'new-window') window = args;
+            const stdout = args[0] !== 'show-environment' ? '123' : environments[args.includes('-g') ? 'global' : 'session'];
+            return { returncode: 0, stdout, stderr: '', command: args };
+        });
+
+        const result = await tmux.spawnInTmux(['node', 'happy.mjs'], { sessionName: 'fixture' }, { APLUS_SESSION_ID: 'mine' });
+
+        expect(result).toMatchObject({ success: true, pid: 123 });
+        const command = window[window.indexOf('-P') - 1];
+        expect(command).toBe('env -u SAYCODE_AGENT_ROOT -u HAPPY_AI_AUTH_SETUP_TOKEN_BINDING -u CLAUDE_CODE_OAUTH_TOKEN -u HAPPY_APLUS_MCP_CALLER_GRANT node happy.mjs');
+    });
+
+    it('leaves the command alone when the tmux server carries no other session', async () => {
+        const tmux = new TmuxUtilities('fixture');
+        let window: string[] = [];
+        vi.spyOn(tmux, 'ensureSessionExists').mockResolvedValue(true);
+        vi.spyOn(tmux, 'executeTmuxCommand').mockImplementation(async (args) => {
+            if (args[0] === 'new-window') window = args;
+            return { returncode: 0, stdout: args[0] === 'show-environment' ? 'PATH=/usr/bin\nCLAUDE_CODE_OAUTH_TOKEN=personal' : '123', stderr: '', command: args };
+        });
+
+        await tmux.spawnInTmux(['node', 'happy.mjs'], { sessionName: 'fixture' }, {});
+
+        expect(window[window.indexOf('-P') - 1]).toBe('node happy.mjs');
+    });
 });

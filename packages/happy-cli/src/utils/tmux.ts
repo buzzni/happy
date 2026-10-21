@@ -22,6 +22,7 @@
 import { spawn, SpawnOptions } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '@/ui/logger';
+import { sanitizeChildEnv } from './childEnv';
 
 export enum TmuxControlState {
     /** Normal text processing mode */
@@ -567,6 +568,26 @@ export class TmuxUtilities {
     }
 
     /**
+     * Names a new window in `sessionName` would get from the tmux server
+     * (global, then session environment) that no child may inherit
+     * (utils/childEnv), less the ones `env` sets for the window itself.
+     */
+    private async inheritedNamesNoChildMayInherit(sessionName: string, env: Record<string, string>): Promise<string[]> {
+        const inherited: Record<string, string> = {};
+        for (const scope of [['-g'], ['-t', sessionName]]) {
+            const result = await this.executeTmuxCommand(['show-environment', ...scope]);
+            for (const line of result?.returncode === 0 ? result.stdout.split('\n') : []) {
+                const separator = line.indexOf('=');
+                // `-NAME` marks a name the session removes from the global environment.
+                if (line.startsWith('-')) delete inherited[line.slice(1)];
+                else if (separator > 0) inherited[line.slice(0, separator)] = line.slice(separator + 1);
+            }
+        }
+        const kept = sanitizeChildEnv(inherited);
+        return Object.keys(inherited).filter((name) => !(name in kept) && env[name] === undefined && /^[A-Z_][A-Z0-9_]*$/i.test(name));
+    }
+
+    /**
      * Ensure session exists, create if needed
      */
     async ensureSessionExists(sessionName?: string): Promise<boolean> {
@@ -770,8 +791,12 @@ export class TmuxUtilities {
             // Ensure session exists
             await this.ensureSessionExists(sessionName);
 
-            // Build command to execute in the new window
-            const fullCommand = args.join(' ');
+            // Build command to execute in the new window. The window starts from
+            // the tmux server's environment and `-e` only adds to it, so what the
+            // server carries from another session (one started from an agent shell
+            // keeps that session's grant and bound token) is removed explicitly.
+            const staleNames = await this.inheritedNamesNoChildMayInherit(sessionName, env ?? {});
+            const fullCommand = [...staleNames.flatMap((name, index) => index === 0 ? ['env', '-u', name] : ['-u', name]), ...args].join(' ');
 
             // Create new window in session with command and environment variables
             // IMPORTANT: Don't manually add -t here - executeTmuxCommand handles it via parameters

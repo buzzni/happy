@@ -30,6 +30,8 @@ const SPAWN_PATHS: Record<string, [call: string, sites: number]> = {
     'modules/common/registerCommonHandlers.ts': ['sanitizeChildEnv(process.env, { boundary: bashEnvBoundary })', 1],
     'claude/runClaude.ts': ['clearInheritedSessionLineage(process.env)', 1],
     'codex/runCodex.ts': ['clearInheritedSessionLineage(process.env)', 1],
+    // tmux windows start from the tmux server's environment, not the spawn's.
+    'utils/tmux.ts': ['sanitizeChildEnv(inherited)', 1],
 }
 
 describe('child environment wiring', () => {
