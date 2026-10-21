@@ -23,7 +23,9 @@
  *    covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the HAPPY_INITIAL_MODEL /
  *    HAPPY_INITIAL_EFFORT spawn seeds; HAPPY_AUTOMATION_* (run-once, resume
  *    prompt, browser continuation) is read by the runner before agent code runs;
- *    the browser task session secret is read once by the runner's MCP server.
+ *    the browser task session secret is read once by the runner's MCP server;
+ *    HAPPY_APLUS_EXPECTED_* and HAPPY_APLUS_MCP_INITIAL_LIFECYCLE are the
+ *    runner's connector config inputs.
  *  - `session-scope`: the current session's own identity, grants and policy.
  *    Its own children (the agent CLI, its tool shells, `happy agent`) need
  *    them; a process that starts or hosts another session must not carry them.
@@ -36,6 +38,11 @@
  *    credential a session is actually spending is decided per spawn, never
  *    inherited — an un-scrubbed value would make every later session on the
  *    machine meter its tokens against somebody else's credential.
+ *    HAPPY_APLUS_MCP_CALLER_GRANT is the signed user/project grant connectors,
+ *    lessons and scheduled tasks are called with; the browser viewer key and
+ *    the lesson owner marker belong to the same session. Left in a daemon a
+ *    session child restarted, they would reach every spawn without an
+ *    envelope.
  */
 export type NonInheritableEnvKind = 'session-lineage' | 'spawn-seed' | 'session-scope'
 
@@ -59,6 +66,17 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_AI_AUTH_', kind: 'session-scope' },
     { prefix: 'APLUS_SESSION_', kind: 'session-scope' },
     { prefix: 'SAYCODE_AGENT_', kind: 'session-scope' },
+    // Per-session connector inputs the runner keeps in its own env
+    // (fetchAplusMcpServers, refreshMcpCallerGrant). Not the whole HAPPY_APLUS_
+    // prefix: HAPPY_APLUS_MCP_CONFIG_URL and HAPPY_APLUS_STUDIO_ORIGIN are
+    // daemon configuration every session needs. injectMcpCallerGrant drops the
+    // whole prefix from request env and re-adds these only from the envelope.
+    { prefix: 'HAPPY_APLUS_MCP_CALLER_GRANT', kind: 'session-scope' },
+    { prefix: 'HAPPY_BROWSER_VIEWER_', kind: 'session-scope' },
+    { prefix: 'HAPPY_APLUS_EXPECTED_', kind: 'spawn-seed' },
+    { prefix: 'HAPPY_APLUS_MCP_INITIAL_LIFECYCLE', kind: 'spawn-seed' },
+    // Read by CML's native hook inside the agent, so it stays in-session.
+    { prefix: 'CLAUDE_MEMORY_LESSON_OWNER', kind: 'session-scope' },
 ]
 
 /**

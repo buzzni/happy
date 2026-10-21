@@ -68,6 +68,31 @@ describe('sanitizeChildEnv', () => {
         expect(scrubbed).toEqual({ PATH: '/usr/bin' })
     })
 
+    it('keeps the session connector grant inside the session and drops it at a session boundary', () => {
+        const env = {
+            HAPPY_APLUS_MCP_CONFIG_URL: 'https://studio.example/api/me/mcp-config',
+            HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.example',
+            HAPPY_APLUS_MCP_CALLER_GRANT: 'grant',
+            HAPPY_BROWSER_VIEWER_KEY: 'viewer',
+            CLAUDE_MEMORY_LESSON_OWNER: 'host',
+            HAPPY_APLUS_EXPECTED_CONNECTORS: '["gmail"]',
+            HAPPY_APLUS_EXPECTED_MCP_SERVICES: '[]',
+            HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'spawn',
+        }
+        const daemonConfig = {
+            HAPPY_APLUS_MCP_CONFIG_URL: 'https://studio.example/api/me/mcp-config',
+            HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.example',
+        }
+        expect(sanitizeChildEnv(env)).toEqual(daemonConfig)
+        // The agent's MCP tools and CML's native hook still read these; the runner's seeds stop.
+        expect(sanitizeChildEnv(env, { boundary: 'in-session' })).toEqual({
+            ...daemonConfig,
+            HAPPY_APLUS_MCP_CALLER_GRANT: 'grant',
+            HAPPY_BROWSER_VIEWER_KEY: 'viewer',
+            CLAUDE_MEMORY_LESSON_OWNER: 'host',
+        })
+    })
+
     it('drops undefined values so the result is safe for spawn env', () => {
         const scrubbed = sanitizeChildEnv({ KEEP: 'x', GONE: undefined })
         expect(scrubbed).toEqual({ KEEP: 'x' })

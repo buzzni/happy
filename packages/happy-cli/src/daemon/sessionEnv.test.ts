@@ -16,6 +16,7 @@ import {
     captureSaycodeAgentEnvironment as captureSetupTokenEnvironment,
     readSetupTokenResumeSelection,
 } from './sessionEnv'
+import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
 import { readAiAuthConnectionVersion } from '../usage/aiAuthSource'
 import { sanitizeChildEnv } from '../utils/childEnv'
 import { expandEnvironmentVariables } from '../utils/expandEnvVars'
@@ -95,6 +96,43 @@ describe('buildSessionSpawnEnvironment', () => {
             PATH: '/usr/bin',
             HAPPY_RECONNECT_SESSION_ID: 'target-session',
             TASK_TOKEN: 'task-token',
+        })
+    })
+
+    describe('a daemon restarted from inside a session', () => {
+        // A session child (`happy daemon start` in an agent shell, Desktop run from a
+        // session shell) leaves that session's connector grant in the daemon env.
+        // injectMcpCallerGrant filters only the request; the inherited env must not carry it.
+        const daemonEnv = {
+            PATH: '/usr/bin',
+            HAPPY_APLUS_MCP_CONFIG_URL: 'https://studio.example/api/me/mcp-config',
+            HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.example',
+            HAPPY_APLUS_MCP_CALLER_GRANT: 'other-users-grant',
+            HAPPY_BROWSER_VIEWER_KEY: 'other-viewer-key',
+            HAPPY_BROWSER_VIEWER_SCOPE_REQUIRED: '1',
+            HAPPY_APLUS_EXPECTED_CONNECTORS: '["gmail"]',
+            HAPPY_APLUS_EXPECTED_MCP_SERVICES: '["slack"]',
+            HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'resume',
+            CLAUDE_MEMORY_LESSON_OWNER: 'host',
+        }
+
+        it('gives a new session spawned without an envelope no grant of its own', () => {
+            const explicit = injectMcpCallerGrant({}, undefined, daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL)
+            expect(buildSessionSpawnEnvironment(daemonEnv, explicit)).toEqual({
+                PATH: '/usr/bin',
+                HAPPY_APLUS_MCP_CONFIG_URL: 'https://studio.example/api/me/mcp-config',
+                HAPPY_APLUS_STUDIO_ORIGIN: 'https://studio.example',
+            })
+        })
+
+        it('gives an enveloped session only the grant it was sent', () => {
+            const explicit = injectMcpCallerGrant({}, 'this-sessions-grant', undefined, null, ['notion'], 'spawn')
+            expect(buildSessionSpawnEnvironment(daemonEnv, explicit)).toMatchObject({
+                HAPPY_APLUS_MCP_CALLER_GRANT: 'this-sessions-grant',
+                HAPPY_APLUS_EXPECTED_CONNECTORS: '["notion"]',
+                HAPPY_APLUS_MCP_INITIAL_LIFECYCLE: 'spawn',
+            })
+            expect(buildSessionSpawnEnvironment(daemonEnv, explicit)).not.toHaveProperty('HAPPY_BROWSER_VIEWER_KEY')
         })
     })
 })
