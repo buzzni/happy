@@ -146,6 +146,11 @@ describe('Happy MCP transport authentication', () => {
         await withPlatform('linux', { sameUidSandbox: true }, expectTcpBearerOnly);
     });
 
+    it.each(['linux', 'darwin'] as const)('keeps an authenticated TCP transport when sandbox-runtime wraps the agent on %s', async platform => {
+        // The wrapper's seccomp (Linux) and Seatbelt unix-socket rules (macOS) deny the bridge's socket connect.
+        await withPlatform(platform, { wrappedSandbox: true }, expectTcpBearerOnly);
+    });
+
     it.skipIf(process.platform === 'win32')('does not export the bearer for socket sessions', async () => {
         await withPlatform('darwin', {}, async server => {
             expect(server.socketPath).toBeTruthy();
