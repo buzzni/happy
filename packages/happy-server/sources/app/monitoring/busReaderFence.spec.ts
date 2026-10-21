@@ -125,3 +125,13 @@ describe('createBusReaderFence', () => {
         expect(onFence).not.toHaveBeenCalled();
     });
 });
+
+describe('busReaderFenceEnabled', () => {
+    it('is on by default and turned off only by HAPPY_BUS_READER_FENCE=0', async () => {
+        const { busReaderFenceEnabled } = await import('./busReaderFence');
+        expect(busReaderFenceEnabled({})).toBe(true);
+        expect(busReaderFenceEnabled({ HAPPY_BUS_READER_FENCE: '1' })).toBe(true);
+        expect(busReaderFenceEnabled({ HAPPY_BUS_READER_FENCE: '0' })).toBe(false);
+        expect(busReaderFenceEnabled({ HAPPY_BUS_READER_FENCE: 'off' })).toBe(false);
+    });
+});

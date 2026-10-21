@@ -7,8 +7,9 @@ import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClien
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
 import { BROWSER_SYNC_EXPIRES_AT, armBrowserSyncDeadline, authenticateBrowserSyncSocket } from "./socket/browserSyncSocketAuth";
-import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamWriteFailuresCounter, redisStreamWriteDuration, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
+import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamReaderFencesCounter, redisStreamWriteFailuresCounter, redisStreamWriteDuration, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
 import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
+import { busReaderFenceEnabled, createBusReaderFence } from "../monitoring/busReaderFence";
 import { usageHandler } from "./socket/usageHandler";
 import { rpcHandler } from "./socket/rpcHandler";
 import { pingHandler } from "./socket/pingHandler";
@@ -89,6 +90,20 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     if (isRedisConfigured(process.env)) {
         const streamClient = createRedisClient();
 
+        // A replica whose reader is stuck but whose writes still land keeps
+        // looking alive to its peers, and every fetchSockets() waits on it
+        // (2026-10-21). Leave the bus through the normal shutdown path
+        // (io.close() publishes ADAPTER_CLOSE) and let the pod restart.
+        const readerFence = createBusReaderFence({
+            enabled: busReaderFenceEnabled(process.env),
+            onFence: (reason) => {
+                redisStreamReaderFencesCounter.inc({ bus: 'account' });
+                log({ module: 'websocket', level: 'error' },
+                    `leaving the cluster bus: ${reason}; restarting so peers stop waiting on this replica`);
+                process.kill(process.pid, 'SIGTERM');
+            },
+        });
+
         // A failed bus write is otherwise invisible: socket.io-adapter's
         // publish() catches the XADD rejection into a debug() log. Count it
         // here so a pinned-to-replica client (-READONLY) is observable.
@@ -102,13 +117,15 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             }
         }, (result, seconds) => {
             redisStreamWriteDuration.observe({ result }, seconds);
+            readerFence.recordWrite(result, seconds);
             if (result === 'success' && seconds > 0.25 && shouldLogSlowWrite('slow')) {
                 log({ module: 'websocket', level: 'warn' },
                     `cluster bus write slow (${Math.round(seconds * 1000)}ms, throttled to 1/min)`);
             }
         });
 
-        io.adapter(createIsolatedRedisAdapter(streamClient, createRedisClient(), { maxLen: 200000, readCount: 2000 }));
+        io.adapter(createIsolatedRedisAdapter(streamClient, createRedisClient(), { maxLen: 200000, readCount: 2000 },
+            { onRead: (result) => readerFence.recordRead(result) }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
         // Terminal sessions must be resolvable from the replica the daemon is
@@ -138,6 +155,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
                 const headMs = parseInt(headId.split("-")[0]);
                 const readMs = parseInt(lastReadOffset.split("-")[0]);
                 redisStreamLagMsGauge.set(headMs - readMs);
+                readerFence.recordLag(headMs - readMs);
             } catch (error) {
                 // Was a bare `catch {}`. Swallowing it left the lag gauge
                 // frozen at its last value, so a dead bus kept reporting a
@@ -148,6 +166,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
                         `cluster stream XINFO failed (throttled to 1/min) — redis_stream_lag_ms is now stale: ${error}`);
                 }
             }
+            readerFence.evaluate();
         }, 5000);
     }
 

@@ -256,6 +256,13 @@ export const redisStreamWriteDuration = new Histogram({
     registers: [register]
 });
 
+export const redisStreamReaderFencesCounter = new Counter({
+    name: 'redis_stream_reader_fences_total',
+    help: 'Times this replica left the Socket.IO cluster bus because its stream reader stalled while writes stayed fast',
+    labelNames: ['bus'] as const,
+    registers: [register]
+});
+
 export const redisStreamReadFailuresCounter = new Counter({
     name: 'redis_stream_read_failures_total',
     help: 'Failed XREAD commands on the Socket.IO cluster bus',

@@ -97,3 +97,9 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
         },
     };
 }
+
+/** Kill switch without a code change: HAPPY_BUS_READER_FENCE=0 (or off/false) disables fencing. */
+export function busReaderFenceEnabled(env: { HAPPY_BUS_READER_FENCE?: string }): boolean {
+    const value = env.HAPPY_BUS_READER_FENCE?.trim().toLowerCase();
+    return !(value === '0' || value === 'off' || value === 'false');
+}
