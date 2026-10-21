@@ -5,6 +5,7 @@ function setup(overrides: Partial<Parameters<typeof createBusReaderFence>[0]> = 
     let now = 0;
     const onFence = vi.fn();
     const fence = createBusReaderFence({ now: () => now, onFence, ...overrides });
+    fence.recordHealthyPeerReaders(1);
     return { fence, onFence, advance: (ms: number) => { now += ms; }, at: () => now };
 }
 
@@ -109,6 +110,35 @@ describe('createBusReaderFence', () => {
             fence.recordLag(90_000);
             fence.evaluate();
             advance(5_000);
+        }
+        expect(onFence).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fence when no other replica reads fine (shared Redis egress throttled for everyone)', () => {
+        const { fence, onFence, advance } = setup();
+        fence.recordHealthyPeerReaders(0);
+        for (let i = 0; i < 12; i += 1) {
+            fence.recordWrite('success', 0.004);
+            fence.recordRead('failure');
+            fence.recordLag(90_000);
+            fence.evaluate();
+            advance(5_000);
+        }
+        expect(onFence).not.toHaveBeenCalled();
+    });
+
+    it('fences once a healthy peer shows up while the local stall persists', () => {
+        const { fence, onFence, advance } = setup();
+        fence.recordHealthyPeerReaders(0);
+        for (let i = 0; i < 6; i += 1) {
+            fence.recordWrite('success', 0.004); fence.recordRead('failure'); fence.recordLag(90_000);
+            fence.evaluate(); advance(5_000);
+        }
+        expect(onFence).not.toHaveBeenCalled();
+        fence.recordHealthyPeerReaders(2);
+        for (let i = 0; i < 4; i += 1) {
+            fence.recordWrite('success', 0.004); fence.recordRead('failure'); fence.recordLag(90_000);
+            fence.evaluate(); advance(5_000);
         }
         expect(onFence).toHaveBeenCalledTimes(1);
     });

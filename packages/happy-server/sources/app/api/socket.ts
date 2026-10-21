@@ -10,6 +10,8 @@ import { BROWSER_SYNC_EXPIRES_AT, armBrowserSyncDeadline, authenticateBrowserSyn
 import { getMetricsLabelsFromSocket, redisStreamInfoFailuresCounter, redisStreamLagMsGauge, redisStreamReaderFencesCounter, redisStreamWriteFailuresCounter, redisStreamWriteDuration, socketioClusterPeersGauge, websocketConnectionsGauge, websocketEventsCounter } from "../monitoring/metrics2";
 import { createLogThrottle, instrumentStreamWrites, readClusterPeerCount } from "../monitoring/redisHealth";
 import { busReaderFenceEnabled, createBusReaderFence } from "../monitoring/busReaderFence";
+import { BUS_READER_HEALTH_KEY, countHealthyPeerReaders, staleReaderFields } from "../monitoring/busReaderHealth";
+import { hostname } from "node:os";
 import { usageHandler } from "./socket/usageHandler";
 import { rpcHandler } from "./socket/rpcHandler";
 import { pingHandler } from "./socket/pingHandler";
@@ -94,6 +96,8 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         // looking alive to its peers, and every fetchSockets() waits on it
         // (2026-10-21). Leave the bus through the normal shutdown path
         // (io.close() publishes ADAPTER_CLOSE) and let the pod restart.
+        const readerId = `${hostname()}:${process.pid}`;
+        let lastReadOkAt = 0;
         const readerFence = createBusReaderFence({
             enabled: busReaderFenceEnabled(process.env),
             onFence: (reason) => {
@@ -125,7 +129,10 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         });
 
         io.adapter(createIsolatedRedisAdapter(streamClient, createRedisClient(), { maxLen: 200000, readCount: CLUSTER_BUS_READ_COUNT },
-            { onRead: (result) => readerFence.recordRead(result) }));
+            { onRead: (result) => {
+                readerFence.recordRead(result);
+                if (result === 'success') lastReadOkAt = Date.now();
+            } }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
         // Terminal sessions must be resolvable from the replica the daemon is
@@ -155,7 +162,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
                 const headMs = parseInt(headId.split("-")[0]);
                 const readMs = parseInt(lastReadOffset.split("-")[0]);
                 redisStreamLagMsGauge.set(headMs - readMs);
-                readerFence.recordLag(headMs - readMs);
+                // Before the first message is read the offset is "0-0" and the
+                // lag is meaningless (epoch-sized); do not let it count as a stall.
+                if (lastReadOffset !== "0-0") readerFence.recordLag(headMs - readMs);
             } catch (error) {
                 // Was a bare `catch {}`. Swallowing it left the lag gauge
                 // frozen at its last value, so a dead bus kept reporting a
@@ -165,6 +174,17 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
                     log({ module: 'websocket', level: 'error' },
                         `cluster stream XINFO failed (throttled to 1/min) — redis_stream_lag_ms is now stale: ${error}`);
                 }
+            }
+            try {
+                if (lastReadOkAt > 0) await streamClient.hset(BUS_READER_HEALTH_KEY, readerId, String(lastReadOkAt));
+                const entries = await streamClient.hgetall(BUS_READER_HEALTH_KEY);
+                const now = Date.now();
+                readerFence.recordHealthyPeerReaders(countHealthyPeerReaders(entries, readerId, now));
+                const stale = staleReaderFields(entries, readerId, now);
+                if (stale.length > 0) await streamClient.hdel(BUS_READER_HEALTH_KEY, ...stale);
+            } catch {
+                // Unknown peer health must never license a fence.
+                readerFence.recordHealthyPeerReaders(0);
             }
             readerFence.evaluate();
         }, 5000);

@@ -11,8 +11,10 @@
 // Readiness cannot fix this (it does not touch bus membership) and must stay
 // decoupled from shared dependencies (specs/readiness-probe-decoupling). So the
 // fence only fires on a *local* asymmetry: reads stalled while this replica's
-// own writes to the same Redis are still fast. A shared Redis slowdown makes
-// writes slow or failing too, and then no replica fences itself.
+// own writes to the same Redis are still fast, *and* at least one other
+// replica reports that it is reading fine. A shared Redis slowdown makes writes
+// slow or failing; Redis-side egress throttling (which hits large reads while
+// small writes stay fast) stalls every reader. Either way no replica fences.
 
 export type BusReaderFenceOptions = {
     now?: () => number;
@@ -34,6 +36,8 @@ export type BusReaderFence = {
     recordRead(result: 'success' | 'failure'): void;
     recordWrite(result: 'success' | 'failure', seconds: number): void;
     recordLag(lagMs: number): void;
+    /** Other replicas whose own reader succeeded recently (from the shared reader-health hash). */
+    recordHealthyPeerReaders(count: number): void;
     evaluate(): void;
     readonly fenced: boolean;
 };
@@ -52,6 +56,7 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
     let lastFastWriteAt: number | null = null;
     let lastBadWriteAt: number | null = null;
     let stallSince: number | null = null;
+    let healthyPeerReaders = 0;
     let fenced = false;
 
     const writesHealthy = (at: number) =>
@@ -78,11 +83,14 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
         recordLag(value) {
             lagMs = value;
         },
+        recordHealthyPeerReaders(count) {
+            healthyPeerReaders = count;
+        },
         evaluate() {
             if (!enabled || fenced) return;
             const at = now();
             const reason = stallReason();
-            if (reason === null || !writesHealthy(at)) {
+            if (reason === null || !writesHealthy(at) || healthyPeerReaders < 1) {
                 stallSince = null;
                 return;
             }
@@ -90,7 +98,8 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
             if (at - stallSince < sustainMs) return;
             fenced = true;
             const prefix = consecutiveFailures >= maxFailures ? 'reads stalled' : 'reader behind';
-            options.onFence(`${prefix}: ${reason} for ${Math.round((at - stallSince) / 1000)}s while writes stay fast`);
+            options.onFence(`${prefix}: ${reason} for ${Math.round((at - stallSince) / 1000)}s while writes stay fast`
+                + ` and ${healthyPeerReaders} other replica(s) read fine`);
         },
         get fenced() {
             return fenced;
