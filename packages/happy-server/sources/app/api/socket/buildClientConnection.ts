@@ -21,5 +21,7 @@ export function buildClientConnection(socket: Socket): ClientConnection {
     if (clientType === 'machine-scoped' && machineId) {
         return { connectionType: 'machine-scoped', socket, userId, machineId, happyClient };
     }
-    return { connectionType: 'user-scoped', socket, userId, happyClient };
+    return socket.data.transportOnly === true
+        ? { connectionType: 'user-scoped', socket, userId, happyClient, transportOnly: true }
+        : { connectionType: 'user-scoped', socket, userId, happyClient };
 }

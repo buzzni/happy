@@ -313,6 +313,10 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         socket.data.clientType = clientType;
         socket.data.sessionId = sessionId;
         socket.data.machineId = machineId;
+        // Send-only user-scoped sockets (desktop RPC pool, terminal relay)
+        // stay out of the fan-out room. Kept on `data`, not read from the
+        // handshake later, because a recovered socket skips this middleware.
+        if (socket.handshake.auth.transportOnly === true) socket.data.transportOnly = true;
         // Recency signal for picking between two live sockets of the same
         // daemon (a reconnect after a network flap leaves the dead one around
         // until engine.io gives up). The old code relied on Set insertion
