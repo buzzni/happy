@@ -153,6 +153,7 @@ function sessionStub() {
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+let getOrCreateSession: ReturnType<typeof vi.fn>;
 const closeQueue = () => { queues[0]!.close(); };
 
 describe('automatic continuation after a capacity failure', () => {
@@ -172,13 +173,14 @@ describe('automatic continuation after a capacity failure', () => {
         const { ApiClient } = await import('@/api/api');
         const stub = sessionStub();
         const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/workspace/project');
+        getOrCreateSession = vi.fn(async () => ({
+            id: 'sess-1', seq: 0, encryptionKey: new Uint8Array(32).fill(7),
+            encryptionVariant: 'dataKey', metadata: sessionMetadata, metadataVersion: 0,
+            agentState: null, agentStateVersion: 0,
+        }));
         const createSpy = vi.spyOn(ApiClient, 'create').mockResolvedValue({
             getOrCreateMachine: vi.fn(async () => ({ id: 'machine-test' })),
-            getOrCreateSession: vi.fn(async () => ({
-                id: 'sess-1', seq: 0, encryptionKey: new Uint8Array(32).fill(7),
-                encryptionVariant: 'dataKey', metadata: sessionMetadata, metadataVersion: 0,
-                agentState: null, agentStateVersion: 0,
-            })),
+            getOrCreateSession,
             sessionSyncClient: vi.fn(() => stub),
             push: vi.fn(() => ({ sendToAllDevices: vi.fn() })),
         } as never);
@@ -360,6 +362,19 @@ describe('automatic continuation after a capacity failure', () => {
             vi.stubEnv('HAPPY_AUTOMATION_RUN_ONCE', '1');
             vi.stubEnv('HAPPY_INITIAL_PROMPT', 'review the pull request');
         });
+
+        // aplus-dev-studio specs/session-source-metadata — same contract as runClaude: recorded
+        // once, and gone from this process's env so the session's own shell does not inherit it.
+        it('records the daemon-supplied session source and removes it from the environment', async () => {
+            vi.stubEnv('HAPPY_CREATED_BY_SOURCE', 'schedule');
+            script = [{ outcome: 'ok' }];
+            await runOnce();
+
+            expect(getOrCreateSession).toHaveBeenCalledWith(expect.objectContaining({
+                metadata: expect.objectContaining({ source: 'schedule' }),
+            }));
+            expect(process.env.HAPPY_CREATED_BY_SOURCE).toBeUndefined();
+        }, 60_000);
 
         it('continues a turn that ended at capacity before exiting', async () => {
             script = [{ outcome: 'overloaded' }, { outcome: 'ok' }];
