@@ -19,6 +19,7 @@ export function createIsolatedRedisAdapter(
     writer: Redis,
     reader: Redis,
     options: Parameters<typeof createAdapter>[1],
+    hooks: { onRead?: (result: 'success' | 'failure', seconds: number) => void } = {},
 ): ReturnType<typeof createAdapter> {
     const active = new Set<ReturnType<ReturnType<typeof createAdapter>>>();
     const bus = options?.streamName === 'socket.io.managed' ? 'managed' : 'account';
@@ -28,6 +29,7 @@ export function createIsolatedRedisAdapter(
         // Closing the last namespace intentionally disconnects its pending read.
         if (active.size === 0) return;
         redisStreamReadDuration.observe({ bus, result }, seconds);
+        try { hooks.onRead?.(result, seconds); } catch { /* A hook must not stop the stream reader. */ }
         if (result === 'failure') {
             const code = redisErrorCode(error);
             redisStreamReadFailuresCounter.inc({ bus, code });

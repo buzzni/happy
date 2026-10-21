@@ -200,6 +200,22 @@ describe('createIsolatedRedisAdapter', () => {
         }
     });
 
+    it('reports every read outcome to the onRead hook so a stalled reader can be fenced', async () => {
+        const writer = redisConnection();
+        const reader = redisConnection();
+        reader.xread.mockRejectedValueOnce(new Error('Command timed out'))
+            .mockRejectedValueOnce(new Error('Command timed out')).mockResolvedValueOnce(null);
+        const onRead = vi.fn();
+        const io = new Server({ adapter: createIsolatedRedisAdapter(writer.client, reader.client, {}, { onRead }) });
+        try {
+            await flush();
+            expect(onRead.mock.calls.map(([result]) => result)).toEqual(['failure', 'failure', 'success']);
+        } finally {
+            io.of('/').adapter.close();
+            writer.client.disconnect();
+        }
+    });
+
     it('does not count the intentional shutdown rejection as a read failure', async () => {
         const writer = redisConnection();
         const reader = redisConnection();
