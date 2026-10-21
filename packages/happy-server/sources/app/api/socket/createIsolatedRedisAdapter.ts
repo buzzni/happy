@@ -15,6 +15,17 @@ import type { Redis } from 'ioredis';
  */
 export const RESTORE_SESSION_TIMEOUT_MS = 3_000;
 
+/*
+ * Entries per XREAD. The 0.2.x adapter re-requests the same offset after a
+ * failed read, so a reply that cannot arrive inside the 5s commandTimeout is a
+ * permanent stall. On 2026-10-21 COUNT 2000 replies were 6-10MB and a degraded
+ * node read them at ~0.6MB/s (10-16s). 200 keeps a typical reply near 1MB.
+ * BLOCK 100 only waits when nothing is pending, so a backlog still drains one
+ * round trip per 200 entries, far above prod's ~100 writes/s. A single
+ * multi-MB entry can still exceed the timeout; the bus reader fence covers it.
+ */
+export const CLUSTER_BUS_READ_COUNT = 200;
+
 export function createIsolatedRedisAdapter(
     writer: Redis,
     reader: Redis,

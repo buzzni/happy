@@ -352,3 +352,12 @@ describe('createIsolatedRedisAdapter', () => {
         }
     });
 });
+
+describe('CLUSTER_BUS_READ_COUNT', () => {
+    it('keeps one XREAD reply small enough to finish inside the 5s command timeout on a slow path', async () => {
+        const { CLUSTER_BUS_READ_COUNT } = await import('./createIsolatedRedisAdapter');
+        // 2026-10-21 prod: COUNT 2000 replies were 6-10MB; a degraded node read them at ~0.6MB/s (10-16s).
+        const prodBytesPerEntry = 10_000_000 / 2000;
+        expect(CLUSTER_BUS_READ_COUNT * prodBytesPerEntry / 600_000).toBeLessThan(5);
+    });
+});

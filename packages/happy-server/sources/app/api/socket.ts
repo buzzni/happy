@@ -2,7 +2,7 @@ import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
 import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { Server } from "socket.io";
-import { createIsolatedRedisAdapter } from "./socket/createIsolatedRedisAdapter";
+import { CLUSTER_BUS_READ_COUNT, createIsolatedRedisAdapter } from "./socket/createIsolatedRedisAdapter";
 import { createRedisClient, isRedisConfigured } from "@/storage/createRedisClient";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
@@ -124,7 +124,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             }
         });
 
-        io.adapter(createIsolatedRedisAdapter(streamClient, createRedisClient(), { maxLen: 200000, readCount: 2000 },
+        io.adapter(createIsolatedRedisAdapter(streamClient, createRedisClient(), { maxLen: 200000, readCount: CLUSTER_BUS_READ_COUNT },
             { onRead: (result) => readerFence.recordRead(result) }));
         log({ module: 'websocket' }, 'Redis streams adapter enabled for multi-process support');
 
@@ -316,7 +316,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             // Its own stream: managed traffic and legacy traffic must not share
             // a bus that either side can read.
             ? createIsolatedRedisAdapter(createRedisClient(), createRedisClient(), {
-                streamName: 'socket.io.managed', maxLen: 200000, readCount: 2000,
+                streamName: 'socket.io.managed', maxLen: 200000, readCount: CLUSTER_BUS_READ_COUNT,
             }) as never
             : undefined,
     });
