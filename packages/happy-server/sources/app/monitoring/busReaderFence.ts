@@ -30,6 +30,8 @@ export type BusReaderFenceOptions = {
     writeFreshMs?: number;
     /** How long the stall must hold, with healthy writes, before fencing. */
     sustainMs?: number;
+    /** A lag sample older than this is unknown, not a stall (the 5s XINFO tick can fail). */
+    lagFreshMs?: number;
 };
 
 export type BusReaderFence = {
@@ -50,9 +52,11 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
     const fastWriteSeconds = options.fastWriteSeconds ?? 1;
     const writeFreshMs = options.writeFreshMs ?? 15_000;
     const sustainMs = options.sustainMs ?? 15_000;
+    const lagFreshMs = options.lagFreshMs ?? 12_000;
 
     let consecutiveFailures = 0;
     let lagMs = 0;
+    let lagAt: number | null = null;
     let lastFastWriteAt: number | null = null;
     let lastBadWriteAt: number | null = null;
     let stallSince: number | null = null;
@@ -64,10 +68,11 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
         && at - lastFastWriteAt <= writeFreshMs
         && (lastBadWriteAt === null || lastBadWriteAt < lastFastWriteAt);
 
-    const stallReason = (): string | null => {
+    const stallReason = (at: number): string | null => {
         const parts: string[] = [];
         if (consecutiveFailures >= maxFailures) parts.push(`${consecutiveFailures} consecutive read failures`);
-        if (lagMs >= maxLagMs) parts.push(`stream lag ${Math.round(lagMs)}ms`);
+        const lagFresh = lagAt !== null && at - lagAt <= lagFreshMs;
+        if (lagFresh && lagMs >= maxLagMs) parts.push(`stream lag ${Math.round(lagMs)}ms`);
         return parts.length > 0 ? parts.join(', ') : null;
     };
 
@@ -82,6 +87,7 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
         },
         recordLag(value) {
             lagMs = value;
+            lagAt = now();
         },
         recordHealthyPeerReaders(count) {
             healthyPeerReaders = count;
@@ -89,7 +95,7 @@ export function createBusReaderFence(options: BusReaderFenceOptions): BusReaderF
         evaluate() {
             if (!enabled || fenced) return;
             const at = now();
-            const reason = stallReason();
+            const reason = stallReason(at);
             if (reason === null || !writesHealthy(at) || healthyPeerReaders < 1) {
                 stallSince = null;
                 return;

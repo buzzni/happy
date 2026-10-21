@@ -143,6 +143,18 @@ describe('createBusReaderFence', () => {
         expect(onFence).toHaveBeenCalledTimes(1);
     });
 
+    it('ignores a lag that stopped being refreshed (XINFO failing) instead of fencing on a stale value', () => {
+        const { fence, onFence, advance } = setup();
+        fence.recordLag(90_000);
+        for (let i = 0; i < 8; i += 1) {
+            fence.recordWrite('success', 0.004);
+            fence.recordRead('success');
+            fence.evaluate();
+            advance(5_000);
+        }
+        expect(onFence).not.toHaveBeenCalled();
+    });
+
     it('can be disabled', () => {
         const { fence, onFence, advance } = setup({ enabled: false });
         for (let i = 0; i < 12; i += 1) {
