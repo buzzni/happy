@@ -50,16 +50,27 @@ export function isAllowedCorsOrigin(origin: string | undefined): boolean {
 const API_CORS_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
 
 /**
+ * Origins of the packaged desktop renderer, matched as exact strings.
+ *
+ * `null` is the renderer served from file://. `app://renderer` is the renderer served from the
+ * standard `app://` scheme (desktop ADR 062-renderer-app-scheme-code-cache). A custom scheme has an
+ * opaque WHATWG origin (`new URL('app://renderer').origin === 'null'`), so it can never pass the
+ * URL-based allow-list above and must be matched before any parsing.
+ */
+const DESKTOP_RENDERER_ORIGINS = new Set(['null', 'app://renderer']);
+/** Chromium's ceiling. Without it a preflight is remembered for 5s and every Bearer request pays an OPTIONS round trip. */
+const DESKTOP_RENDERER_PREFLIGHT_MAX_AGE_SECONDS = 7200;
+
+/**
  * Per-request CORS options for the HTTP API.
  *
- * Allowed studio origins get credentialed CORS. `Origin: null` is the packaged desktop renderer,
- * which runs from file://: it gets CORS without credentials. The API authenticates with Bearer
- * tokens, so a response read through that origin carries no ambient authority. Everything else
- * gets no CORS headers.
+ * Allowed studio origins get credentialed CORS. The packaged desktop renderer origins get CORS
+ * without credentials. The API authenticates with Bearer tokens, so a response read through those
+ * origins carries no ambient authority. Everything else gets no CORS headers.
  */
 export function fastifyCorsDelegate(
     request: { url?: string; headers: { origin?: string | string[]; [LOCALHOST_PREVIEW_HEADER]?: string | string[] } },
-    callback: (error: Error | null, options: { origin: string | boolean; credentials?: boolean; methods: string[] }) => void,
+    callback: (error: Error | null, options: { origin: string | boolean; credentials?: boolean; methods: string[]; maxAge?: number }) => void,
 ): void {
     if (request.url?.startsWith('/v1/preview/') && request.headers[LOCALHOST_PREVIEW_HEADER] === LOCALHOST_PREVIEW_VERSION) {
         callback(null, { origin: false, methods: API_CORS_METHODS });
@@ -68,8 +79,8 @@ export function fastifyCorsDelegate(
     const origin = typeof request.headers.origin === 'string' ? request.headers.origin : undefined;
     if (origin && isAllowedCorsOrigin(origin)) {
         callback(null, { origin, credentials: true, methods: API_CORS_METHODS });
-    } else if (origin === 'null') {
-        callback(null, { origin: 'null', credentials: false, methods: API_CORS_METHODS });
+    } else if (origin && DESKTOP_RENDERER_ORIGINS.has(origin)) {
+        callback(null, { origin, credentials: false, methods: API_CORS_METHODS, maxAge: DESKTOP_RENDERER_PREFLIGHT_MAX_AGE_SECONDS });
     } else {
         callback(null, { origin: false, methods: API_CORS_METHODS });
     }

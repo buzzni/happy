@@ -37,6 +37,7 @@ import { setManagedControlRuntime } from "@/app/api/socket/managedDaemonOutbound
 import { installManagedDaemonRpcExecutor } from "@/app/api/socket/managedDaemonRpcRelay";
 import type { ManagedDaemonClaims } from "@/app/auth/managedDaemonToken";
 import { socketCorsOrigin } from "./cors";
+import { buildClientConnection, transportOnlyFromHandshake } from "@/app/api/socket/buildClientConnection";
 
 export function startSocket(app: Fastify, managedControl: ManagedControlRuntime | null = null) {
     // engine.io claims `/v1/updates` purely by path prefix, blind to Host —
@@ -312,6 +313,10 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         socket.data.clientType = clientType;
         socket.data.sessionId = sessionId;
         socket.data.machineId = machineId;
+        // Send-only user-scoped sockets (desktop RPC pool, terminal relay)
+        // stay out of the fan-out room. Kept on `data`, not read from the
+        // handshake later, because a recovered socket skips this middleware.
+        if (transportOnlyFromHandshake(socket.handshake.auth)) socket.data.transportOnly = true;
         // Recency signal for picking between two live sockets of the same
         // daemon (a reconnect after a network flap leaves the dead one around
         // until engine.io gives up). The old code relied on Set insertion
@@ -367,33 +372,7 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         log({ module: 'websocket' }, `Token verified: ${userId}, clientType: ${clientType || 'user-scoped'}, client: ${labels.client}, sessionId: ${sessionId || 'none'}, machineId: ${machineId || 'none'}, socketId: ${socket.id}`);
 
         // Store connection based on type
-        const metadata = { clientType: clientType || 'user-scoped', sessionId, machineId };
-        const happyClient = socket.data.happyClient as string | undefined;
-        let connection: ClientConnection;
-        if (metadata.clientType === 'session-scoped' && sessionId) {
-            connection = {
-                connectionType: 'session-scoped',
-                socket,
-                userId,
-                sessionId,
-                happyClient
-            };
-        } else if (metadata.clientType === 'machine-scoped' && machineId) {
-            connection = {
-                connectionType: 'machine-scoped',
-                socket,
-                userId,
-                machineId,
-                happyClient
-            };
-        } else {
-            connection = {
-                connectionType: 'user-scoped',
-                socket,
-                userId,
-                happyClient
-            };
-        }
+        const connection: ClientConnection = buildClientConnection(socket);
         eventRouter.addConnection(userId, connection);
         websocketConnectionsGauge.inc({ type: connection.connectionType, ...labels });
 

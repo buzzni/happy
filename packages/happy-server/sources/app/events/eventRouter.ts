@@ -22,6 +22,16 @@ export interface UserScopedConnection {
     socket: Socket;
     userId: string;
     happyClient?: string;
+    /**
+     * Opened only to send (RPC calls, a terminal relay, a title write). Keeps
+     * every user-scoped handler but never joins the user-scoped fan-out room,
+     * so nothing addressed to `user-scoped-only` / `all-interested-in-session`
+     * reaches it and it does not count as a human watching a screen. It still
+     * joins the account room `user:{id}`, so an emit with the default
+     * `all-user-authenticated-connections` filter would reach it. Opt-in by the
+     * client handshake; older clients and servers keep today's behaviour.
+     */
+    transportOnly?: true;
 }
 
 export interface MachineScopedConnection {
@@ -270,7 +280,7 @@ class EventRouter {
 
         switch (connection.connectionType) {
             case 'user-scoped':
-                socket.join(userScopedRoom(userId));
+                if (!connection.transportOnly) socket.join(userScopedRoom(userId));
                 break;
             case 'session-scoped':
                 socket.join(`user:${userId}:session:${connection.sessionId}`);
