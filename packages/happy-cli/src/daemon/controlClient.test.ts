@@ -206,3 +206,22 @@ it('uses only the authenticated loopback daemon for device status and confirmati
   expect(fetchSpy.mock.calls[0][1]?.headers).toMatchObject({Authorization:'Bearer local-only-secret'});
  }finally{fetchSpy.mockRestore();}
 });
+
+// aplus specs/shared-machine-server-signing S6b — the CLI explains each refusal by the daemon's own code.
+it('passes the daemon\'s refusal code and the declined state of use-as-shared through to the command',async()=>{
+ const {useDeviceAsShared}=await import('./controlClient');
+ const state={...stateWithPid(process.pid),controlSecret:'local-only-secret'};
+ mocks.mockReadDaemonStateSnapshot.mockResolvedValue({state,raw:JSON.stringify(state)});
+ const fetchSpy=vi.spyOn(globalThis,'fetch')
+  .mockResolvedValueOnce(new Response(JSON.stringify({accepted:true,confirmed:false,declined:true}),{status:200}))
+  .mockResolvedValueOnce(new Response(JSON.stringify({code:'DEVICE_PIN_PERSIST_FAILED'}),{status:409}))
+  .mockResolvedValueOnce(new Response('not json',{status:409}))
+  .mockResolvedValueOnce(new Response(JSON.stringify({code:'/home/user/.happy secret path'}),{status:409}));
+ try {
+  await expect(useDeviceAsShared('company')).resolves.toEqual({accepted:true,confirmed:false,declined:true});
+  await expect(useDeviceAsShared('company')).rejects.toThrow('DEVICE_PIN_PERSIST_FAILED');
+  await expect(useDeviceAsShared('company')).rejects.toThrow('DEVICE_USE_AS_SHARED_REFUSED');
+  // Only a code-shaped value is passed on; anything else in the body never reaches the message.
+  await expect(useDeviceAsShared('company')).rejects.toThrow(/^DEVICE_USE_AS_SHARED_REFUSED$/);
+ }finally{fetchSpy.mockRestore();}
+});

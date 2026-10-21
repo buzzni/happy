@@ -189,8 +189,12 @@ async function daemonPost(
     if (!response.ok) {
       const errorMessage = `Request failed: ${path}, HTTP ${response.status}`;
       logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
+      // The daemon's own refusal code, when it sent one; never other body fields.
+      let code: unknown;
+      try { code = ((await response.json()) as { code?: unknown } | null)?.code; } catch { code = undefined; }
       return {
-        error: errorMessage, status: response.status
+        error: errorMessage, status: response.status,
+        ...(typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code) ? { code } : {}),
       };
     }
     
@@ -504,6 +508,13 @@ export async function confirmDeviceOrganization(input: { companyId: string; mach
   const result = await daemonPost('/device/confirm-org-key', input);
   if (result.error || result.locallyConfirmed !== true) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
   return { locallyConfirmed: true };
+}
+/** aplus specs/shared-machine-server-signing S6b — loopback only; a refusal (already marked, nothing waiting) is 409. */
+export async function useDeviceAsShared(companyId: string): Promise<{ accepted: true; confirmed: boolean; declined: boolean }> {
+  const result = await daemonPost('/device/use-as-shared', { companyId });
+  if (result.status === 409) throw new Error(result.code ?? 'DEVICE_USE_AS_SHARED_REFUSED');
+  if (result.error || result.accepted !== true) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
+  return { accepted: true, confirmed: result.confirmed === true, declined: result.declined === true };
 }
 
 /**

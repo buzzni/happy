@@ -60,6 +60,8 @@ describe('machineServerLane', () => {
 
 it('never allows remote device confirmation', () => {
     expect(SERVER_LANE_METHODS.has('device:confirm')).toBe(false);
+    // aplus specs/shared-machine-server-signing S6c — only an administrator's customer-key request may mark a PC shared.
+    expect(SERVER_LANE_METHODS.has('device:use-as-shared')).toBe(false);
     expect(SERVER_LANE_METHODS.has('device:enroll')).toBe(true);
 });
 

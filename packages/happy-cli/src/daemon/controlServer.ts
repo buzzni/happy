@@ -256,6 +256,32 @@ export function startDaemonControlServer({
       }
     });
 
+    // aplus specs/shared-machine-server-signing S6b — the PC's own "use as the organization's shared PC" (Desktop·CLI).
+    // Separate from /device/status, whose response Desktop parses strictly.
+    const sharedRequest = z.object({ companyId: z.string().min(1).max(512).regex(/^[^\u0000-\u001f\u007f-\u009f]+$/) }).strict();
+    app.post('/device/shared-status', { bodyLimit: 4096 }, async (request, reply) => {
+      if (request.headers.origin !== undefined) return reply.code(403).send({ code: 'DEVICE_LOCAL_CONFIRM_REQUIRED' });
+      const parsed = sharedRequest.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: 'DEVICE_STATUS_INVALID' });
+      const enrollment = getDeviceEnrollment();
+      if (!enrollment) return reply.code(409).send({ code: 'DEVICE_ENROLLMENT_UNAVAILABLE' });
+      try { return await enrollment.sharedStatus(parsed.data.companyId); }
+      catch { return reply.code(409).send({ code: 'DEVICE_STATUS_UNAVAILABLE' }); }
+    });
+    app.post('/device/use-as-shared', { bodyLimit: 4096 }, async (request, reply) => {
+      if (request.headers.origin !== undefined) return reply.code(403).send({ code: 'DEVICE_LOCAL_CONFIRM_REQUIRED' });
+      const parsed = sharedRequest.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ code: 'DEVICE_USE_AS_SHARED_INVALID' });
+      const enrollment = getDeviceEnrollment();
+      if (!enrollment) return reply.code(409).send({ code: 'DEVICE_ENROLLMENT_UNAVAILABLE' });
+      try { return await enrollment.useAsShared({ companyId: parsed.data.companyId, machineId: enrollment.machineId }, 'local'); }
+      catch (error) {
+        const code = error instanceof Error && ['DEVICE_MACHINE_TYPE_SET', 'DEVICE_AUTO_APPROVAL_REQUIRED', 'DEVICE_USE_AS_SHARED_UNAVAILABLE',
+          'DEVICE_ENROLLMENT_REPLACED', 'DEVICE_PIN_PERSIST_FAILED', 'DEVICE_ENROLLMENT_EXPIRED'].includes(error.message) ? error.message : 'DEVICE_USE_AS_SHARED_FAILED';
+        return reply.code(409).send({ code });
+      }
+    });
+
     // Same secret, same loopback trust boundary — but a WS upgrade never goes
     // through Fastify's route handlers/hooks above, so it needs its own check
     // at `verifyClient` (attachTerminalWsRoute).
