@@ -54,3 +54,32 @@ describe('lesson proposal turn', () => {
         expect(state.take('turn')).toEqual({});
     });
 });
+
+// specs/host-lesson-matching-2026-10-18 P0: prefer revising an existing lesson
+// over adding a near-duplicate, and name new lessons by task class.
+describe('lesson proposal instruction', () => {
+    const START = 'If this turn corrects an earlier mistake or verifies recovery from a failure, you may propose one reusable project lesson before finishing.';
+    const END = 'Do not perform extra work just to generate a lesson.';
+    it('keeps the boundaries stores strip the wrapper by, as one paragraph', () => {
+        for (const lessonUpdates of [true, false]) {
+            const text = createLessonProposalTurn().begin('t', 1, { lessonUpdates });
+            expect(text.startsWith(START)).toBe(true);
+            expect(text.endsWith(END)).toBe(true);
+            expect(text).not.toContain('\n');
+        }
+    });
+    it('asks to revise a lesson already in play and to name new lessons by task class', () => {
+        const text = createLessonProposalTurn().begin('t', 1, { lessonUpdates: true });
+        expect(text).toContain('updatesLesson');
+        expect(text).toMatch(/PR or issue number/);
+    });
+    it('does not offer updatesLesson when the installed store cannot apply it', () => {
+        const text = createLessonProposalTurn().begin('t', 1);
+        expect(text).not.toContain('updatesLesson');
+        expect(text).toMatch(/PR or issue number/);
+    });
+    it('carries the store capability from prepare into the instruction', async () => {
+        const text = await createLessonProposalTurn().prepare('t', async () => ({ revision: 3, lessonUpdates: true }));
+        expect(text).toContain('updatesLesson');
+    });
+});

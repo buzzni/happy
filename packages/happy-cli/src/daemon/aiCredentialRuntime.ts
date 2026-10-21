@@ -35,7 +35,7 @@ import {
   serializeInvalidatedClaudeProvenance,
 } from './aiCredentialProvenance'
 import { SETUP_TOKEN_BINDING_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
-import { readTrustedStudioOrigin, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
+import { readTrustedStudioOrigin, setupTokenCredentialMatches, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
@@ -2185,13 +2185,18 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       if (!deps.setupTokenBinding || !selection.bindingGrant) throw unavailable()
       const claims = await deps.setupTokenBinding.verify(selection.bindingGrant)
       if (!claims || claims.managedAccountId !== managedAccountId || claims.groupScope !== groupScope
-        || claims.credentialGeneration !== credentialGeneration) throw unavailable()
+        || claims.credentialGeneration !== credentialGeneration || (selection.credentialProofVersion === 1 && !claims.tokenProof)) throw unavailable()
       const { companyId, userId, machineId, keyId, nonce, issuedAt } = claims
-      binding = { managedAccountId, credentialGeneration, groupScope, companyId, userId, machineId, keyId, nonce, issuedAt }
+      binding = { managedAccountId, credentialGeneration, groupScope, companyId, userId, machineId, keyId, nonce, issuedAt,
+        ...(claims.tokenProof ? { tokenProof: claims.tokenProof } : {}) }
       consume = { nonce, expiresAt: claims.expiresAt }
     }
-    // The signed caller must own the slot through this scope's applied assignment.
-    // Personal, other-company, other-user, pending and revoked slots fail.
+    // A recorded resume must not carry a former PC's authority into a newly registered daemon.
+    if (binding.machineId !== deps.machineId || binding.companyId !== groupScope) throw unavailable()
+    const proven = !isMachineSetupTokenBinding(binding) && binding.tokenProof ? binding : null
+    let tokenIdentities = new Set<string>()
+    // A current-PC proof owns the token through this user's desired assignment, irrespective of historical apply PC.
+    // Personal, other-company, other-user and revoked slots fail; legacy bindings also require a reconciled apply.
     if (isMachineSetupTokenBinding(binding)) {
       if (!deps.machineSetupTokenAuthority) throw unavailable()
       await deps.machineSetupTokenAuthority(binding)
@@ -2202,20 +2207,33 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         || !receipt.appliedCredentials.some(row => row.managedAccountId === managedAccountId && row.credentialGeneration === credentialGeneration)
         || !await groups.authorizeMachine(groupScope, binding.machineId, setupTokenGroupIdentity(managedAccountId))) throw unavailable()
     } else {
-      const assignment = await groups.assignment(groupScope, 'claude')
-      if (!assignment || !assignment.reconciled || assignment.userId !== binding.userId
-        || !assignment.desired.includes(setupTokenGroupIdentity(managedAccountId))) throw unavailable()
+      const assignment = await groups.assignment(groupScope, 'claude', proven ? binding.userId : undefined)
+      if (!assignment || assignment.userId !== binding.userId
+        || (!proven && (!assignment.reconciled || !assignment.desired.includes(setupTokenGroupIdentity(managedAccountId))))) throw unavailable()
+      tokenIdentities = new Set(assignment.desired)
+      if (proven && tokenIdentities.size === 0) throw unavailable()
     }
     const email = managedSetupTokenEmail(managedAccountId)
     const { listed: roster, exported } = await readSlotRosterAndExport()
-    const listed = roster.find(account => account.email === email)
-    const slot = Array.isArray(exported?.accounts) ? exported.accounts.find((account: Record<string, unknown>) => account?.email === email) : undefined
+    let listed = roster.find(account => account.email === email)
+    let slot = Array.isArray(exported?.accounts) ? exported.accounts.find((account: Record<string, unknown>) => account?.email === email) : undefined
+    if (proven) {
+      if (listed?.disabled === true) throw unavailable()
+      // A set copy may give the same token another id. Only this owner's currently desired managed slots are candidates.
+      slot = Array.isArray(exported?.accounts) ? exported.accounts.find((candidate: Record<string, unknown>) => {
+        const id = managedSetupTokenId(candidate?.email)
+        const value = (candidate?.credentials as { claudeAiOauth?: { accessToken?: unknown } } | undefined)?.claudeAiOauth?.accessToken
+        return id && candidate.credentialType === 'setup_token' && candidate.managedAccountId === id && tokenIdentities.has(setupTokenGroupIdentity(id))
+          && roster.some(row => row.email === candidate.email && row.disabled !== true) && typeof value === 'string' && setupTokenCredentialMatches(value, proven)
+      }) : undefined
+      if (!slot) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
+      listed = roster.find(account => account.email === slot.email)
+    }
     const token = slot?.credentials?.claudeAiOauth?.accessToken
-    if (!listed || listed.disabled === true || slot?.credentialType !== 'setup_token' || slot.managedAccountId !== managedAccountId
+    if (!listed || listed.disabled === true || slot?.credentialType !== 'setup_token' || (!proven && slot.managedAccountId !== managedAccountId)
       || typeof token !== 'string' || !token.startsWith('sk-ant-oat01-')
       || !Number.isSafeInteger(slot.credentialGeneration) || slot.credentialGeneration < 1) throw unavailable()
-    // Exactly the signed generation: a replaced token is a different credential.
-    if (slot.credentialGeneration !== credentialGeneration) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_STALE')
+    if (!proven && slot.credentialGeneration !== credentialGeneration) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_STALE')
     if (consume) {
       // A fresh grant must still be live when it is spent and when its token env is handed out;
       // the slot reads and the durable write can cross the 60 s lifetime. A recorded resume has no fresh grant.
@@ -2470,7 +2488,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     ...(setupToken ? { setupTokenVersion: 1, setupTokenStatusVersion: 1 } : {}),
     // Advertised only when a server-signed binding proof can actually be verified here.
     ...(setupToken && deps.setupTokenBinding && await deps.setupTokenBinding.available()
-      ? { newSessionProfileBinding: true, setupTokenSessionBindingVersion: 1 } : { newSessionProfileBinding: false }) } } }
+      ? { newSessionProfileBinding: true, setupTokenSessionBindingVersion: 1, setupTokenCredentialProofVersion: 1 } : { newSessionProfileBinding: false }) } } }
 }
 
 type ClaudeListDetails = {

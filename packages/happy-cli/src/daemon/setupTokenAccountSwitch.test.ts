@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitchDeps } from './setupTokenAccountSwitch'
-import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, type AiAuthSelection, type SetupTokenBinding } from './sessionEnv'
+import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, type AiAuthSelection, type SetupTokenBinding, type UserSetupTokenBinding } from './sessionEnv'
 import type { TrackedSession } from './types'
 
 const A = '00000000-0000-4000-8000-00000000000a'
@@ -8,7 +8,7 @@ const B = '00000000-0000-4000-8000-00000000000b'
 const NONCE_A = '00000000-0000-4000-8000-0000000000aa'
 const NONCE_B = '00000000-0000-4000-8000-0000000000bb'
 // B was issued after A: a switch from A to B.
-const binding = (managedAccountId: string, userId = 'user-a', nonce = managedAccountId === A ? NONCE_A : NONCE_B): SetupTokenBinding => ({
+const binding = (managedAccountId: string, userId = 'user-a', nonce = managedAccountId === A ? NONCE_A : NONCE_B): UserSetupTokenBinding => ({
   managedAccountId, credentialGeneration: 1, groupScope: 'org-a', companyId: 'org-a', userId, machineId: 'pc-a',
   keyId: 'f'.repeat(64), nonce, issuedAt: managedAccountId === A ? 1 : 2,
 })
@@ -37,6 +37,20 @@ function setup(extra: Partial<SetupTokenAccountSwitchDeps> = {}) {
 }
 
 describe('setup-token account switch (specs/claude-setup-token-account-selection)', () => {
+  it('keeps token-value verification negotiated across an account switch and refuses a downgraded response', async () => {
+    const { switcher, session, deps } = setup()
+    const running = formatSetupTokenBinding({ ...binding(A), tokenProof: 'a'.repeat(64) })
+    session.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: running }
+    vi.mocked(deps.fetch).mockResolvedValueOnce(Response.json({ version: 1, bindingGrant: 'claims.signature', managedAccountId: B, credentialGeneration: 1, credentialProofVersion: 1 }))
+    vi.mocked(deps.sessionEnvironment).mockResolvedValueOnce({ CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-next', [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding({ ...binding(B), tokenProof: 'b'.repeat(64) }) })
+    expect(await switcher.rebind('session-a', running)).toHaveProperty('ok', true)
+    expect(JSON.parse(String(vi.mocked(deps.fetch).mock.calls[0][1]?.body))).toHaveProperty('credentialProofVersion', 1)
+    expect(deps.sessionEnvironment).toHaveBeenCalledWith('claude', expect.objectContaining({ credentialProofVersion: 1 }))
+    const other = setup()
+    other.session.agentEnvironment = { [SETUP_TOKEN_BINDING_ENV]: running }
+    expect(await other.switcher.rebind('session-a', running)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
+    expect(other.deps.sessionEnvironment).not.toHaveBeenCalled()
+  })
   it("reports a session's usage for the account it is bound to", async () => {
     const { switcher, requests } = setup()
     expect(await switcher.reportUsage('session-a', RUNNING_A, observation)).toEqual({ ok: true })

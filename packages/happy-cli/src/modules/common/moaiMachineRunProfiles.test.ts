@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import moaiExtensionProfiles from './fixtures/moai-2.0.0-profiles.json';
+import moaiExtensionProfiles from './fixtures/moai-2.1.0-profiles.json';
 import { MOAI_MANAGED_TOOL } from './moaiMachineRunProfiles';
 import {
     createManagedProjectWriteScopePolicy,
@@ -12,11 +12,12 @@ import {
 
 const READ_PROFILES = ['status', 'ready', 'prime', 'show', 'stats', 'wiki-ls', 'wiki-show', 'show-all', 'backlog-all', 'show-archived', 'show-archived-after', 'read', 'read-all', 'read-group', 'skill-status', 'show-all-worktree', 'show-worktree'].map((name) => `buzzni.moai.${name}`);
 const WRITE_PROFILES = ['add', 'mv', 'edit', 'rm', 'note', 'defer', 'link', 'backlog'].map((name) => `buzzni.moai.${name}`);
+const PROJECT_WRITE_PROFILES = ['init'].map((name) => `buzzni.moai.${name}`);
 
 describe('Moai 2.0 host-owned machine.run catalog', () => {
     it('ships every read and write operation in the daemon registry', () => {
         const profiles = TRUSTED_MACHINE_RUN_PROFILE_REGISTRY.list();
-        expect(profiles.map((profile) => profile.id).sort()).toEqual([...READ_PROFILES, ...WRITE_PROFILES].sort());
+        expect(profiles.map((profile) => profile.id).sort()).toEqual([...READ_PROFILES, ...WRITE_PROFILES, ...PROJECT_WRITE_PROFILES].sort());
         for (const profile of profiles) {
             expect(profile).toMatchObject({
                 executable: 'moai',
@@ -27,13 +28,13 @@ describe('Moai 2.0 host-owned machine.run catalog', () => {
                 stdin: 'none',
             });
             expect(profile.argv.slice(0, 3)).toEqual(['--json', '-C', '{{workspaceRoot}}']);
-            expect(profile.writeScope ?? 'none').toBe(WRITE_PROFILES.includes(profile.id) ? 'moai' : 'none');
+            expect(profile.writeScope ?? 'none').toBe(WRITE_PROFILES.includes(profile.id) ? 'moai' : PROJECT_WRITE_PROFILES.includes(profile.id) ? 'project' : 'none');
         }
     });
 
 
-    // Source: saycode-extensions 7046312, packages/moai/extension.json.
-    it('accepts the released-CLI-compatible Moai 2.0 declarations without digest drift', () => {
+    // Source: saycode-extensions 0399a76 (PR #56), packages/moai/extension.json, less skill-install-saycode.
+    it('accepts the released-CLI-compatible Moai 2.1 declarations without digest drift', () => {
         for (const declared of moaiExtensionProfiles) {
             const actual = TRUSTED_MACHINE_RUN_PROFILE_REGISTRY.resolve(declared.id);
             expect(actual, declared.id).toBeDefined();
@@ -75,7 +76,7 @@ describe('Moai 2.0 host-owned machine.run catalog', () => {
                 const response = await handler({ action: 'capabilities' });
                 return response.action === 'capabilities' ? response.profiles.map((profile) => profile.id).sort() : [];
             };
-            expect(await ids(machine)).toEqual([...READ_PROFILES, ...WRITE_PROFILES].sort());
+            expect(await ids(machine)).toEqual([...READ_PROFILES, ...WRITE_PROFILES, ...PROJECT_WRITE_PROFILES].sort());
             expect(await ids(session)).toEqual([...READ_PROFILES].sort());
             expect(await ids(windows)).toEqual([]);
         } finally {
@@ -95,6 +96,7 @@ const MOAI_PROFILE_DIGESTS: Record<string, string> = {
     'buzzni.moai.show-all-worktree': '7b9fa0e1d8e93b93bceb9de7b43808095080de536b68257c53d4623ed970aca6',
     'buzzni.moai.show-worktree': '6008088310d006082a3a45ea40124fe2b1aba09357c8861135600b7fc88cbb8b',
     'buzzni.moai.skill-status': '336f786c1bd0765a08b9a0d22709d846a9db7df00ebfe4e5ff8064f848ccb7e3',
+    'buzzni.moai.init': 'a2777dc330cb5c57d56141253c87d3b1727c966c71975d39e774a4eae4083760',
 
     'buzzni.moai.add': 'c36a5991cca3a460098b140ce3da31e2435242853bf3b85fcea4af1be4f3fc46',
     'buzzni.moai.backlog': 'fe7d0e75b7728f8993a197f7d07adeffe3efd0a345a22fa234803bcf81d88ada',

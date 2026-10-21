@@ -4,7 +4,7 @@ import type { ManagedMachineTool } from './managedMachineTool';
 
 /**
  * Host-owned Moai catalog. Existing write operations remain available to old
- * extensions; the additional reads match Moai extension 2.0.0 verbatim.
+ * extensions; the additional reads and `init` match Moai extension 2.1.0 verbatim.
  * The managed CLI is pinned independently to the verified v0.17.0 release.
  * Skill installation is deliberately absent: v0.17.0 does not accept the
  * extension's --hook-exe option. Never advertise an operation it cannot run.
@@ -27,6 +27,10 @@ function read(name: string, argv: string[], parameters: Record<string, MachineRu
 
 function write(name: string, argv: string[], parameters: Record<string, MachineRunParameter>): MachineRunProfile {
     return { ...read(name, argv, parameters), writeScope: 'moai' };
+}
+
+function projectWrite(name: string, argv: string[]): MachineRunProfile {
+    return { ...read(name, argv), writeScope: 'project' };
 }
 
 export const MOAI_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
@@ -56,6 +60,10 @@ export const MOAI_MACHINE_RUN_PROFILES: readonly MachineRunProfile[] = [
     write('defer', ['defer', '{{id}}', '--msg', '{{msg}}'], { id: text(128), msg: text(4096) }),
     write('link', ['link', '{{id}}', '--blocks', '{{blocks}}'], { id: text(128), blocks: text(2048) }),
     write('backlog', ['backlog', 'add', '{{title}}'], { title: text(512) }),
+    // The 2.1.0 panel's not-initialized screen: a .moai/ where the project has none, plus the AGENTS.md block,
+    // .gitattributes, .gitignore and the merge driver in .git/config. v0.17.0 takes both flags: skills are left to the
+    // panel's skill banner (it alone passes --hook-exe), and the person's project list is not the panel's to change.
+    projectWrite('init', ['init', '--no-skill', '--no-register']),
 ];
 
 /**

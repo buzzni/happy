@@ -420,3 +420,83 @@ describe('lesson-host-v1', () => {
         });
     });
 });
+
+// specs/host-lesson-matching-2026-10-18 P0: an update candidate replaces an
+// existing lesson, so the approver must see which one and confirm it.
+describe('lesson update candidates over lesson-host-v1', () => {
+    const target = { lessonId: 'l1', revision: 2 };
+    it('keeps the replaced lesson on the candidate snapshot', async () => {
+        const updating = fakeHost({
+            listCandidates: async () => ({ outcome: 'ok', nextOffset: null, candidates: [{
+                candidateId: 'c1', revision: 3, payloadHash: 'h', status: 'reviewed', evidenceKey: 'e',
+                candidate: {
+                    name: 'n', trigger: 'tr', steps: ['s1'], sourceEventIds: ['e1'], sourceSessionIds: ['s'],
+                    scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [], updatesLesson: target,
+                },
+            }] }),
+        });
+        const { handle, dir } = await harness({ host: updating.handle } as any);
+        const result = await handle({ ...snapshotRequest, grantEnvelope: grantFor(snapshotRequest, ['lesson.read']) }) as any;
+        expect(result.snapshot.candidates[0]).toMatchObject({ candidateId: 'c1', updatesLesson: target });
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('carries the current state of the replaced lesson, and only a well-formed one', async () => {
+        const row = (updateTarget: unknown) => ({
+            candidateId: 'c1', revision: 3, payloadHash: 'h', status: 'reviewed', evidenceKey: 'e', updateTarget,
+            candidate: { name: 'n', trigger: 'tr', steps: ['s1'], sourceEventIds: ['e1'], sourceSessionIds: ['s'], scope: 'x', validation: ['v'], reconsiderWhen: 'r', failureModes: [], updatesLesson: target },
+        });
+        const current = { available: true, lessonId: 'l1', currentRevision: 2, name: 'old name', trigger: 'old when', steps: ['old step'], failureModes: [], scope: 'old scope', validation: ['old check'], reconsiderWhen: null, validVersions: [], recallEnabled: true };
+        const updating = fakeHost({
+            listCandidates: async () => ({ outcome: 'ok', nextOffset: null, candidates: [row(current), { ...row({ available: false, lessonId: 'l1' }), candidateId: 'c2' }, { ...row({ available: 'yes' }), candidateId: 'c3' }] }),
+        });
+        const { handle, dir } = await harness({ host: updating.handle } as any);
+        const result = await handle({ ...snapshotRequest, grantEnvelope: grantFor(snapshotRequest, ['lesson.read']) }) as any;
+        expect(result.snapshot.candidates[0].updateTarget).toMatchObject({ available: true, currentRevision: 2, name: 'old name', steps: ['old step'], scope: 'old scope' });
+        expect(result.snapshot.candidates[1].updateTarget).toEqual({ available: false, lessonId: 'l1' });
+        // Malformed: shown as unavailable so a client never offers approval on a guess.
+        expect(result.snapshot.candidates[2].updateTarget).toEqual({ available: false, lessonId: 'l1' });
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('passes a signed confirmation of the replaced lesson through to the store', async () => {
+        const h = await harness();
+        const approve = {
+            version: 1, projectId: 'p1', requestId: 'r-confirm', operation: 'approve',
+            candidateId: 'c1', expectedRevision: 3, payloadHash: 'h', confirmUpdatesLesson: target,
+        };
+        expect((await h.handle({ ...approve, grantEnvelope: grantFor(approve, ['lesson.manage']) })).ok).toBe(true);
+        expect(h.host.calls.find((call) => call.name === 'approveCandidate')!.input.confirmUpdatesLesson).toEqual(target);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+
+    it('refuses a malformed confirmation before reaching the store', async () => {
+        const h = await harness();
+        const approve = {
+            version: 1, projectId: 'p1', requestId: 'r-bad-confirm', operation: 'approve',
+            candidateId: 'c1', expectedRevision: 3, payloadHash: 'h', confirmUpdatesLesson: { lessonId: 'l1', revision: 0 },
+        };
+        expect(await h.handle({ ...approve, grantEnvelope: grantFor(approve, ['lesson.manage']) }))
+            .toEqual({ ok: false, reason: 'invalid_request' });
+        expect(h.host.calls.some((call) => call.name === 'approveCandidate')).toBe(false);
+        await rm(h.dir, { recursive: true, force: true });
+    });
+
+    it.each([
+        ['lesson_not_found', 'not_found'],
+        ['lesson_revision_conflict', 'lesson_changed'],
+        ['update_confirmation_required', 'update_confirmation_required'],
+    ])('maps the store code %s to %s', async (code, reason) => {
+        const failing = fakeHost({
+            approveCandidate: async () => { throw Object.assign(new Error('x'), { code }); },
+        });
+        const { handle, dir } = await harness({ host: failing.handle } as any);
+        const approve = {
+            version: 1, projectId: 'p1', requestId: `r-${code}`, operation: 'approve',
+            candidateId: 'c1', expectedRevision: 3, payloadHash: 'h',
+        };
+        expect(await handle({ ...approve, grantEnvelope: grantFor(approve, ['lesson.manage']) }))
+            .toEqual({ ok: false, reason });
+        await rm(dir, { recursive: true, force: true });
+    });
+});

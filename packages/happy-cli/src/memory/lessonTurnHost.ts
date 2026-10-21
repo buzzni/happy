@@ -140,7 +140,10 @@ function renderLessonBlock(lessons: readonly unknown[], projectPath?: string): s
         const lesson = entry as Record<string, unknown>;
         const versions = list(lesson.validVersions);
         const block = [
-            lessonHeading(lesson),
+            // The revision is what an update proposal names (updatesLesson). It
+            // follows the id token, so `[lesson:<id>]` readers keep matching;
+            // preview and reference forms already carry "delivered revision N".
+            `${lessonHeading(lesson)}${typeof lesson.revision === 'number' ? ` (revision ${lesson.revision})` : ''}`,
             text(lesson.trigger) ? `  when: ${text(lesson.trigger)}` : null,
             text(lesson.scope) ? `  scope: ${text(lesson.scope)}` : null,
             versions.length > 0 ? `  verified on: ${versions.join(', ')}` : null,

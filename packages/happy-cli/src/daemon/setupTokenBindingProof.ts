@@ -8,7 +8,7 @@
  * origin in its own environment and the key at that origin's fixed path; the
  * renderer supplies the envelope but no key, origin or identity.
  */
-import { createHash, createPublicKey, verify } from 'node:crypto'
+import { createHash, createHmac, createPublicKey, timingSafeEqual, verify } from 'node:crypto'
 
 export const SETUP_TOKEN_BINDING_TYPE = 'claude-setup-token-binding-v1'
 export const STUDIO_PUBLIC_KEY_PATH = '/api/claude-collector/public-key'
@@ -27,8 +27,18 @@ export type SetupTokenBindingClaims = {
   v: 1; type: typeof SETUP_TOKEN_BINDING_TYPE; aud: string; keyId: string
   companyId: string; groupScope: string; userId: string; machineId: string
   managedAccountId: string; credentialGeneration: number; nonce: string; issuedAt: number; expiresAt: number
+  tokenProof?: string
 }
 export type StudioPublicKey = { keyId: string; publicKeyBase64: string }
+
+/** Signed, nonce-bound proof of the token value; display metadata and generation are not token identity. */
+export function setupTokenCredentialMatches(token: string, binding: Pick<SetupTokenBindingClaims, 'companyId' | 'userId' | 'machineId' | 'managedAccountId' | 'nonce' | 'tokenProof'>): boolean {
+  if (typeof binding.tokenProof !== 'string' || !/^[a-f0-9]{64}$/.test(binding.tokenProof)) return false
+  const actual = createHmac('sha256', token).update(JSON.stringify([
+    'claude-setup-token-credential-proof-v1', binding.companyId, binding.userId, binding.machineId, binding.managedAccountId, binding.nonce,
+  ])).digest()
+  return timingSafeEqual(actual, Buffer.from(binding.tokenProof, 'hex'))
+}
 
 /** The daemon's own configuration; a bare https origin, or http on loopback for local development. */
 export function readTrustedStudioOrigin(env: Record<string, string | undefined>): string | null {
@@ -61,7 +71,9 @@ export function verifySetupTokenBindingGrant(input: {
       || !verify(null, Buffer.from(encoded), key, Buffer.from(signature, 'base64url'))) return null
     const claims = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Record<string, unknown>
     if (typeof claims !== 'object' || claims === null || Array.isArray(claims)
-      || Object.keys(claims).length !== CLAIM_KEYS.length || CLAIM_KEYS.some(name => !(name in claims))) return null
+      || CLAIM_KEYS.some(name => !(name in claims))
+      || Object.keys(claims).some(name => !(CLAIM_KEYS as readonly string[]).includes(name) && name !== 'tokenProof')
+      || ('tokenProof' in claims && (typeof claims.tokenProof !== 'string' || !/^[a-f0-9]{64}$/.test(claims.tokenProof)))) return null
     const ok = claims.v === 1 && claims.type === SETUP_TOKEN_BINDING_TYPE
       && claims.aud === `${SETUP_TOKEN_BINDING_TYPE}@${input.origin}` && claims.keyId === input.publicKey.keyId
       && [claims.companyId, claims.groupScope, claims.userId, claims.machineId].every(value => typeof value === 'string' && ID.test(value))

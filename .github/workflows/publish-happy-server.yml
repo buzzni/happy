@@ -129,6 +129,14 @@ jobs:
                   name: happy-server-tarball
                   path: pack
 
+            # Node 20's bundled npm (10.8.2, and 10.9.9 too) dies while resolving this package's
+            # tree with `Cannot read properties of null (reading 'edgesOut')` (run 39285283764),
+            # so 0.1.3 never published. npm 11 installs it and still runs install scripts. Users on
+            # Node 20 need the same upgrade (saycode CLI README), so the smoke installs like they do.
+            - name: Upgrade npm on Node 20
+              if: ${{ matrix.node == 20 }}
+              run: npm install -g npm@11.21.0 && npm --version
+
             - name: Install smoke
               run: node pack/guard-publish-artifact.cjs pack/buzzni-happy-server-*.tgz --install-smoke
 
