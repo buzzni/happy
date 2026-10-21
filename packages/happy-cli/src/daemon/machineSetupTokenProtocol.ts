@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
   DAEMON_ROTATION_PATHS, DaemonRotationRequestBodySchema, MachineSetupTokenBindingV2DocumentSchema,
-  SessionExecutionTicketSchema, RotationOriginSchema, parseCanonicalOrgSetupTokenJson, rotationDecodeBinary,
+  SessionExecutionTicketSchema, parseCanonicalOrgSetupTokenJson, rotationDecodeBinary,
   rotationIsFresh, rotationSha256, signRotationDocument, verifyRotationDocument,
   type DaemonRotationRequestBody, type MachineSetupTokenBindingV2Document,
 } from '@slopus/happy-wire'
@@ -14,19 +14,6 @@ export class MachineRotationError extends Error {
   constructor(readonly reason: string, readonly retryAfterMs?: number) { super(`Machine setup-token rotation: ${reason}`) }
 }
 export type MachineRotationConfig = { companyId: string; machineId: string; studioOrigin: string; happyOrigin: string; studioPublicKey: string }
-/** ON requires an exact local pair as well as the server's independent allowlist. Invalid ON is never OFF. */
-export function readMachineRotationConfig(env: NodeJS.ProcessEnv, machineId: string, happyOrigin: string): MachineRotationConfig | null {
-  if (env.HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED !== 'true') return null
-  try {
-    const companyId = z.string().min(1).max(128).parse(env.HAPPY_SETUP_TOKEN_MACHINE_V2_COMPANY_ID)
-    const pairs: unknown = JSON.parse(env.HAPPY_SETUP_TOKEN_MACHINE_V2_ALLOWLIST ?? '[]')
-    if (!Array.isArray(pairs) || !pairs.some(p => Array.isArray(p) && p.length === 2 && p[0] === companyId && p[1] === machineId)) throw new Error()
-    const studioOrigin = RotationOriginSchema.parse(env.HAPPY_APLUS_STUDIO_ORIGIN)
-    const studioPublicKey = env.HAPPY_SETUP_TOKEN_MACHINE_V2_STUDIO_PUBLIC_KEY!
-    rotationDecodeBinary(studioPublicKey, 32)
-    return { companyId, machineId, studioOrigin, happyOrigin: RotationOriginSchema.parse(happyOrigin), studioPublicKey }
-  } catch { throw new MachineRotationError('CONFIGURATION_REQUIRED') }
-}
 const resultSchema = z.object({ version: z.literal(2), operationId: z.string().min(1).max(128),
   state: z.enum(['pending', 'claimed', 'committed', 'exhausted', 'recorded']), tier: z.enum(['available', 'unknown', 'exhausted']).optional(),
   observationId: z.string().optional(), binding: MachineSetupTokenBindingV2DocumentSchema.optional(), executionTicket: SessionExecutionTicketSchema.optional(),

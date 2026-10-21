@@ -68,18 +68,22 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
 
   it('routes trusted machine-v2 launch/resume/channel consumers through precreate, reconnect and execution checks', async () => {
     const text = await runSource();
-    expect(text).toContain('machineSetupTokenRuntime!.prepareLaunch({ ownerAccountId, machineOwnerAccountId');
+    expect(text).toContain('machineRotationRuntime.prepareLaunch({ ownerAccountId, machineOwnerAccountId');
     expect(text).toContain('ownerApi.getOrCreateSession({ ...input, dataKey: channelSessionKeys.get(options) })');
     expect(text).toContain('preparedMachineLaunch.reconnectEnvironment');
-    expect(text).toContain('machineSetupTokenRuntime.resume(tracked, resumeBinding.binding)');
+    expect(text).toContain('resumeMachineRuntime.resume(tracked, resumeBinding.binding');
     expect(text).toContain('tmuxEnv.HAPPY_RECONNECT_SESSION_ID ? { resumeTargetSessionId: tmuxEnv.HAPPY_RECONNECT_SESSION_ID }');
     expect(text).toContain('bound.binding.execution.sessionId !== sessionId');
     expect(text).toContain('expected?.resumeTargetSessionId !== sessionId');
     expect(text).toContain('spawnWithSessionKey: async (options, dataKey)');
     expect(text).toContain('channelSessionKeys.set(options, dataKey)');
-    expect(text).toContain('machineSetupTokenRuntime.validateAuthority(binding)');
+    expect(text).toContain('(await machineRuntimeFor(binding.companyId)).validateAuthority(binding)');
     expect(text).toContain('pendingMachineStarts.add(preparedMachineSessionId)');
     expect(text).toContain('pendingMachineStarts.has(happySessionId)');
+    // aplus Phase 3c — on by default, so a launch machine rotation cannot serve runs the current way instead of failing.
+    expect(text).toContain("if (options.reconnectEnvironment) return fallback('PRECREATED_SESSION');");
+    expect(text).toContain('if (!decision.runtime) return fallback(decision.reason);');
+    expect(text).toContain('const machineRotationRuntime = await machineRotationFor(options);');
   });
 
   it('두 spawn 경로가 자식에게 건네는 바로 그 env 를 검증한다', async () => {
