@@ -103,6 +103,25 @@ afterEach(() => {
 });
 
 describe('worktree ops tickets', () => {
+    it('refuses a Desktop-held common Git lock before creating a worktree', async () => {
+        const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+        mkdirSync(lock);
+        const head = git(repo, 'rev-parse', 'HEAD');
+        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_OPERATION_IN_PROGRESS' });
+        expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+        expect(git(repo, 'branch', '--list', 'bright-fox')).toBe('');
+        expect(existsSync(lock)).toBe(true);
+    });
+
+    it('releases only its own disk lock after a rejected write and allows a fresh retry', async () => {
+        const lock = join(repo, '.git', 'saycode-desktop-write.lock');
+        await call('create', create());
+        expect(existsSync(lock)).toBe(false);
+        expect(await call('create', create())).toMatchObject({ success: false, errorCode: 'WORKTREE_NAME_CONFLICT' });
+        expect(existsSync(lock)).toBe(false);
+        expect(await call('create', create({ name: 'another-worktree' }))).toMatchObject({ success: true });
+    });
+
     it('registers one method per operation', () => {
         expect(Object.keys(handlers()).sort()).toEqual([...WORKTREE_OPS_METHODS].sort());
     });
