@@ -102,6 +102,20 @@ describe('claudeLocal --continue handling', () => {
         mockSandboxCleanup.mockResolvedValue(undefined);
     });
 
+    it('gives the local Claude the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
+        const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', HAPPY_INITIAL_PROMPT: 'seed', APLUS_SESSION_ID: 'self-session' }
+        Object.assign(process.env, injected)
+        try {
+            await claudeLocal({ abort: new AbortController().signal, sessionId: null, path: '/tmp', onSessionFound, claudeArgs: [] });
+            const env = mockSpawn.mock.calls[0][2].env as Record<string, string>;
+            expect(env.HAPPY_RECONNECT_SESSION_ID).toBeUndefined();
+            expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined();
+            expect(env.APLUS_SESSION_ID).toBe('self-session');
+        } finally {
+            for (const key of Object.keys(injected)) delete process.env[key]
+        }
+    });
+
     it('should convert --continue to --resume with last session ID', async () => {
         // Mock claudeFindLastSession to return a session ID
         mockClaudeFindLastSession.mockReturnValue('123e4567-e89b-12d3-a456-426614174000');

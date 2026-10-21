@@ -26,7 +26,7 @@
  * ## Requirement for the daemon track (not implemented here)
  *
  * `HAPPY_AI_AUTH_SOURCE` (and `HAPPY_AI_AUTH_CONNECTION_VERSION`) **must** be
- * added to `SESSION_LINEAGE_ENV_PREFIXES` in `src/daemon/sessionEnv.ts` — a
+ * added to `NON_INHERITABLE_ENV` in `src/utils/childEnv.ts` — a
  * `HAPPY_AI_AUTH_` prefix covers both. The daemon can be restarted by a child
  * and then inherits that child's whole environment; an un-scrubbed value means
  * every later session on that machine reports somebody else's credential as

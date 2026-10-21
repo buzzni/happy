@@ -593,6 +593,7 @@ export class ApiSessionClient extends EventEmitter {
             logger: (msg, data) => logger.debug(msg, data)
         });
         registerCommonHandlers(this.rpcHandlerManager, this.metadata.path, {
+            childEnvBoundary: 'in-session',
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
         });
 

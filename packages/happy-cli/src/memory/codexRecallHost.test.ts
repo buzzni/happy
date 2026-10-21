@@ -191,6 +191,18 @@ describe('Codex event-memory host', () => {
         expect(await host!.recall(turn({ signal: controller.signal }))).toEqual({ reason: 'cancelled', context: '' });
     });
 
+    it('starts the recall worker with the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
+        const { options } = fixture();
+        const spawnSpy = vi.fn((command: string, args: string[], spawnOptions: SpawnOptionsWithoutStdio) => spawn(command, args, spawnOptions));
+        const env = { ...options.env, HAPPY_RECONNECT_ENCRYPTION_KEY: 'key', HAPPY_BROWSER_TASK_SESSION_SECRET: 'secret', APLUS_SESSION_ID: 'self-session' };
+        const host = await prepareCodexRecallHost({ ...options, env, deps: { ...options.deps, spawn: spawnSpy } });
+        await host!.recall(turn());
+        const workerEnv = spawnSpy.mock.calls[0][2].env ?? {};
+        expect(workerEnv.HAPPY_RECONNECT_ENCRYPTION_KEY).toBeUndefined();
+        expect(workerEnv.HAPPY_BROWSER_TASK_SESSION_SECRET).toBeUndefined();
+        expect(workerEnv.APLUS_SESSION_ID).toBe('self-session');
+    });
+
     it('handles synchronous host spawn failure without blocking the foreground turn', async () => {
         const { options } = fixture();
         const host = await prepareCodexRecallHost({ ...options, deps: { ...options.deps, spawn: () => { throw new Error('private prompt/path'); } } });

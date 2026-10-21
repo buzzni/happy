@@ -166,6 +166,23 @@ describe('CodexAppServerClient sandbox integration', () => {
         process.env.RUST_LOG = originalRustLog;
     });
 
+    it('gives Codex the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', HAPPY_INITIAL_PROMPT: 'seed', APLUS_SESSION_ID: 'self-session' }
+        Object.assign(process.env, injected)
+        try {
+            const client = new CodexAppServerClient();
+            await client.connect();
+            const env = mockSpawn.mock.calls[0][2].env as Record<string, string>;
+            expect(env.HAPPY_RECONNECT_SESSION_ID).toBeUndefined();
+            expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined();
+            expect(env.APLUS_SESSION_ID).toBe('self-session');
+            await client.disconnect();
+        } finally {
+            for (const key of Object.keys(injected)) delete process.env[key]
+        }
+    });
+
     it('uses verified state recovery for subsequent Happy launches and permits a scoped diagnostic override', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         mockResolveCodexStateEnvironment.mockImplementation(async env => ({ ...env, CODEX_SQLITE_HOME: env.CODEX_SQLITE_HOME || '/verified/state' }));
@@ -5647,6 +5664,22 @@ describe('CodexAppServerClient sandbox integration', () => {
                 expect(mockWrapForMcpTransport).not.toHaveBeenCalled();
             } finally {
                 await client.disconnect();
+            }
+        });
+
+        it('gives the side command the agent environment of this session, not the runner seeds', async () => {
+            vi.stubEnv('HAPPY_INITIAL_PROMPT', 'runner seed');
+            vi.stubEnv('SAYCODE_AGENT_ROOT', '/session');
+            const { CodexAppServerClient } = await import('./codexAppServerClient');
+            const client = new CodexAppServerClient();
+            try {
+                await client.connect();
+                const launch = await client.prepareSideCommand(['exec', '-']);
+                expect(launch?.env).not.toHaveProperty('HAPPY_INITIAL_PROMPT');
+                expect(launch?.env.SAYCODE_AGENT_ROOT).toBe('/session');
+            } finally {
+                await client.disconnect();
+                vi.unstubAllEnvs();
             }
         });
 

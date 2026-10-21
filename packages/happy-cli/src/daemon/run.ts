@@ -107,7 +107,6 @@ import {
   captureSaycodeAgentEnvironment,
   honorsManagedAiCredentials,
   overlayManagedCredentialEnvironment,
-  scrubSessionLineageEnv,
   stripManagedCredentialConflicts,
   verifyAiAuthSelection,
   type AiAuthSelection,
@@ -115,6 +114,7 @@ import {
   readSetupTokenResumeSelection,
   isMachineSetupTokenBinding,
 } from './sessionEnv';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
@@ -651,7 +651,7 @@ export async function startDaemon(): Promise<void> {
   // environment. Those variables are per-spawn instructions, not daemon
   // state; if they survive here they leak into every child we spawn and all
   // new sessions reconnect to one poisoned session (2026-07-19 incident).
-  const daemonEnvironment = scrubSessionLineageEnv(process.env);
+  const daemonEnvironment = sanitizeChildEnv(process.env);
   for (const key of Object.keys(process.env)) {
     if (!(key in daemonEnvironment)) {
       logger.debug(`[DAEMON RUN] Scrubbing inherited session lineage env: ${key}`);
@@ -2109,7 +2109,7 @@ export async function startDaemon(): Promise<void> {
           extraEnv.HAPPY_FORK_CODEX_THREAD_ID = options.resumeCodexThreadId;
         }
         // Requester identity and source for the new session's metadata.
-        // Re-supplied on every spawn, not lineage — see SESSION_LINEAGE_ENV_PREFIXES.
+        // Re-supplied on every spawn, not lineage — see NON_INHERITABLE_ENV.
         Object.assign(extraEnv, buildSessionRequesterEnv({
           createdByAccountId: options.createdByAccountId,
           createdByDisplayName: options.createdByDisplayName,

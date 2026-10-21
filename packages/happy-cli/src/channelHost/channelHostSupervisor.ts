@@ -25,7 +25,7 @@ import type { Readable, Writable } from 'node:stream';
 
 import type { MachineMetadata } from '@/api/types';
 import type { AutomationDeliveryOutcome, AutomationDeliveryRequest } from '@/daemon/automations/automationDelivery';
-import { scrubSessionLineageEnv } from '@/daemon/sessionEnv';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 export const CHANNEL_HOST_PROTOCOL_VERSION = 1;
 
@@ -170,7 +170,7 @@ export function resolveChannelHostEntry(deps: {
 export function spawnChannelHostChild(entry: string, cwd: string): ChannelHostChild {
     return spawn(process.execPath, ['--no-warnings', '--no-deprecation', entry, 'channel-host'], {
         cwd,
-        env: scrubSessionLineageEnv(process.env),
+        env: sanitizeChildEnv(process.env),
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
     });

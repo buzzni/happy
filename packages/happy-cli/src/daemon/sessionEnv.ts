@@ -1,28 +1,9 @@
 import { MachineSetupTokenBindingV2Schema, parseCanonicalOrgSetupTokenJson, type MachineSetupTokenBindingV2 } from '@slopus/happy-wire'
 import { z } from 'zod'
 /**
- * Session lineage environment variables must never be inherited implicitly.
- *
- * HAPPY_RECONNECT_* attaches a child to an EXISTING happy session and
- * HAPPY_FORK* attaches provider-conversation lineage. They are only valid
- * when the daemon sets them explicitly for one specific spawn (resumeSession
- * / fork RPC). If they leak through `...process.env` — e.g. a resumed child
- * auto-restarts the daemon on version mismatch, and the daemon inherits the
- * child's env — every session the daemon spawns afterwards reconnects to the
- * same happy session. That is the 2026-07-19 incident: chats from every
- * project queued into one session and replayed each other's prompts.
- *
- * APLUS_SESSION_* is the session's own web URL/id exported for agent shell
- * subprocesses (sessionUrlEnv.ts). Scrub it here so a daemon-spawned session
- * starts without stale identity; the child session factory then writes its
- * confirmed current id.
- *
- * SAYCODE_AGENT_* grants per-session orchestration scope. A daemon restarted
- * by one agent must not leak that agent's root/depth/id into unrelated spawns;
- * tracked sessions re-add their captured capability explicitly on resume.
- *
- * HAPPY_CHECKPOINT_* binds protected checkpoint state to one daemon-verified
- * project/worktree. It follows the same no-implicit-inheritance rule.
+ * Session spawn environments: what a daemon-spawned child gets explicitly on
+ * top of an inherited environment that `sanitizeChildEnv` (utils/childEnv.ts)
+ * has already cleared of other sessions' lineage, identity and credentials.
  */
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import {
@@ -39,16 +20,9 @@ import {
 import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
+import { sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 
-// 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
-// HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
-// 'HAPPY_AI_AUTH_' covers HAPPY_AI_AUTH_SOURCE and
-// HAPPY_AI_AUTH_CONNECTION_VERSION: which credential a session is actually
-// spending is decided per spawn, never inherited. A daemon restarted by a
-// child inherits that child's environment, and an un-scrubbed value would make
-// every later session on the machine meter its tokens against somebody else's
-// credential.
-export const SESSION_LINEAGE_ENV_PREFIXES = ['HAPPY_SCOPE_REPORT_', 'HAPPY_WRITE_SCOPE_', 'HAPPY_RECONNECT_', 'HAPPY_FORK', 'HAPPY_CREATED_BY', 'HAPPY_INITIAL_', 'HAPPY_DEFERRED_CONTINUATION_', 'HAPPY_AUTOMATION_', 'HAPPY_ADDITIONAL_DIRECTORIES', 'HAPPY_CHECKPOINT_', 'HAPPY_AI_AUTH_', 'APLUS_SESSION_', 'SAYCODE_AGENT_'] as const
+export { SETUP_TOKEN_BINDING_ENV }
 
 const SAYCODE_AGENT_ENV_KEYS = [
     'SAYCODE_AGENT_ENV',
@@ -65,32 +39,9 @@ type SaycodeAgentEnvironmentKey = typeof SAYCODE_AGENT_ENV_KEYS[number]
 const CHECKPOINT_CONTEXT_KEY = CHECKPOINT_SPAWN_CONTEXT_ENV_KEY
 /** Set from the spawn option `browserContinuation` only (request environment cannot carry HAPPY_AUTOMATION_*). */
 export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
-/**
- * Secret-free record of which managed setup-token generation a session was started on.
- * Daemon-written only: the HAPPY_AI_AUTH_ prefix is scrubbed from inherited and
- * requested environments, so neither can forge or carry it to another session.
- */
-export const SETUP_TOKEN_BINDING_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
 type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof BROWSER_CONTINUATION_ENV
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey, string>>
-
-function isLineageKey(key: string): boolean {
-    return SESSION_LINEAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
-}
-
-/** Returns a copy of `env` without lineage variables (and without undefined values). */
-export function scrubSessionLineageEnv(env: NodeJS.ProcessEnv): Record<string, string> {
-    const scrubbed: Record<string, string> = {}
-    for (const [key, value] of Object.entries(env)) {
-        if (value === undefined || isLineageKey(key)) continue
-        // A child can restart the daemon. Drop its bound bearer before losing
-        // the marker, including malformed markers; unbound personal auth stays.
-        if (env[SETUP_TOKEN_BINDING_ENV] !== undefined && key === 'CLAUDE_CODE_OAUTH_TOKEN') continue
-        scrubbed[key] = value
-    }
-    return scrubbed
-}
 
 /**
  * Who asked for one spawn: requester identity (specs/session-created-by) and source
@@ -117,7 +68,7 @@ export function buildSessionSpawnEnvironment(
     explicit: Record<string, string>,
 ): Record<string, string> {
     return {
-        ...scrubSessionLineageEnv(inherited),
+        ...sanitizeChildEnv(inherited),
         ...explicit,
     }
 }
@@ -210,7 +161,7 @@ export function buildSpawnRequestEnvironment(
         ? Object.fromEntries(POC_BROWSER_TASK_REQUEST_KEYS.flatMap((key) => requested?.[key] === undefined ? [] : [[key, requested[key]]]))
         : {}
     return {
-        ...scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(requested ?? {})),
+        ...sanitizeChildEnv(stripUnsafeRequestedEnvironment(requested ?? {})),
         ...poc,
         // The agent grant is re-admitted only after its own validation (paths and counts).
         ...readRequestedSaycodeAgentGrant(requested ?? {}),
@@ -378,10 +329,10 @@ export function buildResumedSessionSpawnEnvironment(input: {
     const policy = input.explicit[policyKey] ?? input.automation?.[policyKey]
         ?? input.runtime?.[policyKey] ?? input.agentEnvironment?.[policyKey]
     const runtime = expandEnvironmentVariables(
-        scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(input.runtime ?? {})),
+        sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.runtime ?? {})),
     )
     const automation = expandEnvironmentVariables(
-        scrubSessionLineageEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
+        sanitizeChildEnv(stripUnsafeRequestedEnvironment(input.automation ?? {})),
     )
     return buildSessionSpawnEnvironment({ ...input.inherited, [policyKey]: undefined }, {
         // runtime (the resume request) and automation environments are request-supplied too.

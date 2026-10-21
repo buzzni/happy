@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { spawn as crossSpawn } from 'cross-spawn';
 
+import { sanitizeChildEnv } from '@/utils/childEnv';
 import type { OffTurnTitleRunner } from '@/utils/offTurnTitle';
 
 /**
@@ -47,7 +48,7 @@ export function isOffTurnTitleEligible(input: {
 export type CodexCommandLaunch = { command: string; args: string[]; env: NodeJS.ProcessEnv };
 export type PrepareCodexCommand = (args: string[]) => Promise<CodexCommandLaunch | null>;
 
-const plainCodexCommand: PrepareCodexCommand = async (args) => ({ command: 'codex', args, env: process.env });
+const plainCodexCommand: PrepareCodexCommand = async (args) => ({ command: 'codex', args, env: sanitizeChildEnv(process.env, { boundary: 'in-session' }) });
 
 /**
  * Names of the enabled MCP servers in `codex mcp list --json` output, or null

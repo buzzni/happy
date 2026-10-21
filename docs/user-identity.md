@@ -81,7 +81,7 @@ happy-cli daemon (packages/happy-cli/src/daemon/run.ts)
   ├─ sets HAPPY_CREATED_BY_ACCOUNT_ID / HAPPY_CREATED_BY_DISPLAY_NAME on the
   │  spawned process env (same lineage-style passthrough as
   │  HAPPY_FORKED_FROM_SESSION_ID — re-supplied per spawn, scrubbed from
-  │  SESSION_LINEAGE_ENV_PREFIXES so a daemon restart never leaks a stale
+  │  NON_INHERITABLE_ENV (utils/childEnv.ts) so a daemon restart never leaks a stale
   │  value into an unrelated session)
   ▼
 Backend runner (claude/codex/gemini/openclaw/acp)

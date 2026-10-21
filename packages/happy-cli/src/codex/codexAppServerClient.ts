@@ -70,6 +70,7 @@ import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } fr
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 import { CodexAuthRecoveryError, type CodexAuthCheck, type CodexAuthSource } from './codexAuthRecovery';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 type PendingRequest = {
     resolve: (result: unknown) => void;
@@ -1109,10 +1110,8 @@ export class CodexAppServerClient {
         }
 
         // Build env — same filtering as the old MCP client
-        let env: Record<string, string> = {};
-        for (const [key, value] of Object.entries(process.env)) {
-            if (typeof value === 'string') env[key] = value;
-        }
+        // The agent works inside this session: lineage and spawn seeds stop here.
+        let env: Record<string, string> = sanitizeChildEnv(process.env, { boundary: 'in-session' });
         env = await resolveCodexStateEnvironment({ ...env, ...this.startupEnvironment });
         if (!this.managedProviderArgs) {
             // Account rotation swaps in another account's proxy, its own
@@ -1971,10 +1970,8 @@ export class CodexAppServerClient {
      */
     async prepareSideCommand(args: string[]): Promise<{ command: string; args: string[]; env: Record<string, string> } | null> {
         if (!this.connected || !this.sideCommandAllowed) return null;
-        const env: Record<string, string> = {};
-        for (const [key, value] of Object.entries(this.multiAuthProxy?.env ?? process.env)) {
-            if (typeof value === 'string') env[key] = value;
-        }
+        // The proxy env was built from the app-server's already sanitized env.
+        const env: Record<string, string> = { ...(this.multiAuthProxy?.env ?? sanitizeChildEnv(process.env, { boundary: 'in-session' })) };
         if (this.sandboxEnabled && process.platform === 'darwin') {
             env.CODEX_SANDBOX = 'seatbelt';
         } else if (this.sandboxEnabled && process.platform === 'linux' && env.CODEX_SANDBOX === 'seatbelt') {

@@ -26,6 +26,26 @@ describe('createPtySession', () => {
         throw new Error('waitFor timeout')
     }
 
+    it('opens a terminal without any session lineage or scope (utils/childEnv)', async () => {
+        const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', SAYCODE_AGENT_ROOT: '/parent' }
+        Object.assign(process.env, injected)
+        try {
+            const s = track(createPtySession({
+                userId: 'u1',
+                shell: 'node',
+                // The open request's env is client-supplied and cannot carry a session either.
+                env: { SAYCODE_AGENT_ROOT: '/from-request' },
+                args: ['-e', "process.stdout.write('ENV:' + (process.env.HAPPY_RECONNECT_SESSION_ID ?? '-') + (process.env.SAYCODE_AGENT_ROOT ?? '-') + (process.env.PATH ? 'P' : '') + ':END\\n'); setInterval(() => {}, 1000)"],
+            }))
+            let buf = ''
+            s.onData((chunk) => { buf += chunk })
+            await waitFor(() => buf.includes(':END'), 3000)
+            expect(buf).toContain('ENV:--P:END')
+        } finally {
+            for (const key of Object.keys(injected)) delete process.env[key]
+        }
+    })
+
     it('emits child stdout via onData', async () => {
         const s = track(createPtySession({
             userId: 'u1',

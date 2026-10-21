@@ -11,6 +11,7 @@ import { exec, type ExecOptions } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import { validatePath } from '@/modules/common/pathSecurity'
+import { sanitizeChildEnv } from '@/utils/childEnv'
 
 const execAsync = promisify(exec)
 
@@ -44,9 +45,8 @@ export async function runAutomationScript(input: RunAutomationScriptInput): Prom
     timeout: input.timeout,
     maxBuffer: SCRIPT_MAX_BUFFER_BYTES,
     windowsHide: true,
-    env: input.environmentVariables
-      ? { ...process.env, ...input.environmentVariables }
-      : process.env,
+    // 자동화 요청 env 도 다른 세션의 재접속·식별 값을 실어 오지 못하게 한다.
+    env: sanitizeChildEnv({ ...process.env, ...(input.environmentVariables ?? {}) }),
   }
 
   try {

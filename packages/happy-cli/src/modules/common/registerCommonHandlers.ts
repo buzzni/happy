@@ -38,6 +38,7 @@ import {
     type TrustedMachineRunProfileRegistry,
 } from './machineRunProfile';
 import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
+import { sanitizeChildEnv, type ChildEnvBoundary } from '@/utils/childEnv';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -415,6 +416,11 @@ export type RecoverSessionResult =
  * Register all RPC handlers with the session
  */
 export interface CommonHandlerOptions {
+    /**
+     * Where `bash` RPC commands sit relative to this scope's session: `in-session` for a
+     * session's own handlers, `session` (default) for the machine scope (utils/childEnv).
+     */
+    childEnvBoundary?: ChildEnvBoundary;
     machineRun?: {
         /** Host-owned immutable registry. Extension input must never populate this. */
         profileRegistry: TrustedMachineRunProfileRegistry;
@@ -436,6 +442,7 @@ export interface CommonHandlerOptions {
 export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string, options: CommonHandlerOptions = {}) {
     rpcHandlerManager.registerHandler('file-discovery', (request: unknown) => fileDiscovery(workingDirectory, request));
     const bashScheduler = createBashRpcScheduler();
+    const bashEnvBoundary = options.childEnvBoundary ?? 'session';
     const rawMachineRunHandler = createTypedMachineRunHandler(workingDirectory);
     const machineRunOptions = options.machineRun;
     const profileHandlerOptions: MachineRunProfileHandlerOptions = machineRunOptions ? {
@@ -523,6 +530,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                         cwd: data.cwd === '/' ? undefined : data.cwd,
                         timeout: data.timeout || 30000, // Default 30 seconds timeout
                         windowsHide: true, // Prevent cmd.exe popup on Windows for every RPC bash call
+                        env: sanitizeChildEnv(process.env, { boundary: bashEnvBoundary }),
                     };
 
                     logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });

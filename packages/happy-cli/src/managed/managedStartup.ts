@@ -252,53 +252,6 @@ export function stripProviderCredentialOverrides(
 }
 
 /**
- * Prefixes naming a session some earlier launch on this runtime was attached
- * to, forked from, or asked to backfill.
- *
- * Prefixes rather than a list of keys, deliberately. The keys under them are
- * added to over time — reconnect alone carries an id, a key, a variant, a
- * snapshot and three versions, and the fork family names both a Claude session
- * and a Codex thread — and a list is a list that will be short by one. The
- * daemon scrubs the same prefixes when it spawns; this is the child doing it
- * for itself, because the environment it starts in is not always one the
- * daemon just built.
- *
- * `HAPPY_INITIAL_` is deliberately absent: those values are this run's own,
- * and are written immediately after this runs.
- */
-const FOREIGN_SESSION_LINEAGE_PREFIXES = [
-    'HAPPY_RECONNECT_',
-    // Covers both `HAPPY_FORK_*` (the native session or thread to resume and
-    // backfill from) and `HAPPY_FORKED_FROM_*` (the lineage recorded in
-    // metadata).
-    'HAPPY_FORK',
-    'HAPPY_CREATED_BY',
-    'HAPPY_DEFERRED_CONTINUATION_',
-];
-
-/**
- * Forgets any session this runtime was previously attached to.
- *
- * A reused runtime can still carry an earlier launch's lineage. The runners
- * read it before anything else and act on it: a reconnect id resumes that
- * session, dropping this run's prompt as already delivered and merging the
- * foreign snapshot's metadata; a fork id reads that session's transcript off
- * disk and replays it into *this* session, then rewrites the native session id
- * to match. The result is a managed run showing somebody else's conversation
- * under its own SID.
- *
- * Cleared rather than ignored at each call site: the values reach several
- * readers across two runners, and one missed reader is the whole defect again.
- */
-export function clearForeignSessionLineage(env: NodeJS.ProcessEnv): void {
-    for (const key of Object.keys(env)) {
-        if (FOREIGN_SESSION_LINEAGE_PREFIXES.some((prefix) => key.startsWith(prefix))) {
-            delete env[key];
-        }
-    }
-}
-
-/**
  * Points the agent at the one provider route this run was admitted on.
  *
  * Two routes, and they are exclusive. On a platform kind the capability is the

@@ -18,6 +18,7 @@ import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
 import { filterCredentialsFromEnv } from "@/sandbox/config";
 import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from "@/sandbox/sandboxPolicy";
 import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from "@/sandbox/executionCapability";
+import { sanitizeChildEnv } from "@/utils/childEnv";
 
 /**
  * Error thrown when the Claude process exits with a non-zero exit code.
@@ -280,9 +281,8 @@ export async function claudeLocal(opts: {
 
             // Prepare environment variables
             // When sandbox is enabled, filter out credentials to prevent exposure
-            const baseEnv = opts.sandboxConfig?.enabled
-                ? filterCredentialsFromEnv({ ...process.env, ...opts.claudeEnvVars })
-                : { ...process.env, ...opts.claudeEnvVars };
+            const inheritedEnv = { ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...opts.claudeEnvVars };
+            const baseEnv = opts.sandboxConfig?.enabled ? filterCredentialsFromEnv(inheritedEnv) : inheritedEnv;
             const env = baseEnv;
 
             if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) {

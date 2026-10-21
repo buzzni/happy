@@ -215,7 +215,8 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(registeredCommonHandlers).toHaveBeenCalledWith(
             expect.anything(),
             '/tmp',
-            { machineRun: {
+            // The session's own bash RPC keeps the session scope (utils/childEnv in-session boundary).
+            { childEnvBoundary: 'in-session', machineRun: {
                 profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY,
                 // Session scope may run installed tools but never installs them or writes.
                 managedTools: { root: '/tmp/happy-test-home/managed-tools', tools: [expect.objectContaining({ id: 'buzzni.moai' })] },

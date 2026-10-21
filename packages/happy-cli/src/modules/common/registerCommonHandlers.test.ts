@@ -35,6 +35,20 @@ afterEach(async () => {
 });
 
 describe('registerCommonHandlers bash scheduling', () => {
+    it('drops another session from machine-scope commands and keeps a session its own scope (utils/childEnv)', async () => {
+        const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', APLUS_SESSION_ID: 'self-session' };
+        Object.assign(process.env, injected);
+        const command = 'printf "%s|%s" "${HAPPY_RECONNECT_SESSION_ID-}" "${APLUS_SESSION_ID-}"';
+        try {
+            const machine = await createHandlers();
+            await expect(machine.handlers.get('bash')?.({ command, cwd: machine.workingDirectory })).resolves.toMatchObject({ stdout: '|' });
+            const session = await createHandlers(undefined, { childEnvBoundary: 'in-session' });
+            await expect(session.handlers.get('bash')?.({ command, cwd: session.workingDirectory })).resolves.toMatchObject({ stdout: '|self-session' });
+        } finally {
+            for (const key of Object.keys(injected)) delete process.env[key];
+        }
+    });
+
     it('keeps legacy requests foreground-compatible and accepts background classification', async () => {
         const { handlers, workingDirectory } = await createHandlers();
         const handler = handlers.get('bash');

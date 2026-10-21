@@ -7,6 +7,7 @@ import { resolveServiceEntry } from './cmlLessonHost';
 import { loadExternalEsModule } from './externalModuleLoader';
 import { RECALL_OWNER_ENV } from './recallOwnerMarker';
 import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 const PREPARE_BUDGET_MS = 2_000;
 const INGEST_BUDGET_MS = 15_000;
@@ -98,7 +99,7 @@ export async function prepareCodexIngestHost(input: {
     if (!input.accountOwned || !input.sandboxEnabled || input.sandboxPolicyMode !== 'owner-choice') return null;
     const deps = { ...productionDeps, ...input.deps };
     const projectPath = input.projectPath;
-    const env: NodeJS.ProcessEnv = { ...input.env, [RECALL_OWNER_ENV]: 'host-worker' };
+    const env: NodeJS.ProcessEnv = { ...sanitizeChildEnv(input.env, { boundary: 'in-session' }), [RECALL_OWNER_ENV]: 'host-worker' };
     delete env.CLAUDE_MEMORY_DEBUG;
     let prepareTimer: ReturnType<typeof setTimeout> | undefined;
     let entry: string | null;

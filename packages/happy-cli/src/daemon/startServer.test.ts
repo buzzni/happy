@@ -82,6 +82,21 @@ describe('startServerProcess', () => {
     kill(pid)
   })
 
+  it('does not let req.env hand another session to the server', async () => {
+    const dir = mkdir()
+    const script = path.join(dir, 'probe.js')
+    writeFileSync(script, `require('fs').writeFileSync(process.env.OUT, process.env.HAPPY_RECONNECT_SESSION_ID || 'none')`)
+    const outPath = path.join(dir, 'out.txt')
+    const { pid } = await startServerProcess({
+      command: `node ${script}`,
+      cwd: dir,
+      env: { OUT: outPath, HAPPY_RECONNECT_SESSION_ID: 'other-session' },
+    })
+    expect(await waitForFile(outPath)).toBe(true)
+    expect(readFileSync(outPath, 'utf-8')).toBe('none')
+    kill(pid)
+  })
+
   it('rejects with CWD_NOT_FOUND when the working directory is missing', async () => {
     await expect(
       startServerProcess({
