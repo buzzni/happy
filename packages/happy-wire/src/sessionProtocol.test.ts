@@ -328,12 +328,18 @@ describe('session protocol schemas', () => {
     expect(sessionEventSchema.safeParse({ t: 'next-steps', summary: '', actions: [] }).success).toBe(false);
   });
 
-  it('accepts a plan update with step statuses and a scope', () => {
-    const ev = { t: 'plan', scope: 'first_task', steps: [{ text: 'Write the failing test', status: 'completed' }, { text: 'Fix the parser', status: 'in_progress' }] };
-    expect(sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev }).success).toBe(true);
+  it('accepts a plan update with step statuses', () => {
+    const ev = { t: 'plan', steps: [{ text: 'Write the failing test', status: 'completed' }, { text: 'Fix the parser', status: 'in_progress' }] };
+    const parsed = sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev });
+    expect(parsed.success && parsed.data.ev).toEqual(ev);
     expect(sessionEventSchema.safeParse({ ...ev, steps: [] }).success).toBe(false);
-    expect(sessionEventSchema.safeParse({ ...ev, scope: 'other' }).success).toBe(false);
     expect(sessionEventSchema.safeParse({ ...ev, steps: [{ text: 'x', status: 'blocked' }] }).success).toBe(false);
+  });
+
+  it('caps a reply button message at what the card can preview', () => {
+    const parse = (message: string) => sessionEventSchema.safeParse({ t: 'next-steps', summary: 'Done.', actions: [{ label: 'Go', message }] }).success;
+    expect(parse('m'.repeat(500))).toBe(true);
+    expect(parse('m'.repeat(501))).toBe(false);
   });
 
   it('rejects start from non-agent role', () => {

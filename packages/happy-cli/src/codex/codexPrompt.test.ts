@@ -1,5 +1,5 @@
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
-import { CODEX_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
+import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { describe, expect, it } from 'vitest';
 import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 
@@ -273,11 +273,19 @@ it('adds active checkpoint facts to Codex developer instructions without changin
     expect(buildCodexDeveloperInstructions({ checkpointGuidance: '', mode: {} })).not.toContain('CHECKPOINT');
 });
 
-describe('next-steps card and task list guidance', () => {
-    it('tells Codex about both turn cards and drops them with the master switch', () => {
-        const on = buildCodexDeveloperInstructions({ nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT, mode: {} });
+describe('next-steps card guidance', () => {
+    it('rides only on a turn whose client draws the card, under the master switch', () => {
+        const on = buildCodexDeveloperInstructions({ nextStepsPrompt: NEXT_STEPS_PROMPT, mode: { saycodePromptBlocks: { nextSteps: true } } });
         expect(on).toContain('mcp__happy__next_steps');
-        expect(on).toContain('mcp__happy__update_plan');
-        expect(buildCodexDeveloperInstructions({ nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT, mode: { saycodeSystemPromptEnabled: false } })).toBeUndefined();
+        expect(on).not.toContain('mcp__happy__update_plan');
+        expect(buildCodexDeveloperInstructions({ nextStepsPrompt: NEXT_STEPS_PROMPT, mode: {} })).not.toContain('next_steps');
+        expect(buildCodexDeveloperInstructions({ nextStepsPrompt: NEXT_STEPS_PROMPT, mode: { saycodePromptBlocks: { nextSteps: true }, saycodeSystemPromptEnabled: false } })).toBeUndefined();
+    });
+});
+
+describe('resolveCodexSaycodePromptBlocks with the turn-scoped nextSteps key', () => {
+    it('never keeps nextSteps as a standing override', () => {
+        expect(resolveCodexSaycodePromptBlocks(undefined, { saycodePromptBlocks: { nextSteps: true } })).toBeUndefined();
+        expect(resolveCodexSaycodePromptBlocks({ axBase: false }, { saycodePromptBlocks: { axBase: true, nextSteps: true } })).toEqual({ axBase: true });
     });
 });

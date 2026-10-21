@@ -712,6 +712,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
                     lessonProposalTurn: session.lessonProposalTurn,
+                    turnCards: session.turnCards,
                     lessonReviewLifecycle: session.lessonReviewLifecycle,
                     /*
                      * The host and completed-turn history belong to the session.

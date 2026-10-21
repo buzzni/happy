@@ -1,7 +1,8 @@
-/** specs/desktop-next-steps-card (Saycode Desktop) — next_steps / update_plan tool contracts. */
+/** specs/desktop-next-steps-card (Saycode Desktop) — next_steps tool contract. */
 import { describe, expect, it, vi } from 'vitest';
 import { sessionEnvelopeSchema } from '@slopus/happy-wire';
 import { startHappyServer } from './startHappyServer';
+import { createTurnCardSwitch, type TurnCardRunner } from './turnCardTools';
 import type { ApiSessionClient } from '@/api/apiSession';
 
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), debugLargeJson: vi.fn() } }));
@@ -28,12 +29,14 @@ async function rpc(url: string, method: string, params: Record<string, unknown>)
 }
 
 const callTool = (url: string, name: string, args: Record<string, unknown>) => rpc(url, 'tools/call', { name, arguments: args });
+/** A turn whose client said it draws the card. */
+const drawnTurn = (runner: TurnCardRunner) => { const cards = createTurnCardSwitch(runner); cards.set(true); return cards; };
 const listNames = async (url: string): Promise<string[]> => (await rpc(url, 'tools/list', {})).result.tools.map((tool: { name: string }) => tool.name);
 
 describe('next_steps tool', () => {
     it('records the card as an agent session event a client can parse', async () => {
         const client = fakeClient();
-        const server = await startHappyServer(client, { turnCards: 'claude' });
+        const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
         try {
             const reply = await callTool(server.url, 'next_steps', {
                 summary: 'The parser fix is in and its tests pass. Nothing is committed.',
@@ -57,7 +60,7 @@ describe('next_steps tool', () => {
 
     it('rejects an action outside the app action list with the list in the reason', async () => {
         const client = fakeClient();
-        const server = await startHappyServer(client, { turnCards: 'codex' });
+        const server = await startHappyServer(client, { turnCards: drawnTurn('codex') });
         try {
             const reply = await callTool(server.url, 'next_steps', { summary: 'Done.', question: 'Ship?', actions: [{ kind: 'deploy' }] });
             expect(reply.result?.isError ?? !!reply.error).toBe(true);
@@ -68,7 +71,7 @@ describe('next_steps tool', () => {
 
     it('rejects a question with no button to answer it, and a repeated app action', async () => {
         const client = fakeClient();
-        const server = await startHappyServer(client, { turnCards: 'claude' });
+        const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
         try {
             const unanswerable = await callTool(server.url, 'next_steps', { summary: 'Done.', question: 'Which one?', actions: [] });
             expect(unanswerable.result.isError).toBe(true);
@@ -82,7 +85,7 @@ describe('next_steps tool', () => {
 
     it('accepts a recap with no question and no buttons', async () => {
         const client = fakeClient();
-        const server = await startHappyServer(client, { turnCards: 'claude' });
+        const server = await startHappyServer(client, { turnCards: drawnTurn('claude') });
         try {
             const reply = await callTool(server.url, 'next_steps', { summary: 'Answered the question; nothing changed.', actions: [] });
             expect(reply.result.isError).toBeFalsy();
@@ -102,40 +105,50 @@ describe('next_steps tool', () => {
     });
 });
 
-describe('update_plan tool', () => {
-    it('records the whole list as a plan event on Codex', async () => {
+describe('next_steps on a turn whose client does not draw the card', () => {
+    // An older Desktop, the mobile app, a Slack channel: the turn carries no `nextSteps`
+    // block, so the tool must refuse and the model keeps its question in its closing message.
+    it('refuses and records nothing, then accepts once a drawing client sends a turn', async () => {
         const client = fakeClient();
-        const server = await startHappyServer(client, { turnCards: 'codex' });
+        const cards = createTurnCardSwitch('claude');
+        const server = await startHappyServer(client, { turnCards: cards });
         try {
-            expect(server.toolNames).toEqual(expect.arrayContaining(['next_steps', 'update_plan']));
-            const steps = [{ text: 'Reproduce the bug', status: 'completed' }, { text: 'Fix the parser', status: 'in_progress' }, { text: 'Run the tests', status: 'pending' }];
-            const reply = await callTool(server.url, 'update_plan', { scope: 'first_task', steps });
-            expect(reply.result.isError).toBeFalsy();
-            const envelope = client.sendSessionProtocolMessage.mock.calls[0][0];
-            expect(sessionEnvelopeSchema.safeParse(envelope).success).toBe(true);
-            expect(envelope.ev).toEqual({ t: 'plan', scope: 'first_task', steps });
+            const card = { summary: 'Done.', question: 'Commit it now?', actions: [{ kind: 'commit' }] };
+            const refused = await callTool(server.url, 'next_steps', card);
+            expect(refused.result.isError).toBe(true);
+            expect(refused.result.content[0].text).toMatch(/^NEXT_STEPS_UNSUPPORTED: .*closing message/);
+            expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
+
+            cards.set(true);
+            expect((await callTool(server.url, 'next_steps', card)).result.isError).toBeFalsy();
+            cards.set(false);
+            expect((await callTool(server.url, 'next_steps', card)).result.isError).toBe(true);
+            expect(client.sendSessionProtocolMessage).toHaveBeenCalledTimes(1);
         } finally { server.stop(); }
     });
 
-    it('is not offered to Claude, whose TodoWrite list the app already shows', async () => {
-        const server = await startHappyServer(fakeClient(), { turnCards: 'claude' });
-        try {
-            expect(server.toolNames).toContain('next_steps');
-            expect(server.toolNames).not.toContain('update_plan');
-            const names = await listNames(server.url);
-            expect(names).toContain('next_steps');
-            expect(names).not.toContain('update_plan');
-        } finally { server.stop(); }
-    });
-
-    it('refuses on a runner whose client does not draw the list (ACP)', async () => {
+    it('refuses a whitespace-only recap instead of telling the model the card is shown', async () => {
         const client = fakeClient();
-        const server = await startHappyServer(client);
+        const server = await startHappyServer(client, { turnCards: drawnTurn('codex') });
         try {
-            const reply = await callTool(server.url, 'update_plan', { scope: 'new_task', steps: [{ text: 'x', status: 'pending' }] });
-            expect(reply.result.isError).toBe(true);
-            expect(reply.result.content[0].text).toMatch(/PLAN_UNSUPPORTED/);
+            const reply = await callTool(server.url, 'next_steps', { summary: '   ', actions: [] });
+            expect(reply.result?.isError ?? !!reply.error).toBe(true);
             expect(client.sendSessionProtocolMessage).not.toHaveBeenCalled();
         } finally { server.stop(); }
+    });
+});
+
+describe('task list', () => {
+    it('is not a tool: Claude has TodoWrite and Codex its built-in update_plan', async () => {
+        for (const runner of ['claude', 'codex'] as const) {
+            const server = await startHappyServer(fakeClient(), { turnCards: drawnTurn(runner) });
+            try {
+                expect(server.toolNames).toContain('next_steps');
+                expect(server.toolNames).not.toContain('update_plan');
+                const names = await listNames(server.url);
+                expect(names).toContain('next_steps');
+                expect(names).not.toContain('update_plan');
+            } finally { server.stop(); }
+        }
     });
 });

@@ -1,5 +1,5 @@
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
-import { CLAUDE_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
+import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { describe, expect, it } from 'vitest';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 
@@ -109,12 +109,14 @@ it('includes active checkpoint facts with client instructions and leaves inactiv
 });
 
 describe('next-steps card guidance', () => {
-  it('rides with Saycode prompts and drops with the master switch', () => {
-    const on = buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', appendSystemPrompt: 'USER', nextStepsPrompt: CLAUDE_NEXT_STEPS_PROMPT });
-    expect(on.appendSystemPrompt).toContain('mcp__happy__next_steps');
-    expect(on.appendSystemPrompt).not.toContain('update_plan');
-    expect(buildClaudeSystemPromptOptions({
-      saycodeSystemPrompt: '', appendSystemPrompt: 'USER', nextStepsPrompt: CLAUDE_NEXT_STEPS_PROMPT, saycodeSystemPromptEnabled: false,
-    }).appendSystemPrompt).toBe('USER');
+  const build = (extra: Partial<Parameters<typeof buildClaudeSystemPromptOptions>[0]>) =>
+    buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', appendSystemPrompt: 'USER', nextStepsPrompt: NEXT_STEPS_PROMPT, ...extra }).appendSystemPrompt;
+
+  it('rides only on a turn whose client draws the card, under the master switch', () => {
+    expect(build({ saycodePromptBlocks: { nextSteps: true } })).toContain('mcp__happy__next_steps');
+    expect(build({ saycodePromptBlocks: { nextSteps: true } })).not.toContain('update_plan');
+    // Older Desktop, mobile app, channel turn: no block, so the model keeps its question in the body.
+    expect(build({})).not.toContain('next_steps');
+    expect(build({ saycodePromptBlocks: { nextSteps: true }, saycodeSystemPromptEnabled: false })).toBe('USER');
   });
 });

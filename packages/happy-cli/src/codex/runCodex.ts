@@ -105,8 +105,11 @@ import { downloadCodexFileEventAttachment } from './utils/attachmentEvents';
 import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
 import {
+    isSaycodePromptBlockEnabled,
     resolveInitialSaycodeAppendSystemPrompt,
+    resolveMessagePromptBlocks,
     resolveSaycodeAppendSystemPromptForMessage,
+    withoutTurnScopedBlocks,
 } from '@/prompt/promptProvenance';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import type { LessonReviewWorker } from '@/memory/lessonReviewWorker';
@@ -123,14 +126,15 @@ import {
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
     isSupportedCodexReasoningEffort,
-    resolveCodexSaycodePromptBlocks,
     type CodexEnhancedMode,
 } from './codexPrompt';
 import { createCodexExecTitleRunner, isOffTurnTitleEligible } from './codexOffTurnTitle';
 import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
 import { discoverCodexSkillCommands } from './codexSkills';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
-import { CODEX_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
+import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
+import { createTurnCardSwitch } from '@/claude/utils/turnCardTools';
+import { codexPlanEvent } from './codexPlanEvent';
 import { consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
@@ -552,7 +556,7 @@ export async function runCodex(opts: {
     sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
-    let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = initialSaycodePromptBlocks;
+    let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = withoutTurnScopedBlocks(initialSaycodePromptBlocks);
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
@@ -653,10 +657,9 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
 
-        currentSaycodePromptBlocks = resolveCodexSaycodePromptBlocks(
-            currentSaycodePromptBlocks,
-            message.meta,
-        );
+        // `nextSteps` holds for this message only (specs/desktop-next-steps-card).
+        const messagePromptBlocks = resolveMessagePromptBlocks(currentSaycodePromptBlocks, message.meta);
+        currentSaycodePromptBlocks = messagePromptBlocks.standing;
 
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
             current: currentAppendSystemPrompt,
@@ -740,7 +743,7 @@ export async function runCodex(opts: {
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
-            saycodePromptBlocks: currentSaycodePromptBlocks,
+            saycodePromptBlocks: messagePromptBlocks.turn,
             effort: messageEffort,
         };
         const deferredTurn = deferredContinuation.prepare(message.content.text);
@@ -1685,6 +1688,11 @@ export async function runCodex(opts: {
             session.updateMetadata(current => ({ ...current, codexBackgroundTasks: tasks }));
             return;
         }
+        if (msg.type === 'plan_update') {
+            const plan = codexPlanEvent(msg);
+            if (plan) session.sendSessionProtocolMessage(createEnvelope('agent', plan, currentTurnId ? { turn: currentTurnId } : {}));
+            return;
+        }
         if (msg.type === 'codex_usage') {
             try {
                 session.sendProviderUsageEvent(createCodexUsageEvent({
@@ -1868,13 +1876,15 @@ export async function runCodex(opts: {
     const previousBackgroundTasks = session.getMetadata()?.codexBackgroundTasks;
     if (previousBackgroundTasks?.length) client.restoreBackgroundTasks(previousBackgroundTasks);
 
+    // Flipped per turn from that turn's prompt blocks (specs/desktop-next-steps-card).
+    const turnCards = createTurnCardSwitch('codex');
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
         exitAfterFirstTurn,
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         ...(runtimeGate ? { admitTool: <T,>(work: () => Promise<T>) => runtimeGate.admit(work, 'writer') } : {}),
         ...(accountToken !== null ? { proposeLesson: lessonProposalTurn.submit } : {}),
-        turnCards: 'codex',
+        turnCards,
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
@@ -2287,6 +2297,8 @@ export async function runCodex(opts: {
                     }
 
                     const checkpointGuidance = await checkpointComposition.agentReader?.guidance();
+                    // The same gate buildCodexDeveloperInstructions applies to the guidance below.
+                    turnCards.set(isSaycodePromptBlockEnabled('nextSteps', message.mode.saycodePromptBlocks, message.mode.saycodeSystemPromptEnabled));
                     const mcpSync = await measure('mcp-sync', () => mcpConfigSynchronizer.sync({
                         threadId: client.threadId,
                         resumeThread: client.threadId
@@ -2295,7 +2307,7 @@ export async function runCodex(opts: {
                                     connectorGuidance: buildConnectorGuidance(mcpServers),
                                     checkpointGuidance,
                                     agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
-                                    nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT,
+                                    nextStepsPrompt: NEXT_STEPS_PROMPT,
                                     mode: message.mode,
                                 });
                                 const resumed = await client.resumeThread({
@@ -2314,7 +2326,7 @@ export async function runCodex(opts: {
                         connectorGuidance: buildConnectorGuidance(mcpSync.mcpServers),
                         checkpointGuidance,
                         agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
-                        nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT,
+                        nextStepsPrompt: NEXT_STEPS_PROMPT,
                         mode: message.mode,
                     });
                     if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {

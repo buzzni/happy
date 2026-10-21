@@ -4,6 +4,8 @@ import type { SandboxConfig } from '@/persistence';
 import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import type { ClaudeLessonReviewLifecycle } from './session';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
+import type { TurnCardSwitch } from './utils/turnCardTools';
+import { isSaycodePromptBlockEnabled } from '@/prompt/promptProvenance';
 import { EnhancedMode } from "./loop";
 import { endManagedTurnInput } from '@/managed/managedGracefulStop';
 
@@ -46,7 +48,7 @@ import { isConnectorPlatformConfigured, readExpectedConnectors, readExpectedMcpS
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
-import { CLAUDE_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
+import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
 import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
@@ -175,6 +177,8 @@ export async function claudeRemote(opts: {
      * it is absent this function behaves exactly as it did before.
      */
     lessonProposalTurn?: LessonProposalTurn,
+    /** specs/desktop-next-steps-card — set from the prompt blocks this process starts with. */
+    turnCards?: TurnCardSwitch,
     lessonReviewLifecycle?: ClaudeLessonReviewLifecycle,
     lessons?: {
         turn: LessonTurnHost | null,
@@ -474,6 +478,12 @@ async function runClaudeRemote(
         expectedMcpServices: readExpectedMcpServices(),
         configuredServerNames: Object.keys(mergedMcpServers),
     }), { connectorPlatformConfigured: isConnectorPlatformConfigured() });
+    // Every message this process takes shares the initial mode's hash (a different
+    // `nextSteps` restarts it), so the tool and the prompt agree turn by turn.
+    // No switch means no next_steps tool (mandatory sandbox), so no guidance for it either.
+    const turnCardsDrawn = Boolean(opts.turnCards)
+        && isSaycodePromptBlockEnabled('nextSteps', initial.mode.saycodePromptBlocks, initial.mode.saycodeSystemPromptEnabled);
+    opts.turnCards?.set(turnCardsDrawn);
     const promptOptions = buildClaudeSystemPromptOptions({
         customSystemPrompt: initial.mode.customSystemPrompt,
         appendSystemPrompt: initial.mode.appendSystemPrompt,
@@ -484,7 +494,7 @@ async function runClaudeRemote(
         workerDelegationPrompt: workerAgents.delegationPrompt,
         connectorGuidance,
         checkpointGuidance: await opts.checkpointGuidance?.(),
-        nextStepsPrompt: CLAUDE_NEXT_STEPS_PROMPT,
+        nextStepsPrompt: turnCardsDrawn ? NEXT_STEPS_PROMPT : undefined,
         saycodeSystemPromptEnabled: initial.mode.saycodeSystemPromptEnabled,
         saycodePromptBlocks: initial.mode.saycodePromptBlocks,
     });

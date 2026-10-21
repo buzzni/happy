@@ -42,7 +42,7 @@ import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 // registry against the same name.
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 import { runScheduledTaskTool, scheduledTaskToolRequestSchema } from './scheduledTaskTools';
-import { registerTurnCardTools, turnCardToolNames, type TurnCardRunner } from './turnCardTools';
+import { registerTurnCardTools, TURN_CARD_TOOL_NAMES, type TurnCards } from './turnCardTools';
 
 export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
 
@@ -53,8 +53,8 @@ export interface HappyServerHandlers {
     changeTitle: (title: string, branchSlug?: string) => Promise<{ success: boolean; error?: string }>;
     client: ApiSessionClient;
     proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
-    /** Runner whose app draws the turn cards (next_steps, update_plan); absent refuses them. */
-    turnCards?: TurnCardRunner;
+    /** Per-turn switch for the next-steps card; absent (ACP) refuses it. */
+    turnCards?: TurnCards;
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
     browserTaskRuntime?: RuntimeClient;
@@ -143,7 +143,8 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         }, async (input) => runTool(async () => ({ content: [{ type: 'text' as const, text: JSON.stringify(handlers.proposeLesson!(input)) }] })));
     }
 
-    registerTurnCardTools(mcp, { client: handlers.client, runner: handlers.turnCards, runTool });
+    // Not in a mandatory sandbox: that boundary keeps its fixed minimal tool set (like propose_lesson).
+    if (!handlers.mandatorySandbox) registerTurnCardTools(mcp, { client: handlers.client, turnCards: handlers.turnCards, runTool });
 
     if (!handlers.mandatorySandbox && !scopedSession) mcp.registerTool('script_automations', {
         title: 'Manage Script Automations',
@@ -528,8 +529,8 @@ export async function startHappyServer(
         sameUidSandbox?: boolean;
         admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
         proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
-        /** specs/desktop-next-steps-card — which runner's app draws the turn cards. */
-        turnCards?: TurnCardRunner;
+        /** specs/desktop-next-steps-card — whether the running turn's client draws the card. */
+        turnCards?: TurnCards;
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
     } = {},
@@ -660,7 +661,7 @@ export async function startHappyServer(
         url: baseUrl.toString(),
         socketPath,
         mcpConfig,
-        toolNames: [...turnCardToolNames(options.turnCards), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {

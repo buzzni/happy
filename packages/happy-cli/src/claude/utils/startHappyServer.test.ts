@@ -155,7 +155,6 @@ describe('Happy MCP shutdown admission', () => {
             checkpoint_diff: { checkpointId: 'a'.repeat(40), path: 'file.txt' },
             change_title: { title: 'no-write' }, bash_stream: { command: 'no-execution' },
             next_steps: { summary: 'no-write', actions: [] },
-            update_plan: { scope: 'new_task', steps: [{ text: 'no-write', status: 'pending' }] },
             script_automations: { request: { operation: 'list' } },
             scheduled_tasks: { request: { operation: 'list' } },
             browser_click: { ref: '@e1' }, browser_fill: { ref: '@e1', value: 'x' },
