@@ -291,6 +291,7 @@ function categoryOf(app: AppIdentity, self: SelfIdentity, tables: ToolPolicyTabl
         if ((apps.trading.nameIncludes ?? []).some((part) => name.includes(part))) return 'trading';
         if ((apps.browser.nameIncludes ?? []).some((part) => name.includes(part))) return 'browser';
         if ((apps.terminal.nameIncludes ?? []).some((part) => name.includes(part))) return 'terminal';
+        if ((apps.shell.nameIncludes ?? []).some((part) => name.includes(part))) return 'shell';
     }
     return 'other';
 }

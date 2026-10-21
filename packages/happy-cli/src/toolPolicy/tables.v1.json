@@ -1,6 +1,6 @@
 {
   "$comment": "Saycode agent tool policy builtin tables v1. Canonical copy: aplus-dev-studio-desktop specs/agent-tool-policy/policy-tables.md. Classification lists start from Claude Desktop 2.42304.2 (osr/ssr/csr/lsr/usr/dsr/...); entries marked in policy-tables.md as changed/added are applied here. Edit this data, not code branches; bump policyVersion on every change.",
-  "policyVersion": "2026-10-22.2",
+  "policyVersion": "2026-10-22.3",
   "grades": {
     "browser": "read",
     "trading": "read",
@@ -659,6 +659,17 @@
         "mmc.exe",
         "control.exe",
         "systemsettings.exe"
+      ],
+      "nameIncludes": [
+        "finder",
+        "system settings",
+        "system preferences",
+        "activity monitor",
+        "keychain access",
+        "spotlight",
+        "task manager",
+        "file explorer",
+        "control panel"
       ]
     }
   },

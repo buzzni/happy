@@ -26,7 +26,12 @@ const path = require('path');
 const MESSAGE = '도구 정책으로 막힘: Saycode 도구 정책 파일은 에이전트가 바꿀 수 없다 — 정책은 Saycode 설정 화면에서 사용자가 바꾼다. 대신: 필요한 변경을 사용자에게 요청하라. 이 제한을 스크립트·자동화 도구·셸 명령 등 다른 방법으로 우회하지 마라.';
 
 function defaultEnv(policyFile) {
-    return { home: os.homedir(), happyHome: process.env.HAPPY_HOME_DIR || path.dirname(policyFile) };
+    return {
+        home: os.homedir(),
+        happyHome: process.env.HAPPY_HOME_DIR || path.dirname(policyFile),
+        // APFS and NTFS ignore case by default: `Tool-Policy.json` is the same file.
+        caseInsensitive: process.platform === 'darwin' || process.platform === 'win32',
+    };
 }
 
 /** `~`, `$HOME`, `${HOME}`, `$HAPPY_HOME_DIR`, `${HAPPY_HOME_DIR}` → absolute, then resolved against cwd. */
@@ -51,8 +56,11 @@ function globMatches(pattern, value) {
 function targetsPolicyFile(payload, policyFile, env = defaultEnv(policyFile)) {
     const input = (payload && payload.tool_input) || {};
     const cwd = payload.cwd || process.cwd();
-    const policyDir = path.dirname(policyFile);
-    const fileName = path.basename(policyFile);
+    // Fold only resolved paths, never the command: `$HOME` must stay a variable name.
+    const fold = env.caseInsensitive ? (value) => value.toLowerCase() : (value) => value;
+    const file = fold(policyFile);
+    const policyDir = path.dirname(file);
+    const fileName = path.basename(file);
     if (payload.tool_name === 'Bash') {
         if (typeof input.command !== 'string') return false;
         // Quotes, operators, `=` and `,` separate words; what is left may be a path.
@@ -60,16 +68,16 @@ function targetsPolicyFile(payload, policyFile, env = defaultEnv(policyFile)) {
         let namesDir = false;
         let namesFile = false;
         for (const word of words) {
-            const resolved = normalize(word, cwd, env);
-            if (globMatches(resolved, policyFile)) return true;
+            const resolved = fold(normalize(word, cwd, env));
+            if (globMatches(resolved, file)) return true;
             if (globMatches(resolved.replace(/\/+$/, ''), policyDir)) namesDir = true;
-            if (globMatches(path.basename(word), fileName)) namesFile = true;
+            if (globMatches(fold(path.basename(word)), fileName)) namesFile = true;
         }
         return namesDir && namesFile;
     }
     const target = input.file_path || input.notebook_path;
     if (typeof target !== 'string' || target.length === 0) return false;
-    return normalize(target, cwd, env) === policyFile;
+    return fold(normalize(target, cwd, env)) === file;
 }
 
 function main() {

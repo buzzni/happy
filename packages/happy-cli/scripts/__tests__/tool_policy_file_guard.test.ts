@@ -56,6 +56,14 @@ describe('tool_policy_file_guard', () => {
         expect(run(bash(command)).status).toBe(2);
     });
 
+    // Review bot (#909): macOS and Windows file systems ignore case by default.
+    it('compares case-insensitively where the file system does', () => {
+        const write = { tool_name: 'Write', tool_input: { file_path: '/Users/me/.happy/Tool-Policy.json' } };
+        expect(targetsPolicyFile(write, POLICY_FILE, { ...ENV, caseInsensitive: true })).toBe(true);
+        expect(targetsPolicyFile(bash('echo x > ~/.HAPPY/TOOL-POLICY.JSON'), POLICY_FILE, { ...ENV, caseInsensitive: true })).toBe(true);
+        expect(targetsPolicyFile(write, POLICY_FILE, { ...ENV, caseInsensitive: false })).toBe(false);
+    });
+
     it('blocks a relative name from inside the policy directory', () => {
         expect(targetsPolicyFile(bash('echo x > tool-policy.json', '/Users/me/.happy'), POLICY_FILE, ENV)).toBe(true);
         expect(targetsPolicyFile({ tool_name: 'Write', tool_input: { file_path: '~/.happy/tool-policy.json' } }, POLICY_FILE, ENV)).toBe(true);

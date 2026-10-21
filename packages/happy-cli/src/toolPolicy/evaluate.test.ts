@@ -63,6 +63,11 @@ describe('app grade table (policy-tables §1)', () => {
         expect(decide(cua('kill_app', { pid: 1 }, app)).reasonCode).toBe('self_target');
     });
 
+    // Review bot (#909): launching a shell app by name has no bundle id to classify it by.
+    it.each(['System Settings', 'Finder', 'Activity Monitor', 'Task Manager', 'File Explorer'])('launch_app {name: %s} is a shell app', (name) => {
+        expect(decide(cua('launch_app', { name }, { name }))).toMatchObject({ decision: 'blocked', reasonCode: 'grade_exceeded', target: { category: 'shell' } });
+    });
+
     it('launch_app by name is checked against self like a bundle id', () => {
         expect(decide(cua('launch_app', { name: 'Saycode' }, { name: 'Saycode' })).reasonCode).toBe('self_target');
         expect(decide(cua('launch_app', { name: 'Notes' }, { name: 'Notes' })).reasonCode).toBe('first_app_use');
