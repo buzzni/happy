@@ -11,7 +11,11 @@ type Pending = { approval: Approval | null; readyToPin: boolean; pinned: boolean
 /** Pending comparisons are ephemeral. Neither confirmation alone grants persistent trust.
  * Restarting the daemon loses the pending comparison; persisted pins are owned by the approval store.
  */
-export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKeys; now?: () => number; store?: ReturnType<typeof createDeviceOrgPinStore> }) {
+/** aplus specs/shared-machine-server-signing S6 (contract §20.5) — stands in for the local confirmation of a shared PC's
+ * approval: true only when this PC is marked shared and the approval's key is the one its trusted Studio origin serves. */
+export type DeviceAutoConfirm = (input: { transcript: OrgDeviceEnrollmentTranscript; approval: Approval }) => Promise<boolean>;
+export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKeys; now?: () => number; store?: ReturnType<typeof createDeviceOrgPinStore>;
+    autoConfirm?: DeviceAutoConfirm; onSharedPinned?: () => Promise<unknown> }) {
     const now = deps.now ?? Date.now;
     let pending: Pending | null = null;
     let revision = 0;
@@ -23,13 +27,19 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
         if (now() >= enrollment.transcript.expiresAt) throw new Error('DEVICE_ENROLLMENT_EXPIRED');
         // Consent is checked here; registration cannot change while this durable write is in flight.
         const candidate = { publicKey: enrollment.transcript.orgSigningPublicKey, approval: { ...enrollment.approval, body: { ...enrollment.approval.body } } };
-        committing = deps.store.pin(candidate).then(() => { enrollment.pinned = true; })
+        committing = deps.store.pin(candidate).then(async () => {
+            enrollment.pinned = true;
+            // A PC that pinned a shared approval is a shared PC: later approvals may be confirmed automatically.
+            if (enrollment.transcript.machineType === 'shared') await deps.onSharedPinned?.().catch(() => undefined);
+        })
             .catch(() => { throw new Error('DEVICE_PIN_PERSIST_FAILED'); })
             .finally(() => { committing = null; });
         return committing;
     }
     const copy = (value: Pending): Pending => ({ ...value, transcript: { ...value.transcript }, approval: value.approval ? { ...value.approval, body: { ...value.approval.body } } : null, readyToPin: value.locallyConfirmed && value.approval !== null });
     return {
+        /** Advertised as autoOrgPinVersion: Studio approves a shared PC without an administrator only if it confirms itself. */
+        autoConfirms: deps.autoConfirm !== undefined,
         async begin(input: z.input<typeof requestSchema>): Promise<Pending> {
             if (committing) throw new Error('DEVICE_PIN_PENDING');
             // Invalidate first, including malformed replacement attempts; never retain stale consent.
@@ -76,6 +86,13 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
             if (enrollment.approval && canonicalOrgSetupTokenJson(enrollment.approval) !== canonicalOrgSetupTokenJson(document)) throw new Error('REVISION_CONFLICT');
             // Never publish persistent trust before both independent confirmations.
             enrollment.approval = { ...document, body };
+            if (!enrollment.locallyConfirmed && deps.autoConfirm && transcript.machineType === 'shared' && transcript.ownerUserId === null) {
+                // A failed check only leaves the manual confirmation in place.
+                const confirmed = await deps.autoConfirm({ transcript: { ...transcript }, approval: { ...enrollment.approval, body: { ...body } } })
+                    .catch(() => false);
+                if (current !== revision || pending !== enrollment) throw new Error('DEVICE_ENROLLMENT_REPLACED');
+                if (confirmed === true) enrollment.locallyConfirmed = true;
+            }
             await persistIfReady();
         },
         /** The locally confirmed organization pin, which signed setup-token delivery trusts. */

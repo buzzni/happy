@@ -78,6 +78,11 @@ interface Settings {
    * Read through configuration.machineControl.
    */
   machineControl?: 'compat' | 'strict'
+  /**
+   * aplus specs/shared-machine-server-signing S6a — the organization machine type the registration claim reported.
+   * The daemon copies it once into its write-once machine-type marker; this setting itself is never trusted later.
+   */
+  machineType?: 'shared' | 'dedicated'
 }
 
 const defaultSettings: Settings = {

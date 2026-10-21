@@ -1175,6 +1175,8 @@ export class ApiMachineClient {
                     setupTokenRecipient: setupTokenRecipientCapability(this.setupTokenAssignmentRecipient),
                     ...(this.deviceKeys ? { deviceKeyVersion: 1, deviceSigningPublicKey: Buffer.from(this.deviceKeys.signing.publicKey).toString('base64url'), recipientPublicKey: Buffer.from(this.deviceKeys.recipient.publicKey).toString('base64url') } : {}),
                     ...(this.deviceKeys && this.deviceEnrollment ? { signedSetupTokenAssignmentVersion: 1 } : {}),
+                    // aplus specs/shared-machine-server-signing S6 — this daemon confirms a shared PC's server-signed approval itself.
+                    ...(this.deviceKeys && this.deviceEnrollment?.autoConfirms ? { autoOrgPinVersion: 1 } : {}),
                 };
             }
             return capabilities;

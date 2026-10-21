@@ -1985,6 +1985,19 @@ describe('device registration RPC boundary', () => {
         const capabilities = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:capabilities')![1];
         expect(await capabilities()).toMatchObject({ signedSetupTokenAssignmentVersion: 1, deviceKeyVersion: 1 });
     });
+    // aplus specs/shared-machine-server-signing S6 — Studio approves a shared PC without an administrator only for this.
+    it('advertises automatic organization pinning only when the enrollment can confirm a shared PC by itself', async () => {
+        const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;
+        for (const autoConfirms of [true, false]) {
+            const enrollment = { begin: vi.fn(), approve: vi.fn(), getStatus: vi.fn(), orgPin: vi.fn(async () => null), autoConfirms };
+            const client = new ApiMachineClient('token', makeMachine(), { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() }, enrollment as never);
+            client.setRPCHandlers({ spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(), portRegistry: {} as any, aiCredentialRuntime: runtime });
+            const manager = (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager;
+            const capabilities = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:capabilities')![1];
+            if (autoConfirms) expect(await capabilities()).toMatchObject({ autoOrgPinVersion: 1, deviceKeyVersion: 1 });
+            else expect(await capabilities()).not.toHaveProperty('autoOrgPinVersion');
+        }
+    });
     it('does not offer signed delivery without both device keys and a local enrollment controller', async () => {
         const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;
         for (const client of [new ApiMachineClient('token', makeMachine(), { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() }), new ApiMachineClient('token', makeMachine())]) {

@@ -5,6 +5,8 @@ import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from '.
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
 import { spawnRefusalForRemoval, worktreeRemovalReservations } from './worktreeRemovalReservations';
 import { createDeviceEnrollment } from './deviceEnrollment';
+import { createMachineTypeMarker } from './machineTypeMarker';
+import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
@@ -65,6 +67,7 @@ import {
   preparedMachineLaunchHomeDirs,
   readCredentials,
   parseCredentials,
+  readSettings,
 } from '@/persistence';
 import { persistSetupTokenBinding, recoverSetupTokenBindingPersistence } from './setupTokenBindingPersistence';
 import { decideResumeCredentials, readStagedTokenFromHomeDir, tokensShareIdentity } from './resumeCredentials';
@@ -4054,8 +4057,19 @@ export async function startDaemon(): Promise<void> {
       .then((renamed) => { if (renamed.length > 0) logger.debug('[DAEMON RUN] Legacy device state names', renamed); })
       .catch((error) => logger.debug('[DAEMON RUN] Legacy device state rename failed', error));
     const deviceKeys = managedRuntimeActive ? undefined : await loadOrCreateDeviceKeys(configuration.happyHomeDir, machine.id);
+    // aplus specs/shared-machine-server-signing S6a — the type the registration claim reported, copied once and never rewritten.
+    const machineTypeMarker = createMachineTypeMarker({ home: configuration.happyHomeDir, machineId: machine.id });
+    const claimedMachineType = deviceKeys ? (await readSettings()).machineType : undefined;
+    if (claimedMachineType === 'shared' || claimedMachineType === 'dedicated')
+      await machineTypeMarker.record(claimedMachineType)
+        .catch((error) => logger.debug('[DAEMON RUN] machine type marker not recorded', error));
+    // S6 — a shared PC confirms a server-signed approval against the key its trusted Studio origin serves.
+    const autoConfirmOrigin = readTrustedStudioOrigin(process.env);
     if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
-      store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }) });
+      store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }),
+      onSharedPinned: () => machineTypeMarker.record('shared'),
+      ...(autoConfirmOrigin ? { autoConfirm: createSharedPcAutoConfirm({ marker: machineTypeMarker, machineId: machine.id,
+        token: () => credentials.token, studioOrigin: autoConfirmOrigin, log: (message, details) => logger.debug(message, details) }) } : {}) });
     const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);
     if (standaloneWindows) apiMachine.setWindowsStandaloneTrial();
     startDifficultyRoutingMetadataPoll({
