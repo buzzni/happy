@@ -24,7 +24,8 @@ export type SetupTokenUsageObservation = {
   retryAt: number | null
 }
 export type SetupTokenAccountSwitchDeps = {
-  machineRuntime?(): MachineSetupTokenRuntime | null
+  /** The machine-rotation runtime of the binding's company (aplus Phase 3c: one per company). */
+  machineRuntime?(companyId: string): MachineSetupTokenRuntime | null | Promise<MachineSetupTokenRuntime | null>
   findSession(sessionId: string): TrackedSession | undefined
   /** The daemon's single trusted Studio origin (HAPPY_APLUS_STUDIO_ORIGIN). */
   studioOrigin: string | null
@@ -173,7 +174,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
       const parsed = parseBinding(running)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
-        try { const runtime = deps.machineRuntime?.(); if (!runtime) return failure('STUDIO_UNAVAILABLE', 'machine runtime absent')
+        try { const runtime = await deps.machineRuntime?.(parsed.binding.companyId); if (!runtime) return failure('STUDIO_UNAVAILABLE', 'machine runtime absent')
           return await runtime.reportUsage(sessionId, running, observation, signal) }
         catch (error) { return machineFailure(error) }
       }
@@ -192,9 +193,10 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<RebindResult> {
       const parsed = parseBinding(running)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
-        const runtime = deps.machineRuntime?.()
-        if (!runtime) return Promise.resolve(failure('STUDIO_UNAVAILABLE', 'machine runtime absent'))
-        return runtime.rebind(sessionId, running, observation, signal).then(environment => ({ ok: true as const, environment }), machineFailure)
+        const binding = parsed.binding
+        return Promise.resolve(deps.machineRuntime?.(binding.companyId)).then(runtime => runtime
+          ? runtime.rebind(sessionId, running, observation, signal).then(environment => ({ ok: true as const, environment }), machineFailure)
+          : failure('STUDIO_UNAVAILABLE', 'machine runtime absent'), machineFailure)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending

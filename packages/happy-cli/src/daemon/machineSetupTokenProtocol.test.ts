@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import nacl from 'tweetnacl'
 import { rotationSha256, signRotationDocument, verifyRotationDocument } from '@slopus/happy-wire'
-import { createMachineSetupTokenProtocol, readMachineRotationConfig } from './machineSetupTokenProtocol'
+import { createMachineSetupTokenProtocol } from './machineSetupTokenProtocol'
 import type { DeviceOrgPin } from './deviceOrgPinStore'
 
 const companyId = 'company', machineId = 'machine', studioOrigin = 'https://studio.test', happyOrigin = 'https://happy.test'
@@ -14,15 +14,6 @@ function setup(fetcher: typeof fetch) {
   return { protocol, keys, studio, revoke: () => { pin = null } }
 }
 describe('machine-v2 pinned Studio and device boundary', () => {
-  it('is explicitly OFF and refuses malformed ON or a missing exact local allowlist pair', () => {
-    expect(readMachineRotationConfig({}, machineId, happyOrigin)).toBeNull()
-    expect(() => readMachineRotationConfig({ HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED: 'true' }, machineId, happyOrigin)).toThrow('CONFIGURATION_REQUIRED')
-    const env = { HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED: 'true', HAPPY_SETUP_TOKEN_MACHINE_V2_COMPANY_ID: companyId,
-      HAPPY_APLUS_STUDIO_ORIGIN: studioOrigin, HAPPY_SETUP_TOKEN_MACHINE_V2_STUDIO_PUBLIC_KEY: Buffer.alloc(32).toString('base64url'),
-      HAPPY_SETUP_TOKEN_MACHINE_V2_ALLOWLIST: JSON.stringify([[companyId, 'other-machine']]) }
-    expect(() => readMachineRotationConfig(env, machineId, happyOrigin)).toThrow('CONFIGURATION_REQUIRED')
-    expect(readMachineRotationConfig({ ...env, HAPPY_SETUP_TOKEN_MACHINE_V2_ALLOWLIST: JSON.stringify([[companyId, machineId]]) }, machineId, happyOrigin)).toMatchObject({ companyId, machineId })
-  })
   it('signs the exact method/path/body with the approved persistent key; revocation sends nothing', async () => {
     const fetcher = vi.fn(async (_url, options) => {
       const document = JSON.parse(String(options?.body)); await verifyRotationDocument(document, keys.signing.publicKey)

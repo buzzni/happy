@@ -266,3 +266,30 @@ describe('setup-token account switch (specs/claude-setup-token-account-selection
     expect(requests.filter(request => request.url.endsWith('/rebind'))).toHaveLength(1)
   })
 })
+
+// aplus specs/shared-machine-server-signing Phase 3c — one machine-rotation runtime per company, found by the binding's company.
+describe('machine-rotation bindings', () => {
+  const machine = {
+    version: 2, type: 'claude-setup-token-binding', audience: 'saycode-daemon', principalType: 'machine', companyId: 'org-m', machineId: 'pc-a',
+    groupScope: 'org-m', assignmentGeneration: 1, assignmentFingerprint: 'a'.repeat(64), managedAccountId: A, credentialGeneration: 1,
+    approvalId: 'approval', deviceKeyId: 'd'.repeat(64), launchId: 'launch', bindingRevision: 1, previousNonce: null,
+    nonce: Buffer.alloc(32, 1).toString('base64url'), issuedAt: 1, expiresAt: 2, keyId: 'f'.repeat(64),
+    execution: { sessionId: 'session-a', initialNonce: Buffer.alloc(32, 1).toString('base64url'), issueOperationId: 'op', sessionOwnerAccountId: 'owner', machineOwnerAccountId: 'machine-owner' },
+  } as unknown as SetupTokenBinding
+  const running = formatSetupTokenBinding(machine)
+
+  it('reports usage and switches through the runtime of the binding\'s company', async () => {
+    const runtime = { reportUsage: vi.fn(async () => ({ ok: true as const })), rebind: vi.fn(async () => ({ NEXT: '1' })) }
+    const machineRuntime = vi.fn(async () => runtime as never)
+    const { switcher } = setup({ machineRuntime })
+    await expect(switcher.reportUsage('session-a', running, observation)).resolves.toEqual({ ok: true })
+    await expect(switcher.rebind('session-a', running, observation)).resolves.toEqual({ ok: true, environment: { NEXT: '1' } })
+    expect(machineRuntime.mock.calls).toEqual([['org-m'], ['org-m']])
+  })
+
+  it('reports Studio unavailable when that company has no runtime', async () => {
+    const { switcher } = setup({ machineRuntime: async () => null })
+    await expect(switcher.reportUsage('session-a', running, observation)).resolves.toMatchObject({ ok: false, reason: 'STUDIO_UNAVAILABLE' })
+    await expect(switcher.rebind('session-a', running, observation)).resolves.toMatchObject({ ok: false, reason: 'STUDIO_UNAVAILABLE' })
+  })
+})
