@@ -629,17 +629,33 @@ export async function readDaemonState(): Promise<DaemonLocallyPersistedState | n
 }
 
 /**
- * Write daemon state to local file (synchronously for atomic operation).
+ * Write daemon state to local file, replacing it in one rename.
  *
  * Since 2026-09 this file can carry `controlSecret` (ADR-061), so it must be
- * unreadable by other local users. `mode` on `writeFileSync` only applies when
- * the file is newly created — a file that pre-dates this field (or was
- * otherwise created with a looser mode) needs an explicit chmod too.
+ * unreadable by other local users. The replacement is a newly created 0600
+ * file, so a target that pre-dates this (or had a looser mode) is tightened too.
  */
 export function writeDaemonState(state: DaemonLocallyPersistedState): void {
-  writeFileSync(configuration.daemonStateFile, JSON.stringify(state, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  chmodSync(configuration.daemonStateFile, 0o600);
+  const path = configuration.daemonStateFile;
+  const contents = JSON.stringify(state, null, 2);
+  // CLI processes poll this file every few milliseconds; rewriting it in place (truncate, then
+  // write) lets them parse a half-written file. Writing a per-process file and renaming it over the
+  // target keeps every read whole, and the new file is created owner-only.
+  const temporary = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(temporary, contents, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    // Windows refuses the rename while another program (an antivirus scan, an editor) holds the
+    // target. Losing the state would be worse than the old in-place write, so fall back to it.
+    if (process.platform !== 'win32' || !WINDOWS_HELD_FILE_CODES.has((error as NodeJS.ErrnoException).code ?? '')) throw error;
+    writeFileSync(path, contents, { encoding: 'utf-8', mode: 0o600 });
+    chmodSync(path, 0o600);
+  }
 }
+
+const WINDOWS_HELD_FILE_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 
 /**
  * Compare-and-set write: only writes when the file still holds `expectedRaw`, the
