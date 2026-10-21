@@ -138,6 +138,8 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
   it('creates under the original staged Happy account, proves the encrypted payload, and returns token only after persistence and commit', async () => {
     const t = await setup(), prepared = await t.build().prepareLaunch(t.input)
     expect(prepared.reconnectEnvironment.HAPPY_RECONNECT_SESSION_ID).toBe(prepared.session.id)
+    // Phase 3d — the child treats the session created for it as a new conversation, its first prompt included.
+    expect(prepared.reconnectEnvironment.HAPPY_RECONNECT_FRESH_LAUNCH).toBe('1')
     expect(prepared.session.metadata.setupTokenRotation).toEqual({ version: 1, principalType: 'machine', bindingVersion: 2 })
     expect(t.steps).toEqual(['journal', 'issue', 'journal', 'create', 'journal', 'persist', 'claim', 'persist', 'commit', 'journal', 'token'])
     expect(t.persist.mock.calls[0][0].userHomeDir).toBe('/staged-home')

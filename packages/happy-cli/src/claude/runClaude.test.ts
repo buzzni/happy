@@ -577,6 +577,27 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    // aplus specs/shared-machine-server-signing Phase 3d — a machine-rotation launch attaches to the session the daemon
+    // created for it; its first prompt (here a run-once automation's) must start the conversation, not be dropped.
+    it('starts a fresh machine-rotation launch with its first prompt even though it attaches to an existing session', async () => {
+        process.env.HAPPY_RECONNECT_SESSION_ID = 'happy-session-1';
+        process.env.HAPPY_RECONNECT_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32)).toString('base64');
+        process.env.HAPPY_RECONNECT_ENCRYPTION_VARIANT = 'legacy';
+        process.env.HAPPY_RECONNECT_SNAPSHOT = Buffer.from(JSON.stringify({
+            metadata: { path: '/tmp/project', flavor: 'claude' }, seq: 3, metadataVersion: 1, agentStateVersion: 1,
+        })).toString('base64');
+        process.env.HAPPY_RECONNECT_FRESH_LAUNCH = '1';
+        process.env.HAPPY_INITIAL_PROMPT = '공용 PC 자동화';
+        process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.loopOptions.exitAfterFirstTurn).toBe(true);
+        expect(process.env.HAPPY_RECONNECT_FRESH_LAUNCH).toBeUndefined();
+
+        await harness.finish();
+    });
+
     it('includes createdBy in fresh session metadata when the daemon supplies it', async () => {
         process.env.HAPPY_CREATED_BY_ACCOUNT_ID = 'acct-123';
         process.env.HAPPY_CREATED_BY_DISPLAY_NAME = 'Ada';
