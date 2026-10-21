@@ -156,6 +156,26 @@ describe('cua-driver shadow proxy', () => {
         expect(t.calls()).toEqual(['get_window_state {"pid":12,"window_id":7}', 'click {"element_token":"tok-12"}']);
     });
 
+    // Review #1: which window cua-driver acts on is not ours to guess when the pid and the token disagree.
+    it('treats a token from one app sent with the pid of another as an unknown target', async () => {
+        const t = await setup();
+        await t.call('get_window_state', { pid: 11, window_id: 5 });
+        await t.call('click', { pid: 12, element_token: 'tok-11' });
+        expect(t.asked).toMatchObject([{ toolName: 'mcp__cua-driver__click', policy: { reasonCode: 'target_unresolved' } }]);
+    });
+
+    // Review #5: nothing reaches cua-driver without a decision.
+    it('refuses a batch and drops a call without an id or a line it cannot read', async () => {
+        const t = await setup();
+        const answered = new Promise<string>((resolveLine) => t.output.once('data', (chunk) => resolveLine(String(chunk))));
+        t.input.write(JSON.stringify([{ jsonrpc: '2.0', id: 90, method: 'tools/call', params: { name: 'type_text', arguments: { pid: 12, text: 'x' } } }]) + '\n');
+        expect(JSON.parse(await answered)).toMatchObject({ id: 90, error: { code: -32600 } });
+        t.input.write(JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'type_text', arguments: { pid: 12, text: 'x' } } }) + '\n');
+        t.input.write('{"jsonrpc":"2.0","id":91,"method":"tools/call","params":{"name":"type_text"\n');
+        await t.call('list_apps', {});
+        expect(t.calls()).toEqual(['list_apps {}']);
+    });
+
     it('refuses the call when the person declines', async () => {
         const t = await setup({ answer: { approved: false, policyGrant: 'once' } });
         const response = await t.call('click', { pid: 12 }, { callId: 'exec-1' });

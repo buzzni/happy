@@ -7,7 +7,9 @@ import {
     claudeCuaShadowEntry,
     codexCuaShadowConfig,
     readClaudeCuaUpstream,
+    withoutCuaDriver,
 } from './cuaShadow';
+import { cuaUpstreamEnv } from './cuaProxy';
 
 const POLICY_ENV = { HAPPY_TOOL_POLICY_PORT: '4000', HAPPY_TOOL_POLICY_SECRET_FILE: '/h/secret', HAPPY_TOOL_POLICY_SERVER: 'cua-driver' };
 
@@ -48,13 +50,26 @@ describe('reading the cua-driver command Claude would run', () => {
 });
 
 describe('the shadow entries', () => {
-    it('Claude: starts the proxy with the user command after --, and the user env plus the policy env', () => {
+    // The entry travels as `--mcp-config` argv, which other local users can read: the user's env is
+    // only referenced there and Claude expands it from its own environment.
+    it('Claude: starts the proxy with the user command after --, the policy env and a reference to the user env', () => {
         expect(claudeCuaShadowEntry({ execPath: '/n/node', bridgeEntrypoint: '/h/bin/happy-mcp.mjs', upstream: { command: '/c/cua-driver', args: ['mcp'], env: { CUA_TOKEN: 't' } }, policyEnv: POLICY_ENV })).toEqual({
             type: 'stdio',
             command: '/n/node',
             args: ['--no-warnings', '--no-deprecation', '/h/bin/happy-mcp.mjs', '--cua-proxy', '--', '/c/cua-driver', 'mcp'],
-            env: { CUA_TOKEN: 't', ...POLICY_ENV },
+            env: { ...POLICY_ENV, HAPPY_CUA_UPSTREAM_ENV: '${HAPPY_CUA_UPSTREAM_ENV}' },
         });
+        expect(claudeCuaShadowEntry({ execPath: '/n/node', bridgeEntrypoint: '/b', upstream: { command: 'c', args: [], env: {} }, policyEnv: POLICY_ENV }).env).toEqual(POLICY_ENV);
+    });
+
+    it('the proxy reads the referenced user env back for cua-driver only', () => {
+        expect(cuaUpstreamEnv({ PATH: '/bin', HAPPY_CUA_UPSTREAM_ENV: '{"CUA_TOKEN":"t","BAD":1}', ...POLICY_ENV }))
+            .toEqual({ PATH: '/bin', CUA_TOKEN: 't' });
+        expect(cuaUpstreamEnv({ PATH: '/bin', HAPPY_CUA_UPSTREAM_ENV: 'not json' })).toEqual({ PATH: '/bin' });
+    });
+
+    it('keeps an org server of the same name from displacing the shadow', () => {
+        expect(withoutCuaDriver({ notion: 1, 'cua-driver': 2 })).toEqual({ notion: 1 });
     });
 
     it('Codex: replaces the command of the native entry and waits past the approval window', () => {

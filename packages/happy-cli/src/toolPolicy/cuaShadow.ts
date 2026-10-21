@@ -18,6 +18,7 @@
 
 import { readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
+import { CUA_UPSTREAM_ENV_VAR } from './cuaProxy';
 import { BUILTIN_TABLES } from './rules';
 
 export const CUA_DRIVER_SERVER = BUILTIN_TABLES.cuaDriver.server;
@@ -65,8 +66,12 @@ export function claudeCuaShadowEntry(input: ShadowLaunch & { upstream: CuaUpstre
         type: 'stdio',
         command: input.execPath,
         args: proxyArgs(input, input.upstream),
-        // Claude does not merge the user's entry into ours, so its env comes along.
-        env: { ...input.upstream.env, ...input.policyEnv },
+        // Claude does not merge the user's entry into ours, so its env comes along — by reference:
+        // this entry is `--mcp-config` argv, and the caller puts the values in Claude's environment.
+        env: {
+            ...input.policyEnv,
+            ...(Object.keys(input.upstream.env).length > 0 ? { [CUA_UPSTREAM_ENV_VAR]: `\${${CUA_UPSTREAM_ENV_VAR}}` } : {}),
+        },
     };
 }
 
@@ -92,6 +97,12 @@ export function codexCuaShadowConfig(nativeServers: unknown, input: ShadowLaunch
         ...(typeof native.cwd === 'string' ? { cwd: native.cwd } : {}),
         tool_timeout_sec: CUA_SHADOW_TOOL_TIMEOUT_SECONDS,
     };
+}
+
+/** Claude: an org server named `cua-driver` must not displace the shadow while the hook steps aside. */
+export function withoutCuaDriver<T>(servers: Record<string, T>): Record<string, T> {
+    const { [CUA_DRIVER_SERVER]: _displaced, ...rest } = servers;
+    return rest;
 }
 
 function proxyArgs(launch: ShadowLaunch, upstream: { command: string; args: string[] }): string[] {

@@ -6,7 +6,7 @@
  * session hook server, the machine policy loader, target resolver, grants and audit log.
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
@@ -55,6 +55,8 @@ export function createToolPolicyRuntime(input: {
         approver: input.approver,
         unattended: input.unattended,
         terminalPrompt: input.terminalPrompt,
+        // A call without a provider id (no `_meta`) still gets a request id no other call shares.
+        newRequestId: () => `policy-${randomUUID()}`,
     });
 
     return {

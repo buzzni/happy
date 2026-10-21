@@ -235,6 +235,7 @@ async function handlePreToolUse(
             // Only the proxy and the bridge send these; the Claude hook payload never has them.
             ...(data.origin === 'cua-proxy' || data.origin === 'bridge' ? { origin: data.origin } : {}),
             ...(Number.isInteger(data.element_pid) ? { elementPid: data.element_pid as number } : {}),
+            ...(typeof data.permission_mode === 'string' ? { permissionMode: data.permission_mode } : {}),
             ...(annotations ? { annotations } : {}),
         }, controller.signal);
         if (!res.writableEnded && !res.destroyed) {

@@ -23,8 +23,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { parseCuaProxyArgv, startCuaProxy } from '@/toolPolicy/cuaProxy';
-import { toolPolicyClientFromEnv, withoutToolPolicyEnv } from '@/toolPolicy/policyClient';
+import { cuaUpstreamEnv, parseCuaProxyArgv, startCuaProxy } from '@/toolPolicy/cuaProxy';
+import { toolPolicyClientFromEnv } from '@/toolPolicy/policyClient';
 
 function parseArgs(argv: string[]): { url: string | null } {
   let url: string | null = null;
@@ -42,7 +42,7 @@ async function main() {
   const proxied = parseCuaProxyArgv(process.argv.slice(2));
   if (proxied) {
     const proxy = startCuaProxy({
-      upstream: { ...proxied, env: withoutToolPolicyEnv(process.env) },
+      upstream: { ...proxied, env: cuaUpstreamEnv(process.env) },
       policy: toolPolicyClientFromEnv(process.env, 'cua-proxy'),
       input: process.stdin,
       output: process.stdout,

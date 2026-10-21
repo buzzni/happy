@@ -79,10 +79,13 @@ export function buildToolPolicyHookEntries(input: { forwarderCommand: string; fi
 
 /**
  * While cua-driver runs behind the shadow proxy, each of its calls is decided exactly once:
- * - remote (SDK) mode: the proxy decides — only it saw which app an `element_token` names — and
- *   the hook steps aside;
- * - local (terminal) mode: the hook decides, because only it can hand `ask` to Claude's own prompt,
- *   and the proxy then lets through exactly the call (by tool_use_id) the hook let through.
+ * - remote (SDK) mode under bypassPermissions (what Desktop sends): the proxy decides — only it saw
+ *   which app an `element_token` names — and the hook steps aside;
+ * - local (terminal) mode, or any other permission mode: the hook decides — only it can hand `ask`
+ *   to Claude's own prompt, and only its `allow` skips Claude's own approval card, which would
+ *   otherwise come first and share the proxy's request id — and the proxy then lets through exactly
+ *   the call (by tool_use_id) the hook let through. The target the hook judged is not looked up
+ *   again when the call reaches the proxy (as in I1a's hook path).
  * A proxy call the hook did not let through is decided by the proxy, so a mode switch between the
  * two never skips a decision.
  */
@@ -94,7 +97,8 @@ export function handOffCuaToShadowProxy(gate: ToolPolicyGate, options: { termina
         decide: async (call, signal) => {
             if (parseMcpToolName(call.toolName)?.server !== tables.cuaDriver.server) return gate.decide(call, signal);
             if (call.origin === undefined) {
-                if (!options.terminalPrompt() || !call.toolUseId) return { kind: 'pass' };
+                const hookDecides = options.terminalPrompt() || (call.permissionMode !== undefined && call.permissionMode !== 'bypassPermissions');
+                if (!hookDecides || !call.toolUseId) return { kind: 'pass' };
                 const verdict = await gate.decide(call, signal);
                 if (verdict.kind !== 'deny') {
                     decidedByHook.add(call.toolUseId);

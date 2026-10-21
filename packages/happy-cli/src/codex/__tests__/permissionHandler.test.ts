@@ -533,8 +533,18 @@ describe('CodexPermissionHandler tool policy approval (agent-tool-policy R11)', 
         await answer(session, { id: 'd', approved: false });
         await expect(denied).resolves.toEqual({ approved: false, policyGrant: 'once' });
 
+        // Review #6: the Stop button withdraws; it is not a person declining this call.
         const stopped = handler.requestPolicyApproval({ id: 'e', toolName: 't', args: {}, policy, signal: new AbortController().signal });
         handler.abortAll();
-        await expect(stopped).resolves.toEqual({ approved: false, policyGrant: 'once' });
+        await expect(stopped).rejects.toThrow();
+    });
+
+    it('refuses a second request under an id that is still waiting (review #4)', async () => {
+        const { session } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const first = handler.requestPolicyApproval({ id: 'same', toolName: 't', args: {}, policy, signal: new AbortController().signal });
+        await expect(handler.requestPolicyApproval({ id: 'same', toolName: 't', args: {}, policy, signal: new AbortController().signal })).rejects.toThrow();
+        await answer(session, { id: 'same', approved: true });
+        await expect(first).resolves.toEqual({ approved: true, policyGrant: 'once' });
     });
 });

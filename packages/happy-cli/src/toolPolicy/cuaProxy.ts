@@ -21,7 +21,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
-import type { ToolPolicyClient } from './policyClient';
+import { withoutToolPolicyEnv, type ToolPolicyClient } from './policyClient';
 
 /** Snapshots are per window and superseded quickly; this bounds memory over a long session. */
 const MAX_REMEMBERED_TOKENS = 5000;
@@ -105,7 +105,16 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
     const clientLines = createInterface({ input: options.input });
     clientLines.on('line', (line) => {
         const message = parse(line);
-        if (message?.method === 'tools/call' && message.id !== undefined && message.id !== null) {
+        // Only a message the proxy can read is relayed: nothing reaches cua-driver unjudged.
+        if (!message) {
+            refuseUnreadable(line);
+            return;
+        }
+        if (message.method === 'tools/call') {
+            if (message.id === undefined || message.id === null) {
+                log('dropped a tools/call without an id');
+                return;
+            }
             void judge(line, message as JsonRpcMessage & { id: JsonRpcId });
             return;
         }
@@ -148,6 +157,23 @@ export function startCuaProxy(options: CuaProxyOptions): CuaProxy {
         toClient({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: verdict.reason }], isError: true } });
     }
 
+    function refuseUnreadable(line: string): void {
+        let batch: unknown;
+        try {
+            batch = JSON.parse(line);
+        } catch {
+            log('dropped an unreadable line');
+            return;
+        }
+        // JSON-RPC batches are gone from MCP (2025-06-18); answer each request in one rather than judge it.
+        for (const item of Array.isArray(batch) ? batch : []) {
+            const id = isRecord(item) ? item.id : undefined;
+            if (typeof id === 'string' || typeof id === 'number') {
+                toClient({ jsonrpc: '2.0', id, error: { code: -32600, message: 'Batch requests are not supported' } });
+            }
+        }
+    }
+
     function rememberTokens(result: Record<string, unknown> | undefined, requestPid: number | undefined): void {
         const structured = isRecord(result?.structuredContent) ? result.structuredContent : null;
         if (!structured || !Array.isArray(structured.elements)) return;
@@ -183,6 +209,25 @@ export function parseCuaProxyArgv(argv: string[]): { command: string; args: stri
     const separator = argv.indexOf('--');
     if (!argv.includes('--cua-proxy') || separator < 0 || separator + 1 >= argv.length) return null;
     return { command: argv[separator + 1], args: argv.slice(separator + 2) };
+}
+
+/**
+ * Claude only: the user's own cua-driver env, which the shadow entry references as
+ * `${HAPPY_CUA_UPSTREAM_ENV}` (Claude expands it from its environment) instead of carrying it in
+ * `--mcp-config` argv where other local users can read it. Read back here for cua-driver only.
+ */
+export const CUA_UPSTREAM_ENV_VAR = 'HAPPY_CUA_UPSTREAM_ENV';
+
+export function cuaUpstreamEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const { [CUA_UPSTREAM_ENV_VAR]: carried, ...rest } = withoutToolPolicyEnv(env);
+    let user: unknown = {};
+    try {
+        user = JSON.parse(carried ?? '{}');
+    } catch {
+        user = {};
+    }
+    const strings = Object.entries(isRecord(user) ? user : {}).filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+    return { ...rest, ...Object.fromEntries(strings) };
 }
 
 function defaultSpawn(command: string, args: string[], env: NodeJS.ProcessEnv): ChildProcess {

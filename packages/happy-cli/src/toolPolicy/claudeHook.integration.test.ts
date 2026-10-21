@@ -17,6 +17,7 @@ import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 import { query, type SDKMessage } from '@/claude/sdk';
 import { createToolPolicyAuditLog } from './audit';
 import { handOffCuaToShadowProxy } from './claudeHook';
+import { CUA_UPSTREAM_ENV_VAR } from './cuaProxy';
 import { CUA_DRIVER_SERVER, claudeCuaShadowEntry } from './cuaShadow';
 import { createPolicyGrantStore } from './grants';
 import { toolPolicyAdapterEnv } from './policyClient';
@@ -163,6 +164,8 @@ describe('cua-driver shadow proxy with the real Claude CLI', () => {
             upstream: { command: process.execPath, args: [FAKE_CUA], env: { FAKE_CUA_MARKER: marker } },
             policyEnv: toolPolicyAdapterEnv({ port: server.port, secretFile, server: CUA_DRIVER_SERVER }),
         });
+        // As runClaude does: the entry only references the user's cua-driver env; Claude expands it.
+        process.env[CUA_UPSTREAM_ENV_VAR] = JSON.stringify({ FAKE_CUA_MARKER: marker });
         await collect(query({
             prompt: 'Call mcp__cua-driver__get_window_state with pid=11 and window_id=1. Then call mcp__cua-driver__type_text with '
                 + 'element_token set to the element_token from that result and text="ls". Do not retry, and do not pass pid to type_text. Report both results verbatim.',
@@ -176,6 +179,8 @@ describe('cua-driver shadow proxy with the real Claude CLI', () => {
                 strictMcpConfig: true,
             },
         }));
+        delete process.env[CUA_UPSTREAM_ENV_VAR];
+        // The marker path reached cua-driver only through the expanded reference.
         const ran = existsSync(marker) ? readFileSync(marker, 'utf8') : '';
         expect(ran).toContain('get_window_state {"pid":11');
         expect(ran).not.toContain('type_text');

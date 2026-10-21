@@ -71,6 +71,8 @@ export interface PreToolUseCall {
     elementPid?: number;
     /** Proxy and bridge: the tool's `tools/list` annotations (R8, trusted only to tighten). */
     annotations?: PolicyCallInput['annotations'];
+    /** Claude hook: the session's permission mode, when Claude sent it. */
+    permissionMode?: string;
 }
 
 export type HookVerdict =
@@ -230,10 +232,15 @@ export function createToolPolicyGate(deps: {
 /**
  * An `element_token` names an element of an earlier `get_window_state` snapshot. The shadow proxy
  * saw that snapshot and passes its pid; the hook never does, so there the target stays unknown.
+ * A token from one app's snapshot sent with another app's pid (or `scope: desktop`) leaves it to
+ * cua-driver which window it acts on — that is not ours to guess, so the target is unknown (ask).
  */
 function withSnapshotPid(request: CuaTargetRequest, args: Record<string, unknown>, elementPid: number | undefined): CuaTargetRequest {
-    if (request.kind !== 'unknown' || elementPid === undefined || !Number.isInteger(elementPid)) return request;
-    return typeof args.element_token === 'string' && args.pid === undefined && args.target === undefined ? { kind: 'pid', pid: elementPid } : request;
+    if (elementPid === undefined || !Number.isInteger(elementPid) || typeof args.element_token !== 'string') return request;
+    if (request.kind === 'none' || request.kind === 'launch') return request;
+    if (request.kind === 'pid' && request.pid === elementPid) return request;
+    if (request.kind === 'unknown' && args.pid === undefined && args.target === undefined) return { kind: 'pid', pid: elementPid };
+    return { kind: 'unknown' };
 }
 
 /** Shown in Claude's terminal prompt: what needs a person and why. */

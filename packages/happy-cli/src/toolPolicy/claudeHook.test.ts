@@ -337,6 +337,16 @@ describe('cua-driver calls while the shadow proxy runs', () => {
         expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolUseId}`)).toEqual(['hook toolu_1', 'cua-proxy toolu_2', 'cua-proxy toolu_1']);
     });
 
+    // Review #3: outside bypassPermissions Claude's own card comes first; the hook decides so one call gets one card.
+    it('remote mode outside bypassPermissions: the hook decides and the proxy lets that call through', async () => {
+        const { gate, decided } = countingGate({ kind: 'allow' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => false });
+        expect(await handed.decide({ ...click(), permissionMode: 'default' }, signal)).toEqual({ kind: 'allow' });
+        expect(await handed.decide(click('cua-proxy'), signal)).toEqual({ kind: 'pass' });
+        expect(await handed.decide({ ...click(undefined, 'toolu_3'), permissionMode: 'bypassPermissions' }, signal)).toEqual({ kind: 'pass' });
+        expect(decided).toHaveLength(1);
+    });
+
     it('local mode: a call the hook denied is not let through by id', async () => {
         const { gate, decided } = countingGate({ kind: 'deny', reason: 'no', reasonCode: 'x' });
         const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });

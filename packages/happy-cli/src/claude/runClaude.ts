@@ -26,7 +26,8 @@ import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/start
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
 import { handOffCuaToShadowProxy, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
-import { CUA_DRIVER_SERVER, claudeCuaShadowEntry, readClaudeCuaUpstream } from '@/toolPolicy/cuaShadow';
+import { CUA_UPSTREAM_ENV_VAR } from '@/toolPolicy/cuaProxy';
+import { CUA_DRIVER_SERVER, claudeCuaShadowEntry, readClaudeCuaUpstream, withoutCuaDriver } from '@/toolPolicy/cuaShadow';
 import { toolPolicyAdapterEnv } from '@/toolPolicy/policyClient';
 import { createToolPolicyRuntime } from '@/toolPolicy/runtime';
 import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from '@/orchestrator/skillGovernance';
@@ -787,6 +788,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             settingSources: buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env)).settingSources,
         })
         : null;
+    // The shadow entry is `--mcp-config` argv; the user's cua-driver env reaches it by reference.
+    if (cuaUpstream && Object.keys(cuaUpstream.env).length > 0) process.env[CUA_UPSTREAM_ENV_VAR] = JSON.stringify(cuaUpstream.env);
     const toolPolicyGate = toolPolicy && cuaUpstream
         ? handOffCuaToShadowProxy(toolPolicy.gate, { terminalPrompt: () => currentSession?.mode === 'local' })
         : toolPolicy?.gate;
@@ -1912,7 +1915,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             ],
         }));
     }
-    const aplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
+    // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
+    const shadowSafe = <T,>(servers: Record<string, T>): Record<string, T> => (cuaUpstream ? withoutCuaDriver(servers) : servers);
+    const aplusMcpServers = shadowSafe(initialAplusMcpSnapshot?.servers ?? {});
     const baseMcpServers = {
         'happy': happyServer.mcpConfig,
         ...(toolPolicy && cuaUpstream ? {
@@ -2033,7 +2038,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 const refresh = () => refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
                 await (measure ? measure('mcp-grant', refresh) : refresh());
                 const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn' });
-                return measure ? measure('mcp-fetch', fetchConfig) : fetchConfig();
+                const fetched = await (measure ? measure('mcp-fetch', fetchConfig) : fetchConfig());
+                return fetched.ok ? { ...fetched, servers: shadowSafe(fetched.servers) } : fetched;
             },
         },
         session,
