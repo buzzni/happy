@@ -72,6 +72,7 @@ vi.mock('@/claude/utils/startHappyServer', () => ({ startHappyServer: vi.fn(asyn
 }) }));
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), debugLargeJson: vi.fn(), info: vi.fn(), infoDeveloper: vi.fn(), warn: vi.fn() } }));
 vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
+    setCuaShadow = () => {};
     setTurnDispatchHandler = (handler: () => void) => { fixture.markDispatched = handler; };
     setOutputStorageGate = vi.fn();
     freezeInputForShutdown = () => true;

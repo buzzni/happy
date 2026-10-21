@@ -7,12 +7,12 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
-import { toolPolicyMachineCapability, toolPolicyMetadataUpdate, isToolPolicyEnabled } from './claudeHook';
+import { handOffCuaToShadowProxy, toolPolicyMachineCapability, toolPolicyMetadataUpdate, isToolPolicyEnabled } from './claudeHook';
 import { createPolicyGrantStore } from './grants';
-import { createToolPolicyGate, type PolicyApprovalAnswer, type PolicyApprover } from './policyGate';
+import { createToolPolicyGate, type HookVerdict, type PolicyApprovalAnswer, type PolicyApprover, type PreToolUseCall, type ToolPolicyGate } from './policyGate';
 import { ABSENT_MACHINE_POLICY } from './rules';
 import { createTargetResolver, type TargetResolver } from './targetResolver';
 
@@ -255,7 +255,7 @@ describe('tool policy switch and capability', () => {
     it('is on by default and off with HAPPY_TOOL_POLICY=off', () => {
         expect(isToolPolicyEnabled({})).toBe(true);
         expect(isToolPolicyEnabled({ HAPPY_TOOL_POLICY: 'off' })).toBe(false);
-        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook'] });
+        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge'] });
         expect(toolPolicyMachineCapability({ HAPPY_TOOL_POLICY: 'OFF' })).toBeUndefined();
     });
 
@@ -306,5 +306,120 @@ describe('decision latency', () => {
         });
         await gate.decide({ toolName: 'mcp__cua-driver__click', toolInput: { pid: 13 } }, new AbortController().signal);
         expect(asked[0].policy).toMatchObject({ grantOffer: 'once' });
+    });
+});
+
+describe('cua-driver calls while the shadow proxy runs', () => {
+    function countingGate(verdict: HookVerdict): { gate: ToolPolicyGate; decided: PreToolUseCall[] } {
+        const decided: PreToolUseCall[] = [];
+        return { decided, gate: { decide: async (call) => { decided.push(call); return verdict; }, toolsListed: () => undefined } };
+    }
+    const signal = new AbortController().signal;
+    const click = (origin?: 'cua-proxy', toolUseId = 'toolu_1'): PreToolUseCall => ({ toolName: 'mcp__cua-driver__click', toolInput: { pid: 12 }, toolUseId, ...(origin ? { origin } : {}) });
+
+    it('remote mode: the hook steps aside and the proxy decides, once', async () => {
+        const { gate, decided } = countingGate({ kind: 'deny', reason: 'no', reasonCode: 'x' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => false });
+        expect(await handed.decide(click(), signal)).toEqual({ kind: 'pass' });
+        expect(await handed.decide(click('cua-proxy'), signal)).toMatchObject({ kind: 'deny' });
+        expect(decided.map((call) => call.origin)).toEqual(['cua-proxy']);
+    });
+
+    it('local mode: the hook decides (it alone reaches the terminal prompt) and the proxy lets that same call through', async () => {
+        const { gate, decided } = countingGate({ kind: 'ask', reason: 'confirm', reasonCode: 'first_app_use' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        expect(await handed.decide(click(), signal)).toMatchObject({ kind: 'ask' });
+        expect(await handed.decide(click('cua-proxy'), signal)).toEqual({ kind: 'pass' });
+        // Another call the hook never saw is decided by the proxy.
+        await handed.decide(click('cua-proxy', 'toolu_2'), signal);
+        // And a call id is let through once only.
+        await handed.decide(click('cua-proxy'), signal);
+        expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolUseId}`)).toEqual(['hook toolu_1', 'cua-proxy toolu_2', 'cua-proxy toolu_1']);
+    });
+
+    // Review #3: outside bypassPermissions Claude's own card comes first; the hook decides so one call gets one card.
+    it('remote mode outside bypassPermissions: the hook decides and the proxy lets that call through', async () => {
+        const { gate, decided } = countingGate({ kind: 'allow' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => false });
+        expect(await handed.decide({ ...click(), permissionMode: 'default' }, signal)).toEqual({ kind: 'allow' });
+        expect(await handed.decide(click('cua-proxy'), signal)).toEqual({ kind: 'pass' });
+        expect(await handed.decide({ ...click(undefined, 'toolu_3'), permissionMode: 'bypassPermissions' }, signal)).toEqual({ kind: 'pass' });
+        expect(decided).toHaveLength(1);
+    });
+
+    it('local mode: a call the hook denied is not let through by id', async () => {
+        const { gate, decided } = countingGate({ kind: 'deny', reason: 'no', reasonCode: 'x' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        await handed.decide(click(), signal);
+        expect(await handed.decide(click('cua-proxy'), signal)).toMatchObject({ kind: 'deny' });
+        expect(decided).toHaveLength(2);
+    });
+
+    // Cross review #3: a hook-let-through id that never reached the proxy must not outlive the
+    // provider run it came from — a later run may reuse the id for another call.
+    it('forgets hook-let-through ids from an earlier provider generation', async () => {
+        const { gate, decided } = countingGate({ kind: 'allow' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        await handed.decide(click(), signal);
+        handed.newProviderGeneration();
+        await handed.decide(click('cua-proxy'), signal);
+        expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolUseId}`)).toEqual(['hook toolu_1', 'cua-proxy toolu_1']);
+    });
+
+    it('does not keep a verdict that arrives after the provider generation changed', async () => {
+        let release!: () => void;
+        const decided: PreToolUseCall[] = [];
+        const gate: ToolPolicyGate = {
+            decide: async (call) => {
+                decided.push(call);
+                if (!call.origin) await new Promise<void>((done) => { release = done; });
+                return { kind: 'allow' };
+            },
+            toolsListed: () => undefined,
+        };
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        const hook = handed.decide(click(), signal);
+        await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+        handed.newProviderGeneration();
+        release();
+        await hook;
+        await handed.decide(click('cua-proxy'), signal);
+        expect(decided.map((call) => call.origin ?? 'hook')).toEqual(['hook', 'cua-proxy']);
+    });
+
+    it('lets an id through only for the tool the hook decided', async () => {
+        const { gate, decided } = countingGate({ kind: 'allow' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        await handed.decide(click(), signal);
+        await handed.decide({ ...click('cua-proxy'), toolName: 'mcp__cua-driver__type_text' }, signal);
+        expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolName}`)).toEqual(['hook mcp__cua-driver__click', 'cua-proxy mcp__cua-driver__type_text']);
+    });
+
+    // Review bot (#910): the hook judged `pid`; the proxy alone knows the token's snapshot names
+    // another app. That call is decided again, there (R5.1). A token-only call keeps the hook's
+    // verdict: the hook judged an unknown target and a person answered for it.
+    it('decides again at the proxy when the element token contradicts the pid the hook judged', async () => {
+        const { gate, decided } = countingGate({ kind: 'allow' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => true });
+        const typed = (origin?: 'cua-proxy', elementPid?: number, toolUseId = 'toolu_1'): PreToolUseCall => ({
+            toolName: 'mcp__cua-driver__type_text', toolInput: { pid: 12, element_token: 'tok-11', text: 'ls' }, toolUseId,
+            ...(origin ? { origin } : {}), ...(elementPid !== undefined ? { elementPid } : {}),
+        });
+        await handed.decide(typed(), signal);
+        await handed.decide(typed('cua-proxy', 11), signal);
+        // Agreeing token: the hook's verdict stands.
+        await handed.decide(typed(undefined, undefined, 'toolu_2'), signal);
+        await handed.decide(typed('cua-proxy', 12, 'toolu_2'), signal);
+        // Token only: the hook's verdict stands.
+        await handed.decide({ ...click(), toolUseId: 'toolu_3', toolInput: { element_token: 'tok-11' } }, signal);
+        await handed.decide({ ...click('cua-proxy', 'toolu_3'), toolInput: { element_token: 'tok-11' }, elementPid: 11 }, signal);
+        expect(decided.map((call) => `${call.origin ?? 'hook'} ${call.toolUseId}`)).toEqual(['hook toolu_1', 'cua-proxy toolu_1', 'hook toolu_2', 'hook toolu_3']);
+    });
+
+    it('leaves every other tool to the gate as before', async () => {
+        const { gate, decided } = countingGate({ kind: 'pass' });
+        const handed = handOffCuaToShadowProxy(gate, { terminalPrompt: () => false });
+        await handed.decide({ toolName: 'mcp__notion__notion-search', toolInput: {} }, signal);
+        expect(decided).toHaveLength(1);
     });
 });

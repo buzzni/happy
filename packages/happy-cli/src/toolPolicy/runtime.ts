@@ -1,0 +1,73 @@
+/**
+ * One session's tool policy runtime (aplus-dev-studio specs/agent-tool-policy plan "결정: 집행 위치").
+ *
+ * Assembles the gate every adapter calls — the Claude PreToolUse hook, the cua-driver shadow proxy
+ * and the stdio bridge — with the per-process secret those out-of-process adapters present to the
+ * session hook server, the machine policy loader, target resolver, grants and audit log.
+ */
+
+import { randomBytes, randomUUID } from 'node:crypto';
+import { chmodSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
+import { toolPolicyFilePath } from './claudeHook';
+import { createPolicyGrantStore, type PolicyGrantStore } from './grants';
+import { createToolPolicyGate, type PolicyApprover, type ToolPolicyGate } from './policyGate';
+import { createMachinePolicyLoader } from './rules';
+import { createTargetResolver } from './targetResolver';
+
+export interface ToolPolicyRuntime {
+    gate: ToolPolicyGate;
+    grants: PolicyGrantStore;
+    secret: string;
+    secretFile: string;
+    policyFile: string;
+    dispose(): void;
+}
+
+export function createToolPolicyRuntime(input: {
+    happyHomeDir: string;
+    sessionId: () => string | null;
+    publishRecent: (recent: ToolPolicyAuditRecord[]) => void;
+    approver: () => PolicyApprover | null;
+    unattended: boolean;
+    terminalPrompt: () => boolean;
+    grantTtlMs: number | null;
+}): ToolPolicyRuntime {
+    const secret = randomBytes(32).toString('hex');
+    const hooksDir = join(input.happyHomeDir, 'tmp', 'hooks');
+    mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
+    const secretFile = join(hooksDir, `policy-secret-${process.pid}`);
+    writeFileSync(secretFile, secret, { mode: 0o600 });
+    chmodSync(secretFile, 0o600);
+
+    const policyFile = toolPolicyFilePath(input.happyHomeDir);
+    const grants = createPolicyGrantStore({ grantTtlMs: input.grantTtlMs });
+    const gate = createToolPolicyGate({
+        loadMachinePolicy: createMachinePolicyLoader(policyFile),
+        resolver: createTargetResolver(),
+        grants,
+        audit: createToolPolicyAuditLog({
+            path: join(input.happyHomeDir, 'logs', 'tool-policy.jsonl'),
+            sessionId: input.sessionId,
+            publishRecent: input.publishRecent,
+        }),
+        approver: input.approver,
+        unattended: input.unattended,
+        terminalPrompt: input.terminalPrompt,
+        // A call without a provider id (no `_meta`) still gets a request id no other call shares.
+        newRequestId: () => `policy-${randomUUID()}`,
+    });
+
+    return {
+        gate,
+        grants,
+        secret,
+        secretFile,
+        policyFile,
+        dispose: () => {
+            grants.clear();
+            try { unlinkSync(secretFile); } catch { /* already gone */ }
+        },
+    };
+}

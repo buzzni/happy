@@ -185,6 +185,12 @@ import { isManagedBrokerServer } from '@/launcher/codexApproval';
 import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
 import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
 import type { RunnerPrincipal } from '@/claude/runClaude';
+import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
+import { isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { CUA_DRIVER_SERVER, CUA_SHADOW_TOOL_TIMEOUT_SECONDS, codexCuaShadowConfig } from '@/toolPolicy/cuaShadow';
+import { REMOTE_GRANT_TTL_MS } from '@/toolPolicy/grants';
+import { toolPolicyAdapterEnv } from '@/toolPolicy/policyClient';
+import { createToolPolicyRuntime, type ToolPolicyRuntime } from '@/toolPolicy/runtime';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 
 /** See the Claude counterpart. */
@@ -830,7 +836,17 @@ export async function runCodex(opts: {
         // Stop can arrive after the timer has queued its turn but before dispatch.
         messageQueue.queue = messageQueue.queue.filter(item => !capacityContinuationModes.has(item.mode));
     };
+    // Tool policy (agent-tool-policy I1b): set up with the MCP servers below; declared here because
+    // a message may arrive before then.
+    let toolPolicy: ToolPolicyRuntime | null = null;
+    let toolPolicyServer: HookServer | null = null;
+    const stopToolPolicy = () => {
+        toolPolicyServer?.stop();
+        toolPolicy?.dispose();
+    };
     session.onUserMessage((message) => {
+        // R13: the person's next message lifts "you just declined this" memory.
+        toolPolicy?.grants.onUserMessage();
         // A managed run answers exactly the prompt its envelope was admitted
         // for. A message posted to this session by the account owner arrives
         // here as an ordinary user turn: it would change the model, the
@@ -1157,6 +1173,7 @@ export async function runCodex(opts: {
 
             // Stop Happy MCP server
             happyServer.stop();
+            stopToolPolicy();
 
             // This RPC exits the process directly, so the loop's finally never runs — release the
             // reserved checkpoint workspace here too. specs/linux-checkpoint-enforcement-backend R4.
@@ -1930,7 +1947,41 @@ export async function runCodex(opts: {
             env: happyServer.bridgeEnv,
         }
     };
-    const bridgeOptions = { bridgeCommand: bridgeEntrypoint, nodeExecPath: process.execPath };
+    // Tool policy (agent-tool-policy I1b). Codex has no PreToolUse hook: the shadow proxy guards the
+    // user's cua-driver and the bridge guards the servers Saycode injects; a user's other MCP servers
+    // stay unguarded (Q5). The adapters reach this session over loopback HTTP, which a Linux
+    // mandatory sandbox may not allow (unmeasured), so that mode keeps the bridge unguarded rather
+    // than refusing every Saycode tool.
+    if (isToolPolicyEnabled(process.env)) {
+        const policy = createToolPolicyRuntime({
+            happyHomeDir: configuration.happyHomeDir,
+            sessionId: () => session.sessionId,
+            publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
+            approver: () => permissionHandler,
+            unattended: exitAfterFirstTurn,
+            terminalPrompt: () => false,
+            grantTtlMs: REMOTE_GRANT_TTL_MS,
+        });
+        toolPolicy = policy;
+        toolPolicyServer = await startHookServer({
+            onSessionHook: () => undefined,
+            preToolUse: { secret: policy.secret, decide: policy.gate.decide, toolsListed: policy.gate.toolsListed },
+        });
+    }
+    const policyAdapterEnv = (server: string) => toolPolicy && toolPolicyServer
+        ? toolPolicyAdapterEnv({ port: toolPolicyServer.port, secretFile: toolPolicy.secretFile, server })
+        : null;
+    const cuaPolicyEnv = policyAdapterEnv(CUA_DRIVER_SERVER);
+    client.setCuaShadow(cuaPolicyEnv
+        ? (nativeServers) => codexCuaShadowConfig(nativeServers, { execPath: process.execPath, bridgeEntrypoint, policyEnv: cuaPolicyEnv })
+        : null);
+    const bridgeOptions = {
+        bridgeCommand: bridgeEntrypoint,
+        nodeExecPath: process.execPath,
+        ...(cuaPolicyEnv && sandboxPolicyMode !== 'mandatory'
+            ? { toolPolicy: { env: (name: string) => policyAdapterEnv(name) ?? {}, toolTimeoutSec: CUA_SHADOW_TOOL_TIMEOUT_SECONDS } }
+            : {}),
+    };
     const listExternalServices = (mcpServers: Record<string, unknown>) => listExpectedMcpServices({
         expectedConnectors: readExpectedConnectors(),
         expectedMcpServices: readExpectedMcpServices(),
@@ -2811,6 +2862,7 @@ export async function runCodex(opts: {
             // Stop Happy MCP server
             logger.debug('[codex]: happyServer.stop');
             if (!runtimeGate) happyServer.stop();
+            stopToolPolicy();
 
             // Clean up ink UI
             if (process.stdin.isTTY) {

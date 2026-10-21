@@ -1,8 +1,8 @@
 /**
  * One session's tool policy enforcement point (aplus-dev-studio specs/agent-tool-policy R3, R11, R13, R16).
  *
- * Adapters (the Claude PreToolUse hook today; the cua-driver proxy and the stdio bridge in I1b)
- * hand a pending call to `decide`. It resolves the target app, evaluates the call against the
+ * Adapters (the Claude PreToolUse hook, the cua-driver shadow proxy and the stdio bridge) hand a
+ * pending call to `decide`. It resolves the target app, evaluates the call against the
  * current rules, and for `ask` raises an ordinary permission request through the session's
  * approver and waits — up to 30 minutes — for a person. Grants are created only from that answer.
  *
@@ -15,9 +15,14 @@
 
 import {
     blockedMessage,
+    coverageGaps,
     evaluateToolCall,
     isPolicyExcludedTool,
+    parseMcpToolName,
     requiredCuaTarget,
+    type CuaTargetRequest,
+    type ListedTool,
+    type PolicyCallInput,
     type PolicyTarget,
     type PolicyVerdict,
 } from './evaluate';
@@ -60,6 +65,14 @@ export interface PreToolUseCall {
     toolName: string;
     toolInput: unknown;
     toolUseId?: string;
+    /** Absent: the Claude hook. The proxy and the bridge cannot hand `ask` to a terminal prompt. */
+    origin?: 'cua-proxy' | 'bridge';
+    /** Shadow proxy: the pid of the snapshot that issued this call's `element_token` (R5.1). */
+    elementPid?: number;
+    /** Proxy and bridge: the tool's `tools/list` annotations (R8, trusted only to tighten). */
+    annotations?: PolicyCallInput['annotations'];
+    /** Claude hook: the session's permission mode, when Claude sent it. */
+    permissionMode?: string;
 }
 
 export type HookVerdict =
@@ -73,6 +86,8 @@ export type HookVerdict =
 
 export interface ToolPolicyGate {
     decide(call: PreToolUseCall, signal: AbortSignal): Promise<HookVerdict>;
+    /** R9: a server's tool list as an adapter saw it; each gap is recorded once per session. */
+    toolsListed(tools: ListedTool[]): void;
 }
 
 export function createToolPolicyGate(deps: {
@@ -118,10 +133,14 @@ export function createToolPolicyGate(deps: {
     };
 
     const evaluate = async (call: PreToolUseCall, args: Record<string, unknown>): Promise<PolicyVerdict> => {
-        const request = requiredCuaTarget(call.toolName, args, tables);
+        const request = withSnapshotPid(requiredCuaTarget(call.toolName, args, tables), args, call.elementPid);
         const target = request.kind === 'none' ? undefined : await deps.resolver.resolve(request);
-        return evaluateToolCall({ toolName: call.toolName, args, platform, target }, deps.loadMachinePolicy(), deps.grants.view(), tables, now());
+        return evaluateToolCall(
+            { toolName: call.toolName, args, platform, target, ...(call.annotations ? { annotations: call.annotations } : {}) },
+            deps.loadMachinePolicy(), deps.grants.view(), tables, now(),
+        );
     };
+    const covered = new Set<string>();
 
     return {
         decide: async (call, signal) => {
@@ -147,7 +166,7 @@ export function createToolPolicyGate(deps: {
             if (signal.aborted) return refuse(call, verdict, 'aborted', 'aborted');
             if (deps.unattended) return refuse(call, verdict, 'unattended_no_approver', 'unattended');
             const approver = deps.approver();
-            if (!approver && deps.terminalPrompt?.()) {
+            if (!approver && call.origin === undefined && deps.terminalPrompt?.()) {
                 audit(call, verdict, 'terminal_prompt', 'ask');
                 return { kind: 'ask', reasonCode: verdict.reasonCode, reason: askMessage(verdict, call.toolName) };
             }
@@ -187,7 +206,51 @@ export function createToolPolicyGate(deps: {
                 signal.removeEventListener('abort', onAbort);
             }
         },
+        toolsListed: (tools) => {
+            let gaps;
+            try {
+                gaps = coverageGaps(tools.filter((tool) => !covered.has(tool.name)), deps.loadMachinePolicy(), tables);
+            } catch {
+                return;
+            }
+            for (const gap of gaps) {
+                covered.add(gap.tool);
+                deps.audit.note({
+                    at: now(),
+                    tool: gap.tool,
+                    server: parseMcpToolName(gap.tool)?.server === tables.cuaDriver.server ? 'cua-driver' : 'user',
+                    decision: gap.decision,
+                    reasonCode: gap.reasonCode,
+                    ruleId: 'builtin:coverage',
+                    policyVersion: tables.policyVersion,
+                });
+            }
+        },
     };
+}
+
+/**
+ * An `element_token` names an element of an earlier `get_window_state` snapshot. The shadow proxy
+ * saw that snapshot and passes its pid; the hook never does, so there the target stays unknown.
+ * A token from one app's snapshot sent with another app's pid (or `scope: desktop`) leaves it to
+ * cua-driver which window it acts on — that is not ours to guess, so the target is unknown (ask).
+ */
+function withSnapshotPid(request: CuaTargetRequest, args: Record<string, unknown>, elementPid: number | undefined): CuaTargetRequest {
+    if (elementPid === undefined || !Number.isInteger(elementPid) || typeof args.element_token !== 'string') return request;
+    if (request.kind === 'none' || request.kind === 'launch') return request;
+    if (request.kind === 'pid' && request.pid === elementPid) return request;
+    if (request.kind === 'unknown' && args.pid === undefined && args.target === undefined) return { kind: 'pid', pid: elementPid };
+    return { kind: 'unknown' };
+}
+
+/**
+ * The proxy knows an `element_token` names an app other than the target this call would otherwise
+ * have (another pid, or desktop scope): a verdict reached without the snapshot does not hold.
+ */
+export function snapshotContradictsTarget(call: Pick<PreToolUseCall, 'toolName' | 'toolInput' | 'elementPid'>, tables: ToolPolicyTables = BUILTIN_TABLES): boolean {
+    const args = isRecord(call.toolInput) ? call.toolInput : {};
+    const request = requiredCuaTarget(call.toolName, args, tables);
+    return request.kind !== 'unknown' && withSnapshotPid(request, args, call.elementPid).kind === 'unknown';
 }
 
 /** Shown in Claude's terminal prompt: what needs a person and why. */

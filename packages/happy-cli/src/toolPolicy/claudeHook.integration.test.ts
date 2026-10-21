@@ -16,13 +16,19 @@ import { buildHookSettings, toolPolicyHookCommands } from '@/claude/utils/genera
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 import { query, type SDKMessage } from '@/claude/sdk';
 import { createToolPolicyAuditLog } from './audit';
+import { handOffCuaToShadowProxy } from './claudeHook';
+import { CUA_UPSTREAM_ENV_VAR } from './cuaProxy';
+import { CUA_DRIVER_SERVER, claudeCuaShadowEntry } from './cuaShadow';
 import { createPolicyGrantStore } from './grants';
+import { toolPolicyAdapterEnv } from './policyClient';
 import { createToolPolicyGate, type PolicyApprover, type PreToolUseCall } from './policyGate';
 import { ABSENT_MACHINE_POLICY } from './rules';
 
 const MODEL = 'haiku';
 const SCRIPTS = resolve(__dirname, '../../scripts');
 const FAKE_MCP = resolve(__dirname, '__fixtures__/fakeMcpServer.cjs');
+const FAKE_CUA = resolve(__dirname, '__fixtures__/fakeCuaServer.cjs');
+const BRIDGE = resolve(__dirname, '../../bin/happy-mcp.mjs');
 const SECRET = 'c'.repeat(64);
 
 let server: HookServer | null = null;
@@ -104,5 +110,83 @@ describe('tool policy with the real Claude CLI', () => {
         const approver: PolicyApprover = { requestPolicyApproval: async () => ({ approved: true, policyGrant: 'once' }) };
         const { ran } = await runWithPolicy(approver, 'Call the tool mcp__fake__send_mail exactly once with to=a@b.c and report the result.');
         expect(ran).toContain('fake {"to":"a@b.c"}');
+    }, 180_000);
+});
+
+/**
+ * I1b: the user's cua-driver behind the shadow proxy, as runClaude wires it in remote (SDK) mode —
+ * the hook steps aside for `mcp__cua-driver__*` and the proxy decides, with the pid of the snapshot
+ * that issued an `element_token`.
+ */
+describe('cua-driver shadow proxy with the real Claude CLI', () => {
+    it('refuses a keystroke into the Terminal named only by an element token, deciding it once', async () => {
+        if (!await isClaudeAvailable(tmpdir())) return;
+        const dir = mkdtempSync(join(tmpdir(), 'policy-shadow-cli-'));
+        const marker = join(dir, 'cua-calls.log');
+        const secretFile = join(dir, 'secret');
+        writeFileSync(secretFile, SECRET, { mode: 0o600 });
+        const decided: string[] = [];
+        const asked: string[] = [];
+        const gate = handOffCuaToShadowProxy(createToolPolicyGate({
+            loadMachinePolicy: () => ABSENT_MACHINE_POLICY,
+            resolver: { resolve: async (request) => request.kind === 'pid' && request.pid === 11
+                ? { status: 'resolved', app: { pid: 11, bundleId: 'com.apple.Terminal', name: 'Terminal' } }
+                : { status: 'unresolved' } },
+            grants: createPolicyGrantStore(),
+            audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => null }),
+            approver: () => ({ requestPolicyApproval: async (request) => { asked.push(request.toolName); return { approved: false, policyGrant: 'once' }; } }),
+            unattended: false,
+            platform: 'darwin',
+        }), { terminalPrompt: () => false });
+        server = await startHookServer({
+            onSessionHook: () => undefined,
+            preToolUse: {
+                secret: SECRET,
+                decide: async (call: PreToolUseCall, signal) => {
+                    const verdict = await gate.decide(call, signal);
+                    decided.push(`${call.origin ?? 'hook'} ${call.toolName} ${verdict.kind}`);
+                    return verdict;
+                },
+                toolsListed: gate.toolsListed,
+            },
+        });
+        const settingsPath = join(dir, 'settings.json');
+        writeFileSync(settingsPath, JSON.stringify(buildHookSettings({
+            hookCommand: 'true',
+            broadKillGuardCommand: `node "${join(SCRIPTS, 'broad_kill_guard.cjs')}"`,
+            policy: resolveMachineLockdownPolicy({}),
+            homeDir: dir,
+            toolPolicy: toolPolicyHookCommands({ execPath: process.execPath, scriptsDir: SCRIPTS, port: server.port, secretFile, policyFile: join(dir, 'tool-policy.json') }),
+        })));
+        const shadow = claudeCuaShadowEntry({
+            execPath: process.execPath,
+            bridgeEntrypoint: BRIDGE,
+            upstream: { command: process.execPath, args: [FAKE_CUA], env: { FAKE_CUA_MARKER: marker } },
+            policyEnv: toolPolicyAdapterEnv({ port: server.port, secretFile, server: CUA_DRIVER_SERVER }),
+        });
+        // As runClaude does: the entry only references the user's cua-driver env; Claude expands it.
+        process.env[CUA_UPSTREAM_ENV_VAR] = JSON.stringify({ FAKE_CUA_MARKER: marker });
+        await collect(query({
+            prompt: 'Call mcp__cua-driver__get_window_state with pid=11 and window_id=1. Then call mcp__cua-driver__type_text with '
+                + 'element_token set to the element_token from that result and text="ls". Do not retry, and do not pass pid to type_text. Report both results verbatim.',
+            options: {
+                abort: AbortSignal.timeout(150_000),
+                cwd: dir,
+                model: MODEL,
+                permissionMode: 'bypassPermissions',
+                settingsPath,
+                mcpServers: { [CUA_DRIVER_SERVER]: shadow },
+                strictMcpConfig: true,
+            },
+        }));
+        delete process.env[CUA_UPSTREAM_ENV_VAR];
+        // The marker path reached cua-driver only through the expanded reference.
+        const ran = existsSync(marker) ? readFileSync(marker, 'utf8') : '';
+        expect(ran).toContain('get_window_state {"pid":11');
+        expect(ran).not.toContain('type_text');
+        expect(decided).toContain('hook mcp__cua-driver__type_text pass');
+        expect(decided).toContain('cua-proxy mcp__cua-driver__type_text deny');
+        // Decided against the Terminal by its token: past the grade, no prompt to approve.
+        expect(asked).toEqual([]);
     }, 180_000);
 });

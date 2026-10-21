@@ -318,6 +318,37 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain('private config response');
     });
 
+    // agent-tool-policy I1b: the user's own cua-driver, behind the shadow proxy, outranks a
+    // Saycode-injected (Aplus/org) server of the same name — as `withoutCuaDriver` does for Claude.
+    it.each([
+        ['user cua-driver present: the shadow replaces the org entry', { 'cua-driver': { command: 'cua-driver', args: ['mcp'], env: { CUA_KEY: 'user' } } }, 'shadow'],
+        ['config/read unreadable: the name is turned off, the org entry does not inherit user env', 'unreadable', 'disabled'],
+        ['no user cua-driver: the org entry stays', {}, 'org'],
+    ] as const)('cua-driver name collision with an injected server — %s', async (_label, native, expected) => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const { codexCuaShadowConfig } = await import('@/toolPolicy/cuaShadow');
+        const client = new CodexAppServerClient();
+        const launch = { execPath: '/node', bridgeEntrypoint: '/happy-mcp.mjs', policyEnv: { HAPPY_TOOL_POLICY_PORT: '1' } };
+        client.setCuaShadow((nativeServers) => codexCuaShadowConfig(nativeServers, launch));
+        const org = { command: '/node', args: ['/happy-mcp.mjs', '--url', 'https://org.test/mcp'] };
+        const runtime = { happy: { command: 'happy-mcp' }, 'cua-driver': org };
+        const request = vi.spyOn(client as any, 'request').mockImplementation(async (method: any) => {
+            if (method === 'config/read') {
+                if (native === 'unreadable') throw new Error('private config response');
+                return { config: { mcp_servers: native } };
+            }
+            return { thread: { id: 'thread' }, model: 'test' };
+        });
+        await client.startThread({ mcpServers: runtime });
+        const start = request.mock.calls.find(([method]) => method === 'thread/start')![1] as { config: { mcp_servers: Record<string, any> } };
+        const entry = start.config.mcp_servers['cua-driver'];
+        expect(start.config.mcp_servers.happy).toEqual({ command: 'happy-mcp' });
+        if (expected === 'org') expect(entry).toEqual(org);
+        else if (expected === 'disabled') expect(entry).toMatchObject({ enabled: false, args: ['/happy-mcp.mjs', '--cua-proxy'] });
+        else expect(entry).toMatchObject({ args: expect.arrayContaining(['--cua-proxy', '--', 'cua-driver', 'mcp']), env: { CUA_KEY: 'user', HAPPY_TOOL_POLICY_PORT: '1' } });
+        expect(runtime['cua-driver']).toBe(org);
+    });
+
     it('marks memory submission only after turn/start acceptance, preserving pending startup on preparation failure', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient();

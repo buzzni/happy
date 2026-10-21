@@ -21,6 +21,7 @@ import {
 } from '@/channel/channelApprovalEvent';
 import type { ChannelPermissionBinding } from '@/channel/channelPermissionBinding';
 import { createEnvelope } from '@slopus/happy-wire';
+import type { PermissionPolicyMeta, PolicyApprovalAnswer, PolicyApprover } from '@/toolPolicy/policyGate';
 
 // Re-export types for backwards compatibility
 export type { PermissionResult, PendingRequest };
@@ -28,7 +29,7 @@ export type { PermissionResult, PendingRequest };
 /**
  * Codex-specific permission handler.
  */
-export class CodexPermissionHandler extends BasePermissionHandler {
+export class CodexPermissionHandler extends BasePermissionHandler implements PolicyApprover {
     private shutdownClosed = false;
 
     /** A launch shutdown is permanent; ordinary user abortAll remains reusable. */
@@ -152,6 +153,49 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         }
 
         return false;
+    }
+
+    /**
+     * A tool policy `ask` from the cua-driver shadow proxy or the stdio bridge (agent-tool-policy
+     * R11): an ordinary request with the `policy` meta, so every client that shows Codex prompts
+     * shows this one. Rejects when the call itself went away (`signal`), the turn was stopped or the
+     * session reset; Desktop's deny button sends `approved: false` without a decision, which reads
+     * as `abort` here, so any other abort is a refusal.
+     */
+    private readonly policyRequestIds = new Set<string>();
+    private readonly withdrawnPolicyRequestIds = new Set<string>();
+
+    /** The Stop button and shutdown withdraw a policy request; they are not a person declining it. */
+    override abortAll(reason?: string): void {
+        for (const id of this.policyRequestIds) if (this.pendingRequests.has(id)) this.withdrawnPolicyRequestIds.add(id);
+        super.abortAll(reason);
+    }
+
+    async requestPolicyApproval(request: {
+        id: string;
+        toolName: string;
+        args: Record<string, unknown>;
+        policy: PermissionPolicyMeta;
+        signal: AbortSignal;
+    }): Promise<PolicyApprovalAnswer> {
+        if (this.shutdownClosed || request.signal.aborted) throw new Error('Tool policy approval unavailable');
+        // Two calls must never share a card: an answer or a withdrawal would settle the other one.
+        if (this.pendingRequests.has(request.id)) throw new Error('Tool policy approval id already waiting');
+        const onAbort = () => this.cancelRequest(request.id);
+        this.policyRequestIds.add(request.id);
+        const result = await new Promise<PermissionResult>((resolve, reject) => {
+            request.signal.addEventListener('abort', onAbort, { once: true });
+            this.pendingRequests.set(request.id, { resolve, reject, toolName: request.toolName, input: request.args });
+            this.addPendingRequestToState(request.id, request.toolName, request.args, request.policy);
+        }).finally(() => {
+            request.signal.removeEventListener('abort', onAbort);
+            this.policyRequestIds.delete(request.id);
+        });
+        const withdrawn = this.withdrawnPolicyRequestIds.delete(request.id);
+        if (request.signal.aborted || withdrawn) throw new Error('Tool policy approval withdrawn');
+        return result.decision === 'approved' || result.decision === 'approved_for_session'
+            ? { approved: true, policyGrant: result.policyGrant ?? 'once' }
+            : { approved: false, policyGrant: 'once' };
     }
 
     /**

@@ -20,6 +20,7 @@ import { createInterface, type Interface as ReadlineInterface } from 'node:readl
 import { logger } from '@/ui/logger';
 import { withCodexRecallOwnership } from '@/memory/recallOwnerMarker';
 import { nativeCodexRecallOwnershipOverrides } from '@/memory/nativeCodexRecallOwnership';
+import { CODEX_CONFIG_UNREADABLE, CUA_DRIVER_SERVER } from '@/toolPolicy/cuaShadow';
 import { CodexBackgroundTasks, type CodexBackgroundTask } from './codexBackgroundTasks';
 import { readCodexOutput } from './codexOutputReader';
 import { resolveCodexStateEnvironment } from './codexStateRecovery';
@@ -1612,6 +1613,17 @@ export class CodexAppServerClient {
         return cleanup;
     }
 
+    /**
+     * Tool policy (agent-tool-policy I1b): builds the thread entry that puts the shadow proxy in
+     * front of the user's own cua-driver, from `config/read`'s `mcp_servers` (or
+     * `CODEX_CONFIG_UNREADABLE`). Null keeps the thread config as it was.
+     */
+    setCuaShadow(build: ((nativeServers: unknown) => Record<string, unknown> | null) | null): void {
+        this.cuaShadow = build;
+    }
+
+    private cuaShadow: ((nativeServers: unknown) => Record<string, unknown> | null) | null = null;
+
     private async buildThreadConfig(
         mcpServers?: Record<string, unknown>,
         writableRoots?: readonly string[],
@@ -1619,20 +1631,38 @@ export class CodexAppServerClient {
     ): Promise<Record<string, unknown> | null> {
         const config: Record<string, unknown> = {};
         if (mcpServers) config.mcp_servers = mcpServers;
+        // Never log this response: native config can contain credentials.
+        let nativeRead: Promise<unknown> | null = null;
+        const readNativeServers = () => nativeRead ??= (this.request('config/read', { cwd, includeLayers: false }, 3000) as Promise<{
+            config?: { mcp_servers?: unknown };
+        }>).then((effective) => effective.config?.mcp_servers);
         if (this.recallHostPrepared && !this.managedProviderArgs && this.sandboxPolicyMode === 'owner-choice') {
             let nativeServers: unknown;
             try {
                 // MCP stdio children filter their environment. Mark the existing native
                 // CML entry explicitly rather than relying on app-server inheritance.
-                // Never log this response: native config can contain credentials.
-                const effective = await this.request('config/read', { cwd, includeLayers: false }, 3000) as {
-                    config?: { mcp_servers?: unknown };
-                };
-                nativeServers = effective.config?.mcp_servers;
+                nativeServers = await readNativeServers();
             } catch {
                 logger.warn('[CodexAppServer] Native memory MCP ownership configuration unavailable; direct memory reads may fail.');
             }
             Object.assign(config, nativeCodexRecallOwnershipOverrides(nativeServers, mcpServers));
+        }
+        // The user's own cua-driver (behind the shadow) outranks a Saycode-injected server of the
+        // same name: Codex deep-merges the native entry into whatever holds the name, so leaving
+        // the injected one would run it with the user's cua env and the user's cua-driver unjudged.
+        // A config Happy cannot read turns the name off for the same reason; no user entry keeps it.
+        if (this.cuaShadow) {
+            let nativeServers: unknown;
+            try {
+                nativeServers = await readNativeServers();
+            } catch {
+                nativeServers = CODEX_CONFIG_UNREADABLE;
+                logger.warn('[CodexAppServer] Native MCP configuration unavailable; cua-driver is turned off for this thread.');
+            }
+            const shadow = this.cuaShadow(nativeServers);
+            // On top of whatever map is already set (the recall overrides may have built a full one).
+            const current = config.mcp_servers;
+            if (shadow) config.mcp_servers = { ...(current !== null && typeof current === 'object' ? current : {}), [CUA_DRIVER_SERVER]: shadow };
         }
         if (writableRoots?.length) {
             config.sandbox_workspace_write = { writable_roots: [...writableRoots] };

@@ -72,6 +72,7 @@ const OVERLOADED = {
 
 vi.mock('@/codex/codexAppServerClient', () => ({
     CodexAppServerClient: class {
+        setCuaShadow = () => {};
         setEventHandler = vi.fn((handler: (msg: unknown) => void) => { eventHandler = handler; });
         setApprovalHandler = vi.fn();
         setUserInputHandler = vi.fn();

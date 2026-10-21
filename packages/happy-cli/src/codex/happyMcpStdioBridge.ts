@@ -8,6 +8,12 @@
  * via CLI flag `--url <http://127.0.0.1:PORT>`. Additional request headers
  * can be supplied as JSON through `HAPPY_HTTP_MCP_HEADERS`.
  *
+ * Tool policy (aplus-dev-studio specs/agent-tool-policy R8, R9): when the entry carries the policy
+ * env (`toolPolicyAdapterEnv`), every `tools/call` is decided by the session first, with the tool's
+ * `tools/list` annotations, and each listing is reported for the coverage audit.
+ *
+ * `--cua-proxy -- <command> [args...]` runs the cua-driver shadow proxy instead (toolPolicy/cuaProxy).
+ *
  * Note: This process must not print to stdout as it would break MCP STDIO.
  */
 
@@ -17,6 +23,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { cuaUpstreamEnv, parseCuaProxyArgv, startCuaProxy } from '@/toolPolicy/cuaProxy';
+import { toolPolicyClientFromEnv } from '@/toolPolicy/policyClient';
 
 function parseArgs(argv: string[]): { url: string | null } {
   let url: string | null = null;
@@ -31,6 +39,20 @@ function parseArgs(argv: string[]): { url: string | null } {
 }
 
 async function main() {
+  const proxied = parseCuaProxyArgv(process.argv.slice(2));
+  if (proxied) {
+    const proxy = startCuaProxy({
+      upstream: { ...proxied, env: cuaUpstreamEnv(process.env) },
+      policy: toolPolicyClientFromEnv(process.env, 'cua-proxy'),
+      input: process.stdin,
+      output: process.stdout,
+      onExit: (code) => process.exit(code),
+    });
+    process.once('SIGTERM', () => proxy.stop());
+    process.once('SIGINT', () => proxy.stop());
+    return;
+  }
+
   // Resolve target HTTP MCP URL
   const { url: urlFromArgs } = parseArgs(process.argv.slice(2));
   const socketPath = process.env.SAYCODE_MCP_SOCKET;
@@ -90,13 +112,40 @@ async function main() {
     { capabilities: { tools: {} } }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+  const policy = toolPolicyClientFromEnv(process.env, 'bridge');
+  const annotations = new Map<string, Record<string, unknown> | undefined>();
+  const listTools = async (params: Parameters<Client['listTools']>[0]) => {
     const client = await ensureHttpClient();
-    return await client.listTools(request.params) as any;
+    const listed = await client.listTools(params);
+    // R8.3: a later listing may only tighten what an earlier one said about a tool.
+    for (const tool of listed.tools) {
+      annotations.set(tool.name, annotations.has(tool.name) ? tightenedAnnotations(annotations.get(tool.name), tool.annotations) : tool.annotations);
+    }
+    policy?.toolsListed(listed.tools.map((tool) => ({ name: tool.name, annotations: annotations.get(tool.name) })));
+    return listed;
+  };
+
+  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+    return await listTools(request.params) as any;
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const client = await ensureHttpClient();
+    if (policy) {
+      const { name, arguments: args, _meta: meta } = request.params;
+      // The annotations decide R8.2; a call before any listing must not be judged without them.
+      if (!annotations.has(name)) await listTools(undefined).catch(() => undefined);
+      const toolUseId = typeof meta?.['claudecode/toolUseId'] === 'string' ? meta['claudecode/toolUseId']
+        : typeof meta?.callId === 'string' ? meta.callId : undefined;
+      const hints = annotations.get(name);
+      const verdict = await policy.decide({
+        tool: name,
+        args: args ?? {},
+        ...(toolUseId ? { toolUseId } : {}),
+        ...(hints ? { annotations: { readOnlyHint: hints.readOnlyHint as boolean | undefined, destructiveHint: hints.destructiveHint as boolean | undefined } } : {}),
+      }, extra.signal);
+      if (verdict.kind === 'deny') return { content: [{ type: 'text', text: verdict.reason }], isError: true };
+    }
     return await client.callTool(request.params) as any;
   });
 
@@ -123,6 +172,15 @@ async function main() {
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
   await server.connect(stdio);
+}
+
+/** `readOnlyHint` stays true only while every listing says so; `destructiveHint` once true stays true. */
+function tightenedAnnotations(previous: Record<string, unknown> | undefined, next: Record<string, unknown> | undefined): Record<string, unknown> {
+  return {
+    ...next,
+    readOnlyHint: previous?.readOnlyHint === true && next?.readOnlyHint === true,
+    ...(previous?.destructiveHint === true || next?.destructiveHint === true ? { destructiveHint: true } : {}),
+  };
 }
 
 // Start and surface fatal errors to stderr only

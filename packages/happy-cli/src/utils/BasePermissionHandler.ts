@@ -10,6 +10,7 @@
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { AgentState } from "@/api/types";
+import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate';
 
 /**
  * Permission response from the mobile app.
@@ -19,6 +20,8 @@ export interface PermissionResponse {
     approved: boolean;
     updatedInput?: Record<string, unknown>;
     decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort';
+    /** Tool policy (agent-tool-policy R11.3): "allow in this conversation". Older clients omit it. */
+    policyGrant?: 'once' | 'session';
 }
 
 /**
@@ -37,6 +40,7 @@ export interface PendingRequest {
 export interface PermissionResult {
     decision: 'approved' | 'approved_for_session' | 'denied' | 'abort';
     updatedInput?: Record<string, unknown>;
+    policyGrant?: 'session';
 }
 
 /**
@@ -131,6 +135,7 @@ export abstract class BasePermissionHandler {
                 if (response.approved && response.updatedInput && typeof response.updatedInput === 'object' && !Array.isArray(response.updatedInput)) {
                     result.updatedInput = response.updatedInput;
                 }
+                if (response.approved && response.policyGrant === 'session') result.policyGrant = 'session';
                 pending.resolve(result);
                 // After the request is gone and resolved, so a throwing subscriber cannot turn an
                 // answered permission into an unanswered one.
@@ -168,7 +173,7 @@ export abstract class BasePermissionHandler {
     /**
      * Add a pending request to the agent state.
      */
-    protected addPendingRequestToState(toolCallId: string, toolName: string, input: unknown): void {
+    protected addPendingRequestToState(toolCallId: string, toolName: string, input: unknown, policy?: PermissionPolicyMeta): void {
         const createdAt = Date.now();
         this.session.updateAgentState((currentState) => ({
             ...currentState,
@@ -177,7 +182,8 @@ export abstract class BasePermissionHandler {
                 [toolCallId]: {
                     tool: toolName,
                     arguments: input,
-                    createdAt
+                    createdAt,
+                    ...(policy ? { policy } : {}),
                 }
             }
         }));

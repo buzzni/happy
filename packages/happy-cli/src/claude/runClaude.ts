@@ -25,7 +25,12 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
-import { createClaudeToolPolicyRuntime, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { handOffCuaToShadowProxy, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { CUA_UPSTREAM_ENV_VAR } from '@/toolPolicy/cuaProxy';
+import { CUA_DRIVER_SERVER, claudeCuaShadowEntry, readClaudeCuaUpstream, withoutCuaDriver } from '@/toolPolicy/cuaShadow';
+import { toolPolicyAdapterEnv } from '@/toolPolicy/policyClient';
+import { createToolPolicyRuntime } from '@/toolPolicy/runtime';
+import { buildSkillGovernanceOptions, readSkillGovernanceConfigFromEnv } from '@/orchestrator/skillGovernance';
 import { REMOTE_GRANT_TTL_MS } from '@/toolPolicy/grants';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
@@ -64,6 +69,8 @@ import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { getProjectPath } from './utils/path';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { projectPath } from '@/projectPath';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
@@ -761,7 +768,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // the PreToolUse hook to this gate. The daemon cannot yet tell whether a session was started on
     // this PC, so every conversation grant gets the remote-session TTL until Desktop reports it.
     const toolPolicy = isToolPolicyEnabled(process.env)
-        ? createClaudeToolPolicyRuntime({
+        ? createToolPolicyRuntime({
             happyHomeDir: configuration.happyHomeDir,
             sessionId: () => session.sessionId,
             publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
@@ -771,10 +778,26 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             grantTtlMs: REMOTE_GRANT_TTL_MS,
         })
         : null;
+    // I1b: the user's own cua-driver runs behind the shadow proxy, which then decides its calls. Only
+    // where Claude would load the user's MCP servers at all: a managed run, a scoped or mandatory
+    // process sandbox loads none (settingSources [] — measured 2026-10-22), and must not gain one.
+    const cuaUpstream = toolPolicy && managedStartup === null && !scopeLaunch && sandboxPolicyMode !== 'mandatory'
+        ? readClaudeCuaUpstream({
+            configDir: process.env.CLAUDE_CONFIG_DIR || homedir(),
+            cwd: workingDirectory,
+            settingSources: buildSkillGovernanceOptions(readSkillGovernanceConfigFromEnv(process.env)).settingSources,
+        })
+        : null;
+    // The shadow entry is `--mcp-config` argv; the user's cua-driver env reaches it by reference.
+    if (cuaUpstream && Object.keys(cuaUpstream.env).length > 0) process.env[CUA_UPSTREAM_ENV_VAR] = JSON.stringify(cuaUpstream.env);
+    const cuaHandOff = toolPolicy && cuaUpstream
+        ? handOffCuaToShadowProxy(toolPolicy.gate, { terminalPrompt: () => currentSession?.mode === 'local' })
+        : null;
+    const toolPolicyGate = cuaHandOff ?? toolPolicy?.gate;
 
     // Start Hook server for receiving Claude session notifications
     const hookServer = await startHookServer({
-        ...(toolPolicy ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicy.gate.decide } } : {}),
+        ...(toolPolicy && toolPolicyGate ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicyGate.decide, toolsListed: toolPolicyGate.toolsListed } } : {}),
         onSessionHook: (sessionId, data) => {
             logger.debug(`[START] Session hook received: ${sessionId}`, data);
 
@@ -1893,9 +1916,19 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             ],
         }));
     }
-    const aplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
+    // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
+    const shadowSafe = <T,>(servers: Record<string, T>): Record<string, T> => (cuaUpstream ? withoutCuaDriver(servers) : servers);
+    const aplusMcpServers = shadowSafe(initialAplusMcpSnapshot?.servers ?? {});
     const baseMcpServers = {
         'happy': happyServer.mcpConfig,
+        ...(toolPolicy && cuaUpstream ? {
+            [CUA_DRIVER_SERVER]: claudeCuaShadowEntry({
+                execPath: process.execPath,
+                bridgeEntrypoint: join(projectPath(), 'bin', 'happy-mcp.mjs'),
+                upstream: cuaUpstream,
+                policyEnv: toolPolicyAdapterEnv({ port: hookServer.port, secretFile: toolPolicy.secretFile, server: CUA_DRIVER_SERVER }),
+            }),
+        } : {}),
     };
 
     // Create claude loop
@@ -1966,6 +1999,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: happyServer.toolNames.map(toolName => `mcp__happy__${toolName}`),
         onModeChange: (newMode) => {
             currentRunMode = newMode;
+            cuaHandOff?.newProviderGeneration();
             session.sendSessionEvent({ type: 'switch', mode: newMode });
             session.updateAgentState((currentState) => ({
                 ...currentState,
@@ -1975,11 +2009,19 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         onSessionReady: (sessionInstance) => {
             // Store reference for hook server callback
             currentSession = sessionInstance;
+            // R9: Claude's init message names every MCP tool it loaded (no annotations).
+            sessionInstance.policyToolsSeen = toolPolicyGate ? (tools) => toolPolicyGate.toolsListed(tools.map((name) => ({ name }))) : null;
             sessionInstance.prepareChannelExecution = (requestId) => channelAcceptance.prepareExecution(requestId);
             sessionInstance.beginChannelExecution = (requestId) => channelAcceptance.beginExecution(requestId);
         },
-        onAbort: resetTurnScopedOptions,
-        onSessionReset: () => difficultyRoutingCommitter.startEpoch(),
+        onAbort: () => {
+            cuaHandOff?.newProviderGeneration();
+            resetTurnScopedOptions();
+        },
+        onSessionReset: () => {
+            cuaHandOff?.newProviderGeneration();
+            difficultyRoutingCommitter.startEpoch();
+        },
         /**
          * The engine-applied boundary. The launcher calls this when a batch's
          * mode becomes the settings of an SDK query — the first moment the
@@ -2004,7 +2046,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 const refresh = () => refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
                 await (measure ? measure('mcp-grant', refresh) : refresh());
                 const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn' });
-                return measure ? measure('mcp-fetch', fetchConfig) : fetchConfig();
+                const fetched = await (measure ? measure('mcp-fetch', fetchConfig) : fetchConfig());
+                return fetched.ok ? { ...fetched, servers: shadowSafe(fetched.servers) } : fetched;
             },
         },
         session,
