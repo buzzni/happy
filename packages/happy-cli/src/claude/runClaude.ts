@@ -25,7 +25,8 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
-import { createClaudeToolPolicyRuntime, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { createToolPolicyRuntime } from '@/toolPolicy/runtime';
 import { REMOTE_GRANT_TTL_MS } from '@/toolPolicy/grants';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
@@ -761,7 +762,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // the PreToolUse hook to this gate. The daemon cannot yet tell whether a session was started on
     // this PC, so every conversation grant gets the remote-session TTL until Desktop reports it.
     const toolPolicy = isToolPolicyEnabled(process.env)
-        ? createClaudeToolPolicyRuntime({
+        ? createToolPolicyRuntime({
             happyHomeDir: configuration.happyHomeDir,
             sessionId: () => session.sessionId,
             publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
