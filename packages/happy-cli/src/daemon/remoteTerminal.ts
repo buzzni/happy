@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, win32 } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { sanitizeChildEnv } from '@/utils/childEnv'
 
 export interface TerminateOpts {
     /** ms to wait for a graceful SIGHUP exit before escalating to SIGKILL. */
@@ -136,7 +137,7 @@ function createHostedPtySession(opts: PtySessionOpts, host: WindowsTerminalHost)
         cols: initialCols,
         rows: initialRows,
         cwd: opts.cwd || homedir(),
-        env: { ...process.env, ...(opts.env ?? {}) } as { [key: string]: string },
+        env: { ...sanitizeChildEnv(process.env), ...(opts.env ?? {}) },
     })
     let cols = initialCols
     let rows = initialRows
@@ -204,7 +205,7 @@ export function createPtySession(opts: PtySessionOpts): PtySession {
     // Windows shells do not accept the POSIX login-shell flag.
     const args = opts.args ?? (process.platform === 'win32' ? [] : ['-l'])
     const cwd = opts.cwd || homedir()
-    const env: { [key: string]: string } = { ...process.env, ...(opts.env ?? {}) } as { [key: string]: string }
+    const env: { [key: string]: string } = { ...sanitizeChildEnv(process.env), ...(opts.env ?? {}) }
     const initialCols = opts.cols ?? 80
     const initialRows = opts.rows ?? 24
 

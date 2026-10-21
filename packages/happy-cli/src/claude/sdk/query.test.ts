@@ -214,6 +214,20 @@ describe('query adapter', () => {
         }));
     });
 
+    it('gives Claude the session scope but not lineage or spawn seeds (utils/childEnv)', () => {
+        const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', HAPPY_INITIAL_PROMPT: 'seed', APLUS_SESSION_ID: 'self-session' }
+        Object.assign(process.env, injected)
+        try {
+            query({ prompt: 'continue', options: {} })
+            const env = lastOptions().env as Record<string, string>
+            expect(env.HAPPY_RECONNECT_SESSION_ID).toBeUndefined()
+            expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
+            expect(env.APLUS_SESSION_ID).toBe('self-session')
+        } finally {
+            for (const key of Object.keys(injected)) delete process.env[key]
+        }
+    });
+
     it('asks the CLI for its turn-over state only when the caller needs it', () => {
         query({ prompt: 'continue', options: { emitSessionStateEvents: true } });
         expect((lastOptions().env as Record<string, string>).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe('1');

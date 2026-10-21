@@ -109,6 +109,7 @@ import {
   handlePlanUpdate,
   handleThinkingUpdate,
 } from './sessionUpdateHandlers';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 /**
  * Extended RequestPermissionRequest with additional fields that may be present
@@ -394,7 +395,7 @@ export class AcpBackend implements AgentBackend {
       // cmd.exe; joining them into one `cmd.exe /c` line split and reinterpreted them.
       this.process = crossSpawn(this.options.command, args, {
         cwd: this.options.cwd,
-        env: { ...process.env, ...this.options.env },
+        env: { ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...this.options.env },
         // Use 'pipe' for all stdio to capture output without printing to console
         // stdout and stderr will be handled by our event listeners
         stdio: ['pipe', 'pipe', 'pipe'],

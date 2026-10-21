@@ -5,10 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const crossSpawnCalls = vi.hoisted(() => [] as { command: string; args: string[] }[]);
+const crossSpawnEnvs = vi.hoisted(() => [] as (NodeJS.ProcessEnv | undefined)[]);
 vi.mock('cross-spawn', async () => {
   const { spawn } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
   const record = (command: string, args: string[] = [], options?: object) => {
     crossSpawnCalls.push({ command, args });
+    crossSpawnEnvs.push((options as { env?: NodeJS.ProcessEnv } | undefined)?.env);
     // The Windows tree kill has no taskkill here; end the recorded process instead.
     if (command === 'taskkill') {
       process.kill(Number(args[args.indexOf('/pid') + 1]), 'SIGKILL');
@@ -29,6 +31,7 @@ afterEach(async () => {
   await Promise.all(backends.splice(0).map((backend) => backend.dispose()));
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   crossSpawnCalls.length = 0;
+  crossSpawnEnvs.length = 0;
 });
 
 function backend(args: string[] = [], env: Record<string, string> = {}): AcpBackend {
@@ -42,6 +45,20 @@ const exited = async (b: AcpBackend) => {
 };
 
 describe('AcpBackend process', () => {
+  it('gives the ACP agent the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
+    const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', HAPPY_INITIAL_PROMPT: 'seed', APLUS_SESSION_ID: 'self-session' };
+    Object.assign(process.env, injected);
+    try {
+      await backend().startSession();
+      const env = crossSpawnEnvs[0] ?? {};
+      expect(env.HAPPY_RECONNECT_SESSION_ID).toBeUndefined();
+      expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined();
+      expect(env.APLUS_SESSION_ID).toBe('self-session');
+    } finally {
+      for (const key of Object.keys(injected)) delete process.env[key];
+    }
+  });
+
   it('hands the agent its arguments as separate arguments, never as one shell line', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'acp-argv-')); dirs.push(dir);
     const out = join(dir, 'argv.json');

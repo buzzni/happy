@@ -8,6 +8,17 @@ import { realpathSync } from 'node:fs';
 import { runBashStream, type BashStreamProgress } from './bashStream';
 
 describe('runBashStream', () => {
+  it('runs the agent command with the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
+    const injected = { HAPPY_RECONNECT_SESSION_ID: 'cmr-poisoned', HAPPY_INITIAL_PROMPT: 'seed', APLUS_SESSION_ID: 'self-session' };
+    Object.assign(process.env, injected);
+    try {
+      const result = await runBashStream({ command: 'printf "%s|%s|%s" "${HAPPY_RECONNECT_SESSION_ID-}" "${HAPPY_INITIAL_PROMPT-}" "${APLUS_SESSION_ID-}"', onProgress: () => {} });
+      expect(result.stdout).toBe('||self-session');
+    } finally {
+      for (const key of Object.keys(injected)) delete process.env[key];
+    }
+  });
+
   it('captures stdout lines and reports exit 0 on success', async () => {
     const progress: BashStreamProgress[] = [];
     const result = await runBashStream({

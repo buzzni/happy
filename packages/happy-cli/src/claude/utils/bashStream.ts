@@ -14,6 +14,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 const FLUSH_INTERVAL_MS = 200;
 const FLUSH_LINE_BATCH = 32;
@@ -97,7 +98,7 @@ export async function runBashStream(input: RunBashStreamInput): Promise<RunBashS
   return new Promise<RunBashStreamResult>((resolve, reject) => {
     const child = spawn('bash', ['-c', command], {
       cwd,
-      env: env ?? process.env,
+      env: sanitizeChildEnv(env ?? process.env, { boundary: 'in-session' }),
       detached,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

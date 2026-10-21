@@ -12,6 +12,7 @@ import {
     registerManagedGracefulStop,
 } from '@/managed/managedGracefulStop';
 import { reportManagedStopOutcome } from '@/managed/managedStartup';
+import { clearInheritedSessionLineage } from '@/utils/childEnv';
 import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
 
 /**
@@ -182,7 +183,7 @@ import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPubl
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
 import { isManagedBrokerServer } from '@/launcher/codexApproval';
 import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
-import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
+import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
 import type { RunnerPrincipal } from '@/claude/runClaude';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 
@@ -247,7 +248,7 @@ export async function runCodex(opts: {
         // Before the reconnect environment is read, which happens within a few
         // lines and would otherwise resume a session this run has nothing to
         // do with — dropping its prompt on the way.
-        clearForeignSessionLineage(process.env);
+        clearInheritedSessionLineage(process.env);
         applyManagedGatewayEnvironment(process.env, managedStartup.envelope);
         applyManagedInitialPrompt(process.env, managedStartup.envelope);
     }

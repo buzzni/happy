@@ -90,7 +90,8 @@ import { createDeferredContinuationContextConsumer } from '@/utils/deferredConti
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { requireAccountToken, type ManagedStartup } from '@/managed/managedStartup';
-import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
+import { clearInheritedSessionLineage } from '@/utils/childEnv';
+import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
 import {
     buildLocalAutoBootstrapDecision,
     buildManualAppliedDecision,
@@ -211,7 +212,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         // Before the reconnect environment is read, which happens within a few
         // lines and would otherwise resume a session this run has nothing to
         // do with — dropping its prompt on the way.
-        clearForeignSessionLineage(process.env);
+        clearInheritedSessionLineage(process.env);
         // The approved gateway is the only route to a provider, and the
         // capability the only credential this run may spend.
         applyManagedGatewayEnvironment(process.env, envelope);

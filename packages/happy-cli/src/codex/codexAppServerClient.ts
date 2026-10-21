@@ -70,6 +70,7 @@ import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } fr
 import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 import { CodexAuthRecoveryError, type CodexAuthCheck, type CodexAuthSource } from './codexAuthRecovery';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 type PendingRequest = {
     resolve: (result: unknown) => void;
@@ -1109,10 +1110,8 @@ export class CodexAppServerClient {
         }
 
         // Build env — same filtering as the old MCP client
-        let env: Record<string, string> = {};
-        for (const [key, value] of Object.entries(process.env)) {
-            if (typeof value === 'string') env[key] = value;
-        }
+        // The agent works inside this session: lineage and spawn seeds stop here.
+        let env: Record<string, string> = sanitizeChildEnv(process.env, { boundary: 'in-session' });
         env = await resolveCodexStateEnvironment({ ...env, ...this.startupEnvironment });
         if (!this.managedProviderArgs) {
             // Account rotation swaps in another account's proxy, its own
