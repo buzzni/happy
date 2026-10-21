@@ -2461,6 +2461,8 @@ describe('runServerAutomationTick', () => {
       directory: '/repo',
       initialPrompt: expect.stringContaining('Task ID: apply-1'),
     }))
+    // It stands in for the requester's own session, so clients must not hide it as an unattended run.
+    expect(spawnSession.mock.calls[0]![0].sessionSource).toBeUndefined()
     expect(logDebug).toHaveBeenCalledWith(
       '[server-automation] strict machine control: not resuming server-named session unrelated-session'
       + ' for review_apply task apply-1; using a new apply worker',
@@ -2524,6 +2526,7 @@ describe('runServerAutomationTick', () => {
     }))
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       directory: '/isolated/run-1',
+      sessionSource: 'github-trigger',
     }))
   })
 

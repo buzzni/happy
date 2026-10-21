@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { normalizeSessionSource, sessionSourceSpawnEnv } from './sessionSource';
+import { normalizeSessionSource, takeSessionSourceFromEnv } from './sessionSource';
 
 describe('normalizeSessionSource', () => {
     it('keeps known and not-yet-known well-formed tags', () => {
@@ -15,9 +15,14 @@ describe('normalizeSessionSource', () => {
         }
     });
 
-    it('hands a spawn-supplied source to the runner through the lineage-scrubbed env', () => {
-        expect(sessionSourceSpawnEnv('review')).toEqual({ HAPPY_CREATED_BY_SOURCE: 'review' });
-        expect(sessionSourceSpawnEnv('Not A Tag')).toEqual({});
-        expect(sessionSourceSpawnEnv(undefined)).toEqual({});
+    it('takes the spawn-supplied source out of the environment, well-formed or not', () => {
+        const env: NodeJS.ProcessEnv = { HAPPY_CREATED_BY_SOURCE: 'review', PATH: '/bin' };
+        expect(takeSessionSourceFromEnv(env)).toBe('review');
+        expect(env).toEqual({ PATH: '/bin' });
+
+        const malformed: NodeJS.ProcessEnv = { HAPPY_CREATED_BY_SOURCE: 'Not A Tag' };
+        expect(takeSessionSourceFromEnv(malformed)).toBeUndefined();
+        expect(malformed).toEqual({});
+        expect(takeSessionSourceFromEnv({})).toBeUndefined();
     });
 });

@@ -32,8 +32,12 @@ export function normalizeSessionSource(value: unknown): SessionSource | undefine
     return typeof value === 'string' && SESSION_SOURCE_PATTERN.test(value) ? value : undefined;
 }
 
-/** The env a spawn sets so the runner records `source` (empty when nothing well-formed was asked). */
-export function sessionSourceSpawnEnv(value: unknown): Record<string, string> {
-    const source = normalizeSessionSource(value);
-    return source ? { [SESSION_SOURCE_ENV]: source } : {};
+/**
+ * Read once by the runner and removed, like the HAPPY_INITIAL_* seeds: anything the session
+ * later starts from its own shell (a `happy` run, a resume child) must not record this source.
+ */
+export function takeSessionSourceFromEnv(env: NodeJS.ProcessEnv = process.env): SessionSource | undefined {
+    const source = normalizeSessionSource(env[SESSION_SOURCE_ENV]);
+    delete env[SESSION_SOURCE_ENV];
+    return source;
 }

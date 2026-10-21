@@ -47,6 +47,14 @@ describe('MetadataSchema', () => {
         }
         expect(MetadataSchema.parse({ path: '/tmp/project', host: 'local-machine' }).source).toBeUndefined();
     });
+
+    // Before the field was declared, a malformed value was just stripped. Declaring it must not turn
+    // one bad key into an unreadable document (no path, title or flavor for the session).
+    it('drops a non-string session source instead of failing the whole metadata', () => {
+        const metadata = MetadataSchema.parse({ path: '/tmp/project', host: 'local-machine', source: { kind: 'schedule' } });
+        expect(metadata.path).toBe('/tmp/project');
+        expect(metadata.source).toBeUndefined();
+    });
 });
 
 describe('MachineMetadataSchema', () => {

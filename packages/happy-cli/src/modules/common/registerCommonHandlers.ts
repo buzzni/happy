@@ -1,5 +1,6 @@
 import { listWorkspaceDirectory, readWorkspaceFile, writeWorkspaceFile } from './workspaceFileBoundary';
 import { fileDiscovery } from './fileDiscovery';
+import type { SessionSource } from '@/utils/sessionSource';
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
@@ -286,7 +287,7 @@ export interface SpawnSessionOptions {
     createdByAccountId?: string;
     createdByDisplayName?: string;
     /** Who asked for this session, recorded as metadata `source` (see SessionSource). Not lineage. */
-    sessionSource?: string;
+    sessionSource?: SessionSource;
     axStep?: 'plan' | 'design' | 'free';
     bootstrapFiles?: Array<{ relativePath: string; content: string }>;
     /**

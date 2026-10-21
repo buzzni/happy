@@ -219,7 +219,7 @@ export interface ServerAutomationExecutorInput {
     createdByAccountId: null
     agent: AutomationAgent
     /** Recorded as session metadata `source` (aplus-dev-studio specs/session-source-metadata). */
-    sessionSource: 'schedule' | 'github-trigger'
+    sessionSource?: 'schedule' | 'github-trigger'
     model?: string
     effort?: string
     permissionMode?: 'read-only'
@@ -1785,6 +1785,9 @@ async function executeStartedRun(
       && !githubWorktree
     ? { taskId: agentTaskDispatch.taskId, sessionId: agentTaskDispatch.targetSessionId, environmentVariables }
     : null
+  // An apply worker started instead of the requester's own session stands in for that session, so it
+  // is not recorded as an unattended run that clients would hide.
+  const workerSpawnInput = resumeTarget ? { ...spawnInput, sessionSource: undefined } : spawnInput
   if (resumeTarget && input.resumeServerChosenSession === false) {
     input.logDebug?.(
       `[server-automation] strict machine control: not resuming server-named session ${resumeTarget.sessionId}`
@@ -1813,7 +1816,7 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] original requester session unavailable; using a new apply worker: ${resumed.error}`,
       )
-      spawned = await input.spawnSession(spawnInput)
+      spawned = await input.spawnSession(workerSpawnInput)
     } else {
       input.logDebug?.(
         `[server-automation] original requester session is busy; leaving apply pending: ${resumed.error}`,
@@ -1823,7 +1826,7 @@ async function executeStartedRun(
   } else {
     spawned = payload.conversation
       ? await input.deliverConversation?.({ ...run, sessionId: payload.conversation.sessionId, directory: payload.directory, prompt: initialPrompt }) ?? { ok: false, error: 'conversation delivery unsupported' }
-      : await input.spawnSession(spawnInput)
+      : await input.spawnSession(workerSpawnInput)
   }
   if (spawned.ok && agentTaskDispatch) input.maintainAgentTaskLease(agentTaskDispatch)
   if (spawned.ok) {

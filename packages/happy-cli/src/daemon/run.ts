@@ -46,7 +46,7 @@ import type { PayloadTrust } from '@/daemon/automations/payloadTrust';
 import { createMachineControlIo } from '@/datakey/machineControlIo';
 import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
-import { normalizeSessionSource, sessionSourceSpawnEnv, type SessionSource } from '@/utils/sessionSource';
+import { normalizeSessionSource, SESSION_SOURCE_ENV, type SessionSource } from '@/utils/sessionSource';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
@@ -2115,7 +2115,9 @@ export async function startDaemon(): Promise<void> {
           extraEnv.HAPPY_CREATED_BY_DISPLAY_NAME = options.createdByDisplayName;
         }
         // Same lineage scrub as createdBy, so a child never inherits it.
-        Object.assign(extraEnv, sessionSourceSpawnEnv(sessionSource));
+        if (sessionSource) {
+          extraEnv[SESSION_SOURCE_ENV] = sessionSource;
+        }
         logger.debug(`[DAEMON RUN] Environment variable keys (before expansion) (${Object.keys(extraEnv).length}): ${Object.keys(extraEnv).join(', ')}`);
 
         // Expand ${VAR} references from daemon's process.env
@@ -3345,8 +3347,6 @@ export async function startDaemon(): Promise<void> {
         parentSessionId: serverSession.id,
         createdByAccountId: serverSession.metadata.createdBy?.accountId,
         createdByDisplayName: serverSession.metadata.createdBy?.displayName,
-        // The replacement session keeps its predecessor's origin, like createdBy.
-        sessionSource: serverSession.metadata.source,
         initialPrompt: options.initialPrompt,
         initialPromptLocalId: options.initialPromptLocalId,
         appendSystemPrompt: options.appendSystemPrompt,

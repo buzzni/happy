@@ -23,6 +23,7 @@ import { createDeferredContinuationContextConsumer } from '@/utils/deferredConti
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata } from '@/daemon/run';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { encodeBase64 } from '@/api/encryption';
@@ -167,12 +168,15 @@ export async function runOpenClaw(opts: RunOpenClawOptions): Promise<void> {
   // Requester identity from the daemon's spawn RPC (specs/session-created-by).
   const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
   const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+  // Who asked for this session (aplus-dev-studio specs/session-source-metadata); read once and removed.
+  const source = takeSessionSourceFromEnv();
 
   const { state, metadata } = createSessionMetadata({
     flavor: 'openclaw',
     machineId: settings.machineId,
     startedBy: opts.startedBy,
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
+    source,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {

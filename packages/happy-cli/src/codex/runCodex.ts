@@ -53,6 +53,7 @@ import { enqueueChannelTurn } from '@/channel/channelTurnEnqueue';
 import { projectPath } from '@/projectPath';
 import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import {
@@ -341,6 +342,8 @@ export async function runCodex(opts: {
     // Requester identity from the daemon's spawn RPC (specs/session-created-by).
     const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
     const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+    // Who asked for this session (aplus-dev-studio specs/session-source-metadata); read once and removed.
+    const source = takeSessionSourceFromEnv();
 
     const { state, metadata: freshMetadata } = createSessionMetadata({
         flavor: 'codex',
@@ -353,6 +356,7 @@ export async function runCodex(opts: {
         ...(forkedFromSessionId ? { parentSessionId: forkedFromSessionId } : {}),
         ...(forkedFromMessageId ? { forkedFromMessageId } : {}),
         ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
+        source,
     });
 
     const skillCommands = await discoverCodexSkillCommands();
