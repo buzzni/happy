@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { SandboxConfig } from '@/persistence';
 import { createSessionMetadata } from './createSessionMetadata';
 
@@ -37,6 +37,17 @@ describe('createSessionMetadata', () => {
 
         expect(metadata.rpcBinding).toEqual({ version: 1 });
     });
+    // aplus-dev-studio specs/session-source-metadata — the daemon hands the source over per spawn.
+    it('records the spawn-supplied session source and nothing for a missing or malformed one', () => {
+        vi.stubEnv('HAPPY_CREATED_BY_SOURCE', 'schedule');
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1' }).metadata.source).toBe('schedule');
+        vi.stubEnv('HAPPY_CREATED_BY_SOURCE', 'Not A Tag');
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1' }).metadata).not.toHaveProperty('source');
+        vi.unstubAllEnvs();
+        delete process.env.HAPPY_CREATED_BY_SOURCE;
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1' }).metadata).not.toHaveProperty('source');
+    });
+
     it('sets metadata.sandbox to the config when enabled', () => {
         const sandbox = createSandboxConfig();
         const { metadata } = createSessionMetadata({

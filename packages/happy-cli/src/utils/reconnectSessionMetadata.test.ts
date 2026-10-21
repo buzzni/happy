@@ -29,6 +29,8 @@ describe('mergeReconnectSessionMetadata', () => {
             codexThreadId: 'codex-thread',
             parentSessionId: 'parent-session',
             forkedFromMessageId: 'source-message',
+            // Written once at creation; a resume without a spawn source must not erase it.
+            source: 'schedule',
             providerExtension: { enabled: true },
         } as Metadata & { providerExtension: { enabled: boolean } };
         const freshLaunchMetadata = {
@@ -43,6 +45,7 @@ describe('mergeReconnectSessionMetadata', () => {
             codexThreadId: 'codex-thread',
             parentSessionId: 'parent-session',
             forkedFromMessageId: 'source-message',
+            source: 'schedule',
             providerExtension: { enabled: true },
         });
     });

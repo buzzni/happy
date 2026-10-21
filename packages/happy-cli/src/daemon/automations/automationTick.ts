@@ -29,7 +29,7 @@ export interface AutomationTickInput {
   store: AutomationStore
   now: number
   runScript: (input: { command: string; cwd: string; timeout: number }) => Promise<{ ok: boolean; stdout: string; error?: string }>
-  spawnSession: (input: { directory: string; initialPrompt: string; createdByAccountId: string | null; agent: AutomationAgent }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
+  spawnSession: (input: { directory: string; initialPrompt: string; createdByAccountId: string | null; agent: AutomationAgent; sessionSource: 'schedule' }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
   logDebug?: (message: string) => void
 }
@@ -110,6 +110,7 @@ async function runClaimedAutomation(
     // 세션은 데몬 소유자 자격증명으로 뜨지만 귀속(누가 등록했나)은 남긴다.
     createdByAccountId: automation.createdByAccountId ?? null,
     agent: automation.agent ?? 'claude',
+    sessionSource: 'schedule',
   })
   if (!spawned.ok) {
     input.logDebug?.(`[automation-tick] ${automation.id} spawn failed: ${spawned.error}`)

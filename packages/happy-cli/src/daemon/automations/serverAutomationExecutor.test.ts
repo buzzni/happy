@@ -307,6 +307,7 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
         .toMatchObject({ authorization: `Bearer LOCAL-CAPABILITY-${provider}` })
     }
     expect(spawnSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      sessionSource: 'schedule',
       expectedConnectors: ['gmail', 'google-drive'],
       mcpSpawnContext: expect.objectContaining({ mcpCallerGrant: 'LOCAL-SIGNED-GRANT', mcpConfigProjectId: 'P-1' }),
     }))
@@ -836,6 +837,7 @@ describe('runServerAutomationTick', () => {
       .toHaveLength(0)
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       initialPrompt: expect.stringContaining('Review 11: Add search'),
+      sessionSource: 'github-trigger',
     }))
     const carried = store.state().githubTriggers?.[0]
     expect(carried?.generation).toBe(3)

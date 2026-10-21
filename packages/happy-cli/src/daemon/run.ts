@@ -46,6 +46,7 @@ import type { PayloadTrust } from '@/daemon/automations/payloadTrust';
 import { createMachineControlIo } from '@/datakey/machineControlIo';
 import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
+import { normalizeSessionSource, sessionSourceSpawnEnv, type SessionSource } from '@/utils/sessionSource';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { captureSpawnOutputStdio, closeCapturedSpawnOutputStdio, preflightInstalledHappyCLI, readCapturedSpawnOutputTail, spawnHappyCLI, startDetachedHappyCLI } from '@/utils/spawnHappyCLI';
@@ -2045,6 +2046,9 @@ export async function startDaemon(): Promise<void> {
         // `machine-personal` 은 이 머신의 자기 로그인을 고른 것이다. 관리 자격을
         // 해석해 두면 overlayManagedCredentialEnvironment 가 마지막에 덮어 항상
         // 이긴다 — 그래서 해석 자체를 하지 않는다.
+        // Who asked for the session, recorded once as metadata `source` (aplus-dev-studio
+        // specs/session-source-metadata). Malformed values are dropped, never stored.
+        const sessionSource = normalizeSessionSource(options.sessionSource);
         const credentialStartedAt = Date.now();
         let preparedMachineLaunch: Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>> | undefined;
         const machineRotationRuntime = await machineRotationFor(options);
@@ -2062,7 +2066,8 @@ export async function startDaemon(): Promise<void> {
               homeDir: os.homedir(), happyHomeDir: stagedUserHomeDir ?? configuration.happyHomeDir, happyLibDir: projectPath(),
               happyToolsDir: join(projectPath(), 'tools', 'unpacked'), flavor: 'claude', startedFromDaemon: true, startedBy: 'daemon',
               lifecycleState: 'running', lifecycleStateSince: Date.now(),
-              ...(options.createdByAccountId ? { createdBy: { accountId: options.createdByAccountId } } : {}) },
+              ...(options.createdByAccountId ? { createdBy: { accountId: options.createdByAccountId } } : {}),
+              ...(sessionSource ? { source: sessionSource } : {}) },
             createSession: input => ownerApi.getOrCreateSession({ ...input, dataKey: channelSessionKeys.get(options) }),
           });
           preparedMachineSessionId = preparedMachineLaunch.session.id;
@@ -2109,6 +2114,8 @@ export async function startDaemon(): Promise<void> {
         if (options.createdByDisplayName) {
           extraEnv.HAPPY_CREATED_BY_DISPLAY_NAME = options.createdByDisplayName;
         }
+        // Same lineage scrub as createdBy, so a child never inherits it.
+        Object.assign(extraEnv, sessionSourceSpawnEnv(sessionSource));
         logger.debug(`[DAEMON RUN] Environment variable keys (before expansion) (${Object.keys(extraEnv).length}): ${Object.keys(extraEnv).join(', ')}`);
 
         // Expand ${VAR} references from daemon's process.env
@@ -3338,6 +3345,8 @@ export async function startDaemon(): Promise<void> {
         parentSessionId: serverSession.id,
         createdByAccountId: serverSession.metadata.createdBy?.accountId,
         createdByDisplayName: serverSession.metadata.createdBy?.displayName,
+        // The replacement session keeps its predecessor's origin, like createdBy.
+        sessionSource: serverSession.metadata.source,
         initialPrompt: options.initialPrompt,
         initialPromptLocalId: options.initialPromptLocalId,
         appendSystemPrompt: options.appendSystemPrompt,
@@ -3756,6 +3765,7 @@ export async function startDaemon(): Promise<void> {
         directory: string;
         initialPrompt: string;
         createdByAccountId: string | null;
+        sessionSource?: SessionSource;
         agent: 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode';
         model?: string;
         effort?: string;
@@ -3778,6 +3788,7 @@ export async function startDaemon(): Promise<void> {
         // 세션 자체는 데몬 소유자 자격증명으로 등록된다(자동화에 사용자 토큰을
         // 저장하지 않는다 — credentials-at-rest 금지). 귀속 표시만 넘긴다.
         createdByAccountId: input.createdByAccountId ?? undefined,
+        ...(input.sessionSource ? { sessionSource: input.sessionSource } : {}),
         filterInheritedCredentials: input.filterInheritedCredentials,
         environmentVariables: input.environmentVariables,
         expectedConnectors: input.expectedConnectors,

@@ -107,10 +107,11 @@ describe('createChannelHostSessions — spawn', () => {
             environmentVariables: { FOO: 'bar' },
             mcpCallerGrantEnvelope: 'grant-envelope',
             createdByAccountId: 'acct-7',
+            sessionSource: 'channel',
         });
         expect(created[0].metadata).toMatchObject({
             path: '/work/project', flavor: 'codex', machineId: 'm-1', startedBy: 'daemon',
-            createdBy: { accountId: 'acct-7' },
+            createdBy: { accountId: 'acct-7' }, source: 'channel',
         });
     });
 

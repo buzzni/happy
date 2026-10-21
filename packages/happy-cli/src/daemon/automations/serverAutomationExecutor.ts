@@ -218,6 +218,8 @@ export interface ServerAutomationExecutorInput {
     initialPrompt: string
     createdByAccountId: null
     agent: AutomationAgent
+    /** Recorded as session metadata `source` (aplus-dev-studio specs/session-source-metadata). */
+    sessionSource: 'schedule' | 'github-trigger'
     model?: string
     effort?: string
     permissionMode?: 'read-only'
@@ -1766,6 +1768,7 @@ async function executeStartedRun(
     initialPrompt,
     createdByAccountId: null,
     agent: payload.agent ?? 'claude',
+    sessionSource: payload.githubTrigger ? 'github-trigger' as const : 'schedule' as const,
     ...(payload.model ? { model: payload.model } : {}),
     ...(payload.effort ? { effort: payload.effort } : {}),
     ...(agentTaskDispatch ? { filterInheritedCredentials: true } : {}),

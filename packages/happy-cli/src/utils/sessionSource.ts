@@ -31,3 +31,9 @@ const SESSION_SOURCE_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 export function normalizeSessionSource(value: unknown): SessionSource | undefined {
     return typeof value === 'string' && SESSION_SOURCE_PATTERN.test(value) ? value : undefined;
 }
+
+/** The env a spawn sets so the runner records `source` (empty when nothing well-formed was asked). */
+export function sessionSourceSpawnEnv(value: unknown): Record<string, string> {
+    const source = normalizeSessionSource(value);
+    return source ? { [SESSION_SOURCE_ENV]: source } : {};
+}

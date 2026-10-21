@@ -87,6 +87,8 @@ export function createChannelHostSessions(deps: {
         environmentVariables: request.environmentVariables,
         mcpCallerGrantEnvelope: request.mcpCallerGrantEnvelope,
         createdByAccountId: request.createdByAccountId,
+        // A messenger conversation, not one started in a Saycode client (specs/session-source-metadata).
+        sessionSource: 'channel',
     });
 
     const startedSessionId = (result: SpawnSessionResult): string => {
@@ -123,6 +125,7 @@ export function createChannelHostSessions(deps: {
             lifecycleState: 'running',
             lifecycleStateSince: Date.now(),
             ...(request.createdByAccountId ? { createdBy: { accountId: request.createdByAccountId } } : {}),
+            source: 'channel',
         };
         const prepared = await deps.spawnWithSessionKey?.(spawnOptions(request), { key, wrapped });
         if (prepared) {

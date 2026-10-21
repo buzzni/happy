@@ -53,6 +53,8 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_FORK_CODEX_THREAD_ID: 'codex-1',
             HAPPY_CREATED_BY_ACCOUNT_ID: 'acct-stale',
             HAPPY_CREATED_BY_DISPLAY_NAME: 'Stale Name',
+            // A scheduled run's child must not be recorded as a scheduled run too.
+            HAPPY_CREATED_BY_SOURCE: 'schedule',
             HAPPY_INITIAL_PROMPT: 'stale automation prompt',
             HAPPY_INITIAL_MODEL: 'stale-model',
             HAPPY_INITIAL_EFFORT: 'stale-effort',
