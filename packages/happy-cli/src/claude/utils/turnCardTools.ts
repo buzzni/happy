@@ -91,7 +91,9 @@ export function registerTurnCardTools(mcp: McpServer, options: {
 
     mcp.registerTool('next_steps', {
         title: 'Next steps',
-        description: 'Fill the "next step" card the app shows at the end of your turn: a short recap and, when the user has a decision to make, one question with buttons that answer it. Call it once before you end a turn in which you changed files, ran commands, or finished multi-step work; skip it for short answers. Only include an app action that holds right now; otherwise use a reply button {label, message}. If it is refused, end your turn with an ordinary message instead.',
+        // Unconditional "call it every turn" wording would invite calls on turns whose client draws
+        // no card; the when-to-call rules ride only in that turn's <saycode-next-steps> guidance.
+        description: 'Fill the "next step" card the app shows at the end of your turn: a short recap and, when the user has a decision to make, one question with buttons that answer it. Call it only when your instructions contain <saycode-next-steps>, and follow them; otherwise do not call it. Only include an app action that holds right now; otherwise use a reply button {label, message}. If it is refused, end your turn with an ordinary message instead.',
         inputSchema: nextStepsInput,
     }, async (args) => runTool(async () => {
         if (!turnCards?.drawn()) return reply(UNSUPPORTED, true);

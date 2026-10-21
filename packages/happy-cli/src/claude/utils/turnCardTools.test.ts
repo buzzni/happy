@@ -138,6 +138,18 @@ describe('next_steps on a turn whose client does not draw the card', () => {
     });
 });
 
+describe('next_steps description', () => {
+    it('defers when to call to the per-turn guidance instead of asking for a call every turn', async () => {
+        const server = await startHappyServer(fakeClient(), { turnCards: drawnTurn('claude') });
+        try {
+            const tools = (await rpc(server.url, 'tools/list', {})).result.tools as Array<{ name: string; description: string }>;
+            const description = tools.find((tool) => tool.name === 'next_steps')!.description;
+            expect(description).toContain('only when your instructions contain <saycode-next-steps>');
+            expect(description).not.toMatch(/Call it once before you end a turn/);
+        } finally { server.stop(); }
+    });
+});
+
 describe('task list', () => {
     it('is not a tool: Claude has TodoWrite and Codex its built-in update_plan', async () => {
         for (const runner of ['claude', 'codex'] as const) {
