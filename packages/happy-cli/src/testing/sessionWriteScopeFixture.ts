@@ -307,7 +307,13 @@ export class SessionWriteScopeFixture {
     }
     async waitDaemonConnection(connected: boolean) {
         await eventually(async () => {
-            const state = JSON.parse(await readFile(join(this.happyHome, 'daemon.state.json'), 'utf8'));
+            // The daemon rewrites this file in place (truncate, then write), so a poll can land on a
+            // half-written file. That is "not yet", not a failure.
+            let state: { pid?: number; socketConnected?: boolean };
+            try { state = JSON.parse(await readFile(join(this.happyHome, 'daemon.state.json'), 'utf8')); } catch (error) {
+                if (error instanceof SyntaxError) return undefined;
+                throw error;
+            }
             return state.pid === this.daemon!.pid && state.socketConnected === connected ? true : undefined;
         }, `daemon connection ${connected}`);
     }

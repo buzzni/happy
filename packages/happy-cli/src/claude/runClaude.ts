@@ -734,6 +734,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         mandatorySandbox: sandboxPolicyMode === 'mandatory',
         sameUidSandbox: Boolean(scopeLaunch),
+        // claudeLocal wraps Claude (and so the bridge) with sandbox-runtime; the session may switch to local mode.
+        wrappedSandbox: checkpointComposition.sandboxConfig?.enabled === true && process.platform !== 'win32',
         ...(principal.kind === 'account' ? { proposeLesson: lessonProposalTurn.submit } : {}),
         turnCards,
         checkpointReader: checkpointComposition.agentReader,

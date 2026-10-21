@@ -1883,6 +1883,8 @@ export async function runCodex(opts: {
         agentControl: accountToken !== null,
         exitAfterFirstTurn,
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
+        // CodexAppServerClient wraps `codex app-server` (and so the bridge) with sandbox-runtime.
+        wrappedSandbox: checkpointComposition.sandboxConfig?.enabled === true && process.platform !== 'win32',
         ...(runtimeGate ? { admitTool: <T,>(work: () => Promise<T>) => runtimeGate.admit(work, 'writer') } : {}),
         ...(accountToken !== null ? { proposeLesson: lessonProposalTurn.submit } : {}),
         turnCards,
@@ -1918,7 +1920,9 @@ export async function runCodex(opts: {
     const baseMcpServers = {
         happy: {
             command: process.execPath,
-            args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url]
+            args: ['--no-warnings', '--no-deprecation', bridgeEntrypoint, '--url', happyServer.url],
+            // The bridge authenticates to the session MCP; never via argv.
+            env: happyServer.bridgeEnv,
         }
     };
     const bridgeOptions = { bridgeCommand: bridgeEntrypoint, nodeExecPath: process.execPath };

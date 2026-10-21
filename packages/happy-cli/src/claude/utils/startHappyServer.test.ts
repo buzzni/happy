@@ -8,6 +8,7 @@ import { request } from 'node:http';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createChangeTitleHandler, startHappyServer } from './startHappyServer';
+import { unixMcpFetch } from './unixMcpFetch';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import type { ApiSessionClient } from '@/api/apiSession';
 
@@ -36,8 +37,17 @@ function makeFakeClient(hasTitle: boolean) {
     } as unknown as ApiSessionClient;
 }
 
-async function callTool(serverUrl: string, id: number, name: string, args: Record<string, unknown>) {
-    const response = await fetch(serverUrl, {
+type McpServerHandle = { url: string; socketPath?: string; mcpConfig: { env?: Record<string, string> }; bridgeEnv: Record<string, string> };
+
+/** Authenticated fetch to a started server: owner-only socket on POSIX, bearer on Windows. */
+function mcpFetch(server: McpServerHandle): typeof fetch {
+    if (server.socketPath) return unixMcpFetch(server.socketPath, server.mcpConfig.env!.SAYCODE_MCP_TOKEN);
+    const headers = JSON.parse(server.bridgeEnv.HAPPY_HTTP_MCP_HEADERS) as Record<string, string>;
+    return (input, init) => fetch(input, { ...init, headers: { ...init?.headers as Record<string, string>, ...headers } });
+}
+
+async function callTool(server: McpServerHandle, id: number, name: string, args: Record<string, unknown>) {
+    const response = await mcpFetch(server)(server.url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -54,6 +64,134 @@ async function callTool(serverUrl: string, id: number, name: string, args: Recor
     const raw = await response.text();
     return JSON.parse(raw.startsWith('event:') ? raw.slice(raw.indexOf('data: ') + 6) : raw);
 }
+
+function rawSocketCall(socketPath: string, authorization?: string) {
+    return new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = request({ socketPath, method: 'POST', path: '/', headers: {
+            'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
+            ...(authorization ? { Authorization: authorization } : {}),
+        } }, res => {
+            let body = ''; res.on('data', chunk => { body += chunk; });
+            res.on('end', () => resolve({ status: res.statusCode!, body }));
+        });
+        req.on('error', reject);
+        req.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }));
+    });
+}
+
+describe('Happy MCP transport authentication', () => {
+    it.skipIf(process.platform === 'win32')('serves an ordinary POSIX session only over an owner-only socket that requires the session token', async () => {
+        const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
+        try {
+            Object.defineProperty(process, 'platform', { ...descriptor, value: 'darwin' });
+            server = await startHappyServer(makeFakeClient(false));
+            expect(server.socketPath).toBeTruthy();
+            expect((await stat(server.socketPath!)).mode & 0o777).toBe(0o600);
+            expect((await stat(join(server.socketPath!, '..'))).mode & 0o777).toBe(0o700);
+            expect(server.url).toBe('http://localhost/');
+            const token = server.mcpConfig.env!.SAYCODE_MCP_TOKEN;
+            expect(token).toMatch(/^[0-9a-f]{64}$/);
+            expect(server.mcpConfig.type).toBe('stdio');
+            expect(server.bridgeEnv).toEqual({ SAYCODE_MCP_SOCKET: server.socketPath, SAYCODE_MCP_TOKEN: token });
+            expect((await rawSocketCall(server.socketPath!)).status).toBe(401);
+            expect((await rawSocketCall(server.socketPath!, 'Bearer wrong')).status).toBe(401);
+            const reply = await rawSocketCall(server.socketPath!, `Bearer ${token}`);
+            expect(reply.status).toBe(200);
+            expect(reply.body).toContain('bash_stream');
+        } finally {
+            server?.stop();
+            Object.defineProperty(process, 'platform', descriptor);
+        }
+    });
+
+    async function expectTcpBearerOnly(server: Awaited<ReturnType<typeof startHappyServer>>) {
+        expect(server.socketPath).toBeUndefined();
+        expect(server.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
+        const bearer = JSON.parse(server.bridgeEnv.HAPPY_HTTP_MCP_HEADERS).Authorization as string;
+        expect(bearer).toMatch(/^Bearer [0-9a-f]{64}$/);
+        // Claude's MCP config reaches argv (--mcp-config); it may only reference the secret.
+        expect(server.mcpConfig).toEqual({ type: 'http', url: server.url, headers: { Authorization: 'Bearer ${SAYCODE_MCP_BEARER}' } });
+        expect(JSON.stringify(server.mcpConfig)).not.toContain(bearer.slice(7));
+        expect(`Bearer ${process.env.SAYCODE_MCP_BEARER}`).toBe(bearer);
+        const post = (headers: Record<string, string>) => fetch(server.url, { method: 'POST', headers: {
+            'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...headers,
+        }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) });
+        expect((await post({})).status).toBe(401);
+        expect((await post({ Authorization: 'Bearer wrong' })).status).toBe(401);
+        expect((await post({ Authorization: bearer })).status).toBe(200);
+    }
+
+    async function withPlatform(platform: NodeJS.Platform, options: Parameters<typeof startHappyServer>[1], check: (server: Awaited<ReturnType<typeof startHappyServer>>) => Promise<void>) {
+        const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        const previousBearer = process.env.SAYCODE_MCP_BEARER;
+        let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
+        try {
+            Object.defineProperty(process, 'platform', { ...descriptor, value: platform });
+            server = await startHappyServer(makeFakeClient(false), options);
+            await check(server);
+        } finally {
+            server?.stop();
+            Object.defineProperty(process, 'platform', descriptor);
+            expect(process.env.SAYCODE_MCP_BEARER).toBeUndefined();
+            if (previousBearer !== undefined) process.env.SAYCODE_MCP_BEARER = previousBearer;
+        }
+    }
+
+    it('requires the session bearer on the Windows loopback listener and keeps it out of Claude argv', async () => {
+        await withPlatform('win32', {}, expectTcpBearerOnly);
+    });
+
+    it('keeps an authenticated TCP transport for same-UID Linux scope sessions, which cannot open AF_UNIX', async () => {
+        await withPlatform('linux', { sameUidSandbox: true }, expectTcpBearerOnly);
+    });
+
+    it.each(['linux', 'darwin'] as const)('keeps an authenticated TCP transport when sandbox-runtime wraps the agent on %s', async platform => {
+        // The wrapper's seccomp (Linux) and Seatbelt unix-socket rules (macOS) deny the bridge's socket connect.
+        await withPlatform(platform, { wrappedSandbox: true }, expectTcpBearerOnly);
+    });
+
+    it.skipIf(process.platform === 'win32')('does not export the bearer for socket sessions', async () => {
+        await withPlatform('darwin', {}, async server => {
+            expect(server.socketPath).toBeTruthy();
+            expect(process.env.SAYCODE_MCP_BEARER).toBeUndefined();
+        });
+    });
+
+    it.skipIf(process.platform === 'win32')('keeps the underlying cause when the socket directory cannot be created', async () => {
+        const previousTmp = process.env.TMPDIR;
+        try {
+            process.env.TMPDIR = join(tmpdir(), `happy-mcp-missing-${Date.now()}`, 'nested');
+            await withPlatform('darwin', {}, async () => { throw new Error('must not start'); })
+                .then(() => { throw new Error('started'); }, error => {
+                    expect(error).not.toBeInstanceOf(MandatorySandboxError);
+                    expect(String(error)).toMatch(/socket directory unavailable/);
+                    expect((error as Error & { cause?: NodeJS.ErrnoException }).cause?.code).toBe('ENOENT');
+                });
+        } finally {
+            if (previousTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmp;
+        }
+    });
+
+    it.skipIf(process.platform === 'win32')('refuses a socket path the OS cannot bind instead of falling back to TCP', async () => {
+        const previousTmp = process.env.TMPDIR;
+        const longTmp = await mkdtemp(join(tmpdir(), 'happy-mcp-long-'));
+        const deep = join(longTmp, 'x'.repeat(90));
+        await mkdir(deep);
+        try {
+            process.env.TMPDIR = deep;
+            await withPlatform('darwin', {}, async () => { throw new Error('must not start'); })
+                .then(() => { throw new Error('started'); }, error => {
+                    expect(error).not.toBeInstanceOf(MandatorySandboxError);
+                    expect(String(error)).toMatch(/socket path too long/);
+                });
+            expect(await readdir(deep)).toEqual([]);
+        } finally {
+            if (previousTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmp;
+            await rm(longTmp, { recursive: true, force: true });
+        }
+    });
+});
 
 describe('Happy MCP shutdown admission', () => {
     it('fails closed for same-UID protected Linux sessions without creating an MCP socket', async () => {
@@ -129,12 +267,12 @@ describe('Happy MCP shutdown admission', () => {
         const server = await startHappyServer(makeFakeClient(false), { admitTool: work => gate.admit(work, 'writer') });
         let running: Promise<any> | undefined;
         try {
-            running = callTool(server.url, 2, 'bash_stream', { command: 'fixture-only' });
+            running = callTool(server, 2, 'bash_stream', { command: 'fixture-only' });
             await vi.waitFor(() => expect(release).toBeTypeOf('function'));
             gate.freeze(); gate.loopExited();
             expect(gate.hasLiveProducers()).toBe(true);
             const calls = vi.mocked(runBashStream).mock.calls.length;
-            const refused = await callTool(server.url, 3, 'bash_stream', { command: 'must-not-run' });
+            const refused = await callTool(server, 3, 'bash_stream', { command: 'must-not-run' });
             expect(refused.result.isError).toBe(true);
             expect(refused.result.content[0].text).toBe('Tool unavailable during session shutdown');
             expect(vi.mocked(runBashStream).mock.calls.length).toBe(calls);
@@ -162,7 +300,7 @@ describe('Happy MCP shutdown admission', () => {
             browser_open_tab: { url: 'https://example.com' }, browser_close_tab: { tabId: 1 },
         };
         try {
-            const response = await fetch(server.url, {
+            const response = await mcpFetch(server)(server.url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
@@ -173,7 +311,7 @@ describe('Happy MCP shutdown admission', () => {
             const names: string[] = listed.result.tools.map((tool: { name: string }) => tool.name);
             expect(names.length).toBeGreaterThan(0);
             for (const [index, name] of names.entries()) {
-                const result = await callTool(server.url, index + 10, name, args[name] ?? {});
+                const result = await callTool(server, index + 10, name, args[name] ?? {});
                 expect(result.result?.content[0].text, name).toBe('Tool unavailable during session shutdown');
                 expect(admitTool).toHaveBeenCalledTimes(index + 1);
             }
@@ -185,7 +323,7 @@ describe('Happy MCP shutdown admission', () => {
         const admitTool = vi.fn(async () => { throw new Error('Runtime input is closed'); });
         const server = await startHappyServer(client, { admitTool });
         try {
-            const reply = await callTool(server.url, 1, 'change_title', { title: 'Refused title' });
+            const reply = await callTool(server, 1, 'change_title', { title: 'Refused title' });
             expect(reply.result?.isError).toBe(true);
             expect(client.sendClaudeSessionMessage).not.toHaveBeenCalled();
             expect(admitTool).toHaveBeenCalledOnce();
@@ -287,7 +425,7 @@ describe('startHappyServer tool registration', () => {
         let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
         try {
             server = await startHappyServer(makeFakeClient(false), options);
-            const response = await fetch(server.url, { method: 'POST',
+            const response = await mcpFetch(server)(server.url, { method: 'POST',
                 headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
             });
@@ -309,7 +447,7 @@ describe('startHappyServer tool registration', () => {
         let server: Awaited<ReturnType<typeof startHappyServer>> | undefined;
         try {
             server = await startHappyServer(makeFakeClient(false), { exitAfterFirstTurn: true, browserHostContinues: true, mandatorySandbox: false });
-            const response = await fetch(server.url, { method: 'POST',
+            const response = await mcpFetch(server)(server.url, { method: 'POST',
                 headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
             });
@@ -330,7 +468,7 @@ describe('startHappyServer tool registration', () => {
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const response = await fetch(server.url, {
+            const response = await mcpFetch(server)(server.url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -370,7 +508,7 @@ describe('startHappyServer tool registration', () => {
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const payload = await callTool(server.url, 2, 'browser_scroll', { deltaX: 0, deltaY: 0 });
+            const payload = await callTool(server, 2, 'browser_scroll', { deltaX: 0, deltaY: 0 });
             expect(payload.result.isError).toBe(true);
             expect(payload.result.content[0].text).toMatch(/non-zero/i);
         } finally {
@@ -382,7 +520,7 @@ describe('startHappyServer tool registration', () => {
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const payload = await callTool(server.url, 3, 'browser_scroll', { deltaY: 10_001 });
+            const payload = await callTool(server, 3, 'browser_scroll', { deltaY: 10_001 });
             expect(payload.result.isError).toBe(true);
             expect(payload.result.content[0].text).toContain('10000');
         } finally {
@@ -394,7 +532,7 @@ describe('startHappyServer tool registration', () => {
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId: 'test' } as unknown as ApiSessionClient;
         const server = await startHappyServer(client);
         try {
-            const payload = await callTool(server.url, 4, 'browser_scroll', { ref: '', deltaY: 300 });
+            const payload = await callTool(server, 4, 'browser_scroll', { ref: '', deltaY: 300 });
             expect(payload.result.isError).toBe(true);
             expect(payload.result.content[0].text).toMatch(/>=1 characters|at least 1 character/i);
         } finally {
@@ -415,7 +553,7 @@ describe('startHappyServer tool registration', () => {
             // Assert the slug the caller sent is the one that gets stored — a bare
             // "updateMetadata was called" check still passes if the tool wires the
             // wrong argument (e.g. the title) into the handler's slug parameter.
-            const payload = await callTool(server.url, 1, 'change_title', { title: 'Fix login bug', branchSlug: 'fix-login-bug' });
+            const payload = await callTool(server, 1, 'change_title', { title: 'Fix login bug', branchSlug: 'fix-login-bug' });
             expect(payload.result.isError).toBe(false);
 
             expect(updateMetadata).toHaveBeenCalledTimes(1);
@@ -442,7 +580,7 @@ describe('startHappyServer tool registration', () => {
             trackProtectedBashProcess,
         });
         try {
-            const payload = await callTool(server.url, 5, 'bash_stream', {
+            const payload = await callTool(server, 5, 'bash_stream', {
                 command: 'printf isolated > mutation.txt; pwd',
                 cwd: originalPath,
             });
@@ -471,7 +609,7 @@ describe('foreground lesson proposal tool', () => {
         try {
             expect(server.toolNames).toContain('propose_lesson');
             const token = 'b96f00e6-112e-4a8d-8117-23f28d3f9e34';
-            const response = await callTool(server.url, 1, 'propose_lesson', { token, proposal: { name: 'Verified' } });
+            const response = await callTool(server, 1, 'propose_lesson', { token, proposal: { name: 'Verified' } });
             expect(handler).toHaveBeenCalledWith({ token, proposal: { name: 'Verified' } });
             expect(JSON.parse(response.result.content[0].text)).toEqual({ accepted: false });
         } finally { server.stop(); }
@@ -479,8 +617,8 @@ describe('foreground lesson proposal tool', () => {
 });
 
 describe('browser task runtime PoC flag', () => {
-    async function listNames(url: string): Promise<string[]> {
-        const response = await fetch(url, {
+    async function listNames(server: McpServerHandle): Promise<string[]> {
+        const response = await mcpFetch(server)(server.url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
             body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
@@ -495,7 +633,7 @@ describe('browser task runtime PoC flag', () => {
         vi.stubEnv('HAPPY_BROWSER_TASK_RUNTIME_URL', '');
         const server = await startHappyServer(client());
         try {
-            const names = await listNames(server.url);
+            const names = await listNames(server);
             expect(names).toContain('browser_tabs');
             expect(names.some((n) => n.startsWith('browser_task_'))).toBe(false);
         } finally {
@@ -523,7 +661,7 @@ describe('browser task runtime PoC flag', () => {
         vi.stubEnv('HAPPY_BROWSER_TASK_GRANT_FILE', '/nonexistent/grant');
         const server = await startHappyServer(client());
         try {
-            const names = await listNames(server.url);
+            const names = await listNames(server);
             expect(names).toContain('browser_task_submit_batch');
             expect(names.filter((n) => n.startsWith('browser_') && !n.startsWith('browser_task_'))).toEqual([]);
             expect(server.toolNames).toContain('browser_task_submit_batch');
@@ -545,7 +683,7 @@ describe('session-bound checkpoint MCP tools', () => {
         const admit = vi.fn(async work => work());
         const server = await startHappyServer(makeFakeClient(false), { checkpointReader: reader as never, admitTool: admit });
         try {
-            const response = await fetch(server.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+            const response = await mcpFetch(server)(server.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) });
             const text = await response.text();
             const tools = JSON.parse(text.startsWith('event:') ? text.slice(text.indexOf('data: ') + 6) : text).result.tools;
@@ -553,11 +691,11 @@ describe('session-bound checkpoint MCP tools', () => {
             expect(checkpoints.map((tool: { name: string }) => tool.name).sort()).toEqual(['checkpoint_diff', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_status']);
             expect(server.toolNames.filter(name => name.startsWith('checkpoint_')).sort()).toEqual(checkpoints.map((tool: { name: string }) => tool.name).sort());
             for (const tool of checkpoints) expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
-            const result = await callTool(server.url, 2, 'checkpoint_list', { limit: 2 });
+            const result = await callTool(server, 2, 'checkpoint_list', { limit: 2 });
             expect(JSON.parse(result.result.content[0].text)).toMatchObject({ total: 0 });
             expect(reader.query).toHaveBeenCalledWith('list', { limit: 2 }); expect(admit).toHaveBeenCalledOnce();
             reader.query.mockClear();
-            const invalid = await callTool(server.url, 3, 'checkpoint_list', { sessionId: 'other' });
+            const invalid = await callTool(server, 3, 'checkpoint_list', { sessionId: 'other' });
             expect(invalid.result?.isError ?? Boolean(invalid.error)).toBe(true); expect(reader.query).not.toHaveBeenCalled();
         } finally { server.stop(); }
     });
@@ -567,10 +705,10 @@ describe('session-bound checkpoint MCP tools', () => {
         const server = await startHappyServer(makeFakeClient(false), { checkpointReader: { query } as never,
             admitTool: async work => { if (closed) throw new Error('closed'); return work(); } });
         try {
-            const failed = await callTool(server.url, 1, 'checkpoint_list', {});
+            const failed = await callTool(server, 1, 'checkpoint_list', {});
             expect(failed.result.isError).toBe(true); expect(failed.result.content[0].text).toBe('CHECKPOINT_READ_FAILED');
             closed = true;
-            const refused = await callTool(server.url, 2, 'checkpoint_status', {});
+            const refused = await callTool(server, 2, 'checkpoint_status', {});
             expect(refused.result.content[0].text).toBe('Tool unavailable during session shutdown'); expect(query).toHaveBeenCalledOnce();
         } finally { server.stop(); }
     });
@@ -583,7 +721,7 @@ describe('session write scope protected tool surface', () => {
         process.env.HAPPY_WRITE_SCOPE_SESSION = '1';
         const server = await startHappyServer(makeFakeClient(false));
         try {
-            const response = await fetch(server.url, { method: 'POST',
+            const response = await mcpFetch(server)(server.url, { method: 'POST',
                 headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) });
             const raw = await response.text();
@@ -627,7 +765,7 @@ describe('approved Desktop computer tools in the session MCP', () => {
             .mockResolvedValueOnce({ version: 1, tools: available ? [{ extensionId: 'buzzni.test' }] : [] });
         const server = await startHappyServer(client);
         try {
-            const response = await fetch(server.url, {
+            const response = await mcpFetch(server)(server.url, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
             });
@@ -658,13 +796,13 @@ describe('approved Desktop computer tools in the session MCP', () => {
         const server = await startHappyServer(client);
         try {
             expect(server.toolNames).toContain('local_tool_control');
-            const result = await callTool(server.url, 1, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows' });
+            const result = await callTool(server, 1, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows' });
             expect(JSON.parse(result.result.content[0].text)).toMatchObject({ state: 'succeeded' });
             expect(requestLocalToolAgent).toHaveBeenLastCalledWith(context, { action: 'run', extensionId: 'buzzni.test', operation: 'windows', parameters: {} }, expect.any(AbortSignal));
-            const invalid = await callTool(server.url, 2, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows', sessionId: 'S-other' });
+            const invalid = await callTool(server, 2, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows', sessionId: 'S-other' });
             expect(invalid.result?.isError ?? Boolean(invalid.error)).toBe(true);
             denied = true;
-            const revoked = await callTool(server.url, 3, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows' });
+            const revoked = await callTool(server, 3, 'local_tool_control', { action: 'run', extensionId: 'buzzni.test', operation: 'windows' });
             expect(revoked.result).toMatchObject({ isError: true, content: [{ type: 'text', text: 'PERMISSION_REQUIRED' }] });
         } finally {
             server.stop();
