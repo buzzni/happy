@@ -37,6 +37,16 @@ describe('MetadataSchema', () => {
             branchSlug: 'fix-login-bug',
         });
     });
+
+    // aplus-dev-studio specs/session-source-metadata: an undeclared key is stripped here and
+    // the app's metadata write-back would then erase it for every client.
+    it('preserves the CLI-supplied session source through a parse round-trip, including unknown values', () => {
+        for (const source of ['schedule', 'some-future-source']) {
+            const metadata = MetadataSchema.parse({ path: '/tmp/project', host: 'local-machine', source });
+            expect(MetadataSchema.parse(JSON.parse(JSON.stringify(metadata))).source).toBe(source);
+        }
+        expect(MetadataSchema.parse({ path: '/tmp/project', host: 'local-machine' }).source).toBeUndefined();
+    });
 });
 
 describe('MachineMetadataSchema', () => {

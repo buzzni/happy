@@ -6,6 +6,7 @@ import { authenticatedEnvelopesCapabilitySchema, projectPurgeCapabilitySchema, r
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
+import type { SessionSource } from '@/utils/sessionSource'
 import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
 export {
@@ -545,6 +546,13 @@ export type Metadata = {
    * doesn't supply it (specs/session-created-by).
    */
   createdBy?: { accountId: string; displayName?: string }
+  /**
+   * Who started the session (`user`, `schedule`, `github-trigger`, …). An open
+   * enum written once at creation; absent on older sessions and on spawns that
+   * don't supply it, which readers treat as unknown — never as `user`
+   * (aplus-dev-studio specs/session-source-metadata).
+   */
+  source?: SessionSource
   /**
    * Auto-routing state. Deliberately `unknown`: the record may be the pre-v2
    * shape (`{ difficulty, hardTurns, updatedAt }`), the versioned v2 shape, or
