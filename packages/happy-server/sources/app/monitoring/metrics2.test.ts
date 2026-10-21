@@ -29,7 +29,7 @@ vi.mock("@/storage/db", () => ({
     db: dbMock
 }));
 
-import { register, updateDatabaseMetrics } from "./metrics2";
+import { register, updateDatabaseMetrics, eventLoopLagMaxMsSinceScrape } from "./metrics2";
 const gcObservationOptions = gcObserver.observe.mock.calls[0];
 
 describe("updateDatabaseMetrics", () => {
@@ -136,5 +136,17 @@ describe("event loop lag metric", () => {
         const metrics = await register.metrics();
 
         expect(metrics).toContain("event_loop_lag_seconds");
+    });
+});
+
+describe("eventLoopLagMaxMsSinceScrape", () => {
+    it("converts the histogram maximum from nanoseconds to whole milliseconds", () => {
+        eventLoopHistogram.max = 21_400_000;
+        expect(eventLoopLagMaxMsSinceScrape()).toBe(21);
+    });
+
+    it("reads as zero while the histogram has no samples", () => {
+        eventLoopHistogram.max = 0;
+        expect(eventLoopLagMaxMsSinceScrape()).toBe(0);
     });
 });
