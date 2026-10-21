@@ -505,6 +505,13 @@ export async function confirmDeviceOrganization(input: { companyId: string; mach
   if (result.error || result.locallyConfirmed !== true) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
   return { locallyConfirmed: true };
 }
+/** aplus specs/shared-machine-server-signing S6b — loopback only; a refusal (already marked, nothing waiting) is 409. */
+export async function useDeviceAsShared(companyId: string): Promise<{ accepted: true; confirmed: boolean }> {
+  const result = await daemonPost('/device/use-as-shared', { companyId });
+  if (result.status === 409) throw new Error('DEVICE_USE_AS_SHARED_REFUSED');
+  if (result.error || result.accepted !== true) throw new Error('DEVICE_CONTROL_UNAVAILABLE');
+  return { accepted: true, confirmed: result.confirmed === true };
+}
 
 /**
  * Saycode specs/claude-setup-token-account-selection — a setup-token-bound session's usage, and its request

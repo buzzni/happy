@@ -25,3 +25,20 @@ it('does not print confirmation success or raw transport secrets on failure',asy
  await expect(handleDeviceCommand(['confirm','--company-id','company','--machine-id','machine','--digest',digest],deps)).rejects.toThrow('DEVICE_CONTROL_UNAVAILABLE');
  expect(deps.print).not.toHaveBeenCalled();
 });
+// aplus specs/shared-machine-server-signing S6b — the PC's own one-step "use as the organization's shared PC".
+it('marks this PC as the organization\'s shared PC with one explicit command and says whether the key is already pinned',async()=>{
+ for(const [confirmed,expected] of [[true,'조직 키가 저장되었습니다'],[false,'서버 승인이 오면 자동으로 확인됩니다']] as const){
+  const deps={...fixture(),useAsShared:vi.fn(async()=>({accepted:true as const,confirmed}))};
+  await handleDeviceCommand(['use-as-shared','--company-id','company'],deps);
+  expect(deps.useAsShared).toHaveBeenCalledWith('company');
+  expect(deps.print).toHaveBeenCalledWith(expect.stringContaining(expected));
+ }
+ const deps={...fixture(),useAsShared:vi.fn()};
+ for(const args of [['use-as-shared'],['use-as-shared','--company-id','company','--machine-id','m']]) await expect(handleDeviceCommand(args,deps)).rejects.toThrow();
+ expect(deps.useAsShared).not.toHaveBeenCalled();
+});
+it('explains a refusal without claiming the PC was marked',async()=>{
+ const deps={...fixture(),useAsShared:vi.fn(async()=>{throw new Error('DEVICE_USE_AS_SHARED_REFUSED');})};
+ await expect(handleDeviceCommand(['use-as-shared','--company-id','company'],deps)).rejects.toThrow('이미 공용·전용으로 표시된 PC이거나');
+ expect(deps.print).not.toHaveBeenCalled();
+});

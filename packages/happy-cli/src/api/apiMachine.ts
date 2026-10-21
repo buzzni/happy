@@ -950,6 +950,10 @@ export class ApiMachineClient {
                 const input = z.object({ companyId: z.string().min(1).max(512) }).strict().parse(params);
                 return deviceEnrollment.getStatus(input.companyId);
             });
+            // aplus specs/shared-machine-server-signing S6c — an administrator holding the organization key marks this PC
+            // shared over the customer key. Not a server lane method; a legacy machine has no separate lane, so none there.
+            if (this.machine.encryptionVariant === 'dataKey')
+                this.rpcHandlerManager.registerHandler('device:use-as-shared', async params => deviceEnrollment.useAsShared(params as never, 'remote'));
         }
 
         // specs/daemon-rpc-workspace-rebase/ Phase 2 — rebase the

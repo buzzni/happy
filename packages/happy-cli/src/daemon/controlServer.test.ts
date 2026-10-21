@@ -1354,3 +1354,32 @@ it('exposes only public device status behind Bearer and without browser Origin',
 
  }finally{await server.stop();}
 }, 30000);
+
+// aplus specs/shared-machine-server-signing S6b — the PC's own "use as the organization's shared PC", loopback only.
+it('lets only the local user mark this PC shared, and shows the marker on a separate route', async () => {
+ const nacl=(await import('tweetnacl')).default;
+ const {createDeviceEnrollment}=await import('./deviceEnrollment');
+ let marker: 'shared'|'dedicated'|null=null;
+ const enrollment=createDeviceEnrollment({machineId:'machine',keys:{signing:nacl.sign.keyPair(),recipient:nacl.box.keyPair()},
+  marker:{read:async()=>marker,record:async(type)=>{if(marker)return 'exists';marker=type;return 'recorded';}},autoConfirm:async()=>false});
+ await enrollment.begin({companyId:'company',machineType:'shared',ownerUserId:null,orgSigningPublicKey:Buffer.from(nacl.sign.keyPair().publicKey).toString('base64url'),signingGeneration:1});
+ const server=await startDaemonControlServer({getChildren:()=>[],stopSession:()=>({stopped:false,reason:'not-found'}),spawnSession:async()=>({type:'error',errorMessage:'unused'}),requestShutdown:()=>{},onHappySessionWebhook:()=>{},portRegistry:createPortRegistry({filePath:path.join(process.env.HAPPY_HOME_DIR!,'device-shared-ports.json')}),getDeviceEnrollment:()=>enrollment});
+ try{
+  const send=(route:string,headers:Record<string,string>,body:unknown={companyId:'company'})=>realFetch(`http://127.0.0.1:${server.port}/device/${route}`,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(body)});
+  const auth={Authorization:`Bearer ${server.controlSecret}`};
+  for (const route of ['use-as-shared','shared-status']) {
+   expect((await send(route,{})).status).toBe(401);
+   expect((await send(route,{...auth,Origin:'http://localhost'})).status).toBe(403);
+   expect((await send(route,auth,{companyId:'company',machineId:'machine'})).status).toBe(400);
+  }
+  expect(await (await send('shared-status',auth)).json()).toEqual({machineType:null,awaitingSharedConfirmation:true});
+  expect((await send('use-as-shared',auth,{companyId:'other'})).status).toBe(409);
+  expect(marker).toBeNull();
+  const marked=await send('use-as-shared',auth);
+  expect(marked.status).toBe(200);expect(await marked.json()).toEqual({accepted:true,confirmed:false});
+  expect(marker).toBe('shared');
+  const again=await send('use-as-shared',auth);
+  expect(again.status).toBe(409);expect(await again.json()).toEqual({code:'DEVICE_MACHINE_TYPE_SET'});
+  expect(await (await send('shared-status',auth)).json()).toEqual({machineType:'shared',awaitingSharedConfirmation:true});
+ }finally{await server.stop();}
+});

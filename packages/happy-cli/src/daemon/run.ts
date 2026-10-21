@@ -4067,7 +4067,7 @@ export async function startDaemon(): Promise<void> {
     const autoConfirmOrigin = readTrustedStudioOrigin(process.env);
     if (deviceKeys) deviceEnrollment = createDeviceEnrollment({ machineId: machine.id, keys: deviceKeys,
       store: createDeviceOrgPinStore({ home: configuration.happyHomeDir, machineId: machine.id, keys: deviceKeys }),
-      onSharedPinned: () => machineTypeMarker.record('shared'),
+      marker: machineTypeMarker,
       ...(autoConfirmOrigin ? { autoConfirm: createSharedPcAutoConfirm({ marker: machineTypeMarker, machineId: machine.id,
         token: () => credentials.token, studioOrigin: autoConfirmOrigin, log: (message, details) => logger.debug(message, details) }) } : {}) });
     const apiMachine = api.machineSyncClient(machine, deviceKeys, deviceEnrollment ?? undefined, initialDaemonState);

@@ -1985,6 +1985,20 @@ describe('device registration RPC boundary', () => {
         const capabilities = manager.registerHandler.mock.calls.find(([method]) => method === 'ai-credential:capabilities')![1];
         expect(await capabilities()).toMatchObject({ signedSetupTokenAssignmentVersion: 1, deviceKeyVersion: 1 });
     });
+    // aplus specs/shared-machine-server-signing S6c — the customer-key request that marks this PC shared.
+    it('answers an administrator\'s use-as-shared request only where the server lane is kept apart', async () => {
+        const handlers = (client: ApiMachineClient) => (client as unknown as { rpcHandlerManager: { registerHandler: ReturnType<typeof vi.fn> } }).rpcHandlerManager.registerHandler.mock.calls;
+        const enrollment = { begin: vi.fn(), approve: vi.fn(), getStatus: vi.fn(), orgPin: vi.fn(), autoConfirms: true, useAsShared: vi.fn(async () => ({ accepted: true, confirmed: false })) };
+        const keys = { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() };
+        const dataKey = new ApiMachineClient('token', { ...makeMachine(), encryptionVariant: 'dataKey' }, keys, enrollment as never);
+        const registration = handlers(dataKey).find(([method]) => method === 'device:use-as-shared');
+        expect(registration).toBeDefined();
+        await expect(registration![1]({ companyId: 'company', machineId: 'test-machine-id' })).resolves.toEqual({ accepted: true, confirmed: false });
+        expect(enrollment.useAsShared).toHaveBeenCalledWith({ companyId: 'company', machineId: 'test-machine-id' }, 'remote');
+        // A legacy machine's secret is the account secret the server holds: there, the request could come from the server.
+        const legacy = new ApiMachineClient('token', makeMachine(), keys, enrollment as never);
+        expect(handlers(legacy).map(([method]) => method)).not.toContain('device:use-as-shared');
+    });
     // aplus specs/shared-machine-server-signing S6 — Studio approves a shared PC without an administrator only for this.
     it('advertises automatic organization pinning only when the enrollment can confirm a shared PC by itself', async () => {
         const runtime = { capabilities: vi.fn(async () => ({ setupTokenVersion: 1, setupTokenStatusVersion: 1 })), setupTokenGroupSync: vi.fn(), groupSync: vi.fn(), status: vi.fn(), groupReceipt: vi.fn() } as any;

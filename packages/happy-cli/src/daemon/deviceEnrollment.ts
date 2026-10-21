@@ -14,8 +14,10 @@ type Pending = { approval: Approval | null; readyToPin: boolean; pinned: boolean
 /** aplus specs/shared-machine-server-signing S6 (contract §20.5) — stands in for the local confirmation of a shared PC's
  * approval: true only when this PC is marked shared and the approval's key is the one its trusted Studio origin serves. */
 export type DeviceAutoConfirm = (input: { transcript: OrgDeviceEnrollmentTranscript; approval: Approval }) => Promise<boolean>;
+type MachineTypeMarkerStore = { read(): Promise<'shared' | 'dedicated' | null>; record(type: 'shared' | 'dedicated'): Promise<'recorded' | 'exists'> };
+const useAsSharedSchema = z.object({ companyId: z.string().min(1).max(512).regex(/^[^\u0000-\u001f\u007f-\u009f]+$/), machineId: z.string().min(1).max(512) }).strict();
 export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKeys; now?: () => number; store?: ReturnType<typeof createDeviceOrgPinStore>;
-    autoConfirm?: DeviceAutoConfirm; onSharedPinned?: () => Promise<unknown> }) {
+    autoConfirm?: DeviceAutoConfirm; marker?: MachineTypeMarkerStore }) {
     const now = deps.now ?? Date.now;
     let pending: Pending | null = null;
     let revision = 0;
@@ -30,14 +32,25 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
         committing = deps.store.pin(candidate).then(async () => {
             enrollment.pinned = true;
             // A PC that pinned a shared approval is a shared PC: later approvals may be confirmed automatically.
-            if (enrollment.transcript.machineType === 'shared') await deps.onSharedPinned?.().catch(() => undefined);
+            if (enrollment.transcript.machineType === 'shared') await deps.marker?.record('shared').catch(() => undefined);
         })
             .catch(() => { throw new Error('DEVICE_PIN_PERSIST_FAILED'); })
             .finally(() => { committing = null; });
         return committing;
     }
+    const awaitingShared = (companyId: string) => pending?.transcript.companyId === companyId && now() < pending.transcript.expiresAt
+        && pending.transcript.machineType === 'shared' && pending.transcript.ownerUserId === null && !pending.pinned ? pending : null;
+    /** Stands in for the local confirmation of a shared approval; a failed check leaves the manual confirmation in place. */
+    async function confirmAutomatically(enrollment: Pending, current: number) {
+        const { transcript, approval } = enrollment;
+        if (enrollment.locallyConfirmed || !approval || !deps.autoConfirm || transcript.machineType !== 'shared' || transcript.ownerUserId !== null) return;
+        const confirmed = await deps.autoConfirm({ transcript: { ...transcript }, approval: { ...approval, body: { ...approval.body } } }).catch(() => false);
+        if (current !== revision || pending !== enrollment) throw new Error('DEVICE_ENROLLMENT_REPLACED');
+        if (confirmed === true) enrollment.locallyConfirmed = true;
+    }
     const copy = (value: Pending): Pending => ({ ...value, transcript: { ...value.transcript }, approval: value.approval ? { ...value.approval, body: { ...value.approval.body } } : null, readyToPin: value.locallyConfirmed && value.approval !== null });
     return {
+        machineId: deps.machineId,
         /** Advertised as autoOrgPinVersion: Studio approves a shared PC without an administrator only if it confirms itself. */
         autoConfirms: deps.autoConfirm !== undefined,
         async begin(input: z.input<typeof requestSchema>): Promise<Pending> {
@@ -86,14 +99,30 @@ export function createDeviceEnrollment(deps: { machineId: string; keys: DeviceKe
             if (enrollment.approval && canonicalOrgSetupTokenJson(enrollment.approval) !== canonicalOrgSetupTokenJson(document)) throw new Error('REVISION_CONFLICT');
             // Never publish persistent trust before both independent confirmations.
             enrollment.approval = { ...document, body };
-            if (!enrollment.locallyConfirmed && deps.autoConfirm && transcript.machineType === 'shared' && transcript.ownerUserId === null) {
-                // A failed check only leaves the manual confirmation in place.
-                const confirmed = await deps.autoConfirm({ transcript: { ...transcript }, approval: { ...enrollment.approval, body: { ...body } } })
-                    .catch(() => false);
-                if (current !== revision || pending !== enrollment) throw new Error('DEVICE_ENROLLMENT_REPLACED');
-                if (confirmed === true) enrollment.locallyConfirmed = true;
-            }
+            await confirmAutomatically(enrollment, current);
             await persistIfReady();
+        },
+        /**
+         * aplus specs/shared-machine-server-signing S6b·S6c — records this PC as shared and, if a server-signed shared
+         * approval is waiting, confirms it automatically. 'local' is the PC's own loopback request and needs such an
+         * approval; 'remote' is an administrator's customer-key request. Never rewrites an existing marker.
+         */
+        async useAsShared(input: z.input<typeof useAsSharedSchema>, origin: 'local' | 'remote'): Promise<{ accepted: true; confirmed: boolean }> {
+            const request = useAsSharedSchema.parse(input);
+            if (request.machineId !== deps.machineId) throw new Error('DEVICE_USE_AS_SHARED_MISMATCH');
+            if (!deps.marker || !deps.autoConfirm) throw new Error('DEVICE_USE_AS_SHARED_UNAVAILABLE');
+            if (await deps.marker.read()) throw new Error('DEVICE_MACHINE_TYPE_SET');
+            if (origin === 'local' && !awaitingShared(request.companyId)) throw new Error('DEVICE_AUTO_APPROVAL_REQUIRED');
+            if (await deps.marker.record('shared') === 'exists') throw new Error('DEVICE_MACHINE_TYPE_SET');
+            const enrollment = awaitingShared(request.companyId);
+            if (!enrollment) return { accepted: true, confirmed: false };
+            await confirmAutomatically(enrollment, revision);
+            await persistIfReady();
+            return { accepted: true, confirmed: enrollment.pinned };
+        },
+        /** What the PC shows before asking its user to use it as the organization's shared PC. */
+        async sharedStatus(companyId: string) {
+            return { machineType: deps.marker ? await deps.marker.read() : null, awaitingSharedConfirmation: awaitingShared(companyId) !== null };
         },
         /** The locally confirmed organization pin, which signed setup-token delivery trusts. */
         orgPin(companyId: string) {

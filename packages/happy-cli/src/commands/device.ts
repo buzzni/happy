@@ -1,13 +1,14 @@
-import { confirmDeviceOrganization, getDeviceApprovalStatus } from '@/daemon/controlClient';
+import { confirmDeviceOrganization, getDeviceApprovalStatus, useDeviceAsShared } from '@/daemon/controlClient';
 
 type Status = { machineId: string; companyId: string; enrollment: null | { digest: string; expiresAt: number; locallyConfirmed: boolean; administratorApproved: boolean }; pin: null | { policy: string } };
-type Deps = { status: (companyId: string) => Promise<Status>; confirm: (input: { companyId: string; machineId: string; enrollmentDigest: string }) => Promise<{ locallyConfirmed: boolean }>; print: (text: string) => void };
-const usage = 'happy device status --company-id ID | happy device confirm --company-id ID --machine-id ID --digest FULL_SHA256';
-export async function handleDeviceCommand(args: string[], deps: Deps = { status: getDeviceApprovalStatus, confirm: confirmDeviceOrganization, print: console.log }): Promise<void> {
+type Deps = { status: (companyId: string) => Promise<Status>; confirm: (input: { companyId: string; machineId: string; enrollmentDigest: string }) => Promise<{ locallyConfirmed: boolean }>; print: (text: string) => void;
+    useAsShared?: (companyId: string) => Promise<{ accepted: true; confirmed: boolean }> };
+const usage = 'happy device status --company-id ID | happy device confirm --company-id ID --machine-id ID --digest FULL_SHA256 | happy device use-as-shared --company-id ID';
+export async function handleDeviceCommand(args: string[], deps: Deps = { status: getDeviceApprovalStatus, confirm: confirmDeviceOrganization, print: console.log, useAsShared: useDeviceAsShared }): Promise<void> {
     if (args.length === 1 && ['--help', '-h'].includes(args[0])) { deps.print(usage); return; }
     const command = args[0];
-    if (command !== 'status' && command !== 'confirm') throw new Error(usage);
-    const allowed = command === 'status' ? ['--company-id'] : ['--company-id', '--machine-id', '--digest'];
+    if (command !== 'status' && command !== 'confirm' && command !== 'use-as-shared') throw new Error(usage);
+    const allowed = command === 'confirm' ? ['--company-id', '--machine-id', '--digest'] : ['--company-id'];
     const values = new Map<string, string>();
     for (let i = 1; i < args.length; i += 2) {
         const key = args[i], value = args[i + 1];
@@ -16,6 +17,19 @@ export async function handleDeviceCommand(args: string[], deps: Deps = { status:
     }
     if (values.size !== allowed.length) throw new Error(usage);
     const companyId = values.get('--company-id')!;
+    if (command === 'use-as-shared') {
+        // aplus specs/shared-machine-server-signing S6b — the PC still pins only the key its trusted Studio origin serves.
+        let result: { accepted: true; confirmed: boolean };
+        try { result = await (deps.useAsShared ?? useDeviceAsShared)(companyId); } catch (error) {
+            if (error instanceof Error && error.message === 'DEVICE_USE_AS_SHARED_REFUSED')
+                throw new Error('이미 공용·전용으로 표시된 PC이거나, 이 PC를 기다리는 공용 기기 승인이 없습니다. status로 상태를 확인하세요.');
+            throw new Error('DEVICE_CONTROL_UNAVAILABLE');
+        }
+        deps.print(result.confirmed
+            ? '이 PC를 조직 공용 PC로 사용합니다. 조직 키가 저장되었습니다.'
+            : '이 PC를 조직 공용 PC로 표시했습니다. 서버 승인이 오면 자동으로 확인됩니다.');
+        return;
+    }
     if (command === 'confirm') {
         const enrollmentDigest = values.get('--digest')!;
         if (!/^[a-f0-9]{64}$/.test(enrollmentDigest)) throw new Error(usage);
