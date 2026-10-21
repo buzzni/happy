@@ -54,12 +54,14 @@ export function prepareClaudeInitialPrompt(input: {
   reconnectSessionId?: string
   automationRunOnceRequested: boolean
   allowAutomationReconnectPrompt?: boolean
+  /** The reconnect target is the session the daemon created for this very launch (aplus Phase 3d). */
+  freshLaunch?: boolean
 }): PreparedClaudeInitialPrompt {
   const consumedPrompt = consumePendingInitialPrompt(input.env)
   const localId = consumePendingInitialPromptLocalId(input.env)
   const requireConfirmedDelivery = consumeConfirmedInitialPromptDelivery(input.env)
   const prompt = consumedPrompt
-    && (!input.reconnectSessionId || input.allowAutomationReconnectPrompt)
+    && (!input.reconnectSessionId || input.freshLaunch || input.allowAutomationReconnectPrompt)
     ? consumedPrompt
     : null
 

@@ -6,6 +6,8 @@ import {
   SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS,
   isSaycodePromptBlockEnabled,
   resolveInitialSaycodeAppendSystemPrompt,
+  resolveMessagePromptBlocks,
+  withoutTurnScopedBlocks,
   resolveSaycodeAppendSystemPromptForMessage,
   splitClientTurnPromptBlocks,
 } from './promptProvenance';
@@ -15,6 +17,7 @@ describe('prompt provenance inventory', () => {
     expect(PROMPT_BLOCK_PROVENANCE).toEqual({
       'common:agent-orchestration': 'saycode',
       'common:api-gateway': 'saycode',
+      'common:next-steps': 'saycode',
       'claude:title': 'always-on',
       'claude:co-authored-credit': 'saycode',
       'claude:orchestrator': 'selected-feature',
@@ -209,5 +212,48 @@ describe('toggle catalog stays in sync with the provenance inventory', () => {
     for (const id of Object.values(SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS)) {
       expect(PROMPT_BLOCK_PROVENANCE[id]).not.toBe('always-on');
     }
+  });
+});
+
+// specs/desktop-next-steps-card — `nextSteps` is "this turn's client draws the card".
+describe('nextSteps turn-card block', () => {
+  it('is off unless the turn asks for it, and the master switch still wins', () => {
+    expect(isSaycodePromptBlockEnabled('nextSteps', undefined, undefined)).toBe(false);
+    expect(isSaycodePromptBlockEnabled('nextSteps', {}, true)).toBe(false);
+    expect(isSaycodePromptBlockEnabled('nextSteps', { nextSteps: true }, undefined)).toBe(true);
+    expect(isSaycodePromptBlockEnabled('nextSteps', { nextSteps: true }, false)).toBe(false);
+  });
+
+  it('holds for its own message only: a later client that omits the field (mobile app) gets no card', () => {
+    const desktop = resolveMessagePromptBlocks({ axBase: false }, { saycodePromptBlocks: { axBase: false, nextSteps: true } });
+    expect(desktop.turn).toEqual({ axBase: false, nextSteps: true });
+    expect(desktop.standing).toEqual({ axBase: false });
+
+    const mobile = resolveMessagePromptBlocks(desktop.standing, {});
+    expect(mobile.turn).toEqual({ axBase: false });
+    expect(isSaycodePromptBlockEnabled('nextSteps', mobile.turn, true)).toBe(false);
+  });
+
+  it('an older client that never sends the key gets no card (old Desktop, Slack channel)', () => {
+    const turn = resolveMessagePromptBlocks(undefined, { saycodePromptBlocks: { agentOrchestration: true } });
+    expect(turn.turn).toEqual({ agentOrchestration: true });
+    expect(isSaycodePromptBlockEnabled('nextSteps', turn.turn, true)).toBe(false);
+  });
+
+  it('a message that carries only nextSteps leaves the standing overrides as they were', () => {
+    const turn = resolveMessagePromptBlocks({ coAuthoredCredit: false }, { saycodePromptBlocks: { nextSteps: true } });
+    expect(turn.standing).toEqual({ coAuthoredCredit: false });
+    expect(turn.turn).toEqual({ coAuthoredCredit: false, nextSteps: true });
+  });
+
+  it('keeps the old reset and replace rules for the other overrides', () => {
+    expect(resolveMessagePromptBlocks({ axBase: false }, { saycodePromptBlocks: null }).standing).toBeUndefined();
+    expect(resolveMessagePromptBlocks({ axBase: false }, { saycodePromptBlocks: { workerDelegation: false, nextSteps: false } }))
+      .toEqual({ standing: { workerDelegation: false }, turn: { workerDelegation: false } });
+  });
+
+  it('never lets a standing value (initial env, cache) carry the turn-scoped key', () => {
+    expect(withoutTurnScopedBlocks({ axBase: true, nextSteps: true })).toEqual({ axBase: true });
+    expect(resolveMessagePromptBlocks({ nextSteps: true }, undefined).turn).toEqual({});
   });
 });

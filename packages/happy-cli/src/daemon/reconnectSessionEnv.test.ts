@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Metadata } from '@/api/types';
 import {
     buildReconnectSessionEnvironment,
+    consumeReconnectFreshLaunch,
     consumeReconnectSessionEnvironment,
     decodeReconnectSessionSnapshot,
     encodeReconnectSessionSnapshot,
@@ -297,5 +298,23 @@ describe('consumeReconnectSessionEnvironment', () => {
         const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
         expect(consumeReconnectSessionEnvironment(env)).toBeNull();
         expect(env).toEqual({ PATH: '/usr/bin' });
+    });
+});
+
+// aplus specs/shared-machine-server-signing Phase 3d — a machine-rotation launch reuses the session the daemon created for
+// it; the child must treat it as a new conversation (its first prompt included), and only that launch is marked so.
+describe('consumeReconnectFreshLaunch', () => {
+    it('reads the one-shot fresh-launch mark once and removes it', () => {
+        const env: NodeJS.ProcessEnv = { HAPPY_RECONNECT_FRESH_LAUNCH: '1' };
+        expect(consumeReconnectFreshLaunch(env)).toBe(true);
+        expect(env.HAPPY_RECONNECT_FRESH_LAUNCH).toBeUndefined();
+        expect(consumeReconnectFreshLaunch(env)).toBe(false);
+        for (const value of ['true', '0', '']) expect(consumeReconnectFreshLaunch({ HAPPY_RECONNECT_FRESH_LAUNCH: value })).toBe(false);
+    });
+
+    it('is never part of an ordinary resume environment', () => {
+        const env = buildReconnectSessionEnvironment({ sessionId: 's', encryption: { encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy', seq: 1, metadataVersion: 1, agentStateVersion: 1 } as never,
+            serverSnapshot: { metadata: makeMetadata(), seq: 1, metadataVersion: 1, agentStateVersion: 1 } as never });
+        expect(env).not.toHaveProperty('HAPPY_RECONNECT_FRESH_LAUNCH');
     });
 });

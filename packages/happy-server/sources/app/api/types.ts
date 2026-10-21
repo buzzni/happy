@@ -81,6 +81,10 @@ declare module 'fastify' {
          */
         managedGrant?: LiveGrant;
         startTime?: number;
+        /** onRequest 시점의 "마지막 스크레이프 이후 최대 루프 지연"(ms) — 요청 중 갱신 여부 판정용. */
+        loopLagMaxAtStartMs?: number;
+        /** 바디 파싱·검증·전역 훅이 끝난 뒤, 라우트 preHandler(인증)·핸들러 직전 (전역 preHandler). */
+        preHandlerAt?: number;
         /** 핸들러가 끝나고 직렬화가 시작되기 직전 (preSerialization). */
         handlerDoneAt?: number;
         /** 직렬화가 끝나고 소켓에 쓰기 직전 (onSend). */

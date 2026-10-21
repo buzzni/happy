@@ -306,6 +306,42 @@ describe('session protocol schemas', () => {
     expect(parse({ candidateId: 'c', revision: 1, payloadHash: 'h', lesson: { ...lesson, steps: [] } })).toBe(false);
   });
 
+  it('accepts a next-steps card with app actions and reply buttons from the agent', () => {
+    const ev = {
+      t: 'next-steps',
+      summary: 'The login fix is in place and its tests pass. Nothing is committed yet.',
+      question: 'Commit it now?',
+      actions: [{ kind: 'commit' }, { kind: 'verify', label: 'Check in the app' }, { label: 'Not yet', message: 'Hold off; I will review first.' }],
+    };
+    const parsed = sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev });
+    expect(parsed.success && parsed.data.ev).toEqual(ev);
+    expect(sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev: { t: 'next-steps', summary: 'Done.', actions: [] } }).success).toBe(true);
+    expect(sessionEnvelopeSchema.safeParse({ id: 's', time: 1, role: 'session', ev }).success).toBe(false);
+  });
+
+  it('rejects a next-steps action outside the app action list, an empty reply and more than four buttons', () => {
+    const parse = (actions: unknown[]) => sessionEventSchema.safeParse({ t: 'next-steps', summary: 'Done.', actions }).success;
+    expect(parse([{ kind: 'deploy' }])).toBe(false);
+    expect(parse([{ label: 'Go', message: '' }])).toBe(false);
+    expect(parse([{ label: '', message: 'go' }])).toBe(false);
+    expect(parse(Array.from({ length: 5 }, (_, i) => ({ label: `L${i}`, message: 'm' })))).toBe(false);
+    expect(sessionEventSchema.safeParse({ t: 'next-steps', summary: '', actions: [] }).success).toBe(false);
+  });
+
+  it('accepts a plan update with step statuses', () => {
+    const ev = { t: 'plan', steps: [{ text: 'Write the failing test', status: 'completed' }, { text: 'Fix the parser', status: 'in_progress' }] };
+    const parsed = sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev });
+    expect(parsed.success && parsed.data.ev).toEqual(ev);
+    expect(sessionEventSchema.safeParse({ ...ev, steps: [] }).success).toBe(false);
+    expect(sessionEventSchema.safeParse({ ...ev, steps: [{ text: 'x', status: 'blocked' }] }).success).toBe(false);
+  });
+
+  it('caps a reply button message at what the card can preview', () => {
+    const parse = (message: string) => sessionEventSchema.safeParse({ t: 'next-steps', summary: 'Done.', actions: [{ label: 'Go', message }] }).success;
+    expect(parse('m'.repeat(500))).toBe(true);
+    expect(parse('m'.repeat(501))).toBe(false);
+  });
+
   it('rejects start from non-agent role', () => {
     const subagent = createId();
     const parsed = sessionEnvelopeSchema.safeParse({

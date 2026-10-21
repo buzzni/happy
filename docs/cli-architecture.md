@@ -859,3 +859,24 @@ machine-v2는 위의 영속 operation journal과 인증된 operation/execution �
 record를 확인한 뒤 read+sync ACK와 Studio commit을 복구한다. 두 경로 모두 종료된 세션에
 전환 토큰을 반환하지 않는다. 기존 일반 session 저장은 best-effort 계약을 유지하며 최신
 machine-v2 binding을 보존한다. v1에 서버 operation 계약을 추가할 때 복구 경계를 재검토한다.
+
+## Session-local agent control broker
+
+Account Claude/Codex hosts opt into `commands/sessionAgentBroker` through the existing Happy MCP host lifecycle.
+The broker snapshots the current session, directory, runtime credential home and sandbox environment before the
+provider starts. Its loopback-only `commands/agentBroker` endpoint accepts only version 1 agent argv with a random
+per-host capability; browser origins, caller env/cwd and arbitrary commands are refused. It uses the same runtime
+admission gate as tools, limits in-flight work, serializes spawn and cancels workers when the client or host closes.
+The capability is named `SAYCODE_AGENT_BROKER_CAPABILITY` so the provider credential filter preserves this narrow
+session authority while still removing account tokens. Daemon lineage scrubbing prevents contact inheritance.
+
+The bundled Saycode CLI must implement `__agent-broker-v1`; older bundles reject this entrypoint before effects.
+The CLI keeps authoritative lineage/budget in the protected runtime home and emits the legacy workspace projection
+for the sandboxed client to write. The host never accepts executable/env/cwd overrides or writes the workspace
+projection. It permits own-session reads and owned descendants; existing pre-broker children and managed worktree
+creation remain in Desktop controls. No machine credential is sent to the provider, and broker failures never
+fall back to direct credential reads. Revisit for worktree brokerage or multi-machine lineage; do not relax the
+credential read deny as rollback. Publishing the corresponding CLI and exact Happy dependency is a separate step.
+
+Activation is gated by `saycodeAgentBrokerProtocol: 1` in the bundled CLI manifest, so a Happy upgrade before
+the corresponding CLI release retains the old facade. Publish/install acceptance must verify both artifacts.

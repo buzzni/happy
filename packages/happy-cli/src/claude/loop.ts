@@ -1,6 +1,7 @@
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import type { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
+import type { TurnCardSwitch } from './utils/turnCardTools';
 import { ApiSessionClient } from "@/api/apiSession"
 import { MessageQueue2 } from "@/utils/MessageQueue2"
 import { logger } from "@/ui/logger"
@@ -68,6 +69,8 @@ interface LoopOptions {
     /** Built by the runner; see `Session.lessons`. */
     lessons?: LessonSessionHost
     lessonProposalTurn?: LessonProposalTurn
+    /** specs/desktop-next-steps-card — see `Session.turnCards`. */
+    turnCards?: TurnCardSwitch
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
@@ -132,6 +135,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
         lessons: opts.lessons,
         lessonProposalTurn: opts.lessonProposalTurn,
+        turnCards: opts.turnCards,
     });
 
     opts.onSessionReady?.(session)
@@ -147,6 +151,8 @@ export async function loop(opts: LoopOptions): Promise<number> {
         if (opts.scopeProcessSandbox && mode !== 'remote') throw new Error('Scope approval supports Claude remote mode only');
         switch (mode) {
             case 'local': {
+                // The terminal draws no card.
+                opts.turnCards?.set(false);
                 const result = await claudeLocalLauncher(session, {
                     saycodeSystemPromptEnabled: opts.getSaycodeSystemPromptEnabled(),
                     saycodePromptBlocks: opts.getSaycodePromptBlocks(),

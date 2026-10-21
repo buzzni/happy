@@ -1,5 +1,6 @@
 import { drainWorktreeOperations } from './worktreeOps';
-import { createMachineSetupTokenProtocol, readMachineRotationConfig, MachineRotationError } from './machineSetupTokenProtocol';
+import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
+import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
 import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
 import { createMachineSetupTokenJournal } from './machineSetupTokenJournal';
 import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
@@ -1806,22 +1807,38 @@ export async function startDaemon(): Promise<void> {
       logger.warn(`[DAEMON RUN] ${error instanceof Error ? error.message : 'Browser task revocation failed'}`);
     };
 
-    let machineSetupTokenRuntime: MachineSetupTokenRuntime | null = null;
-    let machineRotationConfigurationError: unknown;
+    let machineRotation: ReturnType<typeof createMachineRotationResolver<MachineSetupTokenRuntime>> | null = null;
     let sharedMachineScope = async (): Promise<string | null> => null;
     const pendingMachineStarts = new Set<string>();
     const channelSessionKeys = new WeakMap<SpawnSessionOptions, { key: Uint8Array; wrapped: Uint8Array }>();
-    const requiresMachineRotation = async (options: SpawnSessionOptions) => {
-      if (process.env.HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED !== 'true' || (options.agent && options.agent !== 'claude')
-        || !honorsManagedAiCredentials(options.aiAuthSelection)) return false;
-      const scope = await sharedMachineScope();
-      if (!scope) return false;
-      // Explicit user-v1 grants keep their existing verifier. A machine-v2 document cannot pass it.
-      if (options.aiAuthSelection?.kind === 'claude-setup-token') return false;
-      if (!machineSetupTokenRuntime) throw machineRotationConfigurationError ?? new MachineRotationError('CONFIGURATION_REQUIRED');
-      if (scope !== process.env.HAPPY_SETUP_TOKEN_MACHINE_V2_COMPANY_ID) throw new MachineRotationError('FORBIDDEN');
-      for (const recovered of await machineSetupTokenRuntime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
-      return true;
+    /** The runtime of an existing machine-rotation launch; recovery never depends on new issuance being accepted. */
+    const machineRuntimeFor = async (companyId: string): Promise<MachineSetupTokenRuntime> => {
+      const runtime = await machineRotation?.runtime(companyId);
+      if (!runtime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
+      return runtime;
+    };
+    /** A channel launch decides rotation once, before its session key is staged; spawnSession reuses that decision. */
+    const channelRotationRuntimes = new WeakMap<SpawnSessionOptions, MachineSetupTokenRuntime>();
+    /**
+     * aplus specs/shared-machine-server-signing Phase 3c — the runtime a new shared-machine launch rotates with, or
+     * null when it runs the current way. On by default; the reason is logged whenever it is not used, and nothing about
+     * the decision (an unresolved assignment, Studio unreachable) fails the launch.
+     */
+    const machineRotationFor = async (options: SpawnSessionOptions): Promise<MachineSetupTokenRuntime | null> => {
+      const chosen = channelRotationRuntimes.get(options);
+      if (chosen) return chosen;
+      const runtime = await chooseLaunchRotation({
+        managedClaude: (!options.agent || options.agent === 'claude') && honorsManagedAiCredentials(options.aiAuthSelection),
+        explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token',
+        precreatedSession: !!options.reconnectEnvironment,
+        resolver: machineRotation, scope: sharedMachineScope,
+        log: (reason, unexpected) => {
+          if (unexpected) logger.warn(`[machine-rotation] new launch runs without machine rotation: ${reason}`);
+          else logger.debug(`[machine-rotation] new launch runs without machine rotation: ${reason}`);
+        },
+      });
+      if (runtime) for (const recovered of await runtime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
+      return runtime;
     };
     const authenticatedAccountId = async (token: string): Promise<string> => {
       const response = await fetch(`${configuration.serverUrl}/v1/account/profile`, { headers: { Authorization: `Bearer ${token}` },
@@ -2031,8 +2048,8 @@ export async function startDaemon(): Promise<void> {
         // 이긴다 — 그래서 해석 자체를 하지 않는다.
         const credentialStartedAt = Date.now();
         let preparedMachineLaunch: Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>> | undefined;
-        if (await requiresMachineRotation(options)) {
-          if (options.reconnectEnvironment) throw new MachineRotationError('UNBOUND_PRECREATED_SESSION');
+        const machineRotationRuntime = await machineRotationFor(options);
+        if (machineRotationRuntime) {
           const ownerCredentials = stagedUserHomeDir
             ? parseCredentials(JSON.parse(await fs.readFile(join(stagedUserHomeDir, 'access.key'), 'utf8')))
             : credentials;
@@ -2041,7 +2058,7 @@ export async function startDaemon(): Promise<void> {
           const [ownerAccountId, machineOwnerAccountId] = await Promise.all([
             authenticatedAccountId(ownerCredentials.token), authenticatedAccountId(credentials.token),
           ]);
-          preparedMachineLaunch = await machineSetupTokenRuntime!.prepareLaunch({ ownerAccountId, machineOwnerAccountId, userHomeDir: stagedUserHomeDir,
+          preparedMachineLaunch = await machineRotationRuntime.prepareLaunch({ ownerAccountId, machineOwnerAccountId, userHomeDir: stagedUserHomeDir,
             metadata: { path: directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
               homeDir: os.homedir(), happyHomeDir: stagedUserHomeDir ?? configuration.happyHomeDir, happyLibDir: projectPath(),
               happyToolsDir: join(projectPath(), 'tools', 'unpacked'), flavor: 'claude', startedFromDaemon: true, startedBy: 'daemon',
@@ -2863,13 +2880,14 @@ export async function startDaemon(): Promise<void> {
         });
 
         const resumeBinding = readSetupTokenResumeSelection(tracked.agentEnvironment);
-        const recoveredMachineEnvironment = resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding)
-          ? await (() => { if (!machineSetupTokenRuntime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
-            return machineSetupTokenRuntime.resume(tracked, resumeBinding.binding); })()
+        const resumeMachineRuntime = resumeBinding && isMachineSetupTokenBinding(resumeBinding.binding)
+          ? await machineRuntimeFor(resumeBinding.binding.companyId) : undefined;
+        const recoveredMachineEnvironment = resumeMachineRuntime && resumeBinding
+          ? await resumeMachineRuntime.resume(tracked, resumeBinding.binding as Parameters<MachineSetupTokenRuntime['resume']>[1])
           : undefined;
         const currentMachineBinding = recoveredMachineEnvironment ? readSetupTokenResumeSelection(recoveredMachineEnvironment)?.binding : undefined;
         const unstartedMachineExecution = currentMachineBinding && isMachineSetupTokenBinding(currentMachineBinding) && !metadata.claudeSessionId
-          && await machineSetupTokenRuntime!.canStartWithoutConversation(currentMachineBinding);
+          && await resumeMachineRuntime!.canStartWithoutConversation(currentMachineBinding);
         const launch = buildResumeLaunch(
           { id: happySessionId, active: true, metadata },
           {
@@ -4492,14 +4510,8 @@ export async function startDaemon(): Promise<void> {
     const trustedStudioOrigin = readTrustedStudioOrigin(process.env);
     const aiCredentialRuntime = createNodeAiCredentialRuntime(claudeSwapSupervisor, process.env, os.homedir(), {
       machineId,
-      machineSetupTokenStart: async binding => {
-        if (!machineSetupTokenRuntime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
-        await machineSetupTokenRuntime.recordProviderStart(binding);
-      },
-      machineSetupTokenAuthority: async binding => {
-        if (!machineSetupTokenRuntime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
-        await machineSetupTokenRuntime.validateAuthority(binding);
-      },
+      machineSetupTokenStart: async binding => { await (await machineRuntimeFor(binding.companyId)).recordProviderStart(binding); },
+      machineSetupTokenAuthority: async binding => { await (await machineRuntimeFor(binding.companyId)).validateAuthority(binding); },
       setupTokenBinding: trustedStudioOrigin ? createSetupTokenBindingVerifier({ origin: trustedStudioOrigin, machineId }) : undefined,
       // A group sync never removes the organization account a live session runs on; it waits for a later sync.
       setupTokenAccountsInUse: () => getCurrentChildren().flatMap(session => {
@@ -4519,12 +4531,15 @@ export async function startDaemon(): Promise<void> {
 
     resolveManagedAiCredentialEnvironment = (agent, selection, recorded) => aiCredentialRuntime.sessionEnvironment(agent, selection, recorded);
     sharedMachineScope = aiCredentialRuntime.sharedMachineSetupTokenScope;
-    try {
-      // Existing v2 records retain their recovery configuration when new issuance is OFF.
-      const config = readMachineRotationConfig({ ...process.env, HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED: 'true' }, machineId, new URL(configuration.serverUrl).origin);
-      if (config && deviceKeys && deviceEnrollment) machineSetupTokenRuntime = createMachineSetupTokenRuntime({
-        allowInitialIssue: () => process.env.HAPPY_SETUP_TOKEN_MACHINE_V2_ENABLED === 'true',
-        protocol: createMachineSetupTokenProtocol({ config, keys: deviceKeys, pin: companyId => deviceEnrollment!.orgPin(companyId), bearer: () => credentials.token }),
+    // aplus specs/shared-machine-server-signing Phase 3c — Studio, its rotation key and the company come from the trusted
+    // origin and the shared scope; the environment can only force new issuance off.
+    const rotationKeys = deviceKeys, rotationEnrollment = deviceEnrollment;
+    if (rotationKeys && rotationEnrollment) machineRotation = createMachineRotationResolver<MachineSetupTokenRuntime>({
+      env: process.env, machineId, happyOrigin: new URL(configuration.serverUrl).origin, studioOrigin: trustedStudioOrigin,
+      bearer: () => credentials.token,
+      createRuntime: config => createMachineSetupTokenRuntime({
+        allowInitialIssue: () => machineRotation?.newIssuesAllowed() ?? false,
+        protocol: createMachineSetupTokenProtocol({ config, keys: rotationKeys, pin: companyId => rotationEnrollment.orgPin(companyId), bearer: () => credentials.token }),
         journal: createMachineSetupTokenJournal(configuration.happyHomeDir),
         savePrepared: persistPreparedMachineLaunch, loadPrepared: recoverPreparedMachineLaunch,
         discoverSession: async (state, snapshot, executionProof) => {
@@ -4534,9 +4549,14 @@ export async function startDaemon(): Promise<void> {
         },
         sessionEnvironment: aiCredentialRuntime.sessionEnvironment, persist: persistSetupTokenBinding, recoverPersistence: recoverSetupTokenBindingPersistence,
         findSession: id => getCurrentChildren().find(session => session.happySessionId === id),
-      });
-      if (machineSetupTokenRuntime) for (const recovered of await machineSetupTokenRuntime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
-    } catch (error) { machineRotationConfigurationError = error; }
+      }),
+    });
+    try {
+      // Launches a previous daemon left mid-issue for this machine's shared company.
+      const scope = await sharedMachineScope();
+      const runtime = scope ? await machineRotation?.runtime(scope) : null;
+      if (runtime) for (const recovered of await runtime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
+    } catch (error) { logger.warn(`[machine-rotation] startup recovery failed: ${error instanceof Error ? error.message : 'unknown'}`); }
     // Saycode specs/claude-setup-token-account-selection — a bound session moves off a used-up account.
     setupTokenAccountSwitch = createSetupTokenAccountSwitch({
       findSession: (sessionId) => getCurrentChildren().find(session => session.happySessionId === sessionId),
@@ -4547,7 +4567,7 @@ export async function startDaemon(): Promise<void> {
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
       recordAgentEnvironment: persistSetupTokenBinding,
-      machineRuntime: () => machineSetupTokenRuntime,
+      machineRuntime: (companyId) => machineRotation?.runtime(companyId) ?? null,
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     releaseSetupTokenAccounts = (managedAccountIds) => {
@@ -5057,9 +5077,11 @@ export async function startDaemon(): Promise<void> {
         createSession: (input) => api.getOrCreateSession({ ...input, state: { controlledByUser: false } }),
         spawnSession: (options) => spawnSession(options),
         spawnWithSessionKey: async (options, dataKey) => {
-          if (!await requiresMachineRotation(options)) return null;
+          const runtime = await machineRotationFor(options);
+          if (!runtime) return null;
           channelSessionKeys.set(options, dataKey);
-          try { return await spawnSession(options); } finally { channelSessionKeys.delete(options); }
+          channelRotationRuntimes.set(options, runtime);
+          try { return await spawnSession(options); } finally { channelSessionKeys.delete(options); channelRotationRuntimes.delete(options); }
         },
       });
       const channelHostDirs = channelHostDirectories(configuration.happyHomeDir);

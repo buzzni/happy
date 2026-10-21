@@ -146,6 +146,33 @@ export const httpRequestDurationHistogram = new Histogram({
     registers: [register]
 });
 
+/**
+ * 요청 한 건을 네 구간으로 나눠 센다 (specs/platform-architecture-roadmap S4-1).
+ *
+ * - prehandler: onRequest ~ 전역 preHandler — 바디 파싱·검증·전역 훅
+ * - handler: 전역 preHandler ~ preSerialization — 라우트 preHandler(인증) + 핸들러
+ * - serialize / send: enableMonitoring 의 기존 정의와 같다
+ *
+ * 라벨은 route·phase 만 둔다(404 는 'not_found' 하나). method·status·client 까지 곱하면
+ * 시리즈가 네 배로 불어나는데, 이 지표의 용도는 대조군(/ready, DB·인증 없음)의 구간이
+ * 0 을 벗어나는 순간 — 즉 GC·CPU 스로틀 같은 **프로세스 정지** — 을 event_loop_lag·
+ * cgroup 스로틀 지표와 같은 시간축에 놓는 것이라 그 분해가 필요 없다. 이벤트 루프
+ * 굶주림은 onRequest 앞에서 소모되어 어느 구간에도 잡히지 않는다(enableMonitoring 참고).
+ */
+export const httpRequestPhaseDurationHistogram = new Histogram({
+    name: 'http_request_phase_duration_seconds',
+    help: 'HTTP request time per phase (prehandler, handler, serialize, send) in seconds; /ready phases above zero mean a process stall, not loop starvation',
+    labelNames: ['route', 'phase'] as const,
+    buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10],
+    registers: [register]
+});
+
+/** 마지막 스크레이프 이후 관측된 최대 이벤트 루프 지연(ms). 느린 요청 로그의 맥락용. */
+export function eventLoopLagMaxMsSinceScrape(): number {
+    const maxNanoseconds = eventLoopDelay.max;
+    return Number.isFinite(maxNanoseconds) ? Math.round(maxNanoseconds / 1e6) : 0;
+}
+
 // Database count metrics
 export const databaseRecordCountGauge = new Gauge({
     name: 'database_records_total',
@@ -226,6 +253,13 @@ export const redisStreamWriteDuration = new Histogram({
     help: 'Account bus XADD elapsed time including connection queue, network and event-loop delay; excludes adapter serialization',
     labelNames: ['result'] as const,
     buckets: [0.01, 0.1, 0.25, 0.5, 1, 2, 5, 10],
+    registers: [register]
+});
+
+export const redisStreamReaderFencesCounter = new Counter({
+    name: 'redis_stream_reader_fences_total',
+    help: 'Times this replica left the Socket.IO cluster bus because its stream reader stalled while writes stayed fast',
+    labelNames: ['bus'] as const,
     registers: [register]
 });
 

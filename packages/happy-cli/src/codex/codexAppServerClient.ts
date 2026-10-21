@@ -596,6 +596,7 @@ export class CodexAppServerClient {
             || method === 'thread/goal/cleared'
             || method === 'turn/started'
             || method === 'turn/completed'
+            || method === 'turn/plan/updated'
             || method === 'thread/status/changed'
             || method === 'thread/tokenUsage/updated'
             || method === 'rawResponse/completed'
@@ -880,6 +881,18 @@ export class CodexAppServerClient {
                 params?.turn?.error ?? params?.error,
                 method,
             );
+            return true;
+        }
+
+        if (method === 'turn/plan/updated') {
+            // Same shape as the legacy `plan_update` event (specs/desktop-next-steps-card).
+            const turnId = this.extractTurnId(params);
+            this.eventHandler?.({
+                type: 'plan_update',
+                ...(turnId ? { turn_id: turnId } : {}),
+                explanation: params?.explanation ?? null,
+                plan: params?.plan,
+            });
             return true;
         }
 

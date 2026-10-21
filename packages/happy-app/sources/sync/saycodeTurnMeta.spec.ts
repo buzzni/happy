@@ -86,3 +86,16 @@ describe('buildSaycodeTurnMeta', () => {
         expect(meta.saycodeSystemPromptEnabled).toBe(false);
     });
 });
+
+// Saycode specs/desktop-next-steps-card: `nextSteps` tells happy-cli "this client draws the
+// next-steps card". This app draws no such card, so it must never claim to — otherwise the
+// agent would put its question where the phone cannot show it. Even an account setting that
+// another client wrote under that id must not leak into this app's turns.
+describe('next-steps card capability', () => {
+    it('never sends nextSteps, even when the account settings hold one', () => {
+        for (const preference of [true, false, null]) {
+            const meta = buildSaycodeTurnMeta({ preference, overrides: { nextSteps: true }, surface: 'mobile' });
+            expect(meta.saycodePromptBlocks?.nextSteps).toBeUndefined();
+        }
+    });
+});

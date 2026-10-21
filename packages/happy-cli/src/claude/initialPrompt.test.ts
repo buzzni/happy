@@ -76,6 +76,15 @@ describe('prepareClaudeInitialPrompt', () => {
     expect(env.HAPPY_INITIAL_PROMPT).toBeUndefined()
   })
 
+  // aplus specs/shared-machine-server-signing Phase 3d — the daemon creates a machine-rotation launch's session first.
+  it('keepsTheFirstPromptOfAFreshLaunchThatAttachesToTheSessionTheDaemonCreated', () => {
+    const env = { HAPPY_INITIAL_PROMPT: '첫 질문' }
+    expect(prepareClaudeInitialPrompt({ env, reconnectSessionId: 'created-for-launch', automationRunOnceRequested: false, freshLaunch: true }))
+      .toEqual({ prompt: '첫 질문', exitAfterFirstTurn: false })
+    expect(prepareClaudeInitialPrompt({ env: { HAPPY_INITIAL_PROMPT: '자동화' }, reconnectSessionId: 'created-for-launch', automationRunOnceRequested: true, freshLaunch: true }))
+      .toEqual({ prompt: '자동화', exitAfterFirstTurn: true })
+  })
+
   it('rejectsAnExplicitAutomationResumeWithoutItsPrompt', () => {
     expect(() => prepareClaudeInitialPrompt({
       env: {},

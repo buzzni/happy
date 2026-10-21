@@ -36,6 +36,16 @@ describe('MessageMetaSchema saycodePromptBlocks resilience', () => {
     expect(parsed.success).toBe(true);
     expect(parsed.success && parsed.data.permissionMode).toBe('default');
   });
+
+  // specs/desktop-next-steps-card: a newer Desktop sends `nextSteps`. This schema
+  // has always stripped keys it does not know, which is what lets a daemon released
+  // before that key keep the other overrides and the message (new Desktop + old daemon).
+  it('keeps nextSteps and strips a key it does not know without touching the rest', () => {
+    expect(MessageMetaSchema.parse({ saycodePromptBlocks: { axBase: false, nextSteps: true } }).saycodePromptBlocks)
+      .toEqual({ axBase: false, nextSteps: true });
+    const future = MessageMetaSchema.safeParse({ permissionMode: 'default', saycodePromptBlocks: { axBase: false, someLaterBlock: true } });
+    expect(future.success && future.data.saycodePromptBlocks).toEqual({ axBase: false });
+  });
 });
 
 describe('MessageMetaSchema modelSource', () => {

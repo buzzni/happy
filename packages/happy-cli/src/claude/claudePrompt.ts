@@ -16,6 +16,7 @@ export function buildClaudeSystemPromptOptions({
   workerDelegationPrompt,
   connectorGuidance,
   checkpointGuidance,
+  nextStepsPrompt,
   saycodeSystemPromptEnabled,
   saycodePromptBlocks,
 }: {
@@ -38,6 +39,8 @@ export function buildClaudeSystemPromptOptions({
   workerDelegationPrompt?: string;
   connectorGuidance?: string;
   checkpointGuidance?: string;
+  /** Turn-card guidance (common:next-steps); only on a turn whose client draws the card. */
+  nextStepsPrompt?: string;
   saycodeSystemPromptEnabled?: boolean;
   /** Per-block overrides; default-on blocks do not inherit saycodeSystemPromptEnabled. */
   saycodePromptBlocks?: SaycodePromptBlockOverrides;
@@ -65,6 +68,7 @@ export function buildClaudeSystemPromptOptions({
       connectorGuidance,
       checkpointGuidance,
       saycodeSystemPromptEnabled !== false ? SAYCODE_API_GATEWAY_PROMPT : undefined,
+      isSaycodePromptBlockEnabled('nextSteps', saycodePromptBlocks, saycodeSystemPromptEnabled) ? nextStepsPrompt : undefined,
     ]),
   };
 }

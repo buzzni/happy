@@ -47,7 +47,7 @@ import {
   prepareGeminiInitialPrompt,
   prepareGeminiSessionStart,
 } from '@/gemini/geminiInitialPrompt';
-import { resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
+import { resolveMessagePromptBlocks, resolveSaycodeAppendSystemPromptForMessage } from '@/prompt/promptProvenance';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import {
   readGeminiLocalConfig,
@@ -281,7 +281,8 @@ export async function runGemini(opts: {
       currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
     }
     if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
-      currentSaycodePromptBlocks = message.meta.saycodePromptBlocks ?? undefined;
+      // ACP draws no next-steps card; only the standing overrides apply here.
+      currentSaycodePromptBlocks = resolveMessagePromptBlocks(currentSaycodePromptBlocks, message.meta).standing;
     }
     currentAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
       current: currentAppendSystemPrompt,
