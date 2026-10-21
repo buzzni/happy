@@ -20,7 +20,7 @@ export type SessionSource =
 /**
  * Per-spawn env carrying the source into the runner. Under the `HAPPY_CREATED_BY`
  * prefix on purpose: that prefix is already scrubbed as lineage
- * (SESSION_LINEAGE_ENV_PREFIXES, managed runtime reuse), so a child the session
+ * (NON_INHERITABLE_ENV in utils/childEnv, managed runtime reuse), so a child the session
  * spawns never inherits its parent's source.
  */
 export const SESSION_SOURCE_ENV = 'HAPPY_CREATED_BY_SOURCE';

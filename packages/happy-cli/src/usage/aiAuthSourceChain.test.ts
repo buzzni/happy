@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { ProviderUsageEventV1Schema } from '@slopus/happy-wire'
 import { createClaudeUsageEvent, createCodexUsageEvent } from './providerUsageAdapters'
 import { HAPPY_AI_AUTH_SOURCE_ENV, HAPPY_AI_AUTH_CONNECTION_VERSION_ENV } from './aiAuthSource'
-import { applyAppliedAiAuthSourceEnv, scrubSessionLineageEnv } from '../daemon/sessionEnv'
+import { applyAppliedAiAuthSourceEnv } from '../daemon/sessionEnv'
+import { sanitizeChildEnv } from '../utils/childEnv'
 
 const claudeArgs = {
   sessionId: 's1', occurredAt: 1, transcriptUuid: 'u1', model: 'claude-opus-5',
@@ -45,7 +46,7 @@ describe('종단: 적용 원천이 이벤트까지 간다', () => {
   })
 
   it('보안: 원천 키는 lineage 스크럽으로 제거된다 — 재시작한 daemon 이 남의 원천을 물려주지 않는다', () => {
-    const scrubbed = scrubSessionLineageEnv({
+    const scrubbed = sanitizeChildEnv({
       [HAPPY_AI_AUTH_SOURCE_ENV]: 'personal-subscription',
       [HAPPY_AI_AUTH_CONNECTION_VERSION_ENV]: '7',
       PATH: '/usr/bin',

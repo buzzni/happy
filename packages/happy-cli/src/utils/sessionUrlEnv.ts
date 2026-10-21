@@ -10,7 +10,7 @@
  * Access to the session itself is still gated by the webapp's own auth.
  *
  * Lineage inheritance: daemon-spawned children are protected by the
- * SESSION_LINEAGE_ENV_PREFIXES scrub in daemon/sessionEnv.ts, which strips an
+ * NON_INHERITABLE_ENV scrub in utils/childEnv.ts, which strips an
  * inherited parent APLUS_SESSION_* before spawn. The session factory also
  * replaces any stale inherited value once it knows the current Happy session
  * id, covering nested runs that do not pass through the daemon scrub.
