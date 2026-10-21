@@ -8,9 +8,17 @@ const POLICY_FILE = '/Users/me/.happy/tool-policy.json';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { targetsPolicyFile } = require(GUARD_SCRIPT);
 
+const ENV = { home: '/Users/me', happyHome: '/Users/me/.happy' };
+
 function run(payload: unknown, policyFile = POLICY_FILE) {
-    return spawnSync(process.execPath, [GUARD_SCRIPT, policyFile], { input: typeof payload === 'string' ? payload : JSON.stringify(payload), encoding: 'utf8' });
+    return spawnSync(process.execPath, [GUARD_SCRIPT, policyFile], {
+        input: typeof payload === 'string' ? payload : JSON.stringify(payload),
+        encoding: 'utf8',
+        env: { ...process.env, HOME: '/Users/me', HAPPY_HOME_DIR: '' },
+    });
 }
+
+const bash = (command: string, cwd = '/Users/me/project') => ({ tool_name: 'Bash', tool_input: { command }, cwd });
 
 describe('tool_policy_file_guard', () => {
     it.each([
@@ -20,7 +28,7 @@ describe('tool_policy_file_guard', () => {
         { tool_name: 'Bash', tool_input: { command: `echo '{}' > ${POLICY_FILE}` } },
         { tool_name: 'Bash', tool_input: { command: "sed -i '' s/blocked/allow/ ~/.happy/tool-policy.json" } },
     ])('blocks %j', (payload) => {
-        expect(targetsPolicyFile(payload, POLICY_FILE)).toBe(true);
+        expect(targetsPolicyFile(payload, POLICY_FILE, ENV)).toBe(true);
         const result = run(payload);
         expect(result.status).toBe(2);
         expect(result.stderr).toContain('도구 정책 파일');
@@ -32,6 +40,36 @@ describe('tool_policy_file_guard', () => {
         { tool_name: 'Bash', tool_input: { command: 'ls ~/.happy' } },
     ])('allows %j', (payload) => {
         expect(run(payload).status).toBe(0);
+    });
+
+    // Cross review #1: compare normalized paths, not substrings.
+    it.each([
+        "printf '{}' > ~/.happy/tool-po*.json",
+        'F=$HOME/.happy/tool-policy.json; echo x > "$F"',
+        'cat > "${HOME}/.happy/tool-policy.json"',
+        'cp /tmp/x $HAPPY_HOME_DIR/tool-policy.json',
+        'D=~/.happy; F=tool-policy.json; echo x > $D/$F',
+        'cd ~/.happy && vi tool-policy.json',
+        "python3 -c 'open(\"/Users/me/.happy/tool-policy.json\",\"w\")'",
+    ])('blocks the Bash command %s', (command) => {
+        expect(targetsPolicyFile(bash(command), POLICY_FILE, ENV)).toBe(true);
+        expect(run(bash(command)).status).toBe(2);
+    });
+
+    it('blocks a relative name from inside the policy directory', () => {
+        expect(targetsPolicyFile(bash('echo x > tool-policy.json', '/Users/me/.happy'), POLICY_FILE, ENV)).toBe(true);
+        expect(targetsPolicyFile({ tool_name: 'Write', tool_input: { file_path: '~/.happy/tool-policy.json' } }, POLICY_FILE, ENV)).toBe(true);
+    });
+
+    it.each([
+        'cat docs/tool-policy.json',
+        'cat fixtures/tool-policy.json && ls',
+        'vi /Users/me/project/tool-policy.json',
+        'ls ~/.happy',
+        'echo tool-policy',
+    ])('lets %s through (same name elsewhere)', (command) => {
+        expect(targetsPolicyFile(bash(command), POLICY_FILE, ENV)).toBe(false);
+        expect(run(bash(command)).status).toBe(0);
     });
 
     it('never breaks a session on input it cannot read', () => {
