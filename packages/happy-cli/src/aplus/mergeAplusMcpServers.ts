@@ -6,6 +6,8 @@ export type StdioMcpServerEntry = {
     command: string
     args?: string[]
     env?: Record<string, string>
+    /** Codex only: how long a call may take. A tool policy `ask` waits up to 30 minutes for a person. */
+    tool_timeout_sec?: number
 }
 
 export function mergeAplusMcpServers(
@@ -23,6 +25,8 @@ export function bridgeAplusMcpServers(
     opts: {
         bridgeCommand: string
         nodeExecPath?: string
+        /** Tool policy (agent-tool-policy I1b): the bridge then asks the session before every call. */
+        toolPolicy?: { env: (serverName: string) => Record<string, string>; toolTimeoutSec: number }
     },
 ): McpServersMap<StdioMcpServerEntry> {
     const result: McpServersMap<StdioMcpServerEntry> = {}
@@ -30,10 +34,15 @@ export function bridgeAplusMcpServers(
         const args = opts.nodeExecPath
             ? ['--no-warnings', '--no-deprecation', opts.bridgeCommand, '--url', config.url]
             : ['--url', config.url]
+        const env = {
+            ...(config.headers ? { HAPPY_HTTP_MCP_HEADERS: JSON.stringify(config.headers) } : {}),
+            ...(opts.toolPolicy ? opts.toolPolicy.env(name) : {}),
+        }
         result[name] = {
             command: opts.nodeExecPath ?? opts.bridgeCommand,
             args,
-            env: config.headers ? { HAPPY_HTTP_MCP_HEADERS: JSON.stringify(config.headers) } : undefined,
+            env: Object.keys(env).length > 0 ? env : undefined,
+            ...(opts.toolPolicy ? { tool_timeout_sec: opts.toolPolicy.toolTimeoutSec } : {}),
         }
     }
     return result

@@ -94,6 +94,7 @@ export default defineConfig({
                     include: [
                         'src/claude/planMode.integration.test.ts',
                         'src/toolPolicy/claudeHook.integration.test.ts',
+                        'src/toolPolicy/codexShadow.integration.test.ts',
                     ],
                     sequence: {
                         groupOrder: 1,

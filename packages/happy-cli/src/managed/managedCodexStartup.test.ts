@@ -76,6 +76,7 @@ vi.mock('@/persistence', async (importOriginal) => ({
 }));
 vi.mock('@/codex/codexAppServerClient', () => ({
     CodexAppServerClient: class {
+        setCuaShadow = () => {};
         constructor(...args: unknown[]) { mockClientConstructed(args); }
         connect = mockConnect;
         readThread = mockReadThread;

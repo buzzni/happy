@@ -489,3 +489,52 @@ describe('CodexPermissionHandler channel guidance', () => {
         expect(names).not.toContain('channel-permission');
     });
 });
+
+describe('CodexPermissionHandler tool policy approval (agent-tool-policy R11)', () => {
+    const policy = { reasonCode: 'first_app_use', ruleId: 'builtin:first_app_use', humanOnly: false, grantOffer: 'session' as const };
+    const answer = async (session: ReturnType<typeof createSessionMock>['session'], response: Record<string, unknown>) => {
+        const permission = session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'permission');
+        await permission![1](response);
+    };
+
+    it('raises an ordinary request carrying the policy meta and reads the conversation grant from the answer', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const pending = handler.requestPolicyApproval({ id: 'exec-1', toolName: 'mcp__cua-driver__click', args: { pid: 12 }, policy, signal: new AbortController().signal });
+        expect(getState().requests['exec-1']).toMatchObject({ tool: 'mcp__cua-driver__click', arguments: { pid: 12 }, policy });
+        await answer(session, { id: 'exec-1', approved: true, policyGrant: 'session' });
+        await expect(pending).resolves.toEqual({ approved: true, policyGrant: 'session' });
+        expect(getState().completedRequests['exec-1'].status).toBe('approved');
+    });
+
+    it('reads an answer from a client that does not know policyGrant as "once", and a refusal as not approved', async () => {
+        const { session } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const once = handler.requestPolicyApproval({ id: 'a', toolName: 't', args: {}, policy, signal: new AbortController().signal });
+        await answer(session, { id: 'a', approved: true, decision: 'approved_for_session' });
+        await expect(once).resolves.toEqual({ approved: true, policyGrant: 'once' });
+        const declined = handler.requestPolicyApproval({ id: 'b', toolName: 't', args: {}, policy, signal: new AbortController().signal });
+        await answer(session, { id: 'b', approved: false, decision: 'denied' });
+        await expect(declined).resolves.toEqual({ approved: false, policyGrant: 'once' });
+    });
+
+    // Desktop's deny button sends `approved: false` with no decision, which the base reads as `abort`.
+    it('withdraws the request when the call goes away; any other abort is a refusal', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const controller = new AbortController();
+        const withdrawn = handler.requestPolicyApproval({ id: 'c', toolName: 't', args: {}, policy, signal: controller.signal });
+        controller.abort();
+        await expect(withdrawn).rejects.toThrow();
+        expect(getState().requests.c).toBeUndefined();
+        expect(getState().completedRequests.c.status).toBe('canceled');
+
+        const denied = handler.requestPolicyApproval({ id: 'd', toolName: 't', args: {}, policy, signal: new AbortController().signal });
+        await answer(session, { id: 'd', approved: false });
+        await expect(denied).resolves.toEqual({ approved: false, policyGrant: 'once' });
+
+        const stopped = handler.requestPolicyApproval({ id: 'e', toolName: 't', args: {}, policy, signal: new AbortController().signal });
+        handler.abortAll();
+        await expect(stopped).resolves.toEqual({ approved: false, policyGrant: 'once' });
+    });
+});

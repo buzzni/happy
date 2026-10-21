@@ -59,6 +59,7 @@ let turnsSent: { text: string }[] = [];
 
 vi.mock('@/codex/codexAppServerClient', () => ({
     CodexAppServerClient: class {
+        setCuaShadow = () => {};
         setEventHandler = vi.fn();
         setApprovalHandler = vi.fn();
         setUserInputHandler = vi.fn();
