@@ -1,5 +1,5 @@
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
-import { createMachineRotationResolver } from './machineRotationResolver';
+import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
 import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
 import { createMachineSetupTokenJournal } from './machineSetupTokenJournal';
 import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
@@ -1816,29 +1816,28 @@ export async function startDaemon(): Promise<void> {
       if (!runtime) throw new MachineRotationError('CONFIGURATION_REQUIRED');
       return runtime;
     };
+    /** A channel launch decides rotation once, before its session key is staged; spawnSession reuses that decision. */
+    const channelRotationRuntimes = new WeakMap<SpawnSessionOptions, MachineSetupTokenRuntime>();
     /**
      * aplus specs/shared-machine-server-signing Phase 3c — the runtime a new shared-machine launch rotates with, or
-     * null when it runs the current way. On by default; the reason is logged whenever it is not used.
+     * null when it runs the current way. On by default; the reason is logged whenever it is not used, and nothing about
+     * the decision (an unresolved assignment, Studio unreachable) fails the launch.
      */
     const machineRotationFor = async (options: SpawnSessionOptions): Promise<MachineSetupTokenRuntime | null> => {
-      if ((options.agent && options.agent !== 'claude') || !honorsManagedAiCredentials(options.aiAuthSelection)) return null;
-      const scope = await sharedMachineScope();
-      if (!scope) return null;
-      // Explicit user-v1 grants keep their existing verifier. A machine-v2 document cannot pass it.
-      if (options.aiAuthSelection?.kind === 'claude-setup-token') return null;
-      const fallback = (reason: string) => {
-        const unexpected = reason === 'STUDIO_KEY_UNAVAILABLE' || reason === 'ACCEPTANCE_UNAVAILABLE' || reason === 'UNAVAILABLE';
-        if (unexpected) logger.warn(`[machine-rotation] new launch runs without machine rotation: ${reason}`);
-        else logger.debug(`[machine-rotation] new launch runs without machine rotation: ${reason}`);
-        return null;
-      };
-      // A session created before the launch cannot carry the execution proof machine rotation binds to.
-      if (options.reconnectEnvironment) return fallback('PRECREATED_SESSION');
-      if (!machineRotation) return fallback('UNAVAILABLE');
-      const decision = await machineRotation.newLaunch(scope);
-      if (!decision.runtime) return fallback(decision.reason);
-      for (const recovered of await decision.runtime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
-      return decision.runtime;
+      const chosen = channelRotationRuntimes.get(options);
+      if (chosen) return chosen;
+      const runtime = await chooseLaunchRotation({
+        managedClaude: (!options.agent || options.agent === 'claude') && honorsManagedAiCredentials(options.aiAuthSelection),
+        explicitUserGrant: options.aiAuthSelection?.kind === 'claude-setup-token',
+        precreatedSession: !!options.reconnectEnvironment,
+        resolver: machineRotation, scope: sharedMachineScope,
+        log: (reason, unexpected) => {
+          if (unexpected) logger.warn(`[machine-rotation] new launch runs without machine rotation: ${reason}`);
+          else logger.debug(`[machine-rotation] new launch runs without machine rotation: ${reason}`);
+        },
+      });
+      if (runtime) for (const recovered of await runtime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
+      return runtime;
     };
     const authenticatedAccountId = async (token: string): Promise<string> => {
       const response = await fetch(`${configuration.serverUrl}/v1/account/profile`, { headers: { Authorization: `Bearer ${token}` },
@@ -5077,9 +5076,11 @@ export async function startDaemon(): Promise<void> {
         createSession: (input) => api.getOrCreateSession({ ...input, state: { controlledByUser: false } }),
         spawnSession: (options) => spawnSession(options),
         spawnWithSessionKey: async (options, dataKey) => {
-          if (!await machineRotationFor(options)) return null;
+          const runtime = await machineRotationFor(options);
+          if (!runtime) return null;
           channelSessionKeys.set(options, dataKey);
-          try { return await spawnSession(options); } finally { channelSessionKeys.delete(options); }
+          channelRotationRuntimes.set(options, runtime);
+          try { return await spawnSession(options); } finally { channelSessionKeys.delete(options); channelRotationRuntimes.delete(options); }
         },
       });
       const channelHostDirs = channelHostDirectories(configuration.happyHomeDir);

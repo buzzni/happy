@@ -81,9 +81,12 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     expect(text).toContain('pendingMachineStarts.add(preparedMachineSessionId)');
     expect(text).toContain('pendingMachineStarts.has(happySessionId)');
     // aplus Phase 3c — on by default, so a launch machine rotation cannot serve runs the current way instead of failing.
-    expect(text).toContain("if (options.reconnectEnvironment) return fallback('PRECREATED_SESSION');");
-    expect(text).toContain('if (!decision.runtime) return fallback(decision.reason);');
+    expect(text).toContain('precreatedSession: !!options.reconnectEnvironment,');
+    expect(text).toContain('resolver: machineRotation, scope: sharedMachineScope,');
     expect(text).toContain('const machineRotationRuntime = await machineRotationFor(options);');
+    // Review #896 — a channel launch decides once; spawnSession must not decide again and drop the channel data key.
+    expect(text).toContain('channelRotationRuntimes.set(options, runtime);');
+    expect(text).toContain('const chosen = channelRotationRuntimes.get(options);');
   });
 
   it('두 spawn 경로가 자식에게 건네는 바로 그 env 를 검증한다', async () => {
