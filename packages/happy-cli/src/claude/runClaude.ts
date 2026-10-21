@@ -767,6 +767,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
             approver: () => currentSession?.policyApprover ?? null,
             unattended: exitAfterFirstTurn,
+            terminalPrompt: () => currentSession?.mode === 'local',
             grantTtlMs: REMOTE_GRANT_TTL_MS,
         })
         : null;

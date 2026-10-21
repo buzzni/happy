@@ -50,6 +50,8 @@ function respond(verdict) {
         return process.exit(0);
     }
     if (verdict && verdict.kind === 'allow') return emit('allow', 'Saycode에서 사용자가 승인했다.');
+    // Local (terminal) mode only: Claude's own prompt asks; headless Claude treats it as a denial.
+    if (verdict && verdict.kind === 'ask' && typeof verdict.reason === 'string') return emit('ask', verdict.reason);
     if (verdict && verdict.kind === 'deny' && typeof verdict.reason === 'string') return emit('deny', verdict.reason);
     failClosed('unknown verdict');
 }

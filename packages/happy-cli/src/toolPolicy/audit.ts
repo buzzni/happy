@@ -14,7 +14,8 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, renameSync, statSync 
 import { dirname } from 'node:path';
 import type { ToolPolicyDecision } from './rules';
 
-export type ToolPolicyOutcome = 'approved' | 'denied' | 'timeout' | 'aborted' | 'unattended';
+/** `terminal_prompt`: handed to Claude's own terminal prompt, whose answer the daemon never sees. */
+export type ToolPolicyOutcome = 'approved' | 'denied' | 'timeout' | 'aborted' | 'unattended' | 'terminal_prompt';
 
 export interface ToolPolicyAuditRecord {
     at: number;

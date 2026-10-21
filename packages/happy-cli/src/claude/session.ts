@@ -86,7 +86,7 @@ export class Session {
     /**
      * Who answers a tool policy `ask` (aplus-dev-studio specs/agent-tool-policy R11). Set by the
      * remote launcher while it runs; `null` in local (terminal) mode, where the hook cannot reach a
-     * Saycode approval card and `ask` is refused instead.
+     * Saycode approval card and hands `ask` to Claude's own terminal prompt instead.
      */
     policyApprover: PolicyApprover | null = null;
     

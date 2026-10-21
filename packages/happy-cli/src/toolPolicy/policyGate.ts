@@ -6,7 +6,11 @@
  * current rules, and for `ask` raises an ordinary permission request through the session's
  * approver and waits — up to 30 minutes — for a person. Grants are created only from that answer.
  *
- * Failure direction: an evaluation error is `ask`; `ask` with nobody to ask is `blocked`.
+ * Failure direction: an evaluation error is `ask`; `ask` with nobody to ask is `blocked`. In local
+ * (terminal) mode the person is at Claude's own prompt, so `ask` goes there instead (`terminalPrompt`;
+ * measured 2026-10-22: a hook "ask" makes the Claude 2.1.285 TUI ask even under bypassPermissions,
+ * and a persistent "don't ask again" rule does not skip it). That answer never reaches the daemon,
+ * so it creates no grant and no R13 denial memory.
  */
 
 import {
@@ -63,6 +67,8 @@ export type HookVerdict =
     | { kind: 'pass' }
     /** A person approved it here; skip Claude's own prompt. */
     | { kind: 'allow' }
+    /** Local (terminal) mode: let Claude's own prompt ask the person at the keyboard. */
+    | { kind: 'ask'; reason: string; reasonCode: string }
     | { kind: 'deny'; reason: string; reasonCode: string };
 
 export interface ToolPolicyGate {
@@ -77,6 +83,8 @@ export function createToolPolicyGate(deps: {
     approver: () => PolicyApprover | null;
     /** A run with nobody to answer (run-once automation): `ask` becomes `blocked`. */
     unattended: boolean;
+    /** True while the session runs in Claude's terminal UI, where a person answers Claude's own prompt. */
+    terminalPrompt?: () => boolean;
     platform?: NodeJS.Platform;
     tables?: ToolPolicyTables;
     now?: () => number;
@@ -139,6 +147,10 @@ export function createToolPolicyGate(deps: {
             if (signal.aborted) return refuse(call, verdict, 'aborted', 'aborted');
             if (deps.unattended) return refuse(call, verdict, 'unattended_no_approver', 'unattended');
             const approver = deps.approver();
+            if (!approver && deps.terminalPrompt?.()) {
+                audit(call, verdict, 'terminal_prompt', 'ask');
+                return { kind: 'ask', reasonCode: verdict.reasonCode, reason: askMessage(verdict, call.toolName) };
+            }
             if (!approver) return refuse(call, verdict, 'no_approver', 'unattended');
 
             const controller = new AbortController();
@@ -176,6 +188,12 @@ export function createToolPolicyGate(deps: {
             }
         },
     };
+}
+
+/** Shown in Claude's terminal prompt: what needs a person and why. */
+function askMessage(verdict: PolicyVerdict, toolName: string): string {
+    const target = verdict.target ? ` (${verdict.target.appName}${verdict.action ? `, ${verdict.action}` : ''})` : '';
+    return `Saycode 도구 정책: ${toolName}${target} 호출은 사람의 확인이 필요하다 (${verdict.reasonCode}). 허용하면 이번 호출만 실행된다.`;
 }
 
 function evaluationErrorVerdict(toolName: string, tables: ToolPolicyTables): PolicyVerdict {

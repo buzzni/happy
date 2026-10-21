@@ -39,7 +39,7 @@ const TERMINAL_RESOLVER: TargetResolver = { resolve: async () => ({ status: 'res
 let server: HookServer | null = null;
 afterEach(() => { server?.stop(); server = null; });
 
-async function setup(options: { approver: PolicyApprover | null; resolver?: TargetResolver; unattended?: boolean; approvalTimeoutMs?: number }) {
+async function setup(options: { approver: PolicyApprover | null; resolver?: TargetResolver; unattended?: boolean; approvalTimeoutMs?: number; terminalPrompt?: boolean }) {
     const dir = mkdtempSync(join(tmpdir(), 'policy-hook-'));
     const secretFile = join(dir, 'secret');
     writeFileSync(secretFile, SECRET, { mode: 0o600 });
@@ -52,6 +52,7 @@ async function setup(options: { approver: PolicyApprover | null; resolver?: Targ
         audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => 's1', publishRecent: (r) => recent.push(r) }),
         approver: () => options.approver,
         unattended: options.unattended ?? false,
+        terminalPrompt: () => options.terminalPrompt ?? false,
         platform: 'darwin',
         approvalTimeoutMs: options.approvalTimeoutMs,
     });
@@ -152,6 +153,47 @@ describe('Claude PreToolUse policy hook', () => {
         expect(decision(result.stdout).permissionDecision).toBe('deny');
         expect(decision(result.stdout).permissionDecisionReason).toContain('승인할 사람이 없다');
         expect(asked).toHaveLength(0);
+    });
+
+    it('refuses an ask in a session with no Saycode approver and no terminal', async () => {
+        const { port, secretFile } = await setup({ approver: null });
+        const result = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        expect(decision(result.stdout)).toMatchObject({ permissionDecision: 'deny' });
+        expect(decision(result.stdout).permissionDecisionReason).toContain('승인 요청을 띄울 수 없다');
+    });
+
+    // Cross review #2: in local (terminal) mode a person is at the Claude prompt; measured 2026-10-22 on
+    // Claude 2.1.285 that a hook "ask" makes the TUI ask even under bypassPermissions (context.md).
+    it('hands an ask to Claude\'s own terminal prompt in local mode, and still denies a block', async () => {
+        const { port, secretFile, recent } = await setup({ approver: null, terminalPrompt: true, resolver: TERMINAL_RESOLVER });
+        const asked = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        expect(asked.code).toBe(0);
+        expect(decision(asked.stdout).permissionDecision).toBe('ask');
+        expect(decision(asked.stdout).permissionDecisionReason).toContain('mcp__gmail__send_email');
+        expect(recent[recent.length - 1].at(-1)).toMatchObject({ decision: 'ask', reasonCode: 'high_risk_write', outcome: 'terminal_prompt' });
+
+        const blocked = await runHook([String(port), secretFile], payload('mcp__cua-driver__type_text', { pid: 11, text: 'x' }));
+        expect(decision(blocked.stdout).permissionDecision).toBe('deny');
+    });
+
+    it('a run-once automation in local mode still refuses an ask', async () => {
+        const { port, secretFile } = await setup({ approver: null, terminalPrompt: true, unattended: true });
+        const result = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        expect(decision(result.stdout).permissionDecision).toBe('deny');
+    });
+
+    // Cross review #9: the server's own error paths are part of "every failure denies".
+    it('fails closed when the gate throws (500) and when the payload has no tool name (400)', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'policy-hook-'));
+        const secretFile = join(dir, 'secret');
+        writeFileSync(secretFile, SECRET, { mode: 0o600 });
+        server = await startHookServer({ onSessionHook: () => undefined, preToolUse: { secret: SECRET, decide: async () => { throw new Error('boom'); } } });
+        const thrown = await runHook([String(server.port), secretFile], payload('mcp__notion__notion-search'));
+        expect(thrown.code).toBe(2);
+        expect(decision(thrown.stdout).permissionDecisionReason).toContain('500');
+        const noName = await runHook([String(server.port), secretFile], { hook_event_name: 'PreToolUse', tool_input: {} });
+        expect(noName.code).toBe(2);
+        expect(decision(noName.stdout).permissionDecisionReason).toContain('400');
     });
 
     it('fails closed (deny + exit 2) when the session server is unreachable', async () => {

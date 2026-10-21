@@ -88,6 +88,7 @@ export function createClaudeToolPolicyRuntime(input: {
     publishRecent: (recent: ToolPolicyAuditRecord[]) => void;
     approver: () => PolicyApprover | null;
     unattended: boolean;
+    terminalPrompt: () => boolean;
     grantTtlMs: number | null;
 }): ClaudeToolPolicyRuntime {
     const secret = randomBytes(32).toString('hex');
@@ -110,6 +111,7 @@ export function createClaudeToolPolicyRuntime(input: {
         }),
         approver: input.approver,
         unattended: input.unattended,
+        terminalPrompt: input.terminalPrompt,
     });
 
     return {
