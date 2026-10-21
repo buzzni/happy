@@ -15,7 +15,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { appendFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
@@ -370,12 +370,38 @@ async function resolveWorktreeTarget(guard: PathGuard, path: string, projectId: 
 // ── Serialization ──────────────────────────────────────────────────────────────────────────────
 
 const repositoryQueues = new Map<string, Promise<unknown>>();
+let drainingRepositoryWrites = false;
+
+/** Called before daemon shutdown/handoff releases ownership; never unlock live Git children. */
+export async function drainWorktreeOperations(): Promise<void> {
+    drainingRepositoryWrites = true;
+    await Promise.allSettled([...repositoryQueues.values()]);
+}
 
 /** One operation at a time per repository, so git's own locks never race. Keyed '/'-separated, as git prints the root. */
 async function serialized<T>(path: string, run: () => Promise<T>): Promise<T> {
+    if (drainingRepositoryWrites) throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', 'The daemon is shutting down. Retry after reconnecting.');
     const key = slashed(path);
     const previous = repositoryQueues.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(run);
+    const next = previous.catch(() => undefined).then(async () => {
+        // The process queue cannot exclude Desktop or another daemon. Share their lock after
+        // the ticket/path guard has resolved this repository; no credential or wire change.
+        const common = await runGit(path, ['rev-parse', '--git-common-dir'], { readOnly: true });
+        // Existing prepare/purge operations also accept a folder that is not a repository yet.
+        if (common.code !== 0) return run();
+        const directory = await realpath(resolve(path, common.stdout.trim()));
+        const lock = join(directory, 'saycode-desktop-write.lock');
+        try {
+            await mkdir(lock);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+                throw new OpFailure('WORKTREE_OPERATION_IN_PROGRESS', `Another Git operation is in progress. Retry after it finishes. If its process terminated, verify no Git writer is running before removing the lock: ${lock}`, { lockPath: lock });
+            }
+            throw error;
+        }
+        try { return await run(); }
+        finally { await rmdir(lock).catch(() => undefined); }
+    });
     repositoryQueues.set(key, next);
     try {
         return await next;

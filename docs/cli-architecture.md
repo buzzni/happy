@@ -1,5 +1,16 @@
 # CLI Architecture
 
+## Worktree Git write ownership
+
+Ticket-validated worktree writes share Desktop's common Git directory lock.
+Daemon shutdown and self replacement stop accepting new serialized writes and
+await the accepted queue before releasing daemon ownership and exiting. A live
+Git child must finish before its lock is released. Unexpected termination such
+as SIGKILL cannot run this drain: lock refusal includes the path for recovery
+after verifying that no writer remains. Foreign locks are never automatically
+removed. Revisit crash recovery only with a shared owner-identity protocol across
+Desktop, web runners and the daemon; PID-only stale detection is not sufficient.
+
 An unused Codex Happy session can outlive its first process: the daemon reaps
 empty processes before a delayed first schedule runs. After the existing
 identity, encryption, directory and resume-fence checks, the daemon may start

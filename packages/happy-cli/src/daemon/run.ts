@@ -1,3 +1,4 @@
+import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
 import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
@@ -5399,6 +5400,7 @@ export async function startDaemon(): Promise<void> {
             return activity.activeSessionCount === 0 && activity.activeAutomationCount === 0;
           },
           teardownCurrentDaemon: async () => {
+            await drainWorktreeOperations();
             clearInterval(restartOnStaleVersionAndHeartbeat);
             await checkpointRetentionSchedule.stop();
 
@@ -5539,6 +5541,7 @@ export async function startDaemon(): Promise<void> {
       shutdownCleanupStarted = true;
       clearTimeout(startupShutdownFallback);
       startupShutdownFallback = undefined;
+      await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
       await checkpointRetentionSchedule.stop();
 
@@ -5634,6 +5637,7 @@ export async function startDaemon(): Promise<void> {
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
+    await drainWorktreeOperations();
     process.exit(1);
   }
 }
