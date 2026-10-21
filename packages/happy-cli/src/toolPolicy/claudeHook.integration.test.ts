@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
-import { buildHookSettings } from '@/claude/utils/generateHookSettings';
+import { buildHookSettings, toolPolicyHookCommands } from '@/claude/utils/generateHookSettings';
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
 import { query, type SDKMessage } from '@/claude/sdk';
 import { createToolPolicyAuditLog } from './audit';
@@ -69,10 +69,8 @@ async function runWithPolicy(approver: PolicyApprover | null, prompt: string) {
         broadKillGuardCommand: `node "${join(SCRIPTS, 'broad_kill_guard.cjs')}"`,
         policy: resolveMachineLockdownPolicy({}),
         homeDir: dir,
-        toolPolicy: {
-            forwarderCommand: `node "${join(SCRIPTS, 'policy_hook_forwarder.cjs')}" ${server.port} "${secretFile}"`,
-            fileGuardCommand: `node "${join(SCRIPTS, 'tool_policy_file_guard.cjs')}" "${join(dir, 'tool-policy.json')}"`,
-        },
+        // The production command shape: the daemon's quoted execPath, not `node` from PATH.
+        toolPolicy: toolPolicyHookCommands({ execPath: process.execPath, scriptsDir: SCRIPTS, port: server.port, secretFile, policyFile: join(dir, 'tool-policy.json') }),
     })));
     const server_ = (name: string) => ({ command: process.execPath, args: [FAKE_MCP], env: { FAKE_MCP_MARKER: marker, FAKE_MCP_NAME: name } });
     const messages = await collect(query({

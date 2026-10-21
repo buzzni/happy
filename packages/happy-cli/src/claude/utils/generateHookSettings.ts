@@ -68,6 +68,18 @@ export function buildHookSettings(input: {
 }
 
 /**
+ * The tool policy hook commands, exactly as Claude runs them. The gate must not depend on `node`
+ * being on the hook shell's PATH: a hook that cannot start is a non-blocking error to Claude, i.e.
+ * the call runs unchecked — so the daemon's own executable is quoted in.
+ */
+export function toolPolicyHookCommands(input: { execPath: string; scriptsDir: string; port: number; secretFile: string; policyFile: string }): { forwarderCommand: string; fileGuardCommand: string } {
+    return {
+        forwarderCommand: `"${input.execPath}" "${join(input.scriptsDir, 'policy_hook_forwarder.cjs')}" ${input.port} "${input.secretFile}"`,
+        fileGuardCommand: `"${input.execPath}" "${join(input.scriptsDir, 'tool_policy_file_guard.cjs')}" "${input.policyFile}"`,
+    };
+}
+
+/**
  * Generate a temporary settings file with SessionStart hook configuration
  * 
  * @param port - The port where Happy server is listening
@@ -96,12 +108,13 @@ export function generateHookSettingsFile(port: number, toolPolicy?: { secretFile
         policy: resolveMachineLockdownPolicy(process.env),
         homeDir: homedir(),
         ...(toolPolicy ? {
-            toolPolicy: {
-                // The gate must not depend on `node` being on the hook shell's PATH: a hook that
-                // cannot start is a non-blocking error to Claude, i.e. the call runs unchecked.
-                forwarderCommand: `"${process.execPath}" "${resolve(projectPath(), 'scripts', 'policy_hook_forwarder.cjs')}" ${port} "${toolPolicy.secretFile}"`,
-                fileGuardCommand: `"${process.execPath}" "${resolve(projectPath(), 'scripts', 'tool_policy_file_guard.cjs')}" "${toolPolicy.policyFile}"`,
-            },
+            toolPolicy: toolPolicyHookCommands({
+                execPath: process.execPath,
+                scriptsDir: resolve(projectPath(), 'scripts'),
+                port,
+                secretFile: toolPolicy.secretFile,
+                policyFile: toolPolicy.policyFile,
+            }),
         } : {}),
     });
 
