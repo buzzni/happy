@@ -53,6 +53,21 @@ describe('app grade table (policy-tables §1)', () => {
         expect(decide(cua('click', { pid: 1 }, { pid: 1, bundleId: 'com.google.Chrome.app.abc' })).target?.category).toBe('browser');
     });
 
+    // Cross review #4: helpers found through `ps` and apps launched by name.
+    it.each([
+        ['main executable', { pid: 1, executable: '/Applications/Saycode.app/Contents/MacOS/Saycode', name: 'Saycode' }],
+        ['renderer helper', { pid: 1, executable: '/Applications/Saycode.app/Contents/Frameworks/Saycode Helper (Renderer).app/Contents/MacOS/Saycode Helper (Renderer)' }],
+        ['trial build', { pid: 1, executable: '/Applications/Saycode Trial.app/Contents/MacOS/Saycode Trial' }],
+        ['launch by name', { name: 'Saycode' }],
+    ])('recognizes Saycode itself from its %s', (_label, app) => {
+        expect(decide(cua('kill_app', { pid: 1 }, app)).reasonCode).toBe('self_target');
+    });
+
+    it('launch_app by name is checked against self like a bundle id', () => {
+        expect(decide(cua('launch_app', { name: 'Saycode' }, { name: 'Saycode' })).reasonCode).toBe('self_target');
+        expect(decide(cua('launch_app', { name: 'Notes' }, { name: 'Notes' })).reasonCode).toBe('first_app_use');
+    });
+
     it('treats pids Desktop recorded as its own as self', () => {
         const machine = parseMachinePolicy({ version: 1, selfIdentity: { pids: [4242] }, rules: [] });
         expect(decide(cua('click', { pid: 4242 }, { pid: 4242, bundleId: 'com.github.Electron', name: 'Electron' }), machine).reasonCode).toBe('self_target');
@@ -85,7 +100,7 @@ describe('cua-driver action table (policy-tables §2)', () => {
         expect(decide(cua('page', { tab_id: 't' })).message).toContain('브라우저 도구');
         expect(decide(cua('get_browser_state', {}))).toMatchObject({ decision: 'allow', reasonCode: 'observe' });
         const rules = parseMachinePolicy({ version: 1, rules: [{ id: 'b', tool: 'mcp__cua-driver__*', target: 'browser', decision: 'allow' }] });
-        expect(decide(cua('browser_click', { tab_id: 't' }), rules)).toMatchObject({ decision: 'allow', ruleId: 'machine:b' });
+        expect(decide(cua('browser_click', { tab_id: 't' }), rules)).toMatchObject({ decision: 'ask', reasonCode: 'floor', ruleId: 'machine:b', humanOnly: true });
     });
 
     it('launch_app with urls asks a person once, whatever the app grade', () => {
@@ -111,6 +126,11 @@ describe('cua-driver action table (policy-tables §2)', () => {
         expect(requiredCuaTarget('mcp__cua-driver__list_windows', {})).toEqual({ kind: 'none' });
         expect(requiredCuaTarget('mcp__cua-driver__launch_app', { name: 'Notes' })).toEqual({ kind: 'launch', app: { name: 'Notes' } });
         expect(requiredCuaTarget('mcp__notion__notion-search', { pid: 1 })).toEqual({ kind: 'none' });
+        // Cross review #6: a pid the driver may coerce must not fall back to the frontmost app.
+        expect(requiredCuaTarget('mcp__cua-driver__click', { pid: '13', x: 1, y: 1 })).toEqual({ kind: 'unknown' });
+        expect(requiredCuaTarget('mcp__cua-driver__type_text', { pid: 1.5 })).toEqual({ kind: 'unknown' });
+        expect(requiredCuaTarget('mcp__cua-driver__hotkey', { keys: ['a'], target: { kind: 'window', pid: '6' } })).toEqual({ kind: 'unknown' });
+        expect(requiredCuaTarget('mcp__cua-driver__get_window_state', { pid: '13' })).toEqual({ kind: 'unknown' });
     });
 });
 
@@ -183,6 +203,15 @@ describe('MCP tool defaults (policy-tables §4, R8)', () => {
         expect(verbOf('list_items_delete')).toBeNull();
         expect(verbOf('sendMessage')).toBe('high');
     });
+
+    // Cross review #8: a leading noun followed by a read verb is a read tool.
+    it.each([
+        ['message_list', null], ['email_list', null], ['messages_get', null], ['post_search', null], ['order_get', null],
+        ['release_list', null], ['mail_read', null], ['getMessages', null],
+        ['message_send', 'high'], ['email_delete', 'high'], ['delete_list', 'high'], ['send_message', 'high'], ['post_message', 'high'],
+    ] as const)('verbOf(%s) is %s', (tool, verb) => {
+        expect(verbOf(tool)).toBe(verb);
+    });
 });
 
 describe('combination order (R2, R3, R13)', () => {
@@ -208,10 +237,63 @@ describe('combination order (R2, R3, R13)', () => {
         expect(decide(cua('click', { scope: 'desktop', x: 1, y: 1 }, 'unresolved'), rules)).toMatchObject({ decision: 'ask', reasonCode: 'floor' });
     });
 
-    it('a machine rule can allow a browser by app and target', () => {
+    it('a machine rule can turn a browser by app into a question, not open it', () => {
         const rules = machine([{ id: 'chrome', tool: 'mcp__cua-driver__*', target: 'com.google.Chrome', decision: 'allow' }]);
-        expect(decide(cua('click', { pid: 10 }, CHROME), rules)).toMatchObject({ decision: 'allow', ruleId: 'machine:chrome' });
+        expect(decide(cua('click', { pid: 10 }, CHROME), rules)).toMatchObject({ decision: 'ask', reasonCode: 'floor', ruleId: 'machine:chrome' });
         expect(decide(cua('click', { pid: 11 }, TERMINAL), rules).reasonCode).toBe('first_app_use');
+    });
+
+    // Cross review #1: the local file is not trusted as a source of loosening rules (spec 제약 "보안").
+    it.each([
+        ['terminal typing', 'type_text', { pid: 11, text: 'rm -rf /' }, TERMINAL, 'terminal'],
+        ['trading typing', 'type_text', { pid: 20, text: '1000' }, { pid: 20, name: '영웅문4' }, 'trading'],
+        ['browser click', 'click', { pid: 10, x: 1, y: 1 }, CHROME, 'browser'],
+    ])('a machine allow past the app grade (%s) asks a person instead of opening it', (_label, tool, args, app, target) => {
+        const allow = machine([{ id: 'open', tool: 'mcp__cua-driver__*', target, decision: 'allow' }]);
+        expect(decide(cua(tool, args, app), allow)).toMatchObject({ decision: 'ask', reasonCode: 'floor', ruleId: 'machine:open', humanOnly: true, grantOffer: 'session' });
+        const ask = machine([{ id: 'ask', tool: 'mcp__cua-driver__*', target, decision: 'ask' }]);
+        expect(decide(cua(tool, args, app), ask)).toMatchObject({ decision: 'ask', reasonCode: 'machine_rule', humanOnly: true });
+        const blocked = machine([{ id: 'no', tool: 'mcp__cua-driver__*', target, decision: 'blocked' }]);
+        expect(decide(cua(tool, args, app), blocked)).toMatchObject({ decision: 'blocked', ruleId: 'machine:no' });
+        expect(decide(cua(tool, args, app))).toMatchObject({ decision: 'blocked', reasonCode: 'grade_exceeded' });
+    });
+
+    it('a grant past the app grade covers that action only, and the in-grade grant does not cover it', () => {
+        const allow = machine([{ id: 'open', tool: 'mcp__cua-driver__*', target: 'terminal', decision: 'allow' }]);
+        const typing = decide(cua('type_text', { pid: 11 }, TERMINAL), allow);
+        expect(typing.grantKeys).toEqual(['app:com.apple.Terminal:keyboard']);
+        const appGrant: PolicyGrantView = { hasGrant: (key) => key === 'app:com.apple.Terminal', recentlyDenied: () => false };
+        expect(decide(cua('type_text', { pid: 11 }, TERMINAL), allow, appGrant).decision).toBe('ask');
+        const typingGrant: PolicyGrantView = { hasGrant: (key) => key === 'app:com.apple.Terminal:keyboard', recentlyDenied: () => false };
+        expect(decide(cua('type_text', { pid: 11 }, TERMINAL), allow, typingGrant)).toMatchObject({ decision: 'allow', reasonCode: 'session_grant' });
+        expect(decide(cua('type_text', { pid: 11 }, TERMINAL), ABSENT_MACHINE_POLICY, typingGrant).decision).toBe('blocked');
+    });
+
+    // Cross review #5: an unreadable file must not turn every screenshot into a prompt.
+    it('an unreadable file leaves observing and session tools alone', () => {
+        const unreadable = parseMachinePolicy('garbage');
+        expect(decide(cua('start_session', {}), unreadable)).toMatchObject({ decision: 'allow', reasonCode: 'session_meta' });
+        expect(decide(cua('screenshot', {}), unreadable)).toMatchObject({ decision: 'allow', reasonCode: 'observe' });
+        expect(decide(cua('get_window_state', { pid: 13 }, NOTES), unreadable)).toMatchObject({ decision: 'allow', reasonCode: 'observe' });
+        expect(decide(cua('click', { pid: 13 }, NOTES), unreadable).decision).toBe('ask');
+        expect(decide(cua('get_window_state', { pid: 14 }, SAYCODE), unreadable).decision).toBe('blocked');
+        const invalid = machine([{ id: 'typo', tool: 'mcp__cua-driver__*', decision: 'nope' }]);
+        expect(decide(cua('list_windows', {}), invalid)).toMatchObject({ decision: 'allow', reasonCode: 'observe' });
+        const blockObserve = machine([{ id: 'no-look', tool: 'mcp__cua-driver__*', action: 'observe', decision: 'blocked' }]);
+        expect(decide(cua('screenshot', {}), blockObserve)).toMatchObject({ decision: 'blocked', ruleId: 'machine:no-look' });
+    });
+
+    // Cross review #7: a paste is still keyboard input.
+    it('an action rule on keyboard also covers clipboard combos, but only to tighten', () => {
+        const noKeys = machine([{ id: 'no-keys', tool: 'mcp__cua-driver__*', action: 'keyboard', decision: 'blocked' }]);
+        expect(decide(cua('hotkey', { pid: 13, keys: ['cmd', 'v'] }, NOTES), noKeys)).toMatchObject({ decision: 'blocked', ruleId: 'machine:no-keys' });
+        expect(decide(cua('type_text', { pid: 13 }, NOTES), noKeys).decision).toBe('blocked');
+        const keysOk = machine([{ id: 'keys', tool: 'mcp__cua-driver__*', action: 'keyboard', decision: 'allow' }]);
+        expect(decide(cua('hotkey', { pid: 13, keys: ['cmd', 'v'] }, NOTES), keysOk)).toMatchObject({ decision: 'ask', action: 'clipboard_read' });
+        const noPointer = machine([{ id: 'no-pointer', tool: 'mcp__cua-driver__*', action: 'pointer', decision: 'blocked' }]);
+        expect(decide(cua('click', { pid: 13, button: 'right' }, NOTES), noPointer)).toMatchObject({ decision: 'blocked', ruleId: 'machine:no-pointer' });
+        const pointerOk = machine([{ id: 'pointer', tool: 'mcp__cua-driver__*', action: 'pointer', decision: 'allow' }]);
+        expect(decide(cua('click', { pid: 13, button: 'right' }, NOTES), pointerOk)).toMatchObject({ decision: 'ask', action: 'pointer_full' });
     });
 
     it('a malformed rule degrades to ask, never blocked (R3)', () => {
@@ -226,7 +308,7 @@ describe('combination order (R2, R3, R13)', () => {
         expect(decide(cua('type_text', { pid: 10 }, CHROME), unreadable)).toMatchObject({ decision: 'blocked', reasonCode: 'grade_exceeded' });
         expect(decide({ toolName: 'mcp__notion__notion-search', args: {}, platform: 'darwin' }, unreadable)).toMatchObject({ decision: 'ask', reasonCode: 'machine_rule_invalid' });
         const mixed = machine([{ id: 'open', tool: 'mcp__cua-driver__*', target: 'browser', decision: 'allow' }, { id: 'typo', tool: 'mcp__cua-driver__*', decision: 'nope' }]);
-        expect(decide(cua('click', { pid: 10 }, CHROME), mixed)).toMatchObject({ decision: 'ask', reasonCode: 'machine_rule_invalid' });
+        expect(decide(cua('click', { pid: 10 }, CHROME), mixed)).toMatchObject({ decision: 'ask', humanOnly: true });
     });
 
     it('expired machine rules are ignored', () => {

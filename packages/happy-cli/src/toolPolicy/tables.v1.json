@@ -1,6 +1,6 @@
 {
   "$comment": "Saycode agent tool policy builtin tables v1. Canonical copy: aplus-dev-studio-desktop specs/agent-tool-policy/policy-tables.md. Classification lists start from Claude Desktop 2.42304.2 (osr/ssr/csr/lsr/usr/dsr/...); entries marked in policy-tables.md as changed/added are applied here. Edit this data, not code branches; bump policyVersion on every change.",
-  "policyVersion": "2026-10-22.1",
+  "policyVersion": "2026-10-22.2",
   "grades": {
     "browser": "read",
     "trading": "read",
@@ -31,6 +31,13 @@
         "saycode.exe",
         "saycode trial.exe",
         "saycode-windows-host.exe"
+      ],
+      "namePrefixes": [
+        "saycode"
+      ],
+      "pathIncludes": [
+        "/saycode.app/",
+        "/saycode trial.app/"
       ]
     },
     "media": {
@@ -963,6 +970,31 @@
       "assign",
       "close",
       "reopen"
+    ],
+    "nounFirstWords": [
+      "message",
+      "email",
+      "mail",
+      "post",
+      "order",
+      "release",
+      "charge",
+      "payment",
+      "trade",
+      "transfer"
+    ],
+    "readVerbs": [
+      "list",
+      "get",
+      "search",
+      "read",
+      "fetch",
+      "find",
+      "query",
+      "view",
+      "show",
+      "count",
+      "describe"
     ]
   }
 }

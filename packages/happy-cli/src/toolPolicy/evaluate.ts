@@ -9,6 +9,9 @@
  * Combination order (R2): fixed builtin blocks → machine rules (most restrictive wins, a builtin
  * `floor` turns their `allow` into `ask`) → builtin defaults → a session grant turns `ask` into
  * `allow` (never `blocked`).
+ *
+ * The machine file is user-writable, so it is never trusted to open anything on its own (spec 제약
+ * "보안"): past an app's grade it can at most turn the builtin `blocked` into a person's `ask`.
  */
 
 import {
@@ -106,6 +109,8 @@ export function requiredCuaTarget(toolName: string, args: Record<string, unknown
     }
     if (group === undefined || group === 'admin' || group === 'session_meta' || group === 'ask_always'
         || group === 'clipboard_read' || group === 'clipboard_write' || tables.cuaDriver.browserScopedTools.includes(parsed.tool)) return { kind: 'none' };
+    // A pid the driver might coerce ("13") names an app we cannot see; never fall back to the frontmost one.
+    if (hasNonIntegerPid(args)) return { kind: 'unknown' };
     const pid = pidOf(args);
     if (pid !== undefined) return { kind: 'pid', pid };
     // Observing without a window (list_apps, get_screen_size, a desktop screenshot) acts on no app.
@@ -136,9 +141,11 @@ export function evaluateToolCall(
     const builtin = parsed.server === tables.cuaDriver.server
         ? cuaDefault(parsed.tool, input, machine, tables)
         : mcpDefault(parsed.tool, input, machine, tables);
-    const { fixed, floor, appGrade, keyCombo, ...rest } = builtin;
+    const { fixed, floor, appGrade, keyCombo, baseAction, ...rest } = builtin;
     let verdict: PolicyVerdict = { ...base, ...rest };
-    const ruled = fixed ? null : applyMachineRules(input.toolName, verdict, floor === true, machine.rules, now);
+    // R3: a file that could not be read stands for "ask" — but not for watching the screen or opening a session.
+    const ignoreDegraded = verdict.decision === 'allow' && (verdict.action === 'observe' || verdict.action === 'session_meta');
+    const ruled = fixed ? null : applyMachineRules(input.toolName, verdict, floor === true, machine.rules, now, { baseAction, ignoreDegraded });
     if (ruled) verdict = { ...verdict, ...ruled };
 
     if (verdict.decision === 'ask') {
@@ -161,6 +168,8 @@ type BuiltinVerdict = Pick<PolicyVerdict, 'decision' | 'reasonCode' | 'ruleId' |
     /** For the R12 message only. */
     appGrade?: AppGrade;
     keyCombo?: string;
+    /** The tool's own group when the arguments made it a different action (a paste is still `keyboard`). */
+    baseAction?: CuaAction;
 };
 
 function cuaDefault(tool: string, input: PolicyCallInput, machine: MachinePolicy, tables: ToolPolicyTables): BuiltinVerdict {
@@ -171,7 +180,8 @@ function cuaDefault(tool: string, input: PolicyCallInput, machine: MachinePolicy
     if (group === 'session_meta') return { ...common, decision: 'allow', reasonCode: 'session_meta', ruleId: 'builtin:session_meta', action: 'session_meta' };
     if (group === 'ask_always') return { ...common, decision: 'ask', reasonCode: 'ask_always_tool', ruleId: 'builtin:ask_always_tool', grantOffer: 'once', floor: true };
 
-    let action: CuaAction = group === 'launch' ? 'app_control' : group;
+    const baseAction: CuaAction = group === 'launch' ? 'app_control' : group;
+    let action: CuaAction = baseAction;
     const keys = keyCheck(tool, input.args, input.platform, tables);
     if (keys.blocked) return { ...common, decision: 'blocked', reasonCode: keys.blocked, ruleId: `builtin:${keys.blocked}`, action, fixed: true, keyCombo: keys.combo };
     if (keys.clipboard) action = keys.clipboard;
@@ -195,13 +205,20 @@ function cuaDefault(tool: string, input: PolicyCallInput, machine: MachinePolicy
         ? { category: 'browser', grade: tables.grades.browser, identifier: 'browser', appName: '브라우저' }
         : classifyApp((input.target as Extract<TargetResolution, { status: 'resolved' }>).app, machine.selfIdentity, tables);
     const target: PolicyTarget = { category: app.category, appName: app.appName, bundleIdOrExe: app.identifier };
-    const scoped = { ...common, action, target, denialKey: `${tool}|${app.identifier}`, auditAllow: action !== 'observe', appGrade: app.grade };
+    const scoped = {
+        ...common, action, target, denialKey: `${tool}|${app.identifier}`, auditAllow: action !== 'observe', appGrade: app.grade,
+        ...(action !== baseAction ? { baseAction } : {}),
+    };
     if (app.grade === 'denied') {
         const reason = app.category === 'self' ? 'self_target' : app.category === 'media' ? 'media_target' : 'denied_app';
         return { ...scoped, decision: 'blocked', reasonCode: reason, ruleId: `builtin:${reason}`, fixed: true };
     }
     if (!gradeAllows(app.grade, tables.cuaDriver.actionMinimumGrade[action])) {
-        return { ...scoped, decision: 'blocked', reasonCode: 'grade_exceeded', ruleId: `builtin:grade_${app.category}` };
+        // Floor: a machine `allow` here reads as a person's `ask`, and its grant covers this action only.
+        return {
+            ...scoped, decision: 'blocked', reasonCode: 'grade_exceeded', ruleId: `builtin:grade_${app.category}`,
+            floor: true, humanOnly: true, grantKeys: [`app:${app.identifier}:${action}`],
+        };
     }
     if (group === 'launch' && hasLaunchArguments(input.args)) {
         return { ...scoped, decision: 'ask', reasonCode: 'launch_with_arguments', ruleId: 'builtin:launch_with_arguments', humanOnly: true, grantOffer: 'once', floor: true };
@@ -232,33 +249,53 @@ function mcpDefault(tool: string, input: PolicyCallInput, machine: MachinePolicy
     return { ...common, decision: 'allow', reasonCode: 'default_allow', ruleId: 'builtin:default_allow' };
 }
 
-/** R2.2: most restrictive matching machine rule; a builtin floor reads its `allow` as `ask`. */
-function applyMachineRules(toolName: string, verdict: PolicyVerdict, floor: boolean, rules: MachineRule[], now: number): Partial<PolicyVerdict> | null {
-    const matching = rules.filter((rule) => (rule.expiresAt === undefined || rule.expiresAt > now)
+/**
+ * R2.2: most restrictive matching machine rule; a builtin floor reads its `allow` as `ask`.
+ * Rules on the tool's base action (`keyboard` for a paste combo) may only tighten the result.
+ */
+function applyMachineRules(
+    toolName: string,
+    verdict: PolicyVerdict,
+    floor: boolean,
+    rules: MachineRule[],
+    now: number,
+    options: { baseAction?: CuaAction; ignoreDegraded: boolean },
+): Partial<PolicyVerdict> | null {
+    const applies = (rule: MachineRule, action: PolicyVerdict['action']) => (rule.expiresAt === undefined || rule.expiresAt > now)
         && toolGlobMatches(rule.tool, toolName)
-        && (rule.action === undefined || rule.action === verdict.action)
-        && (rule.target === undefined || targetMatches(rule.target, verdict.target)));
-    if (matching.length === 0) return null;
+        && (rule.action === undefined || rule.action === action)
+        && (rule.target === undefined || targetMatches(rule.target, verdict.target));
     const rank: Record<ToolPolicyDecision, number> = { allow: 0, ask: 1, blocked: 2 };
     const stricter = (a: MachineRule, b: MachineRule) => (rank[b.decision] > rank[a.decision] ? b : a);
-    // R3: a rule that could not be read stands for "ask", which may tighten but never loosen —
-    // otherwise a half-written file would turn a builtin `blocked` into a prompt someone can approve.
-    const degraded = matching.filter(isDegradedRule);
-    const valid = matching.filter((rule) => !isDegradedRule(rule));
-    if (valid.length === 0) {
-        if (rank[verdict.decision] >= rank.ask) return null;
-        return { decision: 'ask', reasonCode: 'machine_rule_invalid', ruleId: `machine:${degraded[0].id}` };
+    const ruled = ruleDecision(rules.filter((rule) => applies(rule, verdict.action) && !(options.ignoreDegraded && isDegradedRule(rule))));
+    if (!options.baseAction) return ruled;
+    const tightening = rules.filter((rule) => rule.action === options.baseAction && !isDegradedRule(rule) && applies(rule, options.baseAction));
+    if (tightening.length === 0) return ruled;
+    const strictest = tightening.reduce(stricter);
+    if (rank[strictest.decision] <= rank[ruled?.decision ?? verdict.decision]) return ruled;
+    return { decision: strictest.decision, reasonCode: 'machine_rule', ruleId: `machine:${strictest.id}` };
+
+    function ruleDecision(matching: MachineRule[]): Partial<PolicyVerdict> | null {
+        if (matching.length === 0) return null;
+        // R3: a rule that could not be read stands for "ask", which may tighten but never loosen —
+        // otherwise a half-written file would turn a builtin `blocked` into a prompt someone can approve.
+        const degraded = matching.filter(isDegradedRule);
+        const valid = matching.filter((rule) => !isDegradedRule(rule));
+        if (valid.length === 0) {
+            if (rank[verdict.decision] >= rank.ask) return null;
+            return { decision: 'ask', reasonCode: 'machine_rule_invalid', ruleId: `machine:${degraded[0].id}` };
+        }
+        const strictest = valid.reduce(stricter);
+        const decision = strictest.decision === 'allow' && floor ? 'ask' : strictest.decision;
+        if (degraded.length > 0 && rank[decision] < rank.ask) {
+            return { decision: 'ask', reasonCode: 'machine_rule_invalid', ruleId: `machine:${degraded[0].id}` };
+        }
+        return {
+            decision,
+            reasonCode: decision !== strictest.decision ? 'floor' : 'machine_rule',
+            ruleId: `machine:${strictest.id}`,
+        };
     }
-    const strictest = valid.reduce(stricter);
-    const ruled = strictest.decision === 'allow' && floor ? 'ask' : strictest.decision;
-    if (degraded.length > 0 && rank[ruled] < rank.ask) {
-        return { decision: 'ask', reasonCode: 'machine_rule_invalid', ruleId: `machine:${degraded[0].id}` };
-    }
-    return {
-        decision: ruled,
-        reasonCode: ruled !== strictest.decision ? 'floor' : 'machine_rule',
-        ruleId: `machine:${strictest.id}`,
-    };
 }
 
 function isDegradedRule(rule: MachineRule): boolean {
@@ -314,6 +351,11 @@ function hasLaunchArguments(args: Record<string, unknown>): boolean {
     return nonEmpty(args.urls) || nonEmpty(args.additional_arguments) || args.webkit_inspector_port !== undefined;
 }
 
+function hasNonIntegerPid(args: Record<string, unknown>): boolean {
+    if (args.pid !== undefined && !Number.isInteger(args.pid)) return true;
+    return isRecord(args.target) && args.target.pid !== undefined && !Number.isInteger(args.target.pid);
+}
+
 function pidOf(args: Record<string, unknown>): number | undefined {
     if (Number.isInteger(args.pid)) return args.pid as number;
     if (isRecord(args.target) && args.target.kind === 'window' && Number.isInteger(args.target.pid)) return args.target.pid as number;
@@ -357,9 +399,14 @@ function keyCheck(tool: string, args: Record<string, unknown>, platform: NodeJS.
     return { clipboard, modifiers: tool === 'click' ? mods.size : 0, combo };
 }
 
-/** R8 verb dictionary: the first of the first two words that is an exact dictionary word. */
+/**
+ * R8 verb dictionary: the first of the first two words that is an exact dictionary word — unless
+ * the first word is a noun the dictionary also lists (`message`, `email`) and the second is a read
+ * verb (`message_list`): that tool reads.
+ */
 export function verbOf(tool: string, tables: ToolPolicyTables = BUILTIN_TABLES): 'high' | 'write' | null {
     const words = tool.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().split(/[_\-.]+/).filter(Boolean).slice(0, 2);
+    if (words.length === 2 && tables.mcp.nounFirstWords.includes(words[0]) && tables.mcp.readVerbs.includes(words[1])) return null;
     for (const word of words) {
         if (tables.mcp.highRiskVerbs.includes(word)) return 'high';
         if (tables.mcp.writeVerbs.includes(word)) return 'write';

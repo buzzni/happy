@@ -30,6 +30,10 @@ interface AppMatchers {
     exeNames?: string[];
     processNames?: string[];
     nameIncludes?: string[];
+    /** Lowercase prefixes of the display name or executable basename (helpers: `Saycode Helper (Renderer)`). */
+    namePrefixes?: string[];
+    /** Lowercase fragments of the executable path (`/saycode.app/` covers every helper inside the bundle). */
+    pathIncludes?: string[];
 }
 
 export interface ToolPolicyTables {
@@ -47,7 +51,14 @@ export interface ToolPolicyTables {
         maxKeysPerAction: number;
     };
     systemKeyCombos: Partial<Record<NodeJS.Platform, string[]>>;
-    mcp: { excludedServers: string[]; highRiskVerbs: string[]; writeVerbs: string[] };
+    mcp: {
+        excludedServers: string[];
+        highRiskVerbs: string[];
+        writeVerbs: string[];
+        /** Dictionary words that are also nouns; followed by a read verb they name a read tool. */
+        nounFirstWords: string[];
+        readVerbs: string[];
+    };
 }
 
 export const BUILTIN_TABLES: ToolPolicyTables = tablesJson as unknown as ToolPolicyTables;
@@ -246,6 +257,10 @@ function categoryOf(app: AppIdentity, self: SelfIdentity, tables: ToolPolicyTabl
     if (app.bundleId && (inList(apps.self.bundleIds, app.bundleId) || self.bundleIds.includes(app.bundleId)
         || (apps.self.bundleIdPrefixes ?? []).some((prefix) => app.bundleId!.startsWith(prefix)))) return 'self';
     if (exe && (inList(apps.self.exeNames, exe) || self.exeNames.includes(exe))) return 'self';
+    // `ps` fallback and `launch_app {name}` see only a path or a name; helpers live inside the app bundle.
+    const path = app.executable?.toLowerCase();
+    if (path && (apps.self.pathIncludes ?? []).some((part) => path.includes(part))) return 'self';
+    if ([exe, name].some((value) => value && (apps.self.namePrefixes ?? []).some((prefix) => value.startsWith(prefix)))) return 'self';
 
     if (isMedia(app, exe, name, tables)) return 'media';
 
