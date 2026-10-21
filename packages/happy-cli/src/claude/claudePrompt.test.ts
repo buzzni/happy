@@ -1,4 +1,5 @@
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
+import { CLAUDE_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { describe, expect, it } from 'vitest';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 
@@ -105,4 +106,15 @@ it('includes active checkpoint facts with client instructions and leaves inactiv
   const custom = buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', customSystemPrompt: 'USER CUSTOM', checkpointGuidance: 'ACTIVE CHECKPOINT FACTS' });
   expect(custom.customSystemPrompt).toBe('USER CUSTOM\n\nACTIVE CHECKPOINT FACTS');
   expect(buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', checkpointGuidance: '' }).appendSystemPrompt).not.toContain('CHECKPOINT');
+});
+
+describe('next-steps card guidance', () => {
+  it('rides with Saycode prompts and drops with the master switch', () => {
+    const on = buildClaudeSystemPromptOptions({ saycodeSystemPrompt: '', appendSystemPrompt: 'USER', nextStepsPrompt: CLAUDE_NEXT_STEPS_PROMPT });
+    expect(on.appendSystemPrompt).toContain('mcp__happy__next_steps');
+    expect(on.appendSystemPrompt).not.toContain('update_plan');
+    expect(buildClaudeSystemPromptOptions({
+      saycodeSystemPrompt: '', appendSystemPrompt: 'USER', nextStepsPrompt: CLAUDE_NEXT_STEPS_PROMPT, saycodeSystemPromptEnabled: false,
+    }).appendSystemPrompt).toBe('USER');
+  });
 });

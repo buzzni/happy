@@ -46,6 +46,7 @@ import { isConnectorPlatformConfigured, readExpectedConnectors, readExpectedMcpS
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
 import { buildClaudeSystemPromptOptions } from './claudePrompt';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
+import { CLAUDE_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv';
 import type { CheckpointSessionComposition, CheckpointTurnPreparation } from '@/checkpoint/checkpointSessionComposition';
 import { CheckpointWriterProcessTree } from '@/checkpoint/checkpointWriterProcessTree';
@@ -483,6 +484,7 @@ async function runClaudeRemote(
         workerDelegationPrompt: workerAgents.delegationPrompt,
         connectorGuidance,
         checkpointGuidance: await opts.checkpointGuidance?.(),
+        nextStepsPrompt: CLAUDE_NEXT_STEPS_PROMPT,
         saycodeSystemPromptEnabled: initial.mode.saycodeSystemPromptEnabled,
         saycodePromptBlocks: initial.mode.saycodePromptBlocks,
     });

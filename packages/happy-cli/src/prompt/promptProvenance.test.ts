@@ -15,6 +15,7 @@ describe('prompt provenance inventory', () => {
     expect(PROMPT_BLOCK_PROVENANCE).toEqual({
       'common:agent-orchestration': 'saycode',
       'common:api-gateway': 'saycode',
+      'common:next-steps': 'saycode',
       'claude:title': 'always-on',
       'claude:co-authored-credit': 'saycode',
       'claude:orchestrator': 'selected-feature',

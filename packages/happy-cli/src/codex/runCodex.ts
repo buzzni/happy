@@ -130,6 +130,7 @@ import { createCodexExecTitleRunner, isOffTurnTitleEligible } from './codexOffTu
 import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
 import { discoverCodexSkillCommands } from './codexSkills';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
+import { CODEX_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import {
@@ -1873,6 +1874,7 @@ export async function runCodex(opts: {
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         ...(runtimeGate ? { admitTool: <T,>(work: () => Promise<T>) => runtimeGate.admit(work, 'writer') } : {}),
         ...(accountToken !== null ? { proposeLesson: lessonProposalTurn.submit } : {}),
+        turnCards: 'codex',
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
@@ -2293,6 +2295,7 @@ export async function runCodex(opts: {
                                     connectorGuidance: buildConnectorGuidance(mcpServers),
                                     checkpointGuidance,
                                     agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
+                                    nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT,
                                     mode: message.mode,
                                 });
                                 const resumed = await client.resumeThread({
@@ -2311,6 +2314,7 @@ export async function runCodex(opts: {
                         connectorGuidance: buildConnectorGuidance(mcpSync.mcpServers),
                         checkpointGuidance,
                         agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
+                        nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT,
                         mode: message.mode,
                     });
                     if (client.threadId && nextDeveloperInstructions !== currentDeveloperInstructions) {

@@ -1,4 +1,5 @@
 import { SAYCODE_API_GATEWAY_PROMPT } from '@/prompt/saycodeApiGatewayPrompt';
+import { CODEX_NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { describe, expect, it } from 'vitest';
 import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 
@@ -270,4 +271,13 @@ it('adds active checkpoint facts to Codex developer instructions without changin
     const active = buildCodexDeveloperInstructions({ checkpointGuidance: 'ACTIVE CHECKPOINT FACTS', mode: { saycodeSystemPromptEnabled: true, appendSystemPrompt: 'USER CONTEXT' } });
     expect(active).toContain('ACTIVE CHECKPOINT FACTS'); expect(active).toContain('USER CONTEXT');
     expect(buildCodexDeveloperInstructions({ checkpointGuidance: '', mode: {} })).not.toContain('CHECKPOINT');
+});
+
+describe('next-steps card and task list guidance', () => {
+    it('tells Codex about both turn cards and drops them with the master switch', () => {
+        const on = buildCodexDeveloperInstructions({ nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT, mode: {} });
+        expect(on).toContain('mcp__happy__next_steps');
+        expect(on).toContain('mcp__happy__update_plan');
+        expect(buildCodexDeveloperInstructions({ nextStepsPrompt: CODEX_NEXT_STEPS_PROMPT, mode: { saycodeSystemPromptEnabled: false } })).toBeUndefined();
+    });
 });

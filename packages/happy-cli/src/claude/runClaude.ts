@@ -730,6 +730,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         mandatorySandbox: sandboxPolicyMode === 'mandatory',
         sameUidSandbox: Boolean(scopeLaunch),
         ...(principal.kind === 'account' ? { proposeLesson: lessonProposalTurn.submit } : {}),
+        turnCards: 'claude',
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,

@@ -59,11 +59,14 @@ export function buildCodexDeveloperInstructions({
     connectorGuidance,
     checkpointGuidance,
     agentOrchestrationPrompt,
+    nextStepsPrompt,
     mode,
 }: {
     connectorGuidance?: string;
     checkpointGuidance?: string;
     agentOrchestrationPrompt?: string;
+    /** Turn-card guidance (common:next-steps); Saycode-owned, so it follows the master switch. */
+    nextStepsPrompt?: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled' | 'saycodePromptBlocks'>;
 }): string | undefined {
     const blocks = [connectorGuidance, checkpointGuidance];
@@ -81,7 +84,7 @@ export function buildCodexDeveloperInstructions({
         blocks.push(splitClientTurnPromptBlocks(mode.appendSystemPrompt).standing);
     }
     if (mode.saycodeSystemPromptEnabled !== false) {
-        blocks.push(SAYCODE_API_GATEWAY_PROMPT);
+        blocks.push(SAYCODE_API_GATEWAY_PROMPT, nextStepsPrompt);
     }
     return blocks.filter((block): block is string => Boolean(block)).join('\n\n') || undefined;
 }

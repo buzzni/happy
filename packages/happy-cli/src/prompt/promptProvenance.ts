@@ -22,6 +22,7 @@ export type PromptProvenance =
 export const PROMPT_BLOCK_PROVENANCE = {
   'common:agent-orchestration': 'saycode',
   'common:api-gateway': 'saycode',
+  'common:next-steps': 'saycode',
   'claude:title': 'always-on',
   'claude:co-authored-credit': 'saycode',
   'claude:orchestrator': 'selected-feature',
@@ -37,7 +38,7 @@ export const PROMPT_BLOCK_PROVENANCE = {
 } as const satisfies Record<string, PromptProvenance>;
 
 /** Saycode-owned blocks controlled only by the existing master prompt switch. */
-export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = ['common:api-gateway'] as const satisfies readonly PromptBlockId[];
+export const SAYCODE_MASTER_PROMPT_PROVENANCE_IDS = ['common:api-gateway', 'common:next-steps'] as const satisfies readonly PromptBlockId[];
 
 export type PromptBlockId = keyof typeof PROMPT_BLOCK_PROVENANCE;
 
