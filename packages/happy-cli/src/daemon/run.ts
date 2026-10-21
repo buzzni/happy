@@ -379,6 +379,7 @@ import {
 } from '@/modules/common/typedMachineRun';
 import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { hostManagedMachineTools } from '@/modules/common/moaiMachineRunProfiles';
+import { toolPolicyMachineCapability, toolPolicyMetadataUpdate } from '@/toolPolicy/claudeHook';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -420,6 +421,7 @@ export const initialMachineMetadata: MachineMetadata = {
   worktreeOps: WORKTREE_OPS_CAPABILITY,
   projectPurge: PROJECT_PURGE_CAPABILITY,
   ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
+  ...(toolPolicyMachineCapability(process.env) ? { toolPolicy: toolPolicyMachineCapability(process.env) } : {}),
 };
 
 // Agent children import the base metadata to register their existing machine.
@@ -4115,6 +4117,12 @@ export async function startDaemon(): Promise<void> {
     if (agentBrowserMetadataUpdate(machine.metadata, agentBrowserMachineCapability())) {
       void apiMachine.updateMachineMetadata((metadata) => agentBrowserMetadataUpdate(metadata, agentBrowserMachineCapability()) ?? metadata!)
         .catch((error) => logger.debug('[DAEMON RUN] agent browser capability not published', error));
+    }
+    // Same for the tool policy capability (aplus-dev-studio specs/agent-tool-policy): Desktop must not
+    // claim enforcement the daemon is not doing, nor miss enforcement it is.
+    if (toolPolicyMetadataUpdate(machine.metadata, toolPolicyMachineCapability(process.env))) {
+      void apiMachine.updateMachineMetadata((metadata) => toolPolicyMetadataUpdate(metadata, toolPolicyMachineCapability(process.env)) ?? metadata!)
+        .catch((error) => logger.debug('[DAEMON RUN] tool policy capability not published', error));
     }
     /** Set only for a managed runtime; the beat below keeps it current. */
     let managedCredentialState: {

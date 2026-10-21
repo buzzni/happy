@@ -93,6 +93,7 @@ export default defineConfig({
                     testTimeout: 180_000,
                     include: [
                         'src/claude/planMode.integration.test.ts',
+                        'src/toolPolicy/claudeHook.integration.test.ts',
                     ],
                     sequence: {
                         groupOrder: 1,

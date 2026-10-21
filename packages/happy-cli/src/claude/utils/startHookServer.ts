@@ -58,7 +58,12 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse, Server } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { logger } from '@/ui/logger';
+import type { HookVerdict, PreToolUseCall } from '@/toolPolicy/policyGate';
+
+/** Header carrying the per-process secret the policy hook script reads from its 0600 file. */
+export const PRE_TOOL_USE_SECRET_HEADER = 'x-happy-hook-secret';
 
 /**
  * Data received from Claude's SessionStart hook
@@ -76,6 +81,15 @@ export interface SessionHookData {
 export interface HookServerOptions {
     /** Called when a session hook is received with a valid session ID */
     onSessionHook: (sessionId: string, data: SessionHookData) => void;
+    /**
+     * Tool policy (aplus-dev-studio specs/agent-tool-policy). The response is held until the
+     * decision is final — for `ask` that is a person's answer — and the decision is aborted when
+     * the hook process goes away.
+     */
+    preToolUse?: {
+        secret: string;
+        decide: (call: PreToolUseCall, signal: AbortSignal) => Promise<HookVerdict>;
+    };
 }
 
 export interface HookServer {
@@ -92,7 +106,7 @@ export interface HookServer {
  * @returns Promise resolving to the server instance with port info
  */
 export async function startHookServer(options: HookServerOptions): Promise<HookServer> {
-    const { onSessionHook } = options;
+    const { onSessionHook, preToolUse } = options;
 
     return new Promise((resolve, reject) => {
         const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -143,6 +157,11 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                 return;
             }
 
+            if (req.method === 'POST' && req.url === '/hook/pre-tool-use' && preToolUse) {
+                await handlePreToolUse(req, res, preToolUse);
+                return;
+            }
+
             // 404 for anything else
             res.writeHead(404).end('not found');
         });
@@ -174,3 +193,48 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
     });
 }
 
+
+/**
+ * Every refusal here is a 4xx/5xx, which the hook script turns into `deny` + exit 2: no answer
+ * from this server ever lets a tool call through.
+ */
+async function handlePreToolUse(
+    req: IncomingMessage,
+    res: ServerResponse,
+    preToolUse: NonNullable<HookServerOptions['preToolUse']>,
+): Promise<void> {
+    const presented = req.headers[PRE_TOOL_USE_SECRET_HEADER];
+    if (typeof presented !== 'string' || !secretMatches(presented, preToolUse.secret)) {
+        res.writeHead(403).end('forbidden');
+        return;
+    }
+    const controller = new AbortController();
+    // The hook process was killed or timed out: nobody will read the answer, so stop waiting.
+    res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+    try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const data = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as Record<string, unknown>;
+        if (typeof data.tool_name !== 'string') {
+            res.writeHead(400).end('missing tool_name');
+            return;
+        }
+        const verdict = await preToolUse.decide({
+            toolName: data.tool_name,
+            toolInput: data.tool_input,
+            toolUseId: typeof data.tool_use_id === 'string' ? data.tool_use_id : undefined,
+        }, controller.signal);
+        if (!res.writableEnded && !res.destroyed) {
+            res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(verdict));
+        }
+    } catch (error) {
+        logger.debug('[hookServer] pre-tool-use failed:', error);
+        if (!res.headersSent) res.writeHead(500).end('error');
+    }
+}
+
+function secretMatches(presented: string, expected: string): boolean {
+    const a = Buffer.from(presented);
+    const b = Buffer.from(expected);
+    return a.length === b.length && timingSafeEqual(a, b);
+}

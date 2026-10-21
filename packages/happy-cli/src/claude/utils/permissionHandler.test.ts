@@ -214,6 +214,8 @@ describe('PermissionHandler external channel answers', () => {
             { mode: 'bypassPermissions' },
             { updatedInput: { command: 'rm -rf /' } },
             { decision: 'approved_for_session' },
+            // A conversation-wide tool policy grant is scope-widening too (agent-tool-policy R11.4).
+            { policyGrant: 'session' },
         ]) {
             const ack = await stub.answer({
                 id: 'tool-call-1', approved: true, channelClaim: CLAIM, ...extra,
@@ -844,5 +846,60 @@ describe('a non-binary prompt is observed as guidance but never answerable', () 
         await queue.flush();
         expect(published).toEqual([]);
         expect(handler.channelBindingFor('tool-call-1')).toBeUndefined();
+    });
+});
+
+describe('PermissionHandler tool policy approvals (aplus-dev-studio specs/agent-tool-policy R11)', () => {
+    const POLICY = {
+        reasonCode: 'first_app_use', ruleId: 'builtin:first_app_use', humanOnly: false, grantOffer: 'session' as const,
+        target: { category: 'other' as const, appName: 'Notes', bundleIdOrExe: 'com.apple.Notes' }, action: 'pointer' as const,
+    };
+
+    function ask(stub: ReturnType<typeof createRecordingSessionStub>, signal = new AbortController().signal) {
+        const handler = new PermissionHandler(stub.session);
+        return handler.requestPolicyApproval({ id: 'toolu_policy', toolName: 'mcp__cua-driver__click', args: { pid: 13 }, policy: POLICY, signal });
+    }
+
+    it('raises an ordinary request that also carries the policy metadata', async () => {
+        const stub = createRecordingSessionStub();
+        const answered = ask(stub);
+        const requests = stub.state().requests as Record<string, Record<string, unknown>>;
+        expect(requests.toolu_policy).toMatchObject({ tool: 'mcp__cua-driver__click', arguments: { pid: 13 }, policy: POLICY });
+        await stub.answer({ id: 'toolu_policy', approved: true, policyGrant: 'session' });
+        await expect(answered).resolves.toEqual({ approved: true, policyGrant: 'session' });
+    });
+
+    it('reads an answer from a client that predates the policy as "once"', async () => {
+        const stub = createRecordingSessionStub();
+        const answered = ask(stub);
+        await stub.answer({ id: 'toolu_policy', approved: true });
+        await expect(answered).resolves.toEqual({ approved: true, policyGrant: 'once' });
+    });
+
+    it('reports a refusal with the person\'s reason', async () => {
+        const stub = createRecordingSessionStub();
+        const answered = ask(stub);
+        await stub.answer({ id: 'toolu_policy', approved: false, reason: 'not now' });
+        await expect(answered).resolves.toEqual({ approved: false, policyGrant: 'once', reason: 'not now' });
+    });
+
+    it('raises nothing for a caller that has already given up', async () => {
+        const stub = createRecordingSessionStub();
+        const controller = new AbortController();
+        controller.abort();
+        await expect(ask(stub, controller.signal)).rejects.toThrow();
+        expect(stub.state().requests).toBeUndefined();
+    });
+
+    it('withdraws the request from the agent state when the caller gives up', async () => {
+        const stub = createRecordingSessionStub();
+        const controller = new AbortController();
+        const answered = ask(stub, controller.signal);
+        controller.abort();
+        await expect(answered).rejects.toThrow();
+        const state = stub.state() as { requests: Record<string, unknown>; completedRequests: Record<string, Record<string, unknown>> };
+        expect(state.requests).toEqual({});
+        expect(state.completedRequests.toolu_policy).toMatchObject({ status: 'canceled', reason: 'Tool policy approval withdrawn', policy: POLICY });
+        expect(await stub.answer({ id: 'toolu_policy', approved: true })).toMatchObject({ applied: false });
     });
 });

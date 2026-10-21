@@ -25,6 +25,8 @@ import { initialMachineMetadata } from '@/daemon/run';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
+import { createClaudeToolPolicyRuntime, isToolPolicyEnabled } from '@/toolPolicy/claudeHook';
+import { REMOTE_GRANT_TTL_MS } from '@/toolPolicy/grants';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { claudeLocal } from '@/claude/claudeLocal';
@@ -755,8 +757,23 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Used by hook server to notify Session when Claude changes session ID
     let currentSession: Session | null = null;
 
+    // Tool policy (aplus-dev-studio specs/agent-tool-policy I1a): every `mcp__*` call goes through
+    // the PreToolUse hook to this gate. The daemon cannot yet tell whether a session was started on
+    // this PC, so every conversation grant gets the remote-session TTL until Desktop reports it.
+    const toolPolicy = isToolPolicyEnabled(process.env)
+        ? createClaudeToolPolicyRuntime({
+            happyHomeDir: configuration.happyHomeDir,
+            sessionId: () => session.sessionId,
+            publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
+            approver: () => currentSession?.policyApprover ?? null,
+            unattended: exitAfterFirstTurn,
+            grantTtlMs: REMOTE_GRANT_TTL_MS,
+        })
+        : null;
+
     // Start Hook server for receiving Claude session notifications
     const hookServer = await startHookServer({
+        ...(toolPolicy ? { preToolUse: { secret: toolPolicy.secret, decide: toolPolicy.gate.decide } } : {}),
         onSessionHook: (sessionId, data) => {
             logger.debug(`[START] Session hook received: ${sessionId}`, data);
 
@@ -788,7 +805,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     logger.debug(`[START] Hook server started on port ${hookServer.port}`);
 
     // Generate hook settings file for Claude
-    const hookSettingsPath = generateHookSettingsFile(hookServer.port);
+    const hookSettingsPath = generateHookSettingsFile(hookServer.port, toolPolicy ? { secretFile: toolPolicy.secretFile, policyFile: toolPolicy.policyFile } : undefined);
 
     // Titles a new chat outside the user's turn with claudeRemote's own launch
     // options (see claudeOffTurnTitle). Managed runs, process sandboxes (scoped
@@ -1629,6 +1646,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         });
     });
     session.onUserMessage((message) => {
+        // R13: the person's next message lifts "you just declined this" memory.
+        toolPolicy?.grants.onUserMessage();
         // A managed run answers exactly the prompt its envelope was admitted
         // for. A message posted to this session by the account owner arrives
         // here as an ordinary user turn: it would change the model, the
@@ -1803,6 +1822,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             offTurnTitle.cancel();
             hookServer.stop();
             cleanupHookSettingsFile(hookSettingsPath);
+            toolPolicy?.dispose();
 
             // Stop the remote JSONL scanner (file watchers + intervals).
             await remoteScanner.cleanup();
@@ -2051,6 +2071,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     offTurnTitle.cancel();
     hookServer.stop();
     cleanupHookSettingsFile(hookSettingsPath);
+    toolPolicy?.dispose();
     logger.debug('Stopped Hook server and cleaned up settings file');
 
     launchControl?.close();

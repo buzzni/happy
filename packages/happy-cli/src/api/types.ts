@@ -7,6 +7,8 @@ import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
 import type { SessionSource } from '@/utils/sessionSource'
+import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate'
+import type { ToolPolicyAuditRecord } from '@/toolPolicy/audit'
 import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
 export {
@@ -272,6 +274,13 @@ export const MachineMetadataSchema = z.object({
   }).optional(),
   /** Current tracked-child presence via encrypted machine RPC (BYOS only). */
   daemonSessionState: z.object({ version: z.literal(1) }).optional(),
+  /**
+   * aplus-dev-studio specs/agent-tool-policy — this daemon decides `mcp__*` calls before they run.
+   * `enforcement` names the adapters in force (I1b adds `cua-proxy`, `codex-bridge`); a plain string
+   * array so a newer daemon's value never makes an older client drop the field. Absent: no policy
+   * (older daemon, or `HAPPY_TOOL_POLICY=off`) — Desktop must not claim rules are enforced.
+   */
+  toolPolicy: z.object({ version: z.literal(1), enforcement: z.array(z.string()) }).optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound machine-scope requests (BYOS only). */
   rpcBinding: rpcBindingCapabilitySchema.optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — runs `spawn-with-sealed-env`. */
@@ -605,7 +614,9 @@ export type AgentState = {
     [id: string]: {
       tool: string,
       arguments: any,
-      createdAt: number
+      createdAt: number,
+      /** aplus-dev-studio specs/agent-tool-policy R11 — present only on a tool policy `ask`. */
+      policy?: PermissionPolicyMeta
     }
   }
   completedRequests?: {
@@ -616,6 +627,7 @@ export type AgentState = {
       completedAt: number,
       status: 'canceled' | 'denied' | 'approved',
       reason?: string,
+      policy?: PermissionPolicyMeta,
       mode?: PermissionMode,
       decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
       allowTools?: string[]
@@ -624,6 +636,8 @@ export type AgentState = {
   agentGoalStatus?: AgentGoalStatus
   /** A turn waiting to retry after a temporary API failure; `null` once it ran or was cancelled. */
   transientRetry?: AgentTransientRetry | null
+  /** aplus-dev-studio specs/agent-tool-policy R16 — latest 50 `ask`/`blocked` decisions, no arguments. */
+  toolPolicy?: { recent: ToolPolicyAuditRecord[] }
 }
 
 /**

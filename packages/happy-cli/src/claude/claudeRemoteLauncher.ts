@@ -221,6 +221,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    session.policyApprover = permissionHandler;
     let mcpStatusReader: Pick<McpRuntimeRecovery, 'readStatuses'> | null = null;
     let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
     registerMcpReconnectHandler(
@@ -1331,6 +1332,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         setupTokenSwitching?.dispose();
 
         // Clean up permission handler
+        session.policyApprover = null;
         permissionHandler.reset();
 
         // Reset Terminal
