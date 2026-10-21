@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { evaluateToolCall, requiredCuaTarget, verbOf, type PolicyCallInput, type PolicyGrantView } from './evaluate';
+import { coverageGaps, evaluateToolCall, requiredCuaTarget, verbOf, type PolicyCallInput, type PolicyGrantView } from './evaluate';
 import { ABSENT_MACHINE_POLICY, parseMachinePolicy, type AppIdentity, type MachinePolicy } from './rules';
 
 const NO_GRANTS: PolicyGrantView = { hasGrant: () => false, recentlyDenied: () => false };
@@ -339,5 +339,47 @@ describe('combination order (R2, R3, R13)', () => {
         const input = cua('click', { pid: 13 }, NOTES);
         expect(decide(input)).toEqual(decide(input));
         expect(decide(input).policyVersion).toMatch(/^\d{4}-\d{2}-\d{2}\.\d+$/);
+    });
+});
+
+describe('coverage audit (R9)', () => {
+    const machine = (rules: unknown[]) => parseMachinePolicy({ version: 1, revision: 1, rules });
+
+    it('flags write tools that no rule names, judging by annotations where the server sends them', () => {
+        const gaps = coverageGaps([
+            { name: 'mcp__notion__notion-update-page' },
+            { name: 'mcp__notion__notion-search' },
+            { name: 'mcp__gmail__send_email' },
+            { name: 'mcp__gh__create_issue', annotations: { readOnlyHint: true } },
+            { name: 'mcp__gh__get_issue', annotations: { destructiveHint: true } },
+            { name: 'mcp__gh__list_issues', annotations: { readOnlyHint: true } },
+        ], ABSENT_MACHINE_POLICY);
+        expect(gaps).toEqual([
+            { tool: 'mcp__notion__notion-update-page', reasonCode: 'unlisted_write_tool', decision: 'allow' },
+            { tool: 'mcp__gmail__send_email', reasonCode: 'unlisted_write_tool', decision: 'ask' },
+            { tool: 'mcp__gh__get_issue', reasonCode: 'unlisted_write_tool', decision: 'allow' },
+        ]);
+    });
+
+    it('treats a rule naming the tool, or a wildcard that is not allow, as coverage', () => {
+        const gaps = coverageGaps([
+            { name: 'mcp__notion__notion-update-page' },
+            { name: 'mcp__notion__notion-create-pages' },
+            { name: 'mcp__linear__create_issue' },
+        ], machine([
+            { id: 'r1', tool: 'mcp__notion__notion-update-page', decision: 'allow', scope: 'machine', source: 'machine' },
+            { id: 'r2', tool: 'mcp__linear__*', decision: 'ask', scope: 'machine', source: 'machine' },
+            { id: 'r3', tool: 'mcp__notion__*', decision: 'allow', scope: 'machine', source: 'machine' },
+        ]));
+        expect(gaps.map((gap) => gap.tool)).toEqual(['mcp__notion__notion-create-pages']);
+    });
+
+    it('flags cua-driver tools the action table does not classify, and skips Saycode servers', () => {
+        const gaps = coverageGaps([
+            { name: 'mcp__cua-driver__click' },
+            { name: 'mcp__cua-driver__teleport_window' },
+            { name: 'mcp__happy__delete_everything' },
+        ], ABSENT_MACHINE_POLICY);
+        expect(gaps).toEqual([{ tool: 'mcp__cua-driver__teleport_window', reasonCode: 'unlisted_tool', decision: 'ask' }]);
     });
 });

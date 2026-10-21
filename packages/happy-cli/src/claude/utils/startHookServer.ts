@@ -60,6 +60,7 @@
 import { createServer, IncomingMessage, ServerResponse, Server } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { logger } from '@/ui/logger';
+import type { ListedTool } from '@/toolPolicy/evaluate';
 import type { HookVerdict, PreToolUseCall } from '@/toolPolicy/policyGate';
 
 /** Header carrying the per-process secret the policy hook script reads from its 0600 file. */
@@ -89,6 +90,8 @@ export interface HookServerOptions {
     preToolUse?: {
         secret: string;
         decide: (call: PreToolUseCall, signal: AbortSignal) => Promise<HookVerdict>;
+        /** R9: the cua-driver shadow proxy and the stdio bridge report what their server lists. */
+        toolsListed?: (tools: ListedTool[]) => void;
     };
 }
 
@@ -162,6 +165,11 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                 return;
             }
 
+            if (req.method === 'POST' && req.url === '/hook/tools-listed' && preToolUse) {
+                await handleToolsListed(req, res, preToolUse);
+                return;
+            }
+
             // 404 for anything else
             res.writeHead(404).end('not found');
         });
@@ -219,10 +227,15 @@ async function handlePreToolUse(
             res.writeHead(400).end('missing tool_name');
             return;
         }
+        const annotations = readAnnotations(data.annotations);
         const verdict = await preToolUse.decide({
             toolName: data.tool_name,
             toolInput: data.tool_input,
             toolUseId: typeof data.tool_use_id === 'string' ? data.tool_use_id : undefined,
+            // Only the proxy and the bridge send these; the Claude hook payload never has them.
+            ...(data.origin === 'cua-proxy' || data.origin === 'bridge' ? { origin: data.origin } : {}),
+            ...(Number.isInteger(data.element_pid) ? { elementPid: data.element_pid as number } : {}),
+            ...(annotations ? { annotations } : {}),
         }, controller.signal);
         if (!res.writableEnded && !res.destroyed) {
             res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(verdict));
@@ -231,6 +244,43 @@ async function handlePreToolUse(
         logger.debug('[hookServer] pre-tool-use failed:', error);
         if (!res.headersSent) res.writeHead(500).end('error');
     }
+}
+
+async function handleToolsListed(
+    req: IncomingMessage,
+    res: ServerResponse,
+    preToolUse: NonNullable<HookServerOptions['preToolUse']>,
+): Promise<void> {
+    const presented = req.headers[PRE_TOOL_USE_SECRET_HEADER];
+    if (typeof presented !== 'string' || !secretMatches(presented, preToolUse.secret)) {
+        res.writeHead(403).end('forbidden');
+        return;
+    }
+    try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const data = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as { tools?: unknown };
+        const tools: ListedTool[] = [];
+        for (const tool of Array.isArray(data.tools) ? data.tools : []) {
+            if (typeof tool?.name !== 'string') continue;
+            const annotations = readAnnotations(tool.annotations);
+            tools.push({ name: tool.name, ...(annotations ? { annotations } : {}) });
+        }
+        preToolUse.toolsListed?.(tools);
+        res.writeHead(204).end();
+    } catch (error) {
+        logger.debug('[hookServer] tools-listed failed:', error);
+        if (!res.headersSent) res.writeHead(400).end('bad request');
+    }
+}
+
+function readAnnotations(value: unknown): PreToolUseCall['annotations'] | undefined {
+    if (typeof value !== 'object' || value === null) return undefined;
+    const { readOnlyHint, destructiveHint } = value as Record<string, unknown>;
+    return {
+        ...(typeof readOnlyHint === 'boolean' ? { readOnlyHint } : {}),
+        ...(typeof destructiveHint === 'boolean' ? { destructiveHint } : {}),
+    };
 }
 
 function secretMatches(presented: string, expected: string): boolean {

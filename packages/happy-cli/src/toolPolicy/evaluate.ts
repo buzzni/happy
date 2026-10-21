@@ -307,6 +307,42 @@ function targetMatches(ruleTarget: string, target: PolicyTarget | undefined): bo
     return ruleTarget === target.category || ruleTarget.toLowerCase() === target.bundleIdOrExe.toLowerCase();
 }
 
+export interface ListedTool {
+    /** Full `mcp__<server>__<tool>` name. */
+    name: string;
+    annotations?: PolicyCallInput['annotations'];
+}
+
+export interface CoverageGap {
+    tool: string;
+    reasonCode: 'unlisted_tool' | 'unlisted_write_tool';
+    /** What the builtin default makes of a call to it today. */
+    decision: ToolPolicyDecision;
+}
+
+/**
+ * R9: tools a server lists that a server upgrade could open without anyone deciding — a write tool
+ * no machine rule names (a wildcard `allow` does not count), or a cua-driver tool the action table
+ * does not classify. Annotations are used only where the adapter saw `tools/list`.
+ */
+export function coverageGaps(tools: ListedTool[], machine: MachinePolicy, tables: ToolPolicyTables = BUILTIN_TABLES): CoverageGap[] {
+    const gaps: CoverageGap[] = [];
+    for (const listed of tools) {
+        const parsed = parseMcpToolName(listed.name);
+        if (!parsed || tables.mcp.excludedServers.includes(parsed.server)) continue;
+        if (parsed.server === tables.cuaDriver.server) {
+            if (cuaToolGroup(parsed.tool, tables) === undefined) gaps.push({ tool: listed.name, reasonCode: 'unlisted_tool', decision: 'ask' });
+            continue;
+        }
+        const builtin = mcpDefault(parsed.tool, { toolName: listed.name, args: {}, platform: process.platform, annotations: listed.annotations }, machine, tables);
+        if (builtin.reasonCode !== 'high_risk_write' && builtin.reasonCode !== 'write_tool') continue;
+        const covered = machine.rules.some((rule) => !isDegradedRule(rule) && toolGlobMatches(rule.tool, listed.name)
+            && (!rule.tool.includes('*') || rule.decision !== 'allow'));
+        if (!covered) gaps.push({ tool: listed.name, reasonCode: 'unlisted_write_tool', decision: builtin.decision });
+    }
+    return gaps;
+}
+
 /** R12: ① what and why, ② what to call instead, ③ do not work around it. */
 export function blockedMessage(verdict: Pick<PolicyVerdict, 'reasonCode' | 'target' | 'action'> & { appGrade?: AppGrade; keyCombo?: string }, toolName: string, tables: ToolPolicyTables = BUILTIN_TABLES): string {
     const target = verdict.target;

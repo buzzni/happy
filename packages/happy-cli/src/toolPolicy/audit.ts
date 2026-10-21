@@ -7,6 +7,9 @@
  * for agentState `toolPolicy.recent`, which Desktop reads loosely (no new session event type: the
  * happy-wire session protocol is a strict union old clients cannot parse).
  *
+ * R9 coverage gaps (`unlisted_tool`, `unlisted_write_tool`) go to the file only: they name tools a
+ * server listed, not calls anyone made, so they are not shown as blocked calls.
+ *
  * Never recorded: window titles, typed text, coordinates or any argument value.
  */
 
@@ -37,6 +40,8 @@ const KEPT_FILES = 3;
 
 export interface ToolPolicyAuditLog {
     record(entry: ToolPolicyAuditRecord): void;
+    /** File only, never `toolPolicy.recent`. */
+    note(entry: ToolPolicyAuditRecord): void;
     recent(): ToolPolicyAuditRecord[];
 }
 
@@ -69,6 +74,7 @@ export function createToolPolicyAuditLog(options: {
             if (recent.length > RECENT_LIMIT) recent.splice(0, recent.length - RECENT_LIMIT);
             options.publishRecent?.([...recent]);
         },
+        note: (entry) => write(JSON.stringify({ ...entry, sessionId: options.sessionId() }) + '\n'),
         recent: () => [...recent],
     };
 }
