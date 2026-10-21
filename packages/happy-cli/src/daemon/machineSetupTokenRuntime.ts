@@ -5,7 +5,7 @@ import { rotationDigest, rotationIsFresh, rotationDecodeBinary, rotationSha256, 
 import type { Metadata, Session } from '@/api/types'
 import { type SessionPersistenceResult, type PersistedSession } from '@/persistence'
 import { encodeBase64, decodeBase64, decrypt } from '@/api/encryption'
-import { buildReconnectSessionEnvironment } from './reconnectSessionEnv'
+import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from './reconnectSessionEnv'
 import { formatSetupTokenBinding, isMachineSetupTokenBinding, readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV,
   type MachineSetupTokenBindingRecord, type SetupTokenBinding, type AiAuthSelection } from './sessionEnv'
 import { assertMachineRevision, journalCurrent, type MachineRotationJournal, type MachineRotationJournalRecord } from './machineSetupTokenJournal'
@@ -238,8 +238,8 @@ export function createMachineSetupTokenRuntime(deps: {
           agentStateVersion: session.agentStateVersion }, userHomeDir: input.userHomeDir, persistedLastProcessedSeq: session.seq }
       if ((await deps.persist(tracked, state.pending.record)).status !== 'committed') throw new MachineRotationError('PERSISTENCE_FAILED');
       const env = await finish(state, tracked)
-      return { session, environment: env, reconnectEnvironment: buildReconnectSessionEnvironment({ sessionId: session.id, encryption: tracked.encryption!,
-        serverSnapshot: { metadata: session.metadata, seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion }, baselineSeq: session.seq }) }
+      return { session, environment: env, reconnectEnvironment: { ...buildReconnectSessionEnvironment({ sessionId: session.id, encryption: tracked.encryption!,
+        serverSnapshot: { metadata: session.metadata, seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion }, baselineSeq: session.seq }), [RECONNECT_FRESH_LAUNCH_ENV]: '1' as const } }
       } finally { activeLaunches.delete(launchId); }
     },
     resume(session: TrackedSession, binding: MachineSetupTokenBindingRecord) {

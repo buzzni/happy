@@ -63,7 +63,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
-import { consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
+import { consumeReconnectFreshLaunch, consumeReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
 import {
     assertClaudeConfirmedDeliveryPossible,
     deliverPreparedClaudeSessionStart,
@@ -347,6 +347,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         reconnectSessionId,
         automationRunOnceRequested,
         allowAutomationReconnectPrompt,
+        freshLaunch: consumeReconnectFreshLaunch(process.env),
     });
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn;
 

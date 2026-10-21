@@ -194,6 +194,18 @@ export function readReconnectSessionEnvironment(
  * environment is refused. The other HAPPY_RECONNECT_* values stay; later code
  * still reads them to recognise a reconnect.
  */
+/**
+ * aplus specs/shared-machine-server-signing Phase 3d — set only on the environment of a machine-rotation launch, whose
+ * session the daemon created before starting the child: the child attaches to it as a new conversation and keeps its
+ * first prompt. An ordinary resume never carries it. One-shot: read and removed.
+ */
+export const RECONNECT_FRESH_LAUNCH_ENV = 'HAPPY_RECONNECT_FRESH_LAUNCH';
+export function consumeReconnectFreshLaunch(env: NodeJS.ProcessEnv): boolean {
+    const fresh = env[RECONNECT_FRESH_LAUNCH_ENV] === '1';
+    delete env[RECONNECT_FRESH_LAUNCH_ENV];
+    return fresh;
+}
+
 export function consumeReconnectSessionEnvironment(
     env: NodeJS.ProcessEnv,
 ): ReconnectSessionClientSnapshot | null {
