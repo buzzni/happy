@@ -1647,7 +1647,11 @@ export class CodexAppServerClient {
             }
             Object.assign(config, nativeCodexRecallOwnershipOverrides(nativeServers, mcpServers));
         }
-        if (this.cuaShadow && !mcpServers?.[CUA_DRIVER_SERVER]) {
+        // The user's own cua-driver (behind the shadow) outranks a Saycode-injected server of the
+        // same name: Codex deep-merges the native entry into whatever holds the name, so leaving
+        // the injected one would run it with the user's cua env and the user's cua-driver unjudged.
+        // A config Happy cannot read turns the name off for the same reason; no user entry keeps it.
+        if (this.cuaShadow) {
             let nativeServers: unknown;
             try {
                 nativeServers = await readNativeServers();
