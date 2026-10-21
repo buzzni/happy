@@ -2,6 +2,7 @@ import type { MessageMeta, PermissionMode } from '@/api/types';
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import {
     isSaycodePromptBlockEnabled,
+    resolveMessagePromptBlocks,
     splitClientTurnPromptBlocks,
     type SaycodePromptBlockOverrides,
 } from '@/prompt/promptProvenance';
@@ -37,11 +38,7 @@ export function resolveCodexSaycodePromptBlocks(
     current: CodexEnhancedMode['saycodePromptBlocks'],
     meta: Pick<MessageMeta, 'saycodePromptBlocks'> | undefined,
 ): CodexEnhancedMode['saycodePromptBlocks'] {
-    if (!Object.prototype.hasOwnProperty.call(meta ?? {}, 'saycodePromptBlocks')) {
-        return current;
-    }
-
-    return meta?.saycodePromptBlocks ?? undefined;
+    return resolveMessagePromptBlocks(current, meta).standing;
 }
 
 export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {
@@ -59,11 +56,14 @@ export function buildCodexDeveloperInstructions({
     connectorGuidance,
     checkpointGuidance,
     agentOrchestrationPrompt,
+    nextStepsPrompt,
     mode,
 }: {
     connectorGuidance?: string;
     checkpointGuidance?: string;
     agentOrchestrationPrompt?: string;
+    /** Turn-card guidance (common:next-steps); only on a turn whose client draws the card. */
+    nextStepsPrompt?: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled' | 'saycodePromptBlocks'>;
 }): string | undefined {
     const blocks = [connectorGuidance, checkpointGuidance];
@@ -82,6 +82,9 @@ export function buildCodexDeveloperInstructions({
     }
     if (mode.saycodeSystemPromptEnabled !== false) {
         blocks.push(SAYCODE_API_GATEWAY_PROMPT);
+    }
+    if (isSaycodePromptBlockEnabled('nextSteps', mode.saycodePromptBlocks, mode.saycodeSystemPromptEnabled)) {
+        blocks.push(nextStepsPrompt);
     }
     return blocks.filter((block): block is string => Boolean(block)).join('\n\n') || undefined;
 }

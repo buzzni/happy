@@ -22,6 +22,7 @@ export type PromptProvenance =
 export const PROMPT_BLOCK_PROVENANCE = {
   'common:agent-orchestration': 'saycode',
   'common:api-gateway': 'saycode',
+  'common:next-steps': 'saycode',
   'claude:title': 'always-on',
   'claude:co-authored-credit': 'saycode',
   'claude:orchestrator': 'selected-feature',
@@ -98,7 +99,8 @@ export type SaycodePromptBlockName =
   | 'agentOrchestration'
   | 'coAuthoredCredit'
   | 'workerDelegation'
-  | 'axBase';
+  | 'axBase'
+  | 'nextSteps';
 
 export type SaycodePromptBlockOverrides = Partial<Record<SaycodePromptBlockName, boolean>>;
 
@@ -115,6 +117,7 @@ export const SAYCODE_PROMPT_BLOCK_PROVENANCE_IDS = {
   coAuthoredCredit: 'claude:co-authored-credit',
   workerDelegation: 'claude:worker-delegation',
   axBase: 'claude:ax-base',
+  nextSteps: 'common:next-steps',
 } as const satisfies Record<SaycodePromptBlockName, PromptBlockId>;
 
 /**
@@ -131,7 +134,53 @@ export function isSaycodePromptBlockEnabled(
   saycodeSystemPromptEnabled: boolean | undefined,
 ): boolean {
   const override = overrides?.[blockName];
+  // A client capability, not a preference: on only when this turn's client said it
+  // draws the card, and still under the master switch (specs/desktop-next-steps-card).
+  if (blockName === 'nextSteps') return override === true && saycodeSystemPromptEnabled !== false;
   if (override !== undefined) return override;
   if (blockName === 'agentOrchestration' || blockName === 'workerDelegation') return true;
   return saycodeSystemPromptEnabled !== false;
+}
+
+/**
+ * Splits one user message's `saycodePromptBlocks` into the overrides that persist for the
+ * session and the ones that hold for this turn only.
+ *
+ * `nextSteps` says "the client that sent this turn draws the next-steps card"
+ * (specs/desktop-next-steps-card). Unlike a preference it must not outlive its message:
+ * a client that omits the field keeps the other overrides, and if the request stuck, a
+ * phone that never draws the card would inherit Desktop's "yes" and the agent would put
+ * its question where the phone cannot show it. A message whose only override is
+ * `nextSteps` therefore also leaves the standing overrides untouched — the same as before
+ * that key existed, when such a client sent no field at all.
+ */
+export function resolveMessagePromptBlocks(
+  current: SaycodePromptBlockOverrides | undefined,
+  meta: { saycodePromptBlocks?: SaycodePromptBlockOverrides | null } | undefined,
+): { standing: SaycodePromptBlockOverrides | undefined; turn: SaycodePromptBlockOverrides | undefined } {
+  const standing = standingPromptBlocks(current, meta);
+  const turnCards = meta?.saycodePromptBlocks?.nextSteps === true;
+  return { standing, turn: turnCards ? { ...standing, nextSteps: true } : standing };
+}
+
+function standingPromptBlocks(
+  current: SaycodePromptBlockOverrides | undefined,
+  meta: { saycodePromptBlocks?: SaycodePromptBlockOverrides | null } | undefined,
+): SaycodePromptBlockOverrides | undefined {
+  const kept = withoutTurnScopedBlocks(current);
+  if (!meta || !Object.prototype.hasOwnProperty.call(meta, 'saycodePromptBlocks')) return kept;
+  const incoming = meta.saycodePromptBlocks;
+  if (!incoming) return undefined;
+  const keys = Object.keys(incoming);
+  if (keys.length > 0 && keys.every((key) => key === 'nextSteps')) return kept;
+  return withoutTurnScopedBlocks(incoming);
+}
+
+/** Drops `nextSteps` from a standing value (an initial env value or a pre-split cache). */
+export function withoutTurnScopedBlocks(
+  blocks: SaycodePromptBlockOverrides | undefined,
+): SaycodePromptBlockOverrides | undefined {
+  if (!blocks || !('nextSteps' in blocks)) return blocks;
+  const { nextSteps: _turnScoped, ...rest } = blocks;
+  return rest;
 }

@@ -4,6 +4,7 @@ import { takeScopeConfirmation } from '@/daemon/sessionWriteScopeConfirmation';
 import { prepareSessionWriteScopeClaude } from '@/daemon/sessionWriteScopeClaude';
 /** Orchestrates Claude sessions, initial prompts, MCP tools and session lifecycle. */
 import { createLessonProposalTurn } from '@/utils/lessonProposalTurn';
+import { createTurnCardSwitch } from './utils/turnCardTools';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
@@ -41,7 +42,7 @@ import { ChannelPromptAcceptance, CHANNEL_ACK_DEADLINE_MS } from '@/channel/chan
 import { enqueueChannelTurn } from '@/channel/channelTurnEnqueue';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { applyAxOrchestration, removeAxSaycodeBasePrompt } from '@/orchestrator/prompts/integrate';
-import { isSaycodePromptBlockEnabled, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
+import { isSaycodePromptBlockEnabled, resolveMessagePromptBlocks, withoutTurnScopedBlocks, type SaycodePromptBlockOverrides } from '@/prompt/promptProvenance';
 import { persistExplicitStep } from '@/orchestrator/state/persistExplicitStep';
 import { appendTitleInstruction } from '@/utils/titlePrompt';
 import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
@@ -724,6 +725,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     });
 
     const lessonProposalTurn = createLessonProposalTurn();
+    // Flipped by claudeRemote per turn from that turn's prompt blocks (specs/desktop-next-steps-card).
+    const turnCards = createTurnCardSwitch('claude');
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
         agentControl: principal.kind === 'account' && sandboxPolicyMode !== 'mandatory',
@@ -732,6 +735,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         mandatorySandbox: sandboxPolicyMode === 'mandatory',
         sameUidSandbox: Boolean(scopeLaunch),
         ...(principal.kind === 'account' ? { proposeLesson: lessonProposalTurn.submit } : {}),
+        turnCards,
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
@@ -892,7 +896,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // delegation blocks stay enabled without one; the remaining blocks inherit the master.
     // Seeded once from HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS for daemon-spawned
     // recovery first turns; later user messages overwrite it via message meta.
-    let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = initialSaycodePromptBlocks;
+    let currentSaycodePromptBlocks: SaycodePromptBlockOverrides | undefined = withoutTurnScopedBlocks(initialSaycodePromptBlocks);
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = initialDisallowedTools; // Track current disallowed tools
     let currentEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined = initialEffortSeed; // Track current Claude effort (thinking depth)
@@ -1258,9 +1262,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             currentSaycodeSystemPromptEnabled = message.meta.saycodeSystemPromptEnabled ?? true;
             logger.debug(`[loop] Saycode system prompt ${currentSaycodeSystemPromptEnabled ? 'enabled' : 'disabled'} by user message`);
         }
+        // `nextSteps` holds for this message only (specs/desktop-next-steps-card).
+        const messagePromptBlocks = resolveMessagePromptBlocks(currentSaycodePromptBlocks, message.meta);
         if (message.meta?.hasOwnProperty('saycodePromptBlocks')) {
-            currentSaycodePromptBlocks = message.meta.saycodePromptBlocks ?? undefined;
-            logger.debug(`[loop] Saycode per-block prompt overrides updated by user message: ${JSON.stringify(currentSaycodePromptBlocks)}`);
+            currentSaycodePromptBlocks = messagePromptBlocks.standing;
+            logger.debug(`[loop] Saycode per-block prompt overrides updated by user message: ${JSON.stringify(message.meta.saycodePromptBlocks)}`);
         }
         messageAppendSystemPrompt = resolveSaycodeAppendSystemPromptForMessage({
             current: currentAppendSystemPrompt,
@@ -1523,7 +1529,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             customSystemPrompt: messageCustomSystemPrompt,
             appendSystemPrompt: messageAppendSystemPrompt,
             saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
-            saycodePromptBlocks: currentSaycodePromptBlocks,
+            saycodePromptBlocks: messagePromptBlocks.turn,
             allowedTools: messageAllowedTools,
             disallowedTools: messageDisallowedTools,
             effort: messageEffort,
@@ -1921,6 +1927,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         path: workingDirectory,
         ...(lessons ? { lessons } : {}),
         lessonProposalTurn,
+        // A mandatory sandbox registers no next_steps tool, so its turns get no card guidance either.
+        ...(sandboxPolicyMode !== 'mandatory' ? { turnCards } : {}),
         sandboxPolicyMode,
         model: options.model,
         permissionMode: initialPermissionMode,

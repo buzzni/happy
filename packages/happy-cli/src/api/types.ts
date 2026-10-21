@@ -363,6 +363,10 @@ export const MessageMetaSchema = z.object({
     coAuthoredCredit: z.boolean().optional(),
     workerDelegation: z.boolean().optional(),
     axBase: z.boolean().optional(),
+    // Not a preference: "the client sending this turn draws the next-steps card"
+    // (specs/desktop-next-steps-card). Holds for its own message only — see
+    // resolveMessagePromptBlocks.
+    nextSteps: z.boolean().optional(),
   }).nullable().optional().catch(undefined),
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)

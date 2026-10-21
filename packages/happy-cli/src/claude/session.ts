@@ -1,6 +1,7 @@
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import type { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
+import type { TurnCardSwitch } from './utils/turnCardTools';
 import { ApiClient, ApiSessionClient } from "@/lib";
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { EnhancedMode } from "./loop";
@@ -46,6 +47,8 @@ export class Session {
      */
     readonly lessons?: LessonSessionHost;
     readonly lessonProposalTurn?: LessonProposalTurn;
+    /** specs/desktop-next-steps-card — whether the running turn's client draws the next-steps card. */
+    readonly turnCards?: TurnCardSwitch;
     readonly lessonReviewLifecycle: ClaudeLessonReviewLifecycle = {
         controller: new AbortController(), completedAssistantTurns: 0,
     };
@@ -99,6 +102,7 @@ export class Session {
         standaloneDrain?: ClaudeStandaloneDrain,
         lessons?: LessonSessionHost,
         lessonProposalTurn?: LessonProposalTurn,
+        turnCards?: TurnCardSwitch,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
         mcpConfig?: McpConfigSource,
@@ -137,6 +141,7 @@ export class Session {
         this.standaloneDrain = opts.standaloneDrain;
         this.lessons = opts.lessons;
         this.lessonProposalTurn = opts.lessonProposalTurn;
+        this.turnCards = opts.turnCards;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
         this.mcpConfig = opts.mcpConfig;

@@ -316,6 +316,52 @@ export const sessionLessonCandidateEventSchema = z.object({
   }).optional(),
 });
 
+// Saycode specs/desktop-next-steps-card — the "next step" box the agent fills at
+// the end of its turn through `mcp__happy__next_steps`. Model text, so it rides
+// on the agent role and a client renders it as plain text only. An app action
+// names a button the client already has (it never carries a command), and a
+// reply button carries the words the client sends back as the user.
+export const NEXT_STEP_ACTION_KINDS = [
+  'commit', 'create_pr', 'merge', 'fix_ci', 'address_comments', 'resolve_conflicts', 'verify', 'archive',
+] as const;
+export type NextStepActionKind = typeof NEXT_STEP_ACTION_KINDS[number];
+// `message` is short on purpose: the client shows it to the user before it is sent as theirs.
+export const NEXT_STEPS_LIMITS = { summary: 1_000, question: 300, label: 60, message: 500, actions: 4 } as const;
+
+export const nextStepActionSchema = z.union([
+  z.object({
+    kind: z.enum(NEXT_STEP_ACTION_KINDS),
+    label: z.string().min(1).max(NEXT_STEPS_LIMITS.label).optional(),
+  }),
+  z.object({
+    label: z.string().min(1).max(NEXT_STEPS_LIMITS.label),
+    message: z.string().min(1).max(NEXT_STEPS_LIMITS.message),
+  }),
+]);
+export type NextStepAction = z.infer<typeof nextStepActionSchema>;
+
+export const sessionNextStepsEventSchema = z.object({
+  t: z.literal('next-steps'),
+  summary: z.string().min(1).max(NEXT_STEPS_LIMITS.summary),
+  question: z.string().min(1).max(NEXT_STEPS_LIMITS.question).optional(),
+  actions: z.array(nextStepActionSchema).max(NEXT_STEPS_LIMITS.actions),
+});
+
+// The task list Codex keeps with its built-in `update_plan`, relayed so a client
+// can show it under the latest message (Claude Code's TodoWrite already reaches
+// clients as a tool call). Each event carries the whole list; the newest one in a
+// turn replaces the earlier ones.
+export const PLAN_STEP_STATUSES = ['pending', 'in_progress', 'completed'] as const;
+export const PLAN_LIMITS = { steps: 20, text: 300 } as const;
+
+export const sessionPlanEventSchema = z.object({
+  t: z.literal('plan'),
+  steps: z.array(z.object({
+    text: z.string().min(1).max(PLAN_LIMITS.text),
+    status: z.enum(PLAN_STEP_STATUSES),
+  })).min(1).max(PLAN_LIMITS.steps),
+});
+
 export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionTextEventSchema,
   sessionServiceMessageEventSchema,
@@ -333,6 +379,8 @@ export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionStopEventSchema,
   sessionDifficultyRoutingEventSchema,
   sessionLessonCandidateEventSchema,
+  sessionNextStepsEventSchema,
+  sessionPlanEventSchema,
 ]);
 
 export type SessionEvent = z.infer<typeof sessionEventSchema>;

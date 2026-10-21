@@ -5018,6 +5018,66 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('maps the raw plan notification into the legacy plan_update event (specs/desktop-next-steps-card)', async () => {
+        const proc = createMockProcess({
+            pid: 3003,
+            onRequest: (msg, stdout) => {
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-plan-1', path: '/tmp/thread-plan-1' },
+                                model: 'gpt-test',
+                                modelProvider: 'openai',
+                                cwd: '/tmp/project',
+                                approvalPolicy: 'never',
+                                sandbox: { type: 'dangerFullAccess' },
+                                reasoningEffort: null,
+                            },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'turn/plan/updated',
+                            params: {
+                                threadId: 'thread-plan-1',
+                                turnId: 'turn-plan-1',
+                                explanation: null,
+                                plan: [{ step: 'Fix the parser', status: 'inProgress' }],
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((msg) => {
+            events.push(msg as Record<string, unknown>);
+        });
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        await waitFor(() => events.some((event) => event.type === 'plan_update'));
+        expect(events.find((event) => event.type === 'plan_update')).toEqual({
+            type: 'plan_update',
+            turn_id: 'turn-plan-1',
+            explanation: null,
+            plan: [{ step: 'Fix the parser', status: 'inProgress' }],
+        });
+
+        await client.disconnect();
+    });
+
     it('maps raw goal notifications into legacy goal events', async () => {
         const proc = createMockProcess({
             pid: 3002,
