@@ -24,22 +24,59 @@ describe('target resolver', () => {
             platform: 'darwin',
             now: () => t,
             exec: fakeExec({
+                '/bin/ps -o lstart= -p 26977': 'Wed Oct 22 01:00:00 2026\n',
                 '/usr/bin/lsappinfo find pid=26977': 'ASN:0x0-0xf20f2-"Finder":\n',
                 '/usr/bin/lsappinfo info -only bundleid -only name -only pid ASN:0x0-0xf20f2-"Finder":': FINDER_INFO,
             }, calls),
         });
         await expect(resolver.resolve({ kind: 'pid', pid: 26977 })).resolves.toEqual({ status: 'resolved', app: { bundleId: 'com.apple.finder', name: 'Finder', pid: 26977 } });
+        expect(calls).toHaveLength(3);
         await resolver.resolve({ kind: 'pid', pid: 26977 });
-        expect(calls).toHaveLength(2);
+        expect(calls.slice(3)).toEqual(['/bin/ps -o lstart= -p 26977']);
         t = 30_000;
         await resolver.resolve({ kind: 'pid', pid: 26977 });
-        expect(calls).toHaveLength(4);
+        expect(calls).toHaveLength(7);
+    });
+
+    // Cross review #3: Notes quits, Terminal gets its pid inside the cache window.
+    it('does not reuse a cached pid once a different process holds it', async () => {
+        const outputs: Record<string, string> = {
+            '/bin/ps -o lstart= -p 500': 'Wed Oct 22 01:00:00 2026\n',
+            '/usr/bin/lsappinfo find pid=500': 'ASN:0x0-0x1:\n',
+            '/usr/bin/lsappinfo info -only bundleid -only name -only pid ASN:0x0-0x1:': '"CFBundleIdentifier"="com.apple.Notes"\n"LSDisplayName"="Notes"\n',
+        };
+        const resolver = createTargetResolver({ platform: 'darwin', now: () => 0, exec: fakeExec(outputs) });
+        await expect(resolver.resolve({ kind: 'pid', pid: 500 })).resolves.toMatchObject({ app: { bundleId: 'com.apple.Notes' } });
+        outputs['/bin/ps -o lstart= -p 500'] = 'Wed Oct 22 01:00:05 2026\n';
+        outputs['/usr/bin/lsappinfo info -only bundleid -only name -only pid ASN:0x0-0x1:'] = '"CFBundleIdentifier"="com.apple.Terminal"\n"LSDisplayName"="Terminal"\n';
+        await expect(resolver.resolve({ kind: 'pid', pid: 500 })).resolves.toMatchObject({ app: { bundleId: 'com.apple.Terminal' } });
+        // A pid whose start time cannot be read is never served from the cache.
+        delete outputs['/bin/ps -o lstart= -p 500'];
+        delete outputs['/usr/bin/lsappinfo find pid=500'];
+        await expect(resolver.resolve({ kind: 'pid', pid: 500 })).resolves.toEqual({ status: 'unresolved' });
+    });
+
+    it('keeps Windows pid lookups for 5 seconds only (no cheap start-time check)', async () => {
+        const calls: string[] = [];
+        let t = 0;
+        const resolver = createTargetResolver({
+            platform: 'win32',
+            now: () => t,
+            exec: fakeExec({ 'powershell.exe -NoProfile -NonInteractive -Command (Get-CimInstance Win32_Process -Filter "ProcessId=9").ExecutablePath': 'C:\\Windows\\notepad.exe\r\n' }, calls),
+        });
+        await resolver.resolve({ kind: 'pid', pid: 9 });
+        t = 4_999;
+        await resolver.resolve({ kind: 'pid', pid: 9 });
+        expect(calls).toHaveLength(1);
+        t = 5_000;
+        await resolver.resolve({ kind: 'pid', pid: 9 });
+        expect(calls).toHaveLength(2);
     });
 
     it('falls back to the executable for a pid with no app record', async () => {
         const resolver = createTargetResolver({
             platform: 'darwin',
-            exec: fakeExec({ '/bin/ps -o comm= -p 77': '/usr/local/bin/node\n' }),
+            exec: fakeExec({ '/bin/ps -o lstart= -p 77': 'Wed Oct 22 01:00:00 2026\n', '/bin/ps -o comm= -p 77': '/usr/local/bin/node\n' }),
         });
         await expect(resolver.resolve({ kind: 'pid', pid: 77 })).resolves.toEqual({ status: 'resolved', app: { pid: 77, executable: '/usr/local/bin/node', name: 'node' } });
     });
@@ -91,5 +128,20 @@ describe('target resolver', () => {
         const result = await resolver.resolve({ kind: 'frontmost' });
         expect(performance.now() - started).toBeLessThan(500);
         expect(['resolved', 'unresolved']).toContain(result.status);
+    });
+
+    // Cross review #9: 제약 "성능" — p95 50 ms including the app lookup, measured on the real commands.
+    it('decides a cached pid lookup within 50 ms at p95 on macOS', async () => {
+        if (process.platform !== 'darwin') return;
+        const resolver = createTargetResolver();
+        await expect(resolver.resolve({ kind: 'pid', pid: process.pid })).resolves.toMatchObject({ status: 'resolved' });
+        const samples: number[] = [];
+        for (let i = 0; i < 100; i++) {
+            const started = performance.now();
+            await resolver.resolve({ kind: 'pid', pid: process.pid });
+            samples.push(performance.now() - started);
+        }
+        samples.sort((a, b) => a - b);
+        expect(samples[Math.floor(samples.length * 0.95)]).toBeLessThan(50);
     });
 });

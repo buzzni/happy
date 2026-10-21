@@ -7,8 +7,12 @@
  * - Windows: CIM `Win32_Process.ExecutablePath`. Frontmost is not resolved yet (→ unresolved).
  * - Linux: `/proc/<pid>/exe`.
  *
- * pid lookups are cached for 30 seconds; frontmost never is. Anything slower than 2 seconds or
- * failing is `unresolved`, which the decision turns into `ask` (R3).
+ * pid lookups are cached for 30 seconds, and a cached entry is used only while the pid still has
+ * the same process start time (`ps -o lstart=`, one cheap exec) — a pid reused by another app
+ * within the window is looked up again (R5.1 "그 시점에 조회"). Windows has no cheap start-time
+ * probe (CIM costs as much as the lookup), so its entries live 5 seconds instead. Frontmost is never
+ * cached. Anything slower than 2 seconds or failing is `unresolved`, which the decision turns into
+ * `ask` (R3).
  */
 
 import { execFile } from 'node:child_process';
@@ -23,6 +27,7 @@ export interface TargetResolver {
 
 export const TARGET_RESOLVE_DEADLINE_MS = 2000;
 const PID_CACHE_MS = 30_000;
+const WINDOWS_PID_CACHE_MS = 5_000;
 
 export function createTargetResolver(options: {
     platform?: NodeJS.Platform;
@@ -34,15 +39,23 @@ export function createTargetResolver(options: {
     const exec = options.exec ?? defaultExec;
     const now = options.now ?? Date.now;
     const deadlineMs = options.deadlineMs ?? TARGET_RESOLVE_DEADLINE_MS;
-    const cache = new Map<number, { app: AppIdentity | null; at: number }>();
+    const cache = new Map<number, { app: AppIdentity | null; at: number; started: string | null }>();
 
     const byPid = async (pid: number): Promise<AppIdentity | null> => {
+        if (platform === 'win32') {
+            const hit = cache.get(pid);
+            if (hit && now() - hit.at < WINDOWS_PID_CACHE_MS) return hit.app;
+            const app = await windowsAppByPid(exec, pid, deadlineMs);
+            cache.set(pid, { app, at: now(), started: null });
+            return app;
+        }
+        // Read the start time first: if the pid changes hands during the lookup, the next call sees a new one.
+        const started = (await exec('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], deadlineMs)).trim() || null;
         const hit = cache.get(pid);
-        if (hit && now() - hit.at < PID_CACHE_MS) return hit.app;
-        const app = platform === 'darwin' ? await macAppByPid(exec, pid, deadlineMs)
-            : platform === 'win32' ? await windowsAppByPid(exec, pid, deadlineMs)
-                : await linuxAppByPid(exec, pid, deadlineMs);
-        cache.set(pid, { app, at: now() });
+        if (hit && started && hit.started === started && now() - hit.at < PID_CACHE_MS) return hit.app;
+        const app = platform === 'darwin' ? await macAppByPid(exec, pid, deadlineMs) : await linuxAppByPid(exec, pid, deadlineMs);
+        if (started) cache.set(pid, { app, at: now(), started });
+        else cache.delete(pid);
         return app;
     };
 
