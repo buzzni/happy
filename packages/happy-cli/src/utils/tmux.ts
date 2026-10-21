@@ -338,12 +338,13 @@ const WIN_OPS: Record<TmuxWindowOperation, string> = {
     'break': 'break-pane',
 };
 
-// Commands that support session targeting
+// Commands that support session targeting. Not new-session: its -t names a
+// session whose group the new one joins.
 const COMMANDS_SUPPORTING_TARGET = new Set([
     'send-keys', 'capture-pane', 'new-window', 'kill-window',
     'select-window', 'split-window', 'select-pane', 'kill-pane',
     'select-layout', 'display-message', 'attach-session', 'detach-client',
-    'new-session', 'kill-session', 'list-windows', 'list-panes'
+    'kill-session', 'list-windows', 'list-panes'
 ]);
 
 // Control sequences that must be separate arguments with proper typing
@@ -429,34 +430,20 @@ export class TmuxUtilities {
             baseCmd = ['tmux', '-S', socketPath];
         }
 
-        // Handle send-keys with proper target specification
-        if (cmd.length > 0 && cmd[0] === 'send-keys') {
-            const fullCmd = [...baseCmd, cmd[0]];
-
-            // Add target specification immediately after send-keys
+        // The target goes immediately after the command name: tmux stops
+        // reading options at the first positional argument (send-keys' keys,
+        // new-window's shell command), so a trailing -t would be passed along
+        // as part of it.
+        const fullCmd = [...baseCmd, ...cmd.slice(0, 1)];
+        if (cmd.length > 0 && COMMANDS_SUPPORTING_TARGET.has(cmd[0])) {
             let target = targetSession;
             if (window) target += `:${window}`;
             if (pane) target += `.${pane}`;
             fullCmd.push('-t', target);
-
-            // Add keys and control sequences
-            fullCmd.push(...cmd.slice(1));
-
-            return this.executeCommand(fullCmd);
-        } else {
-            // Non-send-keys commands
-            const fullCmd = [...baseCmd, ...cmd];
-
-            // Add target specification for commands that support it
-            if (cmd.length > 0 && COMMANDS_SUPPORTING_TARGET.has(cmd[0])) {
-                let target = targetSession;
-                if (window) target += `:${window}`;
-                if (pane) target += `.${pane}`;
-                fullCmd.push('-t', target);
-            }
-
-            return this.executeCommand(fullCmd);
         }
+        fullCmd.push(...cmd.slice(1));
+
+        return this.executeCommand(fullCmd);
     }
 
     /**
@@ -813,25 +800,20 @@ export class TmuxUtilities {
                         continue;
                     }
 
-                    // Escape value for shell safety
-                    // Must escape: backslashes, double quotes, dollar signs, backticks
-                    const escapedValue = value
-                        .replace(/\\/g, '\\\\')   // Backslash first!
-                        .replace(/"/g, '\\"')     // Double quotes
-                        .replace(/\$/g, '\\$')    // Dollar signs
-                        .replace(/`/g, '\\`');    // Backticks
-
-                    createWindowArgs.push('-e', `${key}="${escapedValue}"`);
+                    // tmux is spawned without a shell and takes NAME=value as is:
+                    // quoting or escaping here would become part of the value.
+                    createWindowArgs.push('-e', `${key}=${value}`);
                 }
                 logger.debug(`[TMUX] Setting ${Object.keys(env).length} environment variables in tmux window`);
             }
 
-            // Add the command to run in the window (runs immediately when window is created)
-            createWindowArgs.push(fullCommand);
-
             // Add -P flag to print the pane PID immediately
             createWindowArgs.push('-P');
             createWindowArgs.push('-F', '#{pane_pid}');
+
+            // The command to run in the window comes last: tmux reads no
+            // options after it (runs immediately when window is created)
+            createWindowArgs.push(fullCommand);
 
             // Create window with command and get PID immediately
             const start = () => this.executeTmuxCommand(createWindowArgs, sessionName!);
