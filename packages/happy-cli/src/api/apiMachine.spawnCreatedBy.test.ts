@@ -158,6 +158,30 @@ describe('ApiMachineClient spawn/resume RPC passthrough', () => {
         })]);
     });
 
+    // aplus-dev-studio specs/session-source-metadata — an older Desktop sends nothing; a malformed
+    // value is dropped rather than recorded, so readers fall back to their own heuristics.
+    it.each([
+        { sent: 'github-trigger', forwarded: 'github-trigger' },
+        { sent: 'some-future-source', forwarded: 'some-future-source' },
+        { sent: 'Not A Tag', forwarded: undefined },
+        { sent: undefined, forwarded: undefined },
+    ])('forwards a well-formed sessionSource ($sent) to spawnSession', async ({ sent, forwarded }) => {
+        const calls: any[] = [];
+        const spawnSession = (options: any) => {
+            calls.push(options);
+            return Promise.resolve({ type: 'success', sessionId: 'happy-1' });
+        };
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers(rpcHandlers({ spawnSession }));
+
+        await handlersFrom(client).get('machine-1:spawn-happy-session')?.({
+            directory: '/tmp/project', agent: 'claude', ...(sent === undefined ? {} : { sessionSource: sent }),
+        });
+
+        expect(calls[0].sessionSource).toBe(forwarded);
+    });
+
     it('omits createdBy fields from spawnSession when not supplied (backward compatible)', async () => {
         const calls: any[] = [];
         const spawnSession = (options: any) => {

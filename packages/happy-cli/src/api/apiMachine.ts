@@ -255,6 +255,7 @@ import { createSetupTokenAssignmentRecipient, setupTokenRecipientCapability } fr
 import { createSignedSetupTokenVerifier } from '@/daemon/signedSetupTokenAssignment';
 import type { AutonomousQualityGateRpcHandlers } from '@/daemon/autonomousQualityGateRpc';
 import type { CheckpointRpcHandlers } from '@/checkpoint/checkpointRpc';
+import { normalizeSessionSource } from '@/utils/sessionSource';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
@@ -1255,6 +1256,7 @@ export class ApiMachineClient {
                 forkedFromMessageId,
                 createdByAccountId,
                 createdByDisplayName,
+                sessionSource,
                 axStep,
                 bootstrapFiles,
                 initialPrompt,
@@ -1282,6 +1284,8 @@ export class ApiMachineClient {
             // 돌아 사용자가 고르지 않은 자격으로 세션이 실행된다.
             const validAiAuthSelection = parseAiAuthSelection(aiAuthSelection);
             const validAdditionalDirectories = parseAdditionalDirectories(additionalDirectories);
+            // Recorded as metadata `source`; a malformed value is dropped, never stored.
+            const validSessionSource = normalizeSessionSource(sessionSource);
             if (validAdditionalDirectories && agent !== 'claude' && agent !== 'codex') {
                 throw new Error('Additional directories are only supported for Claude and Codex');
             }
@@ -1352,6 +1356,7 @@ export class ApiMachineClient {
                 forkedFromMessageId,
                 createdByAccountId,
                 createdByDisplayName,
+                ...(validSessionSource ? { sessionSource: validSessionSource } : {}),
                 axStep,
                 bootstrapFiles,
                 initialPrompt,

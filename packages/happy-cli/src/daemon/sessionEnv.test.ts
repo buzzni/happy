@@ -4,6 +4,7 @@ import {
     buildResumedSessionSpawnEnvironment,
     buildSpawnRequestEnvironment,
     buildSessionSpawnEnvironment,
+    buildSessionRequesterEnv,
     captureSaycodeAgentEnvironment,
     stripManagedCredentialConflicts,
     scrubSessionLineageEnv,
@@ -53,6 +54,8 @@ describe('scrubSessionLineageEnv', () => {
             HAPPY_FORK_CODEX_THREAD_ID: 'codex-1',
             HAPPY_CREATED_BY_ACCOUNT_ID: 'acct-stale',
             HAPPY_CREATED_BY_DISPLAY_NAME: 'Stale Name',
+            // A scheduled run's child must not be recorded as a scheduled run too.
+            HAPPY_CREATED_BY_SOURCE: 'schedule',
             HAPPY_INITIAL_PROMPT: 'stale automation prompt',
             HAPPY_INITIAL_MODEL: 'stale-model',
             HAPPY_INITIAL_EFFORT: 'stale-effort',
@@ -843,5 +846,31 @@ describe('setup-token resume binding', () => {
         for (const bad of [undefined, '', 'no-dot', 'a.b.c', 'x'.repeat(5000)]) {
             expect(() => parseAiAuthSelection({ ...base, bindingGrant: bad })).toThrow(/bindingGrant/)
         }
+    })
+})
+
+// The daemon's spawn env carries who asked for the session; the runner turns it into
+// metadata (aplus-dev-studio specs/session-source-metadata). If this link breaks, the
+// metadata is silently empty and clients fall back to their heuristics.
+describe('buildSessionRequesterEnv', () => {
+    it('carries a well-formed session source to the child as HAPPY_CREATED_BY_SOURCE', () => {
+        expect(buildSessionRequesterEnv({ sessionSource: 'schedule' })).toEqual({ HAPPY_CREATED_BY_SOURCE: 'schedule' })
+    })
+
+    it.each(['Schedule', 'has space', '', 'x'.repeat(40), 42, null])('drops a malformed source (%s)', (sessionSource) => {
+        expect(buildSessionRequesterEnv({ sessionSource })).toEqual({})
+    })
+
+    it('keeps requester identity next to the source', () => {
+        expect(buildSessionRequesterEnv({ createdByAccountId: 'acct-1', createdByDisplayName: 'Ada', sessionSource: 'github-trigger' })).toEqual({
+            HAPPY_CREATED_BY_ACCOUNT_ID: 'acct-1',
+            HAPPY_CREATED_BY_DISPLAY_NAME: 'Ada',
+            HAPPY_CREATED_BY_SOURCE: 'github-trigger',
+        })
+    })
+
+    it('is scrubbed as lineage, so a child the session starts never inherits it', () => {
+        const env = buildSessionRequesterEnv({ createdByAccountId: 'acct-1', sessionSource: 'schedule' })
+        expect(scrubSessionLineageEnv({ ...env, SAFE: 'kept' })).toEqual({ SAFE: 'kept' })
     })
 })

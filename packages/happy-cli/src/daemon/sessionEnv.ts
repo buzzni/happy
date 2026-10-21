@@ -38,6 +38,7 @@ import {
 } from '@/usage/aiAuthSource'
 import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
+import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
 
 // 'HAPPY_INITIAL_' covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the
 // HAPPY_INITIAL_MODEL / HAPPY_INITIAL_EFFORT spawn seeds.
@@ -89,6 +90,25 @@ export function scrubSessionLineageEnv(env: NodeJS.ProcessEnv): Record<string, s
         scrubbed[key] = value
     }
     return scrubbed
+}
+
+/**
+ * Who asked for one spawn: requester identity (specs/session-created-by) and source
+ * (aplus-dev-studio specs/session-source-metadata). Re-supplied on every spawn, never
+ * lineage — all three live under the scrubbed HAPPY_CREATED_BY prefix. A malformed
+ * source is dropped, never stored.
+ */
+export function buildSessionRequesterEnv(options: {
+    createdByAccountId?: string
+    createdByDisplayName?: string
+    sessionSource?: unknown
+}): Record<string, string> {
+    const env: Record<string, string> = {}
+    if (options.createdByAccountId) env.HAPPY_CREATED_BY_ACCOUNT_ID = options.createdByAccountId
+    if (options.createdByDisplayName) env.HAPPY_CREATED_BY_DISPLAY_NAME = options.createdByDisplayName
+    const source = normalizeSessionSource(options.sessionSource)
+    if (source) env[SESSION_SOURCE_ENV] = source
+    return env
 }
 
 /** Builds one child environment after removing stale inherited lineage. */

@@ -37,6 +37,12 @@ describe('createSessionMetadata', () => {
 
         expect(metadata.rpcBinding).toEqual({ version: 1 });
     });
+    // aplus-dev-studio specs/session-source-metadata — the runner hands over what the daemon asked for.
+    it('records the session source only when the runner supplies one', () => {
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1', source: 'schedule' }).metadata.source).toBe('schedule');
+        expect(createSessionMetadata({ flavor: 'codex', machineId: 'machine-1' }).metadata).not.toHaveProperty('source');
+    });
+
     it('sets metadata.sandbox to the config when enabled', () => {
         const sandbox = createSandboxConfig();
         const { metadata } = createSessionMetadata({

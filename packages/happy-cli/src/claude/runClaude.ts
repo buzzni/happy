@@ -72,6 +72,7 @@ import {
 } from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
@@ -320,6 +321,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Requester identity from the daemon's spawn RPC (specs/session-created-by).
     const createdByAccountId = process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
     const createdByDisplayName = process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+    // Who asked for this session (aplus-dev-studio specs/session-source-metadata); read once and removed.
+    const source = takeSessionSourceFromEnv();
 
     const { metadata: freshMetadata } = createSessionMetadata({
         flavor: 'claude',
@@ -333,6 +336,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         parentSessionId: forkedFromSessionId,
         forkedFromMessageId,
         createdBy: createdByAccountId ? { accountId: createdByAccountId, displayName: createdByDisplayName } : undefined,
+        source,
     });
 
     // Resume-in-place must use the latest server document as its metadata

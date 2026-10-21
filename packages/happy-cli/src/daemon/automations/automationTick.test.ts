@@ -68,6 +68,7 @@ describe('runAutomationTick', () => {
       initialPrompt: '어제 로그를 점검해줘',
       createdByAccountId: null,
       agent: 'codex',
+      sessionSource: 'schedule',
     })
     const [saved] = store.list()
     expect(saved!.runHistory[0]).toEqual({ at: NOW, outcome: 'woke', sessionId: 'session-new' })

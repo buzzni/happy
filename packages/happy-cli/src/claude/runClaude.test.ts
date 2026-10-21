@@ -364,6 +364,7 @@ describe('runClaude remote JSONL scanner', () => {
         delete process.env.HAPPY_FORK_CLAUDE_SESSION_ID;
         delete process.env.HAPPY_CREATED_BY_ACCOUNT_ID;
         delete process.env.HAPPY_CREATED_BY_DISPLAY_NAME;
+        delete process.env.HAPPY_CREATED_BY_SOURCE;
         delete process.env.HAPPY_INITIAL_PROMPT;
         delete process.env.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED;
         delete process.env.HAPPY_AUTOMATION_RUN_ONCE;
@@ -609,6 +610,21 @@ describe('runClaude remote JSONL scanner', () => {
                 createdBy: { accountId: 'acct-123', displayName: 'Ada' },
             }),
         }));
+
+        await harness.finish();
+    });
+
+    // aplus-dev-studio specs/session-source-metadata — recorded once, and gone from this process's env
+    // so a `happy` started from the session's own shell does not inherit it.
+    it('records the daemon-supplied session source and removes it from the environment', async () => {
+        process.env.HAPPY_CREATED_BY_SOURCE = 'schedule';
+
+        const harness = await startRemoteRunClaudeHarness();
+
+        expect(harness.api.getOrCreateSession).toHaveBeenCalledWith(expect.objectContaining({
+            metadata: expect.objectContaining({ source: 'schedule' }),
+        }));
+        expect(process.env.HAPPY_CREATED_BY_SOURCE).toBeUndefined();
 
         await harness.finish();
     });

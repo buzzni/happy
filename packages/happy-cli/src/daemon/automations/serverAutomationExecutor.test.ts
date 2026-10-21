@@ -307,6 +307,7 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
         .toMatchObject({ authorization: `Bearer LOCAL-CAPABILITY-${provider}` })
     }
     expect(spawnSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      sessionSource: 'schedule',
       expectedConnectors: ['gmail', 'google-drive'],
       mcpSpawnContext: expect.objectContaining({ mcpCallerGrant: 'LOCAL-SIGNED-GRANT', mcpConfigProjectId: 'P-1' }),
     }))
@@ -836,6 +837,7 @@ describe('runServerAutomationTick', () => {
       .toHaveLength(0)
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       initialPrompt: expect.stringContaining('Review 11: Add search'),
+      sessionSource: 'github-trigger',
     }))
     const carried = store.state().githubTriggers?.[0]
     expect(carried?.generation).toBe(3)
@@ -2459,6 +2461,8 @@ describe('runServerAutomationTick', () => {
       directory: '/repo',
       initialPrompt: expect.stringContaining('Task ID: apply-1'),
     }))
+    // It stands in for the requester's own session, so clients must not hide it as an unattended run.
+    expect(spawnSession.mock.calls[0]![0].sessionSource).toBeUndefined()
     expect(logDebug).toHaveBeenCalledWith(
       '[server-automation] strict machine control: not resuming server-named session unrelated-session'
       + ' for review_apply task apply-1; using a new apply worker',
@@ -2522,6 +2526,7 @@ describe('runServerAutomationTick', () => {
     }))
     expect(spawnSession).toHaveBeenCalledWith(expect.objectContaining({
       directory: '/isolated/run-1',
+      sessionSource: 'github-trigger',
     }))
   })
 

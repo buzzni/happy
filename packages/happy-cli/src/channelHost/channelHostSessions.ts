@@ -27,6 +27,9 @@ import { ChannelHostRequestError } from './channelHostSupervisor';
 type SessionKeys = { dataEncryptionKey: string | null; dek: string | null };
 
 const RECONNECTING_AGENTS = new Set(['claude', 'codex']);
+/** A messenger conversation, not one started in a Saycode client (aplus-dev-studio specs/session-source-metadata). */
+const CHANNEL_SESSION_SOURCE = 'channel';
+
 const KNOWN_AGENTS = new Set(['claude', 'codex', 'gemini', 'grok', 'openclaw', 'opencode']);
 
 type SpawnRequest = {
@@ -87,6 +90,7 @@ export function createChannelHostSessions(deps: {
         environmentVariables: request.environmentVariables,
         mcpCallerGrantEnvelope: request.mcpCallerGrantEnvelope,
         createdByAccountId: request.createdByAccountId,
+        sessionSource: CHANNEL_SESSION_SOURCE,
     });
 
     const startedSessionId = (result: SpawnSessionResult): string => {
@@ -123,6 +127,7 @@ export function createChannelHostSessions(deps: {
             lifecycleState: 'running',
             lifecycleStateSince: Date.now(),
             ...(request.createdByAccountId ? { createdBy: { accountId: request.createdByAccountId } } : {}),
+            source: CHANNEL_SESSION_SOURCE,
         };
         const prepared = await deps.spawnWithSessionKey?.(spawnOptions(request), { key, wrapped });
         if (prepared) {

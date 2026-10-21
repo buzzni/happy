@@ -16,6 +16,7 @@ import { configuration } from '@/configuration';
 import { projectPath } from '@/projectPath';
 import type { SandboxConfig } from '@/persistence';
 import packageJson from '../../package.json';
+import type { SessionSource } from '@/utils/sessionSource';
 
 /**
  * Backend flavor identifier for session metadata.
@@ -42,6 +43,8 @@ export interface CreateSessionMetadataOptions {
     forkedFromMessageId?: string;
     /** Account that requested this spawn, if known by the caller. */
     createdBy?: { accountId: string; displayName?: string };
+    /** Who started the session (takeSessionSourceFromEnv); a terminal start has none. */
+    source?: SessionSource;
 }
 
 /**
@@ -104,6 +107,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
         ...(opts.forkedFromMessageId ? { forkedFromMessageId: opts.forkedFromMessageId } : {}),
         ...(opts.createdBy ? { createdBy: opts.createdBy } : {}),
+        ...(opts.source ? { source: opts.source } : {}),
     };
 
     return { state, metadata };

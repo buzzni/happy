@@ -67,6 +67,13 @@ export const MetadataSchema = z.object({
      */
     parentSessionId: z.string().optional(),
     forkedFromMessageId: z.string().optional(),
+    /**
+     * Who started the session (`user`, `schedule`, `github-trigger`, …), written by
+     * happy-cli at creation. An open enum, so a plain string: declared so the app's
+     * metadata write-back does not strip it (aplus-dev-studio specs/session-source-metadata).
+     * A malformed value is dropped rather than failing the whole document.
+     */
+    source: z.string().optional().catch(undefined),
 });
 
 export type Metadata = z.infer<typeof MetadataSchema>;
