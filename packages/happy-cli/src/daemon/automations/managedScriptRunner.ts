@@ -14,8 +14,7 @@ const limits = ['--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-pr
   '--user', '65534:65534', '--memory', '512m', '--cpus', '1', '--pids-limit', '64',
   '--tmpfs', '/tmp:rw,noexec,nosuid,size=16m', '--init'];
 // The docker client runs on the host; nothing session-scoped reaches it (the container gets only its --env).
-const dockerEnvironment = () => sanitizeChildEnv(process.env);
-const docker = (args: string[]) => exec('docker', args, { timeout: 30000, maxBuffer: LOG_LIMIT, env: dockerEnvironment() });
+const docker = (args: string[]) => exec('docker', args, { timeout: 30000, maxBuffer: LOG_LIMIT, env: sanitizeChildEnv(process.env) });
 
 export type ManagedScriptInput = {
   runId: string; source: string; action: ScriptAutomationPayload['action']; input: Record<string, unknown>;
@@ -89,7 +88,7 @@ export async function runManagedScript(input: ManagedScriptInput): Promise<Manag
     await input.beforeStart?.();
     input.signal?.throwIfAborted();
     const result = await new Promise<ManagedScriptResult>((resolve, reject) => {
-      const process = spawn('docker', ['start', '--attach', '--interactive', id], { stdio: ['pipe', 'pipe', 'pipe'], env: dockerEnvironment() });
+      const process = spawn('docker', ['start', '--attach', '--interactive', id], { stdio: ['pipe', 'pipe', 'pipe'], env: sanitizeChildEnv(globalThis.process.env) });
       const secrets = Object.values(input.secrets).filter(Boolean).sort((a, b) => b.length - a.length);
       const captureLimit = LOG_LIMIT + Math.max(0, ...secrets.map((value) => Buffer.byteLength(value)));
       const chunks: Buffer[] = [];

@@ -91,7 +91,8 @@ cross-repo)도 완료: 데스크톱의 `createDesktopProjectSession`이 `created
 - `packages/happy-cli/src/api/apiMachine.ts:241-271` — `spawn-happy-session` RPC 핸들러 (T2)
 - `packages/happy-cli/src/daemon/run.ts:400-503` — `spawnSession()`, `extraEnv` 구성 (T3)
 - `packages/happy-cli/src/daemon/sessionEnv.ts` — `SESSION_LINEAGE_ENV_PREFIXES`,
-  `scrubSessionLineageEnv` (T4)
+  `scrubSessionLineageEnv` (T4). 2026-10-21부터 `src/utils/childEnv.ts`의
+  `NON_INHERITABLE_ENV`·`sanitizeChildEnv`로 옮겨졌다(Desktop specs/codexcli-child-env-hygiene).
 - `packages/happy-cli/src/utils/createSessionMetadata.ts` — 공용 metadata 팩토리 (T6)
 - `packages/happy-cli/src/claude/runClaude.ts:130-192` — inline metadata 구성, T5가 팩토리로
   교체할 지점, T7이 `createdBy` 배선할 지점

@@ -281,9 +281,8 @@ export async function claudeLocal(opts: {
 
             // Prepare environment variables
             // When sandbox is enabled, filter out credentials to prevent exposure
-            const baseEnv = opts.sandboxConfig?.enabled
-                ? filterCredentialsFromEnv({ ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...opts.claudeEnvVars })
-                : { ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...opts.claudeEnvVars };
+            const inheritedEnv = { ...sanitizeChildEnv(process.env, { boundary: 'in-session' }), ...opts.claudeEnvVars };
+            const baseEnv = opts.sandboxConfig?.enabled ? filterCredentialsFromEnv(inheritedEnv) : inheritedEnv;
             const env = baseEnv;
 
             if (opts.mcpServers && Object.keys(opts.mcpServers).length > 0) {

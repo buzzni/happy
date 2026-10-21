@@ -33,6 +33,8 @@ describe('createPtySession', () => {
             const s = track(createPtySession({
                 userId: 'u1',
                 shell: 'node',
+                // The open request's env is client-supplied and cannot carry a session either.
+                env: { SAYCODE_AGENT_ROOT: '/from-request' },
                 args: ['-e', "process.stdout.write('ENV:' + (process.env.HAPPY_RECONNECT_SESSION_ID ?? '-') + (process.env.SAYCODE_AGENT_ROOT ?? '-') + (process.env.PATH ? 'P' : '') + ':END\\n'); setInterval(() => {}, 1000)"],
             }))
             let buf = ''

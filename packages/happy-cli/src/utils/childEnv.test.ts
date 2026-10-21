@@ -125,6 +125,7 @@ describe('sanitizeChildEnv', () => {
             HAPPY_RECONNECT_SESSION_ID: 'cmr-1', HAPPY_RECONNECT_ENCRYPTION_KEY: 'key',
             HAPPY_FORK_CODEX_THREAD_ID: 'codex-1', HAPPY_CREATED_BY_ACCOUNT_ID: 'acct',
             HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE: '/tmp/ctx', HAPPY_INITIAL_PROMPT: 'first prompt',
+            HAPPY_AUTOMATION_RUN_ONCE: '1', HAPPY_AUTOMATION_RESUME_PROMPT: '1',
             APLUS_SESSION_ID: 'session-1', SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo',
             HAPPY_AI_AUTH_SOURCE: 'org-bundle', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'binding',
             CLAUDE_CODE_OAUTH_TOKEN: 'bound', HAPPY_CHECKPOINT_SPAWN_CONTEXT: '{}', HAPPY_WRITE_SCOPE_SESSION: '1',
@@ -141,6 +142,7 @@ describe('sanitizeChildEnv', () => {
     it('classifies every entry by what its value names', () => {
         expect(nonInheritableEnvEntry('HAPPY_RECONNECT_SNAPSHOT')?.kind).toBe('session-lineage')
         expect(nonInheritableEnvEntry('HAPPY_INITIAL_MODEL')?.kind).toBe('spawn-seed')
+        expect(nonInheritableEnvEntry('HAPPY_AUTOMATION_RUN_ONCE')?.kind).toBe('spawn-seed')
         expect(nonInheritableEnvEntry('SAYCODE_AGENT_DEPTH')?.kind).toBe('session-scope')
         expect(nonInheritableEnvEntry('HAPPY_HOME_DIR')).toBeUndefined()
     })

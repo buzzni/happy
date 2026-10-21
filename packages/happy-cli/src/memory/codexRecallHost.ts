@@ -8,6 +8,7 @@ import { resolveServiceEntry } from './cmlLessonHost';
 import { loadExternalEsModule } from './externalModuleLoader';
 import { RECALL_OWNER_ENV } from './recallOwnerMarker';
 import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 
 const OUTPUT_LIMIT_BYTES = 256 * 1024;
 const CONTEXT_LIMIT_CHARS = 24_000;
@@ -69,7 +70,7 @@ export async function prepareCodexRecallHost(input: {
     const deps = { ...productionDeps, ...input.deps };
     const projectPath = input.projectPath;
     // Capture once, before checkpoint cwd transitions; never read model environment overrides.
-    const env: NodeJS.ProcessEnv = { ...input.env, [RECALL_OWNER_ENV]: 'host-worker' };
+    const env: NodeJS.ProcessEnv = { ...sanitizeChildEnv(input.env, { boundary: 'in-session' }), [RECALL_OWNER_ENV]: 'host-worker' };
     delete env.CLAUDE_MEMORY_DEBUG;
     let artifacts: Artifacts | null;
     let prepareTimer: ReturnType<typeof setTimeout> | undefined;

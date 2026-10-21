@@ -21,8 +21,9 @@
  *    and replayed each other's prompts.
  *  - `spawn-seed`: one-shot input to the runner of this spawn. 'HAPPY_INITIAL_'
  *    covers HAPPY_INITIAL_PROMPT(_LOCAL_ID) and the HAPPY_INITIAL_MODEL /
- *    HAPPY_INITIAL_EFFORT spawn seeds; the browser task session secret is read
- *    once by the runner's MCP server.
+ *    HAPPY_INITIAL_EFFORT spawn seeds; HAPPY_AUTOMATION_* (run-once, resume
+ *    prompt, browser continuation) is read by the runner before agent code runs;
+ *    the browser task session secret is read once by the runner's MCP server.
  *  - `session-scope`: the current session's own identity, grants and policy.
  *    Its own children (the agent CLI, its tool shells, `happy agent`) need
  *    them; a process that starts or hosts another session must not carry them.
@@ -49,9 +50,10 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_DEFERRED_CONTINUATION_', kind: 'session-lineage' },
     { prefix: 'HAPPY_INITIAL_', kind: 'spawn-seed' },
     { prefix: 'HAPPY_BROWSER_TASK_SESSION_SECRET', kind: 'spawn-seed' },
+    // Run-once, resume prompt, browser continuation: read by the runner before agent code runs (lessonSessionHost).
+    { prefix: 'HAPPY_AUTOMATION_', kind: 'spawn-seed' },
     { prefix: 'HAPPY_SCOPE_REPORT_', kind: 'session-scope' },
     { prefix: 'HAPPY_WRITE_SCOPE_', kind: 'session-scope' },
-    { prefix: 'HAPPY_AUTOMATION_', kind: 'session-scope' },
     { prefix: 'HAPPY_ADDITIONAL_DIRECTORIES', kind: 'session-scope' },
     { prefix: 'HAPPY_CHECKPOINT_', kind: 'session-scope' },
     { prefix: 'HAPPY_AI_AUTH_', kind: 'session-scope' },
