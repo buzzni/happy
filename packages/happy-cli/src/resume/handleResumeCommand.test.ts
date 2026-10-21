@@ -1,6 +1,45 @@
-import { describe, expect, it } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { tmpdir } from 'node:os';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { buildResumeLaunch, formatResumeHelp, parseResumeCommandArgs } from './handleResumeCommand';
+import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
+
+import { buildResumeLaunch, formatResumeHelp, handleResumeCommand, parseResumeCommandArgs } from './handleResumeCommand';
+import { resolveHappySession } from './resolveHappySession';
+
+vi.mock('@/utils/spawnHappyCLI', () => ({ spawnHappyCLI: vi.fn() }));
+vi.mock('./resolveHappySession', () => ({ resolveHappySession: vi.fn() }));
+
+describe('handleResumeCommand', () => {
+    afterEach(() => {
+        vi.unstubAllEnvs();
+    });
+
+    it('starts the resumed session host without the calling session\'s scope', async () => {
+        // Run from an agent shell, `happy resume <B>` would otherwise hand session A's
+        // agent grant, checkpoint binding and connector grant to session B's runner.
+        vi.stubEnv('SAYCODE_AGENT_ROOT', '/session-a');
+        vi.stubEnv('HAPPY_CHECKPOINT_SPAWN_CONTEXT', '{"projectId":"a"}');
+        vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', 'session-a-grant');
+        vi.stubEnv('HAPPY_HOME_DIR', '/home/u/.happy');
+        vi.mocked(resolveHappySession).mockResolvedValue({
+            id: 'session-b', active: false, metadata: { path: tmpdir(), flavor: 'codex', codexThreadId: 'thread-b' } as never,
+        });
+        const child = new EventEmitter();
+        vi.mocked(spawnHappyCLI).mockImplementation(() => {
+            queueMicrotask(() => child.emit('exit', 0, null));
+            return child as never;
+        });
+
+        await handleResumeCommand(['session-b']);
+
+        const env = vi.mocked(spawnHappyCLI).mock.calls[0][1]?.env ?? {};
+        expect(env.HAPPY_HOME_DIR).toBe('/home/u/.happy');
+        expect(env).not.toHaveProperty('SAYCODE_AGENT_ROOT');
+        expect(env).not.toHaveProperty('HAPPY_CHECKPOINT_SPAWN_CONTEXT');
+        expect(env).not.toHaveProperty('HAPPY_APLUS_MCP_CALLER_GRANT');
+    });
+});
 
 describe('parseResumeCommandArgs', () => {
     it('parses the happy session id', () => {

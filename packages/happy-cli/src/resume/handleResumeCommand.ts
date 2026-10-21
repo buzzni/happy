@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 
 import type { Metadata } from '@/api/types';
+import { sanitizeChildEnv } from '@/utils/childEnv';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 
 import { resolveHappySession, type ResumableHappySession } from './resolveHappySession';
@@ -115,7 +116,10 @@ function spawnResumeChild(launch: ResumeLaunch): Promise<number | null> {
     return new Promise((resolve, reject) => {
         const child = spawnHappyCLI(launch.args, {
             cwd: launch.cwd,
-            env: process.env,
+            // The resumed runner hosts another session: it must not start with the
+            // caller's agent grant, checkpoint binding or connector grant (an agent
+            // shell running `happy resume <id>`).
+            env: sanitizeChildEnv(process.env),
             stdio: 'inherit',
         });
 

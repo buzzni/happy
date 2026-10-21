@@ -13,6 +13,7 @@ const SPAWN_PATHS: Record<string, [call: string, sites: number]> = {
     'daemon/sessionEnv.ts': ['sanitizeChildEnv(', 4],
     'daemon/run.ts': ['sanitizeChildEnv(process.env)', 1],
     'utils/spawnHappyCLI.ts': ['sanitizeChildEnv(', 1],
+    'resume/handleResumeCommand.ts': ['sanitizeChildEnv(process.env)', 1],
     'channelHost/channelHostSupervisor.ts': ['sanitizeChildEnv(process.env)', 1],
     'claude/claudeLocal.ts': ["sanitizeChildEnv(process.env, { boundary: 'in-session' })", 1],
     'claude/sdk/query.ts': ["sanitizeChildEnv(process.env, { boundary: 'in-session' })", 1],
