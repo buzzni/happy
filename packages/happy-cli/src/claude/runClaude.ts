@@ -790,9 +790,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         : null;
     // The shadow entry is `--mcp-config` argv; the user's cua-driver env reaches it by reference.
     if (cuaUpstream && Object.keys(cuaUpstream.env).length > 0) process.env[CUA_UPSTREAM_ENV_VAR] = JSON.stringify(cuaUpstream.env);
-    const toolPolicyGate = toolPolicy && cuaUpstream
+    const cuaHandOff = toolPolicy && cuaUpstream
         ? handOffCuaToShadowProxy(toolPolicy.gate, { terminalPrompt: () => currentSession?.mode === 'local' })
-        : toolPolicy?.gate;
+        : null;
+    const toolPolicyGate = cuaHandOff ?? toolPolicy?.gate;
 
     // Start Hook server for receiving Claude session notifications
     const hookServer = await startHookServer({
@@ -1998,6 +1999,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: happyServer.toolNames.map(toolName => `mcp__happy__${toolName}`),
         onModeChange: (newMode) => {
             currentRunMode = newMode;
+            cuaHandOff?.newProviderGeneration();
             session.sendSessionEvent({ type: 'switch', mode: newMode });
             session.updateAgentState((currentState) => ({
                 ...currentState,
@@ -2012,8 +2014,14 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             sessionInstance.prepareChannelExecution = (requestId) => channelAcceptance.prepareExecution(requestId);
             sessionInstance.beginChannelExecution = (requestId) => channelAcceptance.beginExecution(requestId);
         },
-        onAbort: resetTurnScopedOptions,
-        onSessionReset: () => difficultyRoutingCommitter.startEpoch(),
+        onAbort: () => {
+            cuaHandOff?.newProviderGeneration();
+            resetTurnScopedOptions();
+        },
+        onSessionReset: () => {
+            cuaHandOff?.newProviderGeneration();
+            difficultyRoutingCommitter.startEpoch();
+        },
         /**
          * The engine-applied boundary. The launcher calls this when a batch's
          * mode becomes the settings of an SDK query — the first moment the

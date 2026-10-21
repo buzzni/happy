@@ -87,26 +87,44 @@ export function buildToolPolicyHookEntries(input: { forwarderCommand: string; fi
  *   the call (by tool_use_id) the hook let through. The target the hook judged is not looked up
  *   again when the call reaches the proxy (as in I1a's hook path).
  * A proxy call the hook did not let through is decided by the proxy, so a mode switch between the
- * two never skips a decision.
+ * two never skips a decision. The proxy lets through only the same tool, in the same provider run
+ * (generation), as the hook's verdict.
  */
-export function handOffCuaToShadowProxy(gate: ToolPolicyGate, options: { terminalPrompt: () => boolean; tables?: ToolPolicyTables }): ToolPolicyGate {
+export function handOffCuaToShadowProxy(gate: ToolPolicyGate, options: { terminalPrompt: () => boolean; tables?: ToolPolicyTables }): ToolPolicyGate & {
+    /**
+     * A new provider run (query restart, abort, `/clear`, mode switch): ids the hook let through in
+     * an earlier run are dropped — the provider may reuse one for a different call.
+     */
+    newProviderGeneration(): void;
+} {
     const tables = options.tables ?? BUILTIN_TABLES;
-    const decidedByHook = new Set<string>();
+    let generation = 0;
+    const decidedByHook = new Map<string, { toolName: string; generation: number }>();
     return {
         toolsListed: gate.toolsListed,
+        newProviderGeneration: () => {
+            generation += 1;
+            decidedByHook.clear();
+        },
         decide: async (call, signal) => {
             if (parseMcpToolName(call.toolName)?.server !== tables.cuaDriver.server) return gate.decide(call, signal);
             if (call.origin === undefined) {
                 const hookDecides = options.terminalPrompt() || (call.permissionMode !== undefined && call.permissionMode !== 'bypassPermissions');
                 if (!hookDecides || !call.toolUseId) return { kind: 'pass' };
+                const decidedIn = generation;
                 const verdict = await gate.decide(call, signal);
-                if (verdict.kind !== 'deny') {
-                    decidedByHook.add(call.toolUseId);
-                    if (decidedByHook.size > MAX_HOOK_DECIDED_CALLS) decidedByHook.delete(decidedByHook.values().next().value as string);
+                // A verdict that outlived its provider run (a 30-minute prompt) is not handed on.
+                if (verdict.kind !== 'deny' && decidedIn === generation) {
+                    decidedByHook.set(call.toolUseId, { toolName: call.toolName, generation });
+                    if (decidedByHook.size > MAX_HOOK_DECIDED_CALLS) decidedByHook.delete(decidedByHook.keys().next().value as string);
                 }
                 return verdict;
             }
-            if (call.origin === 'cua-proxy' && call.toolUseId && decidedByHook.delete(call.toolUseId)) return { kind: 'pass' };
+            const handed = call.origin === 'cua-proxy' && call.toolUseId ? decidedByHook.get(call.toolUseId) : undefined;
+            if (handed && call.toolUseId) {
+                decidedByHook.delete(call.toolUseId);
+                if (handed.generation === generation && handed.toolName === call.toolName) return { kind: 'pass' };
+            }
             return gate.decide(call, signal);
         },
     };
