@@ -11,6 +11,7 @@ import {
 } from './bashStreamCallRegistry';
 import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
+import { sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
@@ -703,6 +704,8 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 ...(typeof notification.task_id === 'string' ? { taskId: notification.task_id } : {}),
                 ...(typeof notification.tool_use_id === 'string' ? { toolUseId: notification.tool_use_id } : {}),
             });
+            const text = sdkBackgroundTaskCompletion(message);
+            if (text && !message.isSidechain) envelopes.push(createEnvelope('user', { t: 'text', text }, { claudeUuid }));
         }
         return {
             currentTurnId: state.currentTurnId,
@@ -905,6 +908,9 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                     ...(images ? { images } : {}),
                     ...(backgroundTaskId ? { backgroundTaskId } : {}),
                 }, { turn: turnId, subagent }));
+                const completion = redacted || message.isSidechain ? null
+                    : stoppedBackgroundTaskCompletion(getToolNameById(block.tool_use_id), block);
+                if (completion) envelopes.push(createEnvelope('user', { t: 'text', text: completion }, { turn: turnId, claudeUuid }));
                 clearActiveBashStreamCall(block.tool_use_id);
                 continue;
             }

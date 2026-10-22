@@ -10,6 +10,30 @@ import {
 import { SDKToLogConverter } from './sdkToLogConverter';
 
 describe('mapClaudeLogMessageToSessionEnvelopes', () => {
+    it.each(['completed', 'failed', 'stopped'])('forwards an SDK background task %s without opening a turn', (status) => {
+        const result = mapClaudeLogMessageToSessionEnvelopes({ type: 'system', subtype: 'task_notification',
+            task_id: 'bg-shell', tool_use_id: 'launch-shell', status,
+        } as any, { currentTurnId: null });
+        expect(result.currentTurnId).toBeNull();
+        expect(result.envelopes).toContainEqual(expect.objectContaining({ role: 'user',
+            ev: { t: 'text', text: `<task-notification>\n<task-id>bg-shell</task-id>\n<tool-use-id>launch-shell</tool-use-id>\n<status>${status}</status>\n</task-notification>` },
+        }));
+    });
+
+    it.each([false, true])('only reports a successful TaskStop result (is_error=%s)', (isError) => {
+        const state = { currentTurnId: null };
+        mapClaudeLogMessageToSessionEnvelopes({ type: 'assistant', message: { content: [
+            { type: 'tool_use', id: 'stop-shell', name: 'TaskStop', input: { task_id: 'bg-shell' } },
+        ] } } as any, state);
+        const result = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', message: { content: [
+            { type: 'tool_result', tool_use_id: 'stop-shell', is_error: isError,
+                content: JSON.stringify({ task_id: 'bg-shell', message: isError ? 'Failed to stop task' : 'Successfully stopped task: bg-shell (sleep 60)' }) },
+        ] } } as any, state);
+        const notices = result.envelopes.filter(e => e.ev.t === 'text');
+        expect(notices).toHaveLength(isError ? 0 : 1);
+        if (!isError) expect(notices[0].ev).toMatchObject({ text: expect.stringContaining('<task-id>bg-shell</task-id>\n<status>stopped</status>') });
+    });
+
     it('maps user text to a user text envelope', () => {
         const result = mapClaudeLogMessageToSessionEnvelopes({
             type: 'user',
