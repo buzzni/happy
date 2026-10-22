@@ -507,7 +507,7 @@ describe('structured-output event', () => {
   });
 
   it('says why a turn ended without one instead of omitting the event', () => {
-    for (const reason of ['not_produced', 'schema_mismatch', 'retries_exhausted', 'turn_failed']) {
+    for (const reason of ['not_produced', 'schema_mismatch', 'retries_exhausted', 'turn_failed', 'turn_cancelled']) {
       expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing', reason }).success).toBe(true);
     }
   });

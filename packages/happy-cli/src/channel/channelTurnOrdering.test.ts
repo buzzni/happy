@@ -288,4 +288,28 @@ describe('structured output lands inside the turn it judges', () => {
         expect(shape(envelopes)).toEqual(['turn-start', 'structured-output', 'turn-end']);
         expect(envelopes[1].ev).toEqual({ t: 'structured-output', v: 1, status: 'missing', reason: 'turn_failed' });
     });
+
+    it('fills in a missing verdict for a turn that closes without one, so a cancelled turn never reads as success', async () => {
+        // Abort and launch-failure paths close the turn without an SDK result to judge.
+        const { queue, envelopes, state } = harness();
+        state.structuredOutputVerdicts = true;
+        queue.enqueue(assistant('working on it'));
+        queue.enqueue(turnEndItem('cancelled'));
+        await queue.flush();
+
+        expect(shape(envelopes)).toEqual(['turn-start', 'text', 'structured-output', 'turn-end']);
+        expect(envelopes[2].ev).toEqual({ t: 'structured-output', v: 1, status: 'missing', reason: 'turn_cancelled' });
+        expect(new Set(envelopes.map((envelope) => envelope.turn)).size).toBe(1);
+    });
+
+    it('does not add a second verdict to a turn that already has one', async () => {
+        const { queue, envelopes, state } = harness();
+        state.structuredOutputVerdicts = true;
+        queue.enqueue(assistant('{"answer":"ok"}'));
+        queue.enqueue(structuredOutputItem({ v: 1, status: 'ok', value: { answer: 'ok' } }));
+        queue.enqueue(turnEndItem('completed'));
+        await queue.flush();
+
+        expect(shape(envelopes)).toEqual(['turn-start', 'text', 'structured-output', 'turn-end']);
+    });
 });

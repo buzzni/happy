@@ -30,6 +30,7 @@ import {
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
     mapClaudeStructuredOutput,
+    missingStructuredOutputBeforeClose,
     mapClaudeLogMessageToSessionEnvelopes,
     toolCallTurnFor,
     type ClaudeSessionProtocolState,
@@ -1630,6 +1631,11 @@ export class ApiSessionClient extends EventEmitter {
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
     }
 
+    /** Every later turn of this session closes with a verdict, filled in as `missing` if none came. */
+    enableStructuredOutputVerdicts(): void {
+        this.claudeSessionProtocolState.structuredOutputVerdicts = true;
+    }
+
     /** A structured-output session's verdict on the turn (specs/claude-cli-benchmark-followups R2). */
     sendStructuredOutput(envelope: StructuredOutputEnvelope): void {
         const mapped = mapClaudeStructuredOutput(this.claudeSessionProtocolState, envelope);
@@ -1721,6 +1727,7 @@ export class ApiSessionClient extends EventEmitter {
         // builds the turn-end by hand, so without this a cancelled channel turn ends with no
         // `requestId` and the caller waits forever for an answer that was already decided.
         const requestId = this.claudeSessionProtocolState.currentRequestId ?? undefined;
+        envelopes.push(...missingStructuredOutputBeforeClose(this.claudeSessionProtocolState, turnId, 'cancelled'));
         envelopes.push(createEnvelope(
             'agent',
             { t: 'turn-end', status: 'cancelled', ...(requestId ? { requestId } : {}) },

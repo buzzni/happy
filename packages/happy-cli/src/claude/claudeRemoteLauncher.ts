@@ -275,6 +275,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * no structured-output events at all.
      */
     const judgeTurnStructuredOutput = session.outputFormat ? judgeStructuredOutput(session.outputFormat) : null;
+    if (judgeTurnStructuredOutput) session.client.enableStructuredOutputVerdicts();
     const observedAiAuthByLogMessage = new WeakMap<object, ObservedAiAuthSource>();
     const orderingTarget: ChannelTurnOrderingTarget = {
         setPendingTurnRequestId: (requestId) => session.client.setPendingTurnRequestId(requestId),

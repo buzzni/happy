@@ -19,8 +19,11 @@ import Ajv from 'ajv';
 import type { StructuredOutputMissingReason } from '@slopus/happy-wire';
 
 /**
- * Upper bound on the serialized schema. It travels as an environment value, and Windows caps a
- * single variable at 32,767 characters; half of that leaves room for everything else.
+ * Upper bound on the serialized schema. It travels to the session as one environment value
+ * (Windows caps a variable at 32,767 characters), and the SDK then passes it to the Claude CLI as
+ * a `--json-schema` argument, where it shares Windows' 32,767-character command line with the
+ * MCP config and system prompt. Half of the variable limit is a bound, not a guarantee: a schema
+ * near it is untested on Windows.
  */
 export const STRUCTURED_OUTPUT_MAX_SCHEMA_BYTES = 16 * 1024;
 

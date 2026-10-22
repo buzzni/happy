@@ -142,7 +142,7 @@ export const sessionFinalAnswerEventSchema = z.object({
  * `not_produced` is the important one: Claude's SDK can finish an unsatisfiable schema with
  * `subtype: "success"` and no `structured_output`, so success alone never proves a value exists.
  */
-export const STRUCTURED_OUTPUT_MISSING_REASONS = ['not_produced', 'schema_mismatch', 'retries_exhausted', 'turn_failed'] as const;
+export const STRUCTURED_OUTPUT_MISSING_REASONS = ['not_produced', 'schema_mismatch', 'retries_exhausted', 'turn_failed', 'turn_cancelled'] as const;
 export type StructuredOutputMissingReason = (typeof STRUCTURED_OUTPUT_MISSING_REASONS)[number];
 
 /**
