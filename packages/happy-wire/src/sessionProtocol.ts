@@ -135,6 +135,36 @@ export const sessionFinalAnswerEventSchema = z.object({
   requestId: z.string().min(1).max(128).optional(),
 });
 
+/**
+ * Why a turn of a structured-output session ended without a value (Saycode
+ * specs/claude-cli-benchmark-followups R2).
+ *
+ * `not_produced` is the important one: Claude's SDK can finish an unsatisfiable schema with
+ * `subtype: "success"` and no `structured_output`, so success alone never proves a value exists.
+ */
+export const STRUCTURED_OUTPUT_MISSING_REASONS = ['not_produced', 'schema_mismatch', 'retries_exhausted', 'turn_failed'] as const;
+export type StructuredOutputMissingReason = (typeof STRUCTURED_OUTPUT_MISSING_REASONS)[number];
+
+/**
+ * The machine-readable result of one turn in a session spawned with an output schema.
+ *
+ * Emitted for every turn of such a session — `missing` included — so a reader can tell "this turn
+ * failed to produce one" from "this session never asked for one" without knowing how it was
+ * spawned. Like `final-answer` it is a candidate until the matching `turn-end`.
+ */
+export const sessionStructuredOutputEventSchema = z.object({
+  t: z.literal('structured-output'),
+  v: z.literal(1),
+  status: z.enum(['ok', 'missing']),
+  value: z.unknown().optional(),
+  reason: z.enum(STRUCTURED_OUTPUT_MISSING_REASONS).optional(),
+}).refine(
+  (event) => event.status === 'ok'
+    ? event.value !== undefined && event.reason === undefined
+    : event.value === undefined && event.reason !== undefined,
+  { message: 'ok carries a value; missing carries only a reason' },
+);
+
 export const sessionChannelReadyEventSchema = z.object({
   t: z.literal('channel-ready'),
   requestId: z.string().min(1).max(128),
@@ -370,6 +400,7 @@ export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionToolCallProgressEventSchema,
   sessionFileEventSchema,
   sessionFinalAnswerEventSchema,
+  sessionStructuredOutputEventSchema,
   sessionChannelReadyEventSchema,
   sessionChannelPermissionEventSchema,
   sessionChannelPermissionWithdrawnEventSchema,
