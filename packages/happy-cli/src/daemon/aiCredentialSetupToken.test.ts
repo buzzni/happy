@@ -13,6 +13,7 @@ import {
 } from './sessionEnv'
 import { managedSetupTokenEmail, managedSetupTokenId, setupTokenGroupIdentity, setupTokenRuntimeStatus } from './claudeSetupToken'
 import { createSetupTokenAssignmentRecipient, sealSetupTokenAssignment } from './setupTokenAssignmentWire'
+import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind'
 
 vi.mock('cross-spawn', () => ({ spawn: vi.fn(() => ({ pid: 123 })) }))
 
@@ -909,6 +910,21 @@ describe('managed Claude setup-token runtime', () => {
       await runtime.groupSync(sync(2, payload(managed(B, 1, fakeToken('b')))))
       expect(state.slots.some(slot => slot.managedAccountId === A)).toBe(true)
       await expect(runtime.sessionEnvironment('claude', provenSelection())).rejects.toThrow('CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH')
+    })
+
+    // Saycode specs/managed-account-session-continuation: a proven binding's removed account surfaces as TOKEN_MISMATCH, not UNAVAILABLE.
+    it('moves a proven session whose account a group sync removed onto an assigned account at resume', async () => {
+      const { runtime } = await assigned()
+      const environment = await runtime.sessionEnvironment('claude', provenSelection())
+      const recorded = environment.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING
+      const resume = readSetupTokenResumeSelection(captureSaycodeAgentEnvironment(environment))!
+      expect(resume.binding).toHaveProperty('tokenProof')
+      await runtime.groupSync(sync(2, payload(managed(B, 1, fakeToken('b')))))
+      const next = { CLAUDE_CODE_OAUTH_TOKEN: fakeToken('b') }
+      const rebind = vi.fn(async () => ({ ok: true as const, environment: next }))
+      expect(await resumeSetupTokenEnvironment({ sessionId: 's', recorded, resolve: () => runtime.sessionEnvironment('claude', resume.selection, resume.binding), rebind }))
+        .toEqual({ environment: next, rebound: true })
+      expect(rebind).toHaveBeenCalledWith('s', recorded)
     })
 
     it('rejects a different actual token even when its managed id and generation still match the server', async () => {
