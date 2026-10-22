@@ -153,13 +153,17 @@ async function writeFileWithHashGate(path: string, buffer: Buffer, contentHash: 
             return { success: false, errorCode: 'HASH_MISMATCH', error: `File hash mismatch. Expected: ${expectedHash}, Actual: ${existingHash}` };
         }
     } else {
+        let existing: Awaited<ReturnType<typeof stat>>;
         try {
-            await stat(path);
+            existing = await stat(path);
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
             return writeAndHash(path, buffer, contentHash);
         }
-        if (acceptSameBytes && sha256Hex(await readFile(path)) === contentHash) return { success: true, hash: contentHash, replayed: true };
+        // Only a regular file of the same size can already hold these bytes; anything else is just taken.
+        if (acceptSameBytes && existing.isFile() && existing.size === buffer.length && sha256Hex(await readFile(path)) === contentHash) {
+            return { success: true, hash: contentHash, replayed: true };
+        }
         return { success: false, errorCode: 'FILE_EXISTS', error: 'File already exists but was expected to be new' };
     }
     return writeAndHash(path, buffer, contentHash);

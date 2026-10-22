@@ -273,6 +273,16 @@ describe('registerCommonHandlers writeFile attempts', () => {
         await expect(readFile(path, 'utf8')).resolves.toBe('fresh');
     });
 
+    it('answers FILE_EXISTS when a named create finds a directory at the path', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'taken');
+        await mkdir(path);
+
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('x'), expectedHash: null, attemptId: nextAttemptId(),
+        })).resolves.toMatchObject({ success: false, errorCode: 'FILE_EXISTS' });
+    });
+
     it('keeps the legacy answer for a write without an attempt id', async () => {
         const { handlers, workingDirectory } = await createHandlers();
         const path = join(workingDirectory, 'notes.md');
