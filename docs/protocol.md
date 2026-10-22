@@ -205,6 +205,9 @@ See `api.md` for the full HTTP endpoint catalog and auth flows.
 
 ## Claude runtime account display (session-stream v1)
 
+First supported CLI release candidate: `1.1.10-aplus.352`. No happy-server release
+is required because the existing encrypted session-stream relay is unchanged.
+
 The existing encrypted, volatile `session-stream` relay may carry a `runtime-account`
 snapshot. It does not change credentials, select an account, persist account data, or
 add a server endpoint. The relay still checks `activityCache.isSessionValid(sid, userId)`

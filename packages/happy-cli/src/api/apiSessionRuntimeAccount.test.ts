@@ -1,10 +1,4 @@
-/**
- * The context-usage frame the session client sends Desktop over `session-stream`.
- *
- * Saycode Desktop specs/desktop-chat-context-window-meter, plan.md tests H1–H6. Each signal has
- * to reach Desktop on its own: a normal turn result, a compaction and a reset make no
- * `usage-report`, so a meter that waited for one would never see them.
- */
+/** Verify runtime-account snapshots cross the existing encrypted stream without credential fields. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Metadata } from './types';
 import { decodeBase64, decrypt } from './encryption';
