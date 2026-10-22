@@ -142,6 +142,18 @@ describe('Happy MCP transport authentication', () => {
         await withPlatform('win32', {}, expectTcpBearerOnly);
     });
 
+    it('answers the Windows loopback listener with plain JSON, not an SSE stream endpoint security can hold back', async () => {
+        await withPlatform('win32', {}, async server => {
+            const bearer = JSON.parse(server.bridgeEnv.HAPPY_HTTP_MCP_HEADERS).Authorization as string;
+            const response = await fetch(server.url, { method: 'POST', headers: {
+                'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: bearer,
+            }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) });
+            expect(response.status).toBe(200);
+            expect(response.headers.get('content-type')).toMatch(/^application\/json/);
+            expect(await response.json()).toMatchObject({ jsonrpc: '2.0', id: 1, result: { tools: expect.any(Array) } });
+        });
+    });
+
     it('keeps an authenticated TCP transport for same-UID Linux scope sessions, which cannot open AF_UNIX', async () => {
         await withPlatform('linux', { sameUidSandbox: true }, expectTcpBearerOnly);
     });
