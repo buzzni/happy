@@ -7,10 +7,11 @@
  * `ask`, holds the response until a person answers in Saycode.
  *
  * Fail closed. Claude Code treats a hook that crashes or times out as a non-blocking error and runs
- * the tool anyway, and the Claude build Happy pins ignores `onFailure: "block"` (measured
- * 2026-10-22, specs/agent-tool-policy/context.md). So every path out of this script that is not
- * an explicit verdict is `deny` + exit 2 — including our own deadline, which stays below the hook
- * `timeout` so Claude never reaches its own.
+ * the tool anyway unless the hook sets `onFailure: "block"`, which Claude honours only from 2.1.295
+ * (the bundled 2.1.308 does; 2.1.285 and an older `HAPPY_CLAUDE_PATH` build ignore it — measured,
+ * specs/agent-tool-policy/context.md). So every path out of this script that is not an explicit
+ * verdict is `deny` + exit 2 — including our own deadline, which stays below the hook `timeout` so
+ * Claude never reaches its own. A hook that never starts is left to `onFailure`.
  *
  * Usage: node policy_hook_forwarder.cjs <port> <secret-file> [deadline-ms]
  */
