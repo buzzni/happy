@@ -287,6 +287,20 @@ describe('registerCommonHandlers writeFile attempts', () => {
         })).resolves.toMatchObject({ success: false, errorCode: 'FILE_MISSING' });
     });
 
+    it('lets only one of two overlapping writes from the same opened version through', async () => {
+        // Two clients opened the same version; the gate and the write must not interleave.
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'opened');
+
+        const answers = await Promise.all(['first', 'second'].map((text) => handlers.get('writeFile')?.({
+            path, content: b64(text), expectedHash: sha('opened'), attemptId: nextAttemptId(),
+        })));
+        expect(answers.filter((answer) => answer?.success)).toHaveLength(1);
+        expect(answers.filter((answer) => answer?.errorCode === 'HASH_MISMATCH')).toHaveLength(1);
+        await expect(readFile(path, 'utf8')).resolves.toBe(answers[0]?.success ? 'first' : 'second');
+    });
+
     it('rejects a malformed attempt id before writing', async () => {
         const { handlers, workingDirectory } = await createHandlers();
         const path = join(workingDirectory, 'new.md');

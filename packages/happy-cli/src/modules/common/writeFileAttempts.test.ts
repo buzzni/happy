@@ -43,6 +43,19 @@ describe('write file attempt store', () => {
         expect(store.run('attempt-1', fingerprint, async () => ok).kind).toBe('first');
     });
 
+    it('gives a resend that joined a failing first attempt the same failure, then forgets it', async () => {
+        const store = createWriteFileAttemptStore<{ success: boolean }>({ now: () => 0 });
+        let fail!: () => void;
+        const first = store.run('attempt-1', fingerprint, () => new Promise((resolve) => { fail = () => resolve({ success: false }); }));
+        const resent = store.run('attempt-1', fingerprint, async () => ok);
+        expect(resent.kind).toBe('replay');
+
+        fail();
+        await expect(first.kind === 'first' ? first.result : null).resolves.toEqual({ success: false });
+        await expect(resent.kind === 'replay' ? resent.result : null).resolves.toEqual({ success: false });
+        expect(store.size()).toBe(0);
+    });
+
     it('keeps at most the configured number of records, dropping the oldest', () => {
         const store = createWriteFileAttemptStore<typeof ok>({ maxEntries: 2, now: () => 0 });
         for (const id of ['attempt-1', 'attempt-2', 'attempt-3']) store.run(id, fingerprint, async () => ok);

@@ -117,6 +117,19 @@ interface WriteFileResponse {
 // One per process: `${machineId}:writeFile` and session-scoped registrations share retries' records.
 const writeFileAttempts = createWriteFileAttemptStore<WriteFileResponse>();
 
+// The hash gate reads, compares and writes; two writes to one path must not interleave, or both
+// pass a check against the same opened version and the second overwrites the first.
+const writeFileLocks = new Map<string, Promise<unknown>>();
+
+function withPathLock<T>(path: string, task: () => Promise<T>): Promise<T> {
+    const previous = writeFileLocks.get(path) ?? Promise.resolve();
+    const run = previous.then(task, task);
+    const tail = run.catch(() => undefined);
+    writeFileLocks.set(path, tail);
+    void tail.then(() => { if (writeFileLocks.get(path) === tail) writeFileLocks.delete(path); });
+    return run;
+}
+
 function sha256Hex(buffer: Buffer): string {
     return createHash('sha256').update(buffer).digest('hex');
 }
@@ -750,10 +763,10 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             const buffer = Buffer.from(data.content, 'base64');
             const contentHash = sha256Hex(buffer);
             const expectedHash = data.expectedHash ?? null;
-            if (data.attemptId === undefined) return await writeFileWithHashGate(path, buffer, contentHash, expectedHash, false);
+            if (data.attemptId === undefined) return await withPathLock(path, () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, false));
 
             const attempt = writeFileAttempts.run(data.attemptId, { path, expectedHash, contentHash },
-                () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, true));
+                () => withPathLock(path, () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, true)));
             if (attempt.kind === 'conflict') {
                 return { success: false, errorCode: 'ATTEMPT_CONFLICT', error: 'attemptId was already used for a different write' };
             }
