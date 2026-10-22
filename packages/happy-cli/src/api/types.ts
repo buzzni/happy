@@ -274,6 +274,12 @@ export const MachineMetadataSchema = z.object({
     agents: z.array(z.string()),
     maxSchemaBytes: z.number().int().positive(),
   }).optional(),
+  /**
+   * 이 daemon 의 `writeFile` 이 `attemptId` 재전송을 같은 답으로 처리한다고 광고한다
+   * (aplus-dev-studio specs/claude-cli-benchmark-followups R5). 구형 daemon 은 필드를 무시하므로
+   * 클라이언트는 이 필드를 보고 나서만 `attemptId` 를 보낸다.
+   */
+  writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),

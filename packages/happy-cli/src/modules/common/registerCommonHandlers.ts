@@ -16,6 +16,7 @@ import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { validatePath } from './pathSecurity';
 import { isStrictlyGuardedPath } from './happyHomeGuard';
 import { ensureDirectory } from './ensureDirectory';
+import { createWriteFileAttemptStore, isValidWriteFileAttemptId } from './writeFileAttempts';
 import { createIgnoreMatcher } from './ignorePresets';
 import {
     createGitignoreContext,
@@ -98,30 +99,45 @@ interface WriteFileRequest {
     path: string;
     content: string; // base64 encoded
     expectedHash?: string | null; // null for new files, hash for existing files
+    /** Names this write so a resend is answered, not repeated. Sent only to daemons advertising `writeFileAttempt`. */
+    attemptId?: string;
 }
+
+type WriteFileErrorCode = 'HASH_MISMATCH' | 'FILE_MISSING' | 'FILE_EXISTS' | 'ATTEMPT_CONFLICT' | 'INVALID_ATTEMPT_ID';
 
 interface WriteFileResponse {
     success: boolean;
     hash?: string; // hash of written file
+    /** The answer was not a new write: the attempt was already done, or the file already held these bytes. */
+    replayed?: true;
     error?: string;
+    errorCode?: WriteFileErrorCode;
 }
+
+// One per process: `${machineId}:writeFile` and session-scoped registrations share retries' records.
+const writeFileAttempts = createWriteFileAttemptStore<WriteFileResponse>();
 
 function sha256Hex(buffer: Buffer): string {
     return createHash('sha256').update(buffer).digest('hex');
 }
 
-/** The hash gate: an existing file is written only when its hash is `expectedHash`, a new one only when that is null. */
-async function writeFileWithHashGate(path: string, buffer: Buffer, contentHash: string, expectedHash: string | null): Promise<WriteFileResponse> {
+/**
+ * The hash gate. With `acceptSameBytes` (an attempt whose record is gone, e.g. after a restart),
+ * a file that already holds exactly the requested bytes counts as done instead of a conflict:
+ * nothing would be overwritten, and the alternative reports a save that went through as failed.
+ */
+async function writeFileWithHashGate(path: string, buffer: Buffer, contentHash: string, expectedHash: string | null, acceptSameBytes: boolean): Promise<WriteFileResponse> {
     if (expectedHash !== null) {
         let existingHash: string;
         try {
             existingHash = sha256Hex(await readFile(path));
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-            return { success: false, error: 'File does not exist but hash was provided' };
+            return { success: false, errorCode: 'FILE_MISSING', error: 'File does not exist but hash was provided' };
         }
         if (existingHash !== expectedHash) {
-            return { success: false, error: `File hash mismatch. Expected: ${expectedHash}, Actual: ${existingHash}` };
+            if (acceptSameBytes && existingHash === contentHash) return { success: true, hash: contentHash, replayed: true };
+            return { success: false, errorCode: 'HASH_MISMATCH', error: `File hash mismatch. Expected: ${expectedHash}, Actual: ${existingHash}` };
         }
     } else {
         try {
@@ -130,7 +146,8 @@ async function writeFileWithHashGate(path: string, buffer: Buffer, contentHash: 
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
             return writeAndHash(path, buffer, contentHash);
         }
-        return { success: false, error: 'File already exists but was expected to be new' };
+        if (acceptSameBytes && sha256Hex(await readFile(path)) === contentHash) return { success: true, hash: contentHash, replayed: true };
+        return { success: false, errorCode: 'FILE_EXISTS', error: 'File already exists but was expected to be new' };
     }
     return writeAndHash(path, buffer, contentHash);
 }
@@ -725,12 +742,23 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             return { success: false, error: validation.error };
         }
 
+        if (data.attemptId !== undefined && !isValidWriteFileAttemptId(data.attemptId)) {
+            return { success: false, errorCode: 'INVALID_ATTEMPT_ID', error: 'attemptId must be 8-128 letters, digits, "-" or "_"' };
+        }
         try {
             const path = validation.resolvedPath!;
             const buffer = Buffer.from(data.content, 'base64');
             const contentHash = sha256Hex(buffer);
             const expectedHash = data.expectedHash ?? null;
-            return await writeFileWithHashGate(path, buffer, contentHash, expectedHash);
+            if (data.attemptId === undefined) return await writeFileWithHashGate(path, buffer, contentHash, expectedHash, false);
+
+            const attempt = writeFileAttempts.run(data.attemptId, { path, expectedHash, contentHash },
+                () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, true));
+            if (attempt.kind === 'conflict') {
+                return { success: false, errorCode: 'ATTEMPT_CONFLICT', error: 'attemptId was already used for a different write' };
+            }
+            const result = await attempt.result;
+            return attempt.kind === 'replay' && result.success ? { ...result, replayed: true } : result;
         } catch (error) {
             logger.debug('Failed to write file:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to write file' };
