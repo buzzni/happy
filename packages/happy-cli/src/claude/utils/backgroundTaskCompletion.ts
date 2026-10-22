@@ -17,13 +17,14 @@ function notice(completion: Completion): string {
         `<status>${completion.status}</status>`, '</task-notification>'].join('\n');
 }
 
-/** The SDK receipt and the later scanner detail update one task card. */
-export function backgroundTaskNoticeId(text: string): string | undefined {
+/** Monitor events are independent; terminal receipts must not preempt scanner details in first-id-wins clients. */
+export function backgroundTaskNoticeId(text: string, source: 'notification' | 'receipt' = 'notification'): string | undefined {
     const content = text.trim();
     if (!content.startsWith('<task-notification>') || !content.endsWith('</task-notification>')
         || content.indexOf('<task-notification>', 1) !== -1) return undefined;
     const id = content.match(/<task-id>\s*([A-Za-z0-9_-]{1,512})\s*<\/task-id>/)?.[1];
-    return id ? `task-notification:${id}` : undefined;
+    const status = content.match(/<status>\s*(completed|failed|stopped|killed)\s*<\/status>/)?.[1];
+    return id && status ? `task-notification:${id}${source === 'receipt' ? `:receipt:${status}` : ''}` : undefined;
 }
 
 export function sdkBackgroundTaskCompletion(message: unknown): string | null {

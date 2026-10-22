@@ -15,6 +15,7 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
             task_id: 'bg-shell', tool_use_id: 'launch-shell', status,
         } as any, { currentTurnId: null });
         expect(result.currentTurnId).toBeNull();
+        expect(result.envelopes[0].id).toBe(`task-notification:bg-shell:receipt:${status}`);
         expect(result.envelopes).toContainEqual(expect.objectContaining({ role: 'user',
             ev: { t: 'text', text: `<task-notification>\n<task-id>bg-shell</task-id>\n<tool-use-id>launch-shell</tool-use-id>\n<status>${status}</status>\n</task-notification>` },
         }));
@@ -38,15 +39,41 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         }
     });
 
-    it('uses one message identity for an SDK completion and the later detailed scanner notification', () => {
+    it('keeps the detailed scanner notification distinct from the SDK receipt for first-id-wins clients', () => {
         const state = { currentTurnId: null };
         const sdk = mapClaudeLogMessageToSessionEnvelopes({ type: 'system', subtype: 'task_notification', task_id: 'bg-shell', status: 'completed' } as any, state);
         const text = '<task-notification>\n<task-id>bg-shell</task-id>\n<status>completed</status>\n<summary>Full result</summary>\n</task-notification>';
         const scanner = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', origin: { kind: 'task-notification' },
             message: { role: 'user', content: text } } as any, state);
-        expect(scanner.envelopes[0].id).toBe(sdk.envelopes[0].id);
+        expect(scanner.envelopes[0].id).not.toBe(sdk.envelopes[0].id);
         expect(scanner.envelopes[0].id).toBe('task-notification:bg-shell');
         expect(scanner.envelopes[0].ev).toEqual({ t: 'text', text });
+    });
+
+    it('preserves successive Monitor events for the same task as separate messages', () => {
+        const state = { currentTurnId: null };
+        const notices = ['First event', 'Second event'].map(event => mapClaudeLogMessageToSessionEnvelopes({
+            type: 'user', origin: { kind: 'task-notification' }, message: { role: 'user',
+                content: `<task-notification><task-id>monitor-1</task-id><event>${event}</event></task-notification>` },
+        } as any, state).envelopes[0]);
+        expect(notices[0].id).not.toBe(notices[1].id);
+        expect(notices.every(notice => isCuid(notice.id))).toBe(true);
+    });
+
+    it('keeps a successful TaskStop receipt distinct from its later detailed scanner notification', () => {
+        const state = { currentTurnId: null };
+        mapClaudeLogMessageToSessionEnvelopes({ type: 'assistant', message: { content: [
+            { type: 'tool_use', id: 'stop-shell', name: 'TaskStop', input: { task_id: 'bg-shell' } },
+        ] } } as any, state);
+        const stopped = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', message: { content: [
+            { type: 'tool_result', tool_use_id: 'stop-shell', content: JSON.stringify({
+                task_id: 'bg-shell', message: 'Successfully stopped task: bg-shell (sleep 60)',
+            }) },
+        ] } } as any, state).envelopes.find(envelope => envelope.ev.t === 'text')!;
+        const scanner = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', origin: { kind: 'task-notification' },
+            message: { role: 'user', content: '<task-notification><task-id>bg-shell</task-id><status>stopped</status><summary>Stopped details</summary></task-notification>' },
+        } as any, state).envelopes.find(envelope => envelope.ev.t === 'text')!;
+        expect(scanner.id).not.toBe(stopped.id);
     });
 
     it('keeps an inferred subagent TaskStop receipt out of the root transcript', () => {

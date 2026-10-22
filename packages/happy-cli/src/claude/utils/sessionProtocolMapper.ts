@@ -705,7 +705,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 ...(typeof notification.tool_use_id === 'string' ? { toolUseId: notification.tool_use_id } : {}),
             });
             const text = sdkBackgroundTaskCompletion(message);
-            if (text && !message.isSidechain && !subagent) envelopes.push(createEnvelope('user', { t: 'text', text }, { claudeUuid, id: backgroundTaskNoticeId(text) }));
+            if (text && !message.isSidechain && !subagent) envelopes.push(createEnvelope('user', { t: 'text', text }, { claudeUuid, id: backgroundTaskNoticeId(text, 'receipt') }));
         }
         return {
             currentTurnId: state.currentTurnId,
@@ -910,7 +910,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 }, { turn: turnId, subagent }));
                 const completion = redacted || message.isSidechain || subagent ? null
                     : stoppedBackgroundTaskCompletion(getToolNameById(block.tool_use_id), block);
-                if (completion) envelopes.push(createEnvelope('user', { t: 'text', text: completion }, { claudeUuid, id: backgroundTaskNoticeId(completion) }));
+                if (completion) envelopes.push(createEnvelope('user', { t: 'text', text: completion }, { claudeUuid, id: backgroundTaskNoticeId(completion, 'receipt') }));
                 clearActiveBashStreamCall(block.tool_use_id);
                 continue;
             }
