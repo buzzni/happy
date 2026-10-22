@@ -66,7 +66,8 @@ export function buildToolPolicyHookEntries(input: { forwarderCommand: string; fi
                 type: 'command',
                 command: input.forwarderCommand,
                 timeout: POLICY_HOOK_TIMEOUT_SECONDS,
-                // Honoured by newer Claude builds only; the forwarder fails closed on its own.
+                // Blocks a forwarder that cannot start, times out or dies (Claude 2.1.295+; older
+                // builds ignore it). Once running, the forwarder fails closed on its own.
                 onFailure: 'block',
             }],
         },
