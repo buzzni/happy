@@ -628,8 +628,11 @@ export async function startHappyServer(
             browserHostContinues: options.browserHostContinues,
         });
         try {
+            // Plain JSON replies: endpoint security (seen with Avast on Windows) holds back SSE responses until
+            // Claude's 30s MCP connect timeout, and no happy tool sends server-to-client notifications.
             const transport = new StreamableHTTPServerTransport({
-                sessionIdGenerator: undefined
+                sessionIdGenerator: undefined,
+                enableJsonResponse: true,
             });
             await mcp.connect(transport);
             await transport.handleRequest(req, res);
