@@ -155,6 +155,7 @@ import {
 } from './resumeGuards';
 import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
+import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import {
   removeDeferredContinuationContextFile,
   stageDeferredContinuationContext,
@@ -410,6 +411,7 @@ export const initialMachineMetadata: MachineMetadata = {
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
+  structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).
@@ -2263,6 +2265,10 @@ export async function startDaemon(): Promise<void> {
         }
         if (options.effort) {
           extraEnv.HAPPY_INITIAL_EFFORT = options.effort;
+        }
+        // Structured output: caller-supplied JSON, injected after expansion for the same reason.
+        if (options.outputFormat) {
+          Object.assign(extraEnv, outputFormatSeed(options.outputFormat));
         }
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';

@@ -4,6 +4,7 @@ import {
     closeClaudeTurnWithStatus,
     mapClaudeChannelFinalAnswer,
     mapClaudeLogMessageToSessionEnvelopes,
+    mapClaudeStructuredOutput,
     type ClaudeSessionProtocolState,
 } from '@/claude/utils/sessionProtocolMapper';
 import type { SessionEnvelope, SessionTurnEndStatus } from '@slopus/happy-wire';
@@ -13,6 +14,7 @@ import {
     pendingRequestItem,
     turnEndItem,
     permissionBindingItem,
+    structuredOutputItem,
 } from './channelTurnOrdering';
 import { installChannelPermissionWiring } from './channelPermissionWiring';
 
@@ -37,6 +39,9 @@ function harness() {
         setPendingTurnRequestId: (requestId: string | null) => { state.pendingRequestId = requestId; },
         sendFinalAnswerForChannelTurn: (text: string) => {
             envelopes.push(...mapClaudeChannelFinalAnswer(state, text).envelopes);
+        },
+        sendStructuredOutput: (envelope: Parameters<typeof mapClaudeStructuredOutput>[1]) => {
+            envelopes.push(...mapClaudeStructuredOutput(state, envelope).envelopes);
         },
         closeClaudeSessionTurn: (status: SessionTurnEndStatus) => {
             envelopes.push(...closeClaudeTurnWithStatus(state, status).envelopes);
@@ -255,5 +260,56 @@ describe('permission binding lands on the turn that raised the prompt', () => {
 
         expect(h.bindings).toHaveLength(1);
         expect(shape(h.envelopes)).toEqual(['turn-start', 'text', 'final-answer', 'turn-end']);
+    });
+});
+
+// Saycode specs/claude-cli-benchmark-followups R2.
+describe('structured output lands inside the turn it judges', () => {
+    it('emits the verdict after the turn text and before its terminal', async () => {
+        const { queue, envelopes } = harness();
+        queue.enqueue(assistant('{"answer":"ok"}'));
+        queue.enqueue(structuredOutputItem({ v: 1, status: 'ok', value: { answer: 'ok' } }));
+        queue.enqueue(turnEndItem('completed'));
+        await queue.flush();
+
+        expect(shape(envelopes)).toEqual(['turn-start', 'text', 'structured-output', 'turn-end']);
+        expect(new Set(envelopes.map((envelope) => envelope.turn)).size).toBe(1);
+        expect(envelopes[2].ev).toEqual({ t: 'structured-output', v: 1, status: 'ok', value: { answer: 'ok' } });
+    });
+
+    it('still reports a missing value for a turn that produced no text', async () => {
+        // A turn that failed before any output must not end with silence: the reader would
+        // otherwise take "no event" for "this session never asked for one".
+        const { queue, envelopes } = harness();
+        queue.enqueue(structuredOutputItem({ v: 1, status: 'missing', reason: 'turn_failed' }));
+        queue.enqueue(turnEndItem('failed'));
+        await queue.flush();
+
+        expect(shape(envelopes)).toEqual(['turn-start', 'structured-output', 'turn-end']);
+        expect(envelopes[1].ev).toEqual({ t: 'structured-output', v: 1, status: 'missing', reason: 'turn_failed' });
+    });
+
+    it('fills in a missing verdict for a turn that closes without one, so a cancelled turn never reads as success', async () => {
+        // Abort and launch-failure paths close the turn without an SDK result to judge.
+        const { queue, envelopes, state } = harness();
+        state.structuredOutputVerdicts = true;
+        queue.enqueue(assistant('working on it'));
+        queue.enqueue(turnEndItem('cancelled'));
+        await queue.flush();
+
+        expect(shape(envelopes)).toEqual(['turn-start', 'text', 'structured-output', 'turn-end']);
+        expect(envelopes[2].ev).toEqual({ t: 'structured-output', v: 1, status: 'missing', reason: 'turn_cancelled' });
+        expect(new Set(envelopes.map((envelope) => envelope.turn)).size).toBe(1);
+    });
+
+    it('does not add a second verdict to a turn that already has one', async () => {
+        const { queue, envelopes, state } = harness();
+        state.structuredOutputVerdicts = true;
+        queue.enqueue(assistant('{"answer":"ok"}'));
+        queue.enqueue(structuredOutputItem({ v: 1, status: 'ok', value: { answer: 'ok' } }));
+        queue.enqueue(turnEndItem('completed'));
+        await queue.flush();
+
+        expect(shape(envelopes)).toEqual(['turn-start', 'text', 'structured-output', 'turn-end']);
     });
 });

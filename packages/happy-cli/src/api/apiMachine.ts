@@ -36,6 +36,7 @@ import {
     createMachineResourceService,
 } from '@/daemon/machineResourceService';
 import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/sessionEnv';
+import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
@@ -1264,6 +1265,7 @@ export class ApiMachineClient {
                 browserContinuation,
                 browserAttestation,
                 aiAuthSelection,
+                outputFormat,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -1284,6 +1286,12 @@ export class ApiMachineClient {
             // 돌아 사용자가 고르지 않은 자격으로 세션이 실행된다.
             const validAiAuthSelection = parseAiAuthSelection(aiAuthSelection);
             const validAdditionalDirectories = parseAdditionalDirectories(additionalDirectories);
+            // Refused rather than dropped: a caller that asked for a machine-readable result must
+            // not get a session that silently runs without one (specs/claude-cli-benchmark-followups R2).
+            const validOutputFormat = parseOutputFormat(outputFormat);
+            if (validOutputFormat && (agent ?? 'claude') !== 'claude') {
+                throw new Error('Structured output is only supported for Claude');
+            }
             // Recorded as metadata `source`; a malformed value is dropped, never stored.
             const validSessionSource = normalizeSessionSource(sessionSource);
             if (validAdditionalDirectories && agent !== 'claude' && agent !== 'codex') {
@@ -1364,6 +1372,7 @@ export class ApiMachineClient {
                 ...(browserContinuation ? { browserContinuation: true } : {}),
                 ...(browserAttestation ? { browserAttestation } : {}),
                 aiAuthSelection: validAiAuthSelection,
+                ...(validOutputFormat ? { outputFormat: validOutputFormat } : {}),
             });
 
             switch (result.type) {
@@ -4182,6 +4191,9 @@ export class ApiMachineClient {
             // refused there: it advertises neither, and a stored copy is cleared.
             const advertisedChannelSupport = this.managedHandlers ? undefined : CHANNEL_SUPPORT_CAPABILITY;
             const advertisedAiAuthSelection = this.managedHandlers ? undefined : AI_AUTH_SELECTION_CAPABILITY;
+            const advertisedStructuredOutput = this.managedHandlers ? undefined : STRUCTURED_OUTPUT_CAPABILITY;
+            const structuredOutputStale = JSON.stringify(this.machine.metadata?.structuredOutput)
+                !== JSON.stringify(advertisedStructuredOutput);
             const channelSupportStale = JSON.stringify(this.machine.metadata?.channelSupport)
                 !== JSON.stringify(advertisedChannelSupport);
             const aiAuthSelectionStale = JSON.stringify(this.machine.metadata?.aiAuthSelection)
@@ -4219,7 +4231,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4252,6 +4264,7 @@ export class ApiMachineClient {
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
+                    structuredOutput: advertisedStructuredOutput,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,

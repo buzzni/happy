@@ -263,6 +263,17 @@ export const MachineMetadataSchema = z.object({
    * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
+  /**
+   * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
+   * for these agents. Absent on an older daemon, which would drop the field and run the session
+   * without it, so a client must not send one. `agents` is a plain string array so a newer value
+   * never makes an older client drop the whole field.
+   */
+  structuredOutput: z.object({
+    version: z.literal(1),
+    agents: z.array(z.string()),
+    maxSchemaBytes: z.number().int().positive(),
+  }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),

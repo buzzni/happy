@@ -1,4 +1,5 @@
 import type { SessionTurnEndStatus } from '@slopus/happy-wire';
+import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 
 /**
  * Keeping a turn's boundary events in the same order as its transcript
@@ -37,6 +38,16 @@ export interface ChannelFinalAnswerItem {
     text: string;
 }
 
+/**
+ * A structured-output session's verdict on the turn (Saycode specs/claude-cli-benchmark-followups
+ * R2). Ordered for the same reason as the final candidate: emitted early it finds no open turn,
+ * or the previous one.
+ */
+export interface StructuredOutputItem {
+    __structuredOutput: true;
+    envelope: StructuredOutputEnvelope;
+}
+
 export interface ChannelTurnEndItem {
     __channelTurnEnd: true;
     status: SessionTurnEndStatus;
@@ -54,6 +65,7 @@ export interface ChannelPermissionBindingItem {
 export type ChannelOrderedItem =
     | ChannelPendingRequestItem
     | ChannelFinalAnswerItem
+    | StructuredOutputItem
     | ChannelTurnEndItem
     | ChannelPermissionBindingItem;
 
@@ -63,6 +75,10 @@ export function pendingRequestItem(requestId: string | null): ChannelPendingRequ
 
 export function finalAnswerItem(text: string): ChannelFinalAnswerItem {
     return { __channelFinalAnswer: true, text };
+}
+
+export function structuredOutputItem(envelope: StructuredOutputEnvelope): StructuredOutputItem {
+    return { __structuredOutput: true, envelope };
 }
 
 export function turnEndItem(status: SessionTurnEndStatus): ChannelTurnEndItem {
@@ -81,13 +97,14 @@ export function permissionBindingItem(
 export interface ChannelTurnOrderingTarget {
     setPendingTurnRequestId(requestId: string | null): void;
     sendFinalAnswerForChannelTurn(text: string): void;
+    sendStructuredOutput(envelope: StructuredOutputEnvelope): void;
     closeClaudeSessionTurn(status: SessionTurnEndStatus): void;
     bindChannelPermission(permissionId: string, toolName: string, instanceSeq: number): void;
     sendClaudeSessionMessage(logMessage: unknown): void;
 }
 
 /**
- * The queue's send function. Ordinary log messages go where they always did; the four markers
+ * The queue's send function. Ordinary log messages go where they always did; the markers
  * above are applied in the position they were enqueued.
  */
 export function createOrderedTurnDispatcher(
@@ -101,6 +118,10 @@ export function createOrderedTurnDispatcher(
         }
         if (item && (item as ChannelFinalAnswerItem).__channelFinalAnswer === true) {
             target.sendFinalAnswerForChannelTurn((item as ChannelFinalAnswerItem).text);
+            return;
+        }
+        if (item && (item as StructuredOutputItem).__structuredOutput === true) {
+            target.sendStructuredOutput((item as StructuredOutputItem).envelope);
             return;
         }
         if (item && (item as ChannelTurnEndItem).__channelTurnEnd === true) {

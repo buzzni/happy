@@ -41,6 +41,7 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         continue: opts?.continue,
         model: opts?.model,
         fallbackModel: opts?.fallbackModel,
+        outputFormat: opts?.outputFormat,
         maxTurns: opts?.maxTurns,
         promptSuggestions: opts?.promptSuggestions,
         permissionMode: opts?.permissionMode,

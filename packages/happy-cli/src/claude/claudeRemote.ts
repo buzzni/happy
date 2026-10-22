@@ -64,6 +64,7 @@ import {
 } from '@/memory/lessonTurnObservations';
 import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
 import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
+import type { ClaudeOutputFormat } from './structuredOutput';
 
 export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
 
@@ -246,6 +247,8 @@ export async function claudeRemote(opts: {
      */
     onAiAuthObservationReady?: (observation: ClaudeAuthObservation | null) => void,
     exitAfterFirstTurn?: boolean,
+    /** Session-scoped structured output (specs/claude-cli-benchmark-followups R2); every query of the session carries it. */
+    outputFormat?: ClaudeOutputFormat,
     /** Receives this query's launch options so an off-turn title runs with the same payer and sandbox. */
     offTurnTitle?: ClaudeTitleBridge,
     /** The live query's `/btw` side-question channel, then `null` once the query ends. */
@@ -509,6 +512,7 @@ async function runClaudeRemote(
         permissionMode: mapToClaudeMode(initial.mode.permissionMode),
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,
+        outputFormat: opts.outputFormat,
         customSystemPrompt: promptOptions.customSystemPrompt,
         appendSystemPrompt: promptOptions.appendSystemPrompt,
         allowedTools: initial.mode.allowedTools ? initial.mode.allowedTools.concat(opts.allowedTools) : opts.allowedTools,

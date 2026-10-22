@@ -23,6 +23,8 @@ describe('machine capability discovery lifecycle', () => {
       claude: true, codex: false, gemini: false, openclaw: false, detectedAt: 123,
     });
     expect(metadata.aiAuthSelection).toEqual(daemon.initialMachineMetadata.aiAuthSelection);
+    // specs/claude-cli-benchmark-followups R2: a client gates `--output-schema` on this.
+    expect(metadata.structuredOutput).toEqual({ version: 1, agents: ['claude'], maxSchemaBytes: 16384 });
     expect(MachineMetadataSchema.safeParse(metadata).success).toBe(true);
     expect(daemon.initialMachineMetadata.cliAvailability).toBeUndefined();
   });

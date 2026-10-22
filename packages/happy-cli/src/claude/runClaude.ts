@@ -84,6 +84,7 @@ import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
+import { consumeOutputFormatSeed } from './structuredOutput';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
@@ -920,6 +921,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
         : undefined;
     const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CLAUDE_EFFORT;
+    // Session-scoped structured output (specs/claude-cli-benchmark-followups R2). The daemon already
+    // validated it; a seed that does not parse is dropped, and the session runs without a format.
+    const outputFormat = consumeOutputFormatSeed(process.env) ?? undefined;
+    if (outputFormat) logger.debug('[START] Structured output requested for this session');
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -2063,6 +2068,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         offTurnTitle: offTurnTitleBridge,
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
+        outputFormat,
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });

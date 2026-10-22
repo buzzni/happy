@@ -6,6 +6,7 @@ import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
 import type { StreamDeltaFrame } from '@/claude/streamDeltaRelay';
+import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 import type { ClaudeTurnLatencyDiagnostic } from '@/claude/claudeRemote';
 import type { CodexTurnLatencyProgress } from '@/codex/codexTurnLatency';
 import { backoff, isSessionGoneError } from '@/utils/time';
@@ -28,6 +29,8 @@ import {
     closeClaudeTurnWithStatus,
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
+    mapClaudeStructuredOutput,
+    missingStructuredOutputBeforeClose,
     mapClaudeLogMessageToSessionEnvelopes,
     toolCallTurnFor,
     type ClaudeSessionProtocolState,
@@ -1628,6 +1631,17 @@ export class ApiSessionClient extends EventEmitter {
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
     }
 
+    /** Every later turn of this session closes with a verdict, filled in as `missing` if none came. */
+    enableStructuredOutputVerdicts(): void {
+        this.claudeSessionProtocolState.structuredOutputVerdicts = true;
+    }
+
+    /** A structured-output session's verdict on the turn (specs/claude-cli-benchmark-followups R2). */
+    sendStructuredOutput(envelope: StructuredOutputEnvelope): void {
+        const mapped = mapClaudeStructuredOutput(this.claudeSessionProtocolState, envelope);
+        this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
+    }
+
     /**
      * `observedAiAuthSource` is the remote run's own observation of its login
      * (src/claude/aiAuthObservation.ts), captured when the SDK message arrived.
@@ -1713,6 +1727,7 @@ export class ApiSessionClient extends EventEmitter {
         // builds the turn-end by hand, so without this a cancelled channel turn ends with no
         // `requestId` and the caller waits forever for an answer that was already decided.
         const requestId = this.claudeSessionProtocolState.currentRequestId ?? undefined;
+        envelopes.push(...missingStructuredOutputBeforeClose(this.claudeSessionProtocolState, turnId, 'cancelled'));
         envelopes.push(createEnvelope(
             'agent',
             { t: 'turn-end', status: 'cancelled', ...(requestId ? { requestId } : {}) },

@@ -1,5 +1,6 @@
 import { createId } from '@paralleldrive/cuid2';
 import type { RawJSONLines } from '@/claude/types';
+import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 import {
     createEnvelope,
     type SessionEnvelope,
@@ -15,6 +16,14 @@ import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundT
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
+    /**
+     * The session was spawned with an output schema (Saycode specs/claude-cli-benchmark-followups
+     * R2), so every turn it closes must carry a verdict — even one that ended with no SDK result
+     * to judge (abort, launch failure). Without it a cancelled turn reads as "no value expected".
+     */
+    structuredOutputVerdicts?: boolean;
+    /** The turn the last verdict was emitted for. */
+    structuredOutputVerdictTurn?: string | null;
     /**
      * Set just before a turn that answers an external messenger request, and consumed by the
      * `turn-start` it stamps (Saycode specs/desktop-messenger-channels). Held separately from
@@ -590,6 +599,7 @@ function closeTurn(
     if (!turnId) return;
 
     const requestId = state.currentRequestId ?? undefined;
+    envelopes.push(...missingStructuredOutputBeforeClose(state, turnId, status));
     envelopes.push(createEnvelope(
         'agent',
         { t: 'turn-end', status, ...(requestId ? { requestId } : {}) },
@@ -633,6 +643,35 @@ export function mapClaudeChannelFinalAnswer(
         envelopes.push(createEnvelope('agent', { t: 'final-answer', text, requestId }, { turn }));
     }
     return { currentTurnId: state.currentTurnId, envelopes };
+}
+
+/**
+ * A structured-output session's verdict on the turn (Saycode specs/claude-cli-benchmark-followups
+ * R2). Unlike the channel final answer it is emitted for every turn, `missing` included, opening
+ * a turn if the run produced nothing: a reader must be able to tell a failed turn from a session
+ * that never asked for a value.
+ */
+export function mapClaudeStructuredOutput(
+    state: ClaudeSessionProtocolState,
+    envelope: StructuredOutputEnvelope,
+): ClaudeMapperResult {
+    const envelopes: SessionEnvelope[] = [];
+    const turn = ensureTurn(state, envelopes);
+    envelopes.push(createEnvelope('agent', { t: 'structured-output', ...envelope }, { turn }));
+    state.structuredOutputVerdictTurn = turn;
+    return { currentTurnId: state.currentTurnId, envelopes };
+}
+
+/** The verdict a structured session's turn closes with when nothing judged it; empty otherwise. */
+export function missingStructuredOutputBeforeClose(
+    state: ClaudeSessionProtocolState,
+    turnId: string,
+    status: SessionTurnEndStatus,
+): SessionEnvelope[] {
+    if (!state.structuredOutputVerdicts || state.structuredOutputVerdictTurn === turnId) return [];
+    state.structuredOutputVerdictTurn = turnId;
+    const reason = status === 'cancelled' ? 'turn_cancelled' : status === 'failed' ? 'turn_failed' : 'not_produced';
+    return [createEnvelope('agent', { t: 'structured-output', v: 1, status: 'missing', reason }, { turn: turnId })];
 }
 
 export function closeClaudeTurnWithStatus(

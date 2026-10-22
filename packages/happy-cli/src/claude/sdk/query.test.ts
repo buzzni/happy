@@ -52,6 +52,16 @@ describe('query adapter', () => {
         expect(options.sandbox).toEqual(sandbox);
     });
 
+    it('forwards a session output format to the SDK and leaves it absent otherwise', () => {
+        // Saycode specs/claude-cli-benchmark-followups R2: the field was missing from this mapping,
+        // so a format set upstream never reached the SDK.
+        const outputFormat = { type: 'json_schema' as const, schema: { type: 'object' } };
+        query({ prompt: 'continue', options: { outputFormat } });
+        expect(lastOptions().outputFormat).toEqual(outputFormat);
+        query({ prompt: 'continue' });
+        expect(lastOptions().outputFormat).toBeUndefined();
+    });
+
     it('accepts a readable JavaScript CLI entrypoint without requiring native execute permissions', () => {
         const executable = join(configDirectory, 'cli.js');
         writeFileSync(executable, '// CLI entrypoint', { mode: 0o600 });
