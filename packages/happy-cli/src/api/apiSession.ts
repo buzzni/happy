@@ -6,6 +6,7 @@ import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
 import type { StreamDeltaFrame } from '@/claude/streamDeltaRelay';
+import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 import type { ClaudeTurnLatencyDiagnostic } from '@/claude/claudeRemote';
 import type { CodexTurnLatencyProgress } from '@/codex/codexTurnLatency';
 import { backoff, isSessionGoneError } from '@/utils/time';
@@ -28,6 +29,7 @@ import {
     closeClaudeTurnWithStatus,
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
+    mapClaudeStructuredOutput,
     mapClaudeLogMessageToSessionEnvelopes,
     toolCallTurnFor,
     type ClaudeSessionProtocolState,
@@ -1625,6 +1627,12 @@ export class ApiSessionClient extends EventEmitter {
         // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
         const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
+        this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
+    }
+
+    /** A structured-output session's verdict on the turn (specs/claude-cli-benchmark-followups R2). */
+    sendStructuredOutput(envelope: StructuredOutputEnvelope): void {
+        const mapped = mapClaudeStructuredOutput(this.claudeSessionProtocolState, envelope);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
     }
 

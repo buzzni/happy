@@ -30,9 +30,11 @@ import {
     createOrderedTurnDispatcher,
     finalAnswerItem,
     pendingRequestItem,
+    structuredOutputItem,
     turnEndItem,
     type ChannelTurnOrderingTarget,
 } from '@/channel/channelTurnOrdering';
+import { judgeStructuredOutput, type StructuredOutputResult } from '@/claude/structuredOutput';
 import { getToolName } from "./utils/getToolName";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
@@ -267,10 +269,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * observed it is over — and a message must carry what its own run saw, not the next one's.
      */
     let aiAuthObservation: ClaudeAuthObservation | null = null;
+    /*
+     * Compiled once: the format is session-scoped (specs/claude-cli-benchmark-followups R2), so
+     * every turn is judged against the same schema. Null for an ordinary session, which then emits
+     * no structured-output events at all.
+     */
+    const judgeTurnStructuredOutput = session.outputFormat ? judgeStructuredOutput(session.outputFormat) : null;
     const observedAiAuthByLogMessage = new WeakMap<object, ObservedAiAuthSource>();
     const orderingTarget: ChannelTurnOrderingTarget = {
         setPendingTurnRequestId: (requestId) => session.client.setPendingTurnRequestId(requestId),
         sendFinalAnswerForChannelTurn: (text) => session.client.sendFinalAnswerForChannelTurn(text),
+        sendStructuredOutput: (envelope) => session.client.sendStructuredOutput(envelope),
         closeClaudeSessionTurn: (status) => session.client.closeClaudeSessionTurn(status),
         // The dispatcher carries ordinary log messages as `unknown` because it also carries the
         // markers; the client's own signature is the narrower one.
@@ -443,6 +452,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             // terminal that follows then reports no answer rather than an old one.
             if (result.subtype === 'success' && result.is_error !== true && typeof result.result === 'string') {
                 messageQueue.enqueue(finalAnswerItem(result.result));
+            }
+            // Every turn gets a verdict, `missing` included; presence of a valid value decides it,
+            // never `subtype` alone (an unsatisfiable schema ends `success` with no value).
+            if (judgeTurnStructuredOutput) {
+                messageQueue.enqueue(structuredOutputItem(judgeTurnStructuredOutput(result as StructuredOutputResult)));
             }
         }
 
@@ -1202,6 +1216,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     signal: abortController.signal,
                     exitAfterFirstTurn: session.exitAfterFirstTurn,
+                    outputFormat: session.outputFormat,
                 });
 
                 if (remoteResult === 'turn-complete') {

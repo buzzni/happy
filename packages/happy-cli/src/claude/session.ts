@@ -16,6 +16,7 @@ import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessio
 import type { LessonSessionHost } from '@/memory/lessonSessionHost';
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
+import type { ClaudeOutputFormat } from './structuredOutput';
 
 /** Survives SDK generations, but is reset with the actual conversation. */
 export interface ClaudeLessonReviewLifecycle {
@@ -77,6 +78,8 @@ export class Session {
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     readonly jsRuntime: JsRuntime;
     readonly exitAfterFirstTurn: boolean;
+    /** Session-scoped structured output (specs/claude-cli-benchmark-followups R2), fixed for the process. */
+    readonly outputFormat?: ClaudeOutputFormat;
 
     sessionId: string | null;
     /** Always assigned from opts.startingMode in the constructor — the single
@@ -137,6 +140,7 @@ export class Session {
          *  Defaults to 'local' (a plain interactive terminal run). */
         startingMode?: 'local' | 'remote',
         exitAfterFirstTurn?: boolean,
+        outputFormat?: ClaudeOutputFormat,
     }) {
         this.scopeProcessSandbox = opts.scopeProcessSandbox;
         this.path = opts.path;
@@ -170,6 +174,7 @@ export class Session {
         this.jsRuntime = opts.jsRuntime ?? 'node';
         this.mode = opts.startingMode ?? 'local';
         this.exitAfterFirstTurn = opts.exitAfterFirstTurn === true;
+        this.outputFormat = opts.outputFormat;
 
         // Start keep alive
         this.client.keepAlive(this.thinking, this.mode);

@@ -23,6 +23,7 @@ export { AbortError } from '@anthropic-ai/claude-agent-sdk'
 
 // Alias for backward compatibility
 import type { CanUseTool } from '@anthropic-ai/claude-agent-sdk'
+import type { ClaudeOutputFormat } from '@/claude/structuredOutput'
 export type CanCallToolCallback = CanUseTool
 
 /**
@@ -53,6 +54,11 @@ export interface QueryOptions {
     resume?: string
     model?: string
     fallbackModel?: string
+    /**
+     * Session-scoped structured output (Saycode specs/claude-cli-benchmark-followups R2). Applies
+     * to every turn of the query; see `src/claude/structuredOutput.ts`.
+     */
+    outputFormat?: ClaudeOutputFormat
     strictMcpConfig?: boolean
     canCallTool?: CanCallToolCallback
     /** Path to a settings JSON file to pass to Claude via --settings */

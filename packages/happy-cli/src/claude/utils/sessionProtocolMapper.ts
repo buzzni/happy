@@ -1,5 +1,6 @@
 import { createId } from '@paralleldrive/cuid2';
 import type { RawJSONLines } from '@/claude/types';
+import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 import {
     createEnvelope,
     type SessionEnvelope,
@@ -632,6 +633,22 @@ export function mapClaudeChannelFinalAnswer(
         const turn = ensureTurn(state, envelopes);
         envelopes.push(createEnvelope('agent', { t: 'final-answer', text, requestId }, { turn }));
     }
+    return { currentTurnId: state.currentTurnId, envelopes };
+}
+
+/**
+ * A structured-output session's verdict on the turn (Saycode specs/claude-cli-benchmark-followups
+ * R2). Unlike the channel final answer it is emitted for every turn, `missing` included, opening
+ * a turn if the run produced nothing: a reader must be able to tell a failed turn from a session
+ * that never asked for a value.
+ */
+export function mapClaudeStructuredOutput(
+    state: ClaudeSessionProtocolState,
+    envelope: StructuredOutputEnvelope,
+): ClaudeMapperResult {
+    const envelopes: SessionEnvelope[] = [];
+    const turn = ensureTurn(state, envelopes);
+    envelopes.push(createEnvelope('agent', { t: 'structured-output', ...envelope }, { turn }));
     return { currentTurnId: state.currentTurnId, envelopes };
 }
 
