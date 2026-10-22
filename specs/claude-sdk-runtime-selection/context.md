@@ -1,7 +1,7 @@
 ---
 기능: claude-sdk-runtime-selection
-상태: 구현·로컬 검증 완료, 1.1.10-aplus.249 릴리스 준비
-마지막 갱신: 2026-10-22
+상태: 진행중(SDK 0.3.308 pin 구현·로컬 검증 완료, happy PR 리뷰·CI) — happy 릴리스·Desktop pin 갱신은 머지 후 오케스트레이터
+마지막 갱신: 2026-10-23
 ---
 
 ## 구현과 결정
@@ -48,3 +48,4 @@ pin을 0.3.285 → 0.3.308(내장 Claude Code 2.1.285 → 2.1.308)로 올렸다.
 
 ## 릴리스
 사용자의 명시적 릴리스 요청(2026-09-27)에 따라 PR #563 merge b73fc749 기준 1.1.10-aplus.249를 준비한다. 버전 변경 main 반영 → matching tag push → 공식 Actions publish/registry smoke → 상위 vendor 포인터 반영 순서다. 실행 중인 사용자 daemon은 임의 종료하지 않는다.
+- SDK pin 0.3.308(2026-10-23): 아직 어느 릴리스에도 들어가지 않았다(위 .249 문단은 0.3.283 때 기록). happy main 머지 뒤 버전·태그·발행·Desktop pin 갱신은 오케스트레이터가 사용자 승인 범위에서 진행한다.
