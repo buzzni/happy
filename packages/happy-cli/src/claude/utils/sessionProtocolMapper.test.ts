@@ -20,18 +20,47 @@ describe('mapClaudeLogMessageToSessionEnvelopes', () => {
         }));
     });
 
-    it.each([false, true])('only reports a successful TaskStop result (is_error=%s)', (isError) => {
+    it.each([[false, false], [false, true], [true, false], [true, true]])('only reports successful string/array TaskStop results (error=%s, array=%s)', (isError, asArray) => {
         const state = { currentTurnId: null };
         mapClaudeLogMessageToSessionEnvelopes({ type: 'assistant', message: { content: [
             { type: 'tool_use', id: 'stop-shell', name: 'TaskStop', input: { task_id: 'bg-shell' } },
         ] } } as any, state);
+        const receipt = JSON.stringify({ task_id: 'bg-shell', message: 'Successfully stopped task: bg-shell (sleep 60)' });
         const result = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', message: { content: [
             { type: 'tool_result', tool_use_id: 'stop-shell', is_error: isError,
-                content: JSON.stringify({ task_id: 'bg-shell', message: isError ? 'Failed to stop task' : 'Successfully stopped task: bg-shell (sleep 60)' }) },
+                content: asArray ? [{ type: 'text', text: receipt }] : receipt },
         ] } } as any, state);
         const notices = result.envelopes.filter(e => e.ev.t === 'text');
         expect(notices).toHaveLength(isError ? 0 : 1);
-        if (!isError) expect(notices[0].ev).toMatchObject({ text: expect.stringContaining('<task-id>bg-shell</task-id>\n<status>stopped</status>') });
+        if (!isError) {
+            expect(notices[0].ev).toMatchObject({ text: expect.stringContaining('<task-id>bg-shell</task-id>\n<status>stopped</status>') });
+            expect(notices[0]).not.toHaveProperty('turn');
+        }
+    });
+
+    it('uses one message identity for an SDK completion and the later detailed scanner notification', () => {
+        const state = { currentTurnId: null };
+        const sdk = mapClaudeLogMessageToSessionEnvelopes({ type: 'system', subtype: 'task_notification', task_id: 'bg-shell', status: 'completed' } as any, state);
+        const text = '<task-notification>\n<task-id>bg-shell</task-id>\n<status>completed</status>\n<summary>Full result</summary>\n</task-notification>';
+        const scanner = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', origin: { kind: 'task-notification' },
+            message: { role: 'user', content: text } } as any, state);
+        expect(scanner.envelopes[0].id).toBe(sdk.envelopes[0].id);
+        expect(scanner.envelopes[0].id).toBe('task-notification:bg-shell');
+        expect(scanner.envelopes[0].ev).toEqual({ t: 'text', text });
+    });
+
+    it('keeps an inferred subagent TaskStop receipt out of the root transcript', () => {
+        const state = { currentTurnId: 'root-turn', providerSubagentToSessionSubagent: new Map([['parent-tool', createId()]]) };
+        mapClaudeLogMessageToSessionEnvelopes({ type: 'assistant', parent_tool_use_id: 'parent-tool',
+            message: { content: [{ type: 'tool_use', id: 'child-stop', name: 'TaskStop', input: { task_id: 'child-job' } }] } } as any, state);
+        const result = mapClaudeLogMessageToSessionEnvelopes({ type: 'user', parent_tool_use_id: 'parent-tool',
+            message: { content: [{ type: 'tool_result', tool_use_id: 'child-stop', content: JSON.stringify({
+                task_id: 'child-job', message: 'Successfully stopped task: child-job (sleep 60)',
+            }) }] } } as any, state);
+        expect(result.envelopes.filter(e => e.ev.t === 'text' && !e.subagent)).toHaveLength(0);
+        const sdk = mapClaudeLogMessageToSessionEnvelopes({ type: 'system', parent_tool_use_id: 'parent-tool',
+            subtype: 'task_notification', task_id: 'child-job', status: 'completed' } as any, state);
+        expect(sdk.envelopes.filter(e => e.ev.t === 'text' && !e.subagent)).toHaveLength(0);
     });
 
     it('maps user text to a user text envelope', () => {

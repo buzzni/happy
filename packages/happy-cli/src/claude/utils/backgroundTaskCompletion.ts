@@ -17,6 +17,15 @@ function notice(completion: Completion): string {
         `<status>${completion.status}</status>`, '</task-notification>'].join('\n');
 }
 
+/** The SDK receipt and the later scanner detail update one task card. */
+export function backgroundTaskNoticeId(text: string): string | undefined {
+    const content = text.trim();
+    if (!content.startsWith('<task-notification>') || !content.endsWith('</task-notification>')
+        || content.indexOf('<task-notification>', 1) !== -1) return undefined;
+    const id = content.match(/<task-id>\s*([A-Za-z0-9_-]{1,512})\s*<\/task-id>/)?.[1];
+    return id ? `task-notification:${id}` : undefined;
+}
+
 export function sdkBackgroundTaskCompletion(message: unknown): string | null {
     const data = record(message);
     if (data?.type !== 'system' || data.subtype !== 'task_notification' || !taskId(data.task_id)) return null;
@@ -31,9 +40,14 @@ export function stoppedBackgroundTaskCompletion(toolName: string | undefined, bl
     const result = record(block);
     if (toolName !== 'TaskStop' || result?.is_error === true) return null;
     // TaskStop's harness-authored JSON receipt is the evidence, never the stop request itself.
-    if (typeof result?.content !== 'string') return null;
+    const content = typeof result?.content === 'string' ? result.content : Array.isArray(result?.content)
+        ? result.content.flatMap(block => {
+            const item = record(block);
+            return item?.type === 'text' && typeof item.text === 'string' ? [item.text] : [];
+        }).join('\n') : null;
+    if (!content) return null;
     let receipt: Record<string, unknown> | null;
-    try { receipt = record(JSON.parse(result.content)); } catch { return null; }
+    try { receipt = record(JSON.parse(content)); } catch { return null; }
     if (!receipt || !taskId(receipt.task_id) || typeof receipt.message !== 'string'
         || !receipt.message.startsWith(`Successfully stopped task: ${receipt.task_id} (`)) return null;
     return notice({ taskId: receipt.task_id, status: 'stopped' });
