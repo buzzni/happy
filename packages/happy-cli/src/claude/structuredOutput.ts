@@ -49,12 +49,16 @@ export type StructuredOutputEnvelope =
 type CompiledSchema = (value: unknown) => boolean;
 
 /**
- * `validateSchema: false` because the bundled meta-schema is draft-07 and a 2020-12 `$schema`
- * would otherwise fail to compile; structural errors (an unknown `type`) still throw.
+ * The same admission the bundled Claude CLI applies to `--json-schema` at startup: strict Ajv on
+ * the draft-07 meta-schema. Probed against SDK 0.3.308: a 2020-12 `$schema`, an unknown keyword
+ * and `$async` each make the CLI exit 1, which would fail every turn of the session, so they are
+ * refused at spawn instead. The CLI accepts `format`; `validateFormats: false` accepts it too
+ * without this side vouching for formats (the SDK validated the value already).
  * `logger: false` because a session process must not write to the terminal Claude runs in.
  */
 function compileSchema(schema: Record<string, unknown>): CompiledSchema {
-    return new Ajv({ strict: false, validateSchema: false, allErrors: false, logger: false }).compile(schema);
+    if (schema.$async !== undefined) throw new Error('$async schemas are not supported');
+    return new Ajv({ strict: true, validateFormats: false, allErrors: false, logger: false }).compile(schema);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

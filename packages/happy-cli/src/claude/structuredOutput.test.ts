@@ -25,9 +25,15 @@ describe('parseOutputFormat', () => {
         expect(parseOutputFormat({ type: 'json_schema', schema })).toEqual({ type: 'json_schema', schema });
     });
 
-    it('accepts a 2020-12 schema the default meta-schema does not know', () => {
-        const modern = { $schema: 'https://json-schema.org/draft/2020-12/schema', ...schema };
-        expect(parseOutputFormat({ type: 'json_schema', schema: modern })?.schema).toEqual(modern);
+    it('admits only what the bundled Claude CLI accepts at startup (strict draft-07 Ajv)', () => {
+        // Probed against SDK 0.3.308's bundled CLI: each of these exits 1 with
+        // "--json-schema is not a valid JSON Schema", which would fail every turn of the session.
+        expect(() => parseOutputFormat({ type: 'json_schema', schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', ...schema } })).toThrow(/not a valid JSON Schema/);
+        expect(() => parseOutputFormat({ type: 'json_schema', schema: { $async: true, ...schema } })).toThrow(/\$async/);
+        expect(() => parseOutputFormat({ type: 'json_schema', schema: { 'x-custom': 1, ...schema } })).toThrow(/not a valid JSON Schema/);
+        // ...and accepts what it accepts.
+        expect(parseOutputFormat({ type: 'json_schema', schema: { $schema: 'http://json-schema.org/draft-07/schema#', ...schema } })).toBeDefined();
+        expect(parseOutputFormat({ type: 'json_schema', schema: { type: 'object', properties: { e: { type: 'string', format: 'email' } } } })).toBeDefined();
     });
 
     it('refuses anything a caller could believe was applied when it was not', () => {
