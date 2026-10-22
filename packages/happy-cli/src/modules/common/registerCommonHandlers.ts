@@ -106,6 +106,45 @@ interface WriteFileResponse {
     error?: string;
 }
 
+function sha256Hex(buffer: Buffer): string {
+    return createHash('sha256').update(buffer).digest('hex');
+}
+
+/** The hash gate: an existing file is written only when its hash is `expectedHash`, a new one only when that is null. */
+async function writeFileWithHashGate(path: string, buffer: Buffer, contentHash: string, expectedHash: string | null): Promise<WriteFileResponse> {
+    if (expectedHash !== null) {
+        let existingHash: string;
+        try {
+            existingHash = sha256Hex(await readFile(path));
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            return { success: false, error: 'File does not exist but hash was provided' };
+        }
+        if (existingHash !== expectedHash) {
+            return { success: false, error: `File hash mismatch. Expected: ${expectedHash}, Actual: ${existingHash}` };
+        }
+    } else {
+        try {
+            await stat(path);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            return writeAndHash(path, buffer, contentHash);
+        }
+        return { success: false, error: 'File already exists but was expected to be new' };
+    }
+    return writeAndHash(path, buffer, contentHash);
+}
+
+async function writeAndHash(path: string, buffer: Buffer, contentHash: string): Promise<WriteFileResponse> {
+    // Auto-create the parent directory so the first writeFile to a freshly-bound project
+    // doesn't fail with ENOENT (specs/project-workspace-auto-create/ Phase 2).
+    // mkdir({ recursive: true }) is idempotent and stays inside the validated path,
+    // so traversal defense is unaffected.
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, buffer);
+    return { success: true, hash: contentHash };
+}
+
 interface ListDirectoryRequest {
     path: string;
 }
@@ -687,60 +726,11 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
         }
 
         try {
-            // If expectedHash is provided (not null), verify existing file
-            if (data.expectedHash !== null && data.expectedHash !== undefined) {
-                try {
-                    const existingBuffer = await readFile(validation.resolvedPath!);
-                    const existingHash = createHash('sha256').update(existingBuffer).digest('hex');
-
-                    if (existingHash !== data.expectedHash) {
-                        return {
-                            success: false,
-                            error: `File hash mismatch. Expected: ${data.expectedHash}, Actual: ${existingHash}`
-                        };
-                    }
-                } catch (error) {
-                    const nodeError = error as NodeJS.ErrnoException;
-                    if (nodeError.code !== 'ENOENT') {
-                        throw error;
-                    }
-                    // File doesn't exist but hash was provided
-                    return {
-                        success: false,
-                        error: 'File does not exist but hash was provided'
-                    };
-                }
-            } else {
-                // expectedHash is null - expecting new file
-                try {
-                    await stat(validation.resolvedPath!);
-                    // File exists but we expected it to be new
-                    return {
-                        success: false,
-                        error: 'File already exists but was expected to be new'
-                    };
-                } catch (error) {
-                    const nodeError = error as NodeJS.ErrnoException;
-                    if (nodeError.code !== 'ENOENT') {
-                        throw error;
-                    }
-                    // File doesn't exist - this is expected
-                }
-            }
-
-            // Write the file. Auto-create the parent directory so the
-            // first writeFile to a freshly-bound project doesn't fail
-            // with ENOENT (specs/project-workspace-auto-create/ Phase 2).
-            // mkdir({ recursive: true }) is idempotent and stays inside
-            // the validated path, so traversal defense is unaffected.
+            const path = validation.resolvedPath!;
             const buffer = Buffer.from(data.content, 'base64');
-            await mkdir(dirname(validation.resolvedPath!), { recursive: true });
-            await writeFile(validation.resolvedPath!, buffer);
-
-            // Calculate and return hash of written file
-            const hash = createHash('sha256').update(buffer).digest('hex');
-
-            return { success: true, hash };
+            const contentHash = sha256Hex(buffer);
+            const expectedHash = data.expectedHash ?? null;
+            return await writeFileWithHashGate(path, buffer, contentHash, expectedHash);
         } catch (error) {
             logger.debug('Failed to write file:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to write file' };
