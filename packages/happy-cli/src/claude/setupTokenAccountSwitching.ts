@@ -47,6 +47,8 @@ export const SWITCHED_NOTICE = 'This organization Claude account reached its usa
 export const NO_ACCOUNT_NOTICE = 'This organization Claude account reached its usage limit and no other organization account has quota left.'
 export const APPLY_REQUIRED_NOTICE = 'This organization Claude account reached its usage limit. A newly assigned organization account is being applied to this PC; the session continues automatically once it is ready.'
 export const FORBIDDEN_NOTICE = 'Saycode can no longer manage this session\'s organization Claude account, so it will not switch accounts. Start a new conversation to use the organization accounts assigned to you now.'
+/** Saycode specs/managed-account-session-continuation — the account this conversation ran on left the PC; it resumed on another. */
+export const RESUME_REBOUND_NOTICE = 'The organization Claude account this conversation used is no longer assigned to this PC, so it continues on another organization account.'
 export const CONTINUE_PROMPT = 'The previous request stopped because the organization Claude account reached its usage limit. The session now uses another account — continue from where you stopped.'
 
 export function createSetupTokenAccountSwitching(deps: SetupTokenAccountSwitchingDeps) {

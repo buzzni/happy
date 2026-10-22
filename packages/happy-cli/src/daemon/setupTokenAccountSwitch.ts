@@ -207,5 +207,5 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 }
 function machineFailure(error: unknown) { return { ok: false as const, reason: (error instanceof MachineRotationError ? error.reason : 'REQUEST_FAILED') as SwitchFailure, ...(error instanceof MachineRotationError && error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {}) } }
-type RebindResult = { ok: true; environment: Record<string, string> } | { ok: false; reason: SwitchFailure; retryAfterMs?: number }
+export type RebindResult = { ok: true; environment: Record<string, string> } | { ok: false; reason: SwitchFailure; retryAfterMs?: number }
 export type SetupTokenAccountSwitch = ReturnType<typeof createSetupTokenAccountSwitch>

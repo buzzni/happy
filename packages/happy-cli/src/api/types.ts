@@ -1,4 +1,4 @@
-export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | 'apply-required' | 'forbidden' | 'unsupported' | 'retrying' | 'retry-expired' | 'failed';
+export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | 'apply-required' | 'forbidden' | 'unsupported' | 'retrying' | 'retry-expired' | 'failed' | 'resume-rebound';
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
