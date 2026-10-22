@@ -14,7 +14,7 @@ describe('resume of a setup-token session whose account left this PC (Saycode sp
     expect(rebind).not.toHaveBeenCalled()
   })
 
-  it.each(['CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE', 'CLAUDE_SETUP_TOKEN_BINDING_STALE'])('moves the same session onto an assigned account after %s', async kind => {
+  it.each(['CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE', 'CLAUDE_SETUP_TOKEN_BINDING_STALE', 'CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH'])('moves the same session onto an assigned account after %s', async kind => {
     const rebind = vi.fn(async () => ({ ok: true as const, environment: NEXT }))
     expect(await resumeSetupTokenEnvironment({ sessionId: 's', recorded: RECORDED, resolve: async () => { throw refused(kind) }, rebind }))
       .toEqual({ environment: NEXT, rebound: true })

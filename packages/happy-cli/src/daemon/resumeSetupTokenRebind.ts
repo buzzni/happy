@@ -9,8 +9,11 @@
 import { AiCredentialRuntimeError } from './aiCredentialRuntime'
 import type { RebindResult } from './setupTokenAccountSwitch'
 
-/** The recorded account itself is gone or replaced; an unexpected failure (with a cause) is not a reason to move. */
-const ACCOUNT_LEFT = new Set(['CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE', 'CLAUDE_SETUP_TOKEN_BINDING_STALE'])
+/**
+ * The recorded account itself is gone or replaced; an unexpected failure (with a cause) is not a reason to move.
+ * A token-proof binding reports its removed account as TOKEN_MISMATCH (no desired slot holds its token).
+ */
+const ACCOUNT_LEFT = new Set(['CLAUDE_SETUP_TOKEN_BINDING_UNAVAILABLE', 'CLAUDE_SETUP_TOKEN_BINDING_STALE', 'CLAUDE_SETUP_TOKEN_BINDING_TOKEN_MISMATCH'])
 
 export async function resumeSetupTokenEnvironment(input: {
   sessionId: string
