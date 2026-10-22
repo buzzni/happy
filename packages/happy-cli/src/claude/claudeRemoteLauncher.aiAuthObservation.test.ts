@@ -44,7 +44,7 @@ async function runOneTurn(onAssistant: () => void) {
         sessionId: 'observation-test',
         rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
         updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-        sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+        setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
         applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
     };

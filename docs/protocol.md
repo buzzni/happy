@@ -202,3 +202,41 @@ See `api.md` for the full HTTP endpoint catalog and auth flows.
 - API routes: `packages/happy-server/sources/app/api/routes`
 - Socket handlers: `packages/happy-server/sources/app/api/socket`
 - Event routing: `packages/happy-server/sources/app/events/eventRouter.ts`
+
+## Claude runtime account display (session-stream v1)
+
+The existing encrypted, volatile `session-stream` relay may carry a `runtime-account`
+snapshot. It does not change credentials, select an account, persist account data, or
+add a server endpoint. The relay still checks `activityCache.isSessionValid(sid, userId)`
+and fans out only to the authenticated account's user-scoped connections.
+
+A snapshot has `type: "runtime-account"`, `version: 1`, `provider: "claude"`, `sessionId`,
+`epoch` (`13-digit milliseconds-random suffix`), increasing `seq`, and `observedAt`.
+`kind: "organization"` adds only `companyId`, `machineId`, `managedAccountId`, and
+`credentialGeneration`. `kind: "unknown"` has none of those identity fields. The producer
+whitelists these fields from the already established v1/user or v2/machine binding;
+v2 execution must identify the same session. No token, token proof, nonce, grant,
+execution ticket, user ID, path, email, or subscription plan is sent.
+
+`runClaude` reports its established startup binding. Each remote provider's `system/init`
+reports the binding that provider captured, including after an existing automatic
+rotation. An environment prepared for a future provider or a UI next-launch selection
+is not a running-provider identity. Absent or malformed bindings remain unknown; the
+machine's ambient login is never used as a fallback.
+
+`ApiSessionClient` encrypts the frame with the session's existing legacy/dataKey key,
+resends the complete latest snapshot on reconnect and every ten seconds for late
+viewers, and disposes its resend timer on close. Repeats keep epoch/sequence but refresh
+`observedAt`. Consumers match inner and outer session IDs, drop older epoch/sequence
+frames, and reject secret-bearing or unsupported shapes. Desktop scopes name/quota
+lookup by current company, machine, managed ID, and credential generation. It clears
+on auth change/reconnect/inactivity and expires after thirty seconds without an accepted
+heartbeat. A next-launch choice is independent of this store and never alters an
+existing conversation's binding.
+
+The portable vectors are in
+`packages/happy-cli/src/claude/__fixtures__/runtime-account.v1.json` (mirrored in
+Saycode Desktop `tests/fixtures/runtime-account.v1.json`). Older receivers ignore the
+new frame, while newer Desktop keeps an explicit unknown state for older senders.
+Removing the display frame rolls back the display only; credential and session control
+contracts remain unchanged.

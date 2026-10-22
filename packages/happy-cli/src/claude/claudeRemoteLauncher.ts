@@ -385,6 +385,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (message.type === 'system' && message.subtype === 'init') {
             providerRunning = true;
             providerBinding = process.env[SETUP_TOKEN_BINDING_ENV];
+            session.client.setClaudeRuntimeAccount(providerBinding);
             // The level signal is per provider process. Until its first full
             // snapshot, older CLIs still use this generation's transcript.
             publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });

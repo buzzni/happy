@@ -46,7 +46,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             sessionId: 'happy-session-1',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
@@ -90,6 +90,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         await claudeRemoteLauncher(session as unknown as Session);
 
         expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+        expect(client.setClaudeRuntimeAccount.mock.calls.map(([binding]) => JSON.parse(String(binding)).account)).toEqual(['first', 'second']);
         expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
         // A queued user turn replaces automatic continuation and runs alone on the new account.
         expect(generations[1].prompts[0]).toContain('queued while refused');
@@ -119,7 +120,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             sessionId: 'happy-session-1',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             failClaudeLaunchTurn: vi.fn(),
@@ -153,7 +154,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             sessionId: 'happy-session-1',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
@@ -207,7 +208,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             sessionId: 'happy-session-1',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
@@ -262,7 +263,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 sessionId: 'happy-session-1',
                 rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
                 updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-                sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+                setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
                 applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
@@ -333,7 +334,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 sessionId: 'happy-session-1',
                 rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
                 updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-                sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+                setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
                 applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
