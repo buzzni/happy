@@ -163,7 +163,7 @@ async function startRemoteRunClaudeHarness(opts: {
         updateMetadata: vi.fn((updater: (current: Record<string, unknown>) => Record<string, unknown>) => {
             metadata = updater(metadata);
         }),
-        sendClaudeSessionMessage: vi.fn(),
+        setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(),
         sendSessionProtocolMessage: vi.fn(),
         hasTitle: vi.fn(() => false),
         onUserMessage: vi.fn(),
@@ -896,7 +896,7 @@ describe('runClaude remote JSONL scanner', () => {
             skipExistingMessages: vi.fn(),
             capRuntimeProcessedSeq: vi.fn(),
             updateMetadata: vi.fn(),
-            sendClaudeSessionMessage: vi.fn((message: unknown) => {
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn((message: unknown) => {
                 sentMessages.push(message);
             }),
             hasTitle: vi.fn(() => false),
@@ -1007,7 +1007,7 @@ describe('runClaude remote JSONL scanner', () => {
             updateMetadata: vi.fn((updater: (current: typeof metadata) => typeof metadata) => {
                 metadata = updater(metadata);
             }),
-            sendClaudeSessionMessage: vi.fn((message: unknown) => {
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn((message: unknown) => {
                 sentMessages.push(message);
             }),
             hasTitle: vi.fn(() => false),

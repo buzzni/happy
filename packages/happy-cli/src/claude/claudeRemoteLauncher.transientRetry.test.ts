@@ -66,7 +66,7 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
             Object.assign(agentState, update({ ...agentState }));
         }),
         updateMetadata: vi.fn(), getMetadata: () => ({}),
-        sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+        setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
         applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         failClaudeLaunchTurn: vi.fn(),

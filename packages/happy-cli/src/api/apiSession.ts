@@ -41,6 +41,7 @@ import {
     type ProviderUsageEventV1,
 } from '@slopus/happy-wire';
 import { ClaudeTurnUsageTracker } from '@/usage/claudeTurnUsage';
+import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
 import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
@@ -518,6 +519,8 @@ export class ApiSessionClient extends EventEmitter {
     private providerTokens = 0;
     private providerUsageEventIds = new Set<string>();
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
+    private readonly runtimeAccount = new ClaudeRuntimeAccountPublisher(() => this.sessionId, frame => this.emitSessionStream(frame));
+    setClaudeRuntimeAccount(binding: string | undefined) { if (!this.closed) this.runtimeAccount.update(binding); }
     private readonly contextUsage = new ClaudeContextUsageTracker((snapshot) => {
         this.contextUsageTakeDownRepeats = this.contextUsage.hasValue() ? 0 : CONTEXT_USAGE_TAKE_DOWN_REPEATS;
         this.emitSessionStream(snapshot);
@@ -645,6 +648,7 @@ export class ApiSessionClient extends EventEmitter {
             this.receiveSync.invalidate();
             // Volatile frames sent while the socket was down were dropped; the snapshot repairs them.
             this.resendContextUsage();
+            this.runtimeAccount.resend();
             // The 'archived' ephemeral is transient: archived-while-disconnected
             // is invisible to the handlers below (and archive keeps the session
             // row, so the message sync never 404s either). The durable
@@ -2473,6 +2477,7 @@ export class ApiSessionClient extends EventEmitter {
         this.stopReceivePolling();
         this.stopSmartReconnect();
         this.syncContextUsageResend();
+        this.runtimeAccount.dispose();
         this.socket.close();
     }
 

@@ -1737,6 +1737,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 metadata.setupTokenRotation = { version: 1, principalType: 'machine', bindingVersion: 0 };
                 session.updateMetadata(current => ({ ...current, setupTokenRotation: metadata.setupTokenRotation }));
             }
+            session.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
             const startupBinding = readSetupTokenResumeSelection(process.env)?.binding;
             const requiresMachineAck = !!startupBinding && isMachineSetupTokenBinding(startupBinding);
             try {
