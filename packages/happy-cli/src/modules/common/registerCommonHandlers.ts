@@ -39,6 +39,7 @@ import {
 } from './machineRunProfile';
 import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
 import { sanitizeChildEnv, type ChildEnvBoundary } from '@/utils/childEnv';
+import type { ClaudeOutputFormat } from '@/claude/structuredOutput';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -346,6 +347,8 @@ export interface SpawnSessionOptions {
      * would have used", which is the behaviour that predates the choice.
      */
     aiAuthSelection?: AiAuthSelection;
+    /** Session-scoped Claude structured output, validated at the RPC boundary (specs/claude-cli-benchmark-followups R2). */
+    outputFormat?: ClaudeOutputFormat;
 }
 
 export type SpawnSessionResult =
