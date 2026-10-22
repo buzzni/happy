@@ -428,6 +428,19 @@ RPC is used to send commands over the Socket.IO connection:
 
 This mechanism allows the server and mobile clients to drive local actions without exposing a broad REST surface.
 
+## Session Happy MCP response format
+
+The session Happy MCP server (`startHappyServer.ts`) answers every request as plain JSON
+(`enableJsonResponse: true`), not as an SSE stream. Endpoint security holds back
+`text/event-stream` replies. On a Windows PC with Avast real-time protection, every new
+Claude session waited out Claude Code's ~30s MCP connect timeout with `happy` still
+`pending`. Both a direct claude.exe HTTP connection and the `happy-mcp.mjs` stdio bridge
+were affected, so a transport switch does not help. The same SDK server with JSON replies
+connected normally (2026-10-22, #913). No Happy tool sends server-to-client notifications,
+so JSON replies lose nothing. Revisit if a tool needs progress, logging or `list_changed`
+notifications during a call: those require the SSE path, and the AV stall would then need
+another answer.
+
 ## Implementation references
 - CLI entry: `packages/happy-cli/src/index.ts`
 - Daemon: `packages/happy-cli/src/daemon`
