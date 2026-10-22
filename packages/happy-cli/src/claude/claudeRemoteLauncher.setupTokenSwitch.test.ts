@@ -6,7 +6,7 @@ import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenRebind, reportSetupTokenUsage } from '@/daemon/controlClient';
-import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
+import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -39,6 +39,43 @@ const refused = { type: 'rate_limit_event', uuid: 'rl-1', session_id: 'claude-1'
     rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: Math.floor(Date.now() / 1000) + 3600 } };
 
 describe('setup-token account switch in the remote launcher (Saycode specs/claude-setup-token-account-selection)', () => {
+    // Saycode specs/managed-account-session-continuation — the daemon moved this conversation at resume.
+    it('records once that a resumed conversation moved onto another organization account', async () => {
+        process.env.HAPPY_SETUP_TOKEN_RESUME_REBOUND = '1';
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => Object.assign((async function* () {
+            yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+            for await (const _message of prompt as AsyncIterable<SDKUserMessage>) {
+                yield assistant('msg-1');
+                yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-1' };
+                void handlers.get('switch')!();
+                return;
+            }
+        })(), { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>);
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 }, cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        await claudeRemoteLauncher(session as unknown as Session);
+
+        const notices = client.sendSessionEvent.mock.calls.filter(([event]) => event.setupTokenRotation?.state === 'resume-rebound');
+        expect(notices).toEqual([[{ type: 'message', message: RESUME_REBOUND_NOTICE, setupTokenRotation: { version: 1, state: 'resume-rebound' } }]]);
+        expect(process.env.HAPPY_SETUP_TOKEN_RESUME_REBOUND).toBeUndefined();
+    });
+
     it.each(['result', 'exception'])('restarts the same conversation after a known account refusal (%s) and prioritizes the queued user message', async failure => {
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();

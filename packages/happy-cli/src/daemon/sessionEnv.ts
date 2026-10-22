@@ -295,6 +295,9 @@ function parseSetupTokenBinding(value: string): SetupTokenBinding | null {
  * new grant is needed (the original one was verified and consumed); the journal and
  * storage are re-checked instead. A corrupt record refuses the resume.
  */
+/** Set by the daemon on a resumed session it moved onto another organization account (Saycode specs/managed-account-session-continuation). */
+export const SETUP_TOKEN_RESUME_REBOUND_ENV = 'HAPPY_SETUP_TOKEN_RESUME_REBOUND'
+
 export function readSetupTokenResumeSelection(agentEnvironment: SaycodeAgentEnvironment | undefined):
     { selection: AiAuthSelection; binding: SetupTokenBinding } | undefined {
     const raw = agentEnvironment?.[SETUP_TOKEN_BINDING_ENV]

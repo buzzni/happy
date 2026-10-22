@@ -55,14 +55,14 @@ interface PermissionsField {
 }
 
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
-import { createSetupTokenAccountSwitching, CONTINUE_PROMPT } from './setupTokenAccountSwitching';
+import { createSetupTokenAccountSwitching, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE } from './setupTokenAccountSwitching';
 import { reportSetupTokenUsage, requestSetupTokenRebind } from '@/daemon/controlClient';
 import {
     CLAUDE_TRANSIENT_CONTINUE_PROMPT,
     CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
     createClaudeTransientRetry,
 } from './claudeTransientRetry';
-import { SETUP_TOKEN_BINDING_ENV } from '@/daemon/sessionEnv';
+import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV } from '@/daemon/sessionEnv';
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
@@ -357,6 +357,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         notify: (message) => session.client.sendSessionEvent({ type: 'message', message }),
         notifyState: (message, state) => session.client.sendSessionEvent({ type: 'message', message, setupTokenRotation: { version: 1, state } }),
     }) : null;
+    // Saycode specs/managed-account-session-continuation — said once per move, not again when this process relaunches.
+    if (process.env[SETUP_TOKEN_RESUME_REBOUND_ENV] === '1') {
+        session.client.sendSessionEvent({ type: 'message', message: RESUME_REBOUND_NOTICE, setupTokenRotation: { version: 1, state: 'resume-rebound' } });
+    }
+    delete process.env[SETUP_TOKEN_RESUME_REBOUND_ENV];
     /** Whether this generation's provider process has started (its `system/init` arrived). */
     let providerRunning = false;
     /** The mode the last turn ran with, across provider restarts — the continuation of a refused turn reuses it. */

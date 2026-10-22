@@ -113,9 +113,12 @@ import {
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
   isMachineSetupTokenBinding,
+  SETUP_TOKEN_BINDING_ENV,
+  SETUP_TOKEN_RESUME_REBOUND_ENV,
 } from './sessionEnv';
 import { sanitizeChildEnv } from '@/utils/childEnv';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
+import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
@@ -2773,6 +2776,8 @@ export async function startDaemon(): Promise<void> {
       record: (removed) => githubWorktreeTombstones.record(removed),
     });
 
+    /** Sessions being resumed: an account switch at resume finds their record here, as it finds a live child's. */
+    const resumingSetupTokenSessions = new Map<string, TrackedSession>();
     const spawnResumedSession = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> => {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
@@ -2993,12 +2998,21 @@ export async function startDaemon(): Promise<void> {
           filterCredentials: options?.automation !== undefined,
         });
         const priorCheckpointContext = readCheckpointSpawnContext(tracked.agentEnvironment ?? {});
-        // A setup-token-bound session resumes on exactly its recorded generation or not at all.
-        const managedAiCredentialEnvironment = recoveredMachineEnvironment ?? await resolveManagedAiCredentialEnvironment(
-          resumeAgent,
-          resumeBinding?.selection,
-          resumeBinding?.binding,
-        );
+        // A setup-token-bound session resumes on its recorded generation; when that account left this PC it moves,
+        // still the same session, onto an account Studio assigns (Saycode specs/managed-account-session-continuation).
+        resumingSetupTokenSessions.set(happySessionId, tracked);
+        let resumedCredentials: { environment: Record<string, string>; rebound: boolean };
+        try {
+          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : await resumeSetupTokenEnvironment({
+            sessionId: happySessionId,
+            recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
+            resolve: () => resolveManagedAiCredentialEnvironment(resumeAgent, resumeBinding?.selection, resumeBinding?.binding),
+            rebind: (sessionId, running) => setupTokenAccountSwitch?.rebind(sessionId, running) ?? Promise.resolve({ ok: false, reason: 'STUDIO_UNAVAILABLE' }),
+          });
+        } finally {
+          resumingSetupTokenSessions.delete(happySessionId);
+        }
+        const managedAiCredentialEnvironment = resumedCredentials.environment;
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
             inherited: inheritedResumeEnvironment,
@@ -3023,6 +3037,8 @@ export async function startDaemon(): Promise<void> {
                 HAPPY_AUTOMATION_RESUME_PROMPT: '1',
                 HAPPY_AUTOMATION_RUN_ONCE: '1',
               } : {}),
+              // Always written: a resume request cannot announce a move the daemon did not make.
+              [SETUP_TOKEN_RESUME_REBOUND_ENV]: resumedCredentials.rebound ? '1' : '',
             },
             agentEnvironment: tracked.agentEnvironment,
             sessionId: happySessionId,
@@ -4574,7 +4590,7 @@ export async function startDaemon(): Promise<void> {
     } catch (error) { logger.warn(`[machine-rotation] startup recovery failed: ${error instanceof Error ? error.message : 'unknown'}`); }
     // Saycode specs/claude-setup-token-account-selection — a bound session moves off a used-up account.
     setupTokenAccountSwitch = createSetupTokenAccountSwitch({
-      findSession: (sessionId) => getCurrentChildren().find(session => session.happySessionId === sessionId),
+      findSession: (sessionId) => getCurrentChildren().find(session => session.happySessionId === sessionId) ?? resumingSetupTokenSessions.get(sessionId),
       studioOrigin: trustedStudioOrigin,
       machineId,
       bearer: () => credentials.token,
