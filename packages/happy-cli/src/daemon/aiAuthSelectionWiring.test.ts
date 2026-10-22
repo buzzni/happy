@@ -57,7 +57,8 @@ describe('배선 가드: spawn 이 선택을 존중하고 검증하는가', () =
     const text = await runSource()
     // Resume re-binds exactly the session's own recorded setup-token, never the machine default.
     expect(text).toMatch(/const resumeBinding = readSetupTokenResumeSelection\(tracked\.agentEnvironment\);/)
-    expect(text).toMatch(/await resolveManagedAiCredentialEnvironment\(\s*resumeAgent,\s*resumeBinding\?\.selection,\s*resumeBinding\?\.binding,?\s*\)/)
+    // Resolved inside resumeSetupTokenEnvironment, which may move only an account that left this PC (specs/managed-account-session-continuation).
+    expect(text).toMatch(/resolveManagedAiCredentialEnvironment\(\s*resumeAgent,\s*resumeBinding\?\.selection,\s*resumeBinding\?\.binding,?\s*\)/)
     // A new spawn carries only the selection; the caller comes from the signed grant inside it.
     expect(text).toMatch(/await resolveManagedAiCredentialEnvironment\(options\.agent, options\.aiAuthSelection\)/)
     expect(text).toMatch(/aiCredentialRuntime\.sessionEnvironment\(agent, selection, recorded\)/)

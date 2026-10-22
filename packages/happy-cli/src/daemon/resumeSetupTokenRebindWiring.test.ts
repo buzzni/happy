@@ -25,7 +25,8 @@ describe('resume of a session whose organization account left this PC', () => {
     expect(move).toBeGreaterThan(0)
     expect(resume.slice(0, move)).toContain('resumingSetupTokenSessions.set(happySessionId, tracked)')
     expect(resume.slice(move)).toContain('setupTokenAccountSwitch?.rebind(sessionId, running)')
-    expect(resume.slice(move)).toContain('resumingSetupTokenSessions.delete(happySessionId)')
+    // Cleared on every path, machine-bound resumes included (review #911).
+    expect(resume.slice(move)).toMatch(/\} finally \{\s*resumingSetupTokenSessions\.delete\(happySessionId\);/)
     expect(resume).toContain('const managedAiCredentialEnvironment = resumedCredentials.environment;')
     expect(source).toContain('?? resumingSetupTokenSessions.get(sessionId),')
   })

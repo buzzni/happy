@@ -3001,12 +3001,17 @@ export async function startDaemon(): Promise<void> {
         // A setup-token-bound session resumes on its recorded generation; when that account left this PC it moves,
         // still the same session, onto an account Studio assigns (Saycode specs/managed-account-session-continuation).
         resumingSetupTokenSessions.set(happySessionId, tracked);
-        const resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : await resumeSetupTokenEnvironment({
-          sessionId: happySessionId,
-          recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
-          resolve: () => resolveManagedAiCredentialEnvironment(resumeAgent, resumeBinding?.selection, resumeBinding?.binding),
-          rebind: (sessionId, running) => setupTokenAccountSwitch?.rebind(sessionId, running) ?? Promise.resolve({ ok: false, reason: 'STUDIO_UNAVAILABLE' }),
-        }).finally(() => resumingSetupTokenSessions.delete(happySessionId));
+        let resumedCredentials: { environment: Record<string, string>; rebound: boolean };
+        try {
+          resumedCredentials = recoveredMachineEnvironment ? { environment: recoveredMachineEnvironment, rebound: false } : await resumeSetupTokenEnvironment({
+            sessionId: happySessionId,
+            recorded: tracked.agentEnvironment?.[SETUP_TOKEN_BINDING_ENV],
+            resolve: () => resolveManagedAiCredentialEnvironment(resumeAgent, resumeBinding?.selection, resumeBinding?.binding),
+            rebind: (sessionId, running) => setupTokenAccountSwitch?.rebind(sessionId, running) ?? Promise.resolve({ ok: false, reason: 'STUDIO_UNAVAILABLE' }),
+          });
+        } finally {
+          resumingSetupTokenSessions.delete(happySessionId);
+        }
         const managedAiCredentialEnvironment = resumedCredentials.environment;
         const mcpEnvironment = prepareMcpChildEnvironment({
           environmentVariables: overlayManagedCredentialEnvironment(buildResumedSessionSpawnEnvironment({
