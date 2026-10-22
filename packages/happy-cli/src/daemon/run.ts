@@ -24,6 +24,7 @@ import os from 'os';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
+import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
@@ -412,6 +413,7 @@ export const initialMachineMetadata: MachineMetadata = {
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
+  writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
     // The machine-scope handler installs the managed write policy (apiMachine).

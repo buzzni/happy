@@ -37,6 +37,7 @@ import {
 } from '@/daemon/machineResourceService';
 import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/sessionEnv';
 import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
@@ -4198,6 +4199,10 @@ export class ApiMachineClient {
                 !== JSON.stringify(advertisedChannelSupport);
             const aiAuthSelectionStale = JSON.stringify(this.machine.metadata?.aiAuthSelection)
                 !== JSON.stringify(advertisedAiAuthSelection);
+            // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
+            const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
+            const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
+                !== JSON.stringify(advertisedWriteFileAttempt);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4231,7 +4236,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || writeFileAttemptStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4265,6 +4270,7 @@ export class ApiMachineClient {
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
                     structuredOutput: advertisedStructuredOutput,
+                    writeFileAttempt: advertisedWriteFileAttempt,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
