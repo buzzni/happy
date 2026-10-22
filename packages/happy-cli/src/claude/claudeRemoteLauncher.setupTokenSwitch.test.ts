@@ -48,7 +48,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             sessionId: 'happy-session-1',
             rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
             updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
-            sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
             setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
             applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
         };
