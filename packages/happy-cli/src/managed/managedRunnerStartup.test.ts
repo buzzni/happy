@@ -242,6 +242,7 @@ describe('runClaude for a managed Cloud child', () => {
             drainAttachmentsForUserMessage: vi.fn(async () => []),
             downloadAndDecryptAttachment: vi.fn(),
             getMetadata: vi.fn(() => metadata),
+            setClaudeRuntimeAccount: vi.fn(),
             sendSessionEvent: vi.fn(),
             updateAgentState: vi.fn(),
             rpcHandlerManager: { registerHandler: vi.fn() },
