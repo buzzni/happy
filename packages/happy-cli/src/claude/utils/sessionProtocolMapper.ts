@@ -11,6 +11,7 @@ import {
 } from './bashStreamCallRegistry';
 import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
+import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
@@ -703,6 +704,8 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 ...(typeof notification.task_id === 'string' ? { taskId: notification.task_id } : {}),
                 ...(typeof notification.tool_use_id === 'string' ? { toolUseId: notification.tool_use_id } : {}),
             });
+            const text = sdkBackgroundTaskCompletion(message);
+            if (text && !message.isSidechain && !subagent) envelopes.push(createEnvelope('user', { t: 'text', text }, { claudeUuid, id: backgroundTaskNoticeId(text, 'receipt') }));
         }
         return {
             currentTurnId: state.currentTurnId,
@@ -814,7 +817,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             // and leave the turn state untouched.
             if ((message as { happyTaskNotification?: unknown }).happyTaskNotification === true) {
                 rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
-                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
+                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
                 return {
                     currentTurnId: state.currentTurnId,
                     envelopes,
@@ -830,10 +833,10 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 // waiting request: that would answer it before the follow-up does.
                 if (state.currentTurnId) closeTurn(state, 'completed', envelopes);
                 rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
-                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
+                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
             } else {
                 closeTurn(state, 'completed', envelopes);
-                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid }));
+                envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
             }
 
             return {
@@ -857,7 +860,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             closeTurn(state, 'completed', envelopes);
             for (const block of blocks) {
                 if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
-                    envelopes.push(createEnvelope('user', { t: 'text', text: block.text }, { claudeUuid }));
+                    envelopes.push(createEnvelope('user', { t: 'text', text: block.text }, { claudeUuid, id: backgroundTaskNoticeId(block.text) }));
                 }
             }
 
@@ -905,6 +908,9 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                     ...(images ? { images } : {}),
                     ...(backgroundTaskId ? { backgroundTaskId } : {}),
                 }, { turn: turnId, subagent }));
+                const completion = redacted || message.isSidechain || subagent ? null
+                    : stoppedBackgroundTaskCompletion(getToolNameById(block.tool_use_id), block);
+                if (completion) envelopes.push(createEnvelope('user', { t: 'text', text: completion }, { claudeUuid, id: backgroundTaskNoticeId(completion, 'receipt') }));
                 clearActiveBashStreamCall(block.tool_use_id);
                 continue;
             }
