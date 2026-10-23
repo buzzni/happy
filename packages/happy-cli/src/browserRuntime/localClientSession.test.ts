@@ -16,7 +16,7 @@ async function setup(approved: boolean | null) {
         profileId: async () => 'main', approver: () => approved === null ? null : { requestPolicyApproval } }, { broker, command: handleBrowserClientCommand })
     return { cwd, broker, client, requestPolicyApproval, args: { taskSpaceId: 'space', origins: ['https://fixture.test'], leaseMinutes: 5, outFile: 'connection.json' } }
 }
-it('uses the captured parent credential after human-only approval; returns no credential', async () => {
+it.skipIf(process.platform !== 'linux')('uses the captured parent credential after human-only approval; returns no credential', async () => {
     const h = await setup(true)
     expect(process.env.HAPPY_BROWSER_TASK_SESSION_SECRET).toBeUndefined()
     const reply = await h.client.create(h.args)
@@ -47,7 +47,7 @@ it('owner can inspect and revoke without the connection file, with approval for 
     expect(h.broker.mock.calls[1][3]).toMatchObject({ clientSessionId: 'client-lost-file', profileId: 'main' })
     expect(h.requestPolicyApproval).toHaveBeenCalledTimes(1)
 })
-it('does not follow a destination directory replaced during the approval prompt', async () => {
+it.skipIf(process.platform !== 'linux')('does not follow a destination directory replaced during the approval prompt', async () => {
     const h = await setup(true)
     const { mkdir, rename, symlink } = await import('node:fs/promises')
     const parent = join(h.cwd, 'connections'), moved = join(h.cwd, 'moved')
@@ -61,7 +61,7 @@ it('does not follow a destination directory replaced during the approval prompt'
     await expect(stat(join(outside, 'connection.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     expect(h.broker).not.toHaveBeenCalled()
 })
-it('requires a Git-ignored destination before requesting approval in repositories', async () => {
+it.skipIf(process.platform !== 'linux')('requires a Git-ignored destination before requesting approval in repositories', async () => {
     const h = await setup(true)
     const { execFile } = await import('node:child_process')
     const { promisify } = await import('node:util')
@@ -71,4 +71,11 @@ it('requires a Git-ignored destination before requesting approval in repositorie
     expect(h.requestPolicyApproval).not.toHaveBeenCalled(); expect(h.broker).not.toHaveBeenCalled()
     await writeFile(join(h.cwd, '.gitignore'), 'connection.json\n')
     await expect(h.client.create(h.args)).resolves.toMatchObject({ ok: true })
+})
+
+it.skipIf(process.platform === 'linux')('refuses issuance on unsupported platforms without requesting approval', async () => {
+    const h = await setup(true)
+    await expect(h.client.create(h.args)).rejects.toThrow('requires Linux')
+    expect(h.requestPolicyApproval).not.toHaveBeenCalled()
+    expect(h.broker).not.toHaveBeenCalled()
 })

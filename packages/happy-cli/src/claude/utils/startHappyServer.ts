@@ -639,7 +639,7 @@ export async function startHappyServer(
             trackProtectedBashProcess: options.trackProtectedBashProcess,
             browserTaskRuntime,
             browserTaskProfileId,
-        browserLocalClients: browserTask?.localClients,
+            browserLocalClients: browserTask?.localClients,
             exitAfterFirstTurn: options.exitAfterFirstTurn,
             browserHostContinues: options.browserHostContinues,
         });
