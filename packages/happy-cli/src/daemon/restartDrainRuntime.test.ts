@@ -7,7 +7,7 @@ import { createDaemonRestartDrainRuntime, type DaemonRestartDrainRuntime } from 
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 10))
 
-function harness(options: { activity?: Partial<RestartDrainActivity>; preflight?: boolean; env?: NodeJS.ProcessEnv } = {}) {
+function harness(options: { activity?: Partial<RestartDrainActivity>; preflight?: boolean; preflightImpl?: () => Promise<boolean>; env?: NodeJS.ProcessEnv } = {}) {
     let now = 1_000_000
     let activity: RestartDrainActivity = { inTurnCount: 0, automationCount: 0, busyTerminalCount: 0, openTerminalCount: 0, ...options.activity }
     const home = mkdtempSync(join(tmpdir(), 'drain-runtime-'))
@@ -15,7 +15,7 @@ function harness(options: { activity?: Partial<RestartDrainActivity>; preflight?
     const admission = { closed: false }
     const spies = {
         closeTerminalsForRestart: vi.fn(async () => { calls.push('close-terminals'); return 1 }),
-        preflightReplacement: vi.fn(async () => { calls.push('preflight'); return options.preflight ?? true }),
+        preflightReplacement: vi.fn(async () => { calls.push('preflight'); return options.preflightImpl ? options.preflightImpl() : options.preflight ?? true }),
         handOff: vi.fn(async () => { calls.push('hand-off') }),
         shutdown: vi.fn(() => { calls.push('shutdown') }),
         publishLifecycle: vi.fn(),
@@ -124,6 +124,17 @@ describe('daemon restart drain runtime', () => {
             expect(h.ledger().at(-1)).toMatchObject({ outcome: 'force', trigger: 'handoff-terminal-cap' })
         })
 
+        // Cross review H6: "지금 교대" hastens the pending handoff only, never someone's requested drain.
+        it('leaves an open requested drain (e.g. account-switch) at its own deadline', async () => {
+            const h = current = harness({ activity: { busyTerminalCount: 1 } })
+            await h.runtime.heartbeat(true)
+            h.setActivity({ inTurnCount: 1 })
+            const stop = h.runtime.controlPort.begin({ reason: 'account-switch', intent: 'stop', trigger: 'request' })
+            const deadlineAt = stop.ok ? stop.view.deadlineAt : 0
+            await expect(h.runtime.forceHandoff()).resolves.toEqual({ ok: true, deadlineAt })
+            expect(h.runtime.controller.current()).toMatchObject({ state: 'draining', deadlineAt })
+        })
+
         it('starts a forced drain when the handoff is pending but no drain is open yet', async () => {
             const h = current = harness({ activity: { busyTerminalCount: 1 } })
             await h.runtime.heartbeat(true)
@@ -171,6 +182,43 @@ describe('daemon restart drain runtime', () => {
             await flush()
             expect(h.spies.shutdown).toHaveBeenCalledTimes(1)
             expect(h.spies.handOff).not.toHaveBeenCalled()
+        })
+
+        // Cross review H1: a handoff whose preflight was still running must not join a drain that opened meanwhile —
+        // joining would turn a requested stop (e.g. account-switch) into this daemon restarting itself.
+        it('drops a handoff whose preflight finished after a requested stop drain opened', async () => {
+            let finishPreflight!: (ok: boolean) => void
+            const h = current = harness({ preflightImpl: () => new Promise((resolve) => { finishPreflight = resolve }) })
+            const beat = h.runtime.heartbeat(true)
+            await flush()
+            h.setActivity({ inTurnCount: 1 })
+            const stop = h.runtime.controlPort.begin({ reason: 'account-switch', intent: 'stop', trigger: 'request' })
+            finishPreflight(true)
+            expect(await beat).toBe('hold-automations')
+            expect(h.runtime.controller.current()).toMatchObject({ intent: 'stop', reason: 'account-switch', state: 'draining' })
+            h.setActivity({ inTurnCount: 0 })
+            h.runtime.controlPort.status(stop.ok ? stop.view.operationId : '')
+            await flush()
+            expect(h.runtime.controller.current()).toMatchObject({ intent: 'stop', state: 'ready' })
+            expect(h.spies.handOff).not.toHaveBeenCalled()
+        })
+
+        // Cross review H2: once the daemon hands itself over, /stop is refused like a begin (handing-off),
+        // so a normal shutdown never races the replacement spawn.
+        it('refuses /stop as handing-off once the daemon hands itself over', async () => {
+            let finishPreflight!: (ok: boolean) => void
+            const h = current = harness({ activity: { inTurnCount: 1 }, preflightImpl: () => new Promise((resolve) => { finishPreflight = resolve }) })
+            h.runtime.controlPort.begin({ reason: 'user-restart', intent: 'restart', trigger: 'request', leaseSeconds: 0 })
+            expect(h.runtime.controlPort.handingOff()).toBe(false)
+            h.setActivity({ inTurnCount: 0 })
+            h.runtime.controller.tick()
+            expect(h.runtime.controlPort.stopBlocked()).toBe(false)
+            expect(h.runtime.controlPort.handingOff()).toBe(true)
+            await flush()
+            finishPreflight(true)
+            await flush()
+            expect(h.spies.handOff).toHaveBeenCalledTimes(1)
+            expect(h.runtime.controlPort.handingOff()).toBe(true)
         })
 
         it('blocks /stop only while draining (not once ready)', async () => {

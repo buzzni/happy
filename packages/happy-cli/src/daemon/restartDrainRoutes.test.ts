@@ -14,7 +14,7 @@ describe('restart drain control routes (T9)', () => {
     let stop: (() => Promise<void>) | undefined
     afterEach(async () => { await stop?.(); stop = undefined })
 
-    async function start(options: { activity?: RestartDrainActivity; standalone?: boolean; port?: RestartDrainControlPort } = {}) {
+    async function start(options: { activity?: RestartDrainActivity; standalone?: boolean; port?: RestartDrainControlPort; spawnResult?: Record<string, unknown> } = {}) {
         let activity: RestartDrainActivity = options.activity ?? { inTurnCount: 1, automationCount: 0, busyTerminalCount: 0, openTerminalCount: 0 }
         let now = 10_000
         const requestShutdown = vi.fn()
@@ -27,11 +27,12 @@ describe('restart drain control routes (T9)', () => {
             begin: (request) => controller.begin(request),
             status: (operationId) => controller.status(operationId),
             stopBlocked: () => controller.isDraining(),
+            handingOff: () => controller.isSelfCompleting(),
         }
         const server = await startDaemonControlServer({
             getChildren: () => [],
             stopSession: () => ({ stopped: false, reason: 'not-found' }),
-            spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+            spawnSession: async () => (options.spawnResult ?? { type: 'error', errorMessage: 'unused' }) as never,
             requestShutdown,
             onHappySessionWebhook: () => {},
             portRegistry,
@@ -103,6 +104,22 @@ describe('restart drain control routes (T9)', () => {
         expect((await h.post('/stop')).body).toEqual({ status: 'stopping' })
     })
 
+    it('refuses /stop with the handing-off code while the daemon replaces itself (cross review H2)', async () => {
+        const h = await start()
+        await h.post('/restart-drain/begin', begin({ intent: 'restart', leaseSeconds: 0 }))
+        h.setActivity({ inTurnCount: 0 })
+        h.controller.tick()
+        expect(await h.post('/stop')).toEqual({ status: 409, body: { status: 'handing-off', code: 'RESTART_DRAIN_HANDING_OFF' } })
+        expect(h.requestShutdown).not.toHaveBeenCalled()
+    })
+
+    it('keeps the daemon-restarting code and deadline on a refused loopback /spawn-session (cross review H3c)', async () => {
+        const h = await start({ spawnResult: { type: 'error', code: 'daemon-restarting', errorMessage: 'Daemon is restarting', deadlineAt: 25_000 } })
+        expect(await h.post('/spawn-session', { directory: '/tmp' })).toEqual({
+            status: 500, body: { success: false, error: 'Daemon is restarting', code: 'daemon-restarting', deadlineAt: 25_000 },
+        })
+    })
+
     it('answers a replayed requestId with the same operation', async () => {
         const h = await start()
         const first = await h.post('/restart-drain/begin', begin())
@@ -116,7 +133,7 @@ describe('restart drain control routes (T9)', () => {
     })
 
     it('answers 503 while the daemon has not built its drain yet', async () => {
-        const h = await start({ port: { instanceId: '42:1000', begin: () => ({ ok: false, code: 'not-ready' }), status: () => null, stopBlocked: () => false } })
+        const h = await start({ port: { instanceId: '42:1000', begin: () => ({ ok: false, code: 'not-ready' }), status: () => null, stopBlocked: () => false, handingOff: () => false } })
         expect((await h.post('/restart-drain/begin', begin())).status).toBe(503)
     })
 })

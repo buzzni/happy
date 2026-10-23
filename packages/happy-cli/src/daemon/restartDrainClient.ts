@@ -97,17 +97,27 @@ async function waitForExit(pid: number, timeoutMs: number, deps: RestartDrainCli
     return !deps.isPidAlive(pid)
 }
 
-async function stopViaHttp(deps: RestartDrainClientDeps): Promise<'accepted' | 'unreachable'> {
+async function stopViaHttp(deps: RestartDrainClientDeps): Promise<'accepted' | 'handing-off' | 'unreachable'> {
     const result = await deps.post('/stop', {})
     if (result.ok) return 'accepted'
+    // The daemon already replaces itself (it reached ready with nobody left to finish): wait, never kill.
+    if (result.code === HANDING_OFF_CODE) return 'handing-off'
     // A responding server that refused: never turn that into a force kill.
     if (result.status !== undefined && result.status >= 400) throw new DaemonStopRefusedError(result.error)
     return 'unreachable'
 }
 
+async function waitForHandOff(state: DaemonLocallyPersistedState, deps: RestartDrainClientDeps): Promise<StopDaemonOutcome> {
+    deps.log('[DAEMON STOP] The daemon is already handing over to a new one; waiting for it to exit')
+    await waitForExit(state.pid, HANDING_OFF_EXIT_WAIT_MS, deps)
+    return 'stopped'
+}
+
 async function legacyStop(state: DaemonLocallyPersistedState, deps: RestartDrainClientDeps, options: StopDaemonOptions): Promise<StopDaemonOutcome> {
     options.onProgress?.({ kind: 'legacy-stop' })
-    if (await stopViaHttp(deps) === 'accepted' && await waitForExit(state.pid, LEGACY_DAEMON_EXIT_WAIT_MS, deps)) return 'stopped'
+    const stop = await stopViaHttp(deps)
+    if (stop === 'handing-off') return waitForHandOff(state, deps)
+    if (stop === 'accepted' && await waitForExit(state.pid, LEGACY_DAEMON_EXIT_WAIT_MS, deps)) return 'stopped'
     await killIfStillOurs(state, deps)
     return 'stopped'
 }
@@ -151,11 +161,7 @@ export async function stopDaemonWithDrain(options: StopDaemonOptions, deps: Rest
             leaseSeconds: options.noWait ? 0 : 30,
         })
         if (!begun.ok) {
-            if (begun.code === HANDING_OFF_CODE) {
-                deps.log('[DAEMON STOP] The daemon is already handing over to a new one; waiting for it to exit')
-                await waitForExit(state.pid, HANDING_OFF_EXIT_WAIT_MS, deps)
-                return 'stopped'
-            }
+            if (begun.code === HANDING_OFF_CODE) return waitForHandOff(state, deps)
             if (begun.status === 401) throw new DaemonStopRefusedError(begun.error)
             return legacyStop(state, deps, options)
         }
@@ -176,6 +182,11 @@ export async function stopDaemonWithDrain(options: StopDaemonOptions, deps: Rest
                 view = polled.body as RestartDrainView
                 continue
             }
+            // The daemon no longer knows this operation (called off, then replaced): begin again.
+            if (polled.status === 404) {
+                view = { ...view, state: 'cancelled' }
+                break
+            }
             if (!deps.isPidAlive(state.pid)) return 'stopped'
             if (deps.now() > view.deadlineAt + POLL_SLACK_MS) break
         }
@@ -189,7 +200,9 @@ export async function stopDaemonWithDrain(options: StopDaemonOptions, deps: Rest
     }
 
     options.onProgress?.({ kind: 'stopping' })
-    if (await stopViaHttp(deps) === 'accepted' && await waitForExit(state.pid, DRAINED_DAEMON_EXIT_WAIT_MS, deps)) return 'stopped'
+    const stop = await stopViaHttp(deps)
+    if (stop === 'handing-off') return waitForHandOff(state, deps)
+    if (stop === 'accepted' && await waitForExit(state.pid, DRAINED_DAEMON_EXIT_WAIT_MS, deps)) return 'stopped'
     await killIfStillOurs(state, deps)
     return 'stopped'
 }

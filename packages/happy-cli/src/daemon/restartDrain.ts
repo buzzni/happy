@@ -193,6 +193,11 @@ export class RestartDrainController {
         return this.operation?.state === 'ready'
     }
 
+    /** Ready and finishing by itself (handing off or shutting down): nobody else may stop it now. */
+    isSelfCompleting(): boolean {
+        return this.operation?.state === 'ready' && this.operation.selfCompleted
+    }
+
     current(): RestartDrainView | null {
         return this.operation && this.operation.state !== 'cancelled' ? this.view(this.operation) : null
     }
@@ -440,6 +445,26 @@ function isIdle(activity: RestartDrainActivity, includeTerminals: boolean): bool
     return activity.inTurnCount === 0
         && activity.automationCount === 0
         && (!includeTerminals || activity.busyTerminalCount === 0)
+}
+
+/**
+ * Launches (spawn·resume·recover) that passed the admission gate but are not tracked sessions yet — still
+ * preparing credentials or a worktree. They count as in a turn, so the R4(b) re-check right after admission
+ * closes cannot hand off underneath one.
+ */
+export function createAdmittedLaunchCounter() {
+    let inFlight = 0
+    return {
+        count: () => inFlight,
+        async track<T>(run: () => Promise<T>): Promise<T> {
+            inFlight++
+            try {
+                return await run()
+            } finally {
+                inFlight--
+            }
+        },
+    }
 }
 
 /** A runtime older than this is not trusted to say a turn is still running. */

@@ -122,9 +122,11 @@ export async function readOwnDaemonIdentity(executablePath: string): Promise<Dae
 export type DaemonIdentityVerdict = 'match' | 'mismatch' | 'dead' | 'unknown'
 
 /**
- * Whether `recorded` still names a live process. Only `match` permits a signal:
- * `mismatch` means the pid now belongs to someone else (treat the state as
- * stale), `unknown` means it cannot be proven either way.
+ * Whether `recorded` still names a live process. `mismatch` forbids a signal: the
+ * pid now belongs to someone else (treat the state as stale). `unknown` means it
+ * cannot be proven either way; the stop path (`restartDrainClient.killIfStillOurs`)
+ * still signals it after the full exit wait, like a state file without identity —
+ * refusing would leave a hung daemon that no later `daemon start` can replace.
  */
 export async function verifyDaemonIdentity(
     recorded: DaemonIdentity,

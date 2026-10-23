@@ -27,6 +27,8 @@ export interface RestartDrainControlPort {
     status: (operationId: string) => RestartDrainView | null
     /** A drain is open and not yet ready — `/stop` must wait for it. */
     stopBlocked: () => boolean
+    /** The daemon is replacing (or shutting down) itself — `/stop` is refused with `RESTART_DRAIN_HANDING_OFF`. */
+    handingOff: () => boolean
 }
 
 const token = z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)

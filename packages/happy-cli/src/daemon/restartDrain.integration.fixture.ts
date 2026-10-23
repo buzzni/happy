@@ -57,6 +57,7 @@ async function main() {
         begin: (request) => runtime?.controlPort.begin(request) ?? { ok: false, code: 'not-ready' },
         status: (operationId) => runtime?.controlPort.status(operationId) ?? null,
         stopBlocked: () => runtime?.controlPort.stopBlocked() ?? false,
+        handingOff: () => runtime?.controlPort.handingOff() ?? false,
     }
     const spawnGate = () => {
         const deadline = gate.restartDeadline()

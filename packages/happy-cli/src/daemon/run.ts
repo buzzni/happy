@@ -90,7 +90,7 @@ import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { createBundleReplacementWatcher, readOwnDaemonIdentity } from './daemonIdentity';
 import { daemonRestartingRefusal } from './restartDrainLifecycle';
-import { countInTurnSessions, type RestartDrainActivity } from './restartDrain';
+import { countInTurnSessions, createAdmittedLaunchCounter, type RestartDrainActivity } from './restartDrain';
 import { createDaemonRestartDrainRuntime, type DaemonRestartDrainRuntime } from './restartDrainRuntime';
 import type { RestartDrainControlPort } from './restartDrainRoutes';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
@@ -3421,10 +3421,12 @@ export async function startDaemon(): Promise<void> {
       const deadlineAt = launchReadiness.restartDeadline();
       return deadlineAt === null ? null : daemonRestartingRefusal(kind, deadlineAt);
     };
+    // Admitted but not yet tracked launches count as in a turn for the drain (cross review H4).
+    const admittedLaunches = createAdmittedLaunchCounter();
     const spawnSessionAdmitted = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> =>
-      restartRefusal('launch') ?? spawnSession(options);
+      restartRefusal('launch') ?? admittedLaunches.track(() => spawnSession(options));
     const resumeSessionAdmitted = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
-      restartRefusal('resume') ?? resumeSession(happySessionId, options);
+      restartRefusal('resume') ?? admittedLaunches.track(() => resumeSession(happySessionId, options));
 
     const recoverSession = (
       happySessionId: string,
@@ -3983,6 +3985,7 @@ export async function startDaemon(): Promise<void> {
       begin: (request) => restartDrainRuntime?.controlPort.begin(request) ?? { ok: false, code: 'not-ready' },
       status: (operationId) => restartDrainRuntime?.controlPort.status(operationId) ?? null,
       stopBlocked: () => restartDrainRuntime?.controlPort.stopBlocked() ?? false,
+      handingOff: () => restartDrainRuntime?.controlPort.handingOff() ?? false,
     };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
       restartDrain: restartDrainControlPort,
@@ -5219,7 +5222,7 @@ export async function startDaemon(): Promise<void> {
           && !hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
       ),
       recoverSession: requestEnvironments.rememberResume(
-        async (sessionId: string, options: Parameters<typeof recoverSession>[1]) => restartRefusal('resume') ?? recoverSession(sessionId, options),
+        async (sessionId: string, options: Parameters<typeof recoverSession>[1]) => restartRefusal('resume') ?? admittedLaunches.track(() => recoverSession(sessionId, options)),
         sessionId => !recoveryInFlight.has(sessionId),
       ),
       stopSession,
@@ -5298,7 +5301,7 @@ export async function startDaemon(): Promise<void> {
           getCurrentChildren().filter(session => !standaloneWindows?.owner.ownsRoot(session.pid) && isPidAlive(session.pid)),
           // A session first seen under a minute ago with no report yet counts as in a turn (R11).
           { now, knownSince: (pid) => Math.max(daemonStartedAt, pidToAdoptedAt.get(pid) ?? 0, sessionStartTimes.get(pid) ?? 0) },
-        ),
+        ) + admittedLaunches.count(),
         automationCount: getRuntimeActivity().activeAutomationCount,
         busyTerminalCount: getBusyDaemonTerminalCount(now),
         openTerminalCount: getDaemonTerminalSessionCount(),

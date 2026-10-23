@@ -117,6 +117,20 @@ describe('stopDaemonWithDrain (plan §2.2)', () => {
         expect(h.paths()).toEqual(['/restart-drain/capabilities', '/restart-drain/begin', '/restart-drain/status', '/restart-drain/begin', '/stop'])
     })
 
+    // Cross review H8: a status 404 means the operation is gone (called off and replaced) — begin again at once.
+    it('begins again when a status poll no longer knows the operation', async () => {
+        let begins = 0
+        const h = harness({ routes: {
+            '/restart-drain/begin': () => (++begins === 1
+                ? { ok: true, body: view({ operationId: 'op-1' }) }
+                : { ok: true, body: view({ operationId: 'op-2', state: 'ready' }) }),
+            '/restart-drain/status': () => ({ ok: false, status: 404, error: 'unknown-operation' }),
+        } })
+        await expect(stopDaemonWithDrain({}, h.deps)).resolves.toBe('stopped')
+        expect(h.paths().filter((path) => path === '/restart-drain/status')).toHaveLength(1)
+        expect(begins).toBe(2)
+    })
+
     it('never stops a daemon whose drain was called off twice', async () => {
         const h = harness({ routes: { '/restart-drain/begin': () => ({ ok: true, body: view({ state: 'cancelled' }) }) } })
         await expect(stopDaemonWithDrain({}, h.deps)).resolves.toBe('left-running')
@@ -128,6 +142,17 @@ describe('stopDaemonWithDrain (plan §2.2)', () => {
         const h = harness({ routes: { '/restart-drain/begin': () => ({ ok: false, status: 409, code: 'RESTART_DRAIN_HANDING_OFF', error: 'handing-off' }) } })
         await expect(stopDaemonWithDrain({}, h.deps)).resolves.toBe('stopped')
         expect(h.paths()).not.toContain('/stop')
+        expect(h.deps.kill).not.toHaveBeenCalled()
+    })
+
+    it('waits without a kill when /stop finds the daemon already handing itself over (cross review H2)', async () => {
+        let polls = 0
+        const h = harness({ routes: {
+            '/stop': () => ({ ok: false, status: 409, code: 'RESTART_DRAIN_HANDING_OFF', error: 'handing-off' }),
+        } })
+        const isPidAlive = h.deps.isPidAlive
+        h.deps.isPidAlive = (pid) => (++polls > 3 ? false : isPidAlive(pid))
+        await expect(stopDaemonWithDrain({}, h.deps)).resolves.toBe('stopped')
         expect(h.deps.kill).not.toHaveBeenCalled()
     })
 

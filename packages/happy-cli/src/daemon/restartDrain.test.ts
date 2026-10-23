@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
     countInTurnSessions,
+    createAdmittedLaunchCounter,
     DEFAULT_RESTART_DRAIN_GRACE_SECONDS,
     resolveRestartDrainGraceSeconds,
     RestartDrainController,
@@ -291,5 +292,24 @@ describe('RestartDrainController', () => {
         h.setActivity({ inTurnCount: 2 })
         h.controller.tick()
         expect(h.deps.onChange.mock.calls.length).toBe(published + 1)
+    })
+})
+
+// Cross review H4: a launch that passed the admission gate but is still preparing (credentials, standalone
+// setup) is not a tracked session yet; it must still count as activity, or the R4(b) re-check hands off under it.
+describe('createAdmittedLaunchCounter', () => {
+    it('counts a launch from admission until it settles, success or failure', async () => {
+        const launches = createAdmittedLaunchCounter()
+        let finish!: () => void
+        let fail!: (error: Error) => void
+        const ok = launches.track(() => new Promise<void>((resolve) => { finish = resolve }))
+        const bad = launches.track(() => new Promise<void>((_resolve, reject) => { fail = reject }))
+        expect(launches.count()).toBe(2)
+        finish()
+        await ok
+        expect(launches.count()).toBe(1)
+        fail(new Error('spawn failed'))
+        await expect(bad).rejects.toThrow('spawn failed')
+        expect(launches.count()).toBe(0)
     })
 })

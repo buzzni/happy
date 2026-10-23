@@ -155,6 +155,12 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
             input.log('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running')
             return null
         }
+        // A handoff decided before the await must not join a drain that opened meanwhile: joining would make a
+        // requested stop (e.g. account-switch) restart this daemon instead. The next heartbeat decides again.
+        if (request.trigger !== 'signal' && controller.isAdmissionClosed()) {
+            input.log('[DAEMON RUN] Another restart drain opened during the handoff preflight; leaving it to that drain')
+            return controller.current()
+        }
         const result = controller.begin(request)
         return result.ok ? result.view : null
     }
@@ -164,6 +170,7 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         begin: (request) => controller.begin(request),
         status: (operationId) => controller.status(operationId),
         stopBlocked: () => controller.isDraining(),
+        handingOff: () => handingOff || controller.isSelfCompleting(),
     }
 
     return {
@@ -234,7 +241,8 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         async forceHandoff(): Promise<ForceHandoffResult> {
             if (!pendingHandoff) return { ok: false, code: 'no-pending-handoff' }
             const current = controller.current()
-            if (current?.state === 'draining') {
+            // Only the handoff's own drain is hastened; a requested drain (account-switch …) keeps its grace.
+            if (current?.state === 'draining' && current.trigger.startsWith('handoff')) {
                 const forced = controller.force()
                 return { ok: true, deadlineAt: forced?.deadlineAt ?? now() }
             }
