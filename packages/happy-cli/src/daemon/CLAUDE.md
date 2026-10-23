@@ -129,7 +129,7 @@ Local HTTP server (127.0.0.1 only) provides:
 - `/list` - returns tracked sessions
 - `/stop-session` - terminates specific session
 - `/spawn-session` - creates new session (used by integration tests)
-- `/stop` - graceful daemon shutdown (409 `drain-in-progress` while a restart drain is not yet ready)
+- `/stop` - graceful daemon shutdown (409 `drain-in-progress` while a restart drain is not yet ready; 409 `handing-off` + `code: RESTART_DRAIN_HANDING_OFF` while the daemon replaces or stops itself)
 - `/restart-drain/{capabilities,begin,status}` - restart drain (see above)
 
 ## 4. Process Discovery and Cleanup
