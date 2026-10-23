@@ -322,6 +322,10 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         emitToSocket(resolved.session.daemonSocketId, 'terminal-resume-fwd', {
             sessionId: resolved.session.id,
             afterSeq: Math.trunc(afterSeq),
+            // Which client socket asked: a reconnect arrives as a new one, and the
+            // daemon starts a paged replay over for it instead of merging the resume
+            // into the replay that went to the old socket.
+            clientSocketId: resolved.session.clientSocketId,
             // Asks for one page at a time; absent, the daemon answers all at once.
             ...(typeof data?.maxChars === 'number' && Number.isFinite(maxChars) && maxChars > 0 ? { maxChars: Math.trunc(maxChars) } : {}),
         });

@@ -447,7 +447,7 @@ describe('terminalRelayHandler resume relay', () => {
         await client.trigger('terminal-resume', { sessionId, afterSeq: 7 });
 
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 7 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 7, clientSocketId: 'client-1' } },
         ]);
     });
 
@@ -455,7 +455,7 @@ describe('terminalRelayHandler resume relay', () => {
         const { client, sessionId } = await openSession({ caps: { resume: true } });
         await client.trigger('terminal-resume', { sessionId, afterSeq: 0 });
         expect(roomEmits).toHaveLength(1);
-        expect(roomEmits[0].payload).toEqual({ sessionId, afterSeq: 0 });
+        expect(roomEmits[0].payload).toEqual({ sessionId, afterSeq: 0, clientSocketId: 'client-1' });
     });
 
     it('drops a resume carrying nonsense instead of passing it to the daemon', async () => {
@@ -510,8 +510,8 @@ describe('terminalRelayHandler resume relay', () => {
     /*
      * specs/codexcli-daemon-stream-durability B3.1b — paged resume. The relay
      * copies fields by name, so the new ones are added here; a request without
-     * maxChars still carries exactly the old fields, and so does an answer
-     * without paging fields.
+     * maxChars carries no maxChars field, and an answer without paging fields
+     * carries none of those.
      */
     it('forwards maxChars when the client asks for a paged resume, and only then', async () => {
         const { client, sessionId } = await openSession({ caps: { resume: true, pagedResume: true } });
@@ -520,11 +520,11 @@ describe('terminalRelayHandler resume relay', () => {
         await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: -1 });
 
         expect(roomEmits.map((e) => e.payload)).toEqual([
-            { sessionId, afterSeq: 3, maxChars: 262144 },
-            { sessionId, afterSeq: 3 },
-            { sessionId, afterSeq: 3 },
+            { sessionId, afterSeq: 3, clientSocketId: 'client-1', maxChars: 262144 },
+            { sessionId, afterSeq: 3, clientSocketId: 'client-1' },
+            { sessionId, afterSeq: 3, clientSocketId: 'client-1' },
         ]);
-        expect(Object.keys(roomEmits[1].payload)).toEqual(['sessionId', 'afterSeq']);
+        expect(Object.keys(roomEmits[1].payload)).toEqual(['sessionId', 'afterSeq', 'clientSocketId']);
     });
 
     it('carries the paging fields on the frame, snapshot and gap that answer a paged resume', async () => {
@@ -553,7 +553,9 @@ describe('terminalRelayHandler resume relay', () => {
 
     /*
      * The two fixes meeting: P0-3 lets a reconnected client re-claim its
-     * session, and resume is what makes that recovery lossless.
+     * session, and resume is what makes that recovery lossless. The resume
+     * names the new socket, so the daemon replays afresh for it rather than
+     * merging it into a paged replay that went to the old one.
      */
     it('lets a client that reconnected on a new socket resume its session', async () => {
         const { sessionId } = await openSession({ caps: { resume: true } });
@@ -563,7 +565,7 @@ describe('terminalRelayHandler resume relay', () => {
         await reconnected.trigger('terminal-resume', { sessionId, afterSeq: 2 });
 
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 2 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 2, clientSocketId: 'client-2' } },
         ]);
     });
 });
@@ -697,7 +699,7 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
             await back.trigger('terminal-resume', { sessionId, afterSeq: 4 });
 
             expect(roomEmits).toEqual([
-                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4, clientSocketId: 'client-2' } },
             ]);
             // Rebinding the returning client must not stretch the closed record back to 12h.
             expect(redis.ttls.get(`terminal:session:${sessionId}`)).toBeLessThanOrEqual(30);
@@ -733,7 +735,7 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
 
             expect(back.ownEmits).toEqual([]);
             expect(roomEmits).toEqual([
-                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4, clientSocketId: 'client-2' } },
             ]);
         } finally {
             vi.useRealTimers();
@@ -784,9 +786,9 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
         await daemon.trigger('terminal-closed', { sessionId, code: 4, signal: null });
 
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 0, maxChars: 262_144 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 0, clientSocketId: 'client-2', maxChars: 262_144 } },
             { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 1, data: 'p1', more: true, nextSeq: 1 } },
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 1, maxChars: 262_144 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 1, clientSocketId: 'client-2', maxChars: 262_144 } },
             { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 2, data: 'p2', more: false, nextSeq: 2 } },
             { room: 'client-2', event: 'terminal-closed', payload: { sessionId, code: 4, signal: null } },
         ]);
@@ -871,7 +873,7 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
 
         expect(client.ownEmits).toEqual([]);
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 3 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 3, clientSocketId: 'client-1' } },
         ]);
     });
 

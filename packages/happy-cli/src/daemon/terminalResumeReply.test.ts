@@ -125,12 +125,13 @@ function harness(frames: number, size = 4_000, exit: { code: number; signal: num
     for (let i = 0; i < frames; i++) output.push(String(i % 10).repeat(size))
     const sent: Sent[] = []
     let clock = 1_000
-    const reply = (afterSeq: unknown, maxChars?: unknown) => replyToTerminalResume({
+    const reply = (afterSeq: unknown, maxChars?: unknown, requester?: string) => replyToTerminalResume({
         sessionId: 's1',
         output,
         exit,
         afterSeq,
         maxChars,
+        requester,
         seal: (plain) => `sealed:${plain}`,
         emit: (event, payload) => sent.push({ event, payload }),
         now: () => clock,
@@ -195,6 +196,17 @@ describe('replyToTerminalResume paging (B-R3)', () => {
         h.reply(0, 262_144)
         resetPagedResume(h.output)
         expect(h.reply(0, 262_144)).toBe('replay')
+    })
+
+    // The relay path has no attach: a client that reconnected is only told
+    // apart by the socket its resume came from.
+    it('answers a paged resume from another client socket afresh instead of merging it', () => {
+        const h = harness(250)
+        h.reply(0, 262_144, 'socket-a')
+        const firstPage = frameSeqs(h.sent).length
+        expect(h.reply(0, 262_144, 'socket-a')).toBe('merged')
+        expect(h.reply(0, 262_144, 'socket-b')).toBe('replay')
+        expect(frameSeqs(h.sent).slice(firstPage)).toEqual(Array.from({ length: firstPage }, (_, i) => i + 1))
     })
 
     it('sends a paged snapshot with the reset page and the lost character count', () => {
@@ -277,6 +289,28 @@ describe('an ended terminal behind a paged replay', () => {
         expect(closes(h.sent)).toHaveLength(1)
         // The replay is over: a later resume is answered afresh, not merged.
         expect(pagedReplayInFlight(h.output)).toBe(false)
+    })
+
+    // A relay client that drops mid-replay and comes back on a new socket must
+    // still get every page of the ended terminal before it hears the close.
+    it('replays an ended terminal in full to a client that reconnected mid-replay', () => {
+        vi.useFakeTimers()
+        const h = harness(250, 4_000, { code: 0, signal: null })
+        h.reply(0, 262_144, 'socket-a') // this page is lost with the old socket
+        h.sent.length = 0
+        h.tick(1_000)
+        expect(h.reply(0, 262_144, 'socket-b')).toBe('replay')
+        for (let guard = 0; guard < 10; guard++) {
+            const frames = h.sent.filter((s) => s.event === 'terminal-frame')
+            const last = frames[frames.length - 1].payload
+            if (!last.more) break
+            expect(closes(h.sent)).toHaveLength(0)
+            h.reply(last.nextSeq, 262_144, 'socket-b')
+        }
+        expect(frameSeqs(h.sent)).toEqual(Array.from({ length: 250 }, (_, i) => i + 1))
+        expect(h.sent[h.sent.length - 1].event).toBe('terminal-closed')
+        vi.advanceTimersByTime(PAGED_RESUME_STALE_MS * 2)
+        expect(closes(h.sent)).toHaveLength(1)
     })
 
     it('reports a replay in flight only within the stale window', () => {
