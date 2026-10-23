@@ -21,6 +21,7 @@ import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { createId } from "@paralleldrive/cuid2";
 import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
+import { StreamCapture, bashStreamSpillStoreFor, removeBashStreamSpillStore, renderBashStreamResult } from "./bashStreamOutput";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
@@ -230,6 +231,9 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
         },
     }, async (args) => runTool(async () => {
         logger.debug(`[bash_stream:tool] invoked command=${String(args.command).slice(0, 100)}`);
+        // B-R6: a result over 30,000 chars keeps head and tail; the full output
+        // of a truncated stream is spilled to this session's private folder.
+        const spill = bashStreamSpillStoreFor(handlers.client.sessionId).beginCall();
         try {
             const protectedCwd = handlers.protectedBashCwd?.();
             if (handlers.protectedBashCwd && !protectedCwd) {
@@ -240,6 +244,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
                 cwd: protectedCwd ?? args.cwd,
                 detached: Boolean(handlers.protectedBashCwd),
                 onSpawn: handlers.trackProtectedBashProcess,
+                spill,
                 onProgress: (progress) => {
                     const call = getActiveBashStreamCall();
                     logger.debug(`[bash_stream:tool] flush stream=${progress.stream} lines=${progress.lines.length} call=${call ?? '(none)'}`);
@@ -271,18 +276,24 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
                     }
                 },
             });
-            logger.debug(`[bash_stream:tool] done exit=${result.exitCode} stdoutBytes=${result.stdout.length}`);
-            const tail = `\n[exit ${result.exitCode}]`;
+            const captures = result.captures ?? {
+                stdout: StreamCapture.fromText('stdout', result.stdout, spill),
+                stderr: StreamCapture.fromText('stderr', result.stderr, spill),
+            };
+            logger.debug(`[bash_stream:tool] done exit=${result.exitCode} stdoutChars=${captures.stdout.length} stderrChars=${captures.stderr.length}`);
+            const text = renderBashStreamResult(result.exitCode, captures.stdout, captures.stderr);
+            spill.end();
             return {
                 content: [
                     {
                         type: 'text',
-                        text: (result.stdout || '') + (result.stderr ? `\n--- stderr ---\n${result.stderr}` : '') + tail,
+                        text,
                     },
                 ],
                 isError: result.exitCode !== 0,
             };
         } catch (error) {
+            spill.discard();
             return {
                 content: [
                     {
@@ -699,6 +710,7 @@ export async function startHappyServer(
             void agentBroker?.close();
             server.close(() => { if (privateDir) rmSync(privateDir, { recursive: true, force: true }); });
             server.closeAllConnections();
+            removeBashStreamSpillStore(client.sessionId);
             if (process.env[MCP_BEARER_ENV] === token) delete process.env[MCP_BEARER_ENV];
         }
     }
