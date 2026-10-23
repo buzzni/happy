@@ -1881,9 +1881,6 @@ export async function startDaemon(): Promise<void> {
       trustedMcpContext?: AutomationMcpSpawnContext,
     ): Promise<SpawnSessionResult> => {
       if (!launchReadiness.isReady()) return { type: 'error', errorMessage: 'Daemon is initializing; retry the launch shortly' };
-      // R1: a restart drain refuses before anything runs — retryable, never half-started.
-      const restartDeadlineForLaunch = launchReadiness.restartDeadline();
-      if (restartDeadlineForLaunch !== null) return daemonRestartingRefusal('launch', restartDeadlineForLaunch);
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsProvider(options.agent))) {
         return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
       }
@@ -2809,8 +2806,6 @@ export async function startDaemon(): Promise<void> {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
-      const restartDeadlineForResume = launchReadiness.restartDeadline();
-      if (restartDeadlineForResume !== null) return daemonRestartingRefusal('resume', restartDeadlineForResume);
       if (pendingMachineStarts.has(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The execution-bound session is still starting; retry shortly.' };
       let endResumeLaunch: (() => void) | undefined;
       try {
@@ -3415,6 +3410,22 @@ export async function startDaemon(): Promise<void> {
       };
     };
     const recoveryInFlight = new Map<string, Promise<RecoverSessionResult>>();
+    /*
+     * aplus codexcli-daemon-restart-drain R1·R2: a restart drain closes the doors new work comes in
+     * by — machine RPC spawn/resume/recover, the loopback `/spawn-session`, channel host launches —
+     * with a retryable `daemon-restarting` refusal before anything runs. The daemon's own automation
+     * paths are not gated here: their runners are paused, and a tick already in flight is part of
+     * what the drain waits for, so it must be able to finish.
+     */
+    const restartRefusal = (kind: 'launch' | 'resume') => {
+      const deadlineAt = launchReadiness.restartDeadline();
+      return deadlineAt === null ? null : daemonRestartingRefusal(kind, deadlineAt);
+    };
+    const spawnSessionAdmitted = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> =>
+      restartRefusal('launch') ?? spawnSession(options);
+    const resumeSessionAdmitted = async (happySessionId: string, options?: ResumeSessionOptions): Promise<ResumeSessionResult> =>
+      restartRefusal('resume') ?? resumeSession(happySessionId, options);
+
     const recoverSession = (
       happySessionId: string,
       options: RecoverSessionOptions,
@@ -3978,7 +3989,7 @@ export async function startDaemon(): Promise<void> {
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
-      spawnSession: requestEnvironments.rememberSpawn(spawnSession),
+      spawnSession: requestEnvironments.rememberSpawn(spawnSessionAdmitted),
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
       onHappySessionRuntime,
@@ -5151,13 +5162,13 @@ export async function startDaemon(): Promise<void> {
           version: packageJson.version,
         },
         createSession: (input) => api.getOrCreateSession({ ...input, state: { controlledByUser: false } }),
-        spawnSession: (options) => spawnSession(options),
+        spawnSession: (options) => spawnSessionAdmitted(options),
         spawnWithSessionKey: async (options, dataKey) => {
           const runtime = await machineRotationFor(options);
           if (!runtime) return null;
           channelSessionKeys.set(options, dataKey);
           channelRotationRuntimes.set(options, runtime);
-          try { return await spawnSession(options); } finally { channelSessionKeys.delete(options); channelRotationRuntimes.delete(options); }
+          try { return await spawnSessionAdmitted(options); } finally { channelSessionKeys.delete(options); channelRotationRuntimes.delete(options); }
         },
       });
       const channelHostDirs = channelHostDirectories(configuration.happyHomeDir);
@@ -5201,14 +5212,14 @@ export async function startDaemon(): Promise<void> {
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
       ...(channelHost ? { channelHostCall: channelHost.call } : {}),
-      spawnSession: requestEnvironments.rememberSpawn(spawnSession),
+      spawnSession: requestEnvironments.rememberSpawn(spawnSessionAdmitted),
       resumeSession: requestEnvironments.rememberResume(
-        resumeSession,
+        resumeSessionAdmitted,
         sessionId => !resumeInFlight.has(sessionId)
           && !hasLiveDaemonChild(sessionId, pidToTrackedSession.values(), isPidAlive, ownsUnresolvedJob),
       ),
       recoverSession: requestEnvironments.rememberResume(
-        recoverSession,
+        async (sessionId: string, options: Parameters<typeof recoverSession>[1]) => restartRefusal('resume') ?? recoverSession(sessionId, options),
         sessionId => !recoveryInFlight.has(sessionId),
       ),
       stopSession,
@@ -5295,7 +5306,9 @@ export async function startDaemon(): Promise<void> {
     };
     // Bundle handoff: tear this daemon down and start the installed bundle's. Preflight has
     // already run by the time this is called (drain runtime).
+    let handingOffToInstalledBundle = false;
     const handOffToInstalledBundle = async () => {
+      handingOffToInstalledBundle = true;
       const handoffResult = await handoffToReplacedBundle({
         preflightReplacement: async () => true,
         teardownCurrentDaemon: async () => {
@@ -5549,6 +5562,12 @@ export async function startDaemon(): Promise<void> {
       const handoffAutomation = drainRuntime
         ? await drainRuntime.heartbeat(bundleReplaced)
         : 'run-automations';
+      // A hand-off may have started meanwhile: its teardown marks the state file stopped and
+      // releases the lock, and a heartbeat write after that would claim the file back.
+      if (handingOffToInstalledBundle) {
+        heartbeatRunning = false;
+        return;
+      }
       if (handoffAutomation === 'run-automations') {
         // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지
         // 않는다(detach). spawn webhook 대기가 하트비트의 나머지 임무(자가
@@ -5591,6 +5610,10 @@ export async function startDaemon(): Promise<void> {
       }
 
       // Heartbeat
+      if (handingOffToInstalledBundle) {
+        heartbeatRunning = false;
+        return;
+      }
       try {
         // Recorded on the beat that already exists so the file says whether
         // this daemon can actually reach the server, not merely that its
