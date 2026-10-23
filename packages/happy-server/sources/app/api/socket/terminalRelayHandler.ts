@@ -13,7 +13,7 @@
  *   client → server: 'terminal-resize' { sessionId, cols, rows }
  *   client → server: 'terminal-close'  { sessionId }
  *   daemon → server: 'terminal-frame'  { sessionId, data }
- *   daemon → server: 'terminal-closed' { sessionId, code, signal }
+ *   daemon → server: 'terminal-closed' { sessionId, code, signal } | { sessionId, reason: 'unknown-session' }
  *
  * The same handler is registered on every socket; direction is inferred
  * from whether the originating socket's id matches `clientSocketId` or
@@ -39,6 +39,9 @@ import { randomUUID } from 'node:crypto';
 import {
     addTerminalSession,
     getTerminalSession,
+    getTerminalSessionFresh,
+    markClosedTerminalSessionDaemonGone,
+    markTerminalSessionClosed,
     rebindTerminalSessionSocket,
     removeTerminalSession,
     findTerminalSessionsBySocketId,
@@ -114,8 +117,10 @@ async function resolveTerminalSide(
     sessionId: unknown,
     socket: Socket,
     userId: string,
+    opts: { fresh?: boolean } = {},
 ): Promise<{ session: TerminalSession; side: 'client' | 'daemon' } | null> {
-    const found = await getTerminalSession(typeof sessionId === 'string' ? sessionId : null);
+    const id = typeof sessionId === 'string' ? sessionId : null;
+    const found = opts.fresh ? await getTerminalSessionFresh(id) : await getTerminalSession(id);
     if (!found) return null;
     const side = terminalSideOf(found, socket, userId);
     if (!side) return null;
@@ -265,10 +270,29 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
      * "there is a hole here".
      */
     socket.on('terminal-resume', async (data: any) => {
-        const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
-        if (!resolved || resolved.side !== 'client') return;
+        const sessionId = data?.sessionId;
+        if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+        // Fresh: whether the terminal ended or is gone may have been decided on another replica.
+        const resolved = await resolveTerminalSide(sessionId, socket, userId, { fresh: true });
+        if (!resolved) {
+            /*
+             * Codex CLI benchmark D4 B-R2 — answer instead of leaving the client
+             * waiting forever. No record and another user's record get the very
+             * same answer, on the requesting socket only, so a resume cannot be
+             * used to learn whether a session id exists.
+             */
+            socket.emit('terminal-closed', { sessionId, reason: 'unknown-session' });
+            return;
+        }
+        if (resolved.side !== 'client') return;
         const afterSeq = Number(data?.afterSeq);
         if (!Number.isFinite(afterSeq) || afterSeq < 0) return;
+        const { session } = resolved;
+        if (session.closedAt !== undefined && session.daemonGone && session.exit) {
+            // Nobody left to replay the tail; the stored exit is all that is true.
+            socket.emit('terminal-closed', { sessionId: session.id, code: session.exit.code, signal: session.exit.signal });
+            return;
+        }
         emitToSocket(resolved.session.daemonSocketId, 'terminal-resume-fwd', {
             sessionId: resolved.session.id,
             afterSeq: Math.trunc(afterSeq),
@@ -328,13 +352,30 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         const resolved = await resolveTerminalSide(data?.sessionId, socket, userId);
         if (!resolved || resolved.side !== 'daemon') return;
         const { session } = resolved;
+        cancelReattachTimer(session.id);
+        if (data?.reason === 'unknown-session') {
+            // The daemon's answer to a resume: it no longer has this terminal, so neither do we.
+            emitToSocket(session.clientSocketId, 'terminal-closed', { sessionId: session.id, reason: 'unknown-session' });
+            await removeTerminalSession(session.id);
+            log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] close session=${session.id} (unknown to daemon)`);
+            return;
+        }
         emitToSocket(session.clientSocketId, 'terminal-closed', {
             sessionId: session.id,
             code: data?.code,
             signal: data?.signal,
+            ...(typeof data?.reason === 'string' ? { reason: data.reason } : {}),
         });
-        cancelReattachTimer(session.id);
-        await removeTerminalSession(session.id);
+        /*
+         * Codex CLI benchmark D4 B-R2 — kept, not removed. Whether the client
+         * got that close is unknowable here (it may be detached, on any
+         * replica), so the record stays resolvable for a short TTL and a
+         * returning client's resume still reaches the daemon's retained tail.
+         */
+        await markTerminalSessionClosed(session.id, {
+            code: typeof data?.code === 'number' ? data.code : -1,
+            signal: typeof data?.signal === 'number' ? data.signal : null,
+        });
         log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] close session=${session.id} exit=${data?.code} signal=${data?.signal}`);
     });
 
@@ -349,6 +390,13 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
              * down the live terminal it was replaced by.
              */
             if (socket.id !== session.clientSocketId && socket.id !== session.daemonSocketId) continue;
+
+            if (socket.id === session.daemonSocketId && session.closedAt !== undefined) {
+                // Already ended with a real exit; "daemon disconnected" would be
+                // a lie. Keep the record so a resume is answered from that exit.
+                await markClosedTerminalSessionDaemonGone(session.id);
+                continue;
+            }
 
             if (socket.id === session.daemonSocketId) {
                 /*
@@ -383,10 +431,16 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
             const timer = setTimeout(() => {
                 reattachTimers.delete(session.id);
                 void (async () => {
-                    const current = await getTerminalSession(session.id);
+                    // Fresh: the daemon's close may have been recorded on another replica.
+                    const current = await getTerminalSessionFresh(session.id);
                     // Re-read, because "still bound to the socket that left" is
                     // the only thing that means nobody came back.
                     if (!current || current.clientSocketId !== socket.id) return;
+                    if (current.closedAt !== undefined) {
+                        // The shell already ended; there is nothing to tell the daemon to close.
+                        await removeTerminalSession(current.id);
+                        return;
+                    }
                     try {
                         emitToSocket(current.daemonSocketId, 'terminal-close-fwd', { sessionId: current.id });
                     } catch {

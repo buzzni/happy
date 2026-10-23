@@ -22,6 +22,7 @@ import { accessKeyHandler } from "./socket/accessKeyHandler";
 import { terminalRelayHandler } from "./socket/terminalRelayHandler";
 import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket/terminalSessions";
 import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
+import { registerTerminalSessionClusterListeners } from "@/app/api/socket/terminalSessions";
 import { db } from "@/storage/db";
 import { machineSocketIdentityExists } from "./socket/machineSocketAuth";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
@@ -197,6 +198,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
     // Preview WS frames whose browser socket is owned by a peer replica arrive
     // here via serverSideEmit. Registered once per process.
     registerPreviewWsClusterListeners(io);
+    // Peer replicas drop a terminal record they cached once it is rebound,
+    // closed or removed elsewhere (Codex CLI benchmark D4 B-R2).
+    registerTerminalSessionClusterListeners(io as any);
 
     // Auth runs in middleware so it completes BEFORE the client's `connect`
     // event fires. Without this, the async verifyToken in the connection
