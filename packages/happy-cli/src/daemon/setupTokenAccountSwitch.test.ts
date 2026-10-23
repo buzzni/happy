@@ -5,6 +5,7 @@ import type { TrackedSession } from './types'
 
 const A = '00000000-0000-4000-8000-00000000000a'
 const B = '00000000-0000-4000-8000-00000000000b'
+const C = '00000000-0000-4000-8000-00000000000c'
 const NONCE_A = '00000000-0000-4000-8000-0000000000aa'
 const NONCE_B = '00000000-0000-4000-8000-0000000000bb'
 // B was issued after A: a switch from A to B.
@@ -298,7 +299,8 @@ describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-
   const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
   const moved = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: B }
   function sharedSetup() {
-    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async (): Promise<Record<string, string> | null> => moved) }
+    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async (): Promise<Record<string, string> | null> => moved),
+      environment: vi.fn(async (): Promise<Record<string, string> | null> => moved), moved: vi.fn() }
     const context = setup({ sharedMachine })
     // The daemon recorded which shared account it handed this session at spawn.
     context.session.agentEnvironment = {}
@@ -313,9 +315,30 @@ describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-
     expect(sharedMachine.reportUsage).toHaveBeenCalledWith(A, observation)
     expect(sharedMachine.rebind).toHaveBeenCalledWith(A, observation)
     expect(requests).toEqual([])
-    // The record follows the move: the session now speaks for B, no longer for A.
+    // The record follows the move, and is saved so a restarted daemon still knows it.
     expect(session.sharedSetupTokenAccount).toBe(B)
-    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(session.sharedSetupTokenAccountsLeft).toEqual([A])
+    expect(sharedMachine.moved).toHaveBeenCalledTimes(1)
+  })
+
+  it('brings a session that missed a finished move onto the account it was moved to, without moving it again', async () => {
+    const { switcher, session, sharedMachine } = sharedSetup()
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: true, environment: moved })
+    // The session never applied that answer (stopped, timed out) and still runs on A.
+    expect(await switcher.reportUsage('session-a', sharedRunning, observation)).toEqual({ ok: true })
+    expect(sharedMachine.reportUsage).toHaveBeenLastCalledWith(A, observation)
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: true, environment: moved })
+    expect(sharedMachine.environment).toHaveBeenCalledWith(B)
+    expect(sharedMachine.rebind).toHaveBeenCalledTimes(1)
+    expect(session.sharedSetupTokenAccount).toBe(B)
+    // When B itself can no longer be used, the session moves on from B.
+    sharedMachine.environment.mockResolvedValueOnce(null)
+    const third = { ...moved, [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: C }
+    sharedMachine.rebind.mockResolvedValueOnce(third)
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: true, environment: third })
+    expect(sharedMachine.rebind).toHaveBeenLastCalledWith(B, undefined)
+    expect(session.sharedSetupTokenAccount).toBe(C)
+    expect(session.sharedSetupTokenAccountsLeft).toEqual([A, B])
   })
 
   it('stays put when no other account is usable or the PC cannot answer', async () => {

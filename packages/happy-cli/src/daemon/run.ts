@@ -1272,6 +1272,9 @@ export async function startDaemon(): Promise<void> {
             ...(persisted.deferredContinuationContextFile
               ? { deferredContinuationContextFile: persisted.deferredContinuationContextFile }
               : {}),
+            // A live shared-PC session keeps switching accounts after the daemon restarts.
+            ...(persisted.sharedSetupTokenAccount ? { sharedSetupTokenAccount: persisted.sharedSetupTokenAccount } : {}),
+            ...(persisted.sharedSetupTokenAccountsLeft ? { sharedSetupTokenAccountsLeft: persisted.sharedSetupTokenAccountsLeft } : {}),
           };
           pidToTrackedSession.set(persisted.pid, recovered);
           if (!persisted.happySessionId) {
@@ -1486,6 +1489,8 @@ export async function startDaemon(): Promise<void> {
         startedAt: sessionStartTimes.get(s.pid) ?? Date.now(),
         userHomeDir: s.userHomeDir,
         deferredContinuationContextFile: s.deferredContinuationContextFile,
+        sharedSetupTokenAccount: s.sharedSetupTokenAccount,
+        sharedSetupTokenAccountsLeft: s.sharedSetupTokenAccountsLeft,
       }));
     };
 
@@ -4612,7 +4617,10 @@ export async function startDaemon(): Promise<void> {
       recordAgentEnvironment: persistSetupTokenBinding,
       machineRuntime: (companyId) => machineRotation?.runtime(companyId) ?? null,
       // Saycode specs/shared-pc-session-account-continuation — an unbound shared-PC session moves within this PC's assignment.
-      sharedMachine: { reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind },
+      sharedMachine: {
+        reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,
+        environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),
+      },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     releaseSetupTokenAccounts = (managedAccountIds) => {

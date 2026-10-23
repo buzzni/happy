@@ -2348,6 +2348,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (!sharedAccountUsedUp(managedAccountId)) await sharedMachineUsage(managedAccountId, { observedAt: deps.now(), reason: 'rate-limited', retryAt: null, windows: [] })
     return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId }))
   }
+  /** The environment of exactly that shared account, for a session catching up with a move; null when it is gone. */
+  function sharedMachineAccountEnvironment(managedAccountId: string) {
+    return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ account: managedAccountId }))
+  }
 
   /**
    * A launch or resume without a setup-token binding runs on the machine default.
@@ -2543,7 +2547,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, sharedMachineAccountEnvironment, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}

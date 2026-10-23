@@ -20,7 +20,19 @@ describe('shared-PC account switch wiring', () => {
     expect(source.indexOf(record, tracked)).toBeGreaterThan(tracked)
   })
 
-  it('routes the switch of such a session to this PC\'s own assignment', async () => {
-    expect(await runSource()).toContain('sharedMachine: { reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind },')
+  it('routes the switch of such a session to this PC\'s own assignment and saves each move', async () => {
+    const source = await runSource()
+    expect(source).toContain('reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,')
+    expect(source).toContain('environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),')
+  })
+
+  it('keeps the handed and left accounts across a daemon restart through the tracked-session state file', async () => {
+    const source = await runSource()
+    const serialize = source.slice(source.indexOf('const serializeTrackedSessions = ('), source.indexOf('let persistTrackedSessions'))
+    expect(serialize).toContain('sharedSetupTokenAccount: s.sharedSetupTokenAccount,')
+    expect(serialize).toContain('sharedSetupTokenAccountsLeft: s.sharedSetupTokenAccountsLeft,')
+    const recovered = source.slice(source.indexOf('const recovered: TrackedSession = {'), source.indexOf('pidToTrackedSession.set(persisted.pid, recovered);'))
+    expect(recovered).toContain('...(persisted.sharedSetupTokenAccount ? { sharedSetupTokenAccount: persisted.sharedSetupTokenAccount } : {}),')
+    expect(recovered).toContain('...(persisted.sharedSetupTokenAccountsLeft ? { sharedSetupTokenAccountsLeft: persisted.sharedSetupTokenAccountsLeft } : {}),')
   })
 })

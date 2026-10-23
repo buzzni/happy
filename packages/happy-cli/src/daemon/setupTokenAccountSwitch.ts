@@ -39,11 +39,14 @@ export type SetupTokenAccountSwitchDeps = {
   recordAgentEnvironment(session: TrackedSession, binding: string): SessionPersistenceResult | Promise<SessionPersistenceResult>
   /**
    * An unbound shared-PC session moves within the accounts assigned to this PC, without Studio
-   * (Saycode specs/shared-pc-session-account-continuation). `rebind` answers null when none is usable.
+   * (Saycode specs/shared-pc-session-account-continuation). `rebind` and `environment` answer null when none is usable;
+   * `moved` saves the session's new record.
    */
   sharedMachine?: {
     reportUsage(managedAccountId: string, observation: SetupTokenUsageObservation): Promise<void>
     rebind(managedAccountId: string, observation?: SetupTokenUsageObservation): Promise<Record<string, string> | null>
+    environment(managedAccountId: string): Promise<Record<string, string> | null>
+    moved(): void
   }
 }
 /**
@@ -179,28 +182,40 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
 
   /**
    * The account an unbound shared-PC session runs on. Null: `running` is a binding record, not a shared-PC account;
-   * undefined: not the account this daemon handed that session (the request body alone proves nothing).
+   * undefined: not an account this daemon handed that session (the request body alone proves nothing). `behind`: the
+   * daemon already moved the session off it, and the session missed that answer.
    */
   function sharedSession(sessionId: string, running: string) {
     const managedAccountId = parseSharedMachineSetupTokenAuthority(running)
     if (!managedAccountId) return null
     const session = deps.findSession(sessionId)
-    return session && session.sharedSetupTokenAccount === managedAccountId && deps.sharedMachine
-      ? { session, managedAccountId, sharedMachine: deps.sharedMachine } : undefined
+    const recorded = session?.sharedSetupTokenAccount
+    if (!session || !recorded || !deps.sharedMachine) return undefined
+    const behind = recorded !== managedAccountId
+    if (behind && !session.sharedSetupTokenAccountsLeft?.includes(managedAccountId)) return undefined
+    return { session, managedAccountId, recorded, behind, sharedMachine: deps.sharedMachine }
   }
 
   async function sharedRebindOnce(sessionId: string, shared: NonNullable<ReturnType<typeof sharedSession>>, observation?: SetupTokenUsageObservation): Promise<RebindResult> {
+    const { session, recorded } = shared
     let environment: Record<string, string> | null
-    try { environment = await shared.sharedMachine.rebind(shared.managedAccountId, observation) }
-    catch (error) { return failure('REQUEST_FAILED', `shared rebind ${(error as Error)?.message}`) }
+    try {
+      // Catching up is not another move: the session gets the account it was already moved to, while that one lasts.
+      environment = shared.behind ? await shared.sharedMachine.environment(recorded) : null
+      if (!environment) environment = await shared.sharedMachine.rebind(recorded, shared.behind ? undefined : observation)
+    } catch (error) { return failure('REQUEST_FAILED', `shared rebind ${(error as Error)?.message}`) }
     if (!environment) return { ok: false, reason: 'NO_ACCOUNT' }
     // The session may have ended or moved while the account was prepared: it gets no token then.
-    if (deps.findSession(sessionId) !== shared.session || shared.session.sharedSetupTokenAccount !== shared.managedAccountId) {
+    if (deps.findSession(sessionId) !== session || session.sharedSetupTokenAccount !== recorded) {
       return failure('NOT_BOUND', `shared rebind: session ${sessionId} changed while its account was prepared`)
     }
     const next = sharedMachineSetupTokenAccount(environment)
     if (!next || !environment.CLAUDE_CODE_OAUTH_TOKEN) return failure('REQUEST_FAILED', 'shared rebind answered no shared account')
-    shared.session.sharedSetupTokenAccount = next
+    if (next !== recorded) {
+      session.sharedSetupTokenAccountsLeft = [...(session.sharedSetupTokenAccountsLeft ?? []).filter(id => id !== next), recorded]
+      session.sharedSetupTokenAccount = next
+      shared.sharedMachine.moved()
+    }
     return { ok: true, environment }
   }
 

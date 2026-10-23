@@ -125,6 +125,9 @@ export interface PersistedTrackedSession {
   userHomeDir?: string;
   /** Context file awaiting the first explicit user turn. */
   deferredContinuationContextFile?: string;
+  /** Unbound shared-PC session: the account the daemon handed it and those it moved it off (no secret). */
+  sharedSetupTokenAccount?: string;
+  sharedSetupTokenAccountsLeft?: string[];
 }
 
 /**
