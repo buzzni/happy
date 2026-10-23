@@ -66,6 +66,12 @@ export interface DaemonTerminalEntry {
     readonly output: TerminalOutputBuffer
     /** Set once the PTY has exited; the entry is then only kept for resume. */
     exit: TerminalExit | null
+    /**
+     * Which path carries the terminal. A direct (same-machine WebSocket,
+     * ADR-061) terminal does not depend on the relay socket, so losing that
+     * socket must not end it (specs/codexcli-daemon-stream-durability B2a).
+     */
+    readonly route: 'relay' | 'direct'
 }
 
 interface InternalEntry extends DaemonTerminalEntry {
@@ -83,6 +89,8 @@ export interface AddSessionOptions {
     outputBufferChars?: number
     /** Replay buffer ceiling in frames. Defaults to DEFAULT_TERMINAL_BUFFER_FRAMES. */
     outputBufferFrames?: number
+    /** Defaults to 'relay'. */
+    route?: 'relay' | 'direct'
 }
 
 const sessions = new Map<string, InternalEntry>()
@@ -132,6 +140,7 @@ export function addDaemonTerminalSession(
         lastInputAt: null,
         output: createTerminalOutputBuffer(opts.outputBufferChars, opts.outputBufferFrames),
         exit: null,
+        route: opts.route ?? 'relay',
         _idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         _idleTimer: null,
         _retainTimer: null,
@@ -198,10 +207,15 @@ export function markDaemonTerminalSessionExited(
  * logger-free (see the file header), and every successful teardown is already
  * audited by the `pty.onExit` handler in apiMachine.ts. The user-initiated
  * close path logs abnormal outcomes explicitly.
+ *
+ * `route` limits the teardown to the terminals one path carries: the relay
+ * socket dropping ends relay terminals, while direct ones keep running on
+ * their own connection.
  */
-export function killAllDaemonTerminalSessions(): number {
+export function killAllDaemonTerminalSessions(route?: 'relay' | 'direct'): number {
     let killed = 0
     for (const [id, entry] of sessions) {
+        if (route !== undefined && entry.route !== route) continue
         clearTimers(entry)
         if (entry.exit) {
             sessions.delete(id)

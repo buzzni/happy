@@ -3759,7 +3759,11 @@ export class ApiMachineClient {
             // is deferred to a future remote-terminal-detach-attach spec
             // since it requires server+daemon coordinated state for any
             // real reattach value (Phase 5 review).
-            const killed = killAllDaemonTerminalSessions();
+            // Only relay terminals: a same-machine direct terminal rides its
+            // own WebSocket and must survive the relay going away — a sleeping
+            // laptop drops both, and the direct one is meant to reattach
+            // (specs/codexcli-daemon-stream-durability B2a).
+            const killed = killAllDaemonTerminalSessions('relay');
             if (killed > 0) {
                 logger.debug(`[API MACHINE] Killed ${killed} terminal session(s) on disconnect`);
             }

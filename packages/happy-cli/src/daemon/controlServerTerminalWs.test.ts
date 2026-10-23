@@ -203,7 +203,7 @@ describe('/terminal WS protocol (T7-T8)', () => {
     expect(ack.reqId).toBe(reqId)
     expect(ack.data.ok).toBe(true)
     expect(typeof ack.data.sessionId).toBe('string')
-    expect(ack.data.caps).toEqual({ resume: false, snapshot: false, local: true })
+    expect(ack.data.caps).toEqual({ resume: true, snapshot: true, local: true, attach: true, pagedResume: true })
     ws.close()
   })
 
