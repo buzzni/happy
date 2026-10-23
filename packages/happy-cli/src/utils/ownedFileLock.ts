@@ -39,18 +39,32 @@ export interface OwnedFileLockDeps {
     onReclaimConfirmed?: () => Promise<void>;
     /** Test seam: runs once the lock is held, before `work`. */
     onAcquired?: () => Promise<void>;
+    /**
+     * This boot's identity. Recorded in the lock; a lock recorded under another
+     * boot is abandoned whatever its pid now names. Locks without one are judged
+     * as before.
+     */
+    bootId?: string;
+    /**
+     * Longest any holder keeps this lock. A lock older than this is abandoned
+     * even when its owner looks alive — for locks whose holders only ever run a
+     * short local step, where a stuck holder must not block everyone forever.
+     */
+    maxHoldMs?: number;
 }
 
-interface LockOwner { version: 1; pid: number; startedAt: number; token: string; acquiredAt: number }
+interface LockOwner { version: 1; pid: number; startedAt: number; token: string; acquiredAt: number; bootId?: string }
 interface LockSnapshot { raw: string; owner: LockOwner | null; ino: number; mtimeMs: number }
-type Verdict = { stale: true; why: 'owner-exited' | 'pid-reused' | 'unowned-abandoned' } | { stale: false; holder: FileLockHeldError['holder'] };
+type Verdict = { stale: true; why: 'owner-exited' | 'pid-reused' | 'unowned-abandoned' | 'other-boot' | 'hold-expired' } | { stale: false; holder: FileLockHeldError['holder'] };
 
 /**
  * Runs `work` holding an exclusive lock file shared across processes on this machine.
  *
  * The file records the owner's pid and process start time. A lock whose owner has
  * provably exited (or whose pid now belongs to a later process) is reclaimed;
- * a live owner's lock is never taken, so the caller gets a FileLockHeldError.
+ * a live owner's lock is never taken, so the caller gets a FileLockHeldError —
+ * unless the caller set `bootId` or `maxHoldMs`, which also free a lock from an
+ * earlier boot or one held longer than any holder ever needs.
  * A lock is published with its owner already recorded (written aside, then
  * hard-linked into place, which fails if the path exists), so no window exists in
  * which a held lock looks ownerless and could be reclaimed from under its holder.
@@ -71,7 +85,7 @@ export async function withOwnedFileLock<T>(path: string, work: () => Promise<T>,
 async function acquire(path: string, depth: number, deps: OwnedFileLockDeps): Promise<LockOwner> {
     const now = deps.now ?? Date.now;
     for (let attempt = 0; attempt < ACQUIRE_ATTEMPTS; attempt += 1) {
-        const owner: LockOwner = { version: 1, pid: process.pid, startedAt: SELF_STARTED_AT, token: randomUUID(), acquiredAt: now() };
+        const owner: LockOwner = { version: 1, pid: process.pid, startedAt: SELF_STARTED_AT, token: randomUUID(), acquiredAt: now(), ...(deps.bootId ? { bootId: deps.bootId } : {}) };
         if (await publish(path, owner)) {
             await deps.onLockCreated?.();
             return owner;
@@ -143,6 +157,8 @@ async function judge(seen: LockSnapshot, deps: OwnedFileLockDeps): Promise<Verdi
         const abandoned = (deps.now ?? Date.now)() - seen.mtimeMs > UNOWNED_LOCK_STALE_MS;
         return abandoned ? { stale: true, why: 'unowned-abandoned' } : { stale: false, holder: 'recent-unowned' };
     }
+    if (deps.bootId && owner.bootId && owner.bootId !== deps.bootId) return { stale: true, why: 'other-boot' };
+    if (deps.maxHoldMs !== undefined && (deps.now ?? Date.now)() - owner.acquiredAt > deps.maxHoldMs) return { stale: true, why: 'hold-expired' };
     let startedAt: number | undefined;
     if (owner.pid === process.pid) {
         startedAt = SELF_STARTED_AT;
@@ -179,7 +195,8 @@ function parseOwner(raw: string): LockOwner | null {
     try {
         const value = JSON.parse(raw) as Partial<LockOwner>;
         if (value.version === 1 && Number.isSafeInteger(value.pid) && value.pid! > 0 && Number.isSafeInteger(value.startedAt)
-            && Number.isSafeInteger(value.acquiredAt) && typeof value.token === 'string' && /^[0-9a-f-]{36}$/.test(value.token)) {
+            && Number.isSafeInteger(value.acquiredAt) && typeof value.token === 'string' && /^[0-9a-f-]{36}$/.test(value.token)
+            && (value.bootId === undefined || typeof value.bootId === 'string')) {
             return value as LockOwner;
         }
     } catch {
