@@ -8,11 +8,13 @@
  * instead of deciding for itself.
  *
  * Three answers:
- * - `unattended`: nobody is there (scheduled runs, GitHub triggers, automation retries, a child
- *   delegated by an unattended or messenger parent). A prompt is declined after the wait.
+ * - `unattended`: nobody is there (scheduled runs, GitHub triggers, a fallback retry into one of
+ *   their sessions, a child delegated by an unattended or messenger parent). A prompt is declined
+ *   after the wait.
  * - `channel`: a messenger turn. Its buttons die after five minutes, so the same wait applies.
  * - `attended`: a person sent it, or something acting inside a person's conversation (autopilot,
- *   self-review, PR follow-through, quality gate, browser attention), or we cannot tell. No limit.
+ *   self-review, PR follow-through, quality gate, browser attention, a fan-out pipeline a person
+ *   started), or we cannot tell. No limit.
  *
  * Anything unknown waits: a wrong `attended` costs a stalled automation, a wrong `unattended`
  * declines a person's prompt behind their back.
@@ -41,9 +43,16 @@ export const UNATTENDED_APPROVAL_TIMEOUT_MS = APPROVAL_TIMEOUT_MS;
 export const DELEGATED_ATTENDANCE_ENV = 'SAYCODE_DELEGATED_ATTENDANCE';
 
 /** Desktop `meta.turnTrigger` values sent by something nobody watches (Desktop domain/turnTrigger). */
-const UNATTENDED_TURN_TRIGGERS: ReadonlySet<string> = new Set(['schedule', 'github-trigger', 'automation']);
+const UNATTENDED_TURN_TRIGGERS: ReadonlySet<string> = new Set(['schedule', 'github-trigger']);
 /** Sent on a person's behalf inside their conversation: attended, but not a person arriving. */
 const AUTOMATIC_TURN_TRIGGERS: ReadonlySet<string> = new Set(['autopilot', 'self-review', 'pr-follow-through', 'agent']);
+/**
+ * Desktop writes `automation` for two things (desktop-turn-trigger-tags R2): the rounds and stage
+ * sessions of a fan-out quality pipeline a person started, and a model fallback retry into an
+ * automation's session whose source it did not know. Only the session's own recorded source tells
+ * them apart: a scheduled or GitHub-triggered session is the retry; anything else waits.
+ */
+const AUTOMATION_SESSION_SOURCES: ReadonlySet<string> = new Set(['schedule', 'github-trigger']);
 /** Daemon writers that act inside a person's conversation (plan §3.4). */
 const AUTOMATIC_DAEMON_SOURCES: ReadonlySet<string> = new Set(['autonomous-quality-gate', 'agent-browser']);
 
@@ -77,10 +86,11 @@ export function initialPromptAttendance(delegated: DelegatedAttendance | null): 
 }
 
 /**
- * One input's sender, from its message meta. Own-property reads only: meta is decrypted JSON any
- * client can write, and an inherited key must not pass for one it sent.
+ * One input's sender, from its message meta and the receiving session's recorded `source`
+ * (session metadata, aplus-dev-studio specs/session-source-metadata). Own-property reads only:
+ * meta is decrypted JSON any client can write, and an inherited key must not pass for one it sent.
  */
-export function inputAttendanceFromMeta(meta: unknown): InputAttendance {
+export function inputAttendanceFromMeta(meta: unknown, sessionSource?: unknown): InputAttendance {
     if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return 'human';
     const field = (key: string): unknown => (Object.hasOwn(meta, key) ? (meta as Record<string, unknown>)[key] : undefined);
 
@@ -91,6 +101,9 @@ export function inputAttendanceFromMeta(meta: unknown): InputAttendance {
     const turnTrigger = field('turnTrigger');
     if (typeof turnTrigger === 'string' && UNATTENDED_TURN_TRIGGERS.has(turnTrigger)) return 'unattended';
     if (typeof turnTrigger === 'string' && AUTOMATIC_TURN_TRIGGERS.has(turnTrigger)) return 'automatic';
+    if (turnTrigger === 'automation') {
+        return typeof sessionSource === 'string' && AUTOMATION_SESSION_SOURCES.has(sessionSource) ? 'unattended' : 'automatic';
+    }
 
     const sentFrom = field('sentFrom');
     if (sentFrom === 'automation') return 'unattended';

@@ -16,7 +16,6 @@ describe('inputAttendanceFromMeta (spec R10a, plan §3.4)', () => {
         // Nobody is watching.
         [{ turnTrigger: 'schedule' }, 'unattended'],
         [{ turnTrigger: 'github-trigger' }, 'unattended'],
-        [{ turnTrigger: 'automation' }, 'unattended'],
         [{ sentFrom: 'automation' }, 'unattended'],
         [{ delegatedAttendance: 'unattended' }, 'unattended'],
         // Inside a person's conversation, on their behalf.
@@ -24,6 +23,8 @@ describe('inputAttendanceFromMeta (spec R10a, plan §3.4)', () => {
         [{ turnTrigger: 'self-review' }, 'automatic'],
         [{ turnTrigger: 'pr-follow-through' }, 'automatic'],
         [{ turnTrigger: 'agent' }, 'automatic'],
+        // A fan-out quality pipeline round or stage session a person started (desktop-turn-trigger-tags R2).
+        [{ turnTrigger: 'automation' }, 'automatic'],
         [{ sentFrom: 'happy-agent' }, 'automatic'],
         [{ sentFrom: 'daemon', source: 'autonomous-quality-gate' }, 'automatic'],
         [{ sentFrom: 'daemon', source: 'agent-browser' }, 'automatic'],
@@ -39,6 +40,28 @@ describe('inputAttendanceFromMeta (spec R10a, plan §3.4)', () => {
         [{ delegatedAttendance: 'bogus', turnTrigger: 'schedule' }, 'unattended'],
     ] as const)('reads %j as %s', (meta, expected) => {
         expect(inputAttendanceFromMeta(meta)).toBe(expected);
+    });
+
+    it.each([
+        // A fallback retry into an automation's own session whose source Desktop did not know.
+        ['schedule', 'unattended'],
+        ['github-trigger', 'unattended'],
+        // A fan-out pipeline round or stage session: a person started the pipeline (I7 review H2).
+        ['fanout', 'automatic'],
+        ['user', 'automatic'],
+        ['channel', 'automatic'],
+        [undefined, 'automatic'],
+        ['something-new', 'automatic'],
+    ] as const)('reads an automation turn in a session started by %s as %s', (sessionSource, expected) => {
+        expect(inputAttendanceFromMeta({ turnTrigger: 'automation' }, sessionSource)).toBe(expected);
+    });
+
+    it('lets the session source decide only an automation turn', () => {
+        expect(inputAttendanceFromMeta({ turnTrigger: 'user' }, 'schedule')).toBe('human');
+        expect(inputAttendanceFromMeta({}, 'schedule')).toBe('human');
+        expect(inputAttendanceFromMeta({ turnTrigger: 'autopilot' }, 'github-trigger')).toBe('automatic');
+        expect(inputAttendanceFromMeta({ turnTrigger: 'schedule' }, 'fanout')).toBe('unattended');
+        expect(inputAttendanceFromMeta({ sentFrom: 'automation' }, 'fanout')).toBe('unattended');
     });
 
     it('lets a delegated parent decide over the turn trigger the child message also carries', () => {

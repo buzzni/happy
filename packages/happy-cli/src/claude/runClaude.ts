@@ -1415,7 +1415,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // Whatever this flushed will never run, so its routing decisions are
             // dead. The floor never moved for them — they were only ever pending.
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta)),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1433,7 +1433,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             difficultyRoutingCommitter.requestEpoch();
             deferredContinuation.prepare(message.content.text);
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta)),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1646,7 +1646,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                     ? [routed.pending.clientRequestId]
                     : localDecision ? [localDecision.clientRequestId] : undefined,
                 latencyTrace,
-                inputAttendanceFromMeta(message.meta),
+                inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
             );
             deferredTurn?.commit();
             if (routed) {
@@ -1708,7 +1708,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             return;
         }
         // A person writing lifts the running turn's unattended waits; automatic input does not (R10).
-        turnAttendance.inputArrived(inputAttendanceFromMeta(message.meta));
+        turnAttendance.inputArrived(inputAttendanceFromMeta(message.meta, session.getMetadata()?.source));
         currentSession?.cancelLessonReview();
         const attachmentsPromise = session.drainAttachmentsForUserMessage();
         if (!runtimeGate) return handleUserMessage({ message, attachmentsPromise });

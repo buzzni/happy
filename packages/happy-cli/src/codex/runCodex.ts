@@ -773,7 +773,7 @@ export async function runCodex(opts: {
                 queue: messageQueue,
                 attachments: attachmentsForThisMessage,
                 latencyTrace,
-                attendance: inputAttendanceFromMeta(message.meta),
+                attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
                 // Travels beside the mode so the engine boundary below can commit
                 // this decision — and so a batch keeps every merged request's id.
                 requestIds: routed
@@ -876,7 +876,7 @@ export async function runCodex(opts: {
             return;
         }
         // A person writing lifts the running turn's unattended waits; automatic input does not (R10).
-        turnAttendance?.inputArrived(inputAttendanceFromMeta(message.meta));
+        turnAttendance?.inputArrived(inputAttendanceFromMeta(message.meta, session.getMetadata()?.source));
         const latencyTrace = captureCodexLatencyTrace(message.meta?.latencyTrace, diagnostic => session.sendTurnLatency(diagnostic));
         const accept = () => {
             preemptLessonReview();
