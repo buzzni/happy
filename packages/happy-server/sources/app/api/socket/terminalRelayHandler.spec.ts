@@ -447,7 +447,7 @@ describe('terminalRelayHandler resume relay', () => {
         await client.trigger('terminal-resume', { sessionId, afterSeq: 7 });
 
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 7 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 7, clientSocketId: 'client-1' } },
         ]);
     });
 
@@ -455,7 +455,7 @@ describe('terminalRelayHandler resume relay', () => {
         const { client, sessionId } = await openSession({ caps: { resume: true } });
         await client.trigger('terminal-resume', { sessionId, afterSeq: 0 });
         expect(roomEmits).toHaveLength(1);
-        expect(roomEmits[0].payload).toEqual({ sessionId, afterSeq: 0 });
+        expect(roomEmits[0].payload).toEqual({ sessionId, afterSeq: 0, clientSocketId: 'client-1' });
     });
 
     it('drops a resume carrying nonsense instead of passing it to the daemon', async () => {
@@ -508,8 +508,54 @@ describe('terminalRelayHandler resume relay', () => {
     });
 
     /*
+     * specs/codexcli-daemon-stream-durability B3.1b — paged resume. The relay
+     * copies fields by name, so the new ones are added here; a request without
+     * maxChars carries no maxChars field, and an answer without paging fields
+     * carries none of those.
+     */
+    it('forwards maxChars when the client asks for a paged resume, and only then', async () => {
+        const { client, sessionId } = await openSession({ caps: { resume: true, pagedResume: true } });
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: 262144 });
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: 'lots' });
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: -1 });
+
+        expect(roomEmits.map((e) => e.payload)).toEqual([
+            { sessionId, afterSeq: 3, clientSocketId: 'client-1', maxChars: 262144 },
+            { sessionId, afterSeq: 3, clientSocketId: 'client-1' },
+            { sessionId, afterSeq: 3, clientSocketId: 'client-1' },
+        ]);
+        expect(Object.keys(roomEmits[1].payload)).toEqual(['sessionId', 'afterSeq', 'clientSocketId']);
+    });
+
+    it('carries the paging fields on the frame, snapshot and gap that answer a paged resume', async () => {
+        const { daemon, sessionId } = await openSession({ caps: { resume: true, pagedResume: true } });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 9, data: 'c', more: true, nextSeq: 9 });
+        await daemon.trigger('terminal-snapshot', { sessionId, seq: 4, data: 's', more: false, nextSeq: 4, droppedChars: 120 });
+        await daemon.trigger('terminal-frame-gap', { sessionId, fromSeq: 2, droppedChars: 7 });
+
+        expect(roomEmits.map((e) => e.payload)).toEqual([
+            { sessionId, seq: 9, data: 'c', more: true, nextSeq: 9 },
+            { sessionId, seq: 4, data: 's', more: false, nextSeq: 4, droppedChars: 120 },
+            { sessionId, fromSeq: 2, droppedChars: 7 },
+        ]);
+    });
+
+    it('drops paging fields of the wrong type and adds none to an ordinary frame', async () => {
+        const { daemon, sessionId } = await openSession({ caps: { resume: true } });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 1, data: 'c', more: 'yes', nextSeq: 'x' });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 2, data: 'd' });
+        await daemon.trigger('terminal-frame-gap', { sessionId, fromSeq: 2, droppedChars: 'many' });
+
+        expect(Object.keys(roomEmits[0].payload)).toEqual(['sessionId', 'seq', 'data']);
+        expect(Object.keys(roomEmits[1].payload)).toEqual(['sessionId', 'seq', 'data']);
+        expect(Object.keys(roomEmits[2].payload)).toEqual(['sessionId', 'fromSeq']);
+    });
+
+    /*
      * The two fixes meeting: P0-3 lets a reconnected client re-claim its
-     * session, and resume is what makes that recovery lossless.
+     * session, and resume is what makes that recovery lossless. The resume
+     * names the new socket, so the daemon replays afresh for it rather than
+     * merging it into a paged replay that went to the old one.
      */
     it('lets a client that reconnected on a new socket resume its session', async () => {
         const { sessionId } = await openSession({ caps: { resume: true } });
@@ -519,7 +565,7 @@ describe('terminalRelayHandler resume relay', () => {
         await reconnected.trigger('terminal-resume', { sessionId, afterSeq: 2 });
 
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 2 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 2, clientSocketId: 'client-2' } },
         ]);
     });
 });
@@ -653,7 +699,7 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
             await back.trigger('terminal-resume', { sessionId, afterSeq: 4 });
 
             expect(roomEmits).toEqual([
-                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4, clientSocketId: 'client-2' } },
             ]);
             // Rebinding the returning client must not stretch the closed record back to 12h.
             expect(redis.ttls.get(`terminal:session:${sessionId}`)).toBeLessThanOrEqual(30);
@@ -689,7 +735,7 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
 
             expect(back.ownEmits).toEqual([]);
             expect(roomEmits).toEqual([
-                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4, clientSocketId: 'client-2' } },
             ]);
         } finally {
             vi.useRealTimers();
@@ -713,6 +759,41 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
             { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 1, data: 'tail' } },
             { room: 'client-2', event: 'terminal-closed', payload: { sessionId, code: 2, signal: null } },
         ]);
+    });
+
+    /*
+     * D4 I3·I4 merge: an ended terminal replayed page by page. Every page's
+     * resume must still reach the daemon after the close was recorded, and the
+     * daemon's exit — sent after the last page — must reach the client last.
+     */
+    it('carries a paged replay of an ended terminal across replicas, the exit after the last page', async () => {
+        const { daemon, client, sessionId } = await openAcrossReplicas();
+        await client.trigger('disconnect');
+        await daemon.trigger('terminal-closed', { sessionId, code: 4, signal: null });
+        const replicaC = await loadReplica();
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+        roomEmits.length = 0;
+
+        await back.trigger('terminal-resume', { sessionId, afterSeq: 0, maxChars: 262_144 });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 1, data: 'p1', more: true, nextSeq: 1 });
+        // The next page is asked for through yet another replica.
+        const replicaD = await loadReplica();
+        const again = new FakeSocket('client-2');
+        replicaD.relay.terminalRelayHandler('u1', again as any);
+        await again.trigger('terminal-resume', { sessionId, afterSeq: 1, maxChars: 262_144 });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 2, data: 'p2', more: false, nextSeq: 2 });
+        await daemon.trigger('terminal-closed', { sessionId, code: 4, signal: null });
+
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 0, clientSocketId: 'client-2', maxChars: 262_144 } },
+            { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 1, data: 'p1', more: true, nextSeq: 1 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 1, clientSocketId: 'client-2', maxChars: 262_144 } },
+            { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 2, data: 'p2', more: false, nextSeq: 2 } },
+            { room: 'client-2', event: 'terminal-closed', payload: { sessionId, code: 4, signal: null } },
+        ]);
+        expect(back.ownEmits).toEqual([]);
+        expect(again.ownEmits).toEqual([]);
     });
 
     it('answers from the stored exit when the daemon socket is gone too', async () => {
@@ -792,7 +873,7 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
 
         expect(client.ownEmits).toEqual([]);
         expect(roomEmits).toEqual([
-            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 3 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 3, clientSocketId: 'client-1' } },
         ]);
     });
 

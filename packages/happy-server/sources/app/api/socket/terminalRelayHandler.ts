@@ -168,6 +168,20 @@ async function findMachineSocket(userId: string, machineId: string) {
     return { socket: newestMachineSocket(sockets), degraded };
 }
 
+/*
+ * specs/codexcli-daemon-stream-durability B3.1b — paged resume fields. The
+ * relay copies fields by name, so these are named here; each is copied only
+ * when present with the right type, so an exchange without paging carries
+ * exactly the fields it always did. The relay reads none of them.
+ */
+function pageFields(data: any): { more?: boolean; nextSeq?: number; droppedChars?: number } {
+    return {
+        ...(typeof data?.more === 'boolean' ? { more: data.more } : {}),
+        ...(Number.isFinite(data?.nextSeq) ? { nextSeq: data.nextSeq } : {}),
+        ...(Number.isFinite(data?.droppedChars) ? { droppedChars: data.droppedChars } : {}),
+    };
+}
+
 export function terminalRelayHandler(userId: string, socket: Socket): void {
     socket.on('terminal-open', async (data: any, ack?: (response: any) => void) => {
         const reply = (resp: any) => { if (typeof ack === 'function') ack(resp); };
@@ -265,6 +279,7 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 sessionId: session.id,
                 seq: data?.seq,
                 data: data?.data,
+                ...pageFields(data),
             });
         }
     });
@@ -303,9 +318,16 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
             socket.emit('terminal-closed', { sessionId: session.id, code: session.exit.code, signal: session.exit.signal });
             return;
         }
+        const maxChars = Number(data?.maxChars);
         emitToSocket(resolved.session.daemonSocketId, 'terminal-resume-fwd', {
             sessionId: resolved.session.id,
             afterSeq: Math.trunc(afterSeq),
+            // Which client socket asked: a reconnect arrives as a new one, and the
+            // daemon starts a paged replay over for it instead of merging the resume
+            // into the replay that went to the old socket.
+            clientSocketId: resolved.session.clientSocketId,
+            // Asks for one page at a time; absent, the daemon answers all at once.
+            ...(typeof data?.maxChars === 'number' && Number.isFinite(maxChars) && maxChars > 0 ? { maxChars: Math.trunc(maxChars) } : {}),
         });
     });
 
@@ -320,6 +342,7 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
             sessionId: resolved.session.id,
             seq: data?.seq,
             data: data?.data,
+            ...pageFields(data),
         });
     });
 
@@ -329,6 +352,7 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         emitToSocket(resolved.session.clientSocketId, 'terminal-frame-gap', {
             sessionId: resolved.session.id,
             fromSeq: data?.fromSeq,
+            ...pageFields(data),
         });
     });
 
