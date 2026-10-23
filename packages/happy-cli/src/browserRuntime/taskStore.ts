@@ -103,6 +103,8 @@ export interface SpaceRecord {
     }
     /** Logical Happy sessions explicitly joined to this space. */
     memberSessionIds?: string[]
+    /** Approved local applications keep this space only until these fixed deadlines. */
+    localClientLeases?: Record<string, number>
     /** Durable audit trail for space membership changes. */
     membershipEvents?: Array<{ type: 'created' | 'joined'; agentSessionId: string; atMs: number }>
     /** Sessions whose logical Happy connection has ended. */
