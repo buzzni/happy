@@ -221,4 +221,15 @@ describe('delegation (spec R12)', () => {
         expect(initialPromptAttendance('attended')).toBe('automatic');
         expect(initialPromptAttendance(null)).toBeUndefined();
     });
+
+    it('reads a scheduled or GitHub-triggered spawn\'s own first prompt as the automation\'s', () => {
+        // A Gemini or non-run-once spawn's first prompt has no meta and no run-once marker (review bot, #935).
+        expect(initialPromptAttendance(null, 'schedule')).toBe('unattended');
+        expect(initialPromptAttendance(null, 'github-trigger')).toBe('unattended');
+        expect(initialPromptAttendance(null, 'fanout')).toBeUndefined();
+        expect(initialPromptAttendance(null, 'user')).toBeUndefined();
+        expect(initialPromptAttendance(null, undefined)).toBeUndefined();
+        // A delegating parent's value decides over the child's own source.
+        expect(initialPromptAttendance('attended', 'schedule')).toBe('automatic');
+    });
 });

@@ -1750,7 +1750,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                         mode.permissionMode,
                         allowAutomationReconnectPrompt,
                     ),
-                }, undefined, initialPromptAttendance(delegatedAttendance));
+                }, undefined, initialPromptAttendance(delegatedAttendance, source));
                 logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
             },
         },

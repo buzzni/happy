@@ -338,7 +338,7 @@ export async function runGemini(opts: {
         appendSystemPrompt: currentAppendSystemPrompt,
         saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
         saycodePromptBlocks: currentSaycodePromptBlocks,
-      }, undefined, initialPromptAttendance(delegatedAttendance));
+      }, undefined, initialPromptAttendance(delegatedAttendance, source));
       conversationHistory.addUserMessage(prompt);
     },
     // The daemon may return recovery success as soon as this report arrives.

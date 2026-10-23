@@ -47,6 +47,8 @@ const UNATTENDED_TURN_TRIGGERS: ReadonlySet<string> = new Set(['schedule', 'gith
 /** Sent on a person's behalf inside their conversation: attended, but not a person arriving. */
 const AUTOMATIC_TURN_TRIGGERS: ReadonlySet<string> = new Set(['autopilot', 'self-review', 'pr-follow-through', 'agent']);
 /**
+ * Sources of sessions an automation started (session metadata `source`).
+ *
  * Desktop writes `automation` for two things (desktop-turn-trigger-tags R2): the rounds and stage
  * sessions of a fan-out quality pipeline a person started, and a model fallback retry into an
  * automation's session whose source it did not know. Only the session's own recorded source tells
@@ -78,10 +80,15 @@ export function consumeDelegatedAttendance(env: NodeJS.ProcessEnv): DelegatedAtt
     return value;
 }
 
-/** The attendance of a spawned child's first prompt, which arrives without message meta. */
-export function initialPromptAttendance(delegated: DelegatedAttendance | null): InputAttendance | undefined {
+/**
+ * The attendance of a spawn's first prompt, which arrives without message meta: a delegating
+ * parent's value, else the spawn's own source — a scheduled or GitHub-triggered spawn's prompt was
+ * written by that automation, run-once or not.
+ */
+export function initialPromptAttendance(delegated: DelegatedAttendance | null, spawnSource?: unknown): InputAttendance | undefined {
     if (delegated === 'unattended') return 'unattended';
     if (delegated === 'attended') return 'automatic';
+    if (typeof spawnSource === 'string' && AUTOMATION_SESSION_SOURCES.has(spawnSource)) return 'unattended';
     return undefined;
 }
 

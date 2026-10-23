@@ -914,7 +914,7 @@ export async function runCodex(opts: {
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
-            }, undefined, initialPromptAttendance(delegatedAttendance));
+            }, undefined, initialPromptAttendance(delegatedAttendance, source));
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
         },
         reportStarted: response ? async () => {
