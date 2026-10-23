@@ -44,7 +44,7 @@ async function policySession(answer: PolicyApprovalAnswer, machine: MachinePolic
         grants: createPolicyGrantStore(),
         audit: createToolPolicyAuditLog({ path: auditPath, sessionId: () => 's1' }),
         approver: () => ({ requestPolicyApproval: async (request) => { asked.push(request); return answer; } }),
-        unattended: false,
+        unattended: () => false,
         platform: 'darwin',
     });
     const server = await startHookServer({ onSessionHook: () => undefined, preToolUse: { secret: SECRET, decide: gate.decide, toolsListed: gate.toolsListed } });

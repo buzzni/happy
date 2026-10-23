@@ -22,20 +22,12 @@ import { Session } from "../session";
 import { EnhancedMode, PermissionMode } from "../loop";
 import { getToolDescriptor } from "./getToolDescriptor";
 import { mapToClaudeMode } from "./permissionMode";
-import type { PermissionPolicyMeta, PolicyApprovalAnswer, PolicyApprover } from "@/toolPolicy/policyGate";
+import { APPROVAL_TIMEOUT_ABORT_REASON, type PermissionPolicyMeta, type PolicyApprovalAnswer, type PolicyApprover } from "@/toolPolicy/policyGate";
+import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from "@/utils/permissionResolution";
+import { ApprovalExpiryTimers, withoutExpiresAt } from "@/utils/approvalExpiry";
+import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
 
-/**
- * What the child says it did with an answer.
- *
- * Returned through the ordinary RPC path, which seals it with the session key —
- * so the browser that sent the answer can read it and nothing in between can.
- * Older clients ignore the body, which is what they did when it was `undefined`.
- */
-export interface PermissionAck {
-    applied: boolean;
-    /** Why not, when it was not. */
-    reason?: 'unknown-request' | 'already-answered';
-}
+export type { PermissionAck };
 
 interface PermissionResponse {
     id: string;
@@ -91,6 +83,12 @@ export class PermissionHandler implements PolicyApprover {
     private channelBindings = new Map<string, ChannelPermissionBinding>();
     /** Monotonic per handler. Never reused, so a stale queue item cannot match a live request. */
     private nextInstanceSeq = 1;
+    /** Settled ids, kept across `reset()` so a late answer is told what happened (plan §3.4, T16). */
+    private readonly resolved = new ResolvedPermissionLog();
+    /** The unattended wait (spec R10, T21). Inert until the launcher hands over the turn's attendance. */
+    private readonly expiry = new ApprovalExpiryTimers({
+        onReleased: (ids) => this.session.client.updateAgentState((state) => withoutExpiresAt(state, ids)),
+    });
     private session: Session;
     private allowedTools = new Set<string>();
     private allowedBashLiterals = new Set<string>();
@@ -187,6 +185,11 @@ export class PermissionHandler implements PolicyApprover {
     constructor(session: Session) {
         this.session = session;
         this.setupClientHandler();
+    }
+
+    /** Which turn attendance decides whether a prompt waits forever or is declined (R10a). */
+    setAttendance(attendance: TurnAttendanceState | null): void {
+        this.expiry.setAttendance(attendance);
     }
 
     /**
@@ -361,13 +364,15 @@ export class PermissionHandler implements PolicyApprover {
                 ? { approved: true, policyGrant }
                 : { approved: false, policyGrant: 'once', reason: response?.reason };
         } catch (error) {
-            this.withdrawRequest(request.id, request.signal.aborted ? 'Tool policy approval withdrawn' : 'Tool policy approval failed');
+            // An abort was already recorded by the request's own abort handler; this covers the rest.
+            this.withdrawRequest(request.id, request.signal.aborted ? 'Tool policy approval withdrawn' : 'Tool policy approval failed', 'aborted');
             throw error;
         }
     }
 
-    /** Moves a still-open request to completed/canceled. A request already answered is left alone. */
-    private withdrawRequest(id: string, reason: string): void {
+    /** Moves a still-open request to completed/canceled. A request already settled is left alone. */
+    private withdrawRequest(id: string, reason: string, resolution: PermissionResolution): void {
+        const completedAt = Date.now();
         this.session.client.updateAgentState((currentState) => {
             const request = currentState.requests?.[id];
             if (!request) return currentState;
@@ -378,7 +383,7 @@ export class PermissionHandler implements PolicyApprover {
                 requests,
                 completedRequests: {
                     ...currentState.completedRequests,
-                    [id]: { ...request, completedAt: Date.now(), status: 'canceled', reason },
+                    [id]: { ...request, completedAt, status: 'canceled', reason, resolution },
                 },
             };
         });
@@ -395,16 +400,29 @@ export class PermissionHandler implements PolicyApprover {
         policy?: PermissionPolicyMeta,
     ): Promise<PermissionResult> {
         return new Promise<PermissionResult>((resolve, reject) => {
+            const instanceSeq = this.nextInstanceSeq++;
             // Set up abort signal handling
             const abortHandler = () => {
-                this.pendingRequests.delete(id);
-                this.withdrawChannelBinding(id, 'aborted');
+                // The map and the agent state are touched only for this raising: a reused id may
+                // already be a newer one. This promise is rejected either way.
+                if (this.pendingRequests.get(id)?.instanceSeq === instanceSeq) {
+                    this.pendingRequests.delete(id);
+                    this.expiry.clear(id);
+                    this.withdrawChannelBinding(id, 'aborted');
+                    // The gate gives up on a policy approval with its own reason; anything else is a stop.
+                    const resolution: PermissionResolution = signal.reason === APPROVAL_TIMEOUT_ABORT_REASON ? 'expired' : 'aborted';
+                    // A messenger turn's policy prompt that timed out spends the turn's wait (plan §3.4, Q6).
+                    if (resolution === 'expired') this.expiry.spendBudget();
+                    this.resolved.record(id, resolution);
+                    // Recorded here, not left for the next reset: until then every other screen would
+                    // keep a live card for a call that will never run (T14).
+                    this.withdrawRequest(id, policy ? 'Tool policy approval withdrawn' : 'Permission request aborted', resolution);
+                }
                 reject(new Error('Permission request aborted'));
             };
             signal.addEventListener('abort', abortHandler, { once: true });
 
             // Store the pending request
-            const instanceSeq = this.nextInstanceSeq++;
             this.pendingRequests.set(id, {
                 resolve: (result: PermissionResult) => {
                     signal.removeEventListener('abort', abortHandler);
@@ -419,6 +437,9 @@ export class PermissionHandler implements PolicyApprover {
                 instanceSeq
             });
 
+            const createdAt = Date.now();
+            const wait = this.expiry.arm(id, { policy: Boolean(policy) }, () => this.expire(id, instanceSeq));
+
             // The binding is **not** recorded here. The turn this prompt belongs to has not been
             // stamped yet — the assistant message that opens it is the delayed one this callback
             // is about to release. `bindChannelPermission` is applied from the queue, after it.
@@ -427,6 +448,13 @@ export class PermissionHandler implements PolicyApprover {
             // refused as `unknown-request` rather than applied to a guessed turn.
             if (this.onPermissionRequestCallback) {
                 this.onPermissionRequestCallback(id, toolName, instanceSeq);
+            }
+
+            // This turn already spent its wait (Q6): declined without a card or a push. The callback
+            // above still ran — it releases the delayed message that carries the tool call.
+            if (wait.kind === 'decline-now') {
+                this.expire(id, instanceSeq, { tool: toolName, arguments: input, createdAt });
+                return;
             }
 
             // Send push notification
@@ -450,8 +478,9 @@ export class PermissionHandler implements PolicyApprover {
                     [id]: {
                         tool: toolName,
                         arguments: input,
-                        createdAt: Date.now(),
+                        createdAt,
                         ...(policy ? { policy } : {}),
+                        ...(wait.kind === 'timed' ? { expiresAt: wait.expiresAt } : {}),
                     }
                 }
             }));
@@ -460,6 +489,41 @@ export class PermissionHandler implements PolicyApprover {
         });
     }
 
+
+    /**
+     * Nobody answered in time (spec R10, Q2): decline this one prompt and let the turn go on.
+     *
+     * Not recorded in `responses`: a denial there reads as "the person stopped this tool", which
+     * ends the turn (`isAborted`). The reason tells the model what happened instead (T22).
+     * `raised` is given only when the prompt was never written to the agent state.
+     */
+    private expire(id: string, instanceSeq: number, raised?: { tool: string; arguments: unknown; createdAt: number }): void {
+        const pending = this.pendingRequests.get(id);
+        if (!pending || pending.instanceSeq !== instanceSeq) return;
+        this.pendingRequests.delete(id);
+        this.expiry.clear(id);
+        // The messenger's buttons go; its vocabulary has no `expired` (T23).
+        this.withdrawChannelBinding(id, 'aborted');
+        this.resolved.record(id, 'expired');
+        const reason = unattendedExpiryMessage();
+        pending.resolve({ behavior: 'deny', message: reason });
+        const completedAt = Date.now();
+        this.session.client.updateAgentState((currentState) => {
+            const request = currentState.requests?.[id] ?? raised;
+            if (!request) return currentState;
+            const requests = { ...currentState.requests };
+            delete requests[id];
+            return {
+                ...currentState,
+                requests,
+                completedRequests: {
+                    ...currentState.completedRequests,
+                    [id]: { ...request, completedAt, status: 'denied', reason, resolution: 'expired' },
+                },
+            };
+        });
+        logger.debug(`Permission request ${id} declined: nobody answered within the unattended wait`);
+    }
 
     /**
      * Parses Bash permission strings into literal and prefix sets
@@ -506,7 +570,7 @@ export class PermissionHandler implements PolicyApprover {
     /**
      * Resets all state for new sessions
      */
-    reset(reason: string = 'Session switched to local mode'): void {
+    reset(reason: string = 'Session switched to local mode', resolution: PermissionResolution = 'reset'): void {
         this.responses.clear();
         this.allowedTools.clear();
         this.allowedBashLiterals.clear();
@@ -520,8 +584,10 @@ export class PermissionHandler implements PolicyApprover {
         // launcher-scoped message queue, not to a query, and is registered once.
         this.setPermissionModeCallback = undefined;
 
+        this.expiry.clearAll();
         // Cancel all pending requests
-        for (const [, pending] of this.pendingRequests.entries()) {
+        for (const [id, pending] of this.pendingRequests.entries()) {
+            this.resolved.record(id, resolution);
             pending.reject(new Error('Session reset'));
         }
         this.pendingRequests.clear();
@@ -532,6 +598,7 @@ export class PermissionHandler implements PolicyApprover {
         }
 
         // Move all pending requests to completedRequests with canceled status
+        const completedAt = Date.now();
         this.session.client.updateAgentState((currentState) => {
             const pendingRequests = currentState.requests || {};
             const completedRequests = { ...currentState.completedRequests };
@@ -540,9 +607,10 @@ export class PermissionHandler implements PolicyApprover {
             for (const [id, request] of Object.entries(pendingRequests)) {
                 completedRequests[id] = {
                     ...request,
-                    completedAt: Date.now(),
+                    completedAt,
                     status: 'canceled',
-                    reason
+                    reason,
+                    resolution,
                 };
             }
 
@@ -636,6 +704,7 @@ export class PermissionHandler implements PolicyApprover {
      */
     private missingRequestAck(id: string): PermissionAck {
         logger.debug('Permission request not found or already resolved');
+        if (this.resolved.get(id) !== undefined) return this.resolved.ackFor(id);
         return this.responses.has(id)
             ? { applied: false, reason: 'already-answered' }
             : { applied: false, reason: 'unknown-request' };
@@ -687,11 +756,14 @@ export class PermissionHandler implements PolicyApprover {
     ): PermissionAck {
         this.responses.set(id, { ...message, receivedAt: Date.now() });
         this.pendingRequests.delete(id);
+        this.expiry.clear(id);
+        this.resolved.record(id, 'answered');
         // Answered here or in Desktop — either way the external button is dead now.
         this.withdrawChannelBinding(id, 'answered');
 
         this.handlePermissionResponse(message, pending);
 
+        const completedAt = Date.now();
         this.session.client.updateAgentState((currentState) => {
             const request = currentState.requests?.[id];
             if (!request) return currentState;
@@ -704,11 +776,12 @@ export class PermissionHandler implements PolicyApprover {
                     ...currentState.completedRequests,
                     [id]: {
                         ...request,
-                        completedAt: Date.now(),
+                        completedAt,
                         status: message.approved ? 'approved' : 'denied',
                         reason: message.reason,
                         mode: message.mode,
-                        allowTools: message.allowTools
+                        allowTools: message.allowTools,
+                        resolution: 'answered',
                     }
                 }
             };

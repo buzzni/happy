@@ -16,6 +16,7 @@ import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConf
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2, type PendingAttachment, type QueueLatencyTrace } from '@/utils/MessageQueue2';
+import { consumeDelegatedAttendance, delegatedAttendanceFor, initialPromptAttendance, inputAttendanceFromMeta, TurnAttendanceState } from '@/api/turnAttendance';
 import { hashObject } from '@/utils/deterministicJson';
 import { specialCommandResponse } from '@/claude/specialCommandResponse';
 import { getEnvironmentInfo } from '@/ui/doctor';
@@ -354,6 +355,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         forkedFromMessageId,
         createdBy: createdByAccountId ? { accountId: createdByAccountId, displayName: createdByDisplayName } : undefined,
         source,
+        approvalLifecycle: true,
     });
 
     // Resume-in-place must use the latest server document as its metadata
@@ -748,10 +750,16 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const lessonProposalTurn = createLessonProposalTurn();
     // Flipped by claudeRemote per turn from that turn's prompt blocks (specs/desktop-next-steps-card).
     const turnCards = createTurnCardSwitch('claude');
+    // Whether anyone can answer this run's prompts, turn by turn (codexcli-approval-session-binding
+    // R10a). One owner: the permission handler's unattended wait, the tool policy gate and the
+    // children this session delegates to all read it. A spawned child learns its parent's from env.
+    const delegatedAttendance = consumeDelegatedAttendance(process.env);
+    const turnAttendance = new TurnAttendanceState(exitAfterFirstTurn);
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
         agentControl: principal.kind === 'account' && sandboxPolicyMode !== 'mandatory',
         exitAfterFirstTurn,
+        delegatedAttendance: () => delegatedAttendanceFor(turnAttendance.current()),
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         mandatorySandbox: sandboxPolicyMode === 'mandatory',
         sameUidSandbox: Boolean(scopeLaunch),
@@ -780,7 +788,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             sessionId: () => session.sessionId,
             publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
             approver: () => currentSession?.policyApprover ?? null,
-            unattended: exitAfterFirstTurn,
+            unattended: () => turnAttendance.policyUnattended(),
             terminalPrompt: () => currentSession?.mode === 'local',
             grantTtlMs: REMOTE_GRANT_TTL_MS,
         })
@@ -1407,7 +1415,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // Whatever this flushed will never run, so its routing decisions are
             // dead. The floor never moved for them — they were only ever pending.
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1425,7 +1433,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             difficultyRoutingCommitter.requestEpoch();
             deferredContinuation.prepare(message.content.text);
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1638,6 +1646,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                     ? [routed.pending.clientRequestId]
                     : localDecision ? [localDecision.clientRequestId] : undefined,
                 latencyTrace,
+                inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
             );
             deferredTurn?.commit();
             if (routed) {
@@ -1698,6 +1707,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
             return;
         }
+        // A person writing lifts the running turn's unattended waits; automatic input does not (R10).
+        turnAttendance.inputArrived(inputAttendanceFromMeta(message.meta, session.getMetadata()?.source));
         currentSession?.cancelLessonReview();
         const attachmentsPromise = session.drainAttachmentsForUserMessage();
         if (!runtimeGate) return handleUserMessage({ message, attachmentsPromise });
@@ -1739,7 +1750,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                         mode.permissionMode,
                         allowAutomationReconnectPrompt,
                     ),
-                });
+                }, undefined, initialPromptAttendance(delegatedAttendance, source));
                 logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
             },
         },
@@ -2017,6 +2028,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     try {
         exitCode = await loop({
         scopeProcessSandbox,
+        turnAttendance,
         path: workingDirectory,
         ...(lessons ? { lessons } : {}),
         lessonProposalTurn,
@@ -2031,6 +2043,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: happyServer.toolNames.map(toolName => `mcp__happy__${toolName}`),
         onModeChange: (newMode) => {
             currentRunMode = newMode;
+            // A person took the session over at the terminal: nobody there is unattended (R10a).
+            if (newMode === 'local') turnAttendance.inputArrived('human');
             cuaHandOff?.newProviderGeneration();
             session.sendSessionEvent({ type: 'switch', mode: newMode });
             session.updateAgentState((currentState) => ({

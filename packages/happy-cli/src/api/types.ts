@@ -8,6 +8,7 @@ import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from
 import type { SandboxConfig } from '@/persistence'
 import type { SessionSource } from '@/utils/sessionSource'
 import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate'
+import type { PermissionResolution } from '@/utils/permissionResolution'
 import type { ToolPolicyAuditRecord } from '@/toolPolicy/audit'
 import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
@@ -387,6 +388,12 @@ export type Machine = {
  */
 export const MessageMetaSchema = z.object({
   sentFrom: z.string().optional(), // Source identifier
+  // aplus-dev-studio specs/codexcli-approval-session-binding R10a — who sent this turn. Declared so
+  // the strip-unknown parse keeps them for `inputAttendanceFromMeta`; `.catch` because a malformed
+  // value must degrade to "unknown" (a person, who is waited for), never drop the user's turn.
+  turnTrigger: z.string().optional().catch(undefined), // Desktop: user / schedule / autopilot / …
+  source: z.string().optional().catch(undefined), // daemon writers: autonomous-quality-gate / agent-browser / byos-offline
+  delegatedAttendance: z.enum(['unattended', 'attended']).optional().catch(undefined), // R12, from a delegating parent
   permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'read-only', 'safe-yolo', 'yolo']).optional(), // Permission mode for this message
   model: z.string().nullable().optional(), // Model name for this message (null = reset)
   // Whether `model` is a pin the user chose or a per-turn pick a client router
@@ -546,6 +553,12 @@ export type Metadata = {
   setupTokenRotation?: { version: 1; principalType: 'machine'; bindingVersion: 0 | 2 },
   runtimeCapabilities?: {
     saycodeSystemPromptPreference?: boolean,
+    /**
+     * aplus-dev-studio specs/codexcli-approval-session-binding R15 — this runtime records every
+     * resolution, declines unattended prompts after the wait and puts `expiresAt` on them. Absent:
+     * an older runtime (or an agent without the wait), which never expires anything.
+     */
+    approvalLifecycle?: 1,
   },
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound session-scope requests. */
   rpcBinding?: RpcBindingCapability,
@@ -663,6 +676,12 @@ export type AgentState = {
       createdAt: number,
       /** aplus-dev-studio specs/agent-tool-policy R11 — present only on a tool policy `ask`. */
       policy?: PermissionPolicyMeta
+      /**
+       * aplus-dev-studio specs/codexcli-approval-session-binding R13 — when an unattended wait is
+       * declined, on this process's clock. For display only: clients add `expiresAt - createdAt`
+       * to the moment they first saw the request rather than comparing clocks.
+       */
+      expiresAt?: number
     }
   }
   completedRequests?: {
@@ -677,6 +696,8 @@ export type AgentState = {
       mode?: PermissionMode,
       decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
       allowTools?: string[]
+      /** codexcli-approval-session-binding plan §3.4 — which path settled it. Older clients ignore it. */
+      resolution?: PermissionResolution
     }
   }
   agentGoalStatus?: AgentGoalStatus

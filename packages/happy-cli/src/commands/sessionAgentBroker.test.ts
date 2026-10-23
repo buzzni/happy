@@ -28,6 +28,21 @@ describe('trusted session agent execution', () => {
     expect(filterCredentialsFromEnv({ SAYCODE_AGENT_BROKER_CAPABILITY: 'session-only', GH_TOKEN: 'account-secret' }))
       .toEqual({ SAYCODE_AGENT_BROKER_CAPABILITY: 'session-only' })
   })
+  it('hands the bundled CLI this session\'s current turn attendance on every call, never an inherited one (R12)', async () => {
+    const root = await fixture(), entrypoint = join(root, 'cli.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,attendance:process.env.SAYCODE_DELEGATED_ATTENDANCE ?? null})}))`)
+    let attendance: 'unattended' | 'attended' | null = 'unattended'
+    const execute = createAgentHostExecutor({
+      sessionId: 'current', directory: root, env: { SAYCODE_DELEGATED_ATTENDANCE: 'unattended' }, entrypoint, delegatedAttendance: () => attendance,
+    })
+    const read = async () => JSON.parse((await execute(['spawn'], new AbortController().signal)).stdout).attendance
+    expect(await read()).toBe('unattended')
+    attendance = 'attended'
+    expect(await read()).toBe('attended')
+    // Unknown here: the inherited value is not passed on.
+    attendance = null
+    expect(await read()).toBeNull()
+  })
   it('rotates the contact on resume, clears it on close and honors the runtime admission gate', async () => {
     const env: NodeJS.ProcessEnv = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: process.cwd() }
     let admitted = 0

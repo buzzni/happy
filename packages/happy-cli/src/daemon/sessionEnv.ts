@@ -20,6 +20,7 @@ import {
 import { ADDITIONAL_DIRECTORIES_ENV, readAdditionalDirectoriesEnvironment } from '@/utils/additionalDirectoriesEnv'
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars'
 import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSource'
+import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
 import { sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
 
@@ -160,6 +161,16 @@ export function stripUnsafeRequestedEnvironment(requested: Record<string, string
  */
 const POC_BROWSER_TASK_REQUEST_KEYS = ['HAPPY_BROWSER_TASK_RUNTIME_URL', 'HAPPY_BROWSER_TASK_GRANT_FILE'] as const
 
+/**
+ * The delegating parent's attendance (aplus-dev-studio specs/codexcli-approval-session-binding R12)
+ * a `happy agent spawn` request carries for the child's first prompt. Only the two values pass;
+ * a forged one can only make the child decline sooner or wait, never approve.
+ */
+function readRequestedDelegatedAttendance(requested: Record<string, string>): Record<string, string> {
+    const value = Object.hasOwn(requested, DELEGATED_ATTENDANCE_ENV) ? parseDelegatedAttendance(requested[DELEGATED_ATTENDANCE_ENV]) : null
+    return value ? { [DELEGATED_ATTENDANCE_ENV]: value } : {}
+}
+
 /** Keeps request-supplied project env from impersonating daemon-owned session state. */
 export function buildSpawnRequestEnvironment(
     auth: Record<string, string>,
@@ -174,6 +185,7 @@ export function buildSpawnRequestEnvironment(
         ...poc,
         // The agent grant is re-admitted only after its own validation (paths and counts).
         ...readRequestedSaycodeAgentGrant(requested ?? {}),
+        ...readRequestedDelegatedAttendance(requested ?? {}),
         ...auth,
     }
 }

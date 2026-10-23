@@ -223,6 +223,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    // The unattended wait reads this run's turn attendance (codexcli-approval-session-binding R10).
+    permissionHandler.setAttendance(session.turnAttendance);
     session.policyApprover = permissionHandler;
     let mcpStatusReader: Pick<McpRuntimeRecovery, 'readStatuses'> | null = null;
     let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
@@ -241,7 +243,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // previous process is gone and the new one has no record of the id.
     // reset() moves any stale entries to completedRequests with status
     // 'canceled' so the UI reflects what actually happened.
-    permissionHandler.reset('Previous CLI process exited before responding');
+    permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
 
     // Token-level preview frames ride a separate volatile channel and never
     // enter the persisted message queue below.
@@ -627,6 +629,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             latencyTraces: QueueLatencyTrace[];
             /** Carried through the deferral so an isolated channel turn keeps its handle. */
             channelRequestId?: string;
+            /** Carried through the deferral so the turn is classified by its own inputs (R10a). */
+            allUnattended?: boolean;
         } | null = null;
         /*
          * Queue time ends when a generation takes the batch. A batch held back
@@ -677,7 +681,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (session.managedRun) registerManagedGracefulStop(gracefulStop);
         drain?.attachLauncher({
             requestEndInput: () => { gracefulStop?.request(); },
-            cancelPendingPermissions: () => { permissionHandler.reset('Session is shutting down'); },
+            cancelPendingPermissions: () => { permissionHandler.reset('Session is shutting down', 'shutdown'); },
             generation: () => startedGeneration()?.observer ?? null,
             hasHeldBackInput: () => pending !== null,
             lastResultInterrupted: () => lastResultInterrupted,
@@ -716,7 +720,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const isNewSession = session.sessionId !== previousSessionId;
             if (isNewSession) {
                 messageBuffer.addMessage('Starting new Claude session...', 'status');
-                permissionHandler.reset(); // Reset permissions before starting new session
+                permissionHandler.reset(undefined, 'reset'); // Reset permissions before starting new session
                 sdkToLogConverter.resetParentChain(); // Reset parent chain for new conversation
                 logger.debug(`[remote]: New session detected (previous: ${previousSessionId}, current: ${session.sessionId})`);
             } else {
@@ -829,7 +833,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (providerStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
-                            if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                            if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
+                                session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
+                            }
                             continuation = null;
                         }
                         if (pending) {
@@ -841,6 +847,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
                             messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
+                            session.turnAttendance?.startTurn({ allUnattended: p.allUnattended, channel: p.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(p.channelRequestId);
                             lastTurnCommand = isCommandText(p.message);
                             transientRetry.userTurnStarted();
@@ -933,7 +940,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 if (providerStale()) return null;
                                 if (!providerRunning && continuation) {
-                                    if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                                    if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
+                                        session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
+                                    }
                                     continuation = null;
                                 }
                                 continue;
@@ -951,6 +960,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             messageQueue.enqueue(pendingRequestItem(null));
                             lastTurnChannel = false;
                             lastTurnCommand = false;
+                            // The failed turn again keeps its attendance and its spent wait budget (R10a, Q6).
                             // The failed turn's own settings, unchanged — no provider restart.
                             mode = due.mode.mode;
                             modeHash = due.mode.hash ?? modeHash;
@@ -1014,6 +1024,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // A batch with no channel message clears it, so an in-app turn never
                             // inherits an id.
                             messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
+                            session.turnAttendance?.startTurn({ allUnattended: msg.allUnattended, channel: msg.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(msg.channelRequestId);
                             lastTurnCommand = isCommandText(msg.message);
                             permissionHandler.handleModeChange(mode.permissionMode);
@@ -1300,7 +1311,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 // This generation is gone; no turn of it can still be running.
                 drain?.setQuery(null);
                 drain?.turnEnded();
-                permissionHandler.reset();
+                permissionHandler.reset(undefined, 'generation-ended');
                 modeHash = null;
                 mode = null;
             }
@@ -1359,7 +1370,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
         // Clean up permission handler
         session.policyApprover = null;
-        permissionHandler.reset();
+        permissionHandler.reset(undefined, 'shutdown');
+        permissionHandler.setAttendance(null);
 
         // Reset Terminal
         const t0 = Date.now();

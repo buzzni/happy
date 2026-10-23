@@ -63,7 +63,7 @@ async function runWithPolicy(approver: PolicyApprover | null, prompt: string, ho
         grants: createPolicyGrantStore(),
         audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => null }),
         approver: () => approver,
-        unattended: false,
+        unattended: () => false,
     });
     server = await startHookServer({
         onSessionHook: () => undefined,
@@ -152,7 +152,7 @@ describe('cua-driver shadow proxy with the real Claude CLI', () => {
             grants: createPolicyGrantStore(),
             audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => null }),
             approver: () => ({ requestPolicyApproval: async (request) => { asked.push(request.toolName); return { approved: false, policyGrant: 'once' }; } }),
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         }), { terminalPrompt: () => false });
         server = await startHookServer({

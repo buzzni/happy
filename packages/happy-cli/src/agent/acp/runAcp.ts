@@ -14,6 +14,7 @@ import { hashObject } from '@/utils/deterministicJson';
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata } from '@/daemon/run';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
+import { consumeDelegatedAttendance, inputAttendanceFromMeta, TurnAttendanceState } from '@/api/turnAttendance';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -517,6 +518,7 @@ export async function runAcp(opts: {
     sandbox: settings.sandboxConfig,
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     source,
+    approvalLifecycle: true,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
   if (response) {
@@ -563,10 +565,16 @@ export async function runAcp(opts: {
   }
 
   permissionHandler = new GenericAcpPermissionHandler(session, opts.agentName);
+  // Whether anyone can answer this session's prompts, turn by turn (codexcli-approval-session-binding
+  // R10a). ACP has no run-once mode and no first prompt from env, so a delegating parent's value
+  // (R12) is only removed here, never left for the agent's own shells to pass on.
+  consumeDelegatedAttendance(process.env);
+  const turnAttendance = new TurnAttendanceState();
+  permissionHandler.setAttendance(turnAttendance);
   // Drop any permission requests left in agent state from a previous CLI
   // process that died while a tool prompt was open — see the matching
   // call in claudeRemoteLauncher for the full rationale.
-  permissionHandler.reset('Previous CLI process exited before responding');
+  permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
   const sessionManager = new AcpSessionManager();
   const messageQueue = new MessageQueue2<AcpSwitchMode>((mode) => hashObject(mode));
   let currentPermissionMode: string | undefined;
@@ -954,7 +962,7 @@ export async function runAcp(opts: {
     runtimeGate = gate;
     launchControl.bind(createAcpDrainProvider({
       ready: () => acpSessionId !== null && !loopDone,
-      freezeInput: () => { permissionHandler.reset('Session is shutting down'); },
+      freezeInput: () => { permissionHandler.reset('Session is shutting down', 'shutdown'); },
       activeTurn: () => {
         const sessionToCancel = acpSessionId;
         return pendingTurn && sessionToCancel ? { interrupt: () => backend.cancel(sessionToCancel) } : null;
@@ -991,12 +999,15 @@ export async function runAcp(opts: {
       logger.debug(`[${opts.agentName}] Requested ACP model: ${currentModel ?? 'null'}`);
     }
 
+    const attendance = inputAttendanceFromMeta(message.meta, session.getMetadata()?.source);
+    // A person writing lifts the running turn's unattended waits; automatic input does not (R10).
+    turnAttendance.inputArrived(attendance);
     const deferredTurn = deferredContinuation.prepare(message.content.text);
     try {
       messageQueue.push(deferredTurn?.text ?? message.content.text, {
         permissionMode: currentPermissionMode,
         model: currentModel,
-      });
+      }, undefined, undefined, undefined, attendance);
       deferredTurn?.commit();
     } catch (error) {
       deferredTurn?.rollback();
@@ -1014,7 +1025,7 @@ export async function runAcp(opts: {
       if (acpSessionId) {
         await backend.cancel(acpSessionId);
       }
-      permissionHandler.reset();
+      permissionHandler.reset('Aborted by user', 'aborted');
       abortController.abort();
     } catch (error) {
       logger.debug(`[${opts.agentName}] Abort failed:`, error);
@@ -1107,6 +1118,8 @@ export async function runAcp(opts: {
       }
 
       logAcp('incoming', `Incoming prompt: ${formatUnknownForConsole(batch.message, ACP_EVENT_PREVIEW_CHARS)}`);
+      // The batch that becomes the running turn decides its attendance by its own inputs (R10a).
+      turnAttendance.startTurn({ allUnattended: batch.allUnattended, channel: false });
       sendEnvelopes(sessionManager.startTurn());
       const turnEnded = waitForTurnEnd();
       try {
@@ -1140,7 +1153,7 @@ export async function runAcp(opts: {
     clearPendingTurn(new Error('ACP runner shutting down'));
 
     try {
-      permissionHandler.reset();
+      permissionHandler.reset('Session shutting down', 'shutdown');
     } catch (error) {
       logger.debug(`[${opts.agentName}] Failed to reset permission handler:`, error);
     }
