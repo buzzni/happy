@@ -4078,6 +4078,7 @@ export class ApiMachineClient {
                     sessionId,
                     output: entry?.output ?? null,
                     exit: entry?.exit,
+                    closeReason: entry?.closeReason,
                     afterSeq,
                     maxChars,
                     seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),

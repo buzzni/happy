@@ -59,6 +59,12 @@ describe('replyToTerminalResume', () => {
         expect(sent).toEqual([['terminal-closed', { sessionId: 's1', code: 0, signal: 15 }]])
     })
 
+    it('says the daemon restart ended it when the exit rides a resume answer (R23)', () => {
+        const { sent } = reply({ output: bufferWith('a'), exit: { code: 0, signal: 1 }, closeReason: 'daemon-restart', afterSeq: 1 })
+
+        expect(sent).toEqual([['terminal-closed', { sessionId: 's1', code: 0, signal: 1, reason: 'daemon-restart' }]])
+    })
+
     it('reads a missing or nonsense afterSeq as "seen nothing"', () => {
         const { sent } = reply({ output: bufferWith('a'), afterSeq: 'x' })
 

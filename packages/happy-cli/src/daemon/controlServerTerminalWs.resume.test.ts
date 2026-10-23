@@ -18,7 +18,12 @@ import { randomUUID } from 'node:crypto'
 import { WebSocket, type RawData } from 'ws'
 import { attachTerminalWsRoute, type TerminalWsRoute } from './controlServerTerminalWs'
 import { encrypt, decrypt, encodeBase64, decodeBase64, getRandomBytes } from '@/api/encryption'
-import { getDaemonTerminalSession, getDaemonTerminalSessionCount, _resetDaemonTerminalSessionsForTest } from './daemonTerminalSessions'
+import {
+  closeAllDaemonTerminalSessionsForRestart,
+  getDaemonTerminalSession,
+  getDaemonTerminalSessionCount,
+  _resetDaemonTerminalSessionsForTest,
+} from './daemonTerminalSessions'
 
 const GRACE_MS = 1_500
 const SECRET = 'test-control-secret'
@@ -258,6 +263,50 @@ describe('/terminal WS reattach and replay (B2a)', () => {
     expect(lastPageAt).toBeGreaterThan(-1)
     expect(closedAt).toBeGreaterThan(lastPageAt)
     expect(pushes(client, 'terminal-closed')[0]).toMatchObject({ code: 5 })
+    client.ws.close()
+  })
+
+  /*
+   * Both rules at once: a daemon restart (aplus codexcli-daemon-restart-drain R23)
+   * closes the terminal while the client is still pulling a paged replay
+   * (codexcli-daemon-stream-durability B3.1). The close still waits for the last
+   * page, and still says it was the restart that ended the terminal.
+   */
+  it('holds a restart close until the last page and says the restart ended it', async () => {
+    const client = await connect()
+    const { data: { sessionId } } = await openTerminal(client, "process.stdout.write('x'.repeat(30000)); setInterval(() => {}, 1000)")
+    await waitFor(() => frames(client).reduce((n, f) => n + open(f.data).length, 0) >= 30_000, 5_000)
+    const before = client.inbox.length
+    client.ws.send(JSON.stringify({ event: 'terminal-resume', data: { sessionId, afterSeq: 0, maxChars: 4_096 } }))
+    await waitFor(() => client.inbox.slice(before).some((m) => m.data?.more === true), 3_000)
+
+    await expect(closeAllDaemonTerminalSessionsForRestart()).resolves.toBe(1)
+    await sleep(300)
+    expect(pushes(client, 'terminal-closed')).toEqual([])
+
+    for (let guard = 0; guard < 50 && pushes(client, 'terminal-closed').length === 0; guard++) {
+      const ends = client.inbox.slice(before).filter((m) => m.data?.more !== undefined)
+      const last = ends[ends.length - 1].data
+      client.ws.send(JSON.stringify({ event: 'terminal-resume', data: { sessionId, afterSeq: last.nextSeq, maxChars: 4_096 } }))
+      await sleep(50)
+    }
+    const closedAt = client.inbox.findIndex((m) => m.data?.event === 'terminal-closed')
+    const lastPageAt = client.inbox.map((m) => m.data?.more).lastIndexOf(false)
+    expect(lastPageAt).toBeGreaterThan(-1)
+    expect(closedAt).toBeGreaterThan(lastPageAt)
+    expect(pushes(client, 'terminal-closed')).toHaveLength(1)
+    expect(pushes(client, 'terminal-closed')[0]).toMatchObject({ sessionId, reason: 'daemon-restart' })
+    client.ws.close()
+  })
+
+  /** Nobody is replaying: the restart close goes out at once, with its reason. */
+  it('tells an attached client at once that the restart closed its terminal', async () => {
+    const client = await connect()
+    const { data: { sessionId } } = await openTerminal(client, TICKER)
+    await waitFor(() => frames(client).length >= 2, 5_000)
+    await expect(closeAllDaemonTerminalSessionsForRestart()).resolves.toBe(1)
+    await waitFor(() => pushes(client, 'terminal-closed').length > 0, 3_000)
+    expect(pushes(client, 'terminal-closed')[0]).toMatchObject({ sessionId, reason: 'daemon-restart' })
     client.ws.close()
   })
 

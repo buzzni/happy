@@ -185,7 +185,8 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
   const sendClosed = (terminal: DirectTerminal) => {
     const exit = exitOf(terminal);
     if (!exit) return;
-    sendOn(terminal.ws, { data: { event: 'terminal-closed', sessionId: terminal.sessionId, code: exit.code, signal: exit.signal } });
+    const reason = terminal.entry.closeReason;
+    sendOn(terminal.ws, { data: { event: 'terminal-closed', sessionId: terminal.sessionId, code: exit.code, signal: exit.signal, ...(reason ? { reason } : {}) } });
     forget(terminal);
   };
 
@@ -360,7 +361,12 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           outputCoalescer.dispose();
           // Kept in the registry, like a relay terminal, so a re-attaching
           // client resumes into the last output and this exit (D4 B-R2).
-          markDaemonTerminalSessionExited(sessionId, { code, signal });
+          if (!markDaemonTerminalSessionExited(sessionId, { code, signal })) {
+            // A restart close (aplus codexcli-daemon-restart-drain R23) already took it
+            // out of the registry; this terminal still answers its client's replay and
+            // must say it ended.
+            entry.exit = { code, signal };
+          }
           // Audit every end, however it came about (exit, close, grace expiry, shutdown).
           logger.debug(
             `[LOCAL-DIRECT-TERMINAL] close session=${sessionId} user=${entry.userId} exitCode=${code} signal=${signal ?? 'null'} ` +
@@ -437,6 +443,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
             sessionId: terminal.sessionId,
             output: terminal.entry.output,
             exit: exitOf(terminal),
+            closeReason: terminal.entry.closeReason,
             afterSeq: data.afterSeq,
             maxChars: data.maxChars,
             seal: (chunk) => encodeBase64(encrypt(machineEncryption.encryptionKey, machineEncryption.encryptionVariant, chunk)),

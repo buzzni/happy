@@ -114,6 +114,8 @@ export interface TerminalResumeReplyInput {
     output: TerminalOutputBuffer | null
     /** Set once the PTY has exited; the exit goes out after the output left. */
     exit?: TerminalExit | null
+    /** Why the daemon ended it, carried on the exit (aplus codexcli-daemon-restart-drain R23). */
+    closeReason?: 'daemon-restart'
     afterSeq: unknown
     maxChars?: unknown
     /** Seals one plaintext chunk for the wire. May throw; the caller reports it. */
@@ -185,7 +187,8 @@ export function replyToTerminalResume(input: TerminalResumeReplyInput): Terminal
     else if (paged) pagedCursors.delete(output)
 
     if (exit) {
-        const sendClosed = () => emit('terminal-closed', { sessionId, code: exit.code, signal: exit.signal })
+        const reason = input.closeReason
+        const sendClosed = () => emit('terminal-closed', { sessionId, code: exit.code, signal: exit.signal, ...(reason ? { reason } : {}) })
         if (pagesLeft) {
             // Held behind the pages still to come; goes out anyway if the client stops asking.
             holdExit(output, sendClosed, PAGED_RESUME_STALE_MS)
