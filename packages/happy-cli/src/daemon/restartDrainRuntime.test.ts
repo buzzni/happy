@@ -79,8 +79,8 @@ describe('daemon restart drain runtime', () => {
             expect(await h.runtime.heartbeat(true)).toBe('hold-automations')
             expect(h.runtime.lifecycle()).toMatchObject({ state: 'draining', reason: 'bundle-replaced', inTurnCount: 1, deadlineAt: expect.any(Number) })
             h.advance(120_000)
-            await flush()
-            expect(h.spies.handOff).toHaveBeenCalledTimes(1)
+            // The drain's 5 ms tick timer reaches the deadline; wait for it rather than a fixed delay (CI load).
+            await vi.waitFor(() => expect(h.spies.handOff).toHaveBeenCalledTimes(1))
             expect(h.ledger()).toEqual([expect.objectContaining({ trigger: 'handoff-cap', outcome: 'deadline', inTurnCountAtDeadline: 1, sessionsAfter: 'kept' })])
         })
 
@@ -150,8 +150,7 @@ describe('daemon restart drain runtime', () => {
             h.runtime.controlPort.begin({ reason: 'account-switch', intent: 'stop', trigger: 'request', leaseSeconds: 1 })
             expect(h.admission.closed).toBe(true)
             h.advance(1_001)
-            await flush()
-            expect(h.admission.closed).toBe(false)
+            await vi.waitFor(() => expect(h.admission.closed).toBe(false))
             expect(h.ledger()).toEqual([expect.objectContaining({ outcome: 'cancelled', reason: 'account-switch', intent: 'stop' })])
             expect(h.spies.log).toHaveBeenCalledWith(expect.stringContaining('drain-abandoned'))
         })
@@ -161,8 +160,7 @@ describe('daemon restart drain runtime', () => {
             h.runtime.controlPort.begin({ reason: 'user-restart', intent: 'restart', trigger: 'request', leaseSeconds: 1 })
             h.advance(1_001)
             h.setActivity({ inTurnCount: 0 })
-            await flush()
-            expect(h.calls).toEqual(['close-admission', 'preflight', 'close-terminals', 'hand-off'])
+            await vi.waitFor(() => expect(h.calls).toEqual(['close-admission', 'preflight', 'close-terminals', 'hand-off']))
         })
 
         it('a ready drain called off afterwards closes no terminal and records one cancelled line', async () => {
@@ -170,9 +168,8 @@ describe('daemon restart drain runtime', () => {
             const begun = h.runtime.controlPort.begin({ reason: 'user-restart', intent: 'restart', trigger: 'request', leaseSeconds: 1 })
             expect(begun.ok && begun.view.state).toBe('ready')
             h.advance(1_001)
-            await flush()
+            await vi.waitFor(() => expect(h.admission.closed).toBe(false))
             expect(h.spies.closeTerminalsForRestart).not.toHaveBeenCalled()
-            expect(h.admission.closed).toBe(false)
             expect(h.ledger()).toEqual([expect.objectContaining({ outcome: 'cancelled' })])
         })
 
