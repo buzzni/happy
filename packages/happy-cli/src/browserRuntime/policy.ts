@@ -212,7 +212,8 @@ function isWebUrl(url: string | undefined): boolean {
  * need approval; plain fills, form-state selections, links and navigation do not. Submit approval binds
  * the complete form digest, including the previously filled values.
  */
-export function classifySiteAction(sites: SitePolicy[], step: BatchStep, element?: ElementDescription): SiteDecision {
+export function classifySiteAction(sites: SitePolicy[], step: BatchStep, element?: ElementDescription,
+    autoOrigins: readonly string[] = []): SiteDecision {
     const kind = siteActionKind(step, element)
     if (!kind) return 'auto'
     const target = kind === 'navigate' ? step.url
@@ -236,7 +237,22 @@ export function classifySiteAction(sites: SitePolicy[], step: BatchStep, element
         && (!match.namePrefixes || match.namePrefixes.some((prefix) => name.startsWith(prefix.toLowerCase())))
         && (!match.roles || match.roles.some((candidate) => candidate.toLowerCase() === role)))
     if (rule) return rule.risk
+    // Site rules above always win. Auto grants only a bounded, live DOM interpretation,
+    // never arbitrary buttons, form actions, or a label supplied as an agent argument.
+    if (kind === 'click' && element && autoOrigins.includes(element.frameOrigin)
+        && autoOrigins.includes(originOf(element.pageUrl)) && isLocalUiInteraction(element)) return 'auto'
     return WRITE_CAPABLE.has(kind) ? 'requires-approval' : 'auto'
+}
+
+/** Conservative Auto vocabulary: unknown actions and anything potentially effectful stay human. */
+function isLocalUiInteraction(element: ElementDescription): boolean {
+    if (!element.uiAction || element.form || element.formAction || element.linkUrl || element.submitsForm) return false
+    const name = (element.currentName ?? element.name).trim()
+    if (!name || name.length > 120) return false
+    const context = `${name} ${element.pageUrl}`.toLowerCase()
+    if (/send|submit|publish|upload|delete|remove|erase|pay|purchase|checkout|transfer|permission|sharing|security|password|consent|agree|save|post|reply|confirm|approve|accept|apply|order|merge|전송|보내|제출|게시|업로드|삭제|제거|결제|구매|송금|권한|공유|보안|비밀번호|동의|저장|답글|확인|승인|수락|주문|병합/.test(context)) return false
+    const role = element.currentRole ?? element.role
+    return element.uiAction === 'tab' ? role === 'tab' : role === 'button'
 }
 
 /**

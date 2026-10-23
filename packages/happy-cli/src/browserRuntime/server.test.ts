@@ -106,6 +106,16 @@ describe('runtime HTTP server', () => {
         expect(calls).toHaveLength(0)
     })
 
+    it('accepts scoped Auto mode without an approval decision and rejects mixed or unbound requests', async () => {
+        const { base, calls } = await start()
+        const mode = { taskId: 't1', requestId: 'mode', mode: 'auto', origins: ['https://fixture.test'], runtimeId: 'runtime' }
+        expect((await post(base, 'approve', mode)).status).toBe(200)
+        expect(calls[0]).toMatchObject({ op: 'approve', req: mode })
+        expect((await post(base, 'approve', { ...mode, decision: 'approve', approvalId: 'a', bindingHash: 'b' })).status).toBe(400)
+        const { runtimeId: _, ...unbound } = mode
+        expect((await post(base, 'approve', unbound)).status).toBe(400)
+    })
+
     it('passes the verified auth context and request to the api', async () => {
         const { base, calls } = await start()
         const res = await post(base, 'getTask', { taskId: 't1' })

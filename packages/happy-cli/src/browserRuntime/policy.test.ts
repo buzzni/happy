@@ -242,3 +242,30 @@ describe('any-origin site policy ("*", chosen explicitly at install)', () => {
     })
 })
 
+
+
+describe('task Auto classification', () => {
+    const sites: SitePolicy[] = [{ origin: 'https://fixture.test', actions: [] }]
+    const element: ElementDescription = { ref: '@e1' as never, role: 'button', name: 'Show filters', currentRole: 'button',
+        currentName: 'Show filters', frameOrigin: 'https://fixture.test', pageUrl: 'https://fixture.test/start',
+        formValues: {}, documentGeneration: 1, identity: 'ui', uiAction: 'disclosure' }
+    const scope = ['https://fixture.test']
+    it('only adds automatic local UI controls in the exact consented origin', () => {
+        expect(classifySiteAction(sites, step, element)).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, element, scope)).toBe('auto')
+        expect(classifySiteAction(sites, step, element, ['*'])).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, { ...element, uiAction: undefined }, scope)).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, { ...element, role: 'tab', currentRole: 'tab', uiAction: 'tab' }, scope)).toBe('auto')
+        expect(classifySiteAction(sites, step, { ...element, frameOrigin: 'https://other.test' }, scope)).toBe('requires-approval')
+    })
+    it.each(['Send', 'Delete', 'Upload', 'Pay', 'Share permissions', 'Save', 'Reply', 'Confirm', 'Approve', 'Accept', 'Apply', 'Order', 'Merge', 'Post', '저장', '답글', '승인', '수락', '주문', '병합', 'Change password', 'Accept agreement', '전송', '삭제', '결제', '공유', '보안 설정'])(
+        'never interprets %s as a harmless disclosure', name => {
+            expect(classifySiteAction(sites, step, { ...element, currentName: name }, scope)).toBe('requires-approval')
+        })
+    it('keeps explicit site approval rules, forms, sensitive context and unlabeled controls', () => {
+        expect(classifySiteAction([{ origin: scope[0], actions: [{ match: { kinds: ['click'] }, risk: 'requires-approval' }] }], step, element, scope)).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, { ...element, formAction: scope[0] + '/search' }, scope)).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, { ...element, pageUrl: scope[0] + '/security' }, scope)).toBe('requires-approval')
+        expect(classifySiteAction(sites, step, { ...element, name: '', currentName: '' }, scope)).toBe('requires-approval')
+    })
+})
