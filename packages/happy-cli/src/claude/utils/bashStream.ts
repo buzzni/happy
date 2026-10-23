@@ -3,7 +3,7 @@
  *
  * Spawns a single `bash -c <command>` subprocess and forwards its stdout/
  * stderr line-by-line to the caller via an onProgress callback while still
- * collecting an aggregate output for the eventual MCP tool result. The
+ * collecting a bounded aggregate (bashStreamOutput) for the eventual MCP tool result. The
  * caller (the in-process Happy MCP HTTP handler) feeds those progress
  * batches through `AcpSessionManager.emitProgress(...)` so the daemon can
  * publish `tool-call-progress` envelopes addressed to the live tool call.
@@ -15,6 +15,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { sanitizeChildEnv } from '@/utils/childEnv';
+import { StreamCapture, type BashStreamSpillCall } from './bashStreamOutput';
 
 const FLUSH_INTERVAL_MS = 200;
 const FLUSH_LINE_BATCH = 32;
@@ -33,12 +34,17 @@ export interface RunBashStreamInput {
   detached?: boolean;
   onSpawn?: (child: ChildProcess) => void;
   onProgress: (progress: BashStreamProgress) => void;
+  /** Where a stream too large to keep in memory spills its full output (B-R6). */
+  spill?: BashStreamSpillCall;
 }
 
 export interface RunBashStreamResult {
   exitCode: number;
+  /** Whole stream while it stayed in memory; past that only its head and tail (see `captures`). */
   stdout: string;
   stderr: string;
+  /** Bounded captures the tool result is rendered from (bashStreamOutput). */
+  captures: { stdout: StreamCapture; stderr: StreamCapture };
 }
 
 class StreamLineBuffer {
@@ -94,7 +100,7 @@ function capLine(text: string): string {
 }
 
 export async function runBashStream(input: RunBashStreamInput): Promise<RunBashStreamResult> {
-  const { command, cwd, env, detached = false, onSpawn, onProgress } = input;
+  const { command, cwd, env, detached = false, onSpawn, onProgress, spill } = input;
   return new Promise<RunBashStreamResult>((resolve, reject) => {
     const child = spawn('bash', ['-c', command], {
       cwd,
@@ -104,35 +110,41 @@ export async function runBashStream(input: RunBashStreamInput): Promise<RunBashS
     });
     onSpawn?.(child);
 
-    let stdoutAggregate = '';
-    let stderrAggregate = '';
+    // Bounded aggregates: large streams keep only their edges in memory.
+    const stdoutCapture = new StreamCapture('stdout', spill);
+    const stderrCapture = new StreamCapture('stderr', spill);
     const stdoutBuf = new StreamLineBuffer('stdout', onProgress);
     const stderrBuf = new StreamLineBuffer('stderr', onProgress);
 
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => {
-      stdoutAggregate += chunk;
+      stdoutCapture.push(chunk);
       stdoutBuf.push(chunk);
     });
     child.stderr?.on('data', (chunk: string) => {
-      stderrAggregate += chunk;
+      stderrCapture.push(chunk);
       stderrBuf.push(chunk);
     });
 
     child.on('error', (err) => {
       stdoutBuf.close();
       stderrBuf.close();
+      stdoutCapture.finish();
+      stderrCapture.finish();
       reject(err);
     });
 
     child.on('close', (code) => {
       stdoutBuf.close();
       stderrBuf.close();
+      stdoutCapture.finish();
+      stderrCapture.finish();
       resolve({
         exitCode: code ?? -1,
-        stdout: stdoutAggregate,
-        stderr: stderrAggregate,
+        stdout: stdoutCapture.text,
+        stderr: stderrCapture.text,
+        captures: { stdout: stdoutCapture, stderr: stderrCapture },
       });
     });
   });

@@ -4,8 +4,11 @@
 // complex cases fall through to Claude's built-in Bash.
 
 import { describe, expect, it } from 'vitest';
-import { realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runBashStream, type BashStreamProgress } from './bashStream';
+import { BASH_STREAM_RESULT_MAX_CHARS, BashStreamSpillStore, renderBashStreamResult } from './bashStreamOutput';
 
 describe('runBashStream', () => {
   it('runs the agent command with the session scope but not lineage or spawn seeds (utils/childEnv)', async () => {
@@ -89,5 +92,32 @@ describe('runBashStream', () => {
     // The complete line goes through; the partial trailing fragment is
     // delivered as the final (close-driven) flush, so it shows up too.
     expect(lines).toEqual(['complete', 'incomplete']);
+  });
+
+  it('bounds a 2,000,000-char single line while progress lines keep their 4,096 cap', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bash-stream-spill-'));
+    const store = new BashStreamSpillStore({ root, sessionId: 'run' });
+    const call = store.beginCall();
+    try {
+      const progress: BashStreamProgress[] = [];
+      const result = await runBashStream({
+        command: "head -c 2000000 /dev/zero | tr '\\0' a; printf 'END'; echo oops 1>&2; exit 3",
+        spill: call,
+        onProgress: (p) => progress.push(p),
+      });
+      expect(result.exitCode).toBe(3);
+      expect(result.stderr).toBe('oops\n');
+      const text = renderBashStreamResult(result.exitCode, result.captures!.stdout, result.captures!.stderr);
+      call.end();
+      expect(text.length).toBeLessThanOrEqual(BASH_STREAM_RESULT_MAX_CHARS);
+      expect(text.endsWith('aaaEND\n--- stderr ---\noops\n\n[exit 3]')).toBe(true);
+      const path = /전체 출력: (\S+) …/.exec(text)![1];
+      expect(readFileSync(path, 'utf8')).toBe('a'.repeat(2_000_000) + 'END');
+      const lines = progress.filter((p) => p.stream === 'stdout').flatMap((p) => p.lines);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].length).toBe(4096);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

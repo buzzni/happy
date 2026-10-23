@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import { ApiMachineClient } from './apiMachine';
-import { addDaemonTerminalSession, getDaemonTerminalSession, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
+import { addDaemonTerminalSession, getDaemonTerminalSession, markDaemonTerminalSessionExited, removeDaemonTerminalSession } from '@/daemon/daemonTerminalSessions';
 import { deriveServerRpcKey, decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { logger } from '@/ui/logger';
@@ -419,11 +419,56 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(emitsOf('terminal-frame-gap')).toEqual([{ sessionId: 'resume-1', fromSeq: 1 }]);
         });
 
-        it('ignores a resume for a session this daemon does not have', () => {
+        /*
+         * Codex CLI benchmark D4 B-R2 — silence here left a client that came
+         * back after its terminal was gone waiting forever. The existing
+         * closed event is the answer, so even an old client shows "ended".
+         */
+        it('answers a resume for a session this daemon does not have with unknown-session', () => {
             openRegisteredSession(['one']);
             emitSocketEvent('terminal-resume-fwd', { sessionId: 'no-such-session', afterSeq: 0 });
 
-            expect(mockSocket.emit).not.toHaveBeenCalled();
+            expect(mockSocket.emit.mock.calls).toEqual([
+                ['terminal-closed', { sessionId: 'no-such-session', reason: 'unknown-session' }],
+            ]);
+        });
+
+        it('replays what is left and then re-sends the exit of a terminal that ended while detached', () => {
+            const { entry } = openRegisteredSession(['one', 'two']);
+            markDaemonTerminalSessionExited('resume-1', { code: 3, signal: null });
+
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 1 });
+
+            expect(mockSocket.emit.mock.calls.map(([name, payload]: [string, any]) => [name, payload.seq ?? payload.code]))
+                .toEqual([['terminal-frame', 2], ['terminal-closed', 3]]);
+            expect(emitsOf('terminal-closed')).toEqual([{ sessionId: 'resume-1', code: 3, signal: null }]);
+            expect(entry.output.lastSeq()).toBe(2);
+        });
+
+        it('re-sends the exit even to a client that already has every frame', () => {
+            openRegisteredSession(['one']);
+            markDaemonTerminalSessionExited('resume-1', { code: 0, signal: 15 });
+
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 1 });
+
+            expect(mockSocket.emit.mock.calls).toEqual([
+                ['terminal-closed', { sessionId: 'resume-1', code: 0, signal: 15 }],
+            ]);
+        });
+
+        it('does not write input or resize into a terminal that already ended', () => {
+            const { entry } = openRegisteredSession(['one']);
+            markDaemonTerminalSessionExited('resume-1', { code: 0, signal: null });
+            const machine = makeMachine();
+
+            emitSocketEvent('terminal-frame-fwd', {
+                sessionId: 'resume-1',
+                data: encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, 'ls\n')),
+            });
+            emitSocketEvent('terminal-resize-fwd', { sessionId: 'resume-1', cols: 100, rows: 30 });
+
+            expect(entry.session.write).not.toHaveBeenCalled();
+            expect(entry.session.resize).not.toHaveBeenCalled();
         });
 
         it('treats a missing or nonsense afterSeq as "I have seen nothing"', () => {
@@ -509,6 +554,48 @@ describe('ApiMachineClient socket reconnection', () => {
             const entry = getDaemonTerminalSession(sessionId)!;
             expect(entry.output.lastSeq()).toBe(1);
             expect(entry.output.bufferedChars()).toBeGreaterThan(0);
+        });
+    });
+
+    /*
+     * Codex CLI benchmark D4 B-R2 through the real exit path: a shell that ends
+     * while nobody is attached keeps its entry for the retain window, so the
+     * client that comes back still learns how it ended.
+     */
+    describeUnix('terminal that exits before the client resumes', () => {
+        const sessionId = 'exit-retain-1';
+
+        const emitsOf = (event: string): any[] => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === event)
+            .map(([, payload]: [string, any]) => payload);
+
+        afterEach(() => {
+            removeDaemonTerminalSession(sessionId);
+        });
+
+        it('keeps the ended terminal so a later resume gets its output and exit code', async () => {
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+            const params = encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant, {
+                userId: 'u1', shell: '/bin/sh', args: ['-c', 'printf ended-here; exit 7'],
+            }));
+            const ack = await new Promise<any>((resolve) => {
+                emitSocketEvent('terminal-open-fwd', { sessionId, params }, resolve);
+            });
+            expect(ack.ok).toBe(true);
+            await vi.waitFor(() => expect(emitsOf('terminal-closed')).toHaveLength(1), { timeout: 5000 });
+
+            expect(getDaemonTerminalSession(sessionId)?.exit?.code).toBe(7);
+            mockSocket.emit.mockClear();
+            emitSocketEvent('terminal-resume-fwd', { sessionId, afterSeq: 0 });
+
+            const replayed = emitsOf('terminal-frame')
+                .map((frame: any) => decrypt(machine.encryptionKey, machine.encryptionVariant, decodeBase64(frame.data)))
+                .join('');
+            expect(replayed).toContain('ended-here');
+            expect(emitsOf('terminal-closed')).toEqual([expect.objectContaining({ sessionId, code: 7 })]);
+            expect(mockSocket.emit.mock.calls.at(-1)?.[0]).toBe('terminal-closed');
         });
     });
 
