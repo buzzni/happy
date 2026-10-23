@@ -1362,7 +1362,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     const applied = await replaceCodexMultiAuthFiles(deps, [
       { path: accountsPath, content: JSON.stringify(bundle.accounts) },
       { path: settingsPath, content: JSON.stringify(settings) },
-    ], async () => {
+    ], async (ownWrite) => {
       await deps.execFile('codex-multi-auth', ['forecast', '--live', '--json'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
@@ -1393,7 +1393,9 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           activeIndexByFamily: resetActiveIndexes(currentBundle.accounts.activeIndexByFamily),
           pinnedAccountIndex: undefined,
         }
-        await writeAtomicFile(deps, accountsPath, JSON.stringify(sorted))
+        const sortedContent = JSON.stringify(sorted)
+        ownWrite(accountsPath, sortedContent)
+        await writeAtomicFile(deps, accountsPath, sortedContent)
         return { selection, accountCount: currentBundle.accounts.accounts.length }
       })
       await deps.execFile('codex-multi-auth', ['check'], {
@@ -2848,22 +2850,28 @@ async function retryOnceOnLostRace<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Installs `files` with backups, runs `verify`, and rolls back on failure. `verify` reports its own rewrites
+ * of an installed file through `ownWrite`, so the rollback restores over them instead of keeping them as another writer's.
+ */
 async function replaceCodexMultiAuthFiles<T>(
   deps: AiCredentialRuntimeDependencies,
   files: ManagedCodexFile[],
-  verify: () => Promise<T>,
+  verify: (ownWrite: (path: string, content: string) => void) => Promise<T>,
   guards: CredentialGuard[] = [],
 ): Promise<T> {
   const backups = new Set<string>()
-  const installed = new Set<string>()
+  /** Every content this operation wrote to each installed path. */
+  const installed = new Map<string, Set<string>>()
   const compared: CredentialGuard[] = [
     ...guards,
     ...files.flatMap(file => file.expected === undefined ? [] : [{ path: file.path, expected: file.expected }]),
   ]
   let verified = false
   try {
-    // Only the local compare-and-replace holds the locks; `verify` may reach the network.
-    await withCredentialFileLocks(deps, compared.map(file => file.path), async () => {
+    // Only the local compare-and-replace holds the locks; `verify` may reach the network. Every replaced file is
+    // locked, compared or not, so an install never lands inside another writer's read-modify-write.
+    await withCredentialFileLocks(deps, [...files.map(file => file.path), ...compared.map(file => file.path)], async () => {
       await assertCredentialsUnchanged(deps, compared)
       for (const file of files) {
         const backup = `${file.path}.happy-backup`
@@ -2876,11 +2884,11 @@ async function replaceCodexMultiAuthFiles<T>(
         }
       }
       for (const file of files) {
-        installed.add(file.path)
+        installed.set(file.path, new Set([file.content]))
         await writeAtomicFile(deps, file.path, file.content)
       }
     })
-    const result = await verify()
+    const result = await verify((path, content) => { installed.get(path)?.add(content) })
     verified = true
     for (const path of backups) await deps.rm(`${path}.happy-backup`, { force: true })
     return result
@@ -2893,9 +2901,10 @@ async function replaceCodexMultiAuthFiles<T>(
     for (const file of files) {
       await deps.rm(`${file.path}.happy-tmp`, { force: true }).catch(() => undefined)
       await deps.rm(`${file.path}.happy-sort-tmp`, { force: true }).catch(() => undefined)
-      if (installed.has(file.path)) {
+      const ours = installed.get(file.path)
+      if (ours) {
         const current = await readOptionalText(deps, file.path).catch(() => null)
-        if (current !== null && current !== file.content) {
+        if (current !== null && !ours.has(current)) {
           replacedByOthers.add(file.path)
           continue
         }

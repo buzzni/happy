@@ -3811,4 +3811,48 @@ describe('third-party credential file compare-and-swap (aplus D4 C3)', () => {
     await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()) })
     expect(heldDuringForecast).toBe(0)
   })
+
+  // Cross review I2 #2: the sort inside verification is our own write, not another writer's.
+  it('restores the previous pool and settings when check fails after the replace sorted the pool', async () => {
+    const settingsPath = '/home/operator/.codex/multi-auth/settings.json'
+    const configured = setup()
+    const previousPool = JSON.stringify({ version: 3, accounts: [{ accountId: 'personal', refreshToken: 'user-own-pool' }], activeIndex: 0 })
+    const previousSettings = JSON.stringify({ version: 1, pluginConfig: { user: true } })
+    configured.files.set(poolPath, previousPool)
+    configured.files.set(settingsPath, previousSettings)
+    const original = configured.execFile.getMockImplementation()!
+    configured.execFile.mockImplementation(async (command, args, options) => {
+      if (command === 'codex-multi-auth' && args[0] === 'check') throw Object.assign(new Error('check failed'), { code: 'ETIMEDOUT' })
+      return original(command, args, options)
+    })
+    // The sort drops the pin and resets per-family indexes, so the pool it leaves differs from the installed bundle.
+    const bundle = codexMultiAuthBundle()
+    const pinned = { ...bundle, accounts: { ...bundle.accounts, activeIndex: 2, pinnedAccountIndex: 2, activeIndexByFamily: { codex: 2 } } }
+    await expect(configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(pinned) })).rejects.toBeInstanceOf(Error)
+    expect(configured.writeFile.mock.calls.filter(([path]) => path === `${poolPath}.happy-tmp`)).toHaveLength(2)
+    expect(configured.files.get(poolPath)).toBe(previousPool)
+    expect(configured.files.get(settingsPath)).toBe(previousSettings)
+    expect(configured.files.has(`${poolPath}.happy-backup`)).toBe(false)
+    expect(configured.files.has(`${settingsPath}.happy-backup`)).toBe(false)
+  })
+
+  // Cross review I2 #3: an org bundle install without a compared read still writes the pool under its lock.
+  it('installs a replace-mode org bundle while holding the pool lock', async () => {
+    const held = new Set<string>()
+    const lockCredentialFile = (async <T,>(path: string, work: () => Promise<T>) => {
+      held.add(path)
+      try { return await work() } finally { held.delete(path) }
+    }) as AiCredentialRuntimeDependencies['lockCredentialFile']
+    const configured = setup({ lockCredentialFile })
+    const heldAtPoolWrite: boolean[] = []
+    const write = configured.writeFile.getMockImplementation()!
+    configured.writeFile.mockImplementation(async (path, ...rest) => {
+      if (path === `${poolPath}.happy-tmp`) heldAtPoolWrite.push(held.has(poolPath))
+      return write(path, ...rest)
+    })
+    configured.files.set(poolPath, JSON.stringify({ version: 3, accounts: [], activeIndex: 0 }))
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()) })
+    expect(heldAtPoolWrite.length).toBeGreaterThan(0)
+    expect(heldAtPoolWrite.every(Boolean)).toBe(true)
+  })
 })
