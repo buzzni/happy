@@ -119,6 +119,7 @@ import {
   type SetupTokenBinding,
   readSetupTokenResumeSelection,
   isMachineSetupTokenBinding,
+  sharedMachineSetupTokenAccount,
   SETUP_TOKEN_BINDING_ENV,
   SETUP_TOKEN_RESUME_REBOUND_ENV,
 } from './sessionEnv';
@@ -1287,6 +1288,9 @@ export async function startDaemon(): Promise<void> {
             ...(persisted.deferredContinuationContextFile
               ? { deferredContinuationContextFile: persisted.deferredContinuationContextFile }
               : {}),
+            // A live shared-PC session keeps switching accounts after the daemon restarts.
+            ...(persisted.sharedSetupTokenAccount ? { sharedSetupTokenAccount: persisted.sharedSetupTokenAccount } : {}),
+            ...(persisted.sharedSetupTokenAccountsLeft ? { sharedSetupTokenAccountsLeft: persisted.sharedSetupTokenAccountsLeft } : {}),
           };
           pidToTrackedSession.set(persisted.pid, recovered);
           if (!persisted.happySessionId) {
@@ -1501,6 +1505,8 @@ export async function startDaemon(): Promise<void> {
         startedAt: sessionStartTimes.get(s.pid) ?? Date.now(),
         userHomeDir: s.userHomeDir,
         deferredContinuationContextFile: s.deferredContinuationContextFile,
+        sharedSetupTokenAccount: s.sharedSetupTokenAccount,
+        sharedSetupTokenAccountsLeft: s.sharedSetupTokenAccountsLeft,
       }));
     };
 
@@ -2427,6 +2433,7 @@ export async function startDaemon(): Promise<void> {
               ...(tmuxEnv.HAPPY_RECONNECT_SESSION_ID ? { resumeTargetSessionId: tmuxEnv.HAPPY_RECONNECT_SESSION_ID } : {}),
               ...(agentEnvironment ? { agentEnvironment } : {}),
               ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
+              ...(sharedMachineSetupTokenAccount(managedAiCredentialEnvironment) ? { sharedSetupTokenAccount: sharedMachineSetupTokenAccount(managedAiCredentialEnvironment) } : {}),
               message: directoryCreated
                 ? `The path '${directory}' did not exist. We created a new folder and spawned a new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
                 : `Spawned new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
@@ -2598,6 +2605,8 @@ export async function startDaemon(): Promise<void> {
         ...((resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID) ? { resumeTargetSessionId: resumeTargetSessionId ?? env.HAPPY_RECONNECT_SESSION_ID } : {}),
         ...(agentEnvironment ? { agentEnvironment } : {}),
         ...(deferredContinuationContextFile ? { deferredContinuationContextFile } : {}),
+        // What an account switch of this session must name (Saycode specs/shared-pc-session-account-continuation).
+        ...(sharedMachineSetupTokenAccount(managedAiCredentialEnvironment) ? { sharedSetupTokenAccount: sharedMachineSetupTokenAccount(managedAiCredentialEnvironment) } : {}),
       };
 
       recoveredPendingSpawnStartedAt.delete(rootPid);
@@ -4655,6 +4664,11 @@ export async function startDaemon(): Promise<void> {
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
       recordAgentEnvironment: persistSetupTokenBinding,
       machineRuntime: (companyId) => machineRotation?.runtime(companyId) ?? null,
+      // Saycode specs/shared-pc-session-account-continuation — an unbound shared-PC session moves within this PC's assignment.
+      sharedMachine: {
+        reportUsage: aiCredentialRuntime.sharedMachineUsage, rebind: aiCredentialRuntime.sharedMachineRebind,
+        environment: aiCredentialRuntime.sharedMachineAccountEnvironment, moved: () => persistTrackedSessions(),
+      },
     });
     launchManagedAiCredentialSession = aiCredentialRuntime.launchSession;
     releaseSetupTokenAccounts = (managedAccountIds) => {

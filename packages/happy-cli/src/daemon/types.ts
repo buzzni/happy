@@ -105,6 +105,13 @@ export interface TrackedSession {
   userHomeDir?: string;
   /** Per-session capability restored only when this daemon resumes the child. */
   agentEnvironment?: SaycodeAgentEnvironment;
+  /**
+   * The managed account this daemon handed an unbound shared-PC session at spawn, moved by an account switch
+   * (Saycode specs/shared-pc-session-account-continuation). Kept in the daemon state file; a resume records it afresh.
+   */
+  sharedSetupTokenAccount?: string;
+  /** Accounts this daemon moved that session off, oldest first: a session that missed a move still names one. */
+  sharedSetupTokenAccountsLeft?: string[];
   /** Persistent file consumed only after the first explicit user turn is accepted. */
   deferredContinuationContextFile?: string;
 }
