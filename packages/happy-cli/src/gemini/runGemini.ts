@@ -62,6 +62,7 @@ import {
 } from '@/gemini/utils/optionsParser';
 import { ConversationHistory } from '@/gemini/utils/conversationHistory';
 import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
+import { consumeDelegatedAttendance, initialPromptAttendance, inputAttendanceFromMeta, TurnAttendanceState } from '@/api/turnAttendance';
 
 
 /**
@@ -155,6 +156,7 @@ export async function runGemini(opts: {
     sandbox: sandboxConfig,
     ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
     source,
+    approvalLifecycle: true,
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
@@ -228,7 +230,14 @@ export async function runGemini(opts: {
     preparedInitialPrompt.saycodeSystemPromptEnabled;
   let currentSaycodePromptBlocks = preparedInitialPrompt.saycodePromptBlocks;
 
+  // Whether anyone can answer this session's prompts, turn by turn (codexcli-approval-session-binding
+  // R10a). Gemini has no run-once mode; a spawned child learns its parent's attendance from env (R12).
+  const delegatedAttendance = consumeDelegatedAttendance(process.env);
+  const turnAttendance = new TurnAttendanceState();
   session.onUserMessage((message) => {
+    const attendance = inputAttendanceFromMeta(message.meta, session.getMetadata()?.source);
+    // A person writing lifts the running turn's unattended waits; automatic input does not (R10).
+    turnAttendance.inputArrived(attendance);
     // Resolve permission mode (validate) - same as Codex
     let messagePermissionMode = currentPermissionMode;
     if (message.meta?.permissionMode) {
@@ -305,7 +314,7 @@ export async function runGemini(opts: {
     };
     const deferredTurn = deferredContinuation.prepare(originalUserMessage);
     try {
-      messageQueue.push(deferredTurn?.text ?? originalUserMessage, mode);
+      messageQueue.push(deferredTurn?.text ?? originalUserMessage, mode, undefined, undefined, undefined, attendance);
       deferredTurn?.commit();
     } catch (error) {
       deferredTurn?.rollback();
@@ -329,7 +338,7 @@ export async function runGemini(opts: {
         appendSystemPrompt: currentAppendSystemPrompt,
         saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
         saycodePromptBlocks: currentSaycodePromptBlocks,
-      });
+      }, undefined, initialPromptAttendance(delegatedAttendance));
       conversationHistory.addUserMessage(prompt);
     },
     // The daemon may return recovery success as soon as this report arrives.
@@ -594,6 +603,7 @@ export async function runGemini(opts: {
 
   // Create permission handler for tool approval (variable declared earlier for onSessionSwap)
   permissionHandler = new GeminiPermissionHandler(session);
+  permissionHandler.setAttendance(turnAttendance);
   // Drop any permission requests left in agent state from a previous CLI process that died while a
   // tool prompt was open, as the Claude, Codex and ACP runners do — without it the card stays live
   // on every screen for a call nobody is waiting on (codexcli-approval-session-binding T18).
@@ -973,10 +983,10 @@ export async function runGemini(opts: {
 
   try {
     let currentModeHash: string | null = null;
-    let pending: { message: string; mode: GeminiMode; isolate: boolean; hash: string } | null = null;
+    let pending: { message: string; mode: GeminiMode; isolate: boolean; hash: string; allUnattended?: boolean } | null = null;
 
     while (!shouldExit) {
-      let message: { message: string; mode: GeminiMode; isolate: boolean; hash: string } | null = pending;
+      let message: { message: string; mode: GeminiMode; isolate: boolean; hash: string; allUnattended?: boolean } | null = pending;
       pending = null;
 
       if (!message) {
@@ -998,6 +1008,8 @@ export async function runGemini(opts: {
       if (!message) {
         break;
       }
+      // The batch that becomes the running turn decides its attendance by its own inputs (R10a).
+      turnAttendance.startTurn({ allUnattended: message.allUnattended, channel: false });
 
       let previousConversationContext: string | undefined;
       let startedNewBackendSession = false;
