@@ -384,7 +384,7 @@ interface ServerToDaemonEvents {
     'terminal-close-fwd': (msg: { sessionId: string }) => void;
     // specs/desktop-terminal-reliability/ Phase 3 — the client asks for
     // everything after the last seq it saw, following a reconnect or a gap.
-    'terminal-resume-fwd': (msg: { sessionId: string; afterSeq: number }) => void;
+    'terminal-resume-fwd': (msg: { sessionId: string; afterSeq: number; maxChars?: number }) => void;
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
@@ -514,13 +514,13 @@ interface DaemonToServerEvents {
     // `seq` is monotonic per session and starts at 1, so 0 means "seen
     // nothing". Frames sent before this shipped carry none, which the client
     // reads as "the next one after whatever I last had".
-    'terminal-frame': (msg: { sessionId: string; seq?: number; data: string }) => void;
+    'terminal-frame': (msg: { sessionId: string; seq?: number; data: string; more?: boolean; nextSeq?: number }) => void;
     // The whole replay buffer as one frame, when the client fell further behind
     // than the buffer reaches. The client resets its screen to this.
-    'terminal-snapshot': (msg: { sessionId: string; seq: number; data: string }) => void;
+    'terminal-snapshot': (msg: { sessionId: string; seq: number; data: string; more?: boolean; nextSeq?: number; droppedChars?: number }) => void;
     // There is no honest answer to the resume: say where the hole starts rather
     // than let the client believe it is current.
-    'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number }) => void;
+    'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number; droppedChars?: number }) => void;
     // Codex CLI benchmark D4 B-R2: `reason: 'unknown-session'` answers a resume for a terminal the daemon does not have.
     // aplus codexcli-daemon-restart-drain R23: `reason: 'daemon-restart'` marks an exit the daemon caused to restart.
     'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null; reason?: 'daemon-restart' } | { sessionId: string; reason: 'unknown-session' }) => void;
@@ -4020,7 +4020,7 @@ export class ApiMachineClient {
                  * running in legacy mode all along, because nothing ever
                  * advertised these. Both are honoured below.
                  */
-                ack({ ok: true, pid: pty.pid, caps: { resume: true, snapshot: true } });
+                ack({ ok: true, pid: pty.pid, caps: { resume: true, snapshot: true, pagedResume: true } });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
@@ -4055,7 +4055,7 @@ export class ApiMachineClient {
          * the RPC dispatch gate, so the allowlist there would not see this.
          */
         if (!this.managedHandlers) this.socket.on('terminal-resume-fwd', (msg) => {
-            const { sessionId, afterSeq } = msg || {};
+            const { sessionId, afterSeq, maxChars } = msg || {};
             if (!sessionId || typeof sessionId !== 'string') return;
             const entry = getDaemonTerminalSession(sessionId);
             /*
@@ -4068,11 +4068,14 @@ export class ApiMachineClient {
             // too (terminalResumeReply.ts) — silence left the client waiting forever.
             let outcome: string;
             try {
+                // Shared with the direct path (controlServerTerminalWs.ts) so the
+                // two answer a resume — paged or not — by the same rules.
                 outcome = replyToTerminalResume({
                     sessionId,
                     output: entry?.output ?? null,
                     exit: entry?.exit,
                     afterSeq,
+                    maxChars,
                     seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),
                     emit: (event, payload) => this.socket.emit(event, payload as any),
                 });
@@ -4082,6 +4085,7 @@ export class ApiMachineClient {
             }
             logger.debug(
                 `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${typeof afterSeq === 'number' ? afterSeq : '-'} answer=${outcome}`
+                + (typeof maxChars === 'number' ? ` maxChars=${maxChars}` : '')
                 + (entry?.exit ? ' exited=true' : ''),
             );
         });
