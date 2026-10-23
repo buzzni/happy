@@ -235,6 +235,32 @@ describe('/terminal WS reattach and replay (B2a)', () => {
     second.ws.close()
   })
 
+  it('holds the exit back until the last page when the PTY ends during a paged replay', async () => {
+    const client = await connect()
+    const { data: { sessionId } } = await openTerminal(client, "process.stdout.write('x'.repeat(30000)); process.stdin.on('data', () => process.exit(5))")
+    await waitFor(() => frames(client).reduce((n, f) => n + open(f.data).length, 0) >= 30_000, 5_000)
+    const before = client.inbox.length
+    client.ws.send(JSON.stringify({ event: 'terminal-resume', data: { sessionId, afterSeq: 0, maxChars: 4_096 } }))
+    await waitFor(() => client.inbox.slice(before).some((m) => m.data?.more === true), 3_000)
+    client.ws.send(JSON.stringify({ event: 'terminal-frame', data: { sessionId, data: seal('q\n') } })) // the shell exits mid-replay
+    await sleep(500)
+    expect(pushes(client, 'terminal-closed')).toEqual([])
+
+    // Pull the remaining pages; the exit follows the last one.
+    for (let guard = 0; guard < 50 && pushes(client, 'terminal-closed').length === 0; guard++) {
+      const ends = client.inbox.slice(before).filter((m) => m.data?.more !== undefined)
+      const last = ends[ends.length - 1].data
+      client.ws.send(JSON.stringify({ event: 'terminal-resume', data: { sessionId, afterSeq: last.nextSeq, maxChars: 4_096 } }))
+      await sleep(50)
+    }
+    const closedAt = client.inbox.findIndex((m) => m.data?.event === 'terminal-closed')
+    const lastPageAt = client.inbox.map((m) => m.data?.more).lastIndexOf(false)
+    expect(lastPageAt).toBeGreaterThan(-1)
+    expect(closedAt).toBeGreaterThan(lastPageAt)
+    expect(pushes(client, 'terminal-closed')[0]).toMatchObject({ code: 5 })
+    client.ws.close()
+  })
+
   it('pages a resume that names maxChars', async () => {
     const client = await connect()
     const { data: { sessionId } } = await openTerminal(client, "process.stdout.write('x'.repeat(30000))")
