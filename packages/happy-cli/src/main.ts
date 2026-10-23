@@ -21,6 +21,7 @@ import packageJson from '../package.json'
 import { z } from 'zod'
 import { startDaemon } from './daemon/run'
 import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './daemon/controlClient'
+import { formatStopDaemonProgress, parseDaemonStopArgs, type StopDaemonProgress } from './daemon/restartDrainClient'
 import { getLatestDaemonLog } from './ui/logger'
 import { killRunawayHappyProcesses } from './daemon/doctor'
 import { install } from './daemon/install'
@@ -604,12 +605,26 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
       return
 
-    } else if (daemonSubcommand === 'start') {
+    } else if (daemonSubcommand === 'start' || daemonSubcommand === 'restart') {
+      // aplus codexcli-daemon-restart-drain R5: an explicit restart — or a start that finds a
+      // daemon of another version — drains the running daemon in the foreground, printing
+      // progress, before the new one starts. Turns keep running; sessions survive.
+      const printProgress = createStopProgressPrinter()
+      if (daemonSubcommand === 'restart') {
+        const parsed = parseDaemonStopArgs('restart', args.slice(2))
+        if (!parsed.ok) {
+          console.error(parsed.error)
+          process.exit(1)
+        }
+        await stopDaemon({ ...parsed.options, onProgress: printProgress })
+      } else if (await isRunningDaemonOfAnotherVersion()) {
+        await stopDaemon({ intent: 'restart', reason: 'user-restart', onProgress: printProgress })
+      }
       // Optional preset name (e.g. `happy daemon start saycode`) resolves to
       // HAPPY_APLUS_MCP_CONFIG_URL so it doesn't need to be exported by hand.
       // An explicitly set env var always wins over the preset.
       let daemonEnv = process.env
-      const mcpConfigPreset = args[2]
+      const mcpConfigPreset = daemonSubcommand === 'start' ? args[2] : undefined
       if (mcpConfigPreset && !process.env.HAPPY_APLUS_MCP_CONFIG_URL) {
         const presetUrl = resolveMcpConfigPresetUrl(mcpConfigPreset)
         if (!presetUrl) {
@@ -664,7 +679,13 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       await startDaemon()
       process.exit(0)
     } else if (daemonSubcommand === 'stop') {
-      await stopDaemon()
+      const parsed = parseDaemonStopArgs('stop', args.slice(2))
+      if (!parsed.ok) {
+        console.error(parsed.error)
+        process.exit(1)
+      }
+      const outcome = await stopDaemon({ ...parsed.options, onProgress: createStopProgressPrinter() })
+      if (outcome === 'handed-to-daemon') console.log('The daemon will stop by itself once its running work has finished')
       process.exit(0)
     } else if (daemonSubcommand === 'status') {
       await runDoctorDaemon()
@@ -700,6 +721,11 @@ ${chalk.bold('Usage:')}
   happy daemon start [preset]     Start the daemon (detached). Optional preset
                                    (e.g. "saycode") sets HAPPY_APLUS_MCP_CONFIG_URL.
   happy daemon stop                Stop the daemon (sessions stay alive)
+  happy daemon stop --for-restart [--reason <r>] [--grace <s>] [--no-wait]
+                                   Stop for a restart: first let running turns finish
+                                   (grace per reason, e.g. env-reapply/account-switch 15s)
+  happy daemon restart [--grace <s>] [--force]
+                                   Restart the daemon after running turns finish
   happy daemon status              Show daemon status
   happy daemon list                List active sessions
 
@@ -1037,5 +1063,27 @@ ${chalk.bold('Examples:')}
   } catch (error) {
     console.error(chalk.red('✗ Failed to send push notification'))
     throw error
+  }
+}
+
+/** Prints drain progress when something changed, or every 5 seconds — not every poll. */
+function createStopProgressPrinter(): (progress: StopDaemonProgress) => void {
+  let last = ''
+  return (progress) => {
+    const key = progress.kind === 'draining'
+      ? `${progress.inTurnCount}:${progress.busyTerminalCount}:${Math.ceil(progress.secondsLeft / 5)}`
+      : progress.kind
+    if (key === last) return
+    last = key
+    console.log(formatStopDaemonProgress(progress))
+  }
+}
+
+/** A daemon is running and it is not this CLI's version. Unverifiable health is left to start-sync. */
+async function isRunningDaemonOfAnotherVersion(): Promise<boolean> {
+  try {
+    return await checkIfDaemonRunningAndCleanupStaleState() && !(await isDaemonRunningCurrentlyInstalledHappyVersion())
+  } catch {
+    return false
   }
 }

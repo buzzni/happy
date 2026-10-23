@@ -781,7 +781,9 @@ export async function startDaemon(): Promise<void> {
       // shutdown code, and older ones delete the state file outright — with it
       // goes the only record of the live sessions we're inheriting.
       const before = await readDaemonState();
-      await stopDaemon();
+      // R5: drain the old daemon (sessions survive) rather than cutting it; this start-sync is
+      // detached, so nobody waits on the grace. An old daemon gets the 15 s /stop rule.
+      await stopDaemon({ intent: 'restart', reason: 'version-mismatch' });
       const restored = resolveStatePreservation({ before, after: await readDaemonState() });
       if (restored) {
         writeDaemonState(restored);

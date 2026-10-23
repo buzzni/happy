@@ -14,7 +14,6 @@ import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime'
 import { readCurrentBootIdSync } from '@/utils/bootIdentity'
-import { isPidAlive as defaultIsPidAlive } from '@/persistence'
 
 export interface ExecutableDigest {
     path: string
@@ -30,6 +29,16 @@ export interface DaemonIdentity {
     /** darwin/linux boot identity; never recorded on Windows. */
     bootId?: string
     executable?: ExecutableDigest
+}
+
+/** Own copy (not persistence's): persistence imports this module for lock reclaim. EPERM is alive. */
+function defaultIsPidAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0)
+        return true
+    } catch (error) {
+        return (error as NodeJS.ErrnoException)?.code === 'EPERM'
+    }
 }
 
 /** `ps` reports whole seconds and clocks get stepped; Windows CIM is exact. */
