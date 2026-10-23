@@ -237,6 +237,30 @@ describe('MCP tool defaults (policy-tables §4, R8)', () => {
     ] as const)('verbOf(%s) is %s', (tool, verb) => {
         expect(verbOf(tool)).toBe(verb);
     });
+
+    // VF1 cross review #1: past the old two-word window a dictionary noun after a read verb names what is read.
+    it.each([
+        ['get_latest_release', null], ['get_user_email', null], ['email_get_message', null], ['fetch_customer_payment_methods', null],
+        ['get_thread_message_count', null],
+        // Inside the old window the noun still counts as it did there.
+        ['slack_message_search', 'high'], ['get_release_by_tag', 'high'],
+        // No read verb before it: the noun counts. `edit_message` writes outward, so high is the intended conservative grade.
+        ['edit_message', 'high'], ['add_comment_to_post', 'high'], ['create_draft_email', 'high'],
+        // Only the noun drops out; a verb after it still counts.
+        ['get_message_then_delete', 'high'], ['list_orders_and_send_email', 'high'],
+    ] as const)('verbOf(%s) is %s with nouns past the second word', (tool, verb) => {
+        expect(verbOf(tool)).toBe(verb);
+    });
+
+    it('a real read tool with readOnlyHint stays allowed', () => {
+        expect(decide(mcp('mcp__github__get_latest_release', { readOnlyHint: true })).reasonCode).toBe('default_allow');
+    });
+
+    // VF1 cross review #2: an acronym split never loses a word the camelCase split alone would have matched.
+    it.each([['DElete', 'high'], ['SEnd_items', 'high'], ['CReate', 'write'], ['bulkURLDelete', 'high'], ['getHTTPRelease', null]] as const)(
+        'verbOf(%s) is %s whichever split finds the word', (tool, verb) => {
+            expect(verbOf(tool)).toBe(verb);
+        });
 });
 
 describe('combination order (R2, R3, R13)', () => {
