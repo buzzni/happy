@@ -38,32 +38,44 @@ Control Flow:
    - Releases lock file
    - Exits process
 
-### Version Mismatch Auto-Update
+### Version Mismatch Auto-Update (bundle handoff)
 
-The daemon detects when `npm upgrade happy` occurs:
-1. Heartbeat reads package.json from disk
-2. Compares `JSON.parse(package.json).version` with compiled `configuration.currentCliVersion`
-3. If mismatch detected:
-   - Spawns new daemon via `spawnHappyCLI(['daemon', 'start'])`
-   - Hangs and waits to be killed
-4. New daemon starts, sees old daemon.state.json version != its compiled version
-5. New daemon calls `stopDaemon()` which tries HTTP `/stop`, falls back to SIGKILL
-6. New daemon takes over
+aplus `specs/codexcli-daemon-restart-drain` R4·R18·R25 (`restartDrainRuntime.ts`, `daemonHandoffAutomationGate.ts`):
+1. Each heartbeat checks `dist/index.mjs`: a size/mtime change triggers a sha256 compare against the
+   bundle the daemon booted from (`identity.executable`). A reinstall with identical bytes is not a replacement.
+2. Pre-wait: admission stays open and automation keeps running. At the first heartbeat with no turn in
+   flight, no automation and no terminal typed into in the last 10 minutes, the daemon preflights the new
+   bundle, opens a grace-0 restart drain, re-checks, and hands off (teardown → `daemon start` ×3).
+   Long-lived idle sessions do not block this — sessions are detached and survive the restart.
+3. After 30 min (`HAPPY_DAEMON_HANDOFF_PREWAIT_CAP_MS`) it drains with grace 120 s instead — unless a
+   terminal is in use; after 24 h (`HAPPY_DAEMON_HANDOFF_TERMINAL_CAP_MS`) it publishes
+   `lifecycle.pendingHandoff.forceAvailable` and drains on the next beat (machine RPC
+   `restart-drain:force-handoff` = "지금 교대" pulls that forward).
+
+### Restart drain
+
+`restartDrain.ts` / `restartDrainRuntime.ts`: closes spawn·resume admission (`code: 'daemon-restarting'` +
+`deadlineAt`, retryable) and pauses the automation runners, then waits until no turn is in flight
+(`thinking || hasOpenToolCall`; `pendingUserInput` is not waited for), no automation and no busy terminal,
+or until the per-reason grace (0~300 s). Turns are never killed. Started by the loopback control routes
+`/restart-drain/{capabilities,begin,status}` (lease-renewed; an abandoned `stop` is called off, an
+abandoned `restart` finishes itself), the bundle handoff, or POSIX `SIGHUP`. Each finished drain appends
+one line to `HAPPY_HOME_DIR/restart-drain-outcomes.jsonl` (counts only) and logs `[RESTART_DRAIN]`.
+Published as `daemonState.lifecycle`. The Windows standalone trial keeps its own shutdown drain and does
+not advertise this one.
 
 ### Stopping the Daemon
 
-Command: `happy daemon stop`
+Command: `happy daemon stop [--for-restart [--reason r] [--grace N] [--no-wait]]`, `happy daemon restart`
 
-Control Flow:
-1. `stopDaemon()` in `controlClient.ts` reads daemon.state.json
-2. Attempts graceful shutdown via HTTP POST to `/stop`
-3. Daemon receives request, calls `cleanupAndShutdown()`:
-   - Updates backend status to "shutting-down"
-   - Closes WebSocket connection
-   - Stops HTTP server
-   - Deletes daemon.state.json
-   - Releases lock file
-4. If HTTP fails, falls back to `process.kill(pid, 'SIGKILL')`
+`stopDaemon()` (`controlClient.ts` → `restartDrainClient.ts`):
+1. A daemon advertising `daemon-restart-drain-v1`: begin a drain (plain stop = grace 0; `--for-restart`
+   uses the reason's grace, e.g. env-reapply/account-switch 15 s), poll status, `/stop` once ready, wait 10 s.
+2. An older daemon: `/stop`, wait 15 s.
+3. Only then, and only if `daemon.state.json` `identity` (start time, boot id) still matches the live pid,
+   SIGKILL the daemon process. Session processes are never signalled. A refusal (401/409) stays a refusal.
+4. On shutdown `cleanupAndShutdown()` marks the state file `stopped` and keeps `trackedSessions` so the
+   next daemon re-adopts the still-running sessions.
 
 ## 2. Session Management
 
@@ -117,7 +129,8 @@ Local HTTP server (127.0.0.1 only) provides:
 - `/list` - returns tracked sessions
 - `/stop-session` - terminates specific session
 - `/spawn-session` - creates new session (used by integration tests)
-- `/stop` - graceful daemon shutdown
+- `/stop` - graceful daemon shutdown (409 `drain-in-progress` while a restart drain is not yet ready)
+- `/restart-drain/{capabilities,begin,status}` - restart drain (see above)
 
 ## 4. Process Discovery and Cleanup
 
@@ -147,9 +160,12 @@ Local HTTP server (127.0.0.1 only) provides:
   "startTime": "8/24/2025, 6:46:22 PM",
   "startedWithCliVersion": "0.9.0-6",
   "lastHeartbeat": "8/24/2025, 6:47:22 PM",
-  "daemonLogPath": "/path/to/daemon.log"
+  "daemonLogPath": "/path/to/daemon.log",
+  "identity": { "pid": 12345, "startedAt": 1761190000000, "bootId": "…", "executable": { "path": "…/dist/index.mjs", "size": 1, "mtimeMs": 1, "sha256": "…" } }
 }
 ```
+`identity` (R18) is read once at boot and compared before any path signals a daemon (R19): a live pid
+with a different start time or boot id is someone else's process.
 
 ### Lock File
 - Created with O_EXCL flag for atomic acquisition
