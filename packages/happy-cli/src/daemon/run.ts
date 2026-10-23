@@ -88,7 +88,7 @@ import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
-import { checkExecutableReplaced, readOwnDaemonIdentity } from './daemonIdentity';
+import { createBundleReplacementWatcher, readOwnDaemonIdentity } from './daemonIdentity';
 import { daemonRestartingRefusal } from './restartDrainLifecycle';
 import { countInTurnSessions, type RestartDrainActivity } from './restartDrain';
 import { createDaemonRestartDrainRuntime, type DaemonRestartDrainRuntime } from './restartDrainRuntime';
@@ -4062,8 +4062,8 @@ export async function startDaemon(): Promise<void> {
     // reliable signal: it only changes when the bundle is actually replaced.
     // R18: a changed size/mtime only triggers a hash; identical bytes (a reinstall
     // of the same build) are not a replacement and do not hand off.
-    let bundleBaseline = daemonIdentity.executable;
-    if (!bundleBaseline) {
+    const bundleWatcher = daemonIdentity.executable ? createBundleReplacementWatcher(daemonIdentity.executable) : null;
+    if (!bundleWatcher) {
       // dist/index.mjs not present (e.g. dev mode via tsx) — skip upgrade detection.
       logger.debug(`[DAEMON RUN] Bundle at ${bundlePath} not found; self-restart on upgrade disabled`);
     }
@@ -5551,11 +5551,9 @@ export async function startDaemon(): Promise<void> {
       // then tearing down the control server in the same heartbeat loses the
       // spawned session's webhook, report and project link.
       let bundleReplaced = false;
-      if (bundleBaseline && !standaloneWindows?.candidateId) {
+      if (bundleWatcher && !standaloneWindows?.candidateId) {
         // A file temporarily missing (mid-install) reads as not replaced — retried next heartbeat.
-        const check = checkExecutableReplaced(bundleBaseline);
-        bundleReplaced = check.replaced;
-        if (!check.replaced) bundleBaseline = check.baseline;
+        bundleReplaced = bundleWatcher.check();
       }
       // aplus codexcli-daemon-restart-drain R4: pre-wait without closing admission, hand off at the
       // first quiet moment, drain only at the caps. Decided before this beat's automation ticks.
@@ -5654,8 +5652,8 @@ export async function startDaemon(): Promise<void> {
       shutdownCleanupStarted = true;
       clearTimeout(startupShutdownFallback);
       startupShutdownFallback = undefined;
-      // A drain that reached ready is still closing terminals and writing its outcome line.
-      await restartDrainRuntime?.readyWork();
+      // A ready drain closes its terminals (socket still up, so each says why) and writes its outcome line.
+      await restartDrainRuntime?.finalizeReady();
       restartDrainRuntime?.dispose();
       await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);

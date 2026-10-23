@@ -25,7 +25,12 @@ const POLL_SLACK_MS = 30_000
 
 export type DaemonPostResult =
     | { ok: true; body: any }
-    | { ok: false; status?: number; error: string }
+    | { ok: false; status?: number; code?: string; error: string }
+
+/** Same value as `restartDrainRoutes.RESTART_DRAIN_HANDING_OFF` (kept free of the server module). */
+const HANDING_OFF_CODE = 'RESTART_DRAIN_HANDING_OFF'
+/** A daemon already replacing itself is given this long to exit. */
+const HANDING_OFF_EXIT_WAIT_MS = 30_000
 
 export interface RestartDrainClientDeps {
     readState: () => Promise<DaemonLocallyPersistedState | null>
@@ -132,38 +137,55 @@ export async function stopDaemonWithDrain(options: StopDaemonOptions, deps: Rest
     }
 
     const instanceId: string = capabilities.body.instanceId
-    const begun = await deps.post('/restart-drain/begin', {
-        requestId: deps.randomId(),
-        expectedInstanceId: instanceId,
-        reason: options.reason ?? 'user-restart',
-        intent: options.intent ?? 'stop',
-        ...(options.graceSeconds !== undefined ? { graceSeconds: options.graceSeconds } : {}),
-        ...(options.force ? { force: true } : {}),
-        leaseSeconds: options.noWait ? 0 : 30,
-    })
-    if (!begun.ok) {
-        if (begun.status === 401) throw new DaemonStopRefusedError(begun.error)
-        return legacyStop(state, deps, options)
-    }
-    if (options.noWait) return 'handed-to-daemon'
-
-    let view: RestartDrainView = begun.body
-    while (view.state === 'draining') {
-        options.onProgress?.({
-            kind: 'draining',
-            inTurnCount: view.inTurnCount,
-            openTerminalCount: view.openTerminalCount,
-            busyTerminalCount: view.busyTerminalCount,
-            secondsLeft: Math.max(0, Math.ceil((view.deadlineAt - deps.now()) / 1000)),
+    let view: RestartDrainView | null = null
+    // A drain the daemon called off (our lease lapsed while this process was suspended, or a
+    // restart's preflight failed) is begun once more; a second call-off leaves the daemon running.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const begun = await deps.post('/restart-drain/begin', {
+            requestId: deps.randomId(),
+            expectedInstanceId: instanceId,
+            reason: options.reason ?? 'user-restart',
+            intent: options.intent ?? 'stop',
+            ...(options.graceSeconds !== undefined ? { graceSeconds: options.graceSeconds } : {}),
+            ...(options.force ? { force: true } : {}),
+            leaseSeconds: options.noWait ? 0 : 30,
         })
-        await deps.sleep(STATUS_POLL_MS)
-        const polled = await deps.post('/restart-drain/status', { expectedInstanceId: instanceId, operationId: view.operationId })
-        if (polled.ok) {
-            view = polled.body
-            continue
+        if (!begun.ok) {
+            if (begun.code === HANDING_OFF_CODE) {
+                deps.log('[DAEMON STOP] The daemon is already handing over to a new one; waiting for it to exit')
+                await waitForExit(state.pid, HANDING_OFF_EXIT_WAIT_MS, deps)
+                return 'stopped'
+            }
+            if (begun.status === 401) throw new DaemonStopRefusedError(begun.error)
+            return legacyStop(state, deps, options)
         }
-        if (!deps.isPidAlive(state.pid)) return 'stopped'
-        if (deps.now() > view.deadlineAt + POLL_SLACK_MS) break
+        if (options.noWait) return 'handed-to-daemon'
+
+        view = begun.body as RestartDrainView
+        while (view.state === 'draining') {
+            options.onProgress?.({
+                kind: 'draining',
+                inTurnCount: view.inTurnCount,
+                openTerminalCount: view.openTerminalCount,
+                busyTerminalCount: view.busyTerminalCount,
+                secondsLeft: Math.max(0, Math.ceil((view.deadlineAt - deps.now()) / 1000)),
+            })
+            await deps.sleep(STATUS_POLL_MS)
+            const polled = await deps.post('/restart-drain/status', { expectedInstanceId: instanceId, operationId: view.operationId })
+            if (polled.ok) {
+                view = polled.body as RestartDrainView
+                continue
+            }
+            if (!deps.isPidAlive(state.pid)) return 'stopped'
+            if (deps.now() > view.deadlineAt + POLL_SLACK_MS) break
+        }
+        if (view.state !== 'cancelled') break
+        deps.log(`[DAEMON STOP] The daemon called the drain off (attempt ${attempt})`)
+    }
+    if (view?.state === 'cancelled') {
+        // Never cut a daemon whose drain was called off: it reopened admission and runs on.
+        deps.log('[DAEMON STOP] Drain called off twice; leaving the daemon running')
+        return 'left-running'
     }
 
     options.onProgress?.({ kind: 'stopping' })

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     buildDaemonIdentity,
     checkExecutableReplaced,
+    createBundleReplacementWatcher,
     readExecutableDigest,
     verifyDaemonIdentity,
     type DaemonIdentity,
@@ -98,7 +99,11 @@ describe('verifyDaemonIdentity (R19)', () => {
     })
 
     it('is a different process when the pid was reused later', async () => {
-        await expect(verifyDaemonIdentity(recorded, deps({ readStartedAt: () => 20_000 }))).resolves.toBe('mismatch')
+        await expect(verifyDaemonIdentity(recorded, deps({ readStartedAt: () => 10_000 + 60_000 }))).resolves.toBe('mismatch')
+    })
+
+    it('cannot tell after a small wall-clock step on Linux (lstart moves with boot time)', async () => {
+        await expect(verifyDaemonIdentity(recorded, deps({ readStartedAt: () => 10_000 + 5_000 }))).resolves.toBe('unknown')
     })
 
     it('is a different process after a reboot even if times look close', async () => {
@@ -117,3 +122,18 @@ describe('verifyDaemonIdentity (R19)', () => {
         await expect(verifyDaemonIdentity({ pid: 7 }, deps())).resolves.toBe('unknown')
     })
 })
+
+describe('createBundleReplacementWatcher', () => {
+    it('hashes a replaced bundle once, then answers from its size and mtime', () => {
+        const path = bundle('old')
+        const hash = vi.fn((p: string) => readExecutableDigest(p)!.sha256)
+        const watcher = createBundleReplacementWatcher(readExecutableDigest(path)!, { hash })
+        expect(watcher.check()).toBe(false)
+        writeFileSync(path, 'replaced bundle')
+        expect(watcher.check()).toBe(true)
+        expect(watcher.check()).toBe(true)
+        expect(watcher.check()).toBe(true)
+        expect(hash).toHaveBeenCalledTimes(1)
+    })
+})
+

@@ -865,8 +865,9 @@ async function lockHolderIsGone(lock: LockSnapshot, deps: DaemonLockDeps): Promi
       readStartedAt: lookup,
       ...(deps.readBootId ? { readBootId: deps.readBootId } : {}),
     });
-    if (verdict === 'mismatch') return true;
     if (verdict === 'match') return false;
+    // Still let a holder that answers as the daemon keep its lock (same guard as below).
+    if (verdict === 'mismatch') return !(await (deps.answersAsDaemon ?? answersAsDaemon)(lock.pid));
   }
   const startedAt = await lookup(lock.pid);
   if (startedAt === undefined || startedAt <= lock.mtimeMs + REUSED_LOCK_PID_SLACK_MS) return false;

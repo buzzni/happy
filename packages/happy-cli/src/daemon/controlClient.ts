@@ -476,7 +476,12 @@ export async function stopDaemon(options: StopDaemonOptions = { intent: 'stop', 
       post: async (path, body) => {
         const result = await daemonPost(path, body);
         return result?.error
-          ? { ok: false, ...(typeof result.status === 'number' ? { status: result.status } : {}), error: result.error }
+          ? {
+            ok: false,
+            ...(typeof result.status === 'number' ? { status: result.status } : {}),
+            ...(typeof result.code === 'string' ? { code: result.code } : {}),
+            error: result.error,
+          }
           : { ok: true, body: result };
       },
       isPidAlive: (pid) => {

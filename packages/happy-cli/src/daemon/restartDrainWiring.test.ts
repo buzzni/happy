@@ -3,11 +3,11 @@
  * large closure, so the wiring is checked in source (the gate itself is unit-tested in
  * resumeGuards.restartDrain.test.ts and end-to-end in restartDrain.integration.test.ts).
  */
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-async function runSource(): Promise<string> {
-    const { readFile } = await import('node:fs/promises')
-    const { fileURLToPath } = await import('node:url')
+function runSource(): Promise<string> {
     return readFile(fileURLToPath(new URL('./run.ts', import.meta.url)), 'utf8')
 }
 

@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { configuration } from './configuration';
-import { writeDaemonState, type DaemonLocallyPersistedState } from './persistence';
+import { readDaemonState, writeDaemonState, type DaemonLocallyPersistedState } from './persistence';
 
 vi.mock('node:fs', async (original) => {
     const actual = await original<typeof import('node:fs')>();
@@ -93,7 +93,6 @@ describe('daemon identity field (aplus codexcli-daemon-restart-drain R18)', () =
     });
 
     it('round-trips identity and still reads a state file written before it existed', async () => {
-        const { readDaemonState } = await import('./persistence');
         const base = { pid: 1, httpPort: 1, startTime: 'x', startedWithCliVersion: '1.1.10', state: 'running' as const };
         const identity = { pid: 1, startedAt: 1_000, bootId: 'boot', executable: { path: '/x', size: 1, mtimeMs: 2, sha256: 'a'.repeat(64) } };
         writeDaemonState({ ...base, identity });

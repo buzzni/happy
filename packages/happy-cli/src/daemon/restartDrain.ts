@@ -171,7 +171,7 @@ interface Operation {
 
 export type RestartDrainBeginResult =
     | { ok: true; view: RestartDrainView; joined: boolean }
-    | { ok: false; code: 'invalid-request' | 'not-ready' }
+    | { ok: false; code: 'invalid-request' | 'not-ready' | 'handing-off' }
 
 export class RestartDrainController {
     private operation: Operation | null = null
@@ -216,8 +216,14 @@ export class RestartDrainController {
         const active = this.operation && this.operation.state !== 'cancelled' ? this.operation : null
 
         if (active) {
+            // Already handing itself over: nobody may also stop it underneath.
+            if (active.selfCompleted) return { ok: false, code: 'handing-off' }
             // One drain per daemon: a later request joins it (R3).
-            if (requestedDeadline < active.deadlineAt) active.deadlineAt = requestedDeadline
+            if (requestedDeadline < active.deadlineAt) {
+                active.deadlineAt = requestedDeadline
+                // Refusals must quote the deadline that now applies (R6 retry timing).
+                this.deps.closeAdmission(active.deadlineAt)
+            }
             if (request.force) active.forced = true
             if (request.intent === 'restart') active.intent = 'restart'
             if (request.trigger === 'request' || request.trigger === 'signal') {
@@ -226,10 +232,17 @@ export class RestartDrainController {
                 active.cancelOnBusyTerminal = false
                 active.waitsForTerminals = true
             }
-            if (leaseSeconds === 0) active.selfComplete = true
-            else this.renewLease(active, leaseSeconds, now)
+            if (leaseSeconds === 0) {
+                active.selfComplete = true
+            } else {
+                this.renewLease(active, leaseSeconds, now)
+                // A caller that polls now owns the finish (it sends /stop, or starts its own
+                // daemon); the daemon finishes by itself again only once that lease lapses.
+                active.selfComplete = false
+            }
             this.remember(request.requestId, active.operationId)
             this.evaluate()
+            this.notifyChange()
             return { ok: true, view: this.view(active), joined: true }
         }
 
@@ -287,6 +300,7 @@ export class RestartDrainController {
         if (!operation || operation.state !== 'draining') return null
         operation.deadlineAt = this.deps.now()
         operation.forced = true
+        this.deps.closeAdmission(operation.deadlineAt)
         this.evaluate()
         this.notifyChange()
         return this.view(operation)

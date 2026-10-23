@@ -41,8 +41,14 @@ function defaultIsPidAlive(pid: number): boolean {
     }
 }
 
-/** `ps` reports whole seconds and clocks get stepped; Windows CIM is exact. */
+/** `ps` reports whole seconds; Windows CIM is exact. */
 const POSIX_START_SLACK_MS = 1_000
+/**
+ * Linux `ps -o lstart` is boot time + jiffies, and boot time moves when the wall clock is
+ * stepped (NTP, resume). Between the slack and this, the same process can look a little
+ * off, so it is `unknown`, not `mismatch`; a reused pid starts minutes or hours apart.
+ */
+const POSIX_MISMATCH_MS = 30_000
 
 function sha256Of(path: string): string {
     return createHash('sha256').update(readFileSync(path)).digest('hex')
@@ -138,6 +144,44 @@ export async function verifyDaemonIdentity(
         ?? (platform === 'win32' ? getWindowsProcessStartedAt : getProcessStartedAt)
     const liveStartedAt = await readStartedAt(recorded.pid)
     if (liveStartedAt === undefined) return 'unknown'
-    const slack = platform === 'win32' ? 0 : POSIX_START_SLACK_MS
-    return Math.abs(liveStartedAt - recorded.startedAt) <= slack ? 'match' : 'mismatch'
+    const delta = Math.abs(liveStartedAt - recorded.startedAt)
+    if (platform === 'win32') return delta === 0 ? 'match' : 'mismatch'
+    if (delta <= POSIX_START_SLACK_MS) return 'match'
+    return delta >= POSIX_MISMATCH_MS ? 'mismatch' : 'unknown'
 }
+
+/**
+ * Heartbeat view of the bundle: once it was found replaced, the answer is kept until size or
+ * mtime move again, so a handoff pending for hours does not hash the bundle every minute.
+ */
+export function createBundleReplacementWatcher(
+    baseline: ExecutableDigest,
+    deps: { hash?: (path: string) => string } = {},
+): { check: () => boolean } {
+    let current = baseline
+    let replacedStat: { size: number; mtimeMs: number } | null = null
+    return {
+        check: () => {
+            if (replacedStat) {
+                try {
+                    const { size, mtimeMs } = statSync(current.path)
+                    if (size === replacedStat.size && mtimeMs === replacedStat.mtimeMs) return true
+                } catch {
+                    return true
+                }
+                replacedStat = null
+            }
+            const result = checkExecutableReplaced(current, deps)
+            if (!result.replaced) {
+                current = result.baseline
+                return false
+            }
+            try {
+                const { size, mtimeMs } = statSync(current.path)
+                replacedStat = { size, mtimeMs }
+            } catch { /* re-checked next time */ }
+            return true
+        },
+    }
+}
+

@@ -151,7 +151,18 @@ describe('daemon restart drain runtime', () => {
             h.advance(1_001)
             h.setActivity({ inTurnCount: 0 })
             await flush()
-            expect(h.calls).toEqual(['close-admission', 'close-terminals', 'preflight', 'hand-off'])
+            expect(h.calls).toEqual(['close-admission', 'preflight', 'close-terminals', 'hand-off'])
+        })
+
+        it('a ready drain called off afterwards closes no terminal and records one cancelled line', async () => {
+            const h = current = harness({ preflight: false })
+            const begun = h.runtime.controlPort.begin({ reason: 'user-restart', intent: 'restart', trigger: 'request', leaseSeconds: 1 })
+            expect(begun.ok && begun.view.state).toBe('ready')
+            h.advance(1_001)
+            await flush()
+            expect(h.spies.closeTerminalsForRestart).not.toHaveBeenCalled()
+            expect(h.admission.closed).toBe(false)
+            expect(h.ledger()).toEqual([expect.objectContaining({ outcome: 'cancelled' })])
         })
 
         it('a stop with no-wait (lease 0) shuts down after draining, without a replacement', async () => {
@@ -169,7 +180,10 @@ describe('daemon restart drain runtime', () => {
             h.setActivity({ inTurnCount: 0 })
             h.runtime.controlPort.status(begun.ok ? begun.view.operationId : '')
             expect(h.runtime.controlPort.stopBlocked()).toBe(false)
-            await h.runtime.readyWork()
+            // Not final until the daemon really stops: nothing closed, nothing recorded yet.
+            expect(h.spies.closeTerminalsForRestart).not.toHaveBeenCalled()
+            expect(h.ledger()).toEqual([])
+            await h.runtime.finalizeReady()
             expect(h.ledger()).toEqual([expect.objectContaining({ outcome: 'idle', reason: 'env-reapply', closedTerminalCount: 1 })])
         })
     })

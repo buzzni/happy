@@ -107,6 +107,30 @@ describe('stopDaemonWithDrain (plan §2.2)', () => {
         expect(h.paths()).not.toContain('/stop')
     })
 
+    it('begins once more when the daemon called the drain off (lease lapsed while suspended)', async () => {
+        let begins = 0
+        const h = harness({ routes: {
+            '/restart-drain/begin': () => ({ ok: true, body: view({ state: ++begins === 1 ? 'draining' : 'ready', operationId: `op-${begins}` }) }),
+            '/restart-drain/status': () => ({ ok: true, body: view({ state: 'cancelled', operationId: 'op-1' }) }),
+        } })
+        await expect(stopDaemonWithDrain({ reason: 'env-reapply' }, h.deps)).resolves.toBe('stopped')
+        expect(h.paths()).toEqual(['/restart-drain/capabilities', '/restart-drain/begin', '/restart-drain/status', '/restart-drain/begin', '/stop'])
+    })
+
+    it('never stops a daemon whose drain was called off twice', async () => {
+        const h = harness({ routes: { '/restart-drain/begin': () => ({ ok: true, body: view({ state: 'cancelled' }) }) } })
+        await expect(stopDaemonWithDrain({}, h.deps)).resolves.toBe('left-running')
+        expect(h.paths()).not.toContain('/stop')
+        expect(h.deps.kill).not.toHaveBeenCalled()
+    })
+
+    it('waits for a daemon that is already handing itself over, without /stop or a kill', async () => {
+        const h = harness({ routes: { '/restart-drain/begin': () => ({ ok: false, status: 409, code: 'RESTART_DRAIN_HANDING_OFF', error: 'handing-off' }) } })
+        await expect(stopDaemonWithDrain({}, h.deps)).resolves.toBe('stopped')
+        expect(h.paths()).not.toContain('/stop')
+        expect(h.deps.kill).not.toHaveBeenCalled()
+    })
+
     describe('old daemon (R22: capability missing / begin 404)', () => {
         it('stops with /stop and waits 15 s (not 2 s) before an identity-checked kill', async () => {
             const h = harness({ exitsAfterStop: false, routes: { '/restart-drain/capabilities': () => ({ ok: false, status: 404, error: '404' }) } })

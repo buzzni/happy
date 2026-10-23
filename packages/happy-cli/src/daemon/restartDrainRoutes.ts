@@ -17,6 +17,8 @@ import {
 } from './restartDrain'
 
 export const RESTART_DRAIN_CAPABILITY = 'daemon-restart-drain-v1'
+/** The daemon is already replacing itself; a caller just waits for it to exit. */
+export const RESTART_DRAIN_HANDING_OFF = 'RESTART_DRAIN_HANDING_OFF'
 
 export interface RestartDrainControlPort {
     /** Stable for this daemon process: pid + start time (R18). */
@@ -67,7 +69,10 @@ export function attachRestartDrainRoutes(
             ...(parsed.data.force !== undefined ? { force: parsed.data.force } : {}),
             ...(parsed.data.leaseSeconds !== undefined ? { leaseSeconds: parsed.data.leaseSeconds } : {}),
         })
-        if (!result.ok) return reply.code(result.code === 'not-ready' ? 503 : 400).send({ error: result.code })
+        if (!result.ok) {
+            if (result.code === 'handing-off') return reply.code(409).send({ error: 'handing-off', code: RESTART_DRAIN_HANDING_OFF })
+            return reply.code(result.code === 'not-ready' ? 503 : 400).send({ error: result.code })
+        }
         return result.view
     })
 

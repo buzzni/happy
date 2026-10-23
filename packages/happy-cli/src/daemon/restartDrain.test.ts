@@ -126,7 +126,22 @@ describe('RestartDrainController', () => {
         expect(second.ok && second.view).toMatchObject({
             operationId: first.ok ? first.view.operationId : '', intent: 'restart', deadlineAt: h.now + 15_000,
         })
-        expect(h.deps.closeAdmission).toHaveBeenCalledTimes(1)
+        // Opened once, then re-closed with the earlier deadline so refusals quote it (R6).
+        expect(h.deps.closeAdmission.mock.calls).toEqual([[h.now + 120_000], [h.now + 15_000]])
+    })
+
+    it('a polling caller that joins a self-completing drain takes over the finish', () => {
+        const h = harness({ inTurnCount: 1 })
+        h.controller.begin({ reason: 'bundle-replaced', intent: 'restart', trigger: 'handoff-cap', leaseSeconds: 0 })
+        h.controller.begin({ reason: 'user-restart', intent: 'stop', trigger: 'request', graceSeconds: 0 })
+        expect(h.controller.current()?.state).toBe('ready')
+        expect(h.deps.onSelfComplete).not.toHaveBeenCalled()
+    })
+
+    it('refuses to join a drain that is already handing itself over', () => {
+        const h = harness()
+        h.controller.begin({ reason: 'signal', intent: 'restart', trigger: 'signal', leaseSeconds: 0 })
+        expect(h.controller.begin({ reason: 'user-restart', intent: 'stop', trigger: 'request' })).toEqual({ ok: false, code: 'handing-off' })
     })
 
     it('force pulls the deadline to now and is recorded as force', () => {

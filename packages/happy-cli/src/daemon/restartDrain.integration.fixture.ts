@@ -69,7 +69,7 @@ async function main() {
         if (shuttingDown) return
         shuttingDown = true
         log(`shutdown (${why})`)
-        await runtime?.readyWork()
+        await runtime?.finalizeReady()
         runtime?.dispose()
         await server.stop()
         writeDaemonState({ ...state, state: 'stopped' })

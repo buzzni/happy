@@ -53,7 +53,11 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
     const now = input.now ?? Date.now
     const caps = readHandoffCaps(input.env)
     let pendingHandoff: PendingHandoff | null = null
-    let readyWork: Promise<void> = Promise.resolve()
+    // A ready drain is only final once the daemon actually stops or hands off: a lapsed
+    // lease or a failed preflight can still call it off, and then nothing may have closed
+    // terminals or written a `ready` outcome line.
+    let readySettlement: RestartDrainSettlement | null = null
+    let finalizing: Promise<void> | null = null
     let tickTimer: ReturnType<typeof setInterval> | null = null
     let handingOff = false
 
@@ -87,22 +91,17 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         },
         onReady: (settlement) => {
             input.log(`[RESTART_DRAIN] ready (${settlement.outcome}) reason=${settlement.view.reason} trigger=${settlement.view.trigger}`)
-            readyWork = (async () => {
-                // R23: close terminals while the socket is up so each close says why.
-                let closed = 0
-                try {
-                    closed = await input.closeTerminalsForRestart()
-                } catch (error) {
-                    input.log(`[RESTART_DRAIN] closing terminals failed: ${(error as Error)?.message ?? 'unknown'}`)
-                }
-                record(settlement, closed)
-            })()
+            readySettlement = settlement
+            finalizing = null
         },
         onSelfComplete: (view) => {
             // Never inside the call that reached ready (it may be answering an HTTP request).
             setTimeout(() => { void selfComplete(view) }, 0)
         },
         onCancelled: (settlement, cause) => {
+            // Called off after ready: that ready was never final — one line, `cancelled`.
+            readySettlement = null
+            finalizing = null
             if (cause === 'lease') input.log(`[RESTART_DRAIN] drain-abandoned: nobody renewed the lease; admission reopened (reason=${settlement.view.reason})`)
             else input.log(`[RESTART_DRAIN] cancelled (${cause}); admission reopened`)
             record(settlement, 0)
@@ -110,10 +109,30 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         onChange: () => input.publishLifecycle(),
     })
 
+    /**
+     * The point of no return for a ready drain: close the daemon terminals while the socket is
+     * still up, so each close says why (R23), and write the outcome line (R26). Idempotent.
+     */
+    function finalizeReady(): Promise<void> {
+        const settlement = readySettlement
+        if (!settlement) return Promise.resolve()
+        finalizing ??= (async () => {
+            let closed = 0
+            try {
+                closed = await input.closeTerminalsForRestart()
+            } catch (error) {
+                input.log(`[RESTART_DRAIN] closing terminals failed: ${(error as Error)?.message ?? 'unknown'}`)
+            }
+            record(settlement, closed)
+            readySettlement = null
+        })()
+        return finalizing
+    }
+
     async function selfComplete(view: RestartDrainView): Promise<void> {
-        await readyWork
         if (view.intent === 'stop') {
             input.log('[RESTART_DRAIN] stop drain finished with nobody waiting; shutting down')
+            await finalizeReady()
             input.shutdown()
             return
         }
@@ -127,6 +146,7 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
         if (handingOff) return
         handingOff = true
         stopTicking()
+        await finalizeReady()
         await input.handOff()
     }
 
@@ -149,8 +169,8 @@ export function createDaemonRestartDrainRuntime(input: DaemonRestartDrainRuntime
     return {
         controller,
         controlPort,
-        /** Awaited before shutting down so terminal close frames and the ledger line go out first. */
-        readyWork: () => readyWork,
+        /** Awaited by shutdown: a ready drain closes its terminals and writes its outcome line first. */
+        finalizeReady,
         isAdmissionClosed: () => controller.isAdmissionClosed(),
         pendingHandoff: () => pendingHandoff,
         lifecycle: (): DaemonRestartLifecycle => buildRestartLifecycle(controller.current(), pendingHandoff),
