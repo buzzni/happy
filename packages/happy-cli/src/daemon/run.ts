@@ -88,10 +88,11 @@ import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
+import { checkExecutableReplaced, readOwnDaemonIdentity } from './daemonIdentity';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
-import { existsSync, statSync } from 'fs';
+import { existsSync } from 'fs';
 import { basename, join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -3976,6 +3977,10 @@ export async function startDaemon(): Promise<void> {
     // The managed launch path hands this to each child with its credential.
     managedControlPortValue = controlPort;
 
+    // R18: read once here — the shutdown path must never run `ps`.
+    const bundlePath = join(projectPath(), 'dist', 'index.mjs');
+    const daemonIdentity = await readOwnDaemonIdentity(bundlePath);
+
     // Write initial daemon state (no lock needed for state file)
     const fileState: DaemonLocallyPersistedState = {
       pid: process.pid,
@@ -3988,6 +3993,7 @@ export async function startDaemon(): Promise<void> {
       state: 'running',
       trackedSessions: serializeTrackedSessions(),
       controlSecret,
+      identity: daemonIdentity,
     };
     writeDaemonState(fileState);
     logger.debug('[DAEMON RUN] Daemon state written');
@@ -4014,11 +4020,10 @@ export async function startDaemon(): Promise<void> {
     // diverged from the bundled version (e.g. `happy-coder@0.13.1` deprecation
     // stub bumped package.json without rebuilding dist). File mtime is a more
     // reliable signal: it only changes when the bundle is actually replaced.
-    const bundlePath = join(projectPath(), 'dist', 'index.mjs');
-    let initialBundleMtimeMs = 0;
-    try {
-      initialBundleMtimeMs = statSync(bundlePath).mtimeMs;
-    } catch {
+    // R18: a changed size/mtime only triggers a hash; identical bytes (a reinstall
+    // of the same build) are not a replacement and do not hand off.
+    let bundleBaseline = daemonIdentity.executable;
+    if (!bundleBaseline) {
       // dist/index.mjs not present (e.g. dev mode via tsx) — skip upgrade detection.
       logger.debug(`[DAEMON RUN] Bundle at ${bundlePath} not found; self-restart on upgrade disabled`);
     }
@@ -5383,13 +5388,11 @@ export async function startDaemon(): Promise<void> {
       // then tearing down the control server in the same heartbeat loses the
       // spawned session's webhook, report and project link.
       let bundleReplaced = false;
-      if (initialBundleMtimeMs > 0 && !standaloneWindows?.candidateId) {
-        try {
-          const currentMtimeMs = statSync(bundlePath).mtimeMs;
-          bundleReplaced = currentMtimeMs !== initialBundleMtimeMs;
-        } catch {
-          // File temporarily missing (e.g. mid-install) — retry on next heartbeat.
-        }
+      if (bundleBaseline && !standaloneWindows?.candidateId) {
+        // A file temporarily missing (mid-install) reads as not replaced — retried next heartbeat.
+        const check = checkExecutableReplaced(bundleBaseline);
+        bundleReplaced = check.replaced;
+        if (!check.replaced) bundleBaseline = check.baseline;
       }
       const handoffDecision = decideAutomationAwareHandoff({
         bundleReplaced,
@@ -5562,6 +5565,7 @@ export async function startDaemon(): Promise<void> {
             : { socketDisconnectedSeconds: Math.round(connection.disconnectedForMs / 1000) }),
           trackedSessions: serializeTrackedSessions(),
           controlSecret: fileState.controlSecret,
+          ...(fileState.identity ? { identity: fileState.identity } : {}),
         };
         writeDaemonState(updatedState);
         if (process.env.DEBUG) {

@@ -165,6 +165,13 @@ export interface DaemonLocallyPersistedState {
    * to whatever `controlServer.ts` does for that case.
    */
   controlSecret?: string;
+  /**
+   * aplus specs/codexcli-daemon-restart-drain R18 — who wrote this file: pid,
+   * own process start time (read once at boot), boot id and bundle digest.
+   * Every path that signals a daemon compares it first (R19). Optional: files
+   * from older daemons have none and keep the pid-only checks.
+   */
+  identity?: import('./daemon/daemonIdentity').DaemonIdentity;
 }
 
 export async function readSettings(): Promise<Settings> {

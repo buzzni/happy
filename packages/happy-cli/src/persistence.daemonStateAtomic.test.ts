@@ -77,3 +77,31 @@ describe('daemon state is replaced, never rewritten in place', () => {
         expect(others()).toEqual([]);
     });
 });
+
+describe('daemon identity field (aplus codexcli-daemon-restart-drain R18)', () => {
+    const originalDaemonStateFile = configuration.daemonStateFile;
+    let directory: string;
+
+    beforeEach(() => {
+        directory = fs.mkdtempSync(join(tmpdir(), 'happy-daemon-identity-'));
+        Object.defineProperty(configuration, 'daemonStateFile', { configurable: true, value: join(directory, 'daemon.state.json') });
+    });
+
+    afterEach(() => {
+        Object.defineProperty(configuration, 'daemonStateFile', { configurable: true, value: originalDaemonStateFile });
+        fs.rmSync(directory, { recursive: true, force: true });
+    });
+
+    it('round-trips identity and still reads a state file written before it existed', async () => {
+        const { readDaemonState } = await import('./persistence');
+        const base = { pid: 1, httpPort: 1, startTime: 'x', startedWithCliVersion: '1.1.10', state: 'running' as const };
+        const identity = { pid: 1, startedAt: 1_000, bootId: 'boot', executable: { path: '/x', size: 1, mtimeMs: 2, sha256: 'a'.repeat(64) } };
+        writeDaemonState({ ...base, identity });
+        expect((await readDaemonState())?.identity).toEqual(identity);
+
+        fs.writeFileSync(configuration.daemonStateFile, JSON.stringify(base));
+        const legacy = await readDaemonState();
+        expect(legacy?.identity).toBeUndefined();
+        expect(legacy?.pid).toBe(1);
+    });
+});
