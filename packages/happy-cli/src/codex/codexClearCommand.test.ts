@@ -17,6 +17,12 @@ describe('enqueueCodexUserText', () => {
         expect(queue.push).toHaveBeenCalledWith('scheduled', 'mode', undefined, undefined, undefined, 'unattended');
     });
 
+    it('carries who sent an isolated clear command too, as Claude /clear does', () => {
+        const queue = { push: vi.fn(), pushIsolateAndClear: vi.fn() };
+        enqueueCodexUserText({ text: '/clear', mode: 'mode', queue, attendance: 'unattended' });
+        expect(queue.pushIsolateAndClear).toHaveBeenCalledWith('/clear', 'mode', undefined, undefined, 'unattended');
+    });
+
     it('preserves the trace when an isolated clear command is queued', () => {
         const queue = { push: vi.fn(), pushIsolateAndClear: vi.fn() };
         const latencyTrace = { id: 'trace', receivedAt: 10 };

@@ -960,8 +960,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             messageQueue.enqueue(pendingRequestItem(null));
                             lastTurnChannel = false;
                             lastTurnCommand = false;
-                            // The failed turn again: its attendance, with a fresh wait budget (R10a).
-                            session.turnAttendance?.restartTurn();
+                            // The failed turn again keeps its attendance and its spent wait budget (R10a, Q6).
                             // The failed turn's own settings, unchanged — no provider restart.
                             mode = due.mode.mode;
                             modeHash = due.mode.hash ?? modeHash;

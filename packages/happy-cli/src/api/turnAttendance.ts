@@ -155,6 +155,8 @@ export function unattendedExpiryMessage(timeoutMs: number = UNATTENDED_APPROVAL_
 export class TurnAttendanceState {
     private attendance: TurnAttendance;
     private budgetSpent = false;
+    /** The next started batch continues the current turn (an account switch, a capacity retry). */
+    private continuationQueued = false;
     private readonly releaseListeners = new Set<() => void>();
 
     constructor(private readonly runOnce: boolean = false) {
@@ -171,10 +173,16 @@ export class TurnAttendanceState {
         this.budgetSpent = false;
     }
 
-    /** A queued batch became the running turn. */
+    /**
+     * A queued batch became the running turn. A continuation of the current turn keeps the wait
+     * budget that turn already spent (spec Q6: one wait per turn, not per provider call).
+     */
     startTurn(batch: { allUnattended?: boolean; channel: boolean }): TurnAttendance {
+        const carriedBudget = this.continuationQueued && this.budgetSpent;
+        this.continuationQueued = false;
         const attendance = turnAttendance({ runOnce: this.runOnce, allUnattended: batch.allUnattended === true, channel: batch.channel });
         this.beginTurn(attendance);
+        if (carriedBudget) this.budgetSpent = true;
         return attendance;
     }
 
@@ -185,16 +193,13 @@ export class TurnAttendanceState {
         return this.runOnce || this.attendance === 'unattended' || (this.attendance === 'channel' && this.budgetSpent);
     }
 
-    /** The same turn run again (a transient API retry): its classification, a fresh wait budget. */
-    restartTurn(): void {
-        this.budgetSpent = false;
-    }
-
     /**
      * What an automatic continuation of the current turn carries (an account switch, a capacity
-     * retry): an unattended turn stays unattended rather than becoming a person's turn.
+     * retry), called as it is queued: an unattended turn stays unattended rather than becoming a
+     * person's turn, and keeps the wait budget it spent.
      */
     continuationInput(): InputAttendance | undefined {
+        this.continuationQueued = true;
         return this.attendance === 'attended' ? undefined : 'unattended';
     }
 

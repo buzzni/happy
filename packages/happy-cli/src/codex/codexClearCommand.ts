@@ -4,7 +4,7 @@ import type { InputAttendance } from '@/api/turnAttendance';
 
 type CodexUserTextQueue<T> = {
     push: (message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance) => void;
-    pushIsolateAndClear: (message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace) => string[] | void;
+    pushIsolateAndClear: (message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance) => string[] | void;
 };
 
 export function isCodexClearText(text: string): boolean {
@@ -43,7 +43,8 @@ export function enqueueCodexUserText<T>(opts: {
     attendance?: InputAttendance;
 }): 'clear' | 'queued' {
     if (isCodexClearText(opts.text)) {
-        if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);
+        if (opts.attendance) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance);
+        else if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);
         else opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments);
         return 'clear';
     }

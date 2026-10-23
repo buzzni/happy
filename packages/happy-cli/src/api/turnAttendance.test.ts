@@ -157,16 +157,33 @@ describe('TurnAttendanceState', () => {
         expect(scheduled.policyUnattended()).toBe(true);
     });
 
-    it('keeps an unattended turn unattended across an automatic continuation or a retry', () => {
+    it('keeps an unattended turn unattended across an automatic continuation', () => {
+        const state = new TurnAttendanceState();
+        state.beginTurn('unattended');
+        expect(state.continuationInput()).toBe('unattended');
+        expect(state.startTurn({ allUnattended: true, channel: false })).toBe('unattended');
+        state.beginTurn('attended');
+        expect(state.continuationInput()).toBeUndefined();
+    });
+
+    it('carries a spent wait budget into the continuation of the same turn (Q6, I7 review #6)', () => {
         const state = new TurnAttendanceState();
         state.beginTurn('unattended');
         state.spendBudget();
-        expect(state.continuationInput()).toBe('unattended');
-        state.restartTurn();
-        expect(state.current()).toBe('unattended');
+        state.continuationInput();
+        state.startTurn({ allUnattended: true, channel: false });
+        expect(state.budgetExhausted()).toBe(true);
+        // A turn that is not a continuation gets its own budget.
+        state.startTurn({ allUnattended: true, channel: false });
         expect(state.budgetExhausted()).toBe(false);
-        state.beginTurn('attended');
-        expect(state.continuationInput()).toBeUndefined();
+    });
+
+    it('gives a continuation queued before any expiry the budget it had', () => {
+        const state = new TurnAttendanceState();
+        state.beginTurn('unattended');
+        state.continuationInput();
+        state.startTurn({ allUnattended: true, channel: false });
+        expect(state.budgetExhausted()).toBe(false);
     });
 });
 
