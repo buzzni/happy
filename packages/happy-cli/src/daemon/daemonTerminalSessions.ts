@@ -49,6 +49,14 @@ export interface DaemonTerminalEntry {
     /** Last in/out activity wallclock ms — drives the idle timer reset. */
     lastActivityAt: number
     /**
+     * Last client → PTY input wallclock ms, null until the first keystroke.
+     * Unlike `lastActivityAt` output does not move it: a `tail -f` streaming
+     * away is not someone using the terminal (aplus codexcli-daemon-restart-drain R23).
+     */
+    lastInputAt: number | null
+    /** Why the daemon closed it, carried on `terminal-closed` (R23). */
+    closeReason?: 'daemon-restart'
+    /**
      * Bounded replay buffer for this terminal's output
      * (specs/desktop-terminal-reliability/ Phase 3). Lives here rather than in
      * the relay because happy-server is multi-replica: a buffer kept there
@@ -121,6 +129,7 @@ export function addDaemonTerminalSession(
         bytesIn: 0,
         bytesOut: 0,
         lastActivityAt: now,
+        lastInputAt: null,
         output: createTerminalOutputBuffer(opts.outputBufferChars, opts.outputBufferFrames),
         exit: null,
         _idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
@@ -205,6 +214,41 @@ export function killAllDaemonTerminalSessions(): number {
     return killed
 }
 
+/** A terminal typed into within this window is in use and a restart waits for it (R23). */
+export const BUSY_TERMINAL_INPUT_WINDOW_MS = 10 * 60 * 1000
+
+export function getBusyDaemonTerminalCount(now: number = Date.now(), windowMs: number = BUSY_TERMINAL_INPUT_WINDOW_MS): number {
+    let busy = 0
+    for (const entry of sessions.values()) {
+        // An ended terminal kept only for resume (D4 B-R2) is nobody's to wait for.
+        if (entry.exit) continue
+        if (entry.lastInputAt !== null && now - entry.lastInputAt < windowMs) busy++
+    }
+    return busy
+}
+
+/**
+ * Close every terminal because the daemon is being replaced: each entry is
+ * tagged so its `terminal-closed` frame says why, then torn down and awaited.
+ * Resolves with how many live terminals were closed.
+ */
+export async function closeAllDaemonTerminalSessionsForRestart(): Promise<number> {
+    const pending: Promise<TerminateOutcome>[] = []
+    for (const [id, entry] of sessions) {
+        clearTimers(entry)
+        // Already ended and kept only for resume (D4 B-R2): nothing to tear down.
+        if (entry.exit) {
+            sessions.delete(id)
+            continue
+        }
+        entry.closeReason = 'daemon-restart'
+        pending.push(entry.session.terminate({ graceMs: DISCONNECT_GRACE_MS }).catch((): TerminateOutcome => 'escaped'))
+        sessions.delete(id)
+    }
+    await Promise.all(pending)
+    return pending.length
+}
+
 /**
  * Like `killAllDaemonTerminalSessions`, but waits for every teardown and reports each outcome.
  * An app-close drain (Desktop specs/windows-build-support W0-5h) may only finish once every
@@ -245,6 +289,7 @@ export function recordBytesIn(id: string, n: number): void {
     if (!entry || n <= 0) return
     entry.bytesIn += n
     entry.lastActivityAt = Date.now()
+    entry.lastInputAt = entry.lastActivityAt
     armIdleTimer(entry)
 }
 
