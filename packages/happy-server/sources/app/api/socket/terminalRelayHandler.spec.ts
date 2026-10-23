@@ -508,6 +508,50 @@ describe('terminalRelayHandler resume relay', () => {
     });
 
     /*
+     * specs/codexcli-daemon-stream-durability B3.1b — paged resume. The relay
+     * copies fields by name, so the new ones are added here; a request without
+     * maxChars still carries exactly the old fields, and so does an answer
+     * without paging fields.
+     */
+    it('forwards maxChars when the client asks for a paged resume, and only then', async () => {
+        const { client, sessionId } = await openSession({ caps: { resume: true, pagedResume: true } });
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: 262144 });
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: 'lots' });
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3, maxChars: -1 });
+
+        expect(roomEmits.map((e) => e.payload)).toEqual([
+            { sessionId, afterSeq: 3, maxChars: 262144 },
+            { sessionId, afterSeq: 3 },
+            { sessionId, afterSeq: 3 },
+        ]);
+        expect(Object.keys(roomEmits[1].payload)).toEqual(['sessionId', 'afterSeq']);
+    });
+
+    it('carries the paging fields on the frame, snapshot and gap that answer a paged resume', async () => {
+        const { daemon, sessionId } = await openSession({ caps: { resume: true, pagedResume: true } });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 9, data: 'c', more: true, nextSeq: 9 });
+        await daemon.trigger('terminal-snapshot', { sessionId, seq: 4, data: 's', more: false, nextSeq: 4, droppedChars: 120 });
+        await daemon.trigger('terminal-frame-gap', { sessionId, fromSeq: 2, droppedChars: 7 });
+
+        expect(roomEmits.map((e) => e.payload)).toEqual([
+            { sessionId, seq: 9, data: 'c', more: true, nextSeq: 9 },
+            { sessionId, seq: 4, data: 's', more: false, nextSeq: 4, droppedChars: 120 },
+            { sessionId, fromSeq: 2, droppedChars: 7 },
+        ]);
+    });
+
+    it('drops paging fields of the wrong type and adds none to an ordinary frame', async () => {
+        const { daemon, sessionId } = await openSession({ caps: { resume: true } });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 1, data: 'c', more: 'yes', nextSeq: 'x' });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 2, data: 'd' });
+        await daemon.trigger('terminal-frame-gap', { sessionId, fromSeq: 2, droppedChars: 'many' });
+
+        expect(Object.keys(roomEmits[0].payload)).toEqual(['sessionId', 'seq', 'data']);
+        expect(Object.keys(roomEmits[1].payload)).toEqual(['sessionId', 'seq', 'data']);
+        expect(Object.keys(roomEmits[2].payload)).toEqual(['sessionId', 'fromSeq']);
+    });
+
+    /*
      * The two fixes meeting: P0-3 lets a reconnected client re-claim its
      * session, and resume is what makes that recovery lossless.
      */
