@@ -44,7 +44,7 @@ export interface RunBashStreamResult {
   stdout: string;
   stderr: string;
   /** Bounded captures the tool result is rendered from (bashStreamOutput). */
-  captures?: { stdout: StreamCapture; stderr: StreamCapture };
+  captures: { stdout: StreamCapture; stderr: StreamCapture };
 }
 
 class StreamLineBuffer {

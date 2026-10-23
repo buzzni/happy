@@ -21,7 +21,7 @@ import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
 import { createId } from "@paralleldrive/cuid2";
 import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
-import { StreamCapture, bashStreamSpillStoreFor, removeBashStreamSpillStore, renderBashStreamResult } from "./bashStreamOutput";
+import { bashStreamSpillStoreFor, removeBashStreamSpillStore, renderBashStreamResult } from "./bashStreamOutput";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
@@ -276,10 +276,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
                     }
                 },
             });
-            const captures = result.captures ?? {
-                stdout: StreamCapture.fromText('stdout', result.stdout, spill),
-                stderr: StreamCapture.fromText('stderr', result.stderr, spill),
-            };
+            const { captures } = result;
             logger.debug(`[bash_stream:tool] done exit=${result.exitCode} stdoutChars=${captures.stdout.length} stderrChars=${captures.stderr.length}`);
             const text = renderBashStreamResult(result.exitCode, captures.stdout, captures.stderr);
             spill.end();
