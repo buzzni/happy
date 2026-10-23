@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -55,4 +55,22 @@ it('reports a Windows CLI missing when no Path entry holds an executable for it'
 
   expect(detectCLIAvailability()).toMatchObject({ claude: false, codex: false, gemini: false, openclaw: false });
   expect(mocks.execSync).not.toHaveBeenCalled();
+});
+
+it('ignores a Path directory named like an executable and a broken link', () => {
+  mkdirSync(join(binDir, 'claude.exe'));
+  symlinkSync(join(binDir, 'missing-codex.exe'), join(binDir, 'codex.exe'));
+  writeFileSync(join(binDir, 'real-gemini.exe'), '');
+  symlinkSync(join(binDir, 'real-gemini.exe'), join(binDir, 'gemini.exe'));
+  process.env.PATH = binDir;
+
+  expect(detectCLIAvailability()).toMatchObject({ claude: false, codex: false, gemini: true });
+});
+
+it('falls back to the default executable extensions when PATHEXT holds only empty entries', () => {
+  writeFileSync(join(binDir, 'codex.cmd'), '');
+  process.env.PATH = binDir;
+  process.env.PATHEXT = ' ; ;';
+
+  expect(detectCLIAvailability()).toMatchObject({ codex: true });
 });

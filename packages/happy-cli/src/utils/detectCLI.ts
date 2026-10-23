@@ -1,6 +1,6 @@
 import { execSync } from 'child_process';
 import os from 'os';
-import { existsSync } from 'fs';
+import { existsSync, lstatSync, statSync } from 'fs';
 import { join } from 'path';
 
 export interface CLIAvailability {
@@ -54,11 +54,10 @@ function detectWindows(): CLIAvailability {
   const pathEntries = (process.env.PATH ?? process.env.Path ?? '').split(';')
     .map((entry) => entry.trim().replace(/^"(.*)"$/, '$1'))
     .filter(Boolean);
-  const extensions = [...(process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';'), '.PS1']
-    .map((ext) => ext.trim())
-    .filter(Boolean);
+  const pathExt = (process.env.PATHEXT ?? '').split(';').map((ext) => ext.trim()).filter(Boolean);
+  const extensions = [...(pathExt.length > 0 ? pathExt : ['.COM', '.EXE', '.BAT', '.CMD']), '.PS1'];
   const checkCommand = (name: string): boolean =>
-    pathEntries.some((dir) => extensions.some((ext) => existsSync(join(dir, name + ext.toLowerCase()))));
+    pathEntries.some((dir) => extensions.some((ext) => isCommandFile(join(dir, name + ext.toLowerCase()))));
 
   const claude = checkCommand('claude');
   const codex = checkCommand('codex');
@@ -71,4 +70,22 @@ function detectWindows(): CLIAvailability {
   const openclaw = openclawCommand || openclawConfig || openclawEnv;
 
   return { claude, codex, gemini, openclaw, detectedAt: Date.now() };
+}
+
+/** A file, or a link that does not dangle. Directories named like `claude.exe` are not commands. */
+function isCommandFile(candidate: string): boolean {
+  try {
+    const entry = lstatSync(candidate);
+    if (entry.isFile()) return true;
+    if (!entry.isSymbolicLink()) return false;
+  } catch {
+    return false;
+  }
+  try {
+    return statSync(candidate).isFile();
+  } catch (error) {
+    // Node reports a WindowsApps execution alias (AppExecLink) as a link it cannot follow; only a
+    // missing target means the link is broken.
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
 }
