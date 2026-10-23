@@ -3,6 +3,7 @@ import {
     createTerminalOutputBuffer,
     DEFAULT_TERMINAL_BUFFER_CHARS,
     DEFAULT_TERMINAL_BUFFER_FRAMES,
+    TERMINAL_RESUME_PAGE_CHARS,
 } from './terminalOutputBuffer';
 
 describe('terminalOutputBuffer seq assignment', () => {
@@ -152,5 +153,110 @@ describe('terminalOutputBuffer bounding', () => {
 
     it('defaults the frame ceiling to the same order of magnitude as the character one', () => {
         expect(DEFAULT_TERMINAL_BUFFER_FRAMES).toBe(20_000);
+    });
+});
+
+/*
+ * specs/codexcli-daemon-stream-durability B-R3 — a resume that names `maxChars`
+ * is answered one page at a time, so a 1M-char backlog never travels as one
+ * message. A page never splits a frame (a half escape sequence is worse than a
+ * short page), and a resume without `maxChars` keeps the old one-shot answer.
+ */
+describe('terminalOutputBuffer paged resume (B-R3)', () => {
+    function fill(buffer: ReturnType<typeof createTerminalOutputBuffer>, frames: number, size: number) {
+        for (let i = 0; i < frames; i++) buffer.push(String(i % 10).repeat(size));
+    }
+
+    it('answers a full 1M-char buffer in at most 4 pages of 256K without splitting a frame', () => {
+        const buffer = createTerminalOutputBuffer();
+        fill(buffer, 250, 4_000); // exactly 1,000,000 chars, all still buffered
+        const pushed: Array<{ seq: number; chunk: string }> = [];
+        let afterSeq = 0;
+        let pages = 0;
+        for (;;) {
+            const answer = buffer.resume(afterSeq, TERMINAL_RESUME_PAGE_CHARS);
+            expect(answer.kind).toBe('replay');
+            if (answer.kind !== 'replay') break;
+            pages += 1;
+            const pageChars = answer.frames.reduce((n, f) => n + f.chunk.length, 0);
+            expect(pageChars).toBeLessThanOrEqual(TERMINAL_RESUME_PAGE_CHARS);
+            pushed.push(...answer.frames);
+            afterSeq = answer.frames[answer.frames.length - 1].seq;
+            expect(answer.nextSeq).toBe(afterSeq);
+            if (!answer.more) break;
+        }
+        expect(pages).toBeLessThanOrEqual(4);
+        expect(pushed.map((f) => f.seq)).toEqual(Array.from({ length: 250 }, (_, i) => i + 1));
+        for (const frame of pushed) expect(frame.chunk.length).toBe(4_000);
+    });
+
+    it('still hands over a frame larger than the page, whole, so paging always advances', () => {
+        const buffer = createTerminalOutputBuffer();
+        buffer.push('x'.repeat(10));
+        buffer.push('y'.repeat(10));
+        const answer = buffer.resume(0, 4);
+        expect(answer).toEqual({ kind: 'replay', frames: [{ seq: 1, chunk: 'x'.repeat(10) }], more: true, nextSeq: 1 });
+    });
+
+    it('marks the last page with more:false', () => {
+        const buffer = createTerminalOutputBuffer();
+        buffer.push('aa');
+        buffer.push('bb');
+        expect(buffer.resume(0, 100)).toEqual({
+            kind: 'replay',
+            frames: [{ seq: 1, chunk: 'aa' }, { seq: 2, chunk: 'bb' }],
+            more: false,
+            nextSeq: 2,
+        });
+    });
+
+    it('caps a caller-supplied page size at the protocol maximum', () => {
+        const buffer = createTerminalOutputBuffer();
+        fill(buffer, 100, 4_000);
+        const answer = buffer.resume(0, 10_000_000);
+        expect(answer.kind === 'replay' && answer.frames.reduce((n, f) => n + f.chunk.length, 0))
+            .toBeLessThanOrEqual(TERMINAL_RESUME_PAGE_CHARS);
+    });
+
+    it('turns a snapshot into a reset plus the first page, and says how much output was lost for good', () => {
+        const buffer = createTerminalOutputBuffer(9);
+        buffer.push('aaa');
+        buffer.push('bbb');
+        buffer.push('ccc');
+        buffer.push('ddd'); // frame 1 (3 chars) is gone
+        const first = buffer.resume(0, 4);
+        expect(first).toEqual({ kind: 'snapshot', seq: 2, data: 'bbb', more: true, nextSeq: 2, droppedChars: 3 });
+        // The rest is ordinary replay after the snapshot's seq.
+        expect(buffer.resume(2, 100)).toEqual({
+            kind: 'replay',
+            frames: [{ seq: 3, chunk: 'ccc' }, { seq: 4, chunk: 'ddd' }],
+            more: false,
+            nextSeq: 4,
+        });
+    });
+
+    it('counts only the lost output after the client\'s own position', () => {
+        const buffer = createTerminalOutputBuffer(6);
+        for (const chunk of ['a', 'bb', 'ccc', 'dddd', 'eeeee']) buffer.push(chunk);
+        // Buffered: 'eeeee' (seq 5) only. A client at seq 2 lost 'ccc'+'dddd'.
+        const answer = buffer.resume(2, 100);
+        expect(answer.kind).toBe('snapshot');
+        expect(answer.kind === 'snapshot' && answer.droppedChars).toBe(7);
+    });
+
+    it('reports the lost characters on a paged gap too', () => {
+        const buffer = createTerminalOutputBuffer(1);
+        buffer.push('aaaa');
+        buffer.push('bbbb');
+        expect(buffer.resume(1, 100)).toEqual({ kind: 'gap', fromSeq: 2, droppedChars: 4 });
+    });
+
+    it('keeps the one-shot answer exactly as before when maxChars is absent', () => {
+        const buffer = createTerminalOutputBuffer(6);
+        buffer.push('aaa');
+        buffer.push('bbb');
+        buffer.push('ccc');
+        expect(buffer.resume(0)).toEqual({ kind: 'snapshot', seq: 3, data: 'bbbccc' });
+        expect(buffer.resume(1)).toEqual({ kind: 'replay', frames: [{ seq: 2, chunk: 'bbb' }, { seq: 3, chunk: 'ccc' }] });
     });
 });

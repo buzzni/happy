@@ -478,6 +478,25 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(emitsOf('terminal-frame').map((p: any) => p.seq)).toEqual([1, 2]);
         });
 
+        // specs/codexcli-daemon-stream-durability B3 — a resume naming maxChars
+        // is answered one page at a time; the client pulls the next page.
+        it('pages a resume that names maxChars and merges an overlapping one', () => {
+            const big = Array.from({ length: 250 }, (_, i) => String(i % 10).repeat(4_000));
+            openRegisteredSession(big);
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0, maxChars: 262_144 });
+            const firstPage = emitsOf('terminal-frame');
+            expect(firstPage.length).toBeLessThan(250);
+            const last = firstPage[firstPage.length - 1];
+            expect(last).toMatchObject({ more: true, nextSeq: last.seq });
+
+            // A second ask for the same hole while the page is in flight is merged.
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0, maxChars: 262_144 });
+            expect(emitsOf('terminal-frame')).toHaveLength(firstPage.length);
+
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: last.seq, maxChars: 262_144 });
+            expect(emitsOf('terminal-frame')[firstPage.length].seq).toBe(last.seq + 1);
+        });
+
         /*
          * Why this matters: the client's input and the daemon's output are both
          * silent during a disconnect, so the idle watchdog keeps counting. A
@@ -546,7 +565,7 @@ describe('ApiMachineClient socket reconnection', () => {
             });
 
             expect(ack.ok).toBe(true);
-            expect(ack.caps).toEqual({ resume: true, snapshot: true });
+            expect(ack.caps).toEqual({ resume: true, snapshot: true, pagedResume: true });
             const banner = emitsOf('terminal-frame')[0];
             expect(banner.sessionId).toBe(sessionId);
             expect(banner.seq).toBe(1);
