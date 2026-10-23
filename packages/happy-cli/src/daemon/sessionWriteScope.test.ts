@@ -2,27 +2,101 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { SessionWriteScopeBroker, decisionBytes, type ScopeDecision, type ScopeRequest } from './sessionWriteScope';
 
-function fixture() {
+function fixture(readiness?: () => string | undefined) {
   const keys = generateKeyPairSync('ed25519');
-  let now = 1000;
+  let now = 1000; let generation = 'pid-1';
   const apply = vi.fn(async () => ({ profileApplied: true, cleanup: 'unresolved' as const }));
   const canonicalize = vi.fn(async (path: string) => ({ requestedPath: path, root: path, identity: 'dev:ino', floor: ['/protected'] }));
   const changed = vi.fn(async (_requests: ScopeRequest[]) => {});
   const broker = new SessionWriteScopeBroker({
     publicKey: keys.publicKey, machineId: 'machine', accountId: 'account', incarnation: 'launch',
     now: () => now, resolveSession: async (sessionId) => sessionId === 'session'
-      ? { projectRoot: '/project', generation: 'pid-1' } : null,
-    canonicalize, apply, changed,
+      ? { projectRoot: '/project', generation } : null,
+    canonicalize, apply, changed, readiness,
   });
   const decide = (request: ScopeRequest, action: ScopeDecision['action'] = 'allow', privateKey = keys.privateKey) => {
     const decision: ScopeDecision = { version: 1, requestId: request.id, digest: request.digest, incarnation: 'launch',
       accountId: 'account', machineId: 'machine', sessionId: 'session', action };
     return { decision, signature: sign(null, decisionBytes(decision), privateKey).toString('base64url') };
   };
-  return { broker, apply, decide, canonicalize, changed, advance: () => { now += 600001; } };
+  return { broker, apply, decide, canonicalize, changed, advance: (ms = 600001) => { now += ms; }, setGeneration: (value: string) => { generation = value; } };
 }
 
 describe('session write scope approval authority', () => {
+  it('durably accepts busy approval, returns immediately, and applies once when ready', async () => {
+    let reason: string | undefined = 'SCOPE_WAITING_TURN';
+    const f = fixture(() => reason); const request = await f.broker.request('session', '/target', 'Install tool');
+    const envelope = f.decide(request);
+    expect(await f.broker.decide(envelope)).toMatchObject({ state: 'applying', error: 'SCOPE_WAITING_TURN' });
+    expect(await f.broker.decide(envelope)).toMatchObject({ state: 'applying' });
+    await f.broker.flush(); expect(f.apply).not.toHaveBeenCalled();
+    reason = undefined; await f.broker.flush(); await f.broker.flush();
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.broker.list('session')[0]).toMatchObject({ state: 'cleanup-unresolved', profileApplied: true });
+    expect(f.broker.list('session')[0].error).toBeUndefined();
+  });
+  it('bounds mutation-free retries and never retries an ambiguous drain failure', async () => {
+    const f = fixture(() => undefined); const request = await f.broker.request('session', '/target', 'Install tool');
+    f.apply.mockRejectedValue(new Error('SCOPE_DRAIN_RETRY_SAFE'));
+    await f.broker.decide(f.decide(request));
+    for (let n = 0; n < 5; n++) await f.broker.flush();
+    expect(f.apply).toHaveBeenCalledTimes(4);
+    expect(f.broker.list('session')[0]).toMatchObject({ state: 'failed', error: 'SCOPE_BUSY_RETRY_EXHAUSTED' });
+    const g = fixture(() => undefined); const next = await g.broker.request('session', '/target', 'Install tool');
+    g.apply.mockResolvedValue({ profileApplied: false, cleanup: 'unresolved' });
+    await g.broker.decide(g.decide(next)); await g.broker.flush(); await g.broker.flush();
+    expect(g.apply).toHaveBeenCalledTimes(1);
+  });
+  it('uses a bounded post-approval deadline without modifying the signed descriptor', async () => {
+    const f = fixture(() => undefined); const request = await f.broker.request('session', '/target', 'Install tool');
+    f.advance(590000); await f.broker.decide(f.decide(request)); f.advance(20000); await f.broker.flush();
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.broker.list('session')[0].expiresAt).toBe(request.expiresAt);
+  });
+  it('does not rebind a second queued approval after the first replacement changes generation', async () => {
+    const f = fixture(() => undefined);
+    const first = await f.broker.request('session', '/one', 'Install tool');
+    const second = await f.broker.request('session', '/two', 'Install tool');
+    await f.broker.decide(f.decide(first)); await f.broker.decide(f.decide(second));
+    f.apply.mockImplementationOnce(async () => { f.setGeneration('pid-2'); return { profileApplied: true, cleanup: 'unresolved' }; });
+    await f.broker.flush(); await f.broker.flush();
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.broker.list('session')[1]).toMatchObject({ state: 'failed', error: 'WRITE_SCOPE_CHANGED' });
+  });
+  it('rejects cancellation after application has claimed the request', async () => {
+    const f = fixture(() => undefined); const request = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(request)); const applying = f.broker.flush();
+    await expect(f.broker.cancel('session', request.id)).rejects.toThrow('REQUEST_NOT_PENDING');
+    await applying; expect(f.apply).toHaveBeenCalledTimes(1);
+  });
+  it('does not reapply when saving the confirmed result fails', async () => {
+    const f = fixture(() => undefined); const request = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(request));
+    f.changed.mockImplementation(async records => { if (records.some(item => item.profileApplied)) throw new Error('disk full'); });
+    await expect(f.broker.flush()).rejects.toThrow('SCOPE_JOURNAL_FAILED');
+    f.changed.mockResolvedValue(); await f.broker.flush();
+    expect(f.apply).toHaveBeenCalledTimes(1);
+    expect(f.broker.list('session')[0]).toMatchObject({ profileApplied: true, cleanup: 'unresolved', error: 'SCOPE_JOURNAL_FAILED' });
+  });
+  it('cancels an accepted waiting request without applying it', async () => {
+    const f = fixture(() => 'SCOPE_WAITING_INPUT');
+    const request = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(request));
+    await f.broker.decide(f.decide(request, 'cancel')); await f.broker.flush();
+    expect(f.broker.list('session')[0].state).toBe('cancelled'); expect(f.apply).not.toHaveBeenCalled();
+  });
+  it('never dispatches an accepted request whose journal admission failed', async () => {
+    const f = fixture(() => undefined); const request = await f.broker.request('session', '/target', 'Install tool');
+    f.changed.mockRejectedValueOnce(new Error('disk full'));
+    await expect(f.broker.decide(f.decide(request))).rejects.toThrow();
+    await f.broker.flush(); expect(f.apply).not.toHaveBeenCalled();
+  });
+  it('expires waiting approvals and never restores them in another broker', async () => {
+    const f = fixture(() => 'SCOPE_WAITING_TURN'); const request = await f.broker.request('session', '/target', 'Install tool');
+    await f.broker.decide(f.decide(request)); f.advance(); await f.broker.flush();
+    expect(f.broker.list('session')[0]).toMatchObject({ state: 'expired', error: 'REQUEST_EXPIRED' });
+    expect(f.apply).not.toHaveBeenCalled();
+  });
   it('refuses an agent signature and never treats a shared bearer as approval', async () => {
     const f = fixture();
     const request = await f.broker.request('session', '/target', 'Install tool');
@@ -65,6 +139,14 @@ describe('session write scope approval authority', () => {
     expect(result.state).toBe('failed');
     expect(JSON.stringify(result)).not.toContain('raw secret');
     await expect(f.broker.decide(f.decide(request))).rejects.toThrow('REQUEST_NOT_PENDING');
+  });
+  it('preserves known failure causes but does not expose arbitrary uppercase error text', async () => {
+    for (const [message, code] of [['WRITE_SCOPE_CHANGED', 'WRITE_SCOPE_CHANGED'],
+      ['PRIVATE_TOKEN_VALUE', 'SCOPE_APPLICATION_FAILED']]) {
+      const f = fixture(); f.apply.mockRejectedValueOnce(new Error(message));
+      const request = await f.broker.request('session', '/target', 'Install tool');
+      expect((await f.broker.decide(f.decide(request))).error).toBe(code);
+    }
   });
   it('does not expose mutable descriptors or restore approvals after restart', async () => {
     const f = fixture(); const request = await f.broker.request('session', '/target', 'Install tool');
@@ -140,7 +222,7 @@ describe('session write scope approval authority', () => {
     const revoke = await f.broker.request('session', '/target', 'Revoke tool', 'revoke');
     f.canonicalize.mockImplementation(async path => ({ requestedPath: path, root: path,
       identity: path === '/other' ? 'replacement-inode' : 'dev:ino', floor: ['/protected'] }));
-    expect((await f.broker.decide(f.decide(revoke))).state).toBe('failed');
+    expect((await f.broker.decide(f.decide(revoke))).state).toBe('cleanup-unresolved');
     expect(f.apply).toHaveBeenCalledTimes(2);
     expect(f.broker.list('session').filter(request => request.grantActive).map(request => request.root)).toEqual(['/other']);
   });

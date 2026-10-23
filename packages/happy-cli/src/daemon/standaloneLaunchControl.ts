@@ -144,6 +144,10 @@ export class StandaloneLaunchControl {
       }).catch(() => done({ ...blocked }));
     });
   }
+  canRetry(launchId: string): boolean {
+    const entry = this.entries.get(launchId);
+    return entry?.retryable === true && !entry.operation;
+  }
   /** Only the launch owner may call this after recording the durable outcome. */
   forget(launchId: string): void {
     const entry = this.entries.get(launchId);

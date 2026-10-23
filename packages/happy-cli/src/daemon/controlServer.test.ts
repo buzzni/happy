@@ -1383,3 +1383,30 @@ it('lets only the local user mark this PC shared, and shows the marker on a sepa
   expect(await (await send('shared-status',auth)).json()).toEqual({machineType:'shared',awaitingSharedConfirmation:true});
  }finally{await server.stop();}
 });
+
+
+describe('scope approval diagnostic transport', () => {
+  it('preserves public decision codes and hides arbitrary exception text at the HTTP boundary', async () => {
+    let failure = 'APPROVAL_BINDING_MISMATCH';
+    const directory = mkdtempSync(path.join(tmpdir(), 'scope-http-'));
+    const server = await startDaemonControlServer({
+      getChildren: () => [], stopSession: () => ({ stopped: false, reason: 'not-found' }),
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      requestShutdown: () => {}, onHappySessionWebhook: () => {},
+      portRegistry: createPortRegistry({ filePath: path.join(directory, 'ports.json'), portMin: 33000, portMax: 33010, isPortBindable: async () => true }),
+      writeScopeRuntime: { broker: { decide: async () => { throw new Error(failure); } } } as any,
+    });
+    try {
+      for (const [message, code] of [['APPROVAL_BINDING_MISMATCH', 'APPROVAL_BINDING_MISMATCH'],
+        ['PRIVATE_TOKEN_VALUE', 'WRITE_SCOPE_DECISION_REJECTED']]) {
+        failure = message;
+        const response = await realFetch(`http://127.0.0.1:${server.port}/session-write-scope/decide`, {
+          method: 'POST', headers: { Authorization: `Bearer ${server.controlSecret}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision: { version: 1, requestId: '11111111-1111-4111-8111-111111111111',
+            digest: 'd'.repeat(64), incarnation: 'launch', accountId: 'account', machineId: 'machine', sessionId: 'session', action: 'allow' }, signature: 'fixture' }),
+        });
+        expect(response.status).toBe(409); expect(await response.json()).toEqual({ code });
+      }
+    } finally { await server.stop(); rmSync(directory, { recursive: true, force: true }); }
+  });
+});

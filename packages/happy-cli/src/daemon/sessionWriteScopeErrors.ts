@@ -1,0 +1,13 @@
+/** Public diagnostics are fixed codes, never arbitrary exception messages. */
+const publicCodes = new Set([
+  'SESSION_SCOPE_BUSY', 'SESSION_PRESERVATION_FAILED', 'SESSION_SCOPE_CHANGED', 'WRITE_SCOPE_CHANGED',
+  'REQUEST_EXPIRED', 'GRANT_LIMIT_REACHED', 'GRANT_NOT_ACTIVE', 'REQUEST_NOT_PENDING',
+  'INVALID_APPROVAL', 'APPROVAL_BINDING_MISMATCH', 'PROTECTED_SESSION_REQUIRED', 'POLICY_DENIES_WRITE_ROOT',
+  'ROOT_EXIT_UNCONFIRMED', 'ROOT_STOP_FAILED', 'SCOPE_DRAIN_UNCONFIRMED', 'SCOPE_RESUME_FAILED',
+  'SCOPE_PROFILE_UNCONFIRMED', 'SCOPE_PROFILE_CHILD_EXITED', 'SCOPE_PROFILE_TIMEOUT',
+  'SCOPE_JOURNAL_SAFETY_LIMIT_REACHED', 'SCOPE_JOURNAL_FAILED', 'SCOPE_BUSY_RETRY_EXHAUSTED', 'SCOPE_APPLICATION_FAILED',
+]);
+export function scopeErrorCode(error: unknown, fallback = 'SCOPE_APPLICATION_FAILED'): string {
+  const code = error instanceof Error ? error.message : error;
+  return typeof code === 'string' && publicCodes.has(code) ? code : fallback;
+}
