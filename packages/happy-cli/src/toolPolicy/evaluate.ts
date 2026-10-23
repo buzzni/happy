@@ -438,9 +438,9 @@ function keyCheck(tool: string, args: Record<string, unknown>, platform: NodeJS.
 /**
  * R8 verb dictionary: every word of the tool name (`_`, `-`, `.` and camelCase boundaries) against the
  * dictionary, the strongest grade winning — high > write. A dictionary noun (`message`, `email`) is a noun,
- * not a verb, where a read verb comes before it: as the second word only in `message_list` form (the
- * old two-word window, unchanged), anywhere from the third word on (`get_latest_release`). Splitting
- * acronyms (`bulkURLDelete`) or not (`DElete`) are both tried, so no name reads weaker than before.
+ * not a verb, as the first word before a read verb (`message_list`, the old two-word window, unchanged) and
+ * from the third word on after a read verb in the same clause (`get_latest_release`, not `get_quote_and_trade`).
+ * Splitting acronyms (`bulkURLDelete`) or not (`DElete`) are both tried, so no name reads weaker than before.
  */
 export function verbOf(tool: string, tables: ToolPolicyTables = BUILTIN_TABLES): 'high' | 'write' | null {
     const camel = tool.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
@@ -448,10 +448,17 @@ export function verbOf(tool: string, tables: ToolPolicyTables = BUILTIN_TABLES):
     return grade === 2 ? 'high' : grade === 1 ? 'write' : null;
 }
 
+const CLAUSE_WORDS = ['and', 'then', 'or'];
+
 function verbGrade(name: string, tables: ToolPolicyTables): number {
     const { mcp } = tables;
     const words = name.toLowerCase().split(/[_\-.]+/).filter(Boolean);
-    const readBefore = (index: number) => words.slice(0, index).some((word) => mcp.readVerbs.includes(word));
+    // A read verb covers only its own clause: `get_quote_and_trade` trades.
+    const readBefore = (index: number) => {
+        const clause = words.slice(0, index);
+        const start = Math.max(...CLAUSE_WORDS.map((word) => clause.lastIndexOf(word))) + 1;
+        return clause.slice(start).some((word) => mcp.readVerbs.includes(word));
+    };
     const noun = (word: string, index: number) => mcp.nounFirstWords.includes(word)
         && (index === 0 ? mcp.readVerbs.includes(words[1]) : index >= 2 && readBefore(index));
     return Math.max(0, ...words.map((word, index) => noun(word, index) ? 0

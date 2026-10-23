@@ -248,12 +248,21 @@ describe('MCP tool defaults (policy-tables §4, R8)', () => {
         ['edit_message', 'high'], ['add_comment_to_post', 'high'], ['create_draft_email', 'high'],
         // Only the noun drops out; a verb after it still counts.
         ['get_message_then_delete', 'high'], ['list_orders_and_send_email', 'high'],
+        // Review bot #930: a read verb only covers its own clause; after `and`/`then`/`or` the noun is an action again.
+        ['get_quote_and_trade', 'high'], ['search_and_post_message', 'high'], ['list_items_then_release', 'high'], ['get_or_charge_payment', 'high'],
+        ['items_and_list_payment', null],
     ] as const)('verbOf(%s) is %s with nouns past the second word', (tool, verb) => {
         expect(verbOf(tool)).toBe(verb);
     });
 
     it('a real read tool with readOnlyHint stays allowed', () => {
         expect(decide(mcp('mcp__github__get_latest_release', { readOnlyHint: true })).reasonCode).toBe('default_allow');
+    });
+
+    // Review bot #930, decided on purpose: a high-risk verb anywhere in the name stays high under readOnlyHint (R8.3 — the
+    // server's claim only tightens). A person approves it once per session; nouns after a read verb are the only exemption.
+    it('keeps a high-risk verb past the second word high even with readOnlyHint', () => {
+        expect(decide(mcp('mcp__github__get_pull_request_merge_status', { readOnlyHint: true }))).toMatchObject({ decision: 'ask', reasonCode: 'high_risk_write', humanOnly: true });
     });
 
     // VF1 cross review #2: an acronym split never loses a word the camelCase split alone would have matched.
