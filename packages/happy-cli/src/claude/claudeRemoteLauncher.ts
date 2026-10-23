@@ -223,6 +223,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     // Create permission handler
     const permissionHandler = new PermissionHandler(session);
+    // The unattended wait reads this run's turn attendance (codexcli-approval-session-binding R10).
+    permissionHandler.setAttendance(session.turnAttendance);
     session.policyApprover = permissionHandler;
     let mcpStatusReader: Pick<McpRuntimeRecovery, 'readStatuses'> | null = null;
     let mcpController: Pick<McpRuntimeRecovery, 'reconnectServer'> | null = null;
@@ -627,6 +629,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             latencyTraces: QueueLatencyTrace[];
             /** Carried through the deferral so an isolated channel turn keeps its handle. */
             channelRequestId?: string;
+            /** Carried through the deferral so the turn is classified by its own inputs (R10a). */
+            allUnattended?: boolean;
         } | null = null;
         /*
          * Queue time ends when a generation takes the batch. A batch held back
@@ -841,6 +845,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
                             messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
+                            session.turnAttendance?.startTurn({ allUnattended: p.allUnattended, channel: p.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(p.channelRequestId);
                             lastTurnCommand = isCommandText(p.message);
                             transientRetry.userTurnStarted();
@@ -1014,6 +1019,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // A batch with no channel message clears it, so an in-app turn never
                             // inherits an id.
                             messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
+                            session.turnAttendance?.startTurn({ allUnattended: msg.allUnattended, channel: msg.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(msg.channelRequestId);
                             lastTurnCommand = isCommandText(msg.message);
                             permissionHandler.handleModeChange(mode.permissionMode);
@@ -1360,6 +1366,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // Clean up permission handler
         session.policyApprover = null;
         permissionHandler.reset(undefined, 'shutdown');
+        permissionHandler.setAttendance(null);
 
         // Reset Terminal
         const t0 = Date.now();

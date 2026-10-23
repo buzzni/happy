@@ -1,4 +1,5 @@
 import { logger } from "@/ui/logger";
+import type { InputAttendance } from "@/api/turnAttendance";
 
 export type PendingAttachment = { data: Uint8Array; mimeType: string; name: string };
 
@@ -28,6 +29,11 @@ interface QueueItem<T> {
      * execution approval and switch off its slash commands.
      */
     channelRequestId?: string;
+    /**
+     * Who sent this input (codexcli-approval-session-binding R10a). Beside the mode for the same
+     * reason as `requestIds`: inside it, it would split batches. Absent means a person.
+     */
+    attendance?: InputAttendance;
 }
 
 export type CollectedBatch<T> = {
@@ -49,6 +55,11 @@ export type CollectedBatch<T> = {
      * batch carries at most one — and a batch with one carries nothing else.
      */
     channelRequestId?: string;
+    /**
+     * Every merged input was sent by something nobody watches. The batch is one turn, so a single
+     * input from anyone else makes the whole turn attended (plan §3.4).
+     */
+    allUnattended: boolean;
 }
 
 /**
@@ -89,7 +100,7 @@ export class MessageQueue2<T> {
      * Push a message to the queue with a mode and an optional list of
      * attachments that travel with this message.
      */
-    push(message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace): void {
+    push(message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance): void {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -105,6 +116,7 @@ export class MessageQueue2<T> {
             attachments,
             requestIds,
             latencyTrace,
+            ...(attendance ? { attendance } : {}),
         });
 
         // Trigger message handler if set
@@ -259,13 +271,13 @@ export class MessageQueue2<T> {
      * that were already queued. Used for an automation turn that wakes an
      * existing session while preserving subsequent user input.
      */
-    unshiftIsolated(message: string, mode: T, latencyTrace?: QueueLatencyTrace): void {
+    unshiftIsolated(message: string, mode: T, latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance): void {
         if (this.closed) {
             throw new Error('Cannot unshift to closed queue');
         }
 
         const modeHash = this.modeHasher(mode);
-        this.queue.unshift({ message, mode, modeHash, isolate: true, latencyTrace });
+        this.queue.unshift({ message, mode, modeHash, isolate: true, latencyTrace, ...(attendance ? { attendance } : {}) });
         if (this.onMessageHandler) {
             this.onMessageHandler(message, mode);
         }
@@ -393,6 +405,7 @@ export class MessageQueue2<T> {
         const collectedRequestIds: string[] = [];
         const latencyTraces: QueueLatencyTrace[] = [];
         let channelRequestId: string | undefined;
+        let allUnattended = true;
         let mode = firstItem.mode;
         let isolate = firstItem.isolate ?? false;
         const targetModeHash = firstItem.modeHash;
@@ -404,6 +417,7 @@ export class MessageQueue2<T> {
             if (item.attachments) collectedAttachments.push(...item.attachments);
             if (item.requestIds) collectedRequestIds.push(...item.requestIds);
             if (item.latencyTrace) latencyTraces.push(item.latencyTrace);
+            if (item.attendance !== 'unattended') allUnattended = false;
             channelRequestId = item.channelRequestId;
             logger.debug(`[MessageQueue2] Collected isolated message with mode hash: ${targetModeHash}`);
         } else {
@@ -416,6 +430,7 @@ export class MessageQueue2<T> {
                 if (item.attachments) collectedAttachments.push(...item.attachments);
                 if (item.requestIds) collectedRequestIds.push(...item.requestIds);
                 if (item.latencyTrace) latencyTraces.push(item.latencyTrace);
+                if (item.attendance !== 'unattended') allUnattended = false;
             }
             logger.debug(`[MessageQueue2] Collected batch of ${sameModeMessages.length} messages with mode hash: ${targetModeHash}`);
         }
@@ -433,6 +448,7 @@ export class MessageQueue2<T> {
             attachments: collectedAttachments.length > 0 ? collectedAttachments : undefined,
             requestIds: collectedRequestIds.length > 0 ? collectedRequestIds : undefined,
             ...(channelRequestId !== undefined ? { channelRequestId } : {}),
+            allUnattended,
         };
     }
 

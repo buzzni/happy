@@ -1,4 +1,5 @@
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
+import type { DelegatedAttendance } from '@/api/turnAttendance';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
 /**
@@ -543,6 +544,8 @@ export async function startHappyServer(
         /** The agent process runs under the sandbox-runtime wrapper, whose Linux seccomp denies AF_UNIX to the bridge. */
         wrappedSandbox?: boolean;
         admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
+        /** The current turn's attendance, handed to children this session delegates to (R12). */
+        delegatedAttendance?: () => DelegatedAttendance | null;
         proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
         /** specs/desktop-next-steps-card — whether the running turn's client draws the card. */
         turnCards?: TurnCards;
@@ -679,7 +682,9 @@ export async function startHappyServer(
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         throw error;
     });
-    const agentBroker = options.agentControl ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool) : null;
+    const agentBroker = options.agentControl
+        ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance)
+        : null;
     // Env for the stdio bridge. Codex and ACP agents receive it over JSON-RPC, not argv.
     const bridgeEnv: Record<string, string> = socketPath
         ? { SAYCODE_MCP_SOCKET: socketPath, SAYCODE_MCP_TOKEN: token }

@@ -51,7 +51,7 @@ async function setup(options: { approver: PolicyApprover | null; resolver?: Targ
         grants,
         audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => 's1', publishRecent: (r) => recent.push(r) }),
         approver: () => options.approver,
-        unattended: options.unattended ?? false,
+        unattended: () => options.unattended ?? false,
         terminalPrompt: () => options.terminalPrompt ?? false,
         platform: 'darwin',
         approvalTimeoutMs: options.approvalTimeoutMs,
@@ -236,11 +236,33 @@ describe('Claude PreToolUse policy hook', () => {
             grants: createPolicyGrantStore(),
             audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-abort-')), 'a.jsonl'), sessionId: () => null }),
             approver: () => approverAnswering({ approved: true, policyGrant: 'session' }, asked),
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         await expect(gate.decide({ toolName: 'mcp__gmail__send_email', toolInput: {} }, controller.signal)).resolves.toMatchObject({ kind: 'deny', reasonCode: 'aborted' });
         expect(asked).toHaveLength(0);
+    });
+
+    it('reads the turn\'s attendance on every decision (codexcli-approval-session-binding R10a, Q9)', async () => {
+        const asked: Asked[] = [];
+        let unattended = true;
+        const gate = createToolPolicyGate({
+            loadMachinePolicy: () => ABSENT_MACHINE_POLICY,
+            resolver: NOTES_RESOLVER,
+            grants: createPolicyGrantStore(),
+            audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-attendance-')), 'a.jsonl'), sessionId: () => null }),
+            approver: () => approverAnswering({ approved: true, policyGrant: 'once' }, asked),
+            unattended: () => unattended,
+            platform: 'darwin',
+        });
+        const call = { toolName: 'mcp__gmail__send_email', toolInput: {} };
+        await expect(gate.decide(call, new AbortController().signal)).resolves.toMatchObject({ kind: 'deny', reasonCode: 'unattended_no_approver' });
+        expect(asked).toHaveLength(0);
+
+        // A person wrote during the turn: the next ask waits for them.
+        unattended = false;
+        await expect(gate.decide(call, new AbortController().signal)).resolves.toEqual({ kind: 'allow' });
+        expect(asked).toHaveLength(1);
     });
 
     it('leaves Saycode\'s own tools alone', async () => {
@@ -280,7 +302,7 @@ describe('decision latency', () => {
             grants,
             audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-lat-')), 'a.jsonl'), sessionId: () => null }),
             approver: () => null,
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         const samples: number[] = [];
@@ -301,7 +323,7 @@ describe('decision latency', () => {
             grants: createPolicyGrantStore(),
             audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-lat-')), 'a.jsonl'), sessionId: () => null }),
             approver: () => approverAnswering({ approved: false, policyGrant: 'once' }, asked),
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         await gate.decide({ toolName: 'mcp__cua-driver__click', toolInput: { pid: 13 } }, new AbortController().signal);

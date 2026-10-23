@@ -11,6 +11,12 @@ describe('enqueueCodexUserText', () => {
         expect(queue.push).toHaveBeenCalledWith('OK', 'mode', undefined, ['route'], latencyTrace);
     });
 
+    it('carries who sent the text, so its turn can be classified (codexcli-approval-session-binding R10a)', () => {
+        const queue = { push: vi.fn(), pushIsolateAndClear: vi.fn() };
+        enqueueCodexUserText({ text: 'scheduled', mode: 'mode', queue, attendance: 'unattended' });
+        expect(queue.push).toHaveBeenCalledWith('scheduled', 'mode', undefined, undefined, undefined, 'unattended');
+    });
+
     it('preserves the trace when an isolated clear command is queued', () => {
         const queue = { push: vi.fn(), pushIsolateAndClear: vi.fn() };
         const latencyTrace = { id: 'trace', receivedAt: 10 };

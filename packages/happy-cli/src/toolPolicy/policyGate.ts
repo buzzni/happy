@@ -103,8 +103,12 @@ export function createToolPolicyGate(deps: {
     grants: PolicyGrantStore;
     audit: ToolPolicyAuditLog;
     approver: () => PolicyApprover | null;
-    /** A run with nobody to answer (run-once automation): `ask` becomes `blocked`. */
-    unattended: boolean;
+    /**
+     * Nobody can answer this turn (agent-tool-policy R3): `ask` becomes `blocked`. Read on every
+     * decision, because it is the current turn's attendance (codexcli-approval-session-binding R10a,
+     * Q9) — a person writing mid-turn makes the next `ask` wait for them.
+     */
+    unattended: () => boolean;
     /** True while the session runs in Claude's terminal UI, where a person answers Claude's own prompt. */
     terminalPrompt?: () => boolean;
     platform?: NodeJS.Platform;
@@ -171,7 +175,7 @@ export function createToolPolicyGate(deps: {
 
             // The hook went away while the target was being looked up: nobody will read an answer.
             if (signal.aborted) return refuse(call, verdict, 'aborted', 'aborted');
-            if (deps.unattended) return refuse(call, verdict, 'unattended_no_approver', 'unattended');
+            if (deps.unattended()) return refuse(call, verdict, 'unattended_no_approver', 'unattended');
             const approver = deps.approver();
             if (!approver && call.origin === undefined && deps.terminalPrompt?.()) {
                 audit(call, verdict, 'terminal_prompt', 'ask');

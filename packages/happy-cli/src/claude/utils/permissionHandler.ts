@@ -24,6 +24,8 @@ import { getToolDescriptor } from "./getToolDescriptor";
 import { mapToClaudeMode } from "./permissionMode";
 import { APPROVAL_TIMEOUT_ABORT_REASON, type PermissionPolicyMeta, type PolicyApprovalAnswer, type PolicyApprover } from "@/toolPolicy/policyGate";
 import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from "@/utils/permissionResolution";
+import { ApprovalExpiryTimers } from "@/utils/approvalExpiry";
+import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
 
 export type { PermissionAck };
 
@@ -83,6 +85,8 @@ export class PermissionHandler implements PolicyApprover {
     private nextInstanceSeq = 1;
     /** Settled ids, kept across `reset()` so a late answer is told what happened (plan §3.4, T16). */
     private readonly resolved = new ResolvedPermissionLog();
+    /** The unattended wait (spec R10, T21). Inert until the launcher hands over the turn's attendance. */
+    private readonly expiry = new ApprovalExpiryTimers({ onReleased: (ids) => this.dropExpiresAt(ids) });
     private session: Session;
     private allowedTools = new Set<string>();
     private allowedBashLiterals = new Set<string>();
@@ -179,6 +183,11 @@ export class PermissionHandler implements PolicyApprover {
     constructor(session: Session) {
         this.session = session;
         this.setupClientHandler();
+    }
+
+    /** Which turn attendance decides whether a prompt waits forever or is declined (R10a). */
+    setAttendance(attendance: TurnAttendanceState | null): void {
+        this.expiry.setAttendance(attendance);
     }
 
     /**
@@ -395,9 +404,12 @@ export class PermissionHandler implements PolicyApprover {
                 // Only the raising this handler belongs to: a reused id may already be a newer one.
                 if (this.pendingRequests.get(id)?.instanceSeq !== instanceSeq) return;
                 this.pendingRequests.delete(id);
+                this.expiry.clear(id);
                 this.withdrawChannelBinding(id, 'aborted');
                 // The gate gives up on a policy approval with its own reason; anything else is a stop.
                 const resolution: PermissionResolution = signal.reason === APPROVAL_TIMEOUT_ABORT_REASON ? 'expired' : 'aborted';
+                // A messenger turn's policy prompt that timed out spends the turn's wait (plan §3.4, Q6).
+                if (resolution === 'expired') this.expiry.spendBudget();
                 this.resolved.record(id, resolution);
                 // Recorded here, not left for the next reset: until then every other screen would
                 // keep a live card for a call that will never run (T14).
@@ -421,6 +433,9 @@ export class PermissionHandler implements PolicyApprover {
                 instanceSeq
             });
 
+            const createdAt = Date.now();
+            const wait = this.expiry.arm(id, { policy: Boolean(policy) }, () => this.expire(id, instanceSeq));
+
             // The binding is **not** recorded here. The turn this prompt belongs to has not been
             // stamped yet — the assistant message that opens it is the delayed one this callback
             // is about to release. `bindChannelPermission` is applied from the queue, after it.
@@ -429,6 +444,13 @@ export class PermissionHandler implements PolicyApprover {
             // refused as `unknown-request` rather than applied to a guessed turn.
             if (this.onPermissionRequestCallback) {
                 this.onPermissionRequestCallback(id, toolName, instanceSeq);
+            }
+
+            // This turn already spent its wait (Q6): declined without a card or a push. The callback
+            // above still ran — it releases the delayed message that carries the tool call.
+            if (wait.kind === 'decline-now') {
+                this.expire(id, instanceSeq, { tool: toolName, arguments: input, createdAt });
+                return;
             }
 
             // Send push notification
@@ -452,8 +474,9 @@ export class PermissionHandler implements PolicyApprover {
                     [id]: {
                         tool: toolName,
                         arguments: input,
-                        createdAt: Date.now(),
+                        createdAt,
                         ...(policy ? { policy } : {}),
+                        ...(wait.kind === 'timed' ? { expiresAt: wait.expiresAt } : {}),
                     }
                 }
             }));
@@ -462,6 +485,55 @@ export class PermissionHandler implements PolicyApprover {
         });
     }
 
+
+    /**
+     * Nobody answered in time (spec R10, Q2): decline this one prompt and let the turn go on.
+     *
+     * Not recorded in `responses`: a denial there reads as "the person stopped this tool", which
+     * ends the turn (`isAborted`). The reason tells the model what happened instead (T22).
+     * `raised` is given only when the prompt was never written to the agent state.
+     */
+    private expire(id: string, instanceSeq: number, raised?: { tool: string; arguments: unknown; createdAt: number }): void {
+        const pending = this.pendingRequests.get(id);
+        if (!pending || pending.instanceSeq !== instanceSeq) return;
+        this.pendingRequests.delete(id);
+        this.expiry.clear(id);
+        // The messenger's buttons go; its vocabulary has no `expired` (T23).
+        this.withdrawChannelBinding(id, 'aborted');
+        this.resolved.record(id, 'expired');
+        const reason = unattendedExpiryMessage();
+        pending.resolve({ behavior: 'deny', message: reason });
+        const completedAt = Date.now();
+        this.session.client.updateAgentState((currentState) => {
+            const request = currentState.requests?.[id] ?? raised;
+            if (!request) return currentState;
+            const requests = { ...currentState.requests };
+            delete requests[id];
+            return {
+                ...currentState,
+                requests,
+                completedRequests: {
+                    ...currentState.completedRequests,
+                    [id]: { ...request, completedAt, status: 'denied', reason, resolution: 'expired' },
+                },
+            };
+        });
+        logger.debug(`Permission request ${id} declined: nobody answered within the unattended wait`);
+    }
+
+    /** A person arrived: the countdown no longer applies to these prompts (R10). */
+    private dropExpiresAt(ids: string[]): void {
+        this.session.client.updateAgentState((currentState) => {
+            let requests = currentState.requests;
+            for (const id of ids) {
+                const request = requests?.[id];
+                if (!request || request.expiresAt === undefined) continue;
+                const { expiresAt: _expiresAt, ...rest } = request;
+                requests = { ...requests, [id]: rest };
+            }
+            return requests === currentState.requests ? currentState : { ...currentState, requests };
+        });
+    }
 
     /**
      * Parses Bash permission strings into literal and prefix sets
@@ -522,6 +594,7 @@ export class PermissionHandler implements PolicyApprover {
         // launcher-scoped message queue, not to a query, and is registered once.
         this.setPermissionModeCallback = undefined;
 
+        this.expiry.clearAll();
         // Cancel all pending requests
         for (const [id, pending] of this.pendingRequests.entries()) {
             this.resolved.record(id, resolution);
@@ -693,6 +766,7 @@ export class PermissionHandler implements PolicyApprover {
     ): PermissionAck {
         this.responses.set(id, { ...message, receivedAt: Date.now() });
         this.pendingRequests.delete(id);
+        this.expiry.clear(id);
         this.resolved.record(id, 'answered');
         // Answered here or in Desktop — either way the external button is dead now.
         this.withdrawChannelBinding(id, 'answered');

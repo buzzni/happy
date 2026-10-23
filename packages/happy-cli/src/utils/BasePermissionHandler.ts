@@ -12,6 +12,8 @@ import { ApiSessionClient } from "@/api/apiSession";
 import { AgentState } from "@/api/types";
 import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate';
 import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from '@/utils/permissionResolution';
+import { ApprovalExpiryTimers } from '@/utils/approvalExpiry';
+import { unattendedExpiryMessage, type TurnAttendanceState } from '@/api/turnAttendance';
 
 /**
  * Permission response from the mobile app.
@@ -59,6 +61,13 @@ export abstract class BasePermissionHandler {
     private isResetting = false;
     /** Settled ids, kept across `reset()` so a late answer is told what happened (plan §3.4, T16). */
     private readonly resolved = new ResolvedPermissionLog();
+    /** The unattended wait (spec R10, T21). Inert until the runner hands over the turn's attendance. */
+    private readonly expiry = new ApprovalExpiryTimers({ onReleased: (ids) => this.dropExpiresAt(ids) });
+
+    /** Which turn attendance decides whether a prompt waits forever or is declined (R10a). */
+    setAttendance(attendance: TurnAttendanceState | null): void {
+        this.expiry.setAttendance(attendance);
+    }
 
     /**
      * Returns the log prefix for this handler.
@@ -131,6 +140,7 @@ export abstract class BasePermissionHandler {
 
                 // Remove from pending
                 this.pendingRequests.delete(response.id);
+                this.expiry.clear(response.id);
                 this.resolved.record(response.id, 'answered');
 
                 // Resolve the permission request
@@ -183,6 +193,18 @@ export abstract class BasePermissionHandler {
      */
     protected addPendingRequestToState(toolCallId: string, toolName: string, input: unknown, policy?: PermissionPolicyMeta): void {
         const createdAt = Date.now();
+        // Every subclass registers the pending request before calling this, so the wait starts
+        // here for all of them — and is tied to that exact entry, not to a later reuse of the id.
+        const pending = this.pendingRequests.get(toolCallId);
+        const wait = pending
+            ? this.expiry.arm(toolCallId, { policy: Boolean(policy) }, () => this.expire(toolCallId, pending))
+            : { kind: 'unlimited' as const };
+        if (wait.kind === 'decline-now' && pending) {
+            // The turn already spent its wait (Q6). Settled after the caller finishes raising it,
+            // so whatever it publishes about the prompt is withdrawn again by the settlement.
+            queueMicrotask(() => this.expire(toolCallId, pending, { tool: toolName, arguments: input, createdAt }));
+            return;
+        }
         this.session.updateAgentState((currentState) => ({
             ...currentState,
             requests: {
@@ -192,9 +214,57 @@ export abstract class BasePermissionHandler {
                     arguments: input,
                     createdAt,
                     ...(policy ? { policy } : {}),
+                    ...(wait.kind === 'timed' ? { expiresAt: wait.expiresAt } : {}),
                 }
             }
         }));
+    }
+
+    /**
+     * Nobody answered in time (spec R10, Q2): decline this one prompt and let the turn go on.
+     *
+     * `denied` is explicit: an answer without a decision reads as `abort` here, which would end the
+     * turn. Codex is given only the decision, not a reason (plan §3.4). `raised` is given only when
+     * the prompt was never written to the agent state.
+     */
+    private expire(id: string, pending: PendingRequest, raised?: { tool: string; arguments: unknown; createdAt: number }): void {
+        if (this.pendingRequests.get(id) !== pending) return;
+        this.pendingRequests.delete(id);
+        this.expiry.clear(id);
+        this.resolved.record(id, 'expired');
+        pending.resolve({ decision: 'denied' });
+        // The channel vocabulary has no `expired`; a withdrawn wait is `aborted` there (T23).
+        this.notifySettled(id, 'aborted');
+        const completedAt = Date.now();
+        const reason = unattendedExpiryMessage();
+        this.session.updateAgentState((currentState) => {
+            const request = currentState.requests?.[id] ?? raised;
+            if (!request) return currentState;
+            const { [id]: _, ...requests } = currentState.requests ?? {};
+            return {
+                ...currentState,
+                requests,
+                completedRequests: {
+                    ...currentState.completedRequests,
+                    [id]: { ...request, completedAt, status: 'denied', decision: 'denied', reason, resolution: 'expired' },
+                },
+            } satisfies AgentState;
+        });
+        logger.debug(`${this.getLogPrefix()} Permission ${id} declined: nobody answered within the unattended wait`);
+    }
+
+    /** A person arrived: the countdown no longer applies to these prompts (R10). */
+    private dropExpiresAt(ids: string[]): void {
+        this.session.updateAgentState((currentState) => {
+            let requests = currentState.requests;
+            for (const id of ids) {
+                const request = requests?.[id];
+                if (!request || request.expiresAt === undefined) continue;
+                const { expiresAt: _expiresAt, ...rest } = request;
+                requests = { ...requests, [id]: rest };
+            }
+            return requests === currentState.requests ? currentState : { ...currentState, requests };
+        });
     }
 
     /** Cancel only this provider-owned request; unrelated approvals remain pending. */
@@ -202,6 +272,9 @@ export abstract class BasePermissionHandler {
         const pending = this.pendingRequests.get(id);
         if (!pending) return;
         this.pendingRequests.delete(id);
+        this.expiry.clear(id);
+        // A messenger turn's policy prompt that timed out spends the turn's wait (plan §3.4, Q6).
+        if (resolution === 'expired') this.expiry.spendBudget();
         this.resolved.record(id, resolution);
         pending.resolve({ decision: 'abort' });
         this.notifySettled(id, 'aborted');
@@ -228,6 +301,7 @@ export abstract class BasePermissionHandler {
         if (pendingSnapshot.length === 0) return;
 
         this.pendingRequests.clear();
+        this.expiry.clearAll();
 
         for (const [id, pending] of pendingSnapshot) {
             this.resolved.record(id, resolution);
@@ -283,6 +357,7 @@ export abstract class BasePermissionHandler {
             // Snapshot pending requests to avoid Map mutation during iteration
             const pendingSnapshot = Array.from(this.pendingRequests.entries());
             this.pendingRequests.clear(); // Clear immediately to prevent new entries being processed
+            this.expiry.clearAll();
 
             // Reject all pending requests from snapshot
             for (const [id, pending] of pendingSnapshot) {

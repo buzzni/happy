@@ -708,3 +708,37 @@ describe('MessageQueue2 discarded request identity', () => {
         expect(queue.size()).toBe(1);
     });
 });
+
+describe('MessageQueue2 input attendance (codexcli-approval-session-binding R10a·T20 (c))', () => {
+    const sameMode = () => 'mode';
+
+    it('marks a batch unattended only when every merged input was', async () => {
+        const queue = new MessageQueue2<string>(sameMode);
+        queue.push('scheduled', 'm', undefined, undefined, undefined, 'unattended');
+        queue.push('retry', 'm', undefined, undefined, undefined, 'unattended');
+        expect((await queue.waitForMessagesAndGetAsString())?.allUnattended).toBe(true);
+
+        queue.push('scheduled', 'm', undefined, undefined, undefined, 'unattended');
+        queue.push('a person', 'm', undefined, undefined, undefined, 'human');
+        expect((await queue.waitForMessagesAndGetAsString())?.allUnattended).toBe(false);
+    });
+
+    it('treats an input without attendance as a person', async () => {
+        const queue = new MessageQueue2<string>(sameMode);
+        queue.push('scheduled', 'm', undefined, undefined, undefined, 'unattended');
+        queue.push('unmarked', 'm');
+        expect((await queue.waitForMessagesAndGetAsString())?.allUnattended).toBe(false);
+    });
+
+    it('does not count an automatic input as unattended', async () => {
+        const queue = new MessageQueue2<string>(sameMode);
+        queue.push('autopilot', 'm', undefined, undefined, undefined, 'automatic');
+        expect((await queue.waitForMessagesAndGetAsString())?.allUnattended).toBe(false);
+    });
+
+    it('keeps the attendance of an isolated initial prompt', async () => {
+        const queue = new MessageQueue2<string>(sameMode);
+        queue.unshiftIsolated('delegated', 'm', undefined, 'unattended');
+        expect((await queue.waitForMessagesAndGetAsString())?.allUnattended).toBe(true);
+    });
+});

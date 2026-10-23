@@ -183,6 +183,26 @@ describe('runAutomationTick', () => {
     })
   })
 
+  // aplus codexcli-approval-session-binding T25 — a run-once Claude/Codex automation waiting on a
+  // prompt holds the next ticks back only until the unattended wait declines it: the turn then
+  // finishes, the process exits after its first turn, and the next tick runs.
+  it('skips while the previous run waits on a prompt and runs again once the wait expired and the run exited', async () => {
+    store.replaceAll([makeDueAutomation({
+      runHistory: [{ at: NOW - 120_000, outcome: 'woke', sessionId: 'session-waiting' }],
+    })])
+    let waiting = true
+    const input = makeInput({ isSessionRunning: vi.fn((sessionId: string) => waiting && sessionId === 'session-waiting') })
+
+    expect(await runAutomationTick(input)).toEqual([{ id: 'auto-1', outcome: 'skipped-overlap' }])
+    expect(store.list()[0]!.runHistory[0]).toMatchObject({ outcome: 'skipped-overlap', sessionId: 'session-waiting' })
+
+    // 30 minutes later the prompt was declined, the turn ended and the run-once process exited.
+    waiting = false
+    const later = NOW + 30 * 60_000
+    expect(await runAutomationTick({ ...input, now: later })).toEqual([{ id: 'auto-1', outcome: 'woke' }])
+    expect(input.spawnSession).toHaveBeenCalledTimes(1)
+  })
+
   it('auto-pauses after the third consecutive error', async () => {
     store.replaceAll([makeDueAutomation({
       runHistory: [
