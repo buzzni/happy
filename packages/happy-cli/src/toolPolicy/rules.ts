@@ -53,10 +53,12 @@ export interface ToolPolicyTables {
     systemKeyCombos: Partial<Record<NodeJS.Platform, string[]>>;
     mcp: {
         /**
-         * Which words of a tool name the verb rule reads. Only `all` exists (2026-10-23.1, every word); Desktop reads
-         * it to tell this rule from the older first-two-words one when it labels tools for a runtime it did not ship with.
+         * Which words of a tool name the verb rule reads. Only `all` exists (2026-10-23.1, every word). The daemon
+         * announces it as `verb-words:<value>` in machine metadata `toolPolicy.enforcement`, and Desktop labels tools by
+         * it (the runtime file is its fallback); Desktop shows no label for a value it does not know, so a new rule
+         * gets a new value here and a Desktop parser update.
          */
-        verbWords?: 'all';
+        verbWords: 'all';
         excludedServers: string[];
         highRiskVerbs: string[];
         writeVerbs: string[];
