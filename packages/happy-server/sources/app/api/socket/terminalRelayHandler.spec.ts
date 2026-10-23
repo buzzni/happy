@@ -759,6 +759,41 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
         ]);
     });
 
+    /*
+     * D4 I3·I4 merge: an ended terminal replayed page by page. Every page's
+     * resume must still reach the daemon after the close was recorded, and the
+     * daemon's exit — sent after the last page — must reach the client last.
+     */
+    it('carries a paged replay of an ended terminal across replicas, the exit after the last page', async () => {
+        const { daemon, client, sessionId } = await openAcrossReplicas();
+        await client.trigger('disconnect');
+        await daemon.trigger('terminal-closed', { sessionId, code: 4, signal: null });
+        const replicaC = await loadReplica();
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+        roomEmits.length = 0;
+
+        await back.trigger('terminal-resume', { sessionId, afterSeq: 0, maxChars: 262_144 });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 1, data: 'p1', more: true, nextSeq: 1 });
+        // The next page is asked for through yet another replica.
+        const replicaD = await loadReplica();
+        const again = new FakeSocket('client-2');
+        replicaD.relay.terminalRelayHandler('u1', again as any);
+        await again.trigger('terminal-resume', { sessionId, afterSeq: 1, maxChars: 262_144 });
+        await daemon.trigger('terminal-frame', { sessionId, seq: 2, data: 'p2', more: false, nextSeq: 2 });
+        await daemon.trigger('terminal-closed', { sessionId, code: 4, signal: null });
+
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 0, maxChars: 262_144 } },
+            { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 1, data: 'p1', more: true, nextSeq: 1 } },
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 1, maxChars: 262_144 } },
+            { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 2, data: 'p2', more: false, nextSeq: 2 } },
+            { room: 'client-2', event: 'terminal-closed', payload: { sessionId, code: 4, signal: null } },
+        ]);
+        expect(back.ownEmits).toEqual([]);
+        expect(again.ownEmits).toEqual([]);
+    });
+
     it('answers from the stored exit when the daemon socket is gone too', async () => {
         const { daemon, client, sessionId } = await openAcrossReplicas();
         await client.trigger('disconnect');

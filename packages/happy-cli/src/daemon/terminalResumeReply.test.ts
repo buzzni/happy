@@ -280,14 +280,47 @@ describe('an ended terminal behind a paged replay', () => {
         expect(pagedReplayInFlight(h.output, 1_000 + PAGED_RESUME_STALE_MS)).toBe(false)
     })
 
-    it('holds a live exit that lands mid-replay until the last page', () => {
+    // The relay's pty.onExit (apiMachine.ts) calls sendExitAfterReplay with the
+    // default in-flight check; this is that composition, with a real paged replay.
+    it('holds a live exit that lands mid-replay until the last page carries it', () => {
         vi.useFakeTimers()
+        vi.setSystemTime(1_000) // the harness clock
         const h = harness(250)
         h.reply(0, 262_144)
         const sendClosed = vi.fn()
-        expect(sendExitAfterReplay({ output: h.output, sendClosed, inFlight: (o) => pagedReplayInFlight(o, 1_000) })).toBe('held')
+        expect(sendExitAfterReplay({ output: h.output, sendClosed })).toBe('held')
+
+        for (let guard = 0; guard < 10; guard++) {
+            const frames = h.sent.filter((s) => s.event === 'terminal-frame')
+            const last = frames[frames.length - 1].payload
+            if (!last.more) break
+            h.reply(last.nextSeq, 262_144)
+        }
+        // The last page is answered without the live exit having gone out on its own.
         expect(sendClosed).not.toHaveBeenCalled()
+        expect(pagedReplayInFlight(h.output, 1_000)).toBe(false)
+    })
+
+    it('sends a live exit that lands mid-replay once the client stops asking for pages', () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(1_000)
+        const h = harness(250)
+        h.reply(0, 262_144)
+        const sendClosed = vi.fn()
+        sendExitAfterReplay({ output: h.output, sendClosed })
         vi.advanceTimersByTime(PAGED_RESUME_STALE_MS)
         expect(sendClosed).toHaveBeenCalledTimes(1)
+    })
+
+    it('leaves a held exit to the new connection once the terminal is taken over', () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(1_000)
+        const h = harness(250)
+        h.reply(0, 262_144)
+        const sendClosed = vi.fn()
+        sendExitAfterReplay({ output: h.output, sendClosed })
+        resetPagedResume(h.output)
+        vi.advanceTimersByTime(PAGED_RESUME_STALE_MS * 2)
+        expect(sendClosed).not.toHaveBeenCalled()
     })
 })
