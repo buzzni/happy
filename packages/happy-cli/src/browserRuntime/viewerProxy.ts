@@ -89,6 +89,26 @@ const VIEWER_PATH_RESTORE = "<script>(function(){try{if(location.search||window.
     + "if(typeof p==='string')history.replaceState(null,'',location.pathname+'?path='+encodeURIComponent(p))}catch(e){}})()</script>"
 
 /**
+ * Put before vnc_lite.html's own module script (module scripts run in document
+ * order, so this sees the RFB class first). Fit / actual size is noVNC's own
+ * `scaleViewport` (its input coordinates follow the scale; a CSS transform of
+ * the canvas would not), and switching it must not reconnect: the console
+ * needs the page's RFB object. vnc_lite keeps it in module scope, so the first
+ * assignment to `scaleViewport` (vnc_lite makes one right after `new RFB`, from
+ * `?scale=`) hands the instance to `window.__abpRfb`, where the same-origin
+ * console that framed the page reads it; that first value is taken from the
+ * console's current choice (`parent.__abpViewerFit`) so a reconnected frame
+ * keeps it. Nothing else of noVNC is touched; `resizeSession` stays as the
+ * address says (the console never sets it: the remote resolution is not changed
+ * by the display size). A cross-origin parent throws and is ignored.
+ */
+const VIEWER_FIT_HOOK = "<script type=\"module\">import RFB from './core/rfb.js';(function(){try{"
+    + "var d=Object.getOwnPropertyDescriptor(RFB.prototype,'scaleViewport');if(!d||!d.set||!d.get)return;"
+    + "Object.defineProperty(RFB.prototype,'scaleViewport',{configurable:true,get:d.get,set:function(v){"
+    + "if(!window.__abpRfb){window.__abpRfb=this;try{var f=window.parent!==window&&window.parent.location.origin===location.origin?window.parent.__abpViewerFit:undefined;"
+    + "if(typeof f==='boolean')v=f}catch(e){}}d.set.call(this,v)}})}catch(e){}})()</script>"
+
+/**
  * Serves the pinned noVNC client (the Runtime image copies the Debian novnc
  * package files; no CDN). `/viewer/` is vnc_lite.html. Returns false for
  * anything that is not a known file type inside `root` (symlinks resolved).
@@ -113,9 +133,12 @@ export async function serveViewerAsset(root: string, pathname: string, res: Serv
     }
     let body: Buffer | string = await readFile(file)
     if (relative === 'vnc_lite.html') {
-        const html = body.toString('utf8')
+        let html = body.toString('utf8')
+        const firstModule = html.indexOf('<script type="module"')
+        if (firstModule >= 0) html = html.slice(0, firstModule) + VIEWER_FIT_HOOK + html.slice(firstModule)
         const end = html.indexOf('</head>')
-        if (end >= 0) body = html.slice(0, end) + VIEWER_PATH_RESTORE + html.slice(end)
+        if (end >= 0) html = html.slice(0, end) + VIEWER_PATH_RESTORE + html.slice(end)
+        body = html
     }
     res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff',
         'referrer-policy': 'no-referrer', 'content-security-policy': VIEWER_CSP })

@@ -4,13 +4,18 @@
  * pasted id; renewal is requested before expiry and only a host answer
  * (window.parent, same origin) replaces the token.
  */
+import { existsSync } from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { renderConsolePage } from './consolePage'
 import { HarnessCdp, eventually, findChrome, launchChrome, type LaunchedChrome } from './drivers/pocTestKit'
+import { serveViewerAsset } from './viewerProxy'
 
 const chromePath = findChrome()
+/** The distro noVNC client the Runtime serves at /viewer/ (fit/actual size drives its real RFB object). */
+const novncDir = process.env.ABP_VIEWER_ASSETS_DIR ?? '/usr/share/novnc'
+const hasNovnc = existsSync(`${novncDir}/vnc_lite.html`)
 const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
 const token = (tag: string, expiresAtMs: number) =>
     `abp2.${b64({ alg: 'EdDSA', kid: 'k', typ: 'abp-cap' })}.${b64({ kind: 'interactive', profileId: 'profile-a', capabilityId: tag, expiresAtMs })}.sig-${tag}`
@@ -32,6 +37,11 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         server = http.createServer((req, res) => {
             const url = new URL(req.url ?? '/', 'http://localhost')
             if (url.pathname === '/console') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(renderConsolePage()); return }
+            if (url.pathname.startsWith('/viewer/')) {
+                // The real noVNC client, as the Runtime serves it; its WebSocket finds no upstream here and just disconnects.
+                serveViewerAsset(novncDir, url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
+                return
+            }
             if (url.pathname === '/console-hosted') {
                 // Studio web opens the console in a new window: the host is window.opener on another origin.
                 const hostOrigins = url.searchParams.get('trust') === 'none' ? ['http://studio.poc-three.test'] : [`http://studio.poc-one.test:${port()}`]
@@ -265,6 +275,140 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         expect(await eventually(() => harness.evaluate(target, 'window.__abpViewerPath'), Boolean, 5_000)).toMatch(/^v1\/viewer\/websockify\?ticket=ticket-/)
         await harness.closeTarget(target)
     }, 30_000)
+
+    const withSession = async <T>(targetId: string, fn: (sessionId: string) => Promise<T>): Promise<T> => {
+        const { sessionId } = await harness.conn.send('Target.attachToTarget', { targetId, flatten: true })
+        try { return await fn(sessionId) } finally { await harness.conn.send('Target.detachFromTarget', { sessionId }).catch(() => undefined) }
+    }
+    /** A real key press (CDP input), as the keyboard reaches the page; synthetic events do not toggle a <details>. */
+    const pressKey = (targetId: string, key: string, code: string, keyCode: number) => withSession(targetId, async (sessionId) => {
+        await harness.conn.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode, text: key === 'Enter' ? '\r' : undefined }, sessionId)
+        await harness.conn.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode }, sessionId)
+    })
+    /** The page in a window of this width (CDP emulation, for the time of the callback). */
+    const atWidth = (targetId: string, width: number, expression: string) => withSession(targetId, async (sessionId) => {
+        await harness.conn.send('Emulation.setDeviceMetricsOverride', { width, height: 600, deviceScaleFactor: 1, mobile: false }, sessionId)
+        try {
+            const result = await harness.conn.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId)
+            if (result.exceptionDetails) throw new Error(`harness evaluate failed: ${result.exceptionDetails.text}`)
+            return result.result?.value
+        } finally { await harness.conn.send('Emulation.clearDeviceMetricsOverride', {}, sessionId).catch(() => undefined) }
+    })
+
+    it('gives the screen the console width and the remaining height, with no fixed task column', async () => {
+        ops.length = 0
+        const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('layout', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+        await eventually(() => harness.evaluate(target, `(() => { const d = document.getElementById('detail'); return !!d && !d.hidden })()`), Boolean, 10_000)
+        await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+        await eventually(() => harness.evaluate(target, `!document.getElementById('screenBox').hidden`), Boolean, 5_000)
+        const layout = JSON.parse(String(await harness.evaluate(target, `(() => { const box = document.getElementById('screenBox').getBoundingClientRect();
+            const head = document.querySelector('.screen-head').getBoundingClientRect();
+            return JSON.stringify({ aside: !!document.querySelector('aside'), maxWidth: getComputedStyle(document.querySelector('main')).maxWidth,
+                width: box.width / document.documentElement.clientWidth, bottomGap: window.innerHeight - box.bottom, height: box.height,
+                // What is left under the screen's head line (12px gap above, 12px page padding below) is the screen's.
+                remaining: window.innerHeight - head.bottom - 24,
+                menuAbove: document.getElementById('taskMenu').getBoundingClientRect().bottom <= box.top,
+                controlsAbove: document.getElementById('takeOver').getBoundingClientRect().bottom <= box.top,
+                brandClear: document.querySelector('header h1').getBoundingClientRect().right <= document.getElementById('taskMenu').getBoundingClientRect().left }) })()`)))
+        expect(layout.aside).toBe(false)
+        expect(layout.maxWidth).toBe('none')
+        expect(layout.width).toBeGreaterThanOrEqual(0.9)
+        expect(layout.bottomGap).toBeLessThanOrEqual(24)
+        expect(layout.height).toBeGreaterThanOrEqual(layout.remaining - 1)
+        expect(layout.height).toBeGreaterThanOrEqual(240)
+        expect(layout.menuAbove).toBe(true)
+        expect(layout.controlsAbove).toBe(true)
+        expect(layout.brandClear).toBe(true)
+        await harness.closeTarget(target)
+    }, 30_000)
+
+    it('offers the tasks in a top menu that keeps the number of tasks needing the user in view', async () => {
+        const now = Date.now()
+        listedTasks = [
+            { taskId: 'task-idle', status: 'paused', pauseReason: 'awaiting-agent', tabs: [], updatedAtMs: now },
+            { taskId: 'task-approval', status: 'paused', pauseReason: 'awaiting-user', pendingApproval: { approvalId: 'a' }, tabs: [], updatedAtMs: now },
+            { taskId: 'task-login', status: 'awaiting-user', waitReason: 'login', tabs: [], updatedAtMs: now },
+        ]
+        try {
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('menu', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => harness.evaluate(target, `document.querySelectorAll('#tasks button').length`), (n) => n === 3, 10_000)
+            // The first task needing the user opens by itself; the menu stays closed and still says how many need the user.
+            await eventually(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), (id) => id === 'task-approval', 10_000)
+            // The menu names the selected task as the detail does (the fake getTask answers a plain paused task).
+            const closed = JSON.parse(String(await harness.evaluate(target, `JSON.stringify({ open: document.getElementById('taskMenu').open,
+                count: document.getElementById('needCount').textContent, label: document.getElementById('taskMenuLabel').textContent,
+                name: document.getElementById('taskMenuButton').getAttribute('aria-label'), title: document.getElementById('detailTitle').textContent,
+                button: document.getElementById('taskMenuButton').tagName, focusable: document.getElementById('taskMenuButton').tabIndex >= 0,
+                expanded: document.getElementById('taskMenuButton').getAttribute('aria-expanded'),
+                folded: ['eventsPanel', 'advanced'].map((id) => document.getElementById(id).hidden) })`)))
+            expect(closed).toEqual({ open: false, count: '2', label: 'Paused · task-approval', name: 'Paused · task-approval, 2 tasks need you', title: 'Paused',
+                button: 'SUMMARY', focusable: true, expanded: 'false', folded: [true, true] })
+            // Opened from the keyboard it lists the tasks (those needing the user first, as before); picking one closes it and shows that task.
+            await harness.evaluate(target, `document.getElementById('taskMenuButton').focus()`)
+            await pressKey(target, 'Enter', 'Enter', 13)
+            // aria-expanded follows the <details> toggle event, which is dispatched asynchronously after `open` changes.
+            expect(await eventually(() => harness.evaluate(target, `document.getElementById('taskMenuButton').getAttribute('aria-expanded')`), (v) => v === 'true', 5_000)).toBe('true')
+            expect(await harness.evaluate(target, `JSON.stringify({ open: document.getElementById('taskMenu').open,
+                top: [...document.querySelectorAll('#tasks > button')].map((b) => b.getAttribute('data-task')) })`)).toBe(JSON.stringify({ open: true, top: ['task-approval', 'task-login'] }))
+            await harness.evaluate(target, `document.querySelector('[data-task="task-login"]').click()`)
+            await eventually(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), (id) => id === 'task-login', 10_000)
+            expect(await harness.evaluate(target, `JSON.stringify({ open: document.getElementById('taskMenu').open, label: document.getElementById('taskMenuLabel').textContent, focus: document.activeElement.id })`))
+                .toBe(JSON.stringify({ open: false, label: 'Paused · task-login', focus: 'taskMenuButton' }))
+            // In a narrow window the open panel stays inside the viewport (slid left of its button, 12px from the edge at most).
+            // (The <details> toggle event, which places the panel, is dispatched asynchronously: measure after it.)
+            const narrow = JSON.parse(String(await atWidth(target, 360, `new Promise((resolve) => { document.getElementById('taskMenu').open = true; setTimeout(() => {
+                const p = document.querySelector('#taskMenu .menu-panel').getBoundingClientRect(), b = document.getElementById('taskMenuButton').getBoundingClientRect();
+                document.getElementById('taskMenu').open = false;
+                resolve(JSON.stringify({ left: p.left, right: Math.round(p.right), width: Math.round(p.width), under: p.top >= b.bottom, viewport: document.documentElement.clientWidth })) }, 100) })`)))
+            expect(narrow.viewport).toBe(360)
+            expect(narrow.left).toBeGreaterThanOrEqual(12)
+            expect(narrow.right).toBeLessThanOrEqual(360 - 12)
+            expect(narrow.width).toBe(360 - 24)
+            expect(narrow.under).toBe(true)
+            // Escape closes an open menu and returns focus to its button.
+            await harness.evaluate(target, `document.getElementById('taskMenuButton').click()`)
+            await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), Boolean, 5_000)
+            await pressKey(target, 'Escape', 'Escape', 27)
+            expect(await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), (open) => open === false, 5_000)).toBe(false)
+            expect(await harness.evaluate(target, `document.activeElement.id`)).toBe('taskMenuButton')
+            await harness.closeTarget(target)
+        } finally { listedTasks = defaultTasks() }
+    }, 30_000)
+
+    it.skipIf(!hasNovnc)('switches the open screen between fit and actual size in place, and keeps the choice across a reconnect', async () => {
+        ops.length = 0
+        const cap = token('fit', Date.now() + 600_000)
+        const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+        await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+        await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+        const rfb = `document.getElementById('screen').contentWindow.__abpRfb`
+        // Fit is the default: noVNC's own scaleViewport on its RFB object (input coordinates follow), never a CSS transform.
+        expect(await eventually(() => harness.evaluate(target, `(() => { try { return (${rfb} || {}).scaleViewport } catch (e) { return e.message } })()`), (v) => v === true, 10_000)).toBe(true)
+        expect(await harness.evaluate(target, `document.getElementById('fitToggle').getAttribute('aria-pressed')`)).toBe('true')
+        const src = await harness.evaluate(target, `document.getElementById('screen').src`)
+        const pressed = `[document.getElementById('fitToggle'), document.getElementById('actualSize')].map((b) => b.getAttribute('aria-pressed'))`
+        expect(await harness.evaluate(target, `JSON.stringify(${pressed})`)).toBe(JSON.stringify(['true', 'false']))
+        await harness.evaluate(target, `document.getElementById('actualSize').click()`)
+        expect(await eventually(() => harness.evaluate(target, `${rfb}.scaleViewport`), (v) => v === false, 5_000)).toBe(false)
+        // Actual size is a display change only: same frame, same ticket, and the remote resolution is never requested to change.
+        expect(await harness.evaluate(target, `JSON.stringify({ pressed: ${pressed}, src: document.getElementById('screen').src, resize: ${rfb}.resizeSession })`))
+            .toBe(JSON.stringify({ pressed: ['false', 'true'], src, resize: false }))
+        expect(ops.filter((entry) => entry.op === 'viewerTicket').length).toBe(1)
+        // A renewal reconnects the screen (new frame, new ticket): it starts in the mode the user chose.
+        await harness.evaluate(target, `document.getElementById('screen').contentWindow.__abpOldFrame = true`)
+        const renewed = token('fit-2', Date.now() + 900_000)
+        await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(renewed)}, expiresAtMs: Date.now() + 900_000 }, location.origin)`)
+        await eventually(() => ops.filter((entry) => entry.op === 'viewerTicket').length, (n) => n === 2, 5_000)
+        const fresh = `(() => { const w = document.getElementById('screen').contentWindow; return !w.__abpOldFrame && w.__abpRfb ? w.__abpRfb.scaleViewport : 'pending' })()`
+        expect(await eventually(() => harness.evaluate(target, fresh), (v) => v !== 'pending', 10_000)).toBe(false)
+        expect(await harness.evaluate(target, `JSON.stringify(${pressed})`)).toBe(JSON.stringify(['false', 'true']))
+        // Back to fit, still in place on the reconnected frame.
+        await harness.evaluate(target, `document.getElementById('fitToggle').click()`)
+        expect(await eventually(() => harness.evaluate(target, `${rfb}.scaleViewport`), (v) => v === true, 5_000)).toBe(true)
+        expect(await harness.evaluate(target, `JSON.stringify(${pressed})`)).toBe(JSON.stringify(['true', 'false']))
+        expect(ops.filter((entry) => entry.op === 'viewerTicket').length).toBe(2)
+        await harness.closeTarget(target)
+    }, 40_000)
 
     /** The opener page, once its script has run (openFrontTab does not wait for the load). */
     const openStudio = async () => {
