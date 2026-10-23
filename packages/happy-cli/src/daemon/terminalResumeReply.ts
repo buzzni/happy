@@ -35,6 +35,8 @@ interface PagedCursor {
     /** Seq of the last frame the replay in flight has sent. */
     cursor: number
     at: number
+    /** Who the replay is going to (`requester`); undefined when the caller names none. */
+    requester?: string
 }
 
 // Both keyed by the buffer, which lives exactly as long as the terminal does.
@@ -116,6 +118,12 @@ export interface TerminalResumeReplyInput {
     exit?: TerminalExit | null
     afterSeq: unknown
     maxChars?: unknown
+    /**
+     * Who asked: the relay's client socket id. A paged resume merges only with
+     * a replay going to the same requester — on the relay path a reconnect is
+     * the one sign a new connection took the terminal over.
+     */
+    requester?: string
     /** Seals one plaintext chunk for the wire. May throw; the caller reports it. */
     seal: (plain: string) => string
     emit: (event: TerminalReplyEvent, payload: Record<string, unknown>) => void
@@ -146,7 +154,11 @@ export function replyToTerminalResume(input: TerminalResumeReplyInput): Terminal
         pagedCursors.delete(output)
     } else {
         const inFlight = pagedCursors.get(output)
-        if (inFlight && now - inFlight.at < PAGED_RESUME_STALE_MS && afterSeq < inFlight.cursor) {
+        if (inFlight && inFlight.requester !== input.requester) {
+            // Another connection took the terminal over (a relay reconnect): the
+            // replay in flight went to the old one, so this resume starts its own.
+            resetPagedResume(output)
+        } else if (inFlight && now - inFlight.at < PAGED_RESUME_STALE_MS && afterSeq < inFlight.cursor) {
             // The replay in flight covers this, and carries the exit on its last page.
             return 'merged'
         }
@@ -181,7 +193,7 @@ export function replyToTerminalResume(input: TerminalResumeReplyInput): Terminal
     }
 
     const pagesLeft = paged && (answer.kind === 'replay' || answer.kind === 'snapshot') && answer.more === true
-    if (pagesLeft) pagedCursors.set(output, { cursor: answer.nextSeq ?? afterSeq, at: now })
+    if (pagesLeft) pagedCursors.set(output, { cursor: answer.nextSeq ?? afterSeq, at: now, requester: input.requester })
     else if (paged) pagedCursors.delete(output)
 
     if (exit) {

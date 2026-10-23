@@ -497,6 +497,29 @@ describe('ApiMachineClient socket reconnection', () => {
             expect(emitsOf('terminal-frame')[firstPage.length].seq).toBe(last.seq + 1);
         });
 
+        // A client that drops mid-replay comes back on a new relay socket; the
+        // relay names it, and the replay starts over for it rather than merging.
+        it('replays an ended terminal in full to a client that reconnected mid-replay, then the exit', () => {
+            const big = Array.from({ length: 250 }, (_, i) => String(i % 10).repeat(4_000));
+            openRegisteredSession(big);
+            markDaemonTerminalSessionExited('resume-1', { code: 0, signal: null });
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0, maxChars: 262_144, clientSocketId: 'client-a' });
+            mockSocket.emit.mockClear(); // that page went down with the old socket
+
+            emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: 0, maxChars: 262_144, clientSocketId: 'client-b' });
+            for (let guard = 0; guard < 10; guard++) {
+                const frames = emitsOf('terminal-frame');
+                const last = frames[frames.length - 1];
+                if (!last.more) break;
+                expect(emitsOf('terminal-closed')).toHaveLength(0);
+                emitSocketEvent('terminal-resume-fwd', { sessionId: 'resume-1', afterSeq: last.nextSeq, maxChars: 262_144, clientSocketId: 'client-b' });
+            }
+
+            expect(emitsOf('terminal-frame').map((p: any) => p.seq)).toEqual(Array.from({ length: 250 }, (_, i) => i + 1));
+            expect(mockSocket.emit.mock.calls[mockSocket.emit.mock.calls.length - 1][0]).toBe('terminal-closed');
+            expect(emitsOf('terminal-closed')).toEqual([{ sessionId: 'resume-1', code: 0, signal: null }]);
+        });
+
         /*
          * Why this matters: the client's input and the daemon's output are both
          * silent during a disconnect, so the idle watchdog keeps counting. A

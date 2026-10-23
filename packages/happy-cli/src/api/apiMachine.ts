@@ -381,7 +381,7 @@ interface ServerToDaemonEvents {
     'terminal-close-fwd': (msg: { sessionId: string }) => void;
     // specs/desktop-terminal-reliability/ Phase 3 — the client asks for
     // everything after the last seq it saw, following a reconnect or a gap.
-    'terminal-resume-fwd': (msg: { sessionId: string; afterSeq: number; maxChars?: number }) => void;
+    'terminal-resume-fwd': (msg: { sessionId: string; afterSeq: number; maxChars?: number; clientSocketId?: string }) => void;
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
@@ -4026,7 +4026,7 @@ export class ApiMachineClient {
          * the RPC dispatch gate, so the allowlist there would not see this.
          */
         if (!this.managedHandlers) this.socket.on('terminal-resume-fwd', (msg) => {
-            const { sessionId, afterSeq, maxChars } = msg || {};
+            const { sessionId, afterSeq, maxChars, clientSocketId } = msg || {};
             if (!sessionId || typeof sessionId !== 'string') return;
             const entry = getDaemonTerminalSession(sessionId);
             /*
@@ -4047,6 +4047,9 @@ export class ApiMachineClient {
                     exit: entry?.exit,
                     afterSeq,
                     maxChars,
+                    // The relay names the client socket that asked, so a reconnect
+                    // mid-replay is answered afresh (the direct path resets on attach).
+                    requester: typeof clientSocketId === 'string' ? clientSocketId : undefined,
                     seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),
                     emit: (event, payload) => this.socket.emit(event, payload as any),
                 });
