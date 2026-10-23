@@ -315,6 +315,26 @@ export const MachineMetadataSchema = z.object({
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
 
+export const DaemonRestartLifecycleSchema = z.object({
+  state: z.union([z.enum(['running', 'draining']), z.string()]),
+  intent: z.union([z.enum(['restart', 'stop']), z.string()]).optional(),
+  reason: z.string().optional(),
+  inTurnCount: z.number().int().min(0).optional(),
+  openTerminalCount: z.number().int().min(0).optional(),
+  busyTerminalCount: z.number().int().min(0).optional(),
+  /** Epoch ms the drain ends at the latest. */
+  deadlineAt: z.number().optional(),
+  /** Bundle replaced on disk, waiting for a quiet moment (admission still open). */
+  pendingHandoff: z.object({
+    detectedAt: z.number(),
+    busyTerminalCount: z.number().int().min(0),
+    /** 24 h terminal cap reached: Desktop may offer "지금 교대" (`restart-drain:force-handoff`). */
+    forceAvailable: z.boolean(),
+  }).optional(),
+})
+
+export type DaemonRestartLifecycle = z.infer<typeof DaemonRestartLifecycleSchema>
+
 /**
  * Daemon state - dynamic runtime information (frequently updated)
  */
@@ -337,8 +357,17 @@ export const DaemonStateSchema = z.object({
   activity: z.object({
     activeSessionCount: z.number().int().min(0),
     activeAutomationCount: z.number().int().min(0),
+    /** aplus codexcli-daemon-restart-drain — sessions with a turn in flight. Absent on older daemons. */
+    inTurnCount: z.number().int().min(0).optional(),
     reportedAt: z.number(),
   }).optional(),
+  /**
+   * aplus specs/codexcli-daemon-restart-drain R6·R22·R25 — restart drain and pending bundle handoff.
+   * A separate object rather than a wider `status`: machine metadata `daemonLastKnownStatus` is a
+   * strict enum, so a `draining` status mirrored there would break older metadata parsers.
+   * Declared here because this schema strips unknown keys.
+   */
+  lifecycle: DaemonRestartLifecycleSchema.optional(),
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>

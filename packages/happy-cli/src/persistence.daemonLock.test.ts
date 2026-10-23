@@ -130,3 +130,48 @@ describe('acquireDaemonLock reclaim safety', () => {
     rmSync(lockFile, { force: true })
   })
 })
+
+describe('acquireDaemonLock with daemon identity (aplus codexcli-daemon-restart-drain R19)', () => {
+  const lockFile = join(home, 'daemon.state.json.lock')
+  const stateFile = join(home, 'daemon.state.json')
+  const writeLockAndIdentity = (identity: Record<string, unknown>) => {
+    writeFileSync(lockFile, String(process.pid))
+    const lockAt = Date.now() / 1000 - 5
+    utimesSync(lockFile, lockAt, lockAt)
+    writeFileSync(stateFile, JSON.stringify({ pid: process.pid, httpPort: 1, startTime: 'x', startedWithCliVersion: 'x', identity }))
+  }
+
+  it('ignores a recorded identity older than the lock (a new holder has not written its own yet)', async () => {
+    writeFileSync(stateFile, JSON.stringify({ pid: process.pid, httpPort: 1, startTime: 'x', startedWithCliVersion: 'x', identity: { pid: process.pid, startedAt: 1 } }))
+    const stateAt = Date.now() / 1000 - 60
+    utimesSync(stateFile, stateAt, stateAt)
+    writeFileSync(lockFile, String(process.pid))
+    expect(await acquireDaemonLock(1, 0, { getProcessStartedAt: () => Date.now() - 1_000, readBootId: () => undefined })).toBeNull()
+    rmSync(lockFile, { force: true })
+  })
+
+  it('takes over a fresh-looking lock when the recorded start time says the pid was reused', async () => {
+    writeLockAndIdentity({ pid: process.pid, startedAt: Date.now() - 60 * 60_000 })
+    const handle = await acquireDaemonLock(2, 0, { getProcessStartedAt: () => Date.now(), readBootId: () => undefined })
+    expect(handle).not.toBeNull()
+    await releaseDaemonLock(handle!)
+  })
+
+  it('takes over when the boot id changed (reboot)', async () => {
+    const startedAt = Date.now() - 1_000
+    writeLockAndIdentity({ pid: process.pid, startedAt, bootId: 'before-reboot' })
+    const handle = await acquireDaemonLock(2, 0, { getProcessStartedAt: () => startedAt, readBootId: () => 'after-reboot' })
+    expect(handle).not.toBeNull()
+    await releaseDaemonLock(handle!)
+  })
+
+  it('keeps the lock of the recorded daemon even when its start time looks newer than the lock', async () => {
+    const startedAt = Date.now()
+    writeLockAndIdentity({ pid: process.pid, startedAt })
+    utimesSync(lockFile, (startedAt - 60 * 60_000) / 1000, (startedAt - 60 * 60_000) / 1000)
+    expect(await acquireDaemonLock(1, 0, { getProcessStartedAt: () => startedAt + 500, readBootId: () => undefined })).toBeNull()
+    rmSync(lockFile, { force: true })
+    rmSync(stateFile, { force: true })
+  })
+})
+

@@ -2,12 +2,9 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SessionOwner } from '@/browserRuntime/sessionRegistration'
+import { readLinuxBootId } from '@/utils/bootIdentity'
 
-export async function readBrowserTaskBootId(procRoot = '/proc'): Promise<string> {
-    const bootId = (await readFile(join(procRoot, 'sys/kernel/random/boot_id'), 'utf8')).trim()
-    if (!bootId) throw new Error('Empty Linux boot id')
-    return bootId
-}
+export const readBrowserTaskBootId = readLinuxBootId
 
 /** ENOENT alone proves absence; permissions, malformed data and I/O errors remain unknown. */
 export async function readBrowserTaskPidStartTime(pid: number, procRoot = '/proc'): Promise<string | undefined> {

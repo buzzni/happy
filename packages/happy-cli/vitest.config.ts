@@ -20,6 +20,19 @@ export default defineConfig({
                 },
             },
             {
+                // aplus codexcli-daemon-restart-drain T11b — fake daemon restarts with real processes.
+                extends: true,
+                test: {
+                    name: 'integration-daemon-restart',
+                    include: ['src/daemon/restartDrain.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 180_000,
+                    hookTimeout: 60_000,
+                },
+            },
+            {
                 extends: true,
                 test: {
                     name: 'integration-write-scope',

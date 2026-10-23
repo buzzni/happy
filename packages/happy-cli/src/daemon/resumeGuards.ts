@@ -85,8 +85,23 @@ export function shareInFlight<T>(
     return promise;
 }
 
-/** The control listener starts before network-dependent daemon initialization finishes. */
+/**
+ * The control listener starts before network-dependent daemon initialization finishes.
+ *
+ * A restart drain (aplus codexcli-daemon-restart-drain R1) closes the same door
+ * again: `restartDeadline()` is non-null while new launches and resumes must be
+ * refused as `daemon-restarting`. It is separate from `isReady()` on purpose —
+ * guards that only mean "initialized" (e.g. cancelling a scheduled session) keep
+ * working during a drain.
+ */
 export function createLaunchReadinessGate() {
     let ready = false;
-    return { isReady: () => ready, markReady: () => { ready = true; } };
+    let restartDeadlineAt: number | null = null;
+    return {
+        isReady: () => ready,
+        markReady: () => { ready = true; },
+        closeForRestart: (deadlineAt: number) => { restartDeadlineAt = deadlineAt; },
+        reopenAfterRestartDrain: () => { restartDeadlineAt = null; },
+        restartDeadline: (): number | null => restartDeadlineAt,
+    };
 }
