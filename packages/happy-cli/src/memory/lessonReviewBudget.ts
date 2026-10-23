@@ -2,7 +2,7 @@ import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { FileLockHeldError, withOwnedFileLock, type OwnedFileLockDeps } from './ownedFileLock';
+import { FileLockHeldError, withOwnedFileLock, type OwnedFileLockDeps } from '@/utils/ownedFileLock';
 
 const amount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const entrySchema = z.object({

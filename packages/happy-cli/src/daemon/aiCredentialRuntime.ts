@@ -17,6 +17,7 @@ import { chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile }
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { logger } from '@/ui/logger'
+import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock'
 import {
   getCodexMultiAuthProxyStatus,
   isManagedCodexRotationSettings,
@@ -128,6 +129,12 @@ export type AiCredentialRuntimeDependencies = {
   chmod(path: string, mode: number): Promise<void>
   rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>
   makeTempDir(): Promise<string>
+  /**
+   * Holds the cross-process lock of one third-party credential file (Codex `auth.json`, the
+   * codex-multi-auth pool) around a local read-compare-write. The same lock path is taken by
+   * Desktop's remote scripts. Never held across a network call (aplus D4 Q-C3).
+   */
+  lockCredentialFile<T>(path: string, work: () => Promise<T>): Promise<T>
   /** Required only for one-use setup-token binding nonce persistence; missing support fails closed. */
   syncFile?(path: string): Promise<void>
   syncDirectory?(path: string): Promise<void>
@@ -496,7 +503,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   async function repairCodex(input: { provider: 'codex'; payload: string }) {
     if (input?.provider !== 'codex' || typeof input.payload !== 'string') throw new AiCredentialRuntimeError('INVALID_PAYLOAD')
     assertPayloadSize(input.payload)
-    return serialize(() => withSafeErrors('CODEX_RECOVERY_FAILED', async () => {
+    return serialize(() => withSafeErrors('CODEX_RECOVERY_FAILED', () => retryOnceOnLostRace(async () => {
       const bundle = parseCodexMultiAuthBundle(input.payload)
       const auth = JSON.parse(input.payload).recoveryAuth
       const selected = bundle?.accounts.accounts[bundle.accounts.activeIndex]
@@ -513,7 +520,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       const settingsPath = join(root, 'settings.json')
       const authPath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
       let current = bundle.accounts
-      const saved = await readOptionalJson(accountsPath)
+      const savedRaw = await readOptionalText(deps, accountsPath)
+      const saved = parseOptionalCredentialJson(savedRaw)
       if (saved) {
         const local = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: saved }))
         if (!local) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
@@ -533,15 +541,16 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       merged.activeIndex = activeIndex
       merged.pinnedAccountIndex = undefined
       merged.activeIndexByFamily = Object.fromEntries(Object.keys(merged.activeIndexByFamily ?? {}).map(family => [family, activeIndex]))
-      const previousAuth = await readOptionalJson(authPath)
+      const previousAuthRaw = await readOptionalText(deps, authPath)
+      const previousAuth = parseOptionalCredentialJson(previousAuthRaw)
       const previousSettings = await readOptionalJson(settingsPath)
       const settings = enforceCodexRotationSettings(isObject(previousSettings) && previousSettings.version === 1 && isObject(previousSettings.pluginConfig)
         ? previousSettings as CodexMultiAuthBundle['settings'] : bundle.settings)
       const applyGeneration = await reserveApplyGeneration('codex')
       await replaceCodexMultiAuthFiles(deps, [
-        { path: accountsPath, content: JSON.stringify(merged) },
+        { path: accountsPath, content: JSON.stringify(merged), expected: savedRaw },
         { path: settingsPath, content: JSON.stringify(settings) },
-        { path: authPath, content: JSON.stringify(auth) },
+        { path: authPath, content: JSON.stringify(auth), expected: previousAuthRaw },
       ], async () => { await assertCodexLiveAccount(selected) })
       const cwd = await deps.makeTempDir()
       let probe: CodexRecoveryProbeResult
@@ -577,7 +586,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           rotationChanged: JSON.stringify(previousSettings) !== JSON.stringify(settings) },
         verification: { checkedAt: deps.now(), accounts: [{ account: 1, ok: probe.ok,
           ...(probe.ok ? { model: probe.model } : { errorKind: probe.errorKind }) }] } }
-    }))
+    })))
   }
 
   async function claudeSwapPython(): Promise<string> {
@@ -1118,83 +1127,86 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
 
   async function applyCodex(payload: string, applyMode: 'merge' | 'replace' = 'replace') {
     const bundle = parseCodexMultiAuthBundle(payload)
-    if (bundle) return applyCodexMultiAuth(bundle, applyMode)
+    if (bundle) return retryOnceOnLostRace(() => applyCodexMultiAuth(bundle, applyMode))
     if (applyMode === 'merge') throw new AiCredentialRuntimeError('AI_CREDENTIAL_MERGE_UNSUPPORTED')
     const home = codexHome()
     const authPath = join(home, 'auth.json')
     const backupPath = join(home, 'auth.json.happy-backup')
     const tempPath = join(home, '.auth.json.happy-tmp')
     await deps.mkdir(home, { recursive: true, mode: 0o700 })
-    let hadExisting = false
-    try {
-      await deps.rename(authPath, backupPath)
-      hadExisting = true
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw new AiCredentialRuntimeError('CODEX_BACKUP_FAILED')
-      }
-    }
-    if (hadExisting) {
+    // Desktop's remote scripts swap this file under the same lock; hold it for the whole local replace.
+    return deps.lockCredentialFile(authPath, async () => {
+      let hadExisting = false
       try {
-        await deps.chmod(backupPath, 0o600)
-      } catch {
-        try {
-          await deps.rename(backupPath, authPath)
-        } catch {
-          throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
+        await deps.rename(authPath, backupPath)
+        hadExisting = true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw new AiCredentialRuntimeError('CODEX_BACKUP_FAILED')
         }
-        throw new AiCredentialRuntimeError('CODEX_BACKUP_FAILED')
-      }
-    }
-    try {
-      await deps.writeFile(tempPath, payload, { mode: 0o600 })
-      await deps.chmod(tempPath, 0o600)
-      await deps.rename(tempPath, authPath)
-      await deps.chmod(authPath, 0o600)
-      await deps.execFile('codex', ['login', 'status'])
-      try {
-        await deps.rm(backupPath, { force: true })
-      } catch {
-        throw new AiCredentialRuntimeError('CODEX_BACKUP_CLEANUP_FAILED')
-      }
-    } catch (error) {
-      let tempCleanupFailed = false
-      try {
-        await deps.rm(tempPath, { force: true })
-      } catch {
-        tempCleanupFailed = true
-      }
-      let authRemovalFailed = false
-      try {
-        await deps.rm(authPath, { force: true })
-      } catch {
-        authRemovalFailed = true
       }
       if (hadExisting) {
         try {
-          await deps.rename(backupPath, authPath)
+          await deps.chmod(backupPath, 0o600)
         } catch {
-          throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
-        }
-      } else if (authRemovalFailed) {
-        throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
-      } else {
-        try {
-          await deps.rename(backupPath, authPath)
-          await deps.chmod(authPath, 0o600)
-        } catch (restoreError) {
-          if ((restoreError as NodeJS.ErrnoException).code !== 'ENOENT') {
+          try {
+            await deps.rename(backupPath, authPath)
+          } catch {
             throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
           }
+          throw new AiCredentialRuntimeError('CODEX_BACKUP_FAILED')
         }
       }
-      if (tempCleanupFailed) {
-        throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
+      try {
+        await deps.writeFile(tempPath, payload, { mode: 0o600 })
+        await deps.chmod(tempPath, 0o600)
+        await deps.rename(tempPath, authPath)
+        await deps.chmod(authPath, 0o600)
+        await deps.execFile('codex', ['login', 'status'])
+        try {
+          await deps.rm(backupPath, { force: true })
+        } catch {
+          throw new AiCredentialRuntimeError('CODEX_BACKUP_CLEANUP_FAILED')
+        }
+      } catch (error) {
+        let tempCleanupFailed = false
+        try {
+          await deps.rm(tempPath, { force: true })
+        } catch {
+          tempCleanupFailed = true
+        }
+        let authRemovalFailed = false
+        try {
+          await deps.rm(authPath, { force: true })
+        } catch {
+          authRemovalFailed = true
+        }
+        if (hadExisting) {
+          try {
+            await deps.rename(backupPath, authPath)
+          } catch {
+            throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
+          }
+        } else if (authRemovalFailed) {
+          throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
+        } else {
+          try {
+            await deps.rename(backupPath, authPath)
+            await deps.chmod(authPath, 0o600)
+          } catch (restoreError) {
+            if ((restoreError as NodeJS.ErrnoException).code !== 'ENOENT') {
+              throw new AiCredentialRuntimeError('CODEX_BACKUP_RESTORE_FAILED')
+            }
+          }
+        }
+        if (tempCleanupFailed) {
+          throw new AiCredentialRuntimeError('CODEX_APPLY_ROLLBACK_FAILED')
+        }
+        if (error instanceof AiCredentialRuntimeError) throw error
+        throw new AiCredentialRuntimeError('CODEX_APPLY_FAILED')
       }
-      if (error instanceof AiCredentialRuntimeError) throw error
-      throw new AiCredentialRuntimeError('CODEX_APPLY_FAILED')
-    }
-    return { provider: 'codex' as const, configured: true, status: 'authenticated' as const }
+      return { provider: 'codex' as const, configured: true, status: 'authenticated' as const }
+    })
   }
 
   async function ensureCodexMultiAuth(): Promise<void> {
@@ -1244,14 +1256,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
   }
 
   async function readOptionalJson(path: string): Promise<Record<string, unknown> | null> {
-    try {
-      const parsed = JSON.parse(await deps.readFile(path))
-      if (!isObject(parsed)) throw new AiCredentialRuntimeError('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
-      return parsed
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-      throw error
-    }
+    return parseOptionalCredentialJson(await readOptionalText(deps, path))
   }
 
   async function applyCodexMultiAuth(bundle: CodexMultiAuthBundle, applyMode: 'merge' | 'replace') {
@@ -1265,14 +1270,15 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (applyMode === 'merge') {
       let current = bundle
       let savedSettings: CodexMultiAuthBundle['settings'] = { version: 1, pluginConfig: {} }
-      try {
-        const raw = await deps.readFile(accountsPath)
-        current = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: JSON.parse(raw) }))!
+      // What this merge read; every pool write below is compared against it under the lock.
+      let poolRaw = await readOptionalText(deps, accountsPath)
+      if (poolRaw !== null) {
+        current = parseCodexMultiAuthBundle(JSON.stringify({ ...bundle, accounts: JSON.parse(poolRaw) }))!
         if (!current) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
-      const live = await readOptionalJson(deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json'))
+      const livePath = deps.env.CODEX_CLI_AUTH_PATH || join(codexHome(), 'auth.json')
+      const liveRaw = await readOptionalText(deps, livePath)
+      const live = parseOptionalCredentialJson(liveRaw)
       if (live) {
         const tokens = isObject(live.tokens) ? live.tokens : null
         if (!tokens || typeof tokens.refresh_token !== 'string' || !tokens.refresh_token
@@ -1293,14 +1299,14 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
           addedAt: deps.now(), lastUsed: deps.now(),
         }
         // Capture first, before importing any shared material. A fresh pool starts on the live identity.
-        let hasPool = true
-        try { await deps.readFile(accountsPath) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; hasPool = false }
-        const personalPool = hasPool ? mergeCodexAccounts(current.accounts, { ...bundle.accounts, accounts: [candidate] })
+        const personalPool = poolRaw !== null ? mergeCodexAccounts(current.accounts, { ...bundle.accounts, accounts: [candidate] })
           : { version: 3 as const, activeIndex: 0, accounts: [candidate] }
         current = { ...bundle, accounts: personalPool }
-        await replaceCodexMultiAuthFiles(deps, [{ path: accountsPath, content: JSON.stringify(personalPool) }], async () => {
+        // The captured entry copies the live refresh token: if Codex refreshed it meanwhile, the copy is stale.
+        await replaceCodexMultiAuthFiles(deps, [{ path: accountsPath, content: JSON.stringify(personalPool), expected: poolRaw }], async () => {
           if (await deps.readFile(accountsPath) !== JSON.stringify(personalPool)) throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
-        })
+        }, [{ path: livePath, expected: liveRaw }])
+        poolRaw = JSON.stringify(personalPool)
       }
       try {
         savedSettings = JSON.parse(await deps.readFile(settingsPath))
@@ -1330,14 +1336,10 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
         return active && matching(active, account) && !!live && isObject(live.tokens) && live.tokens.account_id === active.accountId
       })
       const merged = mergeCodexAccounts(refreshed, bundle.accounts)
-      // A refresh/login performed while probing wins over our older snapshot.
-      try {
-        if (JSON.stringify(JSON.parse(await deps.readFile(accountsPath))) !== JSON.stringify(current.accounts)) {
-          throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
-        }
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      // A refresh/login performed while probing wins over our older snapshot: the write below compares the pool
+      // under its lock and, if it moved, the whole merge runs once more from a fresh read.
       await replaceCodexMultiAuthFiles(deps, [
-        { path: accountsPath, content: JSON.stringify(merged) },
+        { path: accountsPath, content: JSON.stringify(merged), expected: poolRaw },
         { path: settingsPath, content: JSON.stringify(savedSettings) },
       ], async () => {
         if (await deps.readFile(accountsPath) !== JSON.stringify(merged)
@@ -1348,49 +1350,59 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       if (repairedActive) {
         // Refresh the same live identity, never switch a valid personal login to another account.
         await deps.execFile('codex-multi-auth', ['switch', String(merged.activeIndex + 1)], { timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })
-        const selected = JSON.parse(await deps.readFile(accountsPath)) as CodexMultiAuthBundle['accounts']
-        await assertCodexLiveAccount(selected.accounts[merged.activeIndex]!)
-        await writeAtomicFile(deps, accountsPath, JSON.stringify({ ...merged, accounts: selected.accounts }))
+        // Read what the switch left and write it back under one lock hold, so nothing lands in between.
+        await deps.lockCredentialFile(accountsPath, async () => {
+          const selected = JSON.parse(await deps.readFile(accountsPath)) as CodexMultiAuthBundle['accounts']
+          await assertCodexLiveAccount(selected.accounts[merged.activeIndex]!)
+          await writeAtomicFile(deps, accountsPath, JSON.stringify({ ...merged, accounts: selected.accounts }))
+        })
       }
       return { provider: 'codex' as const, configured: true, accountCount: merged.accounts.length }
     }
     const applied = await replaceCodexMultiAuthFiles(deps, [
       { path: accountsPath, content: JSON.stringify(bundle.accounts) },
       { path: settingsPath, content: JSON.stringify(settings) },
-    ], async () => {
+    ], async (ownWrite) => {
       await deps.execFile('codex-multi-auth', ['forecast', '--live', '--json'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
-      const currentBundle = parseCodexMultiAuthBundle(JSON.stringify({
-        ...bundle,
-        accounts: JSON.parse(await deps.readFile(accountsPath)),
-      }))
-      if (!currentBundle
-        || currentBundle.accounts.accounts.length !== bundle.accounts.accounts.length) {
-        throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
-      }
+      // `forecast --live` may refresh pool tokens. Sort what it left, reading and writing under one lock hold
+      // so a refresh is never sorted away; the network call above stays outside the lock.
       const quotaCache = await readCodexQuotaCache(deps, root)
-      const selection = selectLeastRemainingCodexAccounts(
-        currentBundle.accounts.accounts,
-        quotaCache,
-        CODEX_MULTI_AUTH_THRESHOLD,
-      )
-      const orderedAccounts = selection.orderedIndexes
-        .map((index) => currentBundle.accounts.accounts[index]!)
-      const sorted = {
-        ...currentBundle.accounts,
-        accounts: orderedAccounts,
-        activeIndex: selection.activeIndex,
-        activeIndexByFamily: resetActiveIndexes(currentBundle.accounts.activeIndexByFamily),
-        pinnedAccountIndex: undefined,
-      }
-      await writeAtomicFile(deps, accountsPath, JSON.stringify(sorted))
+      const sortedPool = await deps.lockCredentialFile(accountsPath, async () => {
+        const currentBundle = parseCodexMultiAuthBundle(JSON.stringify({
+          ...bundle,
+          accounts: JSON.parse(await deps.readFile(accountsPath)),
+        }))
+        if (!currentBundle
+          || currentBundle.accounts.accounts.length !== bundle.accounts.accounts.length) {
+          throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_PAYLOAD_INVALID')
+        }
+        const selection = selectLeastRemainingCodexAccounts(
+          currentBundle.accounts.accounts,
+          quotaCache,
+          CODEX_MULTI_AUTH_THRESHOLD,
+        )
+        const orderedAccounts = selection.orderedIndexes
+          .map((index) => currentBundle.accounts.accounts[index]!)
+        const sorted = {
+          ...currentBundle.accounts,
+          accounts: orderedAccounts,
+          activeIndex: selection.activeIndex,
+          activeIndexByFamily: resetActiveIndexes(currentBundle.accounts.activeIndexByFamily),
+          pinnedAccountIndex: undefined,
+        }
+        const sortedContent = JSON.stringify(sorted)
+        ownWrite(accountsPath, sortedContent)
+        await writeAtomicFile(deps, accountsPath, sortedContent)
+        return { selection, accountCount: currentBundle.accounts.accounts.length }
+      })
       await deps.execFile('codex-multi-auth', ['check'], {
         maxOutputBytes: MAX_PAYLOAD_BYTES,
         timeoutMs: CLAUDE_STATUS_TIMEOUT_MS,
       })
-      return { selection, accountCount: currentBundle.accounts.accounts.length }
+      return sortedPool
     })
     return {
       provider: 'codex' as const,
@@ -2787,32 +2799,96 @@ async function readCodexQuotaCache(
   }
 }
 
-type ManagedCodexFile = { path: string; content: string }
+/**
+ * `expected` is the file's content as this operation last read it (`null`: it was absent). A file
+ * with `expected` is compared again under its credential lock right before anything is replaced;
+ * if Codex or another tool rewrote it meanwhile, nothing is written (aplus D4 C-R5).
+ */
+type ManagedCodexFile = { path: string; content: string; expected?: string | null }
+/** A credential this write depends on without rewriting it, e.g. the live login a pool entry was copied from. */
+type CredentialGuard = { path: string; expected: string | null }
 
+/** The file or another writer changed after this operation read it. One fresh retry is allowed. */
+export const CREDENTIAL_LOST_RACE = 'AI_CREDENTIAL_LOST_RACE'
+
+function parseOptionalCredentialJson(raw: string | null): Record<string, unknown> | null {
+  if (raw === null) return null
+  const parsed = JSON.parse(raw)
+  if (!isObject(parsed)) throw new AiCredentialRuntimeError('AI_CREDENTIAL_PERSONAL_CAPTURE_REQUIRED')
+  return parsed
+}
+
+async function readOptionalText(deps: AiCredentialRuntimeDependencies, path: string): Promise<string | null> {
+  try {
+    return await deps.readFile(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}
+
+/** Takes every listed credential lock, in path order so two writers never wait on each other. */
+function withCredentialFileLocks<T>(deps: AiCredentialRuntimeDependencies, paths: string[], work: () => Promise<T>): Promise<T> {
+  const [first, ...rest] = [...new Set(paths)].sort()
+  return first === undefined ? work() : deps.lockCredentialFile(first, () => withCredentialFileLocks(deps, rest, work))
+}
+
+async function assertCredentialsUnchanged(deps: AiCredentialRuntimeDependencies, expected: CredentialGuard[]): Promise<void> {
+  for (const file of expected) {
+    if (await readOptionalText(deps, file.path) !== file.expected) throw new AiCredentialRuntimeError(CREDENTIAL_LOST_RACE)
+  }
+}
+
+/** Runs a credential write operation again, from its reads, once if it lost the race to another writer. */
+async function retryOnceOnLostRace<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (!(error instanceof AiCredentialRuntimeError) || error.kind !== CREDENTIAL_LOST_RACE) throw error
+    logger.debug('[ai-credential] a credential file changed while it was being written; retrying once from a fresh read')
+    return operation()
+  }
+}
+
+/**
+ * Installs `files` with backups, runs `verify`, and rolls back on failure. `verify` reports its own rewrites
+ * of an installed file through `ownWrite`, so the rollback restores over them instead of keeping them as another writer's.
+ */
 async function replaceCodexMultiAuthFiles<T>(
   deps: AiCredentialRuntimeDependencies,
   files: ManagedCodexFile[],
-  verify: () => Promise<T>,
+  verify: (ownWrite: (path: string, content: string) => void) => Promise<T>,
+  guards: CredentialGuard[] = [],
 ): Promise<T> {
   const backups = new Set<string>()
-  const installed = new Set<string>()
+  /** Every content this operation wrote to each installed path. */
+  const installed = new Map<string, Set<string>>()
+  const compared: CredentialGuard[] = [
+    ...guards,
+    ...files.flatMap(file => file.expected === undefined ? [] : [{ path: file.path, expected: file.expected }]),
+  ]
   let verified = false
   try {
-    for (const file of files) {
-      const backup = `${file.path}.happy-backup`
-      try {
-        await deps.rename(file.path, backup)
-        backups.add(file.path)
-        await deps.chmod(backup, 0o600)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    // Only the local compare-and-replace holds the locks; `verify` may reach the network. Every replaced file is
+    // locked, compared or not, so an install never lands inside another writer's read-modify-write.
+    await withCredentialFileLocks(deps, [...files.map(file => file.path), ...compared.map(file => file.path)], async () => {
+      await assertCredentialsUnchanged(deps, compared)
+      for (const file of files) {
+        const backup = `${file.path}.happy-backup`
+        try {
+          await deps.rename(file.path, backup)
+          backups.add(file.path)
+          await deps.chmod(backup, 0o600)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
       }
-    }
-    for (const file of files) {
-      installed.add(file.path)
-      await writeAtomicFile(deps, file.path, file.content)
-    }
-    const result = await verify()
+      for (const file of files) {
+        installed.set(file.path, new Set([file.content]))
+        await writeAtomicFile(deps, file.path, file.content)
+      }
+    })
+    const result = await verify((path, content) => { installed.get(path)?.add(content) })
     verified = true
     for (const path of backups) await deps.rm(`${path}.happy-backup`, { force: true })
     return result
@@ -2820,14 +2896,26 @@ async function replaceCodexMultiAuthFiles<T>(
     if (verified) {
       throw new AiCredentialRuntimeError('CODEX_MULTI_AUTH_BACKUP_CLEANUP_FAILED')
     }
+    // A file another writer (Codex, codex-multi-auth) replaced after we installed it is newer than our backup: keep it.
+    const replacedByOthers = new Set<string>()
     for (const file of files) {
       await deps.rm(`${file.path}.happy-tmp`, { force: true }).catch(() => undefined)
       await deps.rm(`${file.path}.happy-sort-tmp`, { force: true }).catch(() => undefined)
-      if (installed.has(file.path)) {
+      const ours = installed.get(file.path)
+      if (ours) {
+        const current = await readOptionalText(deps, file.path).catch(() => null)
+        if (current !== null && !ours.has(current)) {
+          replacedByOthers.add(file.path)
+          continue
+        }
         await deps.rm(file.path, { force: true }).catch(() => undefined)
       }
     }
     for (const path of backups) {
+      if (replacedByOthers.has(path)) {
+        await deps.rm(`${path}.happy-backup`, { force: true }).catch(() => undefined)
+        continue
+      }
       try {
         await deps.rename(`${path}.happy-backup`, path)
         await deps.chmod(path, 0o600)
@@ -2955,6 +3043,7 @@ export function createNodeAiCredentialRuntime(
     chmod,
     rm,
     makeTempDir: () => mkdtemp(join(stagingParent(), 'happy-ai-credential-')),
+    lockCredentialFile: (path, work) => withCredentialLock(credentialFileLockPath(path), work),
     supervisor,
     warn: (message) => logger.debug(message),
   })

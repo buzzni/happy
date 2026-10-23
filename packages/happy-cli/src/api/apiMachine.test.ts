@@ -791,6 +791,7 @@ describe('ApiMachineClient socket reconnection', () => {
             mkdir: vi.fn(async () => undefined), rename: vi.fn(async () => undefined),
             chmod: vi.fn(async () => undefined), rm: vi.fn(async () => undefined),
             makeTempDir: vi.fn(async () => '/unused'),
+            lockCredentialFile: (_path, work) => work(),
             supervisor: {
                 enable: vi.fn(async () => undefined), stop: vi.fn(async () => undefined),
                 status: vi.fn(() => ({ state: 'stopped' as const, lastErrorKind: null })),

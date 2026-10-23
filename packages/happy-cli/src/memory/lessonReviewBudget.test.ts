@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LessonReviewBudget } from './lessonReviewBudget';
-import { UNOWNED_LOCK_STALE_MS, type OwnedFileLockDeps } from './ownedFileLock';
+import { UNOWNED_LOCK_STALE_MS, type OwnedFileLockDeps } from '@/utils/ownedFileLock';
 const dirs: string[] = [];
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'lesson-budget-')); dirs.push(dir);
