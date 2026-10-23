@@ -221,7 +221,7 @@ import {
     recordTerminalActivity,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
-import { replyToTerminalResume } from '@/daemon/terminalResumeReply';
+import { replyToTerminalResume, sendExitAfterReplay } from '@/daemon/terminalResumeReply';
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
@@ -3958,7 +3958,12 @@ export class ApiMachineClient {
                     // visible output isn't silently dropped.
                     outputCoalescer.flush();
                     outputCoalescer.dispose();
-                    this.socket.emit('terminal-closed', { sessionId, code, signal });
+                    // Not in the middle of a replay the client is still reading:
+                    // the answer to its last page carries the exit instead (D4 B-R2).
+                    sendExitAfterReplay({
+                        output: entry.output,
+                        sendClosed: () => this.socket.emit('terminal-closed', { sessionId, code, signal }),
+                    });
                     const closedAt = Date.now();
                     // Audit log per specs/remote-terminal/ §3 #7. Body is
                     // intentionally NOT recorded — only metadata. logger.debug
