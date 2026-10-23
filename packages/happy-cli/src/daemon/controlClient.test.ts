@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   mockWriteDaemonState: vi.fn(),
   mockWriteDaemonStateIfUnchanged: vi.fn(),
   mockClearDaemonState: vi.fn(),
+  mockReadDaemonLockHolderPid: vi.fn(),
   mockLoggerDebug: vi.fn(),
 }))
 
@@ -16,6 +17,7 @@ vi.mock('@/persistence', () => ({
   writeDaemonState: mocks.mockWriteDaemonState,
   writeDaemonStateIfUnchanged: mocks.mockWriteDaemonStateIfUnchanged,
   clearDaemonState: mocks.mockClearDaemonState,
+  readDaemonLockHolderPid: mocks.mockReadDaemonLockHolderPid,
 }))
 
 vi.mock('@/ui/logger', () => ({
@@ -137,6 +139,31 @@ describe('checkIfDaemonRunningAndCleanupStaleState', () => {
       await expect(checkIfDaemonRunningAndCleanupStaleState()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
       expect(mocks.mockClearDaemonState).not.toHaveBeenCalled()
       expect(mocks.mockWriteDaemonStateIfUnchanged).not.toHaveBeenCalled()
+    } finally { fetchSpy.mockRestore() }
+  })
+
+  // aplus codexcli-daemon-restart-drain F2 — a bundle handoff marks its own state stopped after closing the
+  // control server and stays alive until the replacement's `daemon start` confirms. That record is released
+  // ownership, not a slow daemon: probing it threw DAEMON_HEALTH_UNCONFIRMED and crashed every replacement.
+  it('reports not running for a live owner that marked its own state stopped, without probing or rewriting it', async () => {
+    const state = { ...stateWithPid(process.pid), state: 'stopped' as const }
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('connection-refused'))
+    try {
+      await expect(checkIfDaemonRunningAndCleanupStaleState()).resolves.toBe(false)
+      expect(fetchSpy).not.toHaveBeenCalled()
+      expect(mocks.mockWriteDaemonStateIfUnchanged).not.toHaveBeenCalled()
+      expect(mocks.mockWriteDaemonState).not.toHaveBeenCalled()
+    } finally { fetchSpy.mockRestore() }
+  })
+
+  it('keeps the health check for a stopped owner that still holds the lock (shutdown still tearing down)', async () => {
+    const state = { ...stateWithPid(process.pid), state: 'stopped' as const }
+    mocks.mockReadDaemonStateSnapshot.mockResolvedValue({ state, raw: JSON.stringify(state) })
+    mocks.mockReadDaemonLockHolderPid.mockReturnValue(process.pid)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('connection-refused'))
+    try {
+      await expect(checkIfDaemonRunningAndCleanupStaleState()).rejects.toThrow('DAEMON_HEALTH_UNCONFIRMED')
     } finally { fetchSpy.mockRestore() }
   })
 

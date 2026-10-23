@@ -5,7 +5,7 @@
 
 import type { AutomationTurnResult } from '@/api/automationTurnTracker';
 import { logger } from '@/ui/logger';
-import { clearDaemonState, readDaemonState, readDaemonStateSnapshot, writeDaemonStateIfUnchanged } from '@/persistence';
+import { clearDaemonState, readDaemonLockHolderPid, readDaemonState, readDaemonStateSnapshot, writeDaemonStateIfUnchanged } from '@/persistence';
 import { Metadata } from '@/api/types';
 import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch';
 import { configuration } from '@/configuration';
@@ -348,6 +348,14 @@ export async function stopDaemonHttp(): Promise<void> {
 export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolean> {
   const { state, raw } = await readDaemonStateSnapshot();
   if (!state) {
+    return false;
+  }
+  // The owner writes `stopped` after closing its control server; the bundle handoff also drops the lock
+  // (`clearDaemonState`) and then stays alive until its replacement confirms, so probing it here failed
+  // every replacement (aplus codexcli-daemon-restart-drain F2). A `stopped` owner that still holds the
+  // lock is mid-shutdown and keeps the checks below. The record is left as written: its tracked
+  // sessions are what the replacement recovers.
+  if (state.state === 'stopped' && readDaemonLockHolderPid() !== state.pid) {
     return false;
   }
 
