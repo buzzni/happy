@@ -15,7 +15,7 @@ import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { FileLockHeldError, withOwnedFileLock } from './ownedFileLock';
+import { FileLockHeldError, withOwnedFileLock } from '@/utils/ownedFileLock';
 
 /** The one directory these files live in, under the daemon's home. */
 export const LESSON_SETTINGS_DIR = 'lesson-host';
