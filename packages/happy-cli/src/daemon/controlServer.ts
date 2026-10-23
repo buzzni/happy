@@ -1,6 +1,7 @@
 import type { createDeviceEnrollment } from './deviceEnrollment';
 import { attachLocalToolAgentRelayRoutes } from './localToolAgentRelay';
 import { attachStandaloneDrain, type StandaloneDrain } from './standaloneDrain';
+import { attachRestartDrainRoutes, type RestartDrainControlPort } from './restartDrainRoutes';
 import { attachBrowserLocalSetupRoutes } from './browserLocalSetupRoutes';
 import type { BrowserLocalSetup } from './browserLocalSetup';
 /**
@@ -108,6 +109,7 @@ export function startDaemonControlServer({
   managedRuntime = false,
   verifyManagedReport,
   standaloneDrain,
+  restartDrain,
   writeScopeRuntime,
   browserLocalSetup,
   getDeviceEnrollment = () => null,
@@ -118,6 +120,8 @@ export function startDaemonControlServer({
   getSetupTokenAccountSwitch?: () => SetupTokenAccountSwitch | null;
   writeScopeRuntime?: SessionWriteScopeRuntime | null;
   standaloneDrain?: StandaloneDrain;
+  /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
+  restartDrain?: RestartDrainControlPort;
   browserLocalSetup?: BrowserLocalSetup;
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -1026,6 +1030,7 @@ export function startDaemonControlServer({
     attachLocalToolAgentRelayRoutes(app);
     if (browserLocalSetup) attachBrowserLocalSetupRoutes(app, browserLocalSetup);
     attachStandaloneDrain(app, managedRuntime ? undefined : standaloneDrain, requestShutdown);
+    attachRestartDrainRoutes(app, managedRuntime ? undefined : restartDrain, { standaloneDrainActive: Boolean(standaloneDrain) });
 
     // Stop daemon
     typed.post('/stop', {
@@ -1037,6 +1042,8 @@ export function startDaemonControlServer({
       }
     }, async (_request, reply) => {
       if (standaloneDrain) { reply.code(409); return { status: 'drain-required' }; }
+      // R5: a stop that skips an open restart drain would cut it short; the caller waits for `ready`.
+      if (restartDrain?.stopBlocked()) { reply.code(409); return { status: 'drain-in-progress' }; }
       logger.debug('[CONTROL SERVER] Stop daemon request received');
 
       // Give time for response to arrive

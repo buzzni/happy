@@ -15,6 +15,8 @@ import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
+import type { DaemonRestartLifecycle } from './types';
+import { DAEMON_RESTARTING_CODE, withRestartLifecycle } from '@/daemon/restartDrainLifecycle';
 import type { DaemonSessionStateResponse } from '@/daemon/daemonSessionState';
 import {
     registerCommonHandlers,
@@ -216,6 +218,7 @@ import {
     getDaemonTerminalSession,
     killAllDaemonTerminalSessions,
     markDaemonTerminalSessionExited,
+    closeAllDaemonTerminalSessionsForRestart,
     recordBytesIn,
     recordBytesOut,
     recordTerminalActivity,
@@ -518,8 +521,9 @@ interface DaemonToServerEvents {
     // There is no honest answer to the resume: say where the hole starts rather
     // than let the client believe it is current.
     'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number }) => void;
-    // Codex CLI benchmark D4 B-R2: `reason` answers a resume for a terminal the daemon does not have.
-    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null } | { sessionId: string; reason: 'unknown-session' }) => void;
+    // Codex CLI benchmark D4 B-R2: `reason: 'unknown-session'` answers a resume for a terminal the daemon does not have.
+    // aplus codexcli-daemon-restart-drain R23: `reason: 'daemon-restart'` marks an exit the daemon caused to restart.
+    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null; reason?: 'daemon-restart' } | { sessionId: string; reason: 'unknown-session' }) => void;
     // Preview WebSocket relay — upstream→browser bytes and tunnel teardown.
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
     'proxy-ws-close': (payload: { tunnelId: string }) => void;
@@ -582,6 +586,15 @@ type MachineRpcHandlers = {
         context?: StopSessionContext,
     ) => Promise<{ result: StopSessionResult; exitVerification: SessionExitVerification }>;
     requestShutdown: () => void;
+    /**
+     * aplus codexcli-daemon-restart-drain R25 "지금 교대": pulls a pending bundle handoff forward.
+     * Narrower than `stop-daemon` — it can only hasten a handoff whose bundle is already installed,
+     * never start a restart or stop.
+     */
+    forceRestartHandoff?: () => Promise<
+        | { ok: true; deadlineAt: number }
+        | { ok: false; code: 'no-pending-handoff' | 'replacement-unavailable' }
+    >;
     portRegistry: PortRegistry;
     /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
     automationStore?: AutomationStore;
@@ -741,7 +754,10 @@ export class ApiMachineClient {
     private runtimeActivityProvider: (() => {
         activeSessionCount: number;
         activeAutomationCount: number;
+        inTurnCount?: number;
     }) | null = null;
+    /** aplus codexcli-daemon-restart-drain R6·R22 — current drain / pending handoff, null while running normally. */
+    private restartLifecycleProvider: (() => DaemonRestartLifecycle | null) | null = null;
     private lastKnownCLIAvailability: CLIAvailability | null = null;
     private lastKnownResumeSupport: ResumeSupport | null = null;
     // specs/20260521-happy-cli-version-republish — daemon 재시작 후 새 cli
@@ -1083,6 +1099,7 @@ export class ApiMachineClient {
         stopSession,
         stopSessionWithExitVerification,
         requestShutdown,
+        forceRestartHandoff,
         portRegistry,
         automationStore,
         aiCredentialRuntime,
@@ -1406,6 +1423,17 @@ export class ApiMachineClient {
                     return { type: 'requestToApproveDirectoryCreation', directory: result.directory };
 
                 case 'error':
+                    // A drain refusal is answered, not thrown: Desktop needs the code and
+                    // deadline to wait and retry once (R6). Every other failure keeps throwing,
+                    // which is what older clients parse.
+                    if (result.code === DAEMON_RESTARTING_CODE) {
+                        return {
+                            type: 'error',
+                            code: result.code,
+                            errorMessage: result.errorMessage,
+                            ...(typeof result.deadlineAt === 'number' ? { deadlineAt: result.deadlineAt } : {}),
+                        };
+                    }
                     throw new Error(result.errorMessage);
             }
         });
@@ -1934,6 +1962,10 @@ export class ApiMachineClient {
         });
 
         // Register stop daemon handler
+        if (forceRestartHandoff) {
+            this.rpcHandlerManager.registerHandler('restart-drain:force-handoff', () => forceRestartHandoff());
+        }
+
         this.rpcHandlerManager.registerHandler('stop-daemon', () => {
             logger.debug('[API MACHINE] Received stop-daemon RPC request');
 
@@ -3960,9 +3992,10 @@ export class ApiMachineClient {
                     outputCoalescer.dispose();
                     // Not in the middle of a replay the client is still reading:
                     // the answer to its last page carries the exit instead (D4 B-R2).
+                    // R23: a restart close says so; Desktop shows why instead of a bare exit code.
                     sendExitAfterReplay({
                         output: entry.output,
-                        sendClosed: () => this.socket.emit('terminal-closed', { sessionId, code, signal }),
+                        sendClosed: () => this.socket.emit('terminal-closed', { sessionId, code, signal, ...(entry.closeReason ? { reason: entry.closeReason } : {}) }),
                     });
                     const closedAt = Date.now();
                     // Audit log per specs/remote-terminal/ §3 #7. Body is
@@ -4155,15 +4188,16 @@ export class ApiMachineClient {
             this.socket.emit('machine-alive', payload);
             const activity = this.runtimeActivityProvider?.();
             if (activity) {
-                this.updateDaemonState((state) => ({
+                this.updateDaemonState((state) => withRestartLifecycle({
                     ...state,
                     status: state?.status ?? 'running',
                     activity: {
                         activeSessionCount: Math.max(0, Math.floor(activity.activeSessionCount)),
                         activeAutomationCount: Math.max(0, Math.floor(activity.activeAutomationCount)),
+                        ...(typeof activity.inTurnCount === 'number' ? { inTurnCount: Math.max(0, Math.floor(activity.inTurnCount)) } : {}),
                         reportedAt: Date.now(),
                     },
-                })).catch((err) => {
+                }, this.restartLifecycleProvider?.() ?? null)).catch((err) => {
                     logger.debug('[API MACHINE] Failed to publish runtime activity:', err);
                 });
             }
@@ -4300,8 +4334,31 @@ export class ApiMachineClient {
     setRuntimeActivityProvider(provider: () => {
         activeSessionCount: number;
         activeAutomationCount: number;
+        inTurnCount?: number;
     }): void {
         this.runtimeActivityProvider = provider;
+    }
+
+    setRestartLifecycleProvider(provider: () => DaemonRestartLifecycle | null): void {
+        this.restartLifecycleProvider = provider;
+    }
+
+    /** Push the drain state now instead of waiting for the next keep-alive (R6). */
+    publishRestartLifecycle(): void {
+        const lifecycle = this.restartLifecycleProvider?.() ?? null;
+        this.updateDaemonState((state) => withRestartLifecycle({ ...state, status: state?.status ?? 'running' }, lifecycle))
+            .catch((err) => logger.debug('[API MACHINE] Failed to publish restart lifecycle:', err));
+    }
+
+    /**
+     * R23: close every daemon terminal before a restart, while the socket is still
+     * up so each `terminal-closed` carries `reason: 'daemon-restart'`.
+     */
+    async closeDaemonTerminalsForRestart(): Promise<number> {
+        const closed = await closeAllDaemonTerminalSessionsForRestart();
+        // The close frames are emitted from each PTY's exit handler; give them a beat to leave.
+        if (closed > 0) await new Promise((resolve) => setTimeout(resolve, 200));
+        return closed;
     }
 
     /**

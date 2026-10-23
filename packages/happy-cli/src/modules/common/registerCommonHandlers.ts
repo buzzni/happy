@@ -441,9 +441,21 @@ export type SpawnSessionResult =
         };
     }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; errorMessage: string };
+    | {
+        type: 'error';
+        errorMessage: string;
+        /**
+         * Machine-readable refusal. `daemon-restarting` (aplus codexcli-daemon-restart-drain R1·R6):
+         * refused before anything ran, retryable once the daemon is back — `deadlineAt` (epoch ms)
+         * is when the drain ends at the latest.
+         */
+        code?: string;
+        deadlineAt?: number;
+    };
 
 export type ResumeSessionErrorCode =
+    /** aplus codexcli-daemon-restart-drain R1 — refused before anything ran; retry after the restart. */
+    | 'daemon-restarting'
     | 'SESSION_LIVE'
     | 'SESSION_NOT_TRACKED'
     | 'SESSION_METADATA_MISSING'
@@ -461,7 +473,13 @@ export type ResumeSessionErrorCode =
 export type ResumeSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; code: ResumeSessionErrorCode; errorMessage: string };
+    | {
+        type: 'error';
+        code: ResumeSessionErrorCode;
+        errorMessage: string;
+        /** With `daemon-restarting`: when the drain ends at the latest (epoch ms). */
+        deadlineAt?: number;
+    };
 
 export type RecoverSessionOptions = {
     initialPrompt: string;

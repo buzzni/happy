@@ -82,13 +82,17 @@ import { BrowserBridge } from './browserBridge';
 import { BrowserLocalSetup, shouldEnableBrowserLocalSetup } from './browserLocalSetup';
 import { readBrowserSetupPolicy, writeBrowserSetupPolicy, localBrowserExtensionMetadata } from './browserLocalSetupStore';
 import { BrowserSessionBrokerClient } from './browserSessionBrokerContract';
-import { getDaemonTerminalSessionCount } from './daemonTerminalSessions';
+import { getBusyDaemonTerminalCount, getDaemonTerminalSessionCount } from './daemonTerminalSessions';
 import { startBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
 import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { checkExecutableReplaced, readOwnDaemonIdentity } from './daemonIdentity';
+import { daemonRestartingRefusal } from './restartDrainLifecycle';
+import { countInTurnSessions, type RestartDrainActivity } from './restartDrain';
+import { createDaemonRestartDrainRuntime, type DaemonRestartDrainRuntime } from './restartDrainRuntime';
+import type { RestartDrainControlPort } from './restartDrainRoutes';
 import { resolveDaemonStateOwnership } from './daemonStateOwnership';
 import { createPortRegistry } from './portRegistry';
 import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs } from './stageUserCredentials';
@@ -238,7 +242,6 @@ import { createLessonGrantVerifier, lessonGrantAudience, type LessonGrantVerifie
 import { fetchLessonGrantPublicKey, requestLessonSnapshotGrant } from '@/memory/lessonHostRuntime';
 import { createAutomationTickRunner } from './automations/automationTickRunner';
 import {
-  decideAutomationAwareHandoff,
   resumeAutomationRunnersAfterFailedHandoff,
 } from './daemonHandoffAutomationGate';
 import { runAutomationScript } from './automations/runAutomationScript';
@@ -722,6 +725,16 @@ export async function startDaemon(): Promise<void> {
     logger.debug('[DAEMON RUN] Received SIGTERM');
     requestShutdown('os-signal');
   });
+
+  // aplus codexcli-daemon-restart-drain R20: SIGHUP is a self-completing restart on POSIX
+  // (Windows has no SIGHUP, and Node's signal send there is an immediate kill).
+  let onSighup: () => void = () => logger.debug('[DAEMON RUN] SIGHUP before the restart drain exists; ignored');
+  if (process.platform !== 'win32') {
+    process.on('SIGHUP', () => {
+      logger.debug('[DAEMON RUN] Received SIGHUP');
+      onSighup();
+    });
+  }
 
   process.on('uncaughtException', (error) => {
     logger.debug('[DAEMON RUN] FATAL: Uncaught exception', error);
@@ -1866,6 +1879,9 @@ export async function startDaemon(): Promise<void> {
       trustedMcpContext?: AutomationMcpSpawnContext,
     ): Promise<SpawnSessionResult> => {
       if (!launchReadiness.isReady()) return { type: 'error', errorMessage: 'Daemon is initializing; retry the launch shortly' };
+      // R1: a restart drain refuses before anything runs — retryable, never half-started.
+      const restartDeadlineForLaunch = launchReadiness.restartDeadline();
+      if (restartDeadlineForLaunch !== null) return daemonRestartingRefusal('launch', restartDeadlineForLaunch);
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsProvider(options.agent))) {
         return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
       }
@@ -2791,6 +2807,8 @@ export async function startDaemon(): Promise<void> {
       if (writeScopeRuntime?.isApplying(happySessionId) && !options?.writeScopeEnvironment) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Session folder permissions are being replaced' };
 
       if (!launchReadiness.isReady()) return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Daemon is initializing; retry the resume shortly' };
+      const restartDeadlineForResume = launchReadiness.restartDeadline();
+      if (restartDeadlineForResume !== null) return daemonRestartingRefusal('resume', restartDeadlineForResume);
       if (pendingMachineStarts.has(happySessionId)) return { type: 'error', code: 'SESSION_LIVE', errorMessage: 'The execution-bound session is still starting; retry shortly.' };
       let endResumeLaunch: (() => void) | undefined;
       try {
@@ -3941,7 +3959,20 @@ export async function startDaemon(): Promise<void> {
     // Assigned once the AI credential runtime exists; the control server asks for it per request.
     let setupTokenAccountSwitch: SetupTokenAccountSwitch | null = null;
     // Start control server
+    // R18: read once here — the shutdown path must never run `ps`.
+    const bundlePath = join(projectPath(), 'dist', 'index.mjs');
+    const daemonIdentity = await readOwnDaemonIdentity(bundlePath);
+    // The restart drain is built once its inputs (runners, activity) exist; until then the
+    // control routes answer `not-ready` (aplus codexcli-daemon-restart-drain T9).
+    let restartDrainRuntime: DaemonRestartDrainRuntime | null = null;
+    const restartDrainControlPort: RestartDrainControlPort = {
+      instanceId: `${daemonIdentity.pid}:${daemonIdentity.startedAt ?? 'unknown'}`,
+      begin: (request) => restartDrainRuntime?.controlPort.begin(request) ?? { ok: false, code: 'not-ready' },
+      status: (operationId) => restartDrainRuntime?.controlPort.status(operationId) ?? null,
+      stopBlocked: () => restartDrainRuntime?.controlPort.stopBlocked() ?? false,
+    };
     const { port: controlPort, stop: stopControlServer, controlSecret } = await startDaemonControlServer({
+      restartDrain: restartDrainControlPort,
       getSetupTokenAccountSwitch: () => setupTokenAccountSwitch,
       getChildren: getCurrentChildren,
       stopSession,
@@ -3976,10 +4007,6 @@ export async function startDaemon(): Promise<void> {
 
     // The managed launch path hands this to each child with its credential.
     managedControlPortValue = controlPort;
-
-    // R18: read once here — the shutdown path must never run `ps`.
-    const bundlePath = join(projectPath(), 'dist', 'index.mjs');
-    const daemonIdentity = await readOwnDaemonIdentity(bundlePath);
 
     // Write initial daemon state (no lock needed for state file)
     const fileState: DaemonLocallyPersistedState = {
@@ -4848,6 +4875,9 @@ export async function startDaemon(): Promise<void> {
           machineToken: credentials.token,
           machineId,
         }),
+        // Taken only after a successful spawn, so a restart drain closes lease acquisition through
+        // the spawn gate (`daemon-restarting`) and paused runners; refusing here would orphan a
+        // task that already started (aplus codexcli-daemon-restart-drain T8).
         maintainAgentTaskLease: (dispatch) => {
           activeServerAutomationLeaseCount += 1;
           maintainAutomationAgentTaskLease({
@@ -5185,6 +5215,11 @@ export async function startDaemon(): Promise<void> {
         if (standaloneWindows) throw new Error('Standalone Windows sessions require authenticated drain and commit');
         requestShutdown('happy-app');
       },
+      ...(standaloneWindows ? {} : {
+        forceRestartHandoff: async () => restartDrainRuntime
+          ? restartDrainRuntime.forceHandoff()
+          : { ok: false as const, code: 'no-pending-handoff' as const },
+      }),
       portRegistry,
       automationStore,
       aiCredentialRuntime,
@@ -5243,7 +5278,120 @@ export async function startDaemon(): Promise<void> {
         + Number(sessionFollowupTickRunner.isRunning())
         + activeServerAutomationLeaseCount,
     });
-    apiMachine.setRuntimeActivityProvider(getRuntimeActivity);
+    const getRestartDrainActivity = (): RestartDrainActivity => {
+      const now = Date.now();
+      return {
+        inTurnCount: countInTurnSessions(
+          getCurrentChildren().filter(session => !standaloneWindows?.owner.ownsRoot(session.pid) && isPidAlive(session.pid)),
+          // A session first seen under a minute ago with no report yet counts as in a turn (R11).
+          { now, knownSince: (pid) => Math.max(daemonStartedAt, pidToAdoptedAt.get(pid) ?? 0, sessionStartTimes.get(pid) ?? 0) },
+        ),
+        automationCount: getRuntimeActivity().activeAutomationCount,
+        busyTerminalCount: getBusyDaemonTerminalCount(now),
+        openTerminalCount: getDaemonTerminalSessionCount(),
+      };
+    };
+    // Bundle handoff: tear this daemon down and start the installed bundle's. Preflight has
+    // already run by the time this is called (drain runtime).
+    const handOffToInstalledBundle = async () => {
+      const handoffResult = await handoffToReplacedBundle({
+        preflightReplacement: async () => true,
+        teardownCurrentDaemon: async () => {
+          await drainWorktreeOperations();
+          clearInterval(restartOnStaleVersionAndHeartbeat);
+          await checkpointRetentionSchedule.stop();
+
+          // Release ownership BEFORE spawning the new daemon. Otherwise the spawned
+          // `happy daemon start` reads our still-present daemon.state.json, sees
+          // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
+          // leaving nothing running once we also exit.
+          stopPersonalProbes();
+          claudeSwapSupervisor.shutdown();
+          // Before the replacement exists: it starts its own host, and two hosts must never
+          // overlap. stop() returns only once the child has exited (SIGKILL after its grace).
+          await channelHost?.stop();
+          apiMachine.shutdown();
+          await stopControlServer();
+          await writeScopeRuntime?.close();
+          await standaloneWindows?.owner.close();
+          await stopBrowserBridge();
+          await cleanupDaemonState();
+          try {
+            await teardownManagedRuntime();
+          } finally {
+            // The daemon lock is this process's, not the managed store's:
+            // a teardown that keeps the writer lock still has to let go of
+            // the lock file, or nothing can start after this exit.
+            await releaseDaemonLock(daemonLockHandle);
+            await stopCaffeinate();
+          }
+        },
+        spawnReplacement: (attempt) => {
+          logger.debug(`[DAEMON RUN] Spawning replacement daemon (attempt ${attempt})`);
+          // startDetached, not spawnDetached: the replacement counts only
+          // once `daemon start` confirms a daemon actually came up. On
+          // 2026-08-25 it exec'd fine and then failed to start one, and
+          // reporting success on exec alone cost six hours of no daemon.
+          return startDetachedHappyCLI(['daemon', 'start'], {
+            stdio: captureSpawnOutputStdio(
+              'daemon-handoff-replacement.log',
+              `handoff from pid ${process.pid} (attempt ${attempt})`,
+            ),
+          });
+        },
+      });
+
+      if (handoffResult === 'handed-off') {
+        logger.debug('[DAEMON RUN] Replacement daemon started; exiting');
+        process.exit(0);
+      }
+      // Teardown already released the socket, control server, state file
+      // and lock, so this process is no longer a working daemon. Exiting
+      // non-zero at least makes the machine's daemon loss visible instead
+      // of leaving a hollow process behind.
+      logger.debug('[DAEMON RUN] FATAL: replacement daemon never started after handoff; this machine now has no daemon');
+      process.exit(1);
+    };
+    // aplus specs/codexcli-daemon-restart-drain — the Windows standalone trial keeps its own
+    // shutdown drain and never advertises this one (two drains must not coexist).
+    const drainRuntime = standaloneWindows ? null : createDaemonRestartDrainRuntime({
+      instanceId: restartDrainControlPort.instanceId,
+      activity: getRestartDrainActivity,
+      closeAdmission: (deadlineAt) => {
+        launchReadiness.closeForRestart(deadlineAt);
+        automationTickRunner.pause();
+        serverAutomationTickRunner.pause();
+        scriptAutomationTickRunner.pause();
+        sessionFollowupTickRunner.pause();
+      },
+      reopenAdmission: () => {
+        launchReadiness.reopenAfterRestartDrain();
+        resumeAutomationRunnersAfterFailedHandoff({
+          legacyAutomationEnabled: apiMachine.shouldRunLegacyAutomationScheduler(),
+          legacyRunner: automationTickRunner,
+          serverRunner: serverAutomationTickRunner,
+        });
+        sessionFollowupTickRunner.resume();
+        scriptAutomationTickRunner.resume();
+      },
+      closeTerminalsForRestart: () => apiMachine.closeDaemonTerminalsForRestart(),
+      preflightReplacement: () => preflightInstalledHappyCLI(),
+      handOff: handOffToInstalledBundle,
+      shutdown: () => requestShutdown('happy-cli'),
+      publishLifecycle: () => apiMachine.publishRestartLifecycle(),
+      happyHomeDir: configuration.happyHomeDir,
+      cliVersion: packageJson.version,
+      log: (message) => logger.debug(message),
+    });
+    restartDrainRuntime = drainRuntime;
+    if (drainRuntime) {
+      apiMachine.setRestartLifecycleProvider(() => drainRuntime.lifecycle());
+      onSighup = () => { void drainRuntime.sighup(); };
+    }
+    apiMachine.setRuntimeActivityProvider(() => ({
+      ...getRuntimeActivity(),
+      ...(drainRuntime ? { inTurnCount: getRestartDrainActivity().inTurnCount } : {}),
+    }));
     const checkpointRetention = new CheckpointRetention(join(configuration.happyHomeDir, 'checkpoints'));
     const checkpointRetentionSchedule = new CheckpointRetentionSchedule({
       collect: (now) => checkpointRetention.collect(now),
@@ -5394,17 +5542,12 @@ export async function startDaemon(): Promise<void> {
         bundleReplaced = check.replaced;
         if (!check.replaced) bundleBaseline = check.baseline;
       }
-      const handoffDecision = decideAutomationAwareHandoff({
-        bundleReplaced,
-        legacyAutomationRunning: automationTickRunner.isRunning(),
-        serverAutomationRunning: serverAutomationTickRunner.isRunning()
-          || scriptAutomationTickRunner.isRunning()
-          || sessionFollowupTickRunner.isRunning(),
-        serverAutomationLeaseRunning: activeServerAutomationLeaseCount > 0,
-        activeSessionCount: getRuntimeActivity().activeSessionCount,
-      });
-
-      if (handoffDecision === 'run-automations') {
+      // aplus codexcli-daemon-restart-drain R4: pre-wait without closing admission, hand off at the
+      // first quiet moment, drain only at the caps. Decided before this beat's automation ticks.
+      const handoffAutomation = drainRuntime
+        ? await drainRuntime.heartbeat(bundleReplaced)
+        : 'run-automations';
+      if (handoffAutomation === 'run-automations') {
         // Scheduled automations tick — 하트비트 케이던스로 기동하되 await하지
         // 않는다(detach). spawn webhook 대기가 하트비트의 나머지 임무(자가
         // 업그레이드 감지·상태 기록)를 막거나 heartbeatRunning 가드로 다음 틱을
@@ -5414,104 +5557,6 @@ export async function startDaemon(): Promise<void> {
         serverAutomationTickRunner.trigger();
         scriptAutomationTickRunner.trigger();
         sessionFollowupTickRunner.trigger();
-      } else {
-        // Pause first so no later trigger can enter between the idle check and
-        // teardown. A tick already in flight is allowed to finish normally.
-        automationTickRunner.pause();
-        serverAutomationTickRunner.pause();
-        scriptAutomationTickRunner.pause();
-        sessionFollowupTickRunner.pause();
-      }
-
-      if (handoffDecision === 'defer-handoff') {
-        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, waiting for runtime activity to finish before handoff');
-      } else if (handoffDecision === 'run-automations' && bundleReplaced) {
-        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk; sessions still active, automations keep running until they finish');
-      }
-
-      if (handoffDecision === 'handoff') {
-        // TODO: We probably do not want to keep this in-process self-restart logic long-term.
-        // A native service manager would make startup and upgrades much simpler: the CLI would
-        // ask the OS to start the latest daemon instead of hand-rolling respawn/kill behavior here.
-        logger.debug('[DAEMON RUN] Daemon bundle replaced on disk, preflighting new daemon before handoff');
-
-        const handoffResult = await handoffToReplacedBundle({
-          preflightReplacement: () => preflightInstalledHappyCLI(),
-          canHandoff: () => {
-            const activity = getRuntimeActivity();
-            return activity.activeSessionCount === 0 && activity.activeAutomationCount === 0;
-          },
-          teardownCurrentDaemon: async () => {
-            await drainWorktreeOperations();
-            clearInterval(restartOnStaleVersionAndHeartbeat);
-            await checkpointRetentionSchedule.stop();
-
-            // Release ownership BEFORE spawning the new daemon. Otherwise the spawned
-            // `happy daemon start` reads our still-present daemon.state.json, sees
-            // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
-            // leaving nothing running once we also exit.
-            stopPersonalProbes();
-            claudeSwapSupervisor.shutdown();
-            // Before the replacement exists: it starts its own host, and two hosts must never
-            // overlap. stop() returns only once the child has exited (SIGKILL after its grace).
-            await channelHost?.stop();
-            apiMachine.shutdown();
-            await stopControlServer();
-            await writeScopeRuntime?.close();
-            await standaloneWindows?.owner.close();
-            await stopBrowserBridge();
-            await cleanupDaemonState();
-            try {
-              await teardownManagedRuntime();
-            } finally {
-              // The daemon lock is this process's, not the managed store's:
-              // a teardown that keeps the writer lock still has to let go of
-              // the lock file, or nothing can start after this exit.
-              await releaseDaemonLock(daemonLockHandle);
-              await stopCaffeinate();
-            }
-          },
-          spawnReplacement: (attempt) => {
-            logger.debug(`[DAEMON RUN] Spawning replacement daemon (attempt ${attempt})`);
-            // startDetached, not spawnDetached: the replacement counts only
-            // once `daemon start` confirms a daemon actually came up. On
-            // 2026-08-25 it exec'd fine and then failed to start one, and
-            // reporting success on exec alone cost six hours of no daemon.
-            return startDetachedHappyCLI(['daemon', 'start'], {
-              stdio: captureSpawnOutputStdio(
-                'daemon-handoff-replacement.log',
-                `handoff from pid ${process.pid} (attempt ${attempt})`,
-              ),
-            });
-          },
-        });
-
-        if (handoffResult === 'handed-off') {
-          logger.debug('[DAEMON RUN] Replacement daemon started; exiting');
-          process.exit(0);
-        }
-
-        if (handoffResult === 'replacement-not-started') {
-          // Teardown already released the socket, control server, state file
-          // and lock, so this process is no longer a working daemon. Exiting
-          // non-zero at least makes the machine's daemon loss visible instead
-          // of leaving a hollow process behind.
-          logger.debug('[DAEMON RUN] FATAL: replacement daemon never started after handoff; this machine now has no daemon');
-          process.exit(1);
-        }
-
-        if (handoffResult === 'deferred') {
-          logger.debug('[DAEMON RUN] Runtime activity started during preflight; deferring daemon handoff');
-        } else {
-          logger.debug('[DAEMON RUN] New daemon bundle preflight failed; keeping current daemon running');
-          resumeAutomationRunnersAfterFailedHandoff({
-            legacyAutomationEnabled: apiMachine.shouldRunLegacyAutomationScheduler(),
-            legacyRunner: automationTickRunner,
-            serverRunner: serverAutomationTickRunner,
-          });
-          sessionFollowupTickRunner.resume();
-          scriptAutomationTickRunner.resume();
-        }
       }
 
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it
@@ -5584,6 +5629,9 @@ export async function startDaemon(): Promise<void> {
       shutdownCleanupStarted = true;
       clearTimeout(startupShutdownFallback);
       startupShutdownFallback = undefined;
+      // A drain that reached ready is still closing terminals and writing its outcome line.
+      await restartDrainRuntime?.readyWork();
+      restartDrainRuntime?.dispose();
       await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
       await checkpointRetentionSchedule.stop();
