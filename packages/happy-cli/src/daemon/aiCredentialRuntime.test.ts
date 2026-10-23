@@ -165,6 +165,7 @@ function setup(
       }
     }),
     makeTempDir: vi.fn(async () => '/tmp/happy-ai-credential-fixed'),
+    lockCredentialFile: (_path, work) => work(),
     supervisor,
     ...overrides,
   })
@@ -3690,5 +3691,88 @@ describe('AI credential group sync failure codes', () => {
     const failure = await runtime.groupSync(request).catch((error: unknown) => error) as { kind?: string; failureCause?: string; message?: string }
     expect(failure).toMatchObject({ kind: 'AI_GROUP_SYNC_FAILED', failureCause: 'Error:EACCES' })
     expect(JSON.stringify(failure) + failure.message).not.toContain('secret-name')
+  })
+})
+
+describe('third-party credential file compare-and-swap (aplus D4 C3)', () => {
+  const authPath = '/home/operator/.codex/auth.json'
+  const poolPath = '/home/operator/.codex/multi-auth/openai-codex-accounts.json'
+  const recoveryAuth = { tokens: { account_id: 'account-a', access_token: 'access-a', refresh_token: 'refresh-a', id_token: 'id-a' } }
+  const probeOk = () => vi.fn(async () => ({ ok: true as const, model: 'gpt-6.1-sol' as const, attempts: 1 }))
+
+  /** Codex rewrites `auth.json` right after the daemon read it — before the daemon's compare under the lock. */
+  function codexRefreshesDuringWrite(times: number) {
+    let remaining = times
+    let configured!: ReturnType<typeof setup>
+    const lockCredentialFile = vi.fn(async <T,>(path: string, work: () => Promise<T>) => {
+      if (path === authPath && remaining > 0) {
+        remaining -= 1
+        configured.files.set(authPath, JSON.stringify({ tokens: { account_id: 'personal', access_token: 'cli-access', refresh_token: `cli-refreshed-${times - remaining}` } }))
+      }
+      return work()
+    })
+    configured = setup({ probeCodex: probeOk(), lockCredentialFile: lockCredentialFile as AiCredentialRuntimeDependencies['lockCredentialFile'] })
+    configured.files.set(authPath, JSON.stringify({ tokens: { account_id: 'personal', access_token: 'old-access', refresh_token: 'old-refresh' } }))
+    return { configured, lockCredentialFile }
+  }
+
+  it('does not write over auth.json Codex just refreshed, then retries once from a fresh read', async () => {
+    const { configured, lockCredentialFile } = codexRefreshesDuringWrite(1)
+    const result = await configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...codexMultiAuthBundle(), recoveryAuth }) })
+    expect(result.configured).toBe(true)
+    expect(lockCredentialFile.mock.calls.filter(([path]) => path === authPath)).toHaveLength(2)
+    // The aborted first attempt wrote nothing; the retry installed atomically with owner-only permissions.
+    const authWrites = configured.writeFile.mock.calls.filter(([path]) => path === `${authPath}.happy-tmp`)
+    expect(authWrites).toHaveLength(1)
+    expect((authWrites[0] as unknown[])[2]).toEqual({ mode: 0o600 })
+    expect(JSON.parse(configured.files.get(authPath)!).tokens.refresh_token).toBe('refresh-a')
+  })
+
+  it('gives up as a lost race when auth.json changes again, leaving the newer login in place', async () => {
+    const { configured } = codexRefreshesDuringWrite(2)
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...codexMultiAuthBundle(), recoveryAuth }) }))
+      .rejects.toMatchObject({ kind: 'AI_CREDENTIAL_LOST_RACE' })
+    expect(configured.writeFile.mock.calls.some(([path]) => path === `${authPath}.happy-tmp`)).toBe(false)
+    expect(JSON.parse(configured.files.get(authPath)!).tokens.refresh_token).toBe('cli-refreshed-2')
+    expect(configured.files.has(`${authPath}.happy-backup`)).toBe(false)
+  })
+
+  it('never copies a stale live refresh token into the pool when Codex refreshed it during a merge', async () => {
+    const token = (sub: string) => `header.${Buffer.from(JSON.stringify({ sub, exp: 9999999999, email: 'me@example.com' })).toString('base64url')}.signature`
+    let refreshed = false
+    let configured!: ReturnType<typeof setup>
+    const lockCredentialFile = (async <T,>(path: string, work: () => Promise<T>) => {
+      if (path === poolPath && !refreshed) {
+        refreshed = true
+        configured.files.set(authPath, JSON.stringify({ tokens: { account_id: 'personal-1', access_token: token('me'), refresh_token: 'cli-refreshed' } }))
+      }
+      return work()
+    }) as AiCredentialRuntimeDependencies['lockCredentialFile']
+    configured = setup({ lockCredentialFile })
+    configured.files.set(authPath, JSON.stringify({ tokens: { account_id: 'personal-1', access_token: token('me'), refresh_token: 'before-refresh' } }))
+
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()), applyMode: 'merge' })
+
+    const pool = JSON.parse(configured.files.get(poolPath)!)
+    expect(pool.accounts.find((account: { accountId: string }) => account.accountId === 'personal-1').refreshToken).toBe('cli-refreshed')
+    expect(JSON.stringify([...configured.files.values()])).not.toContain('before-refresh')
+  })
+
+  it('holds no credential lock while a network-bound verification runs', async () => {
+    let held = 0
+    let heldDuringForecast = -1
+    const lockCredentialFile = (async <T,>(_path: string, work: () => Promise<T>) => {
+      held += 1
+      try { return await work() } finally { held -= 1 }
+    }) as AiCredentialRuntimeDependencies['lockCredentialFile']
+    const configured = setup({ lockCredentialFile })
+    const original = configured.execFile.getMockImplementation()!
+    configured.execFile.mockImplementation(async (command, args, options) => {
+      if (command === 'codex-multi-auth' && args[0] === 'forecast') heldDuringForecast = held
+      return original(command, args, options)
+    })
+    configured.files.set(poolPath, JSON.stringify(codexMultiAuthBundle().accounts))
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()) })
+    expect(heldDuringForecast).toBe(0)
   })
 })
