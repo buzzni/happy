@@ -32,7 +32,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 it('passes private host bootstrap through real daemon startup while scrubbing child lineage', async () => {
   const bootstrap = {
-    HAPPY_WRITE_SCOPE_HOST_VERSION: '1', HAPPY_WRITE_SCOPE_HOST_ACCOUNT_ID: 'account',
+    HAPPY_WRITE_SCOPE_HOST_VERSION: '1', HAPPY_WRITE_SCOPE_HOST_DEFERRED: '1', HAPPY_WRITE_SCOPE_HOST_ACCOUNT_ID: 'account',
     HAPPY_WRITE_SCOPE_HOST_INCARNATION: 'host', HAPPY_WRITE_SCOPE_HOST_PROTECTED_ROOTS: '["/fixture/protected"]',
     HAPPY_WRITE_SCOPE_HOST_PUBLIC_KEY: generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString(),
   };

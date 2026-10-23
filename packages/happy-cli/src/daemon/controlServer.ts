@@ -25,6 +25,7 @@ import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
+import { scopeErrorCode } from './sessionWriteScopeErrors';
 import type { SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
 import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import type { AutomationTurnResult } from '@/api/automationTurnTracker';
@@ -330,7 +331,7 @@ export function startDaemonControlServer({
     }).strict() } }, async (request, reply) => {
       if (!writeScopeRuntime) return reply.code(409).send({ code: 'SESSION_WRITE_SCOPE_UNSUPPORTED' });
       try { return { result: await writeScopeRuntime.broker.decide(request.body) }; }
-      catch { return reply.code(409).send({ code: 'WRITE_SCOPE_DECISION_REJECTED' }); }
+      catch (error) { return reply.code(409).send({ code: scopeErrorCode(error, 'WRITE_SCOPE_DECISION_REJECTED') }); }
     });
     typed.post('/session-write-scope/confirm', { schema: { body: z.object({
       token: z.string().uuid(), sessionId: z.string().max(128), digest: z.string().length(64), pid: z.number().int().positive(),

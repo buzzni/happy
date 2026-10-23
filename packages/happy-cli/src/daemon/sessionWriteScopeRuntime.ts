@@ -7,8 +7,9 @@ import { SandboxConfigSchema } from '@/persistence';
 import type { TrackedSession } from './types';
 import { SessionWriteScopeBroker } from './sessionWriteScope';
 import { canonicalizeSessionWriteRoot } from './sessionWriteScopePaths';
-import { replaceSessionWriteScope, scopeSandboxEnvironment } from './sessionWriteScopeRestart';
+import { confirmScopeProfile, replaceSessionWriteScope, scopeSandboxEnvironment } from './sessionWriteScopeRestart';
 import { hasReliableResumeBaseline } from './reconnectSessionEnv';
+import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { readMachineSandboxPolicyMode, sandboxTrustFloorPaths } from '@/sandbox/sandboxPolicy';
 import { ScopeReportAuthority } from './sessionWriteScopeReports';
@@ -79,6 +80,18 @@ export async function createSessionWriteScopeRuntime(input: {
       const target = resolveTarget(id);
       return target ? { projectRoot: target.session.directory!, generation: String(target.session.pid) } : null;
     },
+    readiness: input.env.HAPPY_WRITE_SCOPE_HOST_DEFERRED === '1' ? request => {
+      const session = input.findSession(request.sessionId);
+      if (!session || String(session.pid) !== request.generation || session.directory !== request.projectRoot) {
+        throw new Error('SESSION_SCOPE_CHANGED');
+      }
+      const runtime = session.runtime;
+      if (!runtime || !reports.authenticated(session.pid, request.sessionId)) return 'SCOPE_WAITING_STATE';
+      if (runtime.pendingUserInput) return 'SCOPE_WAITING_INPUT';
+      if (runtime.hasOpenToolCall) return 'SCOPE_WAITING_TOOL';
+      if (runtime.thinking) return 'SCOPE_WAITING_TURN';
+      return undefined;
+    } : undefined,
     canonicalize: path => canonicalizeSessionWriteRoot(path, { home, protectedRoots }),
     apply: async (request, roots) => {
       const target = resolveTarget(request.sessionId);
@@ -93,7 +106,7 @@ export async function createSessionWriteScopeRuntime(input: {
       const timer = setTimeout(() => confirmations.get(token)?.resolve(false), 110000);
       applyingSessions.add(request.sessionId);
       try {
-        return await replaceSessionWriteScope({ busy, child: target.session.childProcess!,
+        const result = await replaceSessionWriteScope({ busy, child: target.session.childProcess!,
           preserve: () => input.preserve(target.session),
           drain: async () => {
             const launchId = launches.get(target.session.pid);
@@ -111,16 +124,23 @@ export async function createSessionWriteScopeRuntime(input: {
             }
             if (request.expiresAt <= Date.now()) throw new Error('REQUEST_EXPIRED');
           }), waitForProfile: async () => {
-            if (!await confirmation) return false;
+            if (!await confirmScopeProfile(input.findSession(request.sessionId)?.childProcess, confirmation)) throw new Error('SCOPE_PROFILE_TIMEOUT');
             const renewed = resolveTarget(request.sessionId);
             const child = renewed?.session.childProcess;
             return Boolean(renewed && String(renewed.session.pid) !== request.generation
               && child?.exitCode === null && child.signalCode === null);
           },
           environment: { ...environment, HAPPY_WRITE_SCOPE_APPLY_TOKEN: token, HAPPY_WRITE_SCOPE_PROFILE_DIGEST: digest } });
+        const launchId = launches.get(target.session.pid);
+        if (input.env.HAPPY_WRITE_SCOPE_HOST_DEFERRED === '1' && result.error === 'SCOPE_DRAIN_UNCONFIRMED'
+          && launchId && launchControl.canRetry(launchId)) throw new Error('SCOPE_DRAIN_RETRY_SAFE');
+        return result;
       } finally { clearTimeout(timer); confirmations.delete(token); applyingSessions.delete(request.sessionId); }
     },
   });
+  let closed = false;
+  const flush = () => { if (closed) return; void broker.flush().catch(() => logger.debug('[write-scope] status persistence failed')); };
+  const watchdog = setInterval(flush, 500); watchdog.unref?.();
   return {
     broker,
     prepareReports: (sessionId?: string) => {
@@ -132,9 +152,12 @@ export async function createSessionWriteScopeRuntime(input: {
         child.once('exit', forget); child.once('error', forget);
       } };
     },
-    close: () => launchControl.close(),
-    verifyReport: (claim: ManagedReportClaim) => reports.verify(claim,
-      input.findSession(claim.sessionId)?.agentEnvironment?.HAPPY_WRITE_SCOPE_SESSION === '1'),
+    close: () => { closed = true; clearInterval(watchdog); return launchControl.close(); },
+    verifyReport: (claim: ManagedReportClaim) => {
+      const verified = reports.verify(claim, input.findSession(claim.sessionId)?.agentEnvironment?.HAPPY_WRITE_SCOPE_SESSION === '1');
+      if (verified) setImmediate(flush).unref?.();
+      return verified;
+    },
     list: (id: string) => [...recovered.filter(request => request.sessionId === id), ...broker.list(id)],
     capabilities: { sessionWriteScope: { version: 1, agents: ['codex', 'claude'], lifetime: 'session', incarnation, accountId,
       machineId: input.machineId, hostKey: createHash('sha256').update(publicPem).digest('hex') } },

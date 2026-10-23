@@ -28,9 +28,9 @@ export class ScopeJournal {
     const entries = z.array(recordSchema).max(512).parse(JSON.parse(await readFile(this.path, 'utf8')));
     return retainScopeHistory(entries.filter(item => item.accountId === this.accountId && item.machineId === this.machineId).map(item => ({
       ...item, grantActive: false,
-      state: item.state === 'pending' ? 'expired' : ['applying', 'applied', 'cleanup-unresolved'].includes(item.state)
+      state: item.state === 'pending' || (item.state === 'applying' && item.error?.startsWith('SCOPE_WAITING_')) ? 'expired' : ['applying', 'applied', 'cleanup-unresolved'].includes(item.state)
         ? 'cleanup-unresolved' : item.state,
-      ...(['applying', 'applied', 'cleanup-unresolved'].includes(item.state) ? { cleanup: 'unresolved' as const } : {}),
+      ...(['applying', 'applied', 'cleanup-unresolved'].includes(item.state) && !item.error?.startsWith('SCOPE_WAITING_') ? { cleanup: 'unresolved' as const } : {}),
     })));
   }
   write(entries: readonly ScopeRequest[]): Promise<void> {
