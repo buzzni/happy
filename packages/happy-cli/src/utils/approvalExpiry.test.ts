@@ -42,7 +42,7 @@ describe('ApprovalExpiryTimers', () => {
         expect(expire).not.toHaveBeenCalled();
         vi.advanceTimersByTime(1);
         expect(expire).toHaveBeenCalledTimes(1);
-        expect(timers.has('a')).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
     });
 
     it('does not expire a prompt settled first, and leaks no timer', () => {

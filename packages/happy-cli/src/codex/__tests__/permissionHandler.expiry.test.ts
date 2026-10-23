@@ -114,3 +114,21 @@ describe('Codex permission prompts in an unattended turn', () => {
         }
     });
 });
+
+describe('Codex prompt declined at once in a messenger turn', () => {
+    beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(START); });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('publishes nothing to the messenger for it', async () => {
+        const t = setup('channel');
+        const channelTurn = { turnId: 'turn-1', channelRequestId: 'req-1', runtimeId: 'rt' };
+        void t.handler.handleToolCall('call-1', 'CodexBash', {}, { channelTurn });
+        await vi.advanceTimersByTimeAsync(30 * MINUTE);
+        const published = t.protocol.length;
+
+        const second = t.handler.handleToolCall('call-2', 'CodexBash', {}, { channelTurn });
+
+        await expect(second).resolves.toEqual({ decision: 'denied' });
+        expect(t.protocol.length).toBe(published);
+    });
+});

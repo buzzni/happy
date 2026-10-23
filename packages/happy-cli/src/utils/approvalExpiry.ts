@@ -16,6 +16,7 @@
  */
 
 import { UNATTENDED_APPROVAL_TIMEOUT_MS, type TurnAttendanceState } from '@/api/turnAttendance';
+import type { AgentState } from '@/api/types';
 
 export type ApprovalWait =
     /** Nobody is waited for: an attended turn, a policy prompt, or no attendance wired. */
@@ -89,8 +90,16 @@ export class ApprovalExpiryTimers {
         for (const timer of this.timers.values()) clearTimeout(timer);
         this.timers.clear();
     }
+}
 
-    has(id: string): boolean {
-        return this.timers.has(id);
+/** A person arrived: the countdown no longer applies to these prompts (R10). */
+export function withoutExpiresAt(state: AgentState, ids: string[]): AgentState {
+    let requests = state.requests;
+    for (const id of ids) {
+        const request = requests?.[id];
+        if (!request || request.expiresAt === undefined) continue;
+        const { expiresAt: _expiresAt, ...rest } = request;
+        requests = { ...requests, [id]: rest };
     }
+    return requests === state.requests ? state : { ...state, requests };
 }

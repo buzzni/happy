@@ -1415,7 +1415,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // Whatever this flushed will never run, so its routing decisions are
             // dead. The floor never moved for them — they were only ever pending.
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1433,7 +1433,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             difficultyRoutingCommitter.requestEpoch();
             deferredContinuation.prepare(message.content.text);
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -2043,6 +2043,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         allowedTools: happyServer.toolNames.map(toolName => `mcp__happy__${toolName}`),
         onModeChange: (newMode) => {
             currentRunMode = newMode;
+            // A person took the session over at the terminal: nobody there is unattended (R10a).
+            if (newMode === 'local') turnAttendance.inputArrived('human');
             cuaHandOff?.newProviderGeneration();
             session.sendSessionEvent({ type: 'switch', mode: newMode });
             session.updateAgentState((currentState) => ({

@@ -129,6 +129,21 @@ describe('TurnAttendanceState', () => {
         expect(scheduled.policyUnattended()).toBe(false);
         scheduled.beginTurn('channel');
         expect(scheduled.policyUnattended()).toBe(false);
+        // A messenger turn whose wait ran out declines its next ask at once (Q6).
+        scheduled.spendBudget();
+        expect(scheduled.policyUnattended()).toBe(true);
+    });
+
+    it('keeps an unattended turn unattended across an automatic continuation or a retry', () => {
+        const state = new TurnAttendanceState();
+        state.beginTurn('unattended');
+        state.spendBudget();
+        expect(state.continuationInput()).toBe('unattended');
+        state.restartTurn();
+        expect(state.current()).toBe('unattended');
+        expect(state.budgetExhausted()).toBe(false);
+        state.beginTurn('attended');
+        expect(state.continuationInput()).toBeUndefined();
     });
 });
 

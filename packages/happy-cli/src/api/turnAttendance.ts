@@ -167,8 +167,22 @@ export class TurnAttendanceState {
 
     /** The tool policy gate's "nobody to ask" (agent-tool-policy R3, spec Q9). */
     policyUnattended(): boolean {
-        // A run-once session stays unattended for the gate, exactly as before Q9.
-        return this.runOnce || this.attendance === 'unattended';
+        // A run-once session stays unattended for the gate, exactly as before Q9. A messenger turn
+        // whose wait already ran out declines its next ask at once too (R10a, Q6).
+        return this.runOnce || this.attendance === 'unattended' || (this.attendance === 'channel' && this.budgetSpent);
+    }
+
+    /** The same turn run again (a transient API retry): its classification, a fresh wait budget. */
+    restartTurn(): void {
+        this.budgetSpent = false;
+    }
+
+    /**
+     * What an automatic continuation of the current turn carries (an account switch, a capacity
+     * retry): an unattended turn stays unattended rather than becoming a person's turn.
+     */
+    continuationInput(): InputAttendance | undefined {
+        return this.attendance === 'attended' ? undefined : 'unattended';
     }
 
     /**

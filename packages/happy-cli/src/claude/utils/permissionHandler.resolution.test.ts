@@ -121,3 +121,20 @@ describe('PermissionHandler resolution records', () => {
         expect(await stub.answer({ id: 'toolu_1', approved: true })).toEqual({ applied: false, reason: 'unknown-request' });
     });
 });
+
+describe('PermissionHandler abort of a replaced raising', () => {
+    it('still settles the older promise when a newer raising took its id', async () => {
+        const stub = createStub();
+        const handler = new PermissionHandler(stub.session);
+        const first = new AbortController();
+        const older = raise(handler, 'toolu_1', first.signal);
+        const newer = raise(handler, 'toolu_1');
+
+        first.abort();
+
+        await expect(older).rejects.toThrow('Permission request aborted');
+        // The newer raising is untouched and still answerable.
+        expect(await stub.answer({ id: 'toolu_1', approved: true })).toEqual({ applied: true });
+        await expect(newer).resolves.toMatchObject({ behavior: 'allow' });
+    });
+});

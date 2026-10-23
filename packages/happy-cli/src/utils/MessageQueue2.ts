@@ -182,7 +182,7 @@ export class MessageQueue2<T> {
      * needs to know they are dead — otherwise their decisions sit in the state
      * forever, indistinguishable from work still in flight.
      */
-    pushIsolateAndClear(message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace): string[] {
+    pushIsolateAndClear(message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance): string[] {
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -201,6 +201,7 @@ export class MessageQueue2<T> {
             isolate: true,
             attachments,
             latencyTrace,
+            ...(attendance ? { attendance } : {}),
         });
 
         // Trigger message handler if set

@@ -12,7 +12,7 @@ import { ApiSessionClient } from "@/api/apiSession";
 import { AgentState } from "@/api/types";
 import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate';
 import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from '@/utils/permissionResolution';
-import { ApprovalExpiryTimers } from '@/utils/approvalExpiry';
+import { ApprovalExpiryTimers, withoutExpiresAt } from '@/utils/approvalExpiry';
 import { unattendedExpiryMessage, type TurnAttendanceState } from '@/api/turnAttendance';
 
 /**
@@ -62,7 +62,9 @@ export abstract class BasePermissionHandler {
     /** Settled ids, kept across `reset()` so a late answer is told what happened (plan §3.4, T16). */
     private readonly resolved = new ResolvedPermissionLog();
     /** The unattended wait (spec R10, T21). Inert until the runner hands over the turn's attendance. */
-    private readonly expiry = new ApprovalExpiryTimers({ onReleased: (ids) => this.dropExpiresAt(ids) });
+    private readonly expiry = new ApprovalExpiryTimers({
+        onReleased: (ids) => this.session.updateAgentState((state) => withoutExpiresAt(state, ids)),
+    });
 
     /** Which turn attendance decides whether a prompt waits forever or is declined (R10a). */
     setAttendance(attendance: TurnAttendanceState | null): void {
@@ -191,7 +193,11 @@ export abstract class BasePermissionHandler {
     /**
      * Add a pending request to the agent state.
      */
-    protected addPendingRequestToState(toolCallId: string, toolName: string, input: unknown, policy?: PermissionPolicyMeta): void {
+    /**
+     * Raises the prompt in the agent state. Returns false when the turn already spent its wait and
+     * the prompt is being declined instead: the caller then publishes nothing about it.
+     */
+    protected addPendingRequestToState(toolCallId: string, toolName: string, input: unknown, policy?: PermissionPolicyMeta): boolean {
         const createdAt = Date.now();
         // Every subclass registers the pending request before calling this, so the wait starts
         // here for all of them — and is tied to that exact entry, not to a later reuse of the id.
@@ -203,7 +209,7 @@ export abstract class BasePermissionHandler {
             // The turn already spent its wait (Q6). Settled after the caller finishes raising it,
             // so whatever it publishes about the prompt is withdrawn again by the settlement.
             queueMicrotask(() => this.expire(toolCallId, pending, { tool: toolName, arguments: input, createdAt }));
-            return;
+            return false;
         }
         this.session.updateAgentState((currentState) => ({
             ...currentState,
@@ -218,6 +224,7 @@ export abstract class BasePermissionHandler {
                 }
             }
         }));
+        return true;
     }
 
     /**
@@ -251,20 +258,6 @@ export abstract class BasePermissionHandler {
             } satisfies AgentState;
         });
         logger.debug(`${this.getLogPrefix()} Permission ${id} declined: nobody answered within the unattended wait`);
-    }
-
-    /** A person arrived: the countdown no longer applies to these prompts (R10). */
-    private dropExpiresAt(ids: string[]): void {
-        this.session.updateAgentState((currentState) => {
-            let requests = currentState.requests;
-            for (const id of ids) {
-                const request = requests?.[id];
-                if (!request || request.expiresAt === undefined) continue;
-                const { expiresAt: _expiresAt, ...rest } = request;
-                requests = { ...requests, [id]: rest };
-            }
-            return requests === currentState.requests ? currentState : { ...currentState, requests };
-        });
     }
 
     /** Cancel only this provider-owned request; unrelated approvals remain pending. */

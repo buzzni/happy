@@ -2716,7 +2716,7 @@ export async function runCodex(opts: {
                                 }
                                 return;
                             }
-                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode);
+                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode, undefined, turnAttendance?.continuationInput());
                         }, retry.delayMs);
                     }
                 } catch (error) {

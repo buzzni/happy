@@ -255,11 +255,12 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
             });
 
             // Update agent state with pending request
-            this.addPendingRequestToState(toolCallId, toolName, input);
+            const raised = this.addPendingRequestToState(toolCallId, toolName, input);
 
             // After the pending request exists, and swallowing anything thrown: a channel
             // publisher that fails must not stop the Desktop user from being asked at all.
-            if (context?.channelTurn) {
+            // A prompt declined at once (the turn's wait is spent) is never published.
+            if (raised && context?.channelTurn) {
                 try {
                     this.observeChannelWait({
                         permissionId: toolCallId,

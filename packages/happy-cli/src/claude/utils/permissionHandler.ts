@@ -24,7 +24,7 @@ import { getToolDescriptor } from "./getToolDescriptor";
 import { mapToClaudeMode } from "./permissionMode";
 import { APPROVAL_TIMEOUT_ABORT_REASON, type PermissionPolicyMeta, type PolicyApprovalAnswer, type PolicyApprover } from "@/toolPolicy/policyGate";
 import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from "@/utils/permissionResolution";
-import { ApprovalExpiryTimers } from "@/utils/approvalExpiry";
+import { ApprovalExpiryTimers, withoutExpiresAt } from "@/utils/approvalExpiry";
 import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
 
 export type { PermissionAck };
@@ -86,7 +86,9 @@ export class PermissionHandler implements PolicyApprover {
     /** Settled ids, kept across `reset()` so a late answer is told what happened (plan §3.4, T16). */
     private readonly resolved = new ResolvedPermissionLog();
     /** The unattended wait (spec R10, T21). Inert until the launcher hands over the turn's attendance. */
-    private readonly expiry = new ApprovalExpiryTimers({ onReleased: (ids) => this.dropExpiresAt(ids) });
+    private readonly expiry = new ApprovalExpiryTimers({
+        onReleased: (ids) => this.session.client.updateAgentState((state) => withoutExpiresAt(state, ids)),
+    });
     private session: Session;
     private allowedTools = new Set<string>();
     private allowedBashLiterals = new Set<string>();
@@ -401,19 +403,21 @@ export class PermissionHandler implements PolicyApprover {
             const instanceSeq = this.nextInstanceSeq++;
             // Set up abort signal handling
             const abortHandler = () => {
-                // Only the raising this handler belongs to: a reused id may already be a newer one.
-                if (this.pendingRequests.get(id)?.instanceSeq !== instanceSeq) return;
-                this.pendingRequests.delete(id);
-                this.expiry.clear(id);
-                this.withdrawChannelBinding(id, 'aborted');
-                // The gate gives up on a policy approval with its own reason; anything else is a stop.
-                const resolution: PermissionResolution = signal.reason === APPROVAL_TIMEOUT_ABORT_REASON ? 'expired' : 'aborted';
-                // A messenger turn's policy prompt that timed out spends the turn's wait (plan §3.4, Q6).
-                if (resolution === 'expired') this.expiry.spendBudget();
-                this.resolved.record(id, resolution);
-                // Recorded here, not left for the next reset: until then every other screen would
-                // keep a live card for a call that will never run (T14).
-                this.withdrawRequest(id, policy ? 'Tool policy approval withdrawn' : 'Permission request aborted', resolution);
+                // The map and the agent state are touched only for this raising: a reused id may
+                // already be a newer one. This promise is rejected either way.
+                if (this.pendingRequests.get(id)?.instanceSeq === instanceSeq) {
+                    this.pendingRequests.delete(id);
+                    this.expiry.clear(id);
+                    this.withdrawChannelBinding(id, 'aborted');
+                    // The gate gives up on a policy approval with its own reason; anything else is a stop.
+                    const resolution: PermissionResolution = signal.reason === APPROVAL_TIMEOUT_ABORT_REASON ? 'expired' : 'aborted';
+                    // A messenger turn's policy prompt that timed out spends the turn's wait (plan §3.4, Q6).
+                    if (resolution === 'expired') this.expiry.spendBudget();
+                    this.resolved.record(id, resolution);
+                    // Recorded here, not left for the next reset: until then every other screen would
+                    // keep a live card for a call that will never run (T14).
+                    this.withdrawRequest(id, policy ? 'Tool policy approval withdrawn' : 'Permission request aborted', resolution);
+                }
                 reject(new Error('Permission request aborted'));
             };
             signal.addEventListener('abort', abortHandler, { once: true });
@@ -519,20 +523,6 @@ export class PermissionHandler implements PolicyApprover {
             };
         });
         logger.debug(`Permission request ${id} declined: nobody answered within the unattended wait`);
-    }
-
-    /** A person arrived: the countdown no longer applies to these prompts (R10). */
-    private dropExpiresAt(ids: string[]): void {
-        this.session.client.updateAgentState((currentState) => {
-            let requests = currentState.requests;
-            for (const id of ids) {
-                const request = requests?.[id];
-                if (!request || request.expiresAt === undefined) continue;
-                const { expiresAt: _expiresAt, ...rest } = request;
-                requests = { ...requests, [id]: rest };
-            }
-            return requests === currentState.requests ? currentState : { ...currentState, requests };
-        });
     }
 
     /**

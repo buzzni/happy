@@ -833,7 +833,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         if (providerStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
-                            if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                            if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
+                                session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
+                            }
                             continuation = null;
                         }
                         if (pending) {
@@ -938,7 +940,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 if (providerStale()) return null;
                                 if (!providerRunning && continuation) {
-                                    if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation);
+                                    if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
+                                        session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
+                                    }
                                     continuation = null;
                                 }
                                 continue;
@@ -956,6 +960,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             messageQueue.enqueue(pendingRequestItem(null));
                             lastTurnChannel = false;
                             lastTurnCommand = false;
+                            // The failed turn again: its attendance, with a fresh wait budget (R10a).
+                            session.turnAttendance?.restartTurn();
                             // The failed turn's own settings, unchanged — no provider restart.
                             mode = due.mode.mode;
                             modeHash = due.mode.hash ?? modeHash;
