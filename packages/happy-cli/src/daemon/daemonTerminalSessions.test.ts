@@ -1,10 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
     getDaemonTerminalSessionCount,
     removeDaemonTerminalSession,
+    markDaemonTerminalSessionExited,
+    recordTerminalActivity,
+    EXITED_TERMINAL_RETAIN_MS,
     killAllDaemonTerminalSessions,
     terminateAllDaemonTerminalSessions,
     recordBytesIn,
@@ -241,5 +244,68 @@ describe('daemonTerminalSessions', () => {
 
         await expect(terminateAllDaemonTerminalSessions()).resolves.toEqual(['killed', 'escaped'])
         expect(getDaemonTerminalSessionCount()).toBe(0)
+    })
+    /*
+     * Codex CLI benchmark D4 B-R2 — a terminal that ends while its client is
+     * away is kept long enough for that client to come back and learn it ended.
+     */
+    describe('exited terminal retention', () => {
+        const fake = (): PtySession & { terminate: ReturnType<typeof vi.fn> } => ({
+            id: 'f', userId: 'u1', pid: 1, cols: 80, rows: 24, write() {}, resize() {}, kill() {}, isAlive: () => false,
+            terminate: vi.fn(async () => 'already-gone' as const), onData: () => () => {}, onExit: () => () => {},
+        }) as any
+
+        afterEach(() => {
+            vi.useRealTimers()
+        })
+
+        it('keeps the entry and its exit for the retain window, then drops it', () => {
+            vi.useFakeTimers()
+            addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+
+            expect(markDaemonTerminalSessionExited('a', { code: 2, signal: null })).toBe(true)
+            expect(EXITED_TERMINAL_RETAIN_MS).toBe(30_000)
+            vi.advanceTimersByTime(29_999)
+            expect(getDaemonTerminalSession('a')?.exit).toEqual({ code: 2, signal: null })
+
+            vi.advanceTimersByTime(1)
+            expect(getDaemonTerminalSession('a')).toBeNull()
+        })
+
+        it('no longer counts an ended terminal as daemon activity', () => {
+            addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+            markDaemonTerminalSessionExited('a', { code: 0, signal: null })
+
+            expect(getDaemonTerminalSessionCount()).toBe(0)
+        })
+
+        it('does not re-arm the idle watchdog for an ended terminal', () => {
+            vi.useFakeTimers()
+            const pty = fake()
+            addDaemonTerminalSession('a', pty, { userId: 'u', idleTimeoutMs: 1000 })
+            markDaemonTerminalSessionExited('a', { code: 0, signal: null })
+
+            recordTerminalActivity('a')
+            recordBytesIn('a', 5)
+            vi.advanceTimersByTime(2000)
+
+            expect(pty.terminate).not.toHaveBeenCalled()
+        })
+
+        it('an explicit remove cancels the retain timer', () => {
+            vi.useFakeTimers()
+            addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+            markDaemonTerminalSessionExited('a', { code: 0, signal: null })
+            removeDaemonTerminalSession('a')
+            const again = addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+
+            vi.advanceTimersByTime(30_000)
+
+            expect(getDaemonTerminalSession('a')).toBe(again)
+        })
+
+        it('reports false for an unknown session', () => {
+            expect(markDaemonTerminalSessionExited('nope', { code: 0, signal: null })).toBe(false)
+        })
     })
 })

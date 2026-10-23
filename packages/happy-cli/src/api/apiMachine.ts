@@ -215,11 +215,13 @@ import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
     killAllDaemonTerminalSessions,
+    markDaemonTerminalSessionExited,
     recordBytesIn,
     recordBytesOut,
     recordTerminalActivity,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
+import { planTerminalResume } from '@/daemon/terminalResumeReply';
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
@@ -516,7 +518,8 @@ interface DaemonToServerEvents {
     // There is no honest answer to the resume: say where the hole starts rather
     // than let the client believe it is current.
     'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number }) => void;
-    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null }) => void;
+    // Codex CLI benchmark D4 B-R2: `reason` answers a resume for a terminal the daemon does not have.
+    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null } | { sessionId: string; reason: 'unknown-session' }) => void;
     // Preview WebSocket relay — upstream→browser bytes and tunnel teardown.
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
     'proxy-ws-close': (payload: { tunnelId: string }) => void;
@@ -3966,7 +3969,9 @@ export class ApiMachineClient {
                         `exitCode=${code} signal=${signal ?? 'null'} bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} ` +
                         `durationMs=${closedAt - entry.openedAt}`,
                     );
-                    removeDaemonTerminalSession(sessionId);
+                    // Kept, not removed: a client that was detached when the shell
+                    // ended resumes into its last output and this exit (D4 B-R2).
+                    markDaemonTerminalSessionExited(sessionId, { code, signal });
                 });
                 logger.debug(
                     `[REMOTE-TERMINAL] open session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} pid=${pty.pid}`,
@@ -3990,7 +3995,7 @@ export class ApiMachineClient {
         if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry || typeof data !== 'string') return;
+            if (!entry || entry.exit || typeof data !== 'string') return;
             try {
                 const chunk = decrypt(machineKey, machineVariant, decodeBase64(data));
                 if (typeof chunk === 'string') {
@@ -4013,44 +4018,49 @@ export class ApiMachineClient {
          */
         if (!this.managedHandlers) this.socket.on('terminal-resume-fwd', (msg) => {
             const { sessionId, afterSeq } = msg || {};
+            if (!sessionId || typeof sessionId !== 'string') return;
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry) return;
-            const seen = Number.isFinite(afterSeq) ? Math.max(0, Math.trunc(afterSeq as number)) : 0;
-            const answer = entry.output.resume(seen);
             /*
              * A resume is proof the client is still watching. Without this the
              * idle watchdog keeps counting from the last byte that actually
              * moved, and a terminal recovered at minute 14 dies at minute 15.
              */
-            recordTerminalActivity(sessionId);
+            if (entry) recordTerminalActivity(sessionId);
+            // Codex CLI benchmark D4 B-R2: an unknown or ended terminal is answered
+            // too (terminalResumeReply.ts) — silence left the client waiting forever.
+            const reply = planTerminalResume(entry, afterSeq);
             try {
-                if (answer.kind === 'replay') {
-                    for (const frame of answer.frames) {
-                        const data = encodeBase64(encrypt(machineKey, machineVariant, frame.chunk));
-                        this.socket.emit('terminal-frame', { sessionId, seq: frame.seq, data });
+                for (const out of reply.events) {
+                    if (out.event === 'terminal-frame') {
+                        const data = encodeBase64(encrypt(machineKey, machineVariant, out.chunk));
+                        this.socket.emit('terminal-frame', { sessionId, seq: out.seq, data });
+                    } else if (out.event === 'terminal-snapshot') {
+                        const data = encodeBase64(encrypt(machineKey, machineVariant, out.chunk));
+                        this.socket.emit('terminal-snapshot', { sessionId, seq: out.seq, data });
+                    } else if (out.event === 'terminal-frame-gap') {
+                        this.socket.emit('terminal-frame-gap', { sessionId, fromSeq: out.fromSeq });
+                    } else if ('reason' in out) {
+                        this.socket.emit('terminal-closed', { sessionId, reason: out.reason });
+                    } else {
+                        this.socket.emit('terminal-closed', { sessionId, code: out.code, signal: out.signal });
                     }
-                } else if (answer.kind === 'snapshot') {
-                    const data = encodeBase64(encrypt(machineKey, machineVariant, answer.data));
-                    this.socket.emit('terminal-snapshot', { sessionId, seq: answer.seq, data });
-                } else if (answer.kind === 'gap') {
-                    // Nothing to send that would be true. Say where the hole
-                    // starts rather than letting the client believe it is current.
-                    this.socket.emit('terminal-frame-gap', { sessionId, fromSeq: answer.fromSeq });
                 }
             } catch (e) {
                 logger.debug(`[API MACHINE] terminal-resume-fwd reply failed: ${(e as Error).message}`);
                 return;
             }
+            const frames = reply.events.filter((out) => out.event === 'terminal-frame').length;
             logger.debug(
-                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${seen} answer=${answer.kind}`
-                + (answer.kind === 'replay' ? ` frames=${answer.frames.length}` : ''),
+                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${typeof afterSeq === 'number' ? afterSeq : '-'} answer=${reply.kind}`
+                + (reply.kind === 'replay' ? ` frames=${frames}` : '')
+                + (entry?.exit ? ' exited=true' : ''),
             );
         });
 
         this.socket.on('terminal-resize-fwd', (msg) => {
             const { sessionId, cols, rows } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry) return;
+            if (!entry || entry.exit) return;
             if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
             entry.session.resize(cols, rows);
         });
