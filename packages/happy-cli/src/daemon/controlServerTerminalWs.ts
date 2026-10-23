@@ -56,7 +56,7 @@ import {
   type DaemonTerminalEntry,
 } from './daemonTerminalSessions';
 import { createTerminalOutputCoalescer } from './terminalOutputCoalescer';
-import { pagedReplayInFlight, replyToTerminalResume, resetPagedResume } from './terminalResumeReply';
+import { PAGED_RESUME_STALE_MS, pagedReplayInFlight, replyToTerminalResume, resetPagedResume } from './terminalResumeReply';
 
 export interface TerminalWsRoute {
   wss: WebSocketServer;
@@ -173,15 +173,31 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
     removeDaemonTerminalSession(terminal.sessionId);
   };
 
+  /** Tells the attached client the PTY ended, and drops the terminal. */
   const sendClosed = (terminal: DirectTerminal) => {
     const exit = terminal.exit;
     if (!exit) return;
     sendOn(terminal.ws, { data: { event: 'terminal-closed', sessionId: terminal.sessionId, code: exit.code, signal: exit.signal } });
-    logger.debug(
-      `[LOCAL-DIRECT-TERMINAL] close session=${terminal.sessionId} user=${terminal.userId} exitCode=${exit.code} signal=${exit.signal ?? 'null'} ` +
-      `bytesIn=${terminal.entry.bytesIn} bytesOut=${terminal.entry.bytesOut} durationMs=${Date.now() - terminal.entry.openedAt}`,
-    );
     forget(terminal);
+  };
+
+  /**
+   * An ended PTY's exit goes out after the replay the client is reading, never
+   * in the middle of it — the client stops listening once it hears the
+   * terminal closed, and the pages still to come hold its last output. If the
+   * client stops asking for pages, the exit goes out once the replay goes stale.
+   */
+  const sendClosedAfterReplay = (terminal: DirectTerminal) => {
+    if (!pagedReplayInFlight(terminal.entry.output)) {
+      sendClosed(terminal);
+      return;
+    }
+    if (terminal.graceTimer) clearTimeout(terminal.graceTimer);
+    terminal.graceTimer = setTimeout(() => {
+      terminal.graceTimer = null;
+      if (terminals.get(terminal.sessionId) === terminal) sendClosed(terminal);
+    }, PAGED_RESUME_STALE_MS);
+    terminal.graceTimer.unref?.();
   };
 
   /** The WebSocket went away: keep the terminal for the grace window, then end it. */
@@ -331,11 +347,17 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           outputCoalescer.flush();
           outputCoalescer.dispose();
           terminal.exit = { code, signal };
+          // Audit every end, however it came about (exit, close, grace expiry, shutdown).
+          logger.debug(
+            `[LOCAL-DIRECT-TERMINAL] close session=${sessionId} user=${entry.userId} exitCode=${code} signal=${signal ?? 'null'} ` +
+            `bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} durationMs=${Date.now() - entry.openedAt}`,
+          );
           // Grace already expired: nobody is coming back for it.
           if (terminals.get(sessionId) !== terminal) return;
-          // Attached: say so now. Detached: the buffered output and the exit
-          // wait out the grace window for a client that reattaches.
-          if (terminal.ws !== null) sendClosed(terminal);
+          // Attached: say so (after any replay in flight). Detached: the
+          // buffered output and the exit wait out the grace window for a
+          // client that reattaches.
+          if (terminal.ws !== null) sendClosedAfterReplay(terminal);
         });
 
         logger.debug(`[LOCAL-DIRECT-TERMINAL] open session=${sessionId} user=${entry.userId} pid=${pty.pid}`);
@@ -402,7 +424,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           return;
         }
         // An ended terminal reports its exit after the last page of output.
-        if (terminal.exit !== null && !pagedReplayInFlight(terminal.entry.output)) sendClosed(terminal);
+        if (terminal.exit !== null) sendClosedAfterReplay(terminal);
         return;
       }
 
