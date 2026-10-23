@@ -122,6 +122,14 @@ describe('the managed boundary at the query call', () => {
         expect(query).not.toHaveBeenCalled();
     });
 
+    it('carries a session output format through to the query call', async () => {
+        // specs/claude-cli-benchmark-followups R2: a field the middle layers do not know is the
+        // kind that has silently vanished before (`tools`, `effort`), so it is read at the SDK call.
+        const outputFormat = { type: 'json_schema', schema: { type: 'object' } };
+        await expect(runOnce({ managedRun: false, env: {}, extra: { outputFormat } })).rejects.toThrow(SENTINEL);
+        expect(vi.mocked(query).mock.calls[0]![0].options!.outputFormat).toEqual(outputFormat);
+    });
+
     it('leaves a BYOS run untouched', async () => {
         await expect(runOnce({ managedRun: false, env: {} })).rejects.toThrow(SENTINEL);
         const options = vi.mocked(query).mock.calls[0]![0].options!;

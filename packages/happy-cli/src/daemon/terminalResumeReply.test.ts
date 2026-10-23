@@ -1,0 +1,113 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { createTerminalOutputBuffer } from './terminalOutputBuffer'
+import { PAGED_RESUME_STALE_MS, replyToTerminalResume, sendExitAfterReplay, type TerminalReplyEvent } from './terminalResumeReply'
+
+function reply(input: Omit<Parameters<typeof replyToTerminalResume>[0], 'sessionId' | 'seal' | 'emit'>) {
+    const sent: Array<[TerminalReplyEvent, Record<string, unknown>]> = []
+    const outcome = replyToTerminalResume({
+        sessionId: 's1',
+        seal: (plain) => `sealed(${plain})`,
+        emit: (event, payload) => sent.push([event, payload]),
+        ...input,
+    })
+    return { outcome, sent }
+}
+
+function bufferWith(...chunks: string[]) {
+    const output = createTerminalOutputBuffer()
+    for (const chunk of chunks) output.push(chunk)
+    return output
+}
+
+describe('replyToTerminalResume', () => {
+    it('replays the frames after afterSeq, sealed, in order', () => {
+        const { outcome, sent } = reply({ output: bufferWith('a', 'b', 'c'), afterSeq: 1 })
+
+        expect(outcome).toBe('replay')
+        expect(sent).toEqual([
+            ['terminal-frame', { sessionId: 's1', seq: 2, data: 'sealed(b)' }],
+            ['terminal-frame', { sessionId: 's1', seq: 3, data: 'sealed(c)' }],
+        ])
+    })
+
+    it('says nothing to a current client of a live terminal', () => {
+        const { outcome, sent } = reply({ output: bufferWith('a'), afterSeq: 1 })
+
+        expect(outcome).toBe('none')
+        expect(sent).toEqual([])
+    })
+
+    it('answers a terminal it does not have with one unknown-session close', () => {
+        const { outcome, sent } = reply({ output: null, afterSeq: 4 })
+
+        expect(outcome).toBe('unknown-session')
+        expect(sent).toEqual([['terminal-closed', { sessionId: 's1', reason: 'unknown-session' }]])
+    })
+
+    it('sends an ended terminal\'s exit once, after the output that is left', () => {
+        const { sent } = reply({ output: bufferWith('a', 'b'), exit: { code: 3, signal: null }, afterSeq: 1 })
+
+        expect(sent.map(([event]) => event)).toEqual(['terminal-frame', 'terminal-closed'])
+        expect(sent[1]).toEqual(['terminal-closed', { sessionId: 's1', code: 3, signal: null }])
+    })
+
+    it('still tells a current client how the terminal ended', () => {
+        const { outcome, sent } = reply({ output: bufferWith('a'), exit: { code: 0, signal: 15 }, afterSeq: 1 })
+
+        expect(outcome).toBe('none')
+        expect(sent).toEqual([['terminal-closed', { sessionId: 's1', code: 0, signal: 15 }]])
+    })
+
+    it('reads a missing or nonsense afterSeq as "seen nothing"', () => {
+        const { sent } = reply({ output: bufferWith('a'), afterSeq: 'x' })
+
+        expect(sent).toEqual([['terminal-frame', { sessionId: 's1', seq: 1, data: 'sealed(a)' }]])
+    })
+})
+
+/*
+ * Cross review #2: the live close path must not end a terminal in the middle
+ * of a replay the client is still reading. Paged replay (B-R3) supplies the
+ * real in-flight check; here a stand-in plays that part.
+ */
+describe('sendExitAfterReplay', () => {
+    afterEach(() => {
+        vi.useRealTimers()
+    })
+
+    it('sends the exit at once when no replay is in flight', () => {
+        const sendClosed = vi.fn()
+
+        expect(sendExitAfterReplay({ output: bufferWith('a'), sendClosed })).toBe('sent')
+        expect(sendClosed).toHaveBeenCalledTimes(1)
+    })
+
+    it('holds the exit behind a replay in flight and lets the last answer carry it, once', () => {
+        vi.useFakeTimers()
+        const output = bufferWith('a', 'b')
+        const sendClosed = vi.fn()
+
+        expect(sendExitAfterReplay({ output, sendClosed, inFlight: () => true })).toBe('held')
+        expect(sendClosed).not.toHaveBeenCalled()
+
+        const { sent } = reply({ output, exit: { code: 3, signal: null }, afterSeq: 1 })
+        expect(sent.map(([event]) => event)).toEqual(['terminal-frame', 'terminal-closed'])
+
+        vi.advanceTimersByTime(PAGED_RESUME_STALE_MS)
+        expect(sendClosed).not.toHaveBeenCalled()
+    })
+
+    it('sends a held exit once the client stops asking for pages', () => {
+        vi.useFakeTimers()
+        const sendClosed = vi.fn()
+
+        sendExitAfterReplay({ output: bufferWith('a'), sendClosed, inFlight: () => true })
+        vi.advanceTimersByTime(PAGED_RESUME_STALE_MS - 1)
+        expect(sendClosed).not.toHaveBeenCalled()
+        vi.advanceTimersByTime(1)
+        expect(sendClosed).toHaveBeenCalledTimes(1)
+        vi.advanceTimersByTime(PAGED_RESUME_STALE_MS)
+        expect(sendClosed).toHaveBeenCalledTimes(1)
+    })
+})

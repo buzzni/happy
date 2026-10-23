@@ -9,6 +9,14 @@ import { clearDaemonState, readDaemonState, readDaemonStateSnapshot, writeDaemon
 import { Metadata } from '@/api/types';
 import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch';
 import { configuration } from '@/configuration';
+import { randomUUID } from 'node:crypto';
+import { verifyDaemonIdentity } from './daemonIdentity';
+import {
+    DaemonStopRefusedError,
+    stopDaemonWithDrain,
+    type StopDaemonOptions,
+    type StopDaemonOutcome,
+} from './restartDrainClient';
 import { initializeScopeReportSigner, SCOPE_REPORT_HEADER } from './sessionWriteScopeReports';
 import {
     MANAGED_REPORT_CAPABILITY_HEADER,
@@ -297,7 +305,9 @@ export async function spawnDaemonSession(directory: string, sessionId?: string):
   return result;
 }
 
-export class DaemonStopRefused extends Error {}
+/** A responding daemon refused to stop — never converted into a force kill. */
+export const DaemonStopRefused = DaemonStopRefusedError;
+export type DaemonStopRefused = DaemonStopRefusedError;
 
 export async function stopDaemonHttp(): Promise<void> {
   const result = await daemonPost('/stop');
@@ -384,6 +394,12 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
           return false;
         }
       }
+      // R19: a live pid that no longer is the recorded daemon (reused after a crash or reboot)
+      // is not a daemon to wait on, stop or signal.
+      if (state.identity && await verifyDaemonIdentity(state.identity) === 'mismatch') {
+        writeDaemonStateIfUnchanged(raw, { ...state, state: 'crashed', stateReason: 'Daemon PID reused by another process' });
+        return false;
+      }
     }
     throw new Error(`DAEMON_HEALTH_UNCONFIRMED: PID ${state.pid} is alive but its control server could not be verified; state and lock were preserved`);
   }
@@ -444,59 +460,51 @@ export async function cleanupDaemonState(): Promise<void> {
   }
 }
 
-export async function stopDaemon() {
+/**
+ * Stop the running daemon (aplus specs/codexcli-daemon-restart-drain R5·R19·R22).
+ *
+ * Without options this is the plain `happy daemon stop`: a grace-0 drain on a
+ * daemon that supports it, then `/stop`. `--for-restart` callers pass a reason
+ * (and optionally a grace) so turns get time to finish. An old daemon gets the
+ * 15-second `/stop` wait; a kill only ever reaches a process whose recorded
+ * identity still matches.
+ */
+export async function stopDaemon(options: StopDaemonOptions = { intent: 'stop', reason: 'user-restart', graceSeconds: 0 }): Promise<StopDaemonOutcome> {
   try {
-    const state = await readDaemonState();
-    if (!state) {
-      logger.debug('No daemon state found');
-      return;
-    }
-    if (state.state === 'stopped' || state.state === 'crashed') {
-      logger.debug(`Daemon state is ${state.state}, nothing to stop`);
-      return;
-    }
-
-    logger.debug(`Stopping daemon with PID ${state.pid}`);
-
-    // Try HTTP graceful stop
-    try {
-      await stopDaemonHttp();
-
-      // Wait for daemon to die
-      await waitForProcessDeath(state.pid, 2000);
-      logger.debug('Daemon stopped gracefully via HTTP');
-      return;
-    } catch (error) {
-      if (error instanceof DaemonStopRefused) throw error;
-      logger.debug('HTTP stop failed, will force kill', error);
-    }
-
-    // Force kill
-    try {
-      process.kill(state.pid, 'SIGKILL');
-      logger.debug('Force killed daemon');
-    } catch (error) {
-      logger.debug('Daemon already dead');
-    }
+    return await stopDaemonWithDrain(options, {
+      readState: readDaemonState,
+      post: async (path, body) => {
+        const result = await daemonPost(path, body);
+        return result?.error
+          ? {
+            ok: false,
+            ...(typeof result.status === 'number' ? { status: result.status } : {}),
+            ...(typeof result.code === 'string' ? { code: result.code } : {}),
+            error: result.error,
+          }
+          : { ok: true, body: result };
+      },
+      isPidAlive: (pid) => {
+        try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+      },
+      verifyIdentity: (identity) => verifyDaemonIdentity(identity),
+      kill: (pid) => process.kill(pid, 'SIGKILL'),
+      markStale: async (state, reason) => {
+        // Guarded: a daemon that claimed the file meanwhile keeps it.
+        const { state: current, raw } = await readDaemonStateSnapshot();
+        if (current?.pid === state.pid) writeDaemonStateIfUnchanged(raw, { ...current, state: 'crashed', stateReason: reason });
+      },
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      now: () => Date.now(),
+      randomId: () => randomUUID(),
+      log: (message) => logger.debug(message),
+    });
   } catch (error) {
     if (error instanceof DaemonStopRefused) throw error;
     logger.debug('Error stopping daemon', error);
+    return 'left-running';
   }
 }
-
-async function waitForProcessDeath(pid: number, timeout: number): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      process.kill(pid, 0);
-      await new Promise(resolve => setTimeout(resolve, 100));
-    } catch {
-      return; // Process is dead
-    }
-  }
-  throw new Error('Process did not die within timeout');
-}
-
 
 /** Local-only organization approval controls. Never use machine RPC or return the control secret. */
 export async function getDeviceApprovalStatus(companyId: string): Promise<Awaited<ReturnType<ReturnType<typeof import('./deviceEnrollment').createDeviceEnrollment>['getStatus']>>> {

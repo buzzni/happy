@@ -251,6 +251,20 @@ describe('Saycode agent resume environment', () => {
         })).toBeUndefined()
     })
 
+    it('captures a valid output format so a resumed structured session keeps its schema (claude-cli-benchmark-followups R2)', () => {
+        const seed = JSON.stringify({ type: 'json_schema', schema: { type: 'object' } })
+        const captured = captureSaycodeAgentEnvironment({ HAPPY_INITIAL_OUTPUT_FORMAT: seed })
+        expect(captured).toEqual({ HAPPY_INITIAL_OUTPUT_FORMAT: seed })
+        expect(captureSaycodeAgentEnvironment({ HAPPY_INITIAL_OUTPUT_FORMAT: '{not json' })).toBeUndefined()
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' }, explicit: {}, agentEnvironment: captured, sessionId: 'session-2',
+        })).toMatchObject({ HAPPY_INITIAL_OUTPUT_FORMAT: seed })
+        // Never inherited by a spawn that did not ask for it.
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin', HAPPY_INITIAL_OUTPUT_FORMAT: seed }, explicit: {}, sessionId: 'session-3',
+        }).HAPPY_INITIAL_OUTPUT_FORMAT).toBeUndefined()
+    })
+
     it('captures the Chat(beta) browser continuation mark so a resumed turn keeps its guidance', () => {
         const captured = captureSaycodeAgentEnvironment({ HAPPY_AUTOMATION_BROWSER_CONTINUATION: '1', HAPPY_AUTOMATION_RUN_ONCE: '1' })
         expect(captured).toEqual({ HAPPY_AUTOMATION_BROWSER_CONTINUATION: '1' })

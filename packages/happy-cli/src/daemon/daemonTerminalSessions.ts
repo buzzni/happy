@@ -22,6 +22,22 @@ const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000
  */
 const DISCONNECT_GRACE_MS = 500
 
+/**
+ * How long an ended terminal stays registered (Codex CLI benchmark D4 B-R2).
+ *
+ * A client that was detached when the shell exited never saw the closed event;
+ * keeping the entry lets its resume replay what is left and hear the exit code
+ * instead of waiting on silence. Same window as the relay's client reattach
+ * grace (happy-server `CLIENT_REATTACH_GRACE_MS`), so a client the relay still
+ * waits for is never told "unknown" by the daemon.
+ */
+export const EXITED_TERMINAL_RETAIN_MS = 30_000
+
+export interface TerminalExit {
+    code: number
+    signal: number | null
+}
+
 export interface DaemonTerminalEntry {
     readonly id: string
     readonly session: PtySession
@@ -33,6 +49,14 @@ export interface DaemonTerminalEntry {
     /** Last in/out activity wallclock ms — drives the idle timer reset. */
     lastActivityAt: number
     /**
+     * Last client → PTY input wallclock ms, null until the first keystroke.
+     * Unlike `lastActivityAt` output does not move it: a `tail -f` streaming
+     * away is not someone using the terminal (aplus codexcli-daemon-restart-drain R23).
+     */
+    lastInputAt: number | null
+    /** Why the daemon closed it, carried on `terminal-closed` (R23). */
+    closeReason?: 'daemon-restart'
+    /**
      * Bounded replay buffer for this terminal's output
      * (specs/desktop-terminal-reliability/ Phase 3). Lives here rather than in
      * the relay because happy-server is multi-replica: a buffer kept there
@@ -40,11 +64,14 @@ export interface DaemonTerminalEntry {
      * find nothing.
      */
     readonly output: TerminalOutputBuffer
+    /** Set once the PTY has exited; the entry is then only kept for resume. */
+    exit: TerminalExit | null
 }
 
 interface InternalEntry extends DaemonTerminalEntry {
     _idleTimeoutMs: number
     _idleTimer: ReturnType<typeof setTimeout> | null
+    _retainTimer: ReturnType<typeof setTimeout> | null
 }
 
 export interface AddSessionOptions {
@@ -67,9 +94,18 @@ function clearIdleTimer(entry: InternalEntry): void {
     }
 }
 
+function clearTimers(entry: InternalEntry): void {
+    clearIdleTimer(entry)
+    if (entry._retainTimer) {
+        clearTimeout(entry._retainTimer)
+        entry._retainTimer = null
+    }
+}
+
 function armIdleTimer(entry: InternalEntry): void {
     clearIdleTimer(entry)
-    if (entry._idleTimeoutMs <= 0) return
+    // An ended terminal has nothing left to reap; only its retain timer runs.
+    if (entry._idleTimeoutMs <= 0 || entry.exit) return
     entry._idleTimer = setTimeout(() => {
         // Trust pty.onExit to fire and remove the entry from the map; if
         // the teardown races with a manual close, removeDaemonTerminalSession
@@ -93,9 +129,12 @@ export function addDaemonTerminalSession(
         bytesIn: 0,
         bytesOut: 0,
         lastActivityAt: now,
+        lastInputAt: null,
         output: createTerminalOutputBuffer(opts.outputBufferChars, opts.outputBufferFrames),
+        exit: null,
         _idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         _idleTimer: null,
+        _retainTimer: null,
     }
     sessions.set(id, entry)
     armIdleTimer(entry)
@@ -107,15 +146,43 @@ export function getDaemonTerminalSession(id: string | undefined | null): DaemonT
     return sessions.get(id) ?? null
 }
 
+/** Live terminals only — an ended one kept for resume is not daemon activity. */
 export function getDaemonTerminalSessionCount(): number {
-    return sessions.size
+    let live = 0
+    for (const entry of sessions.values()) {
+        if (!entry.exit) live++
+    }
+    return live
 }
 
 export function removeDaemonTerminalSession(id: string): boolean {
     const entry = sessions.get(id)
     if (!entry) return false
-    clearIdleTimer(entry)
+    clearTimers(entry)
     return sessions.delete(id)
+}
+
+/**
+ * Record that the PTY behind `id` has exited and keep the entry — output buffer
+ * included — for `retainMs`, so a client that was away can still resume it
+ * (Codex CLI benchmark D4 B-R2). Returns false when the session is unknown.
+ */
+export function markDaemonTerminalSessionExited(
+    id: string,
+    exit: TerminalExit,
+    retainMs = EXITED_TERMINAL_RETAIN_MS,
+): boolean {
+    const entry = sessions.get(id)
+    if (!entry) return false
+    clearTimers(entry)
+    entry.exit = { code: exit.code, signal: exit.signal }
+    const timer = setTimeout(() => {
+        // A later add() under the same id replaced this entry; leave it be.
+        if (sessions.get(id) === entry) sessions.delete(id)
+    }, retainMs)
+    timer.unref?.()
+    entry._retainTimer = timer
+    return true
 }
 
 /**
@@ -135,12 +202,51 @@ export function removeDaemonTerminalSession(id: string): boolean {
 export function killAllDaemonTerminalSessions(): number {
     let killed = 0
     for (const [id, entry] of sessions) {
-        clearIdleTimer(entry)
+        clearTimers(entry)
+        if (entry.exit) {
+            sessions.delete(id)
+            continue
+        }
         void entry.session.terminate({ graceMs: DISCONNECT_GRACE_MS })
         killed++
         sessions.delete(id)
     }
     return killed
+}
+
+/** A terminal typed into within this window is in use and a restart waits for it (R23). */
+export const BUSY_TERMINAL_INPUT_WINDOW_MS = 10 * 60 * 1000
+
+export function getBusyDaemonTerminalCount(now: number = Date.now(), windowMs: number = BUSY_TERMINAL_INPUT_WINDOW_MS): number {
+    let busy = 0
+    for (const entry of sessions.values()) {
+        // An ended terminal kept only for resume (D4 B-R2) is nobody's to wait for.
+        if (entry.exit) continue
+        if (entry.lastInputAt !== null && now - entry.lastInputAt < windowMs) busy++
+    }
+    return busy
+}
+
+/**
+ * Close every terminal because the daemon is being replaced: each entry is
+ * tagged so its `terminal-closed` frame says why, then torn down and awaited.
+ * Resolves with how many live terminals were closed.
+ */
+export async function closeAllDaemonTerminalSessionsForRestart(): Promise<number> {
+    const pending: Promise<TerminateOutcome>[] = []
+    for (const [id, entry] of sessions) {
+        clearTimers(entry)
+        // Already ended and kept only for resume (D4 B-R2): nothing to tear down.
+        if (entry.exit) {
+            sessions.delete(id)
+            continue
+        }
+        entry.closeReason = 'daemon-restart'
+        pending.push(entry.session.terminate({ graceMs: DISCONNECT_GRACE_MS }).catch((): TerminateOutcome => 'escaped'))
+        sessions.delete(id)
+    }
+    await Promise.all(pending)
+    return pending.length
 }
 
 /**
@@ -151,7 +257,7 @@ export function killAllDaemonTerminalSessions(): number {
 export function terminateAllDaemonTerminalSessions(): Promise<TerminateOutcome[]> {
     const pending: Promise<TerminateOutcome>[] = []
     for (const [id, entry] of sessions) {
-        clearIdleTimer(entry)
+        clearTimers(entry)
         pending.push(entry.session.terminate().catch((): TerminateOutcome => 'escaped'))
         sessions.delete(id)
     }
@@ -183,6 +289,7 @@ export function recordBytesIn(id: string, n: number): void {
     if (!entry || n <= 0) return
     entry.bytesIn += n
     entry.lastActivityAt = Date.now()
+    entry.lastInputAt = entry.lastActivityAt
     armIdleTimer(entry)
 }
 
@@ -201,7 +308,7 @@ export function recordBytesOut(id: string, n: number): void {
 
 export function _resetDaemonTerminalSessionsForTest(): void {
     for (const entry of sessions.values()) {
-        clearIdleTimer(entry)
+        clearTimers(entry)
     }
     sessions.clear()
 }

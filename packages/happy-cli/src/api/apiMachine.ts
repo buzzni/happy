@@ -15,6 +15,8 @@ import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
+import type { DaemonRestartLifecycle } from './types';
+import { DAEMON_RESTARTING_CODE, withRestartLifecycle } from '@/daemon/restartDrainLifecycle';
 import type { DaemonSessionStateResponse } from '@/daemon/daemonSessionState';
 import {
     registerCommonHandlers,
@@ -36,6 +38,8 @@ import {
     createMachineResourceService,
 } from '@/daemon/machineResourceService';
 import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/sessionEnv';
+import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import type { ByosOfflineRpcHandlers } from '@/daemon/byosOfflineReceive';
@@ -213,11 +217,14 @@ import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
     killAllDaemonTerminalSessions,
+    markDaemonTerminalSessionExited,
+    closeAllDaemonTerminalSessionsForRestart,
     recordBytesIn,
     recordBytesOut,
     recordTerminalActivity,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
+import { replyToTerminalResume, sendExitAfterReplay } from '@/daemon/terminalResumeReply';
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
@@ -514,7 +521,9 @@ interface DaemonToServerEvents {
     // There is no honest answer to the resume: say where the hole starts rather
     // than let the client believe it is current.
     'terminal-frame-gap': (msg: { sessionId: string; fromSeq: number }) => void;
-    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null }) => void;
+    // Codex CLI benchmark D4 B-R2: `reason: 'unknown-session'` answers a resume for a terminal the daemon does not have.
+    // aplus codexcli-daemon-restart-drain R23: `reason: 'daemon-restart'` marks an exit the daemon caused to restart.
+    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null; reason?: 'daemon-restart' } | { sessionId: string; reason: 'unknown-session' }) => void;
     // Preview WebSocket relay — upstream→browser bytes and tunnel teardown.
     'proxy-ws-data': (payload: { tunnelId: string; dataB64: string }) => void;
     'proxy-ws-close': (payload: { tunnelId: string }) => void;
@@ -577,6 +586,15 @@ type MachineRpcHandlers = {
         context?: StopSessionContext,
     ) => Promise<{ result: StopSessionResult; exitVerification: SessionExitVerification }>;
     requestShutdown: () => void;
+    /**
+     * aplus codexcli-daemon-restart-drain R25 "지금 교대": pulls a pending bundle handoff forward.
+     * Narrower than `stop-daemon` — it can only hasten a handoff whose bundle is already installed,
+     * never start a restart or stop.
+     */
+    forceRestartHandoff?: () => Promise<
+        | { ok: true; deadlineAt: number }
+        | { ok: false; code: 'no-pending-handoff' | 'replacement-unavailable' }
+    >;
     portRegistry: PortRegistry;
     /** When present, registers the scheduled-automation RPCs and advertises automationSupport. */
     automationStore?: AutomationStore;
@@ -736,7 +754,10 @@ export class ApiMachineClient {
     private runtimeActivityProvider: (() => {
         activeSessionCount: number;
         activeAutomationCount: number;
+        inTurnCount?: number;
     }) | null = null;
+    /** aplus codexcli-daemon-restart-drain R6·R22 — current drain / pending handoff, null while running normally. */
+    private restartLifecycleProvider: (() => DaemonRestartLifecycle | null) | null = null;
     private lastKnownCLIAvailability: CLIAvailability | null = null;
     private lastKnownResumeSupport: ResumeSupport | null = null;
     // specs/20260521-happy-cli-version-republish — daemon 재시작 후 새 cli
@@ -1078,6 +1099,7 @@ export class ApiMachineClient {
         stopSession,
         stopSessionWithExitVerification,
         requestShutdown,
+        forceRestartHandoff,
         portRegistry,
         automationStore,
         aiCredentialRuntime,
@@ -1264,6 +1286,7 @@ export class ApiMachineClient {
                 browserContinuation,
                 browserAttestation,
                 aiAuthSelection,
+                outputFormat,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -1284,6 +1307,12 @@ export class ApiMachineClient {
             // 돌아 사용자가 고르지 않은 자격으로 세션이 실행된다.
             const validAiAuthSelection = parseAiAuthSelection(aiAuthSelection);
             const validAdditionalDirectories = parseAdditionalDirectories(additionalDirectories);
+            // Refused rather than dropped: a caller that asked for a machine-readable result must
+            // not get a session that silently runs without one (specs/claude-cli-benchmark-followups R2).
+            const validOutputFormat = parseOutputFormat(outputFormat);
+            if (validOutputFormat && (agent ?? 'claude') !== 'claude') {
+                throw new Error('Structured output is only supported for Claude');
+            }
             // Recorded as metadata `source`; a malformed value is dropped, never stored.
             const validSessionSource = normalizeSessionSource(sessionSource);
             if (validAdditionalDirectories && agent !== 'claude' && agent !== 'codex') {
@@ -1364,6 +1393,7 @@ export class ApiMachineClient {
                 ...(browserContinuation ? { browserContinuation: true } : {}),
                 ...(browserAttestation ? { browserAttestation } : {}),
                 aiAuthSelection: validAiAuthSelection,
+                ...(validOutputFormat ? { outputFormat: validOutputFormat } : {}),
             });
 
             switch (result.type) {
@@ -1393,6 +1423,17 @@ export class ApiMachineClient {
                     return { type: 'requestToApproveDirectoryCreation', directory: result.directory };
 
                 case 'error':
+                    // A drain refusal is answered, not thrown: Desktop needs the code and
+                    // deadline to wait and retry once (R6). Every other failure keeps throwing,
+                    // which is what older clients parse.
+                    if (result.code === DAEMON_RESTARTING_CODE) {
+                        return {
+                            type: 'error',
+                            code: result.code,
+                            errorMessage: result.errorMessage,
+                            ...(typeof result.deadlineAt === 'number' ? { deadlineAt: result.deadlineAt } : {}),
+                        };
+                    }
                     throw new Error(result.errorMessage);
             }
         });
@@ -1921,6 +1962,10 @@ export class ApiMachineClient {
         });
 
         // Register stop daemon handler
+        if (forceRestartHandoff) {
+            this.rpcHandlerManager.registerHandler('restart-drain:force-handoff', () => forceRestartHandoff());
+        }
+
         this.rpcHandlerManager.registerHandler('stop-daemon', () => {
             logger.debug('[API MACHINE] Received stop-daemon RPC request');
 
@@ -3945,7 +3990,13 @@ export class ApiMachineClient {
                     // visible output isn't silently dropped.
                     outputCoalescer.flush();
                     outputCoalescer.dispose();
-                    this.socket.emit('terminal-closed', { sessionId, code, signal });
+                    // Not in the middle of a replay the client is still reading:
+                    // the answer to its last page carries the exit instead (D4 B-R2).
+                    // R23: a restart close says so; Desktop shows why instead of a bare exit code.
+                    sendExitAfterReplay({
+                        output: entry.output,
+                        sendClosed: () => this.socket.emit('terminal-closed', { sessionId, code, signal, ...(entry.closeReason ? { reason: entry.closeReason } : {}) }),
+                    });
                     const closedAt = Date.now();
                     // Audit log per specs/remote-terminal/ §3 #7. Body is
                     // intentionally NOT recorded — only metadata. logger.debug
@@ -3956,7 +4007,9 @@ export class ApiMachineClient {
                         `exitCode=${code} signal=${signal ?? 'null'} bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} ` +
                         `durationMs=${closedAt - entry.openedAt}`,
                     );
-                    removeDaemonTerminalSession(sessionId);
+                    // Kept, not removed: a client that was detached when the shell
+                    // ended resumes into its last output and this exit (D4 B-R2).
+                    markDaemonTerminalSessionExited(sessionId, { code, signal });
                 });
                 logger.debug(
                     `[REMOTE-TERMINAL] open session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} pid=${pty.pid}`,
@@ -3980,7 +4033,7 @@ export class ApiMachineClient {
         if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry || typeof data !== 'string') return;
+            if (!entry || entry.exit || typeof data !== 'string') return;
             try {
                 const chunk = decrypt(machineKey, machineVariant, decodeBase64(data));
                 if (typeof chunk === 'string') {
@@ -4003,44 +4056,40 @@ export class ApiMachineClient {
          */
         if (!this.managedHandlers) this.socket.on('terminal-resume-fwd', (msg) => {
             const { sessionId, afterSeq } = msg || {};
+            if (!sessionId || typeof sessionId !== 'string') return;
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry) return;
-            const seen = Number.isFinite(afterSeq) ? Math.max(0, Math.trunc(afterSeq as number)) : 0;
-            const answer = entry.output.resume(seen);
             /*
              * A resume is proof the client is still watching. Without this the
              * idle watchdog keeps counting from the last byte that actually
              * moved, and a terminal recovered at minute 14 dies at minute 15.
              */
-            recordTerminalActivity(sessionId);
+            if (entry) recordTerminalActivity(sessionId);
+            // Codex CLI benchmark D4 B-R2: an unknown or ended terminal is answered
+            // too (terminalResumeReply.ts) — silence left the client waiting forever.
+            let outcome: string;
             try {
-                if (answer.kind === 'replay') {
-                    for (const frame of answer.frames) {
-                        const data = encodeBase64(encrypt(machineKey, machineVariant, frame.chunk));
-                        this.socket.emit('terminal-frame', { sessionId, seq: frame.seq, data });
-                    }
-                } else if (answer.kind === 'snapshot') {
-                    const data = encodeBase64(encrypt(machineKey, machineVariant, answer.data));
-                    this.socket.emit('terminal-snapshot', { sessionId, seq: answer.seq, data });
-                } else if (answer.kind === 'gap') {
-                    // Nothing to send that would be true. Say where the hole
-                    // starts rather than letting the client believe it is current.
-                    this.socket.emit('terminal-frame-gap', { sessionId, fromSeq: answer.fromSeq });
-                }
+                outcome = replyToTerminalResume({
+                    sessionId,
+                    output: entry?.output ?? null,
+                    exit: entry?.exit,
+                    afterSeq,
+                    seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),
+                    emit: (event, payload) => this.socket.emit(event, payload as any),
+                });
             } catch (e) {
                 logger.debug(`[API MACHINE] terminal-resume-fwd reply failed: ${(e as Error).message}`);
                 return;
             }
             logger.debug(
-                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${seen} answer=${answer.kind}`
-                + (answer.kind === 'replay' ? ` frames=${answer.frames.length}` : ''),
+                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${typeof afterSeq === 'number' ? afterSeq : '-'} answer=${outcome}`
+                + (entry?.exit ? ' exited=true' : ''),
             );
         });
 
         this.socket.on('terminal-resize-fwd', (msg) => {
             const { sessionId, cols, rows } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
-            if (!entry) return;
+            if (!entry || entry.exit) return;
             if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
             entry.session.resize(cols, rows);
         });
@@ -4139,15 +4188,16 @@ export class ApiMachineClient {
             this.socket.emit('machine-alive', payload);
             const activity = this.runtimeActivityProvider?.();
             if (activity) {
-                this.updateDaemonState((state) => ({
+                this.updateDaemonState((state) => withRestartLifecycle({
                     ...state,
                     status: state?.status ?? 'running',
                     activity: {
                         activeSessionCount: Math.max(0, Math.floor(activity.activeSessionCount)),
                         activeAutomationCount: Math.max(0, Math.floor(activity.activeAutomationCount)),
+                        ...(typeof activity.inTurnCount === 'number' ? { inTurnCount: Math.max(0, Math.floor(activity.inTurnCount)) } : {}),
                         reportedAt: Date.now(),
                     },
-                })).catch((err) => {
+                }, this.restartLifecycleProvider?.() ?? null)).catch((err) => {
                     logger.debug('[API MACHINE] Failed to publish runtime activity:', err);
                 });
             }
@@ -4182,10 +4232,17 @@ export class ApiMachineClient {
             // refused there: it advertises neither, and a stored copy is cleared.
             const advertisedChannelSupport = this.managedHandlers ? undefined : CHANNEL_SUPPORT_CAPABILITY;
             const advertisedAiAuthSelection = this.managedHandlers ? undefined : AI_AUTH_SELECTION_CAPABILITY;
+            const advertisedStructuredOutput = this.managedHandlers ? undefined : STRUCTURED_OUTPUT_CAPABILITY;
+            const structuredOutputStale = JSON.stringify(this.machine.metadata?.structuredOutput)
+                !== JSON.stringify(advertisedStructuredOutput);
             const channelSupportStale = JSON.stringify(this.machine.metadata?.channelSupport)
                 !== JSON.stringify(advertisedChannelSupport);
             const aiAuthSelectionStale = JSON.stringify(this.machine.metadata?.aiAuthSelection)
                 !== JSON.stringify(advertisedAiAuthSelection);
+            // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
+            const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
+            const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
+                !== JSON.stringify(advertisedWriteFileAttempt);
             const advertisedChannelHost = this.managedHandlers ? undefined : this.channelHostAdvertisement;
             const channelHostStale = JSON.stringify(this.machine.metadata?.channelHost)
                 !== JSON.stringify(advertisedChannelHost);
@@ -4219,7 +4276,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || writeFileAttemptStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4252,6 +4309,8 @@ export class ApiMachineClient {
                     additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
+                    structuredOutput: advertisedStructuredOutput,
+                    writeFileAttempt: advertisedWriteFileAttempt,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
                     sealedSpawnEnv: advertisedSealedSpawnEnv,
@@ -4275,8 +4334,31 @@ export class ApiMachineClient {
     setRuntimeActivityProvider(provider: () => {
         activeSessionCount: number;
         activeAutomationCount: number;
+        inTurnCount?: number;
     }): void {
         this.runtimeActivityProvider = provider;
+    }
+
+    setRestartLifecycleProvider(provider: () => DaemonRestartLifecycle | null): void {
+        this.restartLifecycleProvider = provider;
+    }
+
+    /** Push the drain state now instead of waiting for the next keep-alive (R6). */
+    publishRestartLifecycle(): void {
+        const lifecycle = this.restartLifecycleProvider?.() ?? null;
+        this.updateDaemonState((state) => withRestartLifecycle({ ...state, status: state?.status ?? 'running' }, lifecycle))
+            .catch((err) => logger.debug('[API MACHINE] Failed to publish restart lifecycle:', err));
+    }
+
+    /**
+     * R23: close every daemon terminal before a restart, while the socket is still
+     * up so each `terminal-closed` carries `reason: 'daemon-restart'`.
+     */
+    async closeDaemonTerminalsForRestart(): Promise<number> {
+        const closed = await closeAllDaemonTerminalSessionsForRestart();
+        // The close frames are emitted from each PTY's exit handler; give them a beat to leave.
+        if (closed > 0) await new Promise((resolve) => setTimeout(resolve, 200));
+        return closed;
     }
 
     /**

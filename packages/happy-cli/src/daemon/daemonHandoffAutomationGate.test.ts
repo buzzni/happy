@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import { createAutomationTickRunner } from './automations/automationTickRunner'
 import {
-  decideAutomationAwareHandoff,
+  decideHandoffStep,
+  readHandoffCaps,
   resumeAutomationRunnersAfterFailedHandoff,
 } from './daemonHandoffAutomationGate'
 
@@ -16,55 +17,47 @@ function deferred() {
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
-describe('decideAutomationAwareHandoff', () => {
-  it('shouldRunAutomationsWhenTheBundleWasNotReplaced', () => {
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: false,
-      legacyAutomationRunning: false,
-      serverAutomationRunning: false,
-    })).toBe('run-automations')
+const caps = { prewaitCapMs: 30 * 60_000, terminalCapMs: 24 * 60 * 60_000 }
+const quiet = { inTurnCount: 0, automationCount: 0, busyTerminalCount: 0 }
+function step(overrides: Partial<Parameters<typeof decideHandoffStep>[0]> = {}) {
+  return decideHandoffStep({
+    bundleReplaced: true, pending: { detectedAt: 0, busyTerminalCount: 0, forceAvailable: false },
+    now: 60_000, drainOpen: false, ...quiet, ...caps, ...overrides,
+  })
+}
+
+describe('decideHandoffStep (R4·R25)', () => {
+  it('does nothing while the bundle was not replaced or a drain already owns the handoff', () => {
+    expect(step({ bundleReplaced: false })).toBe('none')
+    expect(step({ drainOpen: true })).toBe('none')
   })
 
-  it.each([
-    { legacyAutomationRunning: true, serverAutomationRunning: false },
-    { legacyAutomationRunning: false, serverAutomationRunning: true },
-    { legacyAutomationRunning: true, serverAutomationRunning: true },
-  ])('shouldDeferHandoffWhileAnAutomationTickIsRunning (%o)', (running) => {
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: true,
-      ...running,
-    })).toBe('defer-handoff')
+  // #336 회귀: 장수 세션이 살아 있어도 진행 중 턴·자동화·사용 중 터미널이 0이면 교대한다.
+  it('tries to hand off at the first quiet moment even with long-lived idle sessions alive', () => {
+    expect(step()).toBe('try-now')
   })
 
-  // 2026-09-03: 대화형 세션은 몇 시간씩 살아 있다. 그동안 runner 를 멈추면 서버 이관
-  // 반복 리뷰(session follow-up)가 세션이 모두 끝날 때까지 굶는다 — 교대는 미루되 automation 은 계속.
-  it.each([
-    { legacyAutomationRunning: false, serverAutomationRunning: false },
-    { legacyAutomationRunning: false, serverAutomationRunning: true },
-    { legacyAutomationRunning: true, serverAutomationRunning: false, serverAutomationLeaseRunning: true },
-  ])('shouldKeepRunningAutomationsWhileAnInteractiveOrTerminalSessionDefersHandoff (%o)', (running) => {
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: true,
-      ...running,
-      activeSessionCount: 1,
-    })).toBe('run-automations')
+  it('keeps waiting without closing admission while a turn or automation runs, until the 30 min cap', () => {
+    expect(step({ inTurnCount: 1, now: 29 * 60_000 })).toBe('prewait')
+    expect(step({ automationCount: 1, now: 29 * 60_000 })).toBe('prewait')
+    expect(step({ inTurnCount: 1, now: 30 * 60_000 })).toBe('begin-cap-drain')
   })
 
-  it('shouldHandoffAfterEveryAutomationTickBecomesIdle', () => {
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: true,
-      legacyAutomationRunning: false,
-      serverAutomationRunning: false,
-    })).toBe('handoff')
+  it('never enters the cap drain while a terminal is busy', () => {
+    expect(step({ inTurnCount: 1, busyTerminalCount: 1, now: 31 * 60_000 })).toBe('prewait')
   })
 
-  it('shouldDeferHandoffWhileAnAgentTaskLeaseIsActive', () => {
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: true,
-      legacyAutomationRunning: false,
-      serverAutomationRunning: false,
-      serverAutomationLeaseRunning: true,
-    })).toBe('defer-handoff')
+  it('at the 24 h terminal cap publishes forceAvailable, then drains on the next beat', () => {
+    const now = 24 * 60 * 60_000
+    expect(step({ busyTerminalCount: 1, now })).toBe('publish-force-available')
+    expect(step({ busyTerminalCount: 1, now, pending: { detectedAt: 0, busyTerminalCount: 1, forceAvailable: true } }))
+      .toBe('begin-terminal-cap-drain')
+  })
+
+  it('reads both caps from env', () => {
+    expect(readHandoffCaps({ HAPPY_DAEMON_HANDOFF_PREWAIT_CAP_MS: '5000', HAPPY_DAEMON_HANDOFF_TERMINAL_CAP_MS: '9000' }))
+      .toEqual({ prewaitCapMs: 5000, terminalCapMs: 9000 })
+    expect(readHandoffCaps({})).toEqual(caps)
   })
 
   it('shouldKeepTheDaemonUntilSpawnWebhookReportAndLinkFinish', async () => {
@@ -85,22 +78,14 @@ describe('decideAutomationAwareHandoff', () => {
     await settle()
     runner.pause()
 
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: true,
-      legacyAutomationRunning: false,
-      serverAutomationRunning: runner.isRunning(),
-    })).toBe('defer-handoff')
+    expect(step({ automationCount: Number(runner.isRunning()) })).toBe('prewait')
     runner.trigger()
     expect(events).toEqual(['claim', 'spawn'])
 
     webhook.resolve()
     await settle()
     expect(events).toEqual(['claim', 'spawn', 'webhook', 'report', 'link'])
-    expect(decideAutomationAwareHandoff({
-      bundleReplaced: true,
-      legacyAutomationRunning: false,
-      serverAutomationRunning: runner.isRunning(),
-    })).toBe('handoff')
+    expect(step({ automationCount: Number(runner.isRunning()) })).toBe('try-now')
   })
 })
 

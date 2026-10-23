@@ -263,6 +263,23 @@ export const MachineMetadataSchema = z.object({
    * 이유는 필드 유무만으로는 "어느 선택 종류까지 아는가" 를 말할 수 없기 때문이다.
    */
   aiAuthSelection: z.object({ version: z.literal(1) }).optional(),
+  /**
+   * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
+   * for these agents. Absent on an older daemon, which would drop the field and run the session
+   * without it, so a client must not send one. `agents` is a plain string array so a newer value
+   * never makes an older client drop the whole field.
+   */
+  structuredOutput: z.object({
+    version: z.literal(1),
+    agents: z.array(z.string()),
+    maxSchemaBytes: z.number().int().positive(),
+  }).optional(),
+  /**
+   * 이 daemon 의 `writeFile` 이 `attemptId` 재전송을 같은 답으로 처리한다고 광고한다
+   * (aplus-dev-studio specs/claude-cli-benchmark-followups R5). 구형 daemon 은 필드를 무시하므로
+   * 클라이언트는 이 필드를 보고 나서만 `attemptId` 를 보낸다.
+   */
+  writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
   /** Profile-based no-shell execution negotiated by Desktop extensions. */
   machineRun: z.object({
     protocolVersion: z.literal(1),
@@ -298,6 +315,26 @@ export const MachineMetadataSchema = z.object({
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
 
+export const DaemonRestartLifecycleSchema = z.object({
+  state: z.union([z.enum(['running', 'draining']), z.string()]),
+  intent: z.union([z.enum(['restart', 'stop']), z.string()]).optional(),
+  reason: z.string().optional(),
+  inTurnCount: z.number().int().min(0).optional(),
+  openTerminalCount: z.number().int().min(0).optional(),
+  busyTerminalCount: z.number().int().min(0).optional(),
+  /** Epoch ms the drain ends at the latest. */
+  deadlineAt: z.number().optional(),
+  /** Bundle replaced on disk, waiting for a quiet moment (admission still open). */
+  pendingHandoff: z.object({
+    detectedAt: z.number(),
+    busyTerminalCount: z.number().int().min(0),
+    /** 24 h terminal cap reached: Desktop may offer "지금 교대" (`restart-drain:force-handoff`). */
+    forceAvailable: z.boolean(),
+  }).optional(),
+})
+
+export type DaemonRestartLifecycle = z.infer<typeof DaemonRestartLifecycleSchema>
+
 /**
  * Daemon state - dynamic runtime information (frequently updated)
  */
@@ -320,8 +357,17 @@ export const DaemonStateSchema = z.object({
   activity: z.object({
     activeSessionCount: z.number().int().min(0),
     activeAutomationCount: z.number().int().min(0),
+    /** aplus codexcli-daemon-restart-drain — sessions with a turn in flight. Absent on older daemons. */
+    inTurnCount: z.number().int().min(0).optional(),
     reportedAt: z.number(),
   }).optional(),
+  /**
+   * aplus specs/codexcli-daemon-restart-drain R6·R22·R25 — restart drain and pending bundle handoff.
+   * A separate object rather than a wider `status`: machine metadata `daemonLastKnownStatus` is a
+   * strict enum, so a `draining` status mirrored there would break older metadata parsers.
+   * Declared here because this schema strips unknown keys.
+   */
+  lifecycle: DaemonRestartLifecycleSchema.optional(),
 })
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>

@@ -58,7 +58,12 @@ class FakeSocket {
         this.handlers.set(event, handler);
     }
 
-    emit() {/* not used by these tests */ }
+    /** Events emitted straight back on this socket (answers meant for the requester only). */
+    ownEmits: Array<{ event: string; payload: any }> = [];
+
+    emit(event: string, payload: any) {
+        this.ownEmits.push({ event, payload });
+    }
 
     /** Extra fields the daemon returns in its terminal-open-fwd ack. */
     ackExtras: Record<string, unknown> = {};
@@ -516,5 +521,331 @@ describe('terminalRelayHandler resume relay', () => {
         expect(roomEmits).toEqual([
             { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 2 } },
         ]);
+    });
+});
+
+/** Minimal in-memory stand-in for the ioredis subset, with TTLs recorded. */
+class FakeRedis {
+    strings = new Map<string, string>();
+    ttls = new Map<string, number>();
+    sets = new Map<string, Set<string>>();
+
+    async set(key: string, value: string, _mode: string, ttlSeconds: number) {
+        this.strings.set(key, value);
+        this.ttls.set(key, ttlSeconds);
+        return 'OK';
+    }
+    async get(key: string) { return this.strings.get(key) ?? null; }
+    async del(...keys: string[]) {
+        for (const k of keys) { this.strings.delete(k); this.sets.delete(k); this.ttls.delete(k); }
+        return keys.length;
+    }
+    async sadd(key: string, ...members: string[]) {
+        const set = this.sets.get(key) ?? new Set<string>();
+        members.forEach((m) => set.add(m));
+        this.sets.set(key, set);
+        return members.length;
+    }
+    async srem(key: string, ...members: string[]) {
+        const set = this.sets.get(key);
+        members.forEach((m) => set?.delete(m));
+        return 1;
+    }
+    async smembers(key: string) { return [...(this.sets.get(key) ?? [])]; }
+    async scard(key: string) { return this.sets.get(key)?.size ?? 0; }
+    async expire() { return 1; }
+
+    record(id: string) {
+        const raw = this.strings.get(`terminal:session:${id}`);
+        return raw ? JSON.parse(raw) : null;
+    }
+}
+
+/*
+ * Codex CLI benchmark D4 B-R2 — a terminal that ends while its client is away.
+ *
+ * Each "replica" is a fresh module instance: its own session cache and its own
+ * reattach timers, sharing only the fake Redis and the cluster emit — so a
+ * decision that leans on replica-local state (the old "is a reattach timer
+ * pending here?") fails here the way it fails in production.
+ */
+describe('terminalRelayHandler ended terminal across replicas', () => {
+    let redis: FakeRedis;
+
+    let replicas: Array<typeof import('./terminalSessions')> = [];
+
+    /** A fresh replica, wired to its peers the way the cluster adapter's serverSideEmit would. */
+    async function loadReplica() {
+        vi.resetModules();
+        const relay = await import('./terminalRelayHandler');
+        const store = await import('./terminalSessions');
+        store.setTerminalSessionBackend(redis as any);
+        const listeners: Array<(message: { id?: unknown }) => void> = [];
+        store.registerTerminalSessionClusterListeners({
+            on: (_event, listener) => { listeners.push(listener); },
+            // serverSideEmit reaches every replica except the sender.
+            serverSideEmit: (_event, message) => {
+                for (const peer of replicas) if (peer !== store) peer.forgetCachedTerminalSession(message.id);
+            },
+        });
+        replicas.push(store);
+        return { relay, store };
+    }
+
+    beforeEach(() => {
+        connections.clear();
+        roomEmits.length = 0;
+        redis = new FakeRedis();
+        replicas = [];
+    });
+
+    it('a replica that cached the record follows a client rebound on another replica', async () => {
+        const { daemon, sessionId } = await openAcrossReplicas();
+        await daemon.trigger('terminal-frame', { sessionId, seq: 1, data: 'before' });
+        const replicaC = await loadReplica();
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+        await back.trigger('terminal-frame', { sessionId, data: 'typed' });
+        roomEmits.length = 0;
+
+        await daemon.trigger('terminal-frame', { sessionId, seq: 2, data: 'after' });
+
+        expect(roomEmits).toEqual([
+            { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 2, data: 'after' } },
+        ]);
+    });
+
+    /** Client handled by replica B, daemon by replica A. */
+    async function openAcrossReplicas() {
+        const replicaA = await loadReplica();
+        const replicaB = await loadReplica();
+        const daemon = new FakeSocket('daemon-1');
+        registerMachineSocket('m1', daemon);
+        (daemon as any).data = { clientType: 'machine-scoped', machineId: 'm1' };
+        replicaA.relay.terminalRelayHandler('u1', daemon as any);
+        const client = new FakeSocket('client-1');
+        replicaB.relay.terminalRelayHandler('u1', client as any);
+        const ack = vi.fn();
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc' }, ack);
+        const sessionId = ack.mock.calls[0][0].sessionId;
+        roomEmits.length = 0;
+        return { replicaA, replicaB, daemon, client, sessionId };
+    }
+
+    it('keeps the record of a terminal that ended while the client was detached, so a resume on another replica reaches the daemon', async () => {
+        vi.useFakeTimers();
+        try {
+            const { replicaB, daemon, client, sessionId } = await openAcrossReplicas();
+            await client.trigger('disconnect');
+            await daemon.trigger('terminal-closed', { sessionId, code: 0, signal: null });
+
+            expect(roomEmits).toEqual([
+                { room: 'client-1', event: 'terminal-closed', payload: { sessionId, code: 0, signal: null } },
+            ]);
+            expect(redis.record(sessionId)).toMatchObject({ closedAt: expect.any(Number), exit: { code: 0, signal: null } });
+            expect(redis.ttls.get(`terminal:session:${sessionId}`)).toBe(30);
+            expect(await replicaB.store.countActiveSessionsForUser('u1')).toBe(0);
+
+            roomEmits.length = 0;
+            const replicaC = await loadReplica();
+            const back = new FakeSocket('client-2');
+            replicaC.relay.terminalRelayHandler('u1', back as any);
+            await back.trigger('terminal-resume', { sessionId, afterSeq: 4 });
+
+            expect(roomEmits).toEqual([
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+            ]);
+            // Rebinding the returning client must not stretch the closed record back to 12h.
+            expect(redis.ttls.get(`terminal:session:${sessionId}`)).toBeLessThanOrEqual(30);
+
+            // Replica B's reattach timer still fires, but must not close a terminal that already ended.
+            roomEmits.length = 0;
+            await vi.advanceTimersByTimeAsync(30_001);
+            expect(roomEmits).toEqual([]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    /*
+     * Cross review #3: the reattach window counts from the client leaving, the
+     * retain window from the shell ending. A shell that ends late in the first
+     * must not lose its exit code to it — the closed record runs out on its TTL.
+     */
+    it('keeps a terminal that ended late in the reattach window for its own retain window', async () => {
+        vi.useFakeTimers();
+        try {
+            const { daemon, client, sessionId } = await openAcrossReplicas();
+            await client.trigger('disconnect');
+            await vi.advanceTimersByTimeAsync(25_000);
+            await daemon.trigger('terminal-closed', { sessionId, code: 3, signal: null });
+            await vi.advanceTimersByTimeAsync(10_000);
+
+            roomEmits.length = 0;
+            const replicaC = await loadReplica();
+            const back = new FakeSocket('client-2');
+            replicaC.relay.terminalRelayHandler('u1', back as any);
+            await back.trigger('terminal-resume', { sessionId, afterSeq: 4 });
+
+            expect(back.ownEmits).toEqual([]);
+            expect(roomEmits).toEqual([
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+            ]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('relays the daemon\'s re-sent exit after a replay to the returning client', async () => {
+        const { daemon, client, sessionId } = await openAcrossReplicas();
+        await client.trigger('disconnect');
+        await daemon.trigger('terminal-closed', { sessionId, code: 2, signal: null });
+        const replicaC = await loadReplica();
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+        await back.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+        roomEmits.length = 0;
+
+        await daemon.trigger('terminal-frame', { sessionId, seq: 1, data: 'tail' });
+        await daemon.trigger('terminal-closed', { sessionId, code: 2, signal: null });
+
+        expect(roomEmits).toEqual([
+            { room: 'client-2', event: 'terminal-frame', payload: { sessionId, seq: 1, data: 'tail' } },
+            { room: 'client-2', event: 'terminal-closed', payload: { sessionId, code: 2, signal: null } },
+        ]);
+    });
+
+    it('answers from the stored exit when the daemon socket is gone too', async () => {
+        const { daemon, client, sessionId } = await openAcrossReplicas();
+        await client.trigger('disconnect');
+        await daemon.trigger('terminal-closed', { sessionId, code: 5, signal: null });
+        roomEmits.length = 0;
+        await daemon.trigger('disconnect');
+        // The terminal already ended with a real code; "daemon disconnected" would be a lie.
+        expect(roomEmits).toEqual([]);
+
+        const replicaC = await loadReplica();
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+        await back.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+
+        expect(roomEmits).toEqual([]);
+        expect(back.ownEmits).toEqual([
+            { event: 'terminal-closed', payload: { sessionId, code: 5, signal: null } },
+        ]);
+    });
+
+    it('gives the same unknown-session answer for no record and for another user\'s record, to the requester only', async () => {
+        const { sessionId } = await openAcrossReplicas();
+        const replicaC = await loadReplica();
+        const stranger = new FakeSocket('stranger');
+        replicaC.relay.terminalRelayHandler('u2', stranger as any);
+        const owner = new FakeSocket('client-3');
+        replicaC.relay.terminalRelayHandler('u1', owner as any);
+
+        await stranger.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+        await owner.trigger('terminal-resume', { sessionId: 'no-such-session', afterSeq: 0 });
+
+        expect(roomEmits).toEqual([]);
+        expect(stranger.ownEmits).toEqual([
+            { event: 'terminal-closed', payload: { sessionId, reason: 'unknown-session' } },
+        ]);
+        expect(owner.ownEmits).toEqual([
+            { event: 'terminal-closed', payload: { sessionId: 'no-such-session', reason: 'unknown-session' } },
+        ]);
+    });
+
+    it('answers unknown-session once a closed record expired, even on a replica that still caches it', async () => {
+        const { replicaB, daemon, client, sessionId } = await openAcrossReplicas();
+        await daemon.trigger('terminal-closed', { sessionId, code: 0, signal: null });
+        await replicaB.store.getTerminalSessionFresh(sessionId);
+        // The store's 30-second TTL ran out; nothing told the peers.
+        await redis.del(`terminal:session:${sessionId}`);
+        roomEmits.length = 0;
+
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+
+        expect(roomEmits).toEqual([]);
+        expect(client.ownEmits).toEqual([
+            { event: 'terminal-closed', payload: { sessionId, reason: 'unknown-session' } },
+        ]);
+        expect(await replicaB.store.getTerminalSession(sessionId)).toBeNull();
+    });
+
+    it('a record removed on another replica is unknown here too', async () => {
+        const { replicaA, client, sessionId } = await openAcrossReplicas();
+        await replicaA.store.removeTerminalSession(sessionId);
+
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+
+        expect(client.ownEmits).toEqual([
+            { event: 'terminal-closed', payload: { sessionId, reason: 'unknown-session' } },
+        ]);
+    });
+
+    it('does not end a live terminal the store never recorded, when this replica still has it', async () => {
+        const { client, sessionId } = await openAcrossReplicas();
+        // The write at open was tolerated as a failure, so only this replica's cache knows it.
+        await redis.del(`terminal:session:${sessionId}`);
+
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3 });
+
+        expect(client.ownEmits).toEqual([]);
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 3 } },
+        ]);
+    });
+
+    it('stays silent instead of answering unknown when the store cannot be read', async () => {
+        const { sessionId } = await openAcrossReplicas();
+        const replicaC = await loadReplica();
+        redis.get = async () => { throw new Error('ETIMEDOUT'); };
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+
+        await back.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+
+        expect(back.ownEmits).toEqual([]);
+        expect(roomEmits).toEqual([]);
+    });
+
+    it('forgets a closed record cached on a peer replica when its TTL runs out', async () => {
+        vi.useFakeTimers();
+        try {
+            const { replicaB, daemon, sessionId } = await openAcrossReplicas();
+            await daemon.trigger('terminal-closed', { sessionId, code: 0, signal: null });
+            const replicaC = await loadReplica();
+            expect((await replicaC.store.getTerminalSessionFresh(sessionId))?.closedAt).toEqual(expect.any(Number));
+            await redis.del(`terminal:session:${sessionId}`);
+
+            await vi.advanceTimersByTimeAsync(30_001);
+
+            expect(await replicaC.store.getTerminalSession(sessionId)).toBeNull();
+            expect(await replicaB.store.getTerminalSession(sessionId)).toBeNull();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('answers with the kept exit when the daemon no longer has a terminal the relay saw end', async () => {
+        const { daemon, sessionId } = await openAcrossReplicas();
+        await daemon.trigger('terminal-closed', { sessionId, code: 2, signal: null });
+        roomEmits.length = 0;
+
+        await daemon.trigger('terminal-closed', { sessionId, reason: 'unknown-session' });
+
+        expect(roomEmits).toEqual([
+            { room: 'client-1', event: 'terminal-closed', payload: { sessionId, code: 2, signal: null } },
+        ]);
+    });
+
+    it('carries the daemon\'s unknown-session answer to the client and forgets the record', async () => {
+        const { daemon, sessionId } = await openAcrossReplicas();
+        await daemon.trigger('terminal-closed', { sessionId, reason: 'unknown-session' });
+
+        expect(roomEmits).toEqual([
+            { room: 'client-1', event: 'terminal-closed', payload: { sessionId, reason: 'unknown-session' } },
+        ]);
+        expect(redis.record(sessionId)).toBeNull();
     });
 });

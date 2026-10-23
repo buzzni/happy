@@ -34,10 +34,11 @@ describe('request environment wiring', () => {
 
   it('remembers what clients send through every machine RPC and control server start', async () => {
     const source = await runSource()
-    expect(source).toContain('spawnSession: requestEnvironments.rememberSpawn(spawnSession),')
+    // `spawnSessionAdmitted` = spawnSession behind the restart drain gate (codexcli-daemon-restart-drain).
+    expect(source).toContain('spawnSession: requestEnvironments.rememberSpawn(spawnSessionAdmitted),')
     expect(source).toContain('resumeSession: requestEnvironments.rememberResume(')
     expect(source).toContain('recoverSession: requestEnvironments.rememberResume(')
     expect(source).toContain('!resumeInFlight.has(sessionId)')
-    expect(source.match(/spawnSession: requestEnvironments\.rememberSpawn\(spawnSession\),/g)).toHaveLength(2)
+    expect(source.match(/spawnSession: requestEnvironments\.rememberSpawn\(spawnSessionAdmitted\),/g)).toHaveLength(2)
   })
 })

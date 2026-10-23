@@ -7,6 +7,7 @@
  * the macOS Keychain) and makes every network entry fail. `claude` is a logging stub,
  * so no inference can run. Tokens and signing keys are synthetic.
  */
+import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock'
 import { execFileSync } from 'node:child_process'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs'
@@ -138,6 +139,7 @@ if sys.argv[1:3] == ['auth', 'logout']:
         catch (error) { failures.push(`${command} ${args[0] ?? ''} ${(error as { kind?: string }).kind ?? ''}`); throw error }
       },
       readFile: path => readFile(path, 'utf8'), readdir: path => readdir(path),
+      lockCredentialFile: (path, work) => withCredentialLock(credentialFileLockPath(path), work),
       syncFile: async path => { const file = await open(path, 'r+'); try { await file.sync() } finally { await file.close() } },
       syncDirectory: async path => { const directory = await open(path, 'r'); try { await directory.sync() } finally { await directory.close() } },
       writeFile: async (path, content, options) => { await writeFile(path, content, options) },

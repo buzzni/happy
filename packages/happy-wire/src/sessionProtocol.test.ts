@@ -498,3 +498,26 @@ describe('difficultyRouting previousApplied contract', () => {
     }).success).toBe(false);
   });
 });
+
+// Saycode specs/claude-cli-benchmark-followups R2 — a `--output-schema` turn's machine-readable result.
+describe('structured-output event', () => {
+  it('carries a validated value when the turn produced one', () => {
+    const parsed = sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'ok', value: { answer: 'ok', n: 2 } });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('says why a turn ended without one instead of omitting the event', () => {
+    for (const reason of ['not_produced', 'schema_mismatch', 'retries_exhausted', 'turn_failed', 'turn_cancelled']) {
+      expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing', reason }).success).toBe(true);
+    }
+  });
+
+  it('refuses a shape a reader could misread as success', () => {
+    // ok without a value, missing without a reason, missing that still carries a value.
+    expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'ok' }).success).toBe(false);
+    expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing' }).success).toBe(false);
+    expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing', reason: 'not_produced', value: {} }).success).toBe(false);
+    expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing', reason: 'other' }).success).toBe(false);
+    expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 2, status: 'ok', value: {} }).success).toBe(false);
+  });
+});

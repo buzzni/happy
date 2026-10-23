@@ -18,6 +18,7 @@ import { type SaycodeAgentEnvironment, readSetupTokenResumeSelection, isMachineS
 import { logger } from '@/ui/logger';
 import { parseMachineIdentity, type MachineIdentity } from '@/machineIdentity';
 import { getProcessStartedAt, getWindowsProcessStartedAt } from '@/utils/processStartTime';
+import { verifyDaemonIdentity, type DaemonIdentity } from '@/daemon/daemonIdentity';
 
 export const SandboxConfigSchema = z.object({
   enabled: z.boolean().default(true),
@@ -165,6 +166,13 @@ export interface DaemonLocallyPersistedState {
    * to whatever `controlServer.ts` does for that case.
    */
   controlSecret?: string;
+  /**
+   * aplus specs/codexcli-daemon-restart-drain R18 — who wrote this file: pid,
+   * own process start time (read once at boot), boot id and bundle digest.
+   * Every path that signals a daemon compares it first (R19). Optional: files
+   * from older daemons have none and keep the pid-only checks.
+   */
+  identity?: DaemonIdentity;
 }
 
 export async function readSettings(): Promise<Settings> {
@@ -764,6 +772,8 @@ const REUSED_LOCK_PID_SLACK_MS = 2_000
 export interface DaemonLockDeps {
   /** Epoch ms a live process started, or undefined when it cannot be read. */
   getProcessStartedAt?: (pid: number) => number | undefined | Promise<number | undefined>
+  /** This boot's id (tests); defaults to the platform's. */
+  readBootId?: () => string | undefined
   /** Whether the pid is the daemon answering the control port in daemon.state.json. */
   answersAsDaemon?: (pid: number) => Promise<boolean>
 }
@@ -813,6 +823,16 @@ export async function acquireDaemonLock(
 
 type LockSnapshot = { pid: number; raw: string; mtimeMs: number; ino: number };
 
+function readRecordedDaemonIdentity(lockWrittenAtMs: number): DaemonIdentity | undefined {
+  try {
+    if (statSync(configuration.daemonStateFile).mtimeMs < lockWrittenAtMs) return undefined;
+    const identity = (JSON.parse(readFileSync(configuration.daemonStateFile, 'utf-8')) as DaemonLocallyPersistedState).identity;
+    return identity && Number.isSafeInteger(identity.pid) ? identity : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function readLockSnapshot(): LockSnapshot | null {
   try {
     const raw = readFileSync(configuration.daemonLockFile, 'utf-8');
@@ -834,6 +854,21 @@ async function lockHolderIsGone(lock: LockSnapshot, deps: DaemonLockDeps): Promi
   // process; an existence check alone would then refuse to start a daemon forever.
   const lookup = deps.getProcessStartedAt
     ?? (process.platform === 'win32' ? getWindowsProcessStartedAt : getProcessStartedAt);
+  // aplus codexcli-daemon-restart-drain R19: when the state file names this pid with its
+  // start time and boot id, that is the stronger evidence either way.
+  // Only for a lock no newer than the state file: a daemon that just took the lock (and may
+  // have been handed the recorded pid again) has not written its own identity yet.
+  const recorded = readRecordedDaemonIdentity(lock.mtimeMs);
+  if (recorded?.pid === lock.pid) {
+    const verdict = await verifyDaemonIdentity(recorded, {
+      isPidAlive: () => true,
+      readStartedAt: lookup,
+      ...(deps.readBootId ? { readBootId: deps.readBootId } : {}),
+    });
+    if (verdict === 'match') return false;
+    // Still let a holder that answers as the daemon keep its lock (same guard as below).
+    if (verdict === 'mismatch') return !(await (deps.answersAsDaemon ?? answersAsDaemon)(lock.pid));
+  }
   const startedAt = await lookup(lock.pid);
   if (startedAt === undefined || startedAt <= lock.mtimeMs + REUSED_LOCK_PID_SLACK_MS) return false;
   // A clock step can make a genuine holder look newer than its lock; keep it

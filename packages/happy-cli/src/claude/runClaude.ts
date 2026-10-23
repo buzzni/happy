@@ -59,10 +59,16 @@ import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
     mcpConfigFailureStatuses,
+    withoutRecoveredConfigFailure,
     readExpectedConnectors,
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
-import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
+import {
+    CALLER_GRANT_EXPIRED_NOTICE,
+    onMcpCallerGrantExpired,
+    refreshMcpCallerGrantIfExpiring,
+    startMcpCallerGrantRefreshTimer,
+} from '@/aplus/refreshMcpCallerGrant';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
@@ -84,6 +90,7 @@ import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
+import { consumeOutputFormatSeed } from './structuredOutput';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
     createSessionModelPinPublisher,
@@ -920,6 +927,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         ? rawInitialEffortSeed as 'low' | 'medium' | 'high' | 'xhigh' | 'max'
         : undefined;
     const initialEffortSeed = explicitInitialEffort ?? DEFAULT_CLAUDE_EFFORT;
+    // Session-scoped structured output (specs/claude-cli-benchmark-followups R2). The daemon already
+    // validated it; a seed that does not parse is dropped, and the session runs without a format.
+    const outputFormat = consumeOutputFormatSeed(process.env) ?? undefined;
+    if (outputFormat) logger.debug('[START] Structured output requested for this session');
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -1917,6 +1928,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             ],
         }));
     }
+    if (initialAplusMcpResult && withoutRecoveredConfigFailure(initialAplusMcpResult, session.getMetadata()?.mcpServers)) {
+        session.updateMetadata((currentMetadata) => ({
+            ...currentMetadata,
+            mcpServers: withoutRecoveredConfigFailure(initialAplusMcpResult, currentMetadata.mcpServers) ?? currentMetadata.mcpServers,
+        }));
+    }
     // While the shadow runs, the hook steps aside for `cua-driver`: an org server of that name must not displace it.
     const shadowSafe = <T,>(servers: Record<string, T>): Record<string, T> => (cuaUpstream ? withoutCuaDriver(servers) : servers);
     const aplusMcpServers = shadowSafe(initialAplusMcpSnapshot?.servers ?? {});
@@ -1931,6 +1948,20 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             }),
         } : {}),
     };
+
+    // 턴을 기다리지 않고 grant 를 미리 교환한다. 턴 경계에서만 교환하면 만료 전
+    // 2시간 동안 쉬던 세션은 grant 가 만료돼 대화를 다시 열 때까지 커넥터를
+    // 되찾지 못한다(서버는 만료된 grant 를 교환해주지 않는다).
+    const grantMachineId = machineId;
+    const stopCallerGrantRefresh = accountToken === null || !grantMachineId
+        ? () => {}
+        : startMcpCallerGrantRefreshTimer(() => refreshMcpCallerGrantIfExpiring(accountToken, grantMachineId, {
+            sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined,
+        }));
+    // 체인 상한(7일) 등으로 더는 교환할 수 없게 되면 한 번 알린다. 대화를 다시 시작하면 새 grant 를 받는다.
+    const stopCallerGrantExpiryNotice = onMcpCallerGrantExpired(() => {
+        session.sendSessionEvent({ type: 'message', message: CALLER_GRANT_EXPIRED_NOTICE });
+    });
 
     // Create claude loop
     /*
@@ -2063,10 +2094,13 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         offTurnTitle: offTurnTitleBridge,
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
+        outputFormat,
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,
     });
     } finally {
+        stopCallerGrantRefresh();
+        stopCallerGrantExpiryNotice();
         await scopeProcessSandbox?.close();
         process.removeListener('SIGTERM', closeLessonsOnSignal);
         process.removeListener('SIGINT', closeLessonsOnSignal);

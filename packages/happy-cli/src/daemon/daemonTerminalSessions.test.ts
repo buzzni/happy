@@ -1,14 +1,20 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
     getDaemonTerminalSessionCount,
     removeDaemonTerminalSession,
+    markDaemonTerminalSessionExited,
+    recordTerminalActivity,
+    EXITED_TERMINAL_RETAIN_MS,
     killAllDaemonTerminalSessions,
     terminateAllDaemonTerminalSessions,
     recordBytesIn,
     recordBytesOut,
+    getBusyDaemonTerminalCount,
+    closeAllDaemonTerminalSessionsForRestart,
+    BUSY_TERMINAL_INPUT_WINDOW_MS,
     _resetDaemonTerminalSessionsForTest,
 } from './daemonTerminalSessions'
 import { createPtySession, type PtySession } from './remoteTerminal'
@@ -241,5 +247,115 @@ describe('daemonTerminalSessions', () => {
 
         await expect(terminateAllDaemonTerminalSessions()).resolves.toEqual(['killed', 'escaped'])
         expect(getDaemonTerminalSessionCount()).toBe(0)
+    })
+    /*
+     * Codex CLI benchmark D4 B-R2 — a terminal that ends while its client is
+     * away is kept long enough for that client to come back and learn it ended.
+     */
+    describe('exited terminal retention', () => {
+        const fake = (): PtySession & { terminate: ReturnType<typeof vi.fn> } => ({
+            id: 'f', userId: 'u1', pid: 1, cols: 80, rows: 24, write() {}, resize() {}, kill() {}, isAlive: () => false,
+            terminate: vi.fn(async () => 'already-gone' as const), onData: () => () => {}, onExit: () => () => {},
+        }) as any
+
+        afterEach(() => {
+            vi.useRealTimers()
+        })
+
+        it('keeps the entry and its exit for the retain window, then drops it', () => {
+            vi.useFakeTimers()
+            addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+
+            expect(markDaemonTerminalSessionExited('a', { code: 2, signal: null })).toBe(true)
+            expect(EXITED_TERMINAL_RETAIN_MS).toBe(30_000)
+            vi.advanceTimersByTime(29_999)
+            expect(getDaemonTerminalSession('a')?.exit).toEqual({ code: 2, signal: null })
+
+            vi.advanceTimersByTime(1)
+            expect(getDaemonTerminalSession('a')).toBeNull()
+        })
+
+        it('no longer counts an ended terminal as daemon activity', () => {
+            addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+            markDaemonTerminalSessionExited('a', { code: 0, signal: null })
+
+            expect(getDaemonTerminalSessionCount()).toBe(0)
+        })
+
+        it('does not re-arm the idle watchdog for an ended terminal', () => {
+            vi.useFakeTimers()
+            const pty = fake()
+            addDaemonTerminalSession('a', pty, { userId: 'u', idleTimeoutMs: 1000 })
+            markDaemonTerminalSessionExited('a', { code: 0, signal: null })
+
+            recordTerminalActivity('a')
+            recordBytesIn('a', 5)
+            vi.advanceTimersByTime(2000)
+
+            expect(pty.terminate).not.toHaveBeenCalled()
+        })
+
+        it('an explicit remove cancels the retain timer', () => {
+            vi.useFakeTimers()
+            addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+            markDaemonTerminalSessionExited('a', { code: 0, signal: null })
+            removeDaemonTerminalSession('a')
+            const again = addDaemonTerminalSession('a', fake(), { userId: 'u', idleTimeoutMs: 0 })
+
+            vi.advanceTimersByTime(30_000)
+
+            expect(getDaemonTerminalSession('a')).toBe(again)
+        })
+
+        it('reports false for an unknown session', () => {
+            expect(markDaemonTerminalSessionExited('nope', { code: 0, signal: null })).toBe(false)
+        })
+    })
+
+    describe('restart drain terminal use (aplus codexcli-daemon-restart-drain R23)', () => {
+        it('counts a terminal as busy only after input, and only for 10 minutes', () => {
+            addDaemonTerminalSession('t1', spawn(), { userId: 'u', idleTimeoutMs: 0 })
+            addDaemonTerminalSession('t2', spawn(), { userId: 'u', idleTimeoutMs: 0 })
+            recordBytesOut('t2', 100)
+            expect(getBusyDaemonTerminalCount()).toBe(0)
+            recordBytesIn('t1', 3)
+            const typedAt = getDaemonTerminalSession('t1')!.lastInputAt!
+            expect(getBusyDaemonTerminalCount(typedAt + 1_000)).toBe(1)
+            expect(getBusyDaemonTerminalCount(typedAt + BUSY_TERMINAL_INPUT_WINDOW_MS)).toBe(0)
+        })
+
+        it('output alone never makes a terminal busy', () => {
+            addDaemonTerminalSession('tail', spawn(), { userId: 'u', idleTimeoutMs: 0 })
+            recordBytesOut('tail', 10)
+            expect(getDaemonTerminalSession('tail')!.lastInputAt).toBeNull()
+        })
+
+        it('closes all for a restart, tagging the reason and awaiting teardown', async () => {
+            const entry = addDaemonTerminalSession('t1', spawn(), { userId: 'u', idleTimeoutMs: 0 })
+            addDaemonTerminalSession('t2', spawn(), { userId: 'u', idleTimeoutMs: 0 })
+            await expect(closeAllDaemonTerminalSessionsForRestart()).resolves.toBe(2)
+            expect(entry.closeReason).toBe('daemon-restart')
+            expect(getDaemonTerminalSessionCount()).toBe(0)
+        })
+
+        /*
+         * D4 B-R2 × R23: an ended terminal kept for resume is nobody's open
+         * terminal — it must not hold a restart drain, and a restart close has
+         * nothing left to tear down for it.
+         */
+        it('an ended terminal kept for resume is neither busy nor closed again for a restart', async () => {
+            const ended = spawn()
+            const live = addDaemonTerminalSession('live', spawn(), { userId: 'u', idleTimeoutMs: 0 })
+            addDaemonTerminalSession('ended', ended, { userId: 'u', idleTimeoutMs: 0 })
+            recordBytesIn('ended', 3)
+            markDaemonTerminalSessionExited('ended', { code: 0, signal: null })
+            const terminate = vi.spyOn(ended, 'terminate')
+
+            expect(getBusyDaemonTerminalCount()).toBe(0)
+            await expect(closeAllDaemonTerminalSessionsForRestart()).resolves.toBe(1)
+            expect(terminate).not.toHaveBeenCalled()
+            expect(live.closeReason).toBe('daemon-restart')
+            expect(getDaemonTerminalSession('ended')).toBeNull()
+        })
     })
 })

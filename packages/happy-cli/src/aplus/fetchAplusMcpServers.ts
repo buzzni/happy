@@ -83,6 +83,22 @@ export function mcpConfigFailureStatuses(
     }]
 }
 
+/**
+ * 이 프로세스가 설정 조회에 성공했으면, 이전 프로세스가 남긴 `aplus-config`
+ * 실패 보고를 지운 목록. 지울 것이 없거나 조회가 실패했으면 `null`.
+ *
+ * 재개한 세션의 metadata 에는 이전 프로세스의 보고가 그대로 남는다. 만료된
+ * grant 의 403 이 남아 있으면 Desktop 이 새 grant 로 정상인 대화에
+ * '새 대화 필요'를 안내한다.
+ */
+export function withoutRecoveredConfigFailure<T extends { name: string }>(
+    result: AplusMcpServersFetchResult,
+    servers: readonly T[] | undefined,
+): T[] | null {
+    if (!result.ok || !servers?.some((server) => server.name === 'aplus-config')) return null
+    return servers.filter((server) => server.name !== 'aplus-config')
+}
+
 const TIMEOUT_MS = 3000
 
 export type McpFetchContext = {

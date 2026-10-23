@@ -22,6 +22,7 @@ import type { CheckpointSessionComposition } from '@/checkpoint/checkpointSessio
 export type { PermissionMode } from "@/api/types"
 import type { PermissionMode } from "@/api/types"
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
+import type { ClaudeOutputFormat } from './structuredOutput'
 
 export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -95,6 +96,8 @@ interface LoopOptions {
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime
     exitAfterFirstTurn?: boolean
+    /** Session-scoped structured output from the spawn seed (specs/claude-cli-benchmark-followups R2). */
+    outputFormat?: ClaudeOutputFormat
     getSaycodeSystemPromptEnabled: () => boolean | undefined
     getSaycodePromptBlocks: () => SaycodePromptBlockOverrides | undefined
 }
@@ -133,6 +136,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         jsRuntime: opts.jsRuntime,
         startingMode: opts.startingMode,
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
+        outputFormat: opts.outputFormat,
         lessons: opts.lessons,
         lessonProposalTurn: opts.lessonProposalTurn,
         turnCards: opts.turnCards,

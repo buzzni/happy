@@ -121,6 +121,7 @@ function fakeMachine(initial: Slot[], activeAccountNumber: number | null, option
   const runtime = createAiCredentialRuntime({
     machineSetupTokenStart: options.machineStart ?? (async () => {}),
     machineSetupTokenAuthority: options.machineAuthority ?? (async () => {}),
+    lockCredentialFile: (_path, work) => work(),
     homeDir: join('/home', 'operator'), platform: options.platform, machineId: options.machineId ?? 'machine-1', now: () => options.clock?.now ?? NOW, env: options.env ?? {}, execFile,
     ...(options.binding === false ? {} : { setupTokenBinding: studioVerifier(options.machineId) }),
     ...(options.inUse ? { setupTokenAccountsInUse: options.inUse } : {}),

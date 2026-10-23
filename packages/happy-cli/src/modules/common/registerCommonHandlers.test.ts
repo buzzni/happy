@@ -195,6 +195,133 @@ describe('registerCommonHandlers readFileChunk', () => {
     });
 });
 
+describe('registerCommonHandlers writeFile attempts', () => {
+    const b64 = (text: string) => Buffer.from(text).toString('base64');
+    const sha = (text: string) => createHash('sha256').update(Buffer.from(text)).digest('hex');
+    let attemptCounter = 0;
+    const nextAttemptId = () => `attempt-${process.pid}-${Date.now()}-${++attemptCounter}`;
+
+    it('refuses to overwrite a file that changed after the client opened it', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'opened');
+        await writeFile(path, 'changed elsewhere');
+
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('mine'), expectedHash: sha('opened'), attemptId: nextAttemptId(),
+        })).resolves.toMatchObject({ success: false, errorCode: 'HASH_MISMATCH' });
+        await expect(readFile(path, 'utf8')).resolves.toBe('changed elsewhere');
+    });
+
+    it('answers a resent attempt with its first result instead of a conflict', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'opened');
+        const request = { path, content: b64('mine'), expectedHash: sha('opened'), attemptId: nextAttemptId() };
+
+        await expect(handlers.get('writeFile')?.(request)).resolves.toEqual({ success: true, hash: sha('mine') });
+        // The first answer was lost; the client sends the same attempt again.
+        await expect(handlers.get('writeFile')?.(request)).resolves.toEqual({ success: true, hash: sha('mine'), replayed: true });
+        await expect(readFile(path, 'utf8')).resolves.toBe('mine');
+    });
+
+    it('answers a resent attempt that overlaps the first one with the same result', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'opened');
+        const request = { path, content: b64('mine'), expectedHash: sha('opened'), attemptId: nextAttemptId() };
+
+        const [first, resent] = await Promise.all([handlers.get('writeFile')?.(request), handlers.get('writeFile')?.(request)]);
+        expect(first).toEqual({ success: true, hash: sha('mine') });
+        expect(resent).toEqual({ success: true, hash: sha('mine'), replayed: true });
+    });
+
+    it('refuses an attempt id reused for a different write without touching the file', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'opened');
+        const attemptId = nextAttemptId();
+        await handlers.get('writeFile')?.({ path, content: b64('mine'), expectedHash: sha('opened'), attemptId });
+
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('other'), expectedHash: sha('mine'), attemptId,
+        })).resolves.toMatchObject({ success: false, errorCode: 'ATTEMPT_CONFLICT' });
+        await expect(readFile(path, 'utf8')).resolves.toBe('mine');
+    });
+
+    it('treats a resent attempt whose record is gone as done when the file already holds its bytes', async () => {
+        // A daemon restart loses the record; the retry must still not read as a conflict.
+        const first = await createHandlers();
+        const path = join(first.workingDirectory, 'notes.md');
+        await writeFile(path, 'mine');
+
+        await expect(first.handlers.get('writeFile')?.({
+            path, content: b64('mine'), expectedHash: sha('opened'), attemptId: nextAttemptId(),
+        })).resolves.toEqual({ success: true, hash: sha('mine'), replayed: true });
+    });
+
+    it('creates a new file once and answers the resent create as done', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'nested', 'new.md');
+        const request = { path, content: b64('fresh'), expectedHash: null, attemptId: nextAttemptId() };
+
+        await expect(handlers.get('writeFile')?.(request)).resolves.toEqual({ success: true, hash: sha('fresh') });
+        await expect(handlers.get('writeFile')?.(request)).resolves.toEqual({ success: true, hash: sha('fresh'), replayed: true });
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('second'), expectedHash: null, attemptId: nextAttemptId(),
+        })).resolves.toMatchObject({ success: false, errorCode: 'FILE_EXISTS' });
+        await expect(readFile(path, 'utf8')).resolves.toBe('fresh');
+    });
+
+    it('answers FILE_EXISTS when a named create finds a directory at the path', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'taken');
+        await mkdir(path);
+
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('x'), expectedHash: null, attemptId: nextAttemptId(),
+        })).resolves.toMatchObject({ success: false, errorCode: 'FILE_EXISTS' });
+    });
+
+    it('keeps the legacy answer for a write without an attempt id', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'mine');
+
+        // Same bytes, but without an attempt the hash gate is all there is.
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('mine'), expectedHash: sha('opened'),
+        })).resolves.toMatchObject({ success: false, errorCode: 'HASH_MISMATCH', error: expect.stringContaining('File hash mismatch') });
+        await expect(handlers.get('writeFile')?.({
+            path: join(workingDirectory, 'gone.md'), content: b64('x'), expectedHash: sha('opened'),
+        })).resolves.toMatchObject({ success: false, errorCode: 'FILE_MISSING' });
+    });
+
+    it('lets only one of two overlapping writes from the same opened version through', async () => {
+        // Two clients opened the same version; the gate and the write must not interleave.
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'notes.md');
+        await writeFile(path, 'opened');
+
+        const answers = await Promise.all(['first', 'second'].map((text) => handlers.get('writeFile')?.({
+            path, content: b64(text), expectedHash: sha('opened'), attemptId: nextAttemptId(),
+        })));
+        expect(answers.filter((answer) => answer?.success)).toHaveLength(1);
+        expect(answers.filter((answer) => answer?.errorCode === 'HASH_MISMATCH')).toHaveLength(1);
+        await expect(readFile(path, 'utf8')).resolves.toBe(answers[0]?.success ? 'first' : 'second');
+    });
+
+    it('rejects a malformed attempt id before writing', async () => {
+        const { handlers, workingDirectory } = await createHandlers();
+        const path = join(workingDirectory, 'new.md');
+
+        await expect(handlers.get('writeFile')?.({
+            path, content: b64('x'), expectedHash: null, attemptId: 'bad id/with spaces',
+        })).resolves.toMatchObject({ success: false, errorCode: 'INVALID_ATTEMPT_ID' });
+        await expect(readdir(workingDirectory)).resolves.toEqual([]);
+    });
+});
+
 describe('project-scoped file RPCs', () => {
     it('reads project files and returns structured absence without using legacy handlers', async () => {
         const { handlers, workingDirectory } = await createHandlers();

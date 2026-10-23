@@ -16,6 +16,7 @@ import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { validatePath } from './pathSecurity';
 import { isStrictlyGuardedPath } from './happyHomeGuard';
 import { ensureDirectory } from './ensureDirectory';
+import { createWriteFileAttemptStore, isValidWriteFileAttemptId } from './writeFileAttempts';
 import { createIgnoreMatcher } from './ignorePresets';
 import {
     createGitignoreContext,
@@ -39,6 +40,7 @@ import {
 } from './machineRunProfile';
 import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
 import { sanitizeChildEnv, type ChildEnvBoundary } from '@/utils/childEnv';
+import type { ClaudeOutputFormat } from '@/claude/structuredOutput';
 
 const execAsync = promisify(exec);
 const READ_FILE_CHUNK_MAX_BYTES = 3 * 1024 * 1024;
@@ -97,12 +99,84 @@ interface WriteFileRequest {
     path: string;
     content: string; // base64 encoded
     expectedHash?: string | null; // null for new files, hash for existing files
+    /** Names this write so a resend is answered, not repeated. Sent only to daemons advertising `writeFileAttempt`. */
+    attemptId?: string;
 }
+
+type WriteFileErrorCode = 'HASH_MISMATCH' | 'FILE_MISSING' | 'FILE_EXISTS' | 'ATTEMPT_CONFLICT' | 'INVALID_ATTEMPT_ID';
 
 interface WriteFileResponse {
     success: boolean;
     hash?: string; // hash of written file
+    /** The answer was not a new write: the attempt was already done, or the file already held these bytes. */
+    replayed?: true;
     error?: string;
+    errorCode?: WriteFileErrorCode;
+}
+
+// One per process: `${machineId}:writeFile` and session-scoped registrations share retries' records.
+const writeFileAttempts = createWriteFileAttemptStore<WriteFileResponse>();
+
+// The hash gate reads, compares and writes; two writes to one path must not interleave, or both
+// pass a check against the same opened version and the second overwrites the first.
+const writeFileLocks = new Map<string, Promise<unknown>>();
+
+function withPathLock<T>(path: string, task: () => Promise<T>): Promise<T> {
+    const previous = writeFileLocks.get(path) ?? Promise.resolve();
+    const run = previous.then(task, task);
+    const tail = run.catch(() => undefined);
+    writeFileLocks.set(path, tail);
+    void tail.then(() => { if (writeFileLocks.get(path) === tail) writeFileLocks.delete(path); });
+    return run;
+}
+
+function sha256Hex(buffer: Buffer): string {
+    return createHash('sha256').update(buffer).digest('hex');
+}
+
+/**
+ * The hash gate. With `acceptSameBytes` (an attempt whose record is gone, e.g. after a restart),
+ * a file that already holds exactly the requested bytes counts as done instead of a conflict:
+ * nothing would be overwritten, and the alternative reports a save that went through as failed.
+ */
+async function writeFileWithHashGate(path: string, buffer: Buffer, contentHash: string, expectedHash: string | null, acceptSameBytes: boolean): Promise<WriteFileResponse> {
+    if (expectedHash !== null) {
+        let existingHash: string;
+        try {
+            existingHash = sha256Hex(await readFile(path));
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            return { success: false, errorCode: 'FILE_MISSING', error: 'File does not exist but hash was provided' };
+        }
+        if (existingHash !== expectedHash) {
+            if (acceptSameBytes && existingHash === contentHash) return { success: true, hash: contentHash, replayed: true };
+            return { success: false, errorCode: 'HASH_MISMATCH', error: `File hash mismatch. Expected: ${expectedHash}, Actual: ${existingHash}` };
+        }
+    } else {
+        let existing: Awaited<ReturnType<typeof stat>>;
+        try {
+            existing = await stat(path);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            return writeAndHash(path, buffer, contentHash);
+        }
+        // Only a regular file of the same size can already hold these bytes; anything else is just taken.
+        if (acceptSameBytes && existing.isFile() && existing.size === buffer.length && sha256Hex(await readFile(path)) === contentHash) {
+            return { success: true, hash: contentHash, replayed: true };
+        }
+        return { success: false, errorCode: 'FILE_EXISTS', error: 'File already exists but was expected to be new' };
+    }
+    return writeAndHash(path, buffer, contentHash);
+}
+
+async function writeAndHash(path: string, buffer: Buffer, contentHash: string): Promise<WriteFileResponse> {
+    // Auto-create the parent directory so the first writeFile to a freshly-bound project
+    // doesn't fail with ENOENT (specs/project-workspace-auto-create/ Phase 2).
+    // mkdir({ recursive: true }) is idempotent and stays inside the validated path,
+    // so traversal defense is unaffected.
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, buffer);
+    return { success: true, hash: contentHash };
 }
 
 interface ListDirectoryRequest {
@@ -346,6 +420,8 @@ export interface SpawnSessionOptions {
      * would have used", which is the behaviour that predates the choice.
      */
     aiAuthSelection?: AiAuthSelection;
+    /** Session-scoped Claude structured output, validated at the RPC boundary (specs/claude-cli-benchmark-followups R2). */
+    outputFormat?: ClaudeOutputFormat;
 }
 
 export type SpawnSessionResult =
@@ -365,9 +441,21 @@ export type SpawnSessionResult =
         };
     }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; errorMessage: string };
+    | {
+        type: 'error';
+        errorMessage: string;
+        /**
+         * Machine-readable refusal. `daemon-restarting` (aplus codexcli-daemon-restart-drain R1·R6):
+         * refused before anything ran, retryable once the daemon is back — `deadlineAt` (epoch ms)
+         * is when the drain ends at the latest.
+         */
+        code?: string;
+        deadlineAt?: number;
+    };
 
 export type ResumeSessionErrorCode =
+    /** aplus codexcli-daemon-restart-drain R1 — refused before anything ran; retry after the restart. */
+    | 'daemon-restarting'
     | 'SESSION_LIVE'
     | 'SESSION_NOT_TRACKED'
     | 'SESSION_METADATA_MISSING'
@@ -385,7 +473,13 @@ export type ResumeSessionErrorCode =
 export type ResumeSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; code: ResumeSessionErrorCode; errorMessage: string };
+    | {
+        type: 'error';
+        code: ResumeSessionErrorCode;
+        errorMessage: string;
+        /** With `daemon-restarting`: when the drain ends at the latest (epoch ms). */
+        deadlineAt?: number;
+    };
 
 export type RecoverSessionOptions = {
     initialPrompt: string;
@@ -683,61 +777,23 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             return { success: false, error: validation.error };
         }
 
+        if (data.attemptId !== undefined && !isValidWriteFileAttemptId(data.attemptId)) {
+            return { success: false, errorCode: 'INVALID_ATTEMPT_ID', error: 'attemptId must be 8-128 letters, digits, "-" or "_"' };
+        }
         try {
-            // If expectedHash is provided (not null), verify existing file
-            if (data.expectedHash !== null && data.expectedHash !== undefined) {
-                try {
-                    const existingBuffer = await readFile(validation.resolvedPath!);
-                    const existingHash = createHash('sha256').update(existingBuffer).digest('hex');
-
-                    if (existingHash !== data.expectedHash) {
-                        return {
-                            success: false,
-                            error: `File hash mismatch. Expected: ${data.expectedHash}, Actual: ${existingHash}`
-                        };
-                    }
-                } catch (error) {
-                    const nodeError = error as NodeJS.ErrnoException;
-                    if (nodeError.code !== 'ENOENT') {
-                        throw error;
-                    }
-                    // File doesn't exist but hash was provided
-                    return {
-                        success: false,
-                        error: 'File does not exist but hash was provided'
-                    };
-                }
-            } else {
-                // expectedHash is null - expecting new file
-                try {
-                    await stat(validation.resolvedPath!);
-                    // File exists but we expected it to be new
-                    return {
-                        success: false,
-                        error: 'File already exists but was expected to be new'
-                    };
-                } catch (error) {
-                    const nodeError = error as NodeJS.ErrnoException;
-                    if (nodeError.code !== 'ENOENT') {
-                        throw error;
-                    }
-                    // File doesn't exist - this is expected
-                }
-            }
-
-            // Write the file. Auto-create the parent directory so the
-            // first writeFile to a freshly-bound project doesn't fail
-            // with ENOENT (specs/project-workspace-auto-create/ Phase 2).
-            // mkdir({ recursive: true }) is idempotent and stays inside
-            // the validated path, so traversal defense is unaffected.
+            const path = validation.resolvedPath!;
             const buffer = Buffer.from(data.content, 'base64');
-            await mkdir(dirname(validation.resolvedPath!), { recursive: true });
-            await writeFile(validation.resolvedPath!, buffer);
+            const contentHash = sha256Hex(buffer);
+            const expectedHash = data.expectedHash ?? null;
+            if (data.attemptId === undefined) return await withPathLock(path, () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, false));
 
-            // Calculate and return hash of written file
-            const hash = createHash('sha256').update(buffer).digest('hex');
-
-            return { success: true, hash };
+            const attempt = writeFileAttempts.run(data.attemptId, { path, expectedHash, contentHash },
+                () => withPathLock(path, () => writeFileWithHashGate(path, buffer, contentHash, expectedHash, true)));
+            if (attempt.kind === 'conflict') {
+                return { success: false, errorCode: 'ATTEMPT_CONFLICT', error: 'attemptId was already used for a different write' };
+            }
+            const result = await attempt.result;
+            return attempt.kind === 'replay' && result.success ? { ...result, replayed: true } : result;
         } catch (error) {
             logger.debug('Failed to write file:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to write file' };

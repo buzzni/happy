@@ -1,6 +1,7 @@
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
 /** Happy MCP registration, tool routing and session-specific guidance contracts. */
 import { runBashStream } from './bashStream';
+import { StreamCapture } from './bashStreamOutput';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -274,7 +275,9 @@ describe('Happy MCP shutdown admission', () => {
             canFreezeInbound: () => true, freezeInbound: () => true, stopLoop: () => {} });
         let release!: () => void;
         vi.mocked(runBashStream).mockImplementationOnce(() => new Promise(resolve => {
-            release = () => resolve({ exitCode: 0, stdout: 'last output', stderr: '' });
+            release = () => resolve({ exitCode: 0, stdout: 'last output', stderr: '', captures: {
+                stdout: StreamCapture.fromText('stdout', 'last output'), stderr: StreamCapture.fromText('stderr', ''),
+            } });
         }));
         const server = await startHappyServer(makeFakeClient(false), { admitTool: work => gate.admit(work, 'writer') });
         let running: Promise<any> | undefined;
