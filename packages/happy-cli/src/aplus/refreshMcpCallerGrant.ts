@@ -11,7 +11,9 @@
  */
 
 import { logger } from '@/ui/logger'
+import { createSerialLock, credentialFingerprint, recoverCredential, RefreshFailure } from '@/utils/refreshRecovery'
 
+/** 턴 시작을 오래 붙잡지 않도록 갱신 상한(45초, C-R2)보다 짧게 둔다. */
 const TIMEOUT_MS = 3000
 /** 이 시간 안에 만료될 grant 는 미리 교환한다. 턴 경계마다 확인하므로 넉넉히 둔다. */
 export const REFRESH_THRESHOLD_MS = 2 * 60 * 60 * 1000
@@ -59,6 +61,41 @@ function resolveRefreshUrl(configUrl: string): string | null {
 }
 
 /**
+ * 교환 거절 중 grant 자체가 더는 교환될 수 없다는 뜻인 것: 만료됐거나 체인 상한(7일)에
+ * 닿았거나 서명이 틀렸다. 같은 grant 로는 다시 시도해도 낫지 않는다. 그 밖의 거절(세션
+ * 매핑·권한 조회 등)은 나중에 다시 시도한다.
+ */
+const NOT_RENEWABLE_ERRORS = new Set(['Caller grant is not renewable', 'caller_grant_not_renewable', 'invalid_caller_grant'])
+
+/** 대화를 다시 시작해야 커넥터 권한이 돌아올 때 세션에 남기는 알림. Desktop 이 이 원문으로 번역한다. */
+export const CALLER_GRANT_EXPIRED_NOTICE = 'Connector access for this conversation has expired. Start the conversation again to restore it.'
+
+/** 타이머·턴 경계·도구가 같은 grant 를 동시에 교환하지 않게 프로세스 안에서 하나씩 실행한다. */
+const exchangeLock = createSerialLock()
+let expiredListener: (() => void) | null = null
+
+/**
+ * grant 가 영구히 교환되지 않게 된 순간(지문당 한 번) 부를 함수를 등록한다.
+ *
+ * @returns 등록을 푸는 함수.
+ */
+export function onMcpCallerGrantExpired(listener: () => void): () => void {
+    expiredListener = listener
+    return () => {
+        if (expiredListener === listener) expiredListener = null
+    }
+}
+
+async function readRefusalCode(res: Response): Promise<string | undefined> {
+    try {
+        const body = (await res.json()) as { error?: unknown }
+        return typeof body?.error === 'string' && NOT_RENEWABLE_ERRORS.has(body.error) ? 'invalid_grant' : undefined
+    } catch {
+        return undefined
+    }
+}
+
+/**
  * @returns 교환에 성공해 env 를 갱신했으면 `true`.
  */
 export async function refreshMcpCallerGrantIfExpiring(
@@ -74,49 +111,50 @@ export async function refreshMcpCallerGrantIfExpiring(
     // grant 는 발급 시점 scope 에 묶여 있다. 호출부가 추측하지 않고 실제 설정
     // URL 의 scope 를 그대로 쓴다.
     const projectId = context.projectId ?? readConfigProjectId(configUrl)
-    const sessionAuthority = projectId && context.sessionId
-        ? { machineId, sessionId: context.sessionId, callerGrant: grant } : null
+    const sessionBound = Boolean(projectId && context.sessionId)
     let refreshUrl = resolveRefreshUrl(configUrl)
     if (!refreshUrl) return false
-    if (sessionAuthority) {
+    if (sessionBound) {
         refreshUrl = new URL(`/api/projects/${encodeURIComponent(projectId!)}/lesson-host/refresh`, refreshUrl).toString()
     }
+    const exchangeUrl = refreshUrl
+    const fingerprint = (value: string) => credentialFingerprint('mcp-caller-grant', machineId, value)
 
-    const ctl = new AbortController()
-    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
-    try {
-        const res = await fetch(refreshUrl, {
-            method: 'POST',
-            redirect: 'error',
-            ...(sessionAuthority ? { body: JSON.stringify(sessionAuthority) } : {}),
-            headers: {
-                ...(sessionAuthority ? { 'Content-Type': 'application/json' } : {}),
-                'Authorization': `Bearer ${token}`,
-                'X-Aplus-Machine-Id': machineId,
-                'X-Aplus-Caller-Grant': grant,
-                ...(projectId ? { 'X-Aplus-Project-Id': projectId } : {}),
-            },
-            signal: ctl.signal,
-        })
-        if (!res.ok) {
-            // 교환이 거부돼도 기존 grant 는 아직 유효하다. 그대로 쓴다.
-            logger.debug(`[aplus] caller grant 교환 거부 ${res.status}`)
-            return false
-        }
-        const body = (await res.json()) as { grant?: unknown }
-        if (typeof body?.grant !== 'string' || !body.grant) {
-            logger.debug('[aplus] caller grant 교환 응답이 올바르지 않음')
-            return false
-        }
-        process.env.HAPPY_APLUS_MCP_CALLER_GRANT = body.grant
-        logger.debug('[aplus] caller grant 교환 완료')
-        return true
-    } catch {
-        logger.debug('[aplus] caller grant 교환 실패 — 기존 grant 유지')
-        return false
-    } finally {
-        clearTimeout(timer)
+    const outcome = await recoverCredential<string>({
+        read: async () => process.env.HAPPY_APLUS_MCP_CALLER_GRANT || null,
+        fingerprint,
+        refresh: async (current, signal) => {
+            const res = await fetch(exchangeUrl, {
+                method: 'POST',
+                redirect: 'error',
+                ...(sessionBound ? { body: JSON.stringify({ machineId, sessionId: context.sessionId, callerGrant: current }) } : {}),
+                headers: {
+                    ...(sessionBound ? { 'Content-Type': 'application/json' } : {}),
+                    'Authorization': `Bearer ${token}`,
+                    'X-Aplus-Machine-Id': machineId,
+                    'X-Aplus-Caller-Grant': current,
+                    ...(projectId ? { 'X-Aplus-Project-Id': projectId } : {}),
+                },
+                signal,
+            })
+            if (!res.ok) {
+                // 교환이 거부돼도 기존 grant 는 아직 유효할 수 있다. 그대로 쓴다.
+                throw new RefreshFailure({ status: res.status, code: res.status === 403 ? await readRefusalCode(res) : undefined })
+            }
+            const body = (await res.json()) as { grant?: unknown }
+            if (typeof body?.grant !== 'string' || !body.grant) throw new Error('caller grant 교환 응답이 올바르지 않음')
+            return body.grant
+        },
+        write: async (next) => {
+            process.env.HAPPY_APLUS_MCP_CALLER_GRANT = next
+        },
+    }, fingerprint(grant), { lock: exchangeLock, refreshTimeoutMs: TIMEOUT_MS })
+
+    if (outcome.status === 'failed' && outcome.classification === 'permanent' && !outcome.cached) {
+        logger.debug('[aplus] caller grant 를 더 교환할 수 없음 — 대화를 다시 시작해야 커넥터가 돌아온다')
+        expiredListener?.()
     }
+    return outcome.status === 'refreshed'
 }
 
 /**

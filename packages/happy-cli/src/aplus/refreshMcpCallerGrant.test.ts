@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetPermanentRefreshFailuresForTest } from '@/utils/refreshRecovery';
 import {
+    CALLER_GRANT_EXPIRED_NOTICE,
     grantExpiresWithin,
+    onMcpCallerGrantExpired,
     refreshMcpCallerGrantIfExpiring,
     REFRESH_CHECK_INTERVAL_MS,
     REFRESH_THRESHOLD_MS,
@@ -34,6 +37,7 @@ describe('refreshMcpCallerGrantIfExpiring', () => {
         vi.unstubAllGlobals();
         delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
         delete process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
+        resetPermanentRefreshFailuresForTest();
     });
 
     it('exchanges an expiring grant and updates the child env', async () => {
@@ -170,5 +174,110 @@ describe('startMcpCallerGrantRefreshTimer', () => {
         await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS);
         expect(refresh).toHaveBeenCalledTimes(3);
         stop();
+    });
+});
+
+describe('caller grant renewal across the timer and turn boundaries (D4 C2)', () => {
+    const EXP = 10 * 24 * 60 * 60 * 1000;
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+        // 만료 1시간 전: 2시간 갱신 창 안.
+        vi.setSystemTime(EXP - 60 * 60 * 1000);
+        process.env.HAPPY_APLUS_MCP_CONFIG_URL = 'https://saycode.test/api/me/mcp-config';
+        process.env.HAPPY_APLUS_MCP_CALLER_GRANT = grantWithExp(EXP);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+        delete process.env.HAPPY_APLUS_MCP_CONFIG_URL;
+        delete process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
+        resetPermanentRefreshFailuresForTest();
+    });
+
+    const refresh = () => refreshMcpCallerGrantIfExpiring('happy-token', 'machine-1');
+
+    it('renews from the timer inside the window and sends one POST when a turn boundary overlaps it', async () => {
+        const fetchMock = vi.fn<typeof fetch>(() => new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(new Response(JSON.stringify({ grant: grantWithExp(EXP + 86_400_000) }), { status: 200 })), 1_000);
+        }));
+        vi.stubGlobal('fetch', fetchMock);
+        const stop = startMcpCallerGrantRefreshTimer(refresh);
+
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        // 타이머의 교환이 아직 돌아오지 않은 사이에 턴이 시작된다.
+        const turnBoundary = refresh();
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        await expect(turnBoundary).resolves.toBe(false);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(process.env.HAPPY_APLUS_MCP_CALLER_GRANT).toBe(grantWithExp(EXP + 86_400_000));
+        stop();
+    });
+
+    it('treats the 7-day chain limit as permanent: one notice, then no more POSTs for that grant', async () => {
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(
+            JSON.stringify({ error: 'Caller grant is not renewable' }), { status: 403 },
+        ));
+        vi.stubGlobal('fetch', fetchMock);
+        const notice = vi.fn();
+        const unsubscribe = onMcpCallerGrantExpired(notice);
+        const stop = startMcpCallerGrantRefreshTimer(refresh);
+
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(notice).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(REFRESH_CHECK_INTERVAL_MS * 3);
+        await refresh();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(notice).toHaveBeenCalledTimes(1);
+        stop();
+        unsubscribe();
+    });
+
+    it('reads the lesson-host refusal code as permanent too', async () => {
+        vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => new Response(
+            JSON.stringify({ error: 'caller_grant_not_renewable' }), { status: 403 },
+        )));
+        const notice = vi.fn();
+        const unsubscribe = onMcpCallerGrantExpired(notice);
+        await refresh();
+        expect(notice).toHaveBeenCalledTimes(1);
+        unsubscribe();
+    });
+
+    it('keeps retrying without a notice when the refusal is not about the grant itself', async () => {
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(
+            JSON.stringify({ error: 'lesson_host_session_denied' }), { status: 403 },
+        ));
+        vi.stubGlobal('fetch', fetchMock);
+        const notice = vi.fn();
+        const unsubscribe = onMcpCallerGrantExpired(notice);
+        await refresh();
+        await refresh();
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(notice).not.toHaveBeenCalled();
+        unsubscribe();
+    });
+
+    it('keeps the grant and retries on a server or network failure', async () => {
+        const fetchMock = vi.fn<typeof fetch>()
+            .mockImplementationOnce(async () => new Response('down', { status: 503 }))
+            .mockImplementationOnce(async () => { throw new TypeError('fetch failed'); })
+            .mockImplementation(async () => new Response(JSON.stringify({ grant: 'fresh-grant' }), { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+        const current = process.env.HAPPY_APLUS_MCP_CALLER_GRANT;
+        await expect(refresh()).resolves.toBe(false);
+        await expect(refresh()).resolves.toBe(false);
+        expect(process.env.HAPPY_APLUS_MCP_CALLER_GRANT).toBe(current);
+        await expect(refresh()).resolves.toBe(true);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('names the notice the Desktop translates', () => {
+        expect(CALLER_GRANT_EXPIRED_NOTICE).toBe('Connector access for this conversation has expired. Start the conversation again to restore it.');
     });
 });

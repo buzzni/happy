@@ -63,7 +63,12 @@ import {
     readExpectedConnectors,
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
-import { refreshMcpCallerGrantIfExpiring, startMcpCallerGrantRefreshTimer } from '@/aplus/refreshMcpCallerGrant';
+import {
+    CALLER_GRANT_EXPIRED_NOTICE,
+    onMcpCallerGrantExpired,
+    refreshMcpCallerGrantIfExpiring,
+    startMcpCallerGrantRefreshTimer,
+} from '@/aplus/refreshMcpCallerGrant';
 import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
@@ -1953,6 +1958,10 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         : startMcpCallerGrantRefreshTimer(() => refreshMcpCallerGrantIfExpiring(accountToken, grantMachineId, {
             sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined,
         }));
+    // 체인 상한(7일) 등으로 더는 교환할 수 없게 되면 한 번 알린다. 대화를 다시 시작하면 새 grant 를 받는다.
+    const stopCallerGrantExpiryNotice = onMcpCallerGrantExpired(() => {
+        session.sendSessionEvent({ type: 'message', message: CALLER_GRANT_EXPIRED_NOTICE });
+    });
 
     // Create claude loop
     /*
@@ -2091,6 +2100,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     });
     } finally {
         stopCallerGrantRefresh();
+        stopCallerGrantExpiryNotice();
         await scopeProcessSandbox?.close();
         process.removeListener('SIGTERM', closeLessonsOnSignal);
         process.removeListener('SIGINT', closeLessonsOnSignal);

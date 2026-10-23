@@ -56,7 +56,12 @@ import { join } from 'node:path';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
-import { refreshMcpCallerGrantIfExpiring, startMcpCallerGrantRefreshTimer } from '@/aplus/refreshMcpCallerGrant';
+import {
+    CALLER_GRANT_EXPIRED_NOTICE,
+    onMcpCallerGrantExpired,
+    refreshMcpCallerGrantIfExpiring,
+    startMcpCallerGrantRefreshTimer,
+} from '@/aplus/refreshMcpCallerGrant';
 import {
     fetchAplusMcpConfigSnapshot,
     fetchAplusMcpServersResult,
@@ -2009,6 +2014,10 @@ export async function runCodex(opts: {
         : startMcpCallerGrantRefreshTimer(() => refreshMcpCallerGrantIfExpiring(accountToken, grantMachineId, {
             sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined,
         }));
+    // 체인 상한(7일) 등으로 더는 교환할 수 없게 되면 한 번 알린다. 대화를 다시 시작하면 새 grant 를 받는다.
+    const stopCallerGrantExpiryNotice = onMcpCallerGrantExpired(() => {
+        session.sendSessionEvent({ type: 'message', message: CALLER_GRANT_EXPIRED_NOTICE });
+    });
     const mcpConfigSynchronizer = new CodexMcpConfigSynchronizer({
         baseServers: baseMcpServers,
         initialAplusServers: initialAplusMcpServers,
@@ -2897,6 +2906,7 @@ export async function runCodex(opts: {
         } finally {
             clearInterval(keepAliveInterval);
             stopCallerGrantRefresh();
+            stopCallerGrantExpiryNotice();
             if (!loopExitRecorded) runtimeGate?.loopExited();
         }
     }
