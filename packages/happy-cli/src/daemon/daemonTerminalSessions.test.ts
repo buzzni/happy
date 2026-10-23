@@ -157,6 +157,21 @@ describe('daemonTerminalSessions', () => {
         expect(exited).toBe(false)
     })
 
+    // specs/codexcli-daemon-stream-durability B2a — the relay socket dropping
+    // ends relay terminals only; a direct terminal rides its own WebSocket.
+    it('killAll limited to a route leaves the other route\'s terminals running', async () => {
+        const relay = spawn()
+        const direct = spawn()
+        addDaemonTerminalSession('relay-1', relay, { userId: 'u', idleTimeoutMs: 0 })
+        addDaemonTerminalSession('direct-1', direct, { userId: 'u', idleTimeoutMs: 0, route: 'direct' })
+
+        expect(killAllDaemonTerminalSessions('relay')).toBe(1)
+        expect(getDaemonTerminalSession('relay-1')).toBeNull()
+        expect(getDaemonTerminalSession('direct-1')?.route).toBe('direct')
+        expect(direct.isAlive()).toBe(true)
+        await direct.terminate()
+    })
+
     it('killAll signals every session, clears timers, and empties the map', async () => {
         const a = spawn()
         const b = spawn()
