@@ -221,7 +221,7 @@ import {
     recordTerminalActivity,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
-import { planTerminalResume } from '@/daemon/terminalResumeReply';
+import { replyToTerminalResume } from '@/daemon/terminalResumeReply';
 import type { ChildProcess } from 'node:child_process';
 import type { BrowserCdpPipe } from '@/daemon/browserCdpPipe';
 import { shouldReconnect } from '@/utils/lidState';
@@ -4028,31 +4028,22 @@ export class ApiMachineClient {
             if (entry) recordTerminalActivity(sessionId);
             // Codex CLI benchmark D4 B-R2: an unknown or ended terminal is answered
             // too (terminalResumeReply.ts) — silence left the client waiting forever.
-            const reply = planTerminalResume(entry, afterSeq);
+            let outcome: string;
             try {
-                for (const out of reply.events) {
-                    if (out.event === 'terminal-frame') {
-                        const data = encodeBase64(encrypt(machineKey, machineVariant, out.chunk));
-                        this.socket.emit('terminal-frame', { sessionId, seq: out.seq, data });
-                    } else if (out.event === 'terminal-snapshot') {
-                        const data = encodeBase64(encrypt(machineKey, machineVariant, out.chunk));
-                        this.socket.emit('terminal-snapshot', { sessionId, seq: out.seq, data });
-                    } else if (out.event === 'terminal-frame-gap') {
-                        this.socket.emit('terminal-frame-gap', { sessionId, fromSeq: out.fromSeq });
-                    } else if ('reason' in out) {
-                        this.socket.emit('terminal-closed', { sessionId, reason: out.reason });
-                    } else {
-                        this.socket.emit('terminal-closed', { sessionId, code: out.code, signal: out.signal });
-                    }
-                }
+                outcome = replyToTerminalResume({
+                    sessionId,
+                    output: entry?.output ?? null,
+                    exit: entry?.exit,
+                    afterSeq,
+                    seal: (chunk) => encodeBase64(encrypt(machineKey, machineVariant, chunk)),
+                    emit: (event, payload) => this.socket.emit(event, payload as any),
+                });
             } catch (e) {
                 logger.debug(`[API MACHINE] terminal-resume-fwd reply failed: ${(e as Error).message}`);
                 return;
             }
-            const frames = reply.events.filter((out) => out.event === 'terminal-frame').length;
             logger.debug(
-                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${typeof afterSeq === 'number' ? afterSeq : '-'} answer=${reply.kind}`
-                + (reply.kind === 'replay' ? ` frames=${frames}` : '')
+                `[REMOTE-TERMINAL] resume session=${sessionId} afterSeq=${typeof afterSeq === 'number' ? afterSeq : '-'} answer=${outcome}`
                 + (entry?.exit ? ' exited=true' : ''),
             );
         });
