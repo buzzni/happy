@@ -450,8 +450,9 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                     // the only thing that means nobody came back.
                     if (!current || current.clientSocketId !== socket.id) return;
                     if (current.closedAt !== undefined) {
-                        // The shell already ended; there is nothing to tell the daemon to close.
-                        await removeTerminalSession(current.id);
+                        // The shell already ended; there is nothing to tell the daemon to
+                        // close. The record runs out on its own TTL, counted from the end —
+                        // removing it here would cut a late exit's retain window short.
                         return;
                     }
                     try {

@@ -667,6 +667,35 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
         }
     });
 
+    /*
+     * Cross review #3: the reattach window counts from the client leaving, the
+     * retain window from the shell ending. A shell that ends late in the first
+     * must not lose its exit code to it — the closed record runs out on its TTL.
+     */
+    it('keeps a terminal that ended late in the reattach window for its own retain window', async () => {
+        vi.useFakeTimers();
+        try {
+            const { daemon, client, sessionId } = await openAcrossReplicas();
+            await client.trigger('disconnect');
+            await vi.advanceTimersByTimeAsync(25_000);
+            await daemon.trigger('terminal-closed', { sessionId, code: 3, signal: null });
+            await vi.advanceTimersByTimeAsync(10_000);
+
+            roomEmits.length = 0;
+            const replicaC = await loadReplica();
+            const back = new FakeSocket('client-2');
+            replicaC.relay.terminalRelayHandler('u1', back as any);
+            await back.trigger('terminal-resume', { sessionId, afterSeq: 4 });
+
+            expect(back.ownEmits).toEqual([]);
+            expect(roomEmits).toEqual([
+                { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 4 } },
+            ]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('relays the daemon\'s re-sent exit after a replay to the returning client', async () => {
         const { daemon, client, sessionId } = await openAcrossReplicas();
         await client.trigger('disconnect');
