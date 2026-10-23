@@ -726,9 +726,11 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
         ]);
     });
 
-    it('answers unknown-session once the record is gone, even on a replica that still caches it', async () => {
-        const { replicaB, client, sessionId } = await openAcrossReplicas();
-        // Replica B cached the record at open; another replica then drops it.
+    it('answers unknown-session once a closed record expired, even on a replica that still caches it', async () => {
+        const { replicaB, daemon, client, sessionId } = await openAcrossReplicas();
+        await daemon.trigger('terminal-closed', { sessionId, code: 0, signal: null });
+        await replicaB.store.getTerminalSessionFresh(sessionId);
+        // The store's 30-second TTL ran out; nothing told the peers.
         await redis.del(`terminal:session:${sessionId}`);
         roomEmits.length = 0;
 
@@ -739,6 +741,73 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
             { event: 'terminal-closed', payload: { sessionId, reason: 'unknown-session' } },
         ]);
         expect(await replicaB.store.getTerminalSession(sessionId)).toBeNull();
+    });
+
+    it('a record removed on another replica is unknown here too', async () => {
+        const { replicaA, client, sessionId } = await openAcrossReplicas();
+        await replicaA.store.removeTerminalSession(sessionId);
+
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+
+        expect(client.ownEmits).toEqual([
+            { event: 'terminal-closed', payload: { sessionId, reason: 'unknown-session' } },
+        ]);
+    });
+
+    it('does not end a live terminal the store never recorded, when this replica still has it', async () => {
+        const { client, sessionId } = await openAcrossReplicas();
+        // The write at open was tolerated as a failure, so only this replica's cache knows it.
+        await redis.del(`terminal:session:${sessionId}`);
+
+        await client.trigger('terminal-resume', { sessionId, afterSeq: 3 });
+
+        expect(client.ownEmits).toEqual([]);
+        expect(roomEmits).toEqual([
+            { room: 'daemon-1', event: 'terminal-resume-fwd', payload: { sessionId, afterSeq: 3 } },
+        ]);
+    });
+
+    it('stays silent instead of answering unknown when the store cannot be read', async () => {
+        const { sessionId } = await openAcrossReplicas();
+        const replicaC = await loadReplica();
+        redis.get = async () => { throw new Error('ETIMEDOUT'); };
+        const back = new FakeSocket('client-2');
+        replicaC.relay.terminalRelayHandler('u1', back as any);
+
+        await back.trigger('terminal-resume', { sessionId, afterSeq: 0 });
+
+        expect(back.ownEmits).toEqual([]);
+        expect(roomEmits).toEqual([]);
+    });
+
+    it('forgets a closed record cached on a peer replica when its TTL runs out', async () => {
+        vi.useFakeTimers();
+        try {
+            const { replicaB, daemon, sessionId } = await openAcrossReplicas();
+            await daemon.trigger('terminal-closed', { sessionId, code: 0, signal: null });
+            const replicaC = await loadReplica();
+            expect((await replicaC.store.getTerminalSessionFresh(sessionId))?.closedAt).toEqual(expect.any(Number));
+            await redis.del(`terminal:session:${sessionId}`);
+
+            await vi.advanceTimersByTimeAsync(30_001);
+
+            expect(await replicaC.store.getTerminalSession(sessionId)).toBeNull();
+            expect(await replicaB.store.getTerminalSession(sessionId)).toBeNull();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('answers with the kept exit when the daemon no longer has a terminal the relay saw end', async () => {
+        const { daemon, sessionId } = await openAcrossReplicas();
+        await daemon.trigger('terminal-closed', { sessionId, code: 2, signal: null });
+        roomEmits.length = 0;
+
+        await daemon.trigger('terminal-closed', { sessionId, reason: 'unknown-session' });
+
+        expect(roomEmits).toEqual([
+            { room: 'client-1', event: 'terminal-closed', payload: { sessionId, code: 2, signal: null } },
+        ]);
     });
 
     it('carries the daemon\'s unknown-session answer to the client and forgets the record', async () => {

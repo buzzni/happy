@@ -113,14 +113,22 @@ function terminalSideOf(session: TerminalSession, socket: Socket, userId: string
  * current socket when the id has moved. Returns null when the socket has no
  * business with this session.
  */
+type ResolvedTerminalSide = { session: TerminalSession; side: 'client' | 'daemon' };
+
+async function resolveTerminalSide(sessionId: unknown, socket: Socket, userId: string): Promise<ResolvedTerminalSide | null>;
+/** `fresh` reads the shared store first; `undetermined` when it could not be read and nothing is cached. */
+async function resolveTerminalSide(
+    sessionId: unknown, socket: Socket, userId: string, opts: { fresh: true },
+): Promise<ResolvedTerminalSide | null | 'undetermined'>;
 async function resolveTerminalSide(
     sessionId: unknown,
     socket: Socket,
     userId: string,
     opts: { fresh?: boolean } = {},
-): Promise<{ session: TerminalSession; side: 'client' | 'daemon' } | null> {
+): Promise<ResolvedTerminalSide | null | 'undetermined'> {
     const id = typeof sessionId === 'string' ? sessionId : null;
     const found = opts.fresh ? await getTerminalSessionFresh(id) : await getTerminalSession(id);
+    if (found === undefined) return 'undetermined';
     if (!found) return null;
     const side = terminalSideOf(found, socket, userId);
     if (!side) return null;
@@ -274,6 +282,8 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         if (typeof sessionId !== 'string' || sessionId.length === 0) return;
         // Fresh: whether the terminal ended or is gone may have been decided on another replica.
         const resolved = await resolveTerminalSide(sessionId, socket, userId, { fresh: true });
+        // The store could not be read: stay silent, as before, so a later resume can still succeed.
+        if (resolved === 'undetermined') return;
         if (!resolved) {
             /*
              * Codex CLI benchmark D4 B-R2 — answer instead of leaving the client
@@ -355,7 +365,10 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
         cancelReattachTimer(session.id);
         if (data?.reason === 'unknown-session') {
             // The daemon's answer to a resume: it no longer has this terminal, so neither do we.
-            emitToSocket(session.clientSocketId, 'terminal-closed', { sessionId: session.id, reason: 'unknown-session' });
+            // Its retain window can end a moment before our closed TTL; the exit we kept is still true.
+            emitToSocket(session.clientSocketId, 'terminal-closed', session.closedAt !== undefined && session.exit
+                ? { sessionId: session.id, code: session.exit.code, signal: session.exit.signal }
+                : { sessionId: session.id, reason: 'unknown-session' });
             await removeTerminalSession(session.id);
             log({ module: 'terminal-relay' }, `[REMOTE-TERMINAL] close session=${session.id} (unknown to daemon)`);
             return;

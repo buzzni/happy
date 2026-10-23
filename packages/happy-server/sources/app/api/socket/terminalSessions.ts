@@ -120,7 +120,9 @@ export function forgetCachedTerminalSession(id: string): void {
 }
 
 function tellPeers(id: string): void {
-    if (!notifyPeers) return;
+    // Without a shared store there is one replica and no peer to tell (the
+    // in-memory adapter's serverSideEmit would only print a warning).
+    if (!notifyPeers || !backend) return;
     try {
         notifyPeers(id);
     } catch (error) {
@@ -204,7 +206,7 @@ export async function getTerminalSession(id: string | undefined | null): Promise
     if (!raw) return null;
     try {
         const session = JSON.parse(raw) as TerminalSession;
-        cache.set(session.id, session);
+        cacheSession(session);
         return session;
     } catch {
         return null;
@@ -214,23 +216,32 @@ export async function getTerminalSession(id: string | undefined | null): Promise
 /**
  * Like getTerminalSession, but asks the shared store first when there is one.
  *
- * The local cache never learns that another replica closed or removed a
- * record, which is fine for per-frame routing (AC6) but not for the questions
- * a resume asks — "has this terminal ended?", "does it still exist?". A store
- * failure falls back to the cache rather than calling a live terminal unknown.
+ * The local cache does not learn when a record's short closed TTL runs out in
+ * the store, and a peer notice can be missed; that is fine for per-frame
+ * routing (AC6) but not for the questions a resume asks — "has this terminal
+ * ended?", "does it still exist?".
+ *
+ * `undefined` means nobody can tell: the store could not be read and this
+ * replica holds no copy. Callers must not turn that into "unknown".
  */
-export async function getTerminalSessionFresh(id: string | undefined | null): Promise<TerminalSession | null> {
+export async function getTerminalSessionFresh(id: string | undefined | null): Promise<TerminalSession | null | undefined> {
     if (!id) return null;
-    if (!backend) return cache.get(id) ?? null;
+    const cached = cache.get(id) ?? null;
+    if (!backend) return cached;
     const raw = await tolerate<string | null | undefined>('get', () => backend!.get(sessionKey(id)), undefined);
-    if (raw === undefined) return cache.get(id) ?? null;
+    if (raw === undefined) return cached ?? undefined;
     if (raw === null) {
+        // Gone from the store. A closed copy here has simply expired. A live
+        // copy may be one the store never got (its write at open was
+        // tolerated as a failure) — keep it rather than end a working terminal
+        // on that evidence; a removal elsewhere reaches this cache as a peer notice.
+        if (cached && cached.closedAt === undefined) return cached;
         cache.delete(id);
         return null;
     }
     try {
         const session = JSON.parse(raw) as TerminalSession;
-        cache.set(session.id, session);
+        cacheSession(session);
         return session;
     } catch {
         return null;
@@ -239,17 +250,23 @@ export async function getTerminalSessionFresh(id: string | undefined | null): Pr
 
 const closedCacheTimers = new Map<string, NodeJS.Timeout>();
 
-async function writeClosedSession(next: TerminalSession, what: string): Promise<void> {
-    cache.set(next.id, next);
-    // Without a shared store the cache *is* the registry, so it needs its own expiry.
-    const existing = closedCacheTimers.get(next.id);
+/** Caches a record; a closed one also gets a local expiry matching its store TTL. */
+function cacheSession(session: TerminalSession): void {
+    cache.set(session.id, session);
+    if (session.closedAt === undefined) return;
+    const existing = closedCacheTimers.get(session.id);
     if (existing) clearTimeout(existing);
     const timer = setTimeout(() => {
-        closedCacheTimers.delete(next.id);
-        if (cache.get(next.id)?.closedAt !== undefined) cache.delete(next.id);
-    }, ttlSecondsFor(next) * 1000);
+        closedCacheTimers.delete(session.id);
+        if (cache.get(session.id)?.closedAt !== undefined) cache.delete(session.id);
+    }, ttlSecondsFor(session) * 1000);
     timer.unref?.();
-    closedCacheTimers.set(next.id, timer);
+    closedCacheTimers.set(session.id, timer);
+}
+
+async function writeClosedSession(next: TerminalSession, what: string): Promise<void> {
+    // Without a shared store the cache *is* the registry, so its expiry matters there too.
+    cacheSession(next);
     await tolerate(what, async () => {
         await backend!.set(sessionKey(next.id), JSON.stringify(next), 'EX', ttlSecondsFor(next));
         // An ended terminal no longer counts toward the per-user cap.

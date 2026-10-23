@@ -1,11 +1,13 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     addTerminalSession,
     countActiveSessionsForUser,
     findTerminalSessionsBySocketId,
     getTerminalSession,
     removeTerminalSession,
+    registerTerminalSessionClusterListeners,
     setTerminalSessionBackend,
+    setTerminalSessionPeerNotifier,
     _resetTerminalSessionsForTest,
 } from './terminalSessions';
 
@@ -64,6 +66,18 @@ describe('terminal session store — no Redis configured (single replica)', () =
     beforeEach(() => {
         setTerminalSessionBackend(null);
         _resetTerminalSessionsForTest();
+    });
+
+    it('shouldNotAskPeersToInvalidateWhenThereIsNoSharedStore', async () => {
+        const serverSideEmit = vi.fn();
+        registerTerminalSessionClusterListeners({ on: () => {}, serverSideEmit });
+        try {
+            await addTerminalSession(session());
+            await removeTerminalSession('s1');
+            expect(serverSideEmit).not.toHaveBeenCalled();
+        } finally {
+            setTerminalSessionPeerNotifier(null);
+        }
     });
 
     it('shouldStillRoundTripThroughTheLocalMap', async () => {
