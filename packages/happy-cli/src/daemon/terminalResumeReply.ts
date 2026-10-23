@@ -61,9 +61,15 @@ function holdExit(output: TerminalOutputBuffer, sendClosed: () => void, staleMs:
     heldExits.set(output, timer)
 }
 
-/** A new connection took the terminal over: whatever paged replay was in flight went to the old one. */
+/**
+ * A new connection took the terminal over: whatever paged replay was in flight
+ * went to the old one, and an exit held behind it is now for the new
+ * connection's own resume to carry — sent on its own, it could arrive before
+ * that replay and cut it short.
+ */
 export function resetPagedResume(output: TerminalOutputBuffer): void {
     pagedCursors.delete(output)
+    releaseHeldExit(output)
 }
 
 /**

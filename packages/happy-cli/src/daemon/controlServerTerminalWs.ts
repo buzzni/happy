@@ -49,6 +49,7 @@ import { decideTerminalCwd, formatCwdFallbackBanner } from './decideTerminalCwd'
 import { createPtySession, type PtySession } from './remoteTerminal';
 import {
   addDaemonTerminalSession,
+  markDaemonTerminalSessionExited,
   recordBytesIn,
   recordBytesOut,
   recordTerminalActivity,
@@ -56,7 +57,7 @@ import {
   type DaemonTerminalEntry,
 } from './daemonTerminalSessions';
 import { createTerminalOutputCoalescer } from './terminalOutputCoalescer';
-import { PAGED_RESUME_STALE_MS, pagedReplayInFlight, replyToTerminalResume, resetPagedResume } from './terminalResumeReply';
+import { replyToTerminalResume, resetPagedResume, sendExitAfterReplay } from './terminalResumeReply';
 
 export interface TerminalWsRoute {
   wss: WebSocketServer;
@@ -81,7 +82,8 @@ export interface MachineEncryption {
 export const DIRECT_TERMINAL_DETACH_GRACE_MS = 30_000;
 
 /**
- * Open direct terminals per user, detached ones included. Same ceiling the
+ * Open direct terminals per user, detached ones included — not ones that
+ * ended or that the user closed, which only wait to report their exit. Same ceiling the
  * relay enforces (happy-server terminalSessions.ts `MAX_TERMINALS_PER_USER`)
  * and the same error text, so the desktop's capacity handling treats both
  * paths alike — and a refused direct open still falls back to the relay.
@@ -115,7 +117,13 @@ interface DirectTerminal {
   readonly userId: string;
   ws: WebSocket | null;
   graceTimer: ReturnType<typeof setTimeout> | null;
-  exit: { code: number; signal: number | null } | null;
+  /** The user closed it: nobody re-attaches to it, so it waits out no grace window. */
+  closing: boolean;
+}
+
+/** The registry entry holds the exit, as on the relay path (D4 B-R2). */
+function exitOf(terminal: DirectTerminal) {
+  return terminal.entry.exit;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -175,7 +183,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
   /** Tells the attached client the PTY ended, and drops the terminal. */
   const sendClosed = (terminal: DirectTerminal) => {
-    const exit = terminal.exit;
+    const exit = exitOf(terminal);
     if (!exit) return;
     sendOn(terminal.ws, { data: { event: 'terminal-closed', sessionId: terminal.sessionId, code: exit.code, signal: exit.signal } });
     forget(terminal);
@@ -183,33 +191,35 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
   /**
    * An ended PTY's exit goes out after the replay the client is reading, never
-   * in the middle of it — the client stops listening once it hears the
-   * terminal closed, and the pages still to come hold its last output. If the
-   * client stops asking for pages, the exit goes out once the replay goes stale.
+   * in the middle of it — the same rule as the relay path (terminalResumeReply.ts
+   * `sendExitAfterReplay`). A held exit that comes due while the terminal is
+   * detached is left to the grace window: the client that re-attaches resumes
+   * into the output and the exit.
    */
   const sendClosedAfterReplay = (terminal: DirectTerminal) => {
-    if (!pagedReplayInFlight(terminal.entry.output)) {
-      sendClosed(terminal);
-      return;
-    }
-    if (terminal.graceTimer) clearTimeout(terminal.graceTimer);
-    terminal.graceTimer = setTimeout(() => {
-      terminal.graceTimer = null;
-      if (terminals.get(terminal.sessionId) === terminal) sendClosed(terminal);
-    }, PAGED_RESUME_STALE_MS);
-    terminal.graceTimer.unref?.();
+    sendExitAfterReplay({
+      output: terminal.entry.output,
+      sendClosed: () => {
+        if (terminals.get(terminal.sessionId) === terminal && terminal.ws !== null) sendClosed(terminal);
+      },
+    });
   };
 
   /** The WebSocket went away: keep the terminal for the grace window, then end it. */
   const detach = (terminal: DirectTerminal) => {
     terminal.ws = null;
+    if (terminal.closing) {
+      // Closed by the user, its PTY already ending: not a re-attach target.
+      forget(terminal);
+      return;
+    }
     if (terminal.graceTimer) clearTimeout(terminal.graceTimer);
     terminal.graceTimer = setTimeout(() => {
       terminal.graceTimer = null;
       if (terminal.ws !== null) return;
-      logger.debug(`[LOCAL-DIRECT-TERMINAL] detach grace expired session=${terminal.sessionId} exited=${terminal.exit !== null}`);
+      logger.debug(`[LOCAL-DIRECT-TERMINAL] detach grace expired session=${terminal.sessionId} exited=${exitOf(terminal) !== null}`);
       forget(terminal);
-      if (terminal.exit === null) void terminal.pty.terminate();
+      if (exitOf(terminal) === null) void terminal.pty.terminate();
     }, detachGraceMs);
     // A waiting terminal must not keep the daemon process alive on its own.
     terminal.graceTimer.unref?.();
@@ -272,7 +282,9 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
         const auditUserId = auditUserIdOf(openParams);
         let open = 0;
-        for (const terminal of terminals.values()) if (terminal.userId === auditUserId) open += 1;
+        for (const terminal of terminals.values()) {
+          if (terminal.userId === auditUserId && exitOf(terminal) === null && !terminal.closing) open += 1;
+        }
         if (open >= MAX_DIRECT_TERMINALS_PER_USER) {
           if (reqId) send({ reqId, error: 'Too many active terminals' });
           return;
@@ -306,7 +318,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
 
         const sessionId = pty.id;
         const entry = addDaemonTerminalSession(sessionId, pty, { userId: auditUserId, machineId: null, route: 'direct' });
-        const terminal: DirectTerminal = { sessionId, pty, entry, userId: auditUserId, ws, graceTimer: null, exit: null };
+        const terminal: DirectTerminal = { sessionId, pty, entry, userId: auditUserId, ws, graceTimer: null, closing: false };
         terminals.set(sessionId, terminal);
         bound = terminal;
 
@@ -346,7 +358,9 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         pty.onExit((code, signal) => {
           outputCoalescer.flush();
           outputCoalescer.dispose();
-          terminal.exit = { code, signal };
+          // Kept in the registry, like a relay terminal, so a re-attaching
+          // client resumes into the last output and this exit (D4 B-R2).
+          markDaemonTerminalSessionExited(sessionId, { code, signal });
           // Audit every end, however it came about (exit, close, grace expiry, shutdown).
           logger.debug(
             `[LOCAL-DIRECT-TERMINAL] close session=${sessionId} user=${entry.userId} exitCode=${code} signal=${signal ?? 'null'} ` +
@@ -354,6 +368,12 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
           );
           // Grace already expired: nobody is coming back for it.
           if (terminals.get(sessionId) !== terminal) return;
+          if (terminal.closing) {
+            // The user closed it: say so if still attached, and let it go.
+            sendClosed(terminal);
+            forget(terminal);
+            return;
+          }
           // Attached: say so (after any replay in flight). Detached: the
           // buffered output and the exit wait out the grace window for a
           // client that reattaches.
@@ -397,7 +417,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         // A paged replay in flight was going to the old connection.
         resetPagedResume(terminal.entry.output);
         recordTerminalActivity(sessionId);
-        logger.debug(`[LOCAL-DIRECT-TERMINAL] attach session=${sessionId} user=${terminal.userId} exited=${terminal.exit !== null}`);
+        logger.debug(`[LOCAL-DIRECT-TERMINAL] attach session=${sessionId} user=${terminal.userId} exited=${exitOf(terminal) !== null}`);
         if (reqId) send({ reqId, data: { ok: true, sessionId, caps: DIRECT_TERMINAL_CAPS } });
         return;
       }
@@ -411,24 +431,31 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
         if (!machineEncryption) return;
         recordTerminalActivity(terminal.sessionId);
         try {
+          // An ended terminal's exit rides the answer — after the last page
+          // of output, by the rules the relay path follows too.
           replyToTerminalResume({
             sessionId: terminal.sessionId,
             output: terminal.entry.output,
+            exit: exitOf(terminal),
             afterSeq: data.afterSeq,
             maxChars: data.maxChars,
             seal: (chunk) => encodeBase64(encrypt(machineEncryption.encryptionKey, machineEncryption.encryptionVariant, chunk)),
-            emit: (replyEvent, payload) => send({ data: { event: replyEvent, ...payload } }),
+            emit: (replyEvent, payload) => {
+              // A held exit can come due after this connection lost the terminal:
+              // then the grace window or the newer connection owns it.
+              if (replyEvent === 'terminal-closed' && terminal.ws !== ws) return;
+              send({ data: { event: replyEvent, ...payload } });
+              if (replyEvent === 'terminal-closed') forget(terminal);
+            },
           });
         } catch (e) {
           logger.debug(`[LOCAL-DIRECT-TERMINAL] resume reply failed: ${(e as Error).message}`);
           return;
         }
-        // An ended terminal reports its exit after the last page of output.
-        if (terminal.exit !== null) sendClosedAfterReplay(terminal);
         return;
       }
 
-      if (terminal.exit !== null) return; // the PTY is gone; only resume still means something.
+      if (exitOf(terminal) !== null) return; // the PTY is gone; only resume still means something.
 
       if (event === 'terminal-frame') {
         if (!isRecord(data) || typeof data.data !== 'string') return;
@@ -453,6 +480,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
       }
 
       if (event === 'terminal-close') {
+        terminal.closing = true;
         void terminal.pty.terminate();
         return;
       }
@@ -472,7 +500,7 @@ export function attachTerminalWsRoute(httpServer: HttpServer, opts: {
       new Promise((resolve) => {
         for (const terminal of [...terminals.values()]) {
           forget(terminal);
-          if (terminal.exit === null) void terminal.pty.terminate();
+          if (exitOf(terminal) === null) void terminal.pty.terminate();
         }
         for (const ws of sockets) ws.terminate();
         sockets.clear();

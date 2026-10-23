@@ -290,4 +290,44 @@ describe('/terminal WS reattach and replay (B2a)', () => {
     expect(getDaemonTerminalSessionCount()).toBe(6)
     for (const client of [...clients, sixth, other]) client.ws.close()
   })
+
+  // Cross review I4 #2: a closed or ended terminal waits out no grace window
+  // inside the cap — closing one of five and opening another must not fall back to the relay.
+  it('frees a cap slot as soon as the user closes a terminal and its socket goes', async () => {
+    const clients: Client[] = []
+    for (let i = 0; i < 5; i++) {
+      const client = await connect()
+      clients.push(client)
+      expect((await openTerminal(client, 'setInterval(() => {}, 1000)')).data.ok).toBe(true)
+    }
+    const closing = clients.shift()!
+    closing.ws.send(JSON.stringify({ event: 'terminal-close', data: {} }))
+    closing.ws.close() // the desktop closes its socket right after sending terminal-close
+    await closing.closed
+
+    const next = await connect()
+    expect((await openTerminal(next, 'setInterval(() => {}, 1000)')).data.ok).toBe(true)
+    for (const client of [...clients, next]) client.ws.close()
+  })
+
+  it('does not count a terminal that ended while detached, though it waits for its client', async () => {
+    const clients: Client[] = []
+    for (let i = 0; i < 4; i++) {
+      const client = await connect()
+      clients.push(client)
+      expect((await openTerminal(client, 'setInterval(() => {}, 1000)')).data.ok).toBe(true)
+    }
+    const ending = await connect()
+    const { data: { sessionId } } = await openTerminal(ending, 'setTimeout(() => process.exit(0), 300)')
+    ending.ws.terminate()
+    await ending.closed
+    await waitFor(() => getDaemonTerminalSession(sessionId)?.exit != null, 3_000)
+
+    const next = await connect()
+    expect((await openTerminal(next, 'setInterval(() => {}, 1000)')).data.ok).toBe(true)
+    // Still kept for a client that re-attaches within the grace window.
+    expect(getDaemonTerminalSession(sessionId)).not.toBeNull()
+    expect(getDaemonTerminalSessionCount()).toBe(5)
+    for (const client of [...clients, next]) client.ws.close()
+  })
 })
