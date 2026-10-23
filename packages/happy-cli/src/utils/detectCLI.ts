@@ -13,7 +13,7 @@ export interface CLIAvailability {
 
 /**
  * Detects which CLI tools are available on this machine.
- * Cross-platform: uses `command -v` on POSIX, `Get-Command` on Windows.
+ * Cross-platform: uses `command -v` on POSIX and a Path lookup on Windows.
  */
 export function detectCLIAvailability(): CLIAvailability {
   const isWindows = os.platform() === 'win32';
@@ -48,14 +48,17 @@ function detectPosix(): CLIAvailability {
 }
 
 function detectWindows(): CLIAvailability {
-  const checkCommand = (name: string): boolean => {
-    try {
-      execSync(`powershell -NoProfile -Command "Get-Command ${name} -ErrorAction SilentlyContinue"`, { stdio: 'ignore', windowsHide: true });
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  // Looks up Path in-process instead of asking powershell's Get-Command. The keep-alive
+  // re-detects every 20s, and the shell spawn (node → cmd.exe → powershell.exe) flashed a
+  // console window each time even with windowsHide.
+  const pathEntries = (process.env.PATH ?? process.env.Path ?? '').split(';')
+    .map((entry) => entry.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+  const extensions = [...(process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';'), '.PS1']
+    .map((ext) => ext.trim())
+    .filter(Boolean);
+  const checkCommand = (name: string): boolean =>
+    pathEntries.some((dir) => extensions.some((ext) => existsSync(join(dir, name + ext.toLowerCase()))));
 
   const claude = checkCommand('claude');
   const codex = checkCommand('codex');
