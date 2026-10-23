@@ -52,6 +52,11 @@ export interface ToolPolicyTables {
     };
     systemKeyCombos: Partial<Record<NodeJS.Platform, string[]>>;
     mcp: {
+        /**
+         * Which words of a tool name the verb rule reads. Only `all` exists (2026-10-23.1, every word); Desktop reads
+         * it to tell this rule from the older first-two-words one when it labels tools for a runtime it did not ship with.
+         */
+        verbWords?: 'all';
         excludedServers: string[];
         highRiskVerbs: string[];
         writeVerbs: string[];

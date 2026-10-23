@@ -203,10 +203,30 @@ describe('MCP tool defaults (policy-tables §4, R8)', () => {
         expect(decide(mcp('mcp__notion__notion-update-page'), machine).decision).toBe('ask');
     });
 
-    it('verb dictionary reads the first two words only', () => {
+    it('verb dictionary reads every word, the strongest grade winning', () => {
         expect(verbOf('notion-delete-page')).toBe('high');
-        expect(verbOf('list_items_delete')).toBeNull();
+        // Was null while only the first two words counted; a trailing `delete` now makes it high on purpose.
+        expect(verbOf('list_items_delete')).toBe('high');
         expect(verbOf('sendMessage')).toBe('high');
+    });
+
+    // V1 F1: memory-server tools put a resource noun before the verb, past the old two-word window.
+    it.each([
+        ['mem-perspective-observation-delete', 'high'], ['mem-asset-create', 'write'], ['mem-lesson-save', 'write'],
+        ['memPerspectiveObservationDelete', 'high'], ['memAssetCreate', 'write'], ['bulkURLDelete', 'high'],
+        ['mem_asset_create_and_delete', 'high'], ['update_then_send', 'high'], ['mem-asset-update.delete', 'high'], ['delete', 'high'], ['save', 'write'],
+        ['mem-context-pack', null], ['mem-search', null], ['get_deleted_items', null], ['frobnicate', null],
+        // A leading noun is still a noun before a read verb, but the words after it count.
+        ['message_list_delete', 'high'], ['email_get_and_update', 'write'],
+    ] as const)('verbOf(%s) is %s over all words', (tool, verb) => {
+        expect(verbOf(tool)).toBe(verb);
+    });
+
+    it('judges the tool name only, never the server prefix', () => {
+        expect(decide(mcp('mcp__delete-service__list_items')).reasonCode).toBe('default_allow');
+        expect(decide(mcp('mcp__claude-memory-layer__mem-perspective-observation-delete'))).toMatchObject({ decision: 'ask', reasonCode: 'high_risk_write', humanOnly: true });
+        expect(decide(mcp('mcp__claude-memory-layer__mem-asset-create')).reasonCode).toBe('write_tool');
+        expect(decide(mcp('mcp__claude-memory-layer__mem-lesson-save')).reasonCode).toBe('write_tool');
     });
 
     // Cross review #8: a leading noun followed by a read verb is a read tool.
@@ -353,11 +373,16 @@ describe('coverage audit (R9)', () => {
             { name: 'mcp__gh__create_issue', annotations: { readOnlyHint: true } },
             { name: 'mcp__gh__get_issue', annotations: { destructiveHint: true } },
             { name: 'mcp__gh__list_issues', annotations: { readOnlyHint: true } },
+            { name: 'mcp__claude-memory-layer__mem-perspective-observation-delete' },
+            { name: 'mcp__claude-memory-layer__mem-lesson-save' },
+            { name: 'mcp__claude-memory-layer__mem-search' },
         ], ABSENT_MACHINE_POLICY);
         expect(gaps).toEqual([
             { tool: 'mcp__notion__notion-update-page', reasonCode: 'unlisted_write_tool', decision: 'allow' },
             { tool: 'mcp__gmail__send_email', reasonCode: 'unlisted_write_tool', decision: 'ask' },
             { tool: 'mcp__gh__get_issue', reasonCode: 'unlisted_write_tool', decision: 'allow' },
+            { tool: 'mcp__claude-memory-layer__mem-perspective-observation-delete', reasonCode: 'unlisted_write_tool', decision: 'ask' },
+            { tool: 'mcp__claude-memory-layer__mem-lesson-save', reasonCode: 'unlisted_write_tool', decision: 'allow' },
         ]);
     });
 

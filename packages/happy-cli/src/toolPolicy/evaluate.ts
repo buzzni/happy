@@ -436,17 +436,20 @@ function keyCheck(tool: string, args: Record<string, unknown>, platform: NodeJS.
 }
 
 /**
- * R8 verb dictionary: the first of the first two words that is an exact dictionary word — unless
- * the first word is a noun the dictionary also lists (`message`, `email`) and the second is a read
- * verb (`message_list`): that tool reads.
+ * R8 verb dictionary: every word of the tool name (`_`, `-`, `.` and camelCase boundaries) against the
+ * dictionary, the strongest grade winning — high > write. A leading noun the dictionary also lists
+ * (`message`, `email`) followed by a read verb (`message_list`) is a noun there and does not count;
+ * the words after it still do.
  */
 export function verbOf(tool: string, tables: ToolPolicyTables = BUILTIN_TABLES): 'high' | 'write' | null {
-    const words = tool.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().split(/[_\-.]+/).filter(Boolean).slice(0, 2);
-    if (words.length === 2 && tables.mcp.nounFirstWords.includes(words[0]) && tables.mcp.readVerbs.includes(words[1])) return null;
-    for (const word of words) {
-        if (tables.mcp.highRiskVerbs.includes(word)) return 'high';
-        if (tables.mcp.writeVerbs.includes(word)) return 'write';
-    }
+    const words = tool
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+        .toLowerCase().split(/[_\-.]+/).filter(Boolean);
+    const leadingNoun = words.length >= 2 && tables.mcp.nounFirstWords.includes(words[0]) && tables.mcp.readVerbs.includes(words[1]);
+    const verbs = leadingNoun ? words.slice(1) : words;
+    if (verbs.some((word) => tables.mcp.highRiskVerbs.includes(word))) return 'high';
+    if (verbs.some((word) => tables.mcp.writeVerbs.includes(word))) return 'write';
     return null;
 }
 
