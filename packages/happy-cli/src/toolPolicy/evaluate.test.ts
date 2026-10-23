@@ -203,10 +203,30 @@ describe('MCP tool defaults (policy-tables §4, R8)', () => {
         expect(decide(mcp('mcp__notion__notion-update-page'), machine).decision).toBe('ask');
     });
 
-    it('verb dictionary reads the first two words only', () => {
+    it('verb dictionary reads every word, the strongest grade winning', () => {
         expect(verbOf('notion-delete-page')).toBe('high');
-        expect(verbOf('list_items_delete')).toBeNull();
+        // Was null while only the first two words counted; a trailing `delete` now makes it high on purpose.
+        expect(verbOf('list_items_delete')).toBe('high');
         expect(verbOf('sendMessage')).toBe('high');
+    });
+
+    // V1 F1: memory-server tools put a resource noun before the verb, past the old two-word window.
+    it.each([
+        ['mem-perspective-observation-delete', 'high'], ['mem-asset-create', 'write'], ['mem-lesson-save', 'write'],
+        ['memPerspectiveObservationDelete', 'high'], ['memAssetCreate', 'write'], ['bulkURLDelete', 'high'],
+        ['mem_asset_create_and_delete', 'high'], ['update_then_send', 'high'], ['mem-asset-update.delete', 'high'], ['delete', 'high'], ['save', 'write'],
+        ['mem-context-pack', null], ['mem-search', null], ['get_deleted_items', null], ['frobnicate', null],
+        // A leading noun is still a noun before a read verb, but the words after it count.
+        ['message_list_delete', 'high'], ['email_get_and_update', 'write'],
+    ] as const)('verbOf(%s) is %s over all words', (tool, verb) => {
+        expect(verbOf(tool)).toBe(verb);
+    });
+
+    it('judges the tool name only, never the server prefix', () => {
+        expect(decide(mcp('mcp__delete-service__list_items')).reasonCode).toBe('default_allow');
+        expect(decide(mcp('mcp__claude-memory-layer__mem-perspective-observation-delete'))).toMatchObject({ decision: 'ask', reasonCode: 'high_risk_write', humanOnly: true });
+        expect(decide(mcp('mcp__claude-memory-layer__mem-asset-create')).reasonCode).toBe('write_tool');
+        expect(decide(mcp('mcp__claude-memory-layer__mem-lesson-save')).reasonCode).toBe('write_tool');
     });
 
     // Cross review #8: a leading noun followed by a read verb is a read tool.
@@ -217,6 +237,39 @@ describe('MCP tool defaults (policy-tables §4, R8)', () => {
     ] as const)('verbOf(%s) is %s', (tool, verb) => {
         expect(verbOf(tool)).toBe(verb);
     });
+
+    // VF1 cross review #1: past the old two-word window a dictionary noun after a read verb names what is read.
+    it.each([
+        ['get_latest_release', null], ['get_user_email', null], ['email_get_message', null], ['fetch_customer_payment_methods', null],
+        ['get_thread_message_count', null],
+        // Inside the old window the noun still counts as it did there.
+        ['slack_message_search', 'high'], ['get_release_by_tag', 'high'],
+        // No read verb before it: the noun counts. `edit_message` writes outward, so high is the intended conservative grade.
+        ['edit_message', 'high'], ['add_comment_to_post', 'high'], ['create_draft_email', 'high'],
+        // Only the noun drops out; a verb after it still counts.
+        ['get_message_then_delete', 'high'], ['list_orders_and_send_email', 'high'],
+        // Review bot #930: a read verb only covers its own clause; after `and`/`then`/`or` the noun is an action again.
+        ['get_quote_and_trade', 'high'], ['search_and_post_message', 'high'], ['list_items_then_release', 'high'], ['get_or_charge_payment', 'high'],
+        ['items_and_list_payment', null],
+    ] as const)('verbOf(%s) is %s with nouns past the second word', (tool, verb) => {
+        expect(verbOf(tool)).toBe(verb);
+    });
+
+    it('a real read tool with readOnlyHint stays allowed', () => {
+        expect(decide(mcp('mcp__github__get_latest_release', { readOnlyHint: true })).reasonCode).toBe('default_allow');
+    });
+
+    // Review bot #930, decided on purpose: a high-risk verb anywhere in the name stays high under readOnlyHint (R8.3 — the
+    // server's claim only tightens). A person approves it once per session; nouns after a read verb are the only exemption.
+    it('keeps a high-risk verb past the second word high even with readOnlyHint', () => {
+        expect(decide(mcp('mcp__github__get_pull_request_merge_status', { readOnlyHint: true }))).toMatchObject({ decision: 'ask', reasonCode: 'high_risk_write', humanOnly: true });
+    });
+
+    // VF1 cross review #2: an acronym split never loses a word the camelCase split alone would have matched.
+    it.each([['DElete', 'high'], ['SEnd_items', 'high'], ['CReate', 'write'], ['bulkURLDelete', 'high'], ['getHTTPRelease', null]] as const)(
+        'verbOf(%s) is %s whichever split finds the word', (tool, verb) => {
+            expect(verbOf(tool)).toBe(verb);
+        });
 });
 
 describe('combination order (R2, R3, R13)', () => {
@@ -353,11 +406,16 @@ describe('coverage audit (R9)', () => {
             { name: 'mcp__gh__create_issue', annotations: { readOnlyHint: true } },
             { name: 'mcp__gh__get_issue', annotations: { destructiveHint: true } },
             { name: 'mcp__gh__list_issues', annotations: { readOnlyHint: true } },
+            { name: 'mcp__claude-memory-layer__mem-perspective-observation-delete' },
+            { name: 'mcp__claude-memory-layer__mem-lesson-save' },
+            { name: 'mcp__claude-memory-layer__mem-search' },
         ], ABSENT_MACHINE_POLICY);
         expect(gaps).toEqual([
             { tool: 'mcp__notion__notion-update-page', reasonCode: 'unlisted_write_tool', decision: 'allow' },
             { tool: 'mcp__gmail__send_email', reasonCode: 'unlisted_write_tool', decision: 'ask' },
             { tool: 'mcp__gh__get_issue', reasonCode: 'unlisted_write_tool', decision: 'allow' },
+            { tool: 'mcp__claude-memory-layer__mem-perspective-observation-delete', reasonCode: 'unlisted_write_tool', decision: 'ask' },
+            { tool: 'mcp__claude-memory-layer__mem-lesson-save', reasonCode: 'unlisted_write_tool', decision: 'allow' },
         ]);
     });
 
