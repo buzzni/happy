@@ -35,11 +35,12 @@ import {
   serializeAppliedClaudeProvenance,
   serializeInvalidatedClaudeProvenance,
 } from './aiCredentialProvenance'
-import { SETUP_TOKEN_BINDING_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
+import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, formatSetupTokenBinding, overlayManagedCredentialEnvironment, type AiAuthSelection, type SetupTokenBinding, type MachineSetupTokenBindingRecord, isMachineSetupTokenBinding } from './sessionEnv'
 import { readTrustedStudioOrigin, setupTokenCredentialMatches, type SetupTokenBindingVerifier } from './setupTokenBindingProof'
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '@/claude/utils/claudeAuthOverrideEnv'
 import { openSetupTokenAssignment, type SetupTokenAssignmentRecipient } from './setupTokenAssignmentWire'
 import { HAPPY_AI_AUTH_SOURCE_ENV } from '@/usage/aiAuthSource'
+import type { SetupTokenUsageObservation } from './setupTokenAccountSwitch'
 import {
   cswapAtLeastPinned, isManagedSetupTokenAccount, managedSetupTokenEmail, managedSetupTokenId, parseCswapVersion, sameManagedSetupToken,
   setupTokenGroupIdentity, setupTokenRuntimeStatus, supportsManagedSetupTokens,
@@ -51,6 +52,10 @@ const CLAUDE_SWAP_VERSION = '0.27.0b2'
 /** Windows: the daemon's claude-swap calls and `cswap auto` run through this verified base Python (RE8). */
 export const claudeSwapPython = createClaudeSwapPythonResolver({ platform: process.platform, find: () => findClaudeSwapPython(CLAUDE_SWAP_PACKAGE, process.env), verify: verifyClaudeSwapPython })
 const CLAUDE_STATUS_TIMEOUT_MS = 120_000
+/** Either window at this share means the account is used up; the session tracker's and Studio's rule. */
+const SHARED_ACCOUNT_USED_UP_PCT = 95
+/** A used-up shared account without a known reset is skipped for one 5-hour window. */
+const SHARED_ACCOUNT_UNKNOWN_RESET_MS = 5 * 60 * 60_000
 // Keep readable historical bundles separate from supported installed runtimes.
 // Bundles from supported runtimes are readable; parseCodexMultiAuthBundle still
 // requires the OAuth account v3 / settings v1 contract.
@@ -2266,8 +2271,12 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
    * unbound launch spends it through the child's environment only, like a bound one.
    * Null when the machine has no such assignment, or a user assignment desires a
    * setup-token (its refusal then decides). Never a substitute credential.
+   *
+   * It prefers an account not known to be used up (Saycode specs/shared-pc-session-account-continuation).
+   * `account`: exactly the account a prepared launch runs on; `moveFrom`: another usable account for a
+   * session leaving that one. Either is null when there is none.
    */
-  async function sharedMachineSessionEnvironment(): Promise<Record<string, string> | null> {
+  async function sharedMachineSessionEnvironment(choice?: { account: string | undefined } | { moveFrom: string }): Promise<Record<string, string> | null> {
     if (!deps.machineId || await groups.hasManagedDesired('claude', 'user')) return null
     const entries = await groups.machineManaged('claude', deps.machineId)
     if (entries.length === 0) return null
@@ -2277,17 +2286,67 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     return withSafeErrors('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE', async () => {
       const { listed, exported } = await readSlotRosterAndExport()
       const slots: Array<Record<string, unknown>> = Array.isArray(exported?.accounts) ? exported.accounts : []
-      const token = slots.map(slot => {
+      const candidates = slots.flatMap(slot => {
         const id = managedSetupTokenId(slot?.email)
         const accessToken = (slot?.credentials as { claudeAiOauth?: { accessToken?: unknown } } | undefined)?.claudeAiOauth?.accessToken
         const enabled = listed.some(account => account.email === slot.email && account.disabled !== true)
         return id !== null && identities.has(setupTokenGroupIdentity(id)) && enabled && slot.credentialType === 'setup_token'
-          && slot.managedAccountId === id && typeof accessToken === 'string' && accessToken.startsWith('sk-ant-oat01-') ? accessToken : null
-      }).find((value): value is string => value !== null)
-      if (!token) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
+          && slot.managedAccountId === id && typeof accessToken === 'string' && accessToken.startsWith('sk-ant-oat01-') ? [{ managedAccountId: id, token: accessToken }] : []
+      })
+      const usable = candidates.filter(candidate => !sharedAccountUsedUp(candidate.managedAccountId))
+      // With every account used up a launch still gets the default: the provider's refusal then speaks.
+      const chosen = !choice ? usable[0] ?? candidates[0]
+        : 'account' in choice ? candidates.find(candidate => candidate.managedAccountId === choice.account)
+        : usable.find(candidate => candidate.managedAccountId !== choice.moveFrom)
+      if (!chosen) {
+        if (choice) return null
+        throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_MACHINE_DEFAULT_UNAVAILABLE')
+      }
       const cleared = Object.fromEntries(CLAUDE_AUTH_OVERRIDE_ENV_KEYS.map(key => [key, '']))
-      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1' }
+      return { ...cleared, CLAUDE_CODE_OAUTH_TOKEN: chosen.token, [HAPPY_AI_AUTH_SOURCE_ENV]: 'org-bundle', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1',
+        [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: chosen.managedAccountId }
     })
+  }
+
+  /**
+   * What sessions observed of each shared account (Saycode specs/shared-pc-session-account-continuation): the latest
+   * reading per window, and a refusal no window explains. Process-local: after a daemon restart a session learns it
+   * again from its first refused turn and moves.
+   */
+  const sharedAccountUsage = new Map<string, { windows: Map<string, { observedAt: number; usedUpUntil: number | null }>; refusal: { observedAt: number; until: number } | null }>()
+  const sharedAccountUsedUp = (managedAccountId: string) => {
+    const usage = sharedAccountUsage.get(managedAccountId), now = deps.now()
+    return !!usage && ((usage.refusal?.until ?? 0) > now || [...usage.windows.values()].some(window => (window.usedUpUntil ?? 0) > now))
+  }
+  /** A shared-PC session's reading of its account. A window it does not mention, or an older reading, changes nothing. */
+  async function sharedMachineUsage(managedAccountId: string, observation: SetupTokenUsageObservation) {
+    const usage = sharedAccountUsage.get(managedAccountId) ?? { windows: new Map(), refusal: null }
+    sharedAccountUsage.set(managedAccountId, usage)
+    let full = false
+    for (const window of observation.windows) {
+      const usedUp = window.pct !== null && window.pct >= SHARED_ACCOUNT_USED_UP_PCT
+      full ||= usedUp
+      if ((usage.windows.get(window.kind)?.observedAt ?? -Infinity) > observation.observedAt) continue
+      usage.windows.set(window.kind, { observedAt: observation.observedAt,
+        usedUpUntil: usedUp ? window.resetsAt ?? observation.observedAt + SHARED_ACCOUNT_UNKNOWN_RESET_MS : null })
+    }
+    if (observation.reason === 'rate-limited') {
+      // Held until its retry time; without one, as long as a full window says, else for one 5-hour window. Never shortened.
+      const until = observation.retryAt ?? (full ? null : observation.observedAt + SHARED_ACCOUNT_UNKNOWN_RESET_MS)
+      if (until !== null && until > (usage.refusal?.until ?? -Infinity)) usage.refusal = { observedAt: observation.observedAt, until }
+    } else if (usage.refusal && usage.refusal.observedAt < observation.observedAt) {
+      usage.refusal = null
+    }
+  }
+  /**
+   * Another account assigned to this shared PC for a session leaving a used-up one; null when none is usable.
+   * The session applies the environment itself and restarts its provider on the same conversation.
+   */
+  async function sharedMachineRebind(managedAccountId: string, observation?: SetupTokenUsageObservation) {
+    if (observation) await sharedMachineUsage(managedAccountId, observation)
+    // Asked to move: the account is used up even when the session has no reading of when it resets.
+    if (!sharedAccountUsedUp(managedAccountId)) await sharedMachineUsage(managedAccountId, { observedAt: deps.now(), reason: 'rate-limited', retryAt: null, windows: [] })
+    return serializeLaunch('prepare', () => sharedMachineSessionEnvironment({ moveFrom: managedAccountId }))
   }
 
   /**
@@ -2375,7 +2434,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       // Explicit personal, other agents and ZAI environments retain their bypass.
       // The shared machine's token is read again under the group-sync queue; a replaced one is stale.
       if (sharedMachineLaunches.has(environment)) return serializeLaunch('launch', async () => {
-        const current = await sharedMachineSessionEnvironment()
+        const current = await sharedMachineSessionEnvironment({ account: environment[SETUP_TOKEN_SHARED_ACCOUNT_ENV] })
         if (current?.CLAUDE_CODE_OAUTH_TOKEN !== environment.CLAUDE_CODE_OAUTH_TOKEN) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_BINDING_STALE')
         return await start()
       })
@@ -2484,7 +2543,7 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
     if (entries.length !== 1 || entries[0].pending) throw new AiCredentialRuntimeError('CLAUDE_SETUP_TOKEN_ASSIGNMENT_UNRESOLVED')
     return entries[0].scope
   })
-  return { sharedMachineSetupTokenScope, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
+  return { sharedMachineSetupTokenScope, sharedMachineUsage, sharedMachineRebind, launchSession, personalSchedulerTick, stopPersonalScheduler, tokenProbe, collectorProbe, capture, repairCodex, apply, groupSync, setupTokenGroupSync, releaseSetupTokenAccounts, groupReceipt: (scope: string, selected: 'claude' | 'codex', principal?: { principalType: 'machine'; machineId: string }) => serialize(() => groups.receipt(scope, selected, principal ? { ...principal, userId: principal.machineId } : undefined)), purge, status, verify, rotation, sessionEnvironment, capabilities: async (machineId?: string) => {
     // One fresh runtime observation per RPC: launching cswap repeatedly can block a secured Windows host.
     let stdout = ''
     try { stdout = (await deps.execFile('cswap', ['token-runtime', 'capabilities'], { maxOutputBytes: 64 * 1024, timeoutMs: CLAUDE_STATUS_TIMEOUT_MS })).stdout } catch {}

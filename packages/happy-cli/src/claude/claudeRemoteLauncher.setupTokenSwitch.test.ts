@@ -149,6 +149,74 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         expect(successfulResults).toEqual(['result-2']);
     });
 
+    // Saycode specs/shared-pc-session-account-continuation — a shared PC session has no Studio binding.
+    it('moves an unbound shared-PC session off a used-up account and continues the refused turn', async () => {
+        const SHARED_A = '0b6f2c1e-1111-4a2b-8c3d-000000000001';
+        const SHARED_B = '0b6f2c1e-1111-4a2b-8c3d-000000000002';
+        delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING;
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED = '1';
+        process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT = SHARED_A;
+        vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: true, environment: {
+            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: SHARED_B } });
+        try {
+            const queue = new MessageQueue2<EnhancedMode>(hashObject);
+            const handlers = new Map<string, () => Promise<unknown>>();
+            const client = {
+                sessionId: 'happy-session-1',
+                rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+                updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+                setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+                setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+                applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+            };
+            const generations: Array<{ token?: string; resume?: string; prompts: string[] }> = [];
+            vi.mocked(query).mockImplementation(({ prompt, options }) => {
+                const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[] };
+                generations.push(generation);
+                const first = generations.length === 1;
+                const response = (async function* () {
+                    yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                    for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                        generation.prompts.push(JSON.stringify(message.message.content));
+                        if (first) {
+                            yield refused;
+                            yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                            continue;
+                        }
+                        yield assistant('msg-2');
+                        yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: 'result-2' };
+                        void handlers.get('switch')!();
+                        return;
+                    }
+                })();
+                return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+            });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            const session: Record<string, unknown> = {
+                lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+                cancelLessonReview: vi.fn(),
+                sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+                api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+                consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+            };
+
+            await claudeRemoteLauncher(session as unknown as Session);
+
+            expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
+            expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
+            expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
+            const running = `shared-machine:${SHARED_A}`;
+            expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
+            expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
+            // The organization account shown for a session still comes only from a signed binding.
+            expect(client.setClaudeRuntimeAccount.mock.calls).toEqual([[undefined], [undefined]]);
+            expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
+        } finally {
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED;
+            delete process.env.HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT;
+        }
+    });
+
     it('closes a refused turn as failed when the provider throws and rebind fails', async () => {
         vi.mocked(requestSetupTokenRebind).mockResolvedValueOnce({ ok: false, reason: 'FORBIDDEN' });
         const queue = new MessageQueue2<EnhancedMode>(hashObject);

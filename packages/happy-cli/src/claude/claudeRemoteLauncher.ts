@@ -64,7 +64,7 @@ import {
     CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
     createClaudeTransientRetry,
 } from './claudeTransientRetry';
-import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV } from '@/daemon/sessionEnv';
+import { SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_RESUME_REBOUND_ENV, sharedMachineSetupTokenAuthority } from '@/daemon/sessionEnv';
 
 export async function claudeRemoteLauncher(session: Session): Promise<'switch' | 'exit'> {
     logger.debug('[claudeRemoteLauncher] Starting remote launcher');
@@ -357,10 +357,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * Saycode specs/claude-setup-token-account-selection — a session bound to an organization
      * setup-token account moves off it once the provider reports it used up. The token is read when
      * a provider process starts, so a switch restarts the provider on the same conversation.
+     * An unbound shared-PC session moves the same way, within the PC's own assignment
+     * (Saycode specs/shared-pc-session-account-continuation).
      */
-    const setupTokenSwitching = process.env[SETUP_TOKEN_BINDING_ENV] ? createSetupTokenAccountSwitching({
+    const runningAuthority = () => process.env[SETUP_TOKEN_BINDING_ENV] ?? sharedMachineSetupTokenAuthority(process.env);
+    const setupTokenSwitching = runningAuthority() ? createSetupTokenAccountSwitching({
         sessionId: () => session.client.sessionId ?? null,
-        binding: () => providerBinding ?? process.env[SETUP_TOKEN_BINDING_ENV],
+        binding: () => providerBinding ?? runningAuthority(),
         report: reportSetupTokenUsage,
         rebind: requestSetupTokenRebind,
         applyEnvironment: (environment) => { for (const [key, value] of Object.entries(environment)) process.env[key] = value; },
@@ -376,14 +379,14 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let providerRunning = false;
     /** The mode the last turn ran with, across provider restarts — the continuation of a refused turn reuses it. */
     let lastTurnMode: EnhancedMode | null = null;
-    /** The setup-token binding the running provider started with; usage is booked to it, not to a later switch. */
+    /** The setup-token binding (or shared-PC account) the running provider started with; usage is booked to it, not to a later switch. */
     let providerBinding: string | undefined;
     /** Whether the last turn answered a channel request; its lifecycle cannot authorize a second execution. */
     let lastTurnChannel = false;
     /** A refused turn to continue as the first turn of the next provider (set by a switch). */
     let continuation: EnhancedMode | null = null;
     /** The provider runs on a binding the session has since switched away from. */
-    const providerStale = () => providerRunning && providerBinding !== undefined && providerBinding !== process.env[SETUP_TOKEN_BINDING_ENV];
+    const providerStale = () => providerRunning && providerBinding !== undefined && providerBinding !== runningAuthority();
 
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
@@ -399,8 +402,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
         if (message.type === 'system' && message.subtype === 'init') {
             providerRunning = true;
-            providerBinding = process.env[SETUP_TOKEN_BINDING_ENV];
-            session.client.setClaudeRuntimeAccount(providerBinding);
+            providerBinding = runningAuthority();
+            session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
             // The level signal is per provider process. Until its first full
             // snapshot, older CLIs still use this generation's transcript.
             publishBackgroundTasks({ startedAt: Date.now(), available: true, tasks: null });

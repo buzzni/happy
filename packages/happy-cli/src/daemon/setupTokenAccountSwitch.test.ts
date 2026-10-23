@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitchDeps } from './setupTokenAccountSwitch'
-import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, type AiAuthSelection, type SetupTokenBinding, type UserSetupTokenBinding } from './sessionEnv'
+import { formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV, SETUP_TOKEN_SHARED_ACCOUNT_ENV, sharedMachineSetupTokenAuthority, type AiAuthSelection, type SetupTokenBinding, type UserSetupTokenBinding } from './sessionEnv'
 import type { TrackedSession } from './types'
 
 const A = '00000000-0000-4000-8000-00000000000a'
@@ -291,5 +291,67 @@ describe('machine-rotation bindings', () => {
     const { switcher } = setup({ machineRuntime: async () => null })
     await expect(switcher.reportUsage('session-a', running, observation)).resolves.toMatchObject({ ok: false, reason: 'STUDIO_UNAVAILABLE' })
     await expect(switcher.rebind('session-a', running, observation)).resolves.toMatchObject({ ok: false, reason: 'STUDIO_UNAVAILABLE' })
+  })
+})
+
+describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-account-continuation)', () => {
+  const sharedRunning = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: A })!
+  const moved = { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: B }
+  function sharedSetup() {
+    const sharedMachine = { reportUsage: vi.fn(async () => undefined), rebind: vi.fn(async (): Promise<Record<string, string> | null> => moved) }
+    const context = setup({ sharedMachine })
+    // The daemon recorded which shared account it handed this session at spawn.
+    context.session.agentEnvironment = {}
+    context.session.sharedSetupTokenAccount = A
+    return { ...context, sharedMachine }
+  }
+
+  it('moves an unbound shared-PC session within the accounts assigned to that PC, without Studio', async () => {
+    const { switcher, requests, session, sharedMachine } = sharedSetup()
+    expect(await switcher.reportUsage('session-a', sharedRunning, observation)).toEqual({ ok: true })
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: true, environment: moved })
+    expect(sharedMachine.reportUsage).toHaveBeenCalledWith(A, observation)
+    expect(sharedMachine.rebind).toHaveBeenCalledWith(A, observation)
+    expect(requests).toEqual([])
+    // The record follows the move: the session now speaks for B, no longer for A.
+    expect(session.sharedSetupTokenAccount).toBe(B)
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+  })
+
+  it('stays put when no other account is usable or the PC cannot answer', async () => {
+    const { switcher, session, sharedMachine } = sharedSetup()
+    sharedMachine.rebind.mockResolvedValueOnce(null)
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: false, reason: 'NO_ACCOUNT' })
+    sharedMachine.rebind.mockRejectedValueOnce(new Error('cswap failed'))
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: false, reason: 'REQUEST_FAILED' })
+    expect(session.sharedSetupTokenAccount).toBe(A)
+  })
+
+  it('serves only the account the daemon handed that session', async () => {
+    const { switcher, session, sharedMachine } = sharedSetup()
+    const other = sharedMachineSetupTokenAuthority({ HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1', [SETUP_TOKEN_SHARED_ACCOUNT_ENV]: B })!
+    // Another account than the recorded one, an unknown session, and a session the daemon never handed a shared account.
+    expect(await switcher.rebind('session-a', other, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(await switcher.reportUsage('session-a', other, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(await switcher.rebind('unknown-session', sharedRunning, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    delete session.sharedSetupTokenAccount
+    expect(await switcher.rebind('session-a', sharedRunning, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(await switcher.reportUsage('session-a', sharedRunning, observation)).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(sharedMachine.rebind).not.toHaveBeenCalled()
+    expect(sharedMachine.reportUsage).not.toHaveBeenCalled()
+  })
+
+  it('returns no token to a session that ended while the account was being prepared, and runs one move at a time', async () => {
+    const { switcher, deps, session, sharedMachine } = sharedSetup()
+    let release!: () => void
+    sharedMachine.rebind.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve(moved) }))
+    const first = switcher.rebind('session-a', sharedRunning, observation)
+    const second = switcher.rebind('session-a', sharedRunning, observation)
+    deps.findSession = () => undefined
+    release()
+    expect(await first).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(await second).toEqual({ ok: false, reason: 'NOT_BOUND' })
+    expect(sharedMachine.rebind).toHaveBeenCalledTimes(1)
+    expect(session.sharedSetupTokenAccount).toBe(A)
   })
 })

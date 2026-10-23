@@ -11,7 +11,7 @@ import { MachineRotationError } from './machineSetupTokenProtocol'
 import type { MachineSetupTokenRuntime } from './machineSetupTokenRuntime'
 import { isMachineSetupTokenBinding } from './sessionEnv'
 import type { AiAuthSelection, SetupTokenBinding } from './sessionEnv'
-import { readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
+import { parseSharedMachineSetupTokenAuthority, readSetupTokenResumeSelection, SETUP_TOKEN_BINDING_ENV, sharedMachineSetupTokenAccount } from './sessionEnv'
 import type { TrackedSession } from './types'
 import type { SessionPersistenceResult } from '@/persistence'
 import { logger } from '@/ui/logger'
@@ -37,6 +37,14 @@ export type SetupTokenAccountSwitchDeps = {
   sessionEnvironment(agent: string, selection: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>>
   /** Durable ACK required; change committed memory only after publication succeeds. */
   recordAgentEnvironment(session: TrackedSession, binding: string): SessionPersistenceResult | Promise<SessionPersistenceResult>
+  /**
+   * An unbound shared-PC session moves within the accounts assigned to this PC, without Studio
+   * (Saycode specs/shared-pc-session-account-continuation). `rebind` answers null when none is usable.
+   */
+  sharedMachine?: {
+    reportUsage(managedAccountId: string, observation: SetupTokenUsageObservation): Promise<void>
+    rebind(managedAccountId: string, observation?: SetupTokenUsageObservation): Promise<Record<string, string> | null>
+  }
 }
 /**
  * FORBIDDEN: Studio refuses this binding for good (PC reassigned, unknown binding); the session stops asking.
@@ -169,9 +177,42 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     return savePending(sessionId, session, environment)
   }
 
+  /**
+   * The account an unbound shared-PC session runs on. Null: `running` is a binding record, not a shared-PC account;
+   * undefined: not the account this daemon handed that session (the request body alone proves nothing).
+   */
+  function sharedSession(sessionId: string, running: string) {
+    const managedAccountId = parseSharedMachineSetupTokenAuthority(running)
+    if (!managedAccountId) return null
+    const session = deps.findSession(sessionId)
+    return session && session.sharedSetupTokenAccount === managedAccountId && deps.sharedMachine
+      ? { session, managedAccountId, sharedMachine: deps.sharedMachine } : undefined
+  }
+
+  async function sharedRebindOnce(sessionId: string, shared: NonNullable<ReturnType<typeof sharedSession>>, observation?: SetupTokenUsageObservation): Promise<RebindResult> {
+    let environment: Record<string, string> | null
+    try { environment = await shared.sharedMachine.rebind(shared.managedAccountId, observation) }
+    catch (error) { return failure('REQUEST_FAILED', `shared rebind ${(error as Error)?.message}`) }
+    if (!environment) return { ok: false, reason: 'NO_ACCOUNT' }
+    // The session may have ended or moved while the account was prepared: it gets no token then.
+    if (deps.findSession(sessionId) !== shared.session || shared.session.sharedSetupTokenAccount !== shared.managedAccountId) {
+      return failure('NOT_BOUND', `shared rebind: session ${sessionId} changed while its account was prepared`)
+    }
+    const next = sharedMachineSetupTokenAccount(environment)
+    if (!next || !environment.CLAUDE_CODE_OAUTH_TOKEN) return failure('REQUEST_FAILED', 'shared rebind answered no shared account')
+    shared.session.sharedSetupTokenAccount = next
+    return { ok: true, environment }
+  }
+
   return {
     /** `running`: the binding record the session itself runs with, so usage is never booked to another account. */
     async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
+      const shared = sharedSession(sessionId, running)
+      if (shared === undefined) return failure('NOT_BOUND', `usage: session ${sessionId} is not an unbound shared-PC session`)
+      if (shared) {
+        try { await shared.sharedMachine.reportUsage(shared.managedAccountId, observation); return { ok: true } }
+        catch (error) { return failure('REQUEST_FAILED', `shared usage ${(error as Error)?.message}`) }
+      }
       const parsed = parseBinding(running)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         try { const runtime = await deps.machineRuntime?.(parsed.binding.companyId); if (!runtime) return failure('STUDIO_UNAVAILABLE', 'machine runtime absent')
@@ -191,6 +232,8 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
 
     /** One switch per session at a time; a second request while one runs gets that one's answer. */
     rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<RebindResult> {
+      const shared = sharedSession(sessionId, running)
+      if (shared === undefined) return Promise.resolve(failure('NOT_BOUND', `rebind: session ${sessionId} is not an unbound shared-PC session`))
       const parsed = parseBinding(running)
       if (parsed && isMachineSetupTokenBinding(parsed.binding)) {
         const binding = parsed.binding
@@ -200,7 +243,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       }
       const pending = inFlight.get(sessionId)
       if (pending) return pending
-      const started = rebindOnce(sessionId, running).finally(() => inFlight.delete(sessionId))
+      const started = (shared ? sharedRebindOnce(sessionId, shared, observation) : rebindOnce(sessionId, running)).finally(() => inFlight.delete(sessionId))
       inFlight.set(sessionId, started)
       return started
     },

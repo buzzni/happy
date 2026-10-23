@@ -336,6 +336,50 @@ describe('managed Claude setup-token runtime', () => {
     expect(spawn).toHaveBeenCalledTimes(1)
   })
 
+  // Saycode specs/shared-pc-session-account-continuation — a shared PC moves its sessions within its own assignment.
+  it('moves a shared machine session off a used-up account and keeps later launches off it until it resets', async () => {
+    const clock = { now: NOW }
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1', clock })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
+    const first = await runtime.sessionEnvironment('claude')
+    expect(first).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('a'), HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: A, HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1' })
+
+    const resetsAt = NOW + 3_600_000
+    const refused = { observedAt: NOW, reason: 'rate-limited' as const, retryAt: resetsAt, windows: [{ kind: 'unified5h' as const, pct: 100, resetsAt }] }
+    const moved = await runtime.sharedMachineRebind(A, refused)
+    expect(moved).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: fakeToken('b'), HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B, HAPPY_AI_AUTH_SOURCE: 'org-bundle', HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED: '1' })
+    // A launch prepared on the used-up account still starts on it: the account, not the choice, is rechecked.
+    await expect(runtime.launchSession(first, () => 'started')).resolves.toBe('started')
+    // New launches and resumes skip the used-up account; with no other usable account a session stays put.
+    expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+    await runtime.sharedMachineUsage(B, { ...refused, reason: 'ok', retryAt: null, windows: [{ kind: 'unified7d', pct: 97, resetsAt: NOW + 7_200_000 }] })
+    expect(await runtime.sharedMachineRebind(B, refused)).toBeNull()
+    // Everything used up: a launch keeps the machine default rather than refusing to start.
+    expect(await runtime.sessionEnvironment('claude')).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: A })
+
+    clock.now = resetsAt
+    expect(await runtime.sharedMachineRebind(B, refused)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: A })
+    // B's weekly window outlasts the 5-hour refusal it was later asked to leave: a shorter reason never shortens it.
+    expect(await runtime.sharedMachineRebind(A, { ...refused, observedAt: resetsAt, retryAt: resetsAt + 3_600_000 })).toBeNull()
+  })
+
+  it('keeps a used-up window through readings that do not mention it or are older, until a newer one frees it', async () => {
+    const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
+    await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',
+      generation: 1, fingerprint: '1'.padStart(64, '0'), payload: payload(managed(A, 1, fakeToken('a')), managed(B, 1, fakeToken('b'))) })
+    const reading = (observedAt: number, kind: 'unified5h' | 'unified7d', pct: number) =>
+      ({ observedAt, reason: 'ok' as const, retryAt: null, windows: [{ kind, pct, resetsAt: NOW + 7_200_000 }] })
+    await runtime.sharedMachineUsage(B, reading(NOW, 'unified7d', 97))
+    // Another session on B reads only its 5-hour window; an older weekly reading arrives late.
+    await runtime.sharedMachineUsage(B, reading(NOW + 1, 'unified5h', 10))
+    await runtime.sharedMachineUsage(B, reading(NOW - 1_000, 'unified7d', 20))
+    const refusedA = { observedAt: NOW, reason: 'rate-limited' as const, retryAt: NOW + 3_600_000, windows: [] }
+    expect(await runtime.sharedMachineRebind(A, refusedA)).toBeNull()
+    await runtime.sharedMachineUsage(B, reading(NOW + 2, 'unified7d', 50))
+    expect(await runtime.sharedMachineRebind(A, refusedA)).toMatchObject({ HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT: B })
+  })
+
   it('keeps refusing an unbound session while a user assignment desires a setup-token, even on a shared machine', async () => {
     const { runtime } = fakeMachine([], null, { machineId: 'machine-1' })
     await runtime.groupSync({ version: 1, scope: 'company-1', principalType: 'machine', machineId: 'machine-1', provider: 'claude',

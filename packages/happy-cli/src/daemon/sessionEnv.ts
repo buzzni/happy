@@ -282,6 +282,33 @@ export function formatSetupTokenBinding(binding: SetupTokenBinding): string {
     return JSON.stringify({ ...Object.fromEntries(BINDING_KEYS.map((key) => [key, key === 'version' ? 1 : binding[key]])), ...(binding.tokenProof ? { tokenProof: binding.tokenProof } : {}) })
 }
 
+/**
+ * The managed account an unbound shared-PC launch spends (Saycode specs/shared-pc-session-account-continuation).
+ * Daemon-written like the binding: no Studio binding exists, so the daemon moves such a session within the
+ * accounts assigned to this PC.
+ */
+export const SETUP_TOKEN_SHARED_ACCOUNT_ENV = 'HAPPY_AI_AUTH_SETUP_TOKEN_SHARED_ACCOUNT'
+const SHARED_MACHINE_AUTHORITY = 'shared-machine:'
+
+/** The managed account an unbound shared-PC environment spends; undefined for any other environment. */
+export function sharedMachineSetupTokenAccount(env: Record<string, string | undefined>): string | undefined {
+    const managedAccountId = env[SETUP_TOKEN_SHARED_ACCOUNT_ENV]
+    return env.HAPPY_AI_AUTH_SETUP_TOKEN_LEGACY_SHARED === '1' && !env[SETUP_TOKEN_BINDING_ENV] && managedAccountId && MANAGED_ACCOUNT_ID.test(managedAccountId)
+        ? managedAccountId : undefined
+}
+
+/** What a shared-PC session reports and switches against, in place of a binding record. */
+export function sharedMachineSetupTokenAuthority(env: Record<string, string | undefined>): string | undefined {
+    const managedAccountId = sharedMachineSetupTokenAccount(env)
+    return managedAccountId ? `${SHARED_MACHINE_AUTHORITY}${managedAccountId}` : undefined
+}
+
+/** The managed account a shared-PC authority names; undefined for a binding record or anything else. */
+export function parseSharedMachineSetupTokenAuthority(value: string): string | undefined {
+    const managedAccountId = value.startsWith(SHARED_MACHINE_AUTHORITY) ? value.slice(SHARED_MACHINE_AUTHORITY.length) : ''
+    return MANAGED_ACCOUNT_ID.test(managedAccountId) ? managedAccountId : undefined
+}
+
 function parseSetupTokenBinding(value: string): SetupTokenBinding | null {
     try {
         if (value.length > 8192) return null
