@@ -3758,6 +3758,42 @@ describe('third-party credential file compare-and-swap (aplus D4 C3)', () => {
     expect(JSON.stringify([...configured.files.values()])).not.toContain('before-refresh')
   })
 
+  it('keeps a login Codex wrote after the install when verification then fails, instead of restoring the old backup', async () => {
+    let configured!: ReturnType<typeof setup>
+    let rewritten = false
+    const lockCredentialFile = (async <T,>(path: string, work: () => Promise<T>) => {
+      const result = await work()
+      if (path === authPath && !rewritten) {
+        rewritten = true
+        configured.files.set(authPath, JSON.stringify({ tokens: { account_id: 'personal', access_token: 'cli-access', refresh_token: 'cli-newest' } }))
+      }
+      return result
+    }) as AiCredentialRuntimeDependencies['lockCredentialFile']
+    configured = setup({ probeCodex: probeOk(), lockCredentialFile })
+    configured.files.set(authPath, JSON.stringify({ tokens: { account_id: 'personal', access_token: 'old-access', refresh_token: 'old-refresh' } }))
+    await expect(configured.runtime.repairCodex({ provider: 'codex', payload: JSON.stringify({ ...codexMultiAuthBundle(), recoveryAuth }) }))
+      .rejects.toMatchObject({ kind: 'AI_CREDENTIAL_ACTIVE_INVALID' })
+    expect(JSON.parse(configured.files.get(authPath)!).tokens.refresh_token).toBe('cli-newest')
+    expect(configured.files.has(`${authPath}.happy-backup`)).toBe(false)
+  })
+
+  it('sorts the pool forecast left under the lock without rolling back a concurrent refresh', async () => {
+    const configured = setup()
+    const original = configured.execFile.getMockImplementation()!
+    configured.execFile.mockImplementation(async (command, args, options) => {
+      if (command === 'codex-multi-auth' && args[0] === 'forecast') {
+        // codex-multi-auth refreshes a token while forecasting.
+        const pool = JSON.parse(configured.files.get(poolPath)!)
+        pool.accounts[1].refreshToken = 'refreshed-by-forecast'
+        configured.files.set(poolPath, JSON.stringify(pool))
+      }
+      return original(command, args, options)
+    })
+    await configured.runtime.apply({ provider: 'codex', payload: JSON.stringify(codexMultiAuthBundle()) })
+    const pool = JSON.parse(configured.files.get(poolPath)!)
+    expect(pool.accounts.map((account: { refreshToken: string }) => account.refreshToken)).toContain('refreshed-by-forecast')
+  })
+
   it('holds no credential lock while a network-bound verification runs', async () => {
     let held = 0
     let heldDuringForecast = -1

@@ -66,6 +66,8 @@ function resolveRefreshUrl(configUrl: string): string | null {
  * 매핑·권한 조회 등)은 나중에 다시 시도한다.
  */
 const NOT_RENEWABLE_ERRORS = new Set(['Caller grant is not renewable', 'caller_grant_not_renewable', 'invalid_caller_grant'])
+/** 공통 분류에서 영구로 읽히는 OAuth 코드로 옮긴다. */
+const NOT_RENEWABLE_CODE = 'invalid_grant'
 
 /** 대화를 다시 시작해야 커넥터 권한이 돌아올 때 세션에 남기는 알림. Desktop 이 이 원문으로 번역한다. */
 export const CALLER_GRANT_EXPIRED_NOTICE = 'Connector access for this conversation has expired. Start the conversation again to restore it.'
@@ -89,7 +91,7 @@ export function onMcpCallerGrantExpired(listener: () => void): () => void {
 async function readRefusalCode(res: Response): Promise<string | undefined> {
     try {
         const body = (await res.json()) as { error?: unknown }
-        return typeof body?.error === 'string' && NOT_RENEWABLE_ERRORS.has(body.error) ? 'invalid_grant' : undefined
+        return typeof body?.error === 'string' && NOT_RENEWABLE_ERRORS.has(body.error) ? NOT_RENEWABLE_CODE : undefined
     } catch {
         return undefined
     }
@@ -119,6 +121,9 @@ export async function refreshMcpCallerGrantIfExpiring(
     }
     const exchangeUrl = refreshUrl
     const fingerprint = (value: string) => credentialFingerprint('mcp-caller-grant', machineId, value)
+    // 401 은 grant 가 아니라 machine 토큰의 거절이다. 영구로 세어 다시 POST 하지 않지만, "대화를 다시
+    // 시작하면 복구돼요" 안내는 grant 자체가 교환 불가일 때만 맞다.
+    let grantNotRenewable = false
 
     const outcome = await recoverCredential<string>({
         read: async () => process.env.HAPPY_APLUS_MCP_CALLER_GRANT || null,
@@ -139,7 +144,9 @@ export async function refreshMcpCallerGrantIfExpiring(
             })
             if (!res.ok) {
                 // 교환이 거부돼도 기존 grant 는 아직 유효할 수 있다. 그대로 쓴다.
-                throw new RefreshFailure({ status: res.status, code: res.status === 403 ? await readRefusalCode(res) : undefined })
+                const code = res.status === 403 ? await readRefusalCode(res) : undefined
+                grantNotRenewable = code === NOT_RENEWABLE_CODE
+                throw new RefreshFailure({ status: res.status, code })
             }
             const body = (await res.json()) as { grant?: unknown }
             if (typeof body?.grant !== 'string' || !body.grant) throw new Error('caller grant 교환 응답이 올바르지 않음')
@@ -151,8 +158,8 @@ export async function refreshMcpCallerGrantIfExpiring(
     }, fingerprint(grant), { lock: exchangeLock, refreshTimeoutMs: TIMEOUT_MS })
 
     if (outcome.status === 'failed' && outcome.classification === 'permanent' && !outcome.cached) {
-        logger.debug('[aplus] caller grant 를 더 교환할 수 없음 — 대화를 다시 시작해야 커넥터가 돌아온다')
-        expiredListener?.()
+        logger.debug(`[aplus] caller grant 교환 영구 실패 (${grantNotRenewable ? 'grant 교환 불가' : 'machine 토큰 거절'})`)
+        if (grantNotRenewable) expiredListener?.()
     }
     return outcome.status === 'refreshed'
 }

@@ -249,6 +249,18 @@ describe('caller grant renewal across the timer and turn boundaries (D4 C2)', ()
         unsubscribe();
     });
 
+    it('stops POSTing after a 401 machine-token refusal without telling the user to restart the conversation', async () => {
+        const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }));
+        vi.stubGlobal('fetch', fetchMock);
+        const notice = vi.fn();
+        const unsubscribe = onMcpCallerGrantExpired(notice);
+        await refresh();
+        await refresh();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(notice).not.toHaveBeenCalled();
+        unsubscribe();
+    });
+
     it('keeps retrying without a notice when the refusal is not about the grant itself', async () => {
         const fetchMock = vi.fn<typeof fetch>(async () => new Response(
             JSON.stringify({ error: 'lesson_host_session_denied' }), { status: 403 },
