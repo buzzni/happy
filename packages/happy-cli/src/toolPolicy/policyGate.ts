@@ -33,6 +33,13 @@ import type { ToolPolicyAuditLog, ToolPolicyOutcome } from './audit';
 
 export const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000;
 
+/**
+ * The abort reason the gate gives a policy approval it stops waiting for (codexcli-approval-session-binding
+ * T15). Approvers compare `signal.reason` with it to record the withdrawal as `expired` rather than
+ * `aborted`; any other abort (the hook went away) stays `aborted`.
+ */
+export const APPROVAL_TIMEOUT_ABORT_REASON = Object.freeze({ kind: 'tool-policy-approval-timeout' as const });
+
 /** Rides on `agentState.requests[id].policy` (R11). Clients that do not know it show a plain prompt. */
 export interface PermissionPolicyMeta {
     reasonCode: string;
@@ -176,7 +183,7 @@ export function createToolPolicyGate(deps: {
             const onAbort = () => controller.abort();
             signal.addEventListener('abort', onAbort, { once: true });
             let timedOut = false;
-            const timer = setTimeout(() => { timedOut = true; controller.abort(); }, approvalTimeoutMs);
+            const timer = setTimeout(() => { timedOut = true; controller.abort(APPROVAL_TIMEOUT_ABORT_REASON); }, approvalTimeoutMs);
             try {
                 const answer = await approver.requestPolicyApproval({
                     id: call.toolUseId ?? deps.newRequestId?.() ?? `policy-${now()}`,

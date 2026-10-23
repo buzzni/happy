@@ -1484,7 +1484,7 @@ export async function runCodex(opts: {
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching
     // call in claudeRemoteLauncher for the full rationale.
-    permissionHandler.reset('Previous CLI process exited before responding');
+    permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
     reasoningProcessor = new ReasoningProcessor((message) => {
         const envelopes = mapCodexProcessorMessageToSessionEnvelopes(message, { currentTurnId });
         for (const envelope of envelopes) {
@@ -2301,7 +2301,7 @@ export async function runCodex(opts: {
                     codexStartedSubagents = new Set<string>();
                     codexActiveSubagents = new Set<string>();
                     codexProviderSubagentToSessionSubagent = new Map<string, string>();
-                    permissionHandler.reset();
+                    permissionHandler.reset(undefined, 'reset');
                     reasoningProcessor.abort();
                     diffProcessor.reset();
                     appendSystemPromptInjected = false;
@@ -2766,8 +2766,9 @@ export async function runCodex(opts: {
                         logger.debug('[codex]: checkpoint abortTurn failed', error);
                     }
                     authRecovery.endTurn();
-                    // Reset permission handler, reasoning processor, and diff processor
-                    permissionHandler.reset();
+                    // Reset permission handler, reasoning processor, and diff processor.
+                    // Every turn ends here; a stop already recorded its requests as `aborted`.
+                    permissionHandler.reset(undefined, 'turn-ended');
                     reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
                     diffProcessor.reset();
                     thinking = false;

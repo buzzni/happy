@@ -566,7 +566,7 @@ export async function runAcp(opts: {
   // Drop any permission requests left in agent state from a previous CLI
   // process that died while a tool prompt was open — see the matching
   // call in claudeRemoteLauncher for the full rationale.
-  permissionHandler.reset('Previous CLI process exited before responding');
+  permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
   const sessionManager = new AcpSessionManager();
   const messageQueue = new MessageQueue2<AcpSwitchMode>((mode) => hashObject(mode));
   let currentPermissionMode: string | undefined;
@@ -954,7 +954,7 @@ export async function runAcp(opts: {
     runtimeGate = gate;
     launchControl.bind(createAcpDrainProvider({
       ready: () => acpSessionId !== null && !loopDone,
-      freezeInput: () => { permissionHandler.reset('Session is shutting down'); },
+      freezeInput: () => { permissionHandler.reset('Session is shutting down', 'shutdown'); },
       activeTurn: () => {
         const sessionToCancel = acpSessionId;
         return pendingTurn && sessionToCancel ? { interrupt: () => backend.cancel(sessionToCancel) } : null;
@@ -1014,7 +1014,7 @@ export async function runAcp(opts: {
       if (acpSessionId) {
         await backend.cancel(acpSessionId);
       }
-      permissionHandler.reset();
+      permissionHandler.reset('Aborted by user', 'aborted');
       abortController.abort();
     } catch (error) {
       logger.debug(`[${opts.agentName}] Abort failed:`, error);
@@ -1140,7 +1140,7 @@ export async function runAcp(opts: {
     clearPendingTurn(new Error('ACP runner shutting down'));
 
     try {
-      permissionHandler.reset();
+      permissionHandler.reset('Session shutting down', 'shutdown');
     } catch (error) {
       logger.debug(`[${opts.agentName}] Failed to reset permission handler:`, error);
     }

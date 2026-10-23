@@ -274,7 +274,7 @@ describe('BasePermissionHandler settlement hook', () => {
         const handler = new ObservingHandler(mock.session as any);
         handler.throwOnSettle = true;
         const decided = raise(handler);
-        await expect(mock.answer({ id: 'call_exec_1', approved: true })).resolves.toBeUndefined();
+        await expect(mock.answer({ id: 'call_exec_1', approved: true })).resolves.toEqual({ applied: true });
         await expect(decided).resolves.toEqual({ decision: 'approved' });
         // The agent state still moved the request to completed.
         expect(mock.getState().completedRequests.call_exec_1).toMatchObject({ status: 'approved' });
@@ -546,5 +546,65 @@ describe('CodexPermissionHandler tool policy approval (agent-tool-policy R11)', 
         await expect(handler.requestPolicyApproval({ id: 'same', toolName: 't', args: {}, policy, signal: new AbortController().signal })).rejects.toThrow();
         await answer(session, { id: 'same', approved: true });
         await expect(first).resolves.toEqual({ approved: true, policyGrant: 'once' });
+    });
+});
+
+describe('Base permission handler resolution records (codexcli-approval-session-binding T15·T16·T17)', () => {
+    function answerer(session: ReturnType<typeof createSessionMock>['session']) {
+        const permission = session.rpcHandlerManager.registerHandler.mock.calls.find(([name]) => name === 'permission');
+        return permission![1] as (message: unknown) => Promise<unknown>;
+    }
+
+    it('acknowledges the first answer and refuses a duplicate as already answered', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const pending = handler.handleToolCall('call-1', 'Bash', {});
+        const answer = answerer(session);
+
+        await expect(answer({ id: 'call-1', approved: true })).resolves.toEqual({ applied: true });
+        await expect(answer({ id: 'call-1', approved: false })).resolves.toEqual({ applied: false, reason: 'already-answered' });
+        await expect(answer({ id: 'never-raised', approved: true })).resolves.toEqual({ applied: false, reason: 'unknown-request' });
+        await expect(pending).resolves.toEqual({ decision: 'approved' });
+        expect(getState().completedRequests['call-1']).toMatchObject({ status: 'approved', resolution: 'answered' });
+    });
+
+    it.each([
+        ['abortAll', 'aborted'],
+        ['cancelRequest', 'aborted'],
+        ['reset', 'reset'],
+    ] as const)('records %s as %s', async (path, resolution) => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const pending = handler.handleToolCall('call-1', 'Bash', {});
+        void pending.catch(() => {});
+
+        if (path === 'abortAll') handler.abortAll();
+        else if (path === 'cancelRequest') handler.cancelRequest('call-1');
+        else handler.reset();
+
+        await pending.catch(() => {});
+        expect(getState().completedRequests['call-1']).toMatchObject({ status: 'canceled', resolution });
+    });
+
+    it('takes the resolution a caller names, and answers a late answer after the reset as unknown', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        void handler.handleToolCall('call-1', 'Bash', {}).catch(() => {});
+
+        handler.reset('Previous CLI process exited before responding', 'runtime-restart');
+
+        expect(getState().completedRequests['call-1']).toMatchObject({ resolution: 'runtime-restart' });
+        await expect(answerer(session)({ id: 'call-1', approved: true })).resolves.toEqual({ applied: false, reason: 'unknown-request' });
+    });
+
+    it('records a shutdown as shutdown', async () => {
+        const { session, getState } = createSessionMock();
+        const handler = new CodexPermissionHandler(session as any);
+        const pending = handler.handleToolCall('call-1', 'Bash', {});
+
+        handler.closeForShutdown();
+
+        await pending;
+        expect(getState().completedRequests['call-1']).toMatchObject({ reason: 'Session shutting down', resolution: 'shutdown' });
     });
 });

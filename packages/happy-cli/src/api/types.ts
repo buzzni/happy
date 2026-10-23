@@ -8,6 +8,7 @@ import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from
 import type { SandboxConfig } from '@/persistence'
 import type { SessionSource } from '@/utils/sessionSource'
 import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate'
+import type { PermissionResolution } from '@/utils/permissionResolution'
 import type { ToolPolicyAuditRecord } from '@/toolPolicy/audit'
 import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
@@ -663,6 +664,12 @@ export type AgentState = {
       createdAt: number,
       /** aplus-dev-studio specs/agent-tool-policy R11 — present only on a tool policy `ask`. */
       policy?: PermissionPolicyMeta
+      /**
+       * aplus-dev-studio specs/codexcli-approval-session-binding R13 — when an unattended wait is
+       * declined, on this process's clock. For display only: clients add `expiresAt - createdAt`
+       * to the moment they first saw the request rather than comparing clocks.
+       */
+      expiresAt?: number
     }
   }
   completedRequests?: {
@@ -677,6 +684,8 @@ export type AgentState = {
       mode?: PermissionMode,
       decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
       allowTools?: string[]
+      /** codexcli-approval-session-binding plan §3.4 — which path settled it. Older clients ignore it. */
+      resolution?: PermissionResolution
     }
   }
   agentGoalStatus?: AgentGoalStatus

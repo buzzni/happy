@@ -594,6 +594,10 @@ export async function runGemini(opts: {
 
   // Create permission handler for tool approval (variable declared earlier for onSessionSwap)
   permissionHandler = new GeminiPermissionHandler(session);
+  // Drop any permission requests left in agent state from a previous CLI process that died while a
+  // tool prompt was open, as the Claude, Codex and ACP runners do — without it the card stays live
+  // on every screen for a call nobody is waiting on (codexcli-approval-session-binding T18).
+  permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
   
   // Create reasoning processor for handling thinking/reasoning chunks
   const reasoningProcessor = new GeminiReasoningProcessor((message) => {
@@ -1016,7 +1020,7 @@ export async function runGemini(opts: {
         }
         
         // Reset permission handler and reasoning processor on mode change (like Codex)
-        permissionHandler.reset();
+        permissionHandler.reset(undefined, 'reset');
         reasoningProcessor.abort();
         
         // Dispose old backend and create new one with new model
@@ -1306,7 +1310,7 @@ export async function runGemini(opts: {
         }
       } finally {
         // Reset permission handler, reasoning processor, and diff processor after turn (like Codex)
-        permissionHandler.reset();
+        permissionHandler.reset(undefined, 'turn-ended');
         reasoningProcessor.abort(); // Use abort to properly finish any in-progress tool calls
         diffProcessor.reset(); // Reset diff processor on turn completion
         

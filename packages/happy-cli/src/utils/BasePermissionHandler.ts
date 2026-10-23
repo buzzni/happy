@@ -11,6 +11,7 @@ import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { AgentState } from "@/api/types";
 import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate';
+import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from '@/utils/permissionResolution';
 
 /**
  * Permission response from the mobile app.
@@ -56,6 +57,8 @@ export abstract class BasePermissionHandler {
     protected pendingRequests = new Map<string, PendingRequest>();
     protected session: ApiSessionClient;
     private isResetting = false;
+    /** Settled ids, kept across `reset()` so a late answer is told what happened (plan §3.4, T16). */
+    private readonly resolved = new ResolvedPermissionLog();
 
     /**
      * Returns the log prefix for this handler.
@@ -115,17 +118,20 @@ export abstract class BasePermissionHandler {
      * Setup RPC handler for permission responses.
      */
     protected setupRpcHandler(): void {
-        this.session.rpcHandlerManager.registerHandler<PermissionResponse, void>(
+        // Returns what happened to the answer, as the Claude handler does (T17). Clients that predate
+        // the body ignore it, which is what they did with `undefined`.
+        this.session.rpcHandlerManager.registerHandler<PermissionResponse, PermissionAck>(
             'permission',
             async (response) => {
                 const pending = this.pendingRequests.get(response.id);
                 if (!pending) {
                     logger.debug(`${this.getLogPrefix()} Permission request not found or already resolved`);
-                    return;
+                    return this.resolved.ackFor(response.id);
                 }
 
                 // Remove from pending
                 this.pendingRequests.delete(response.id);
+                this.resolved.record(response.id, 'answered');
 
                 // Resolve the permission request
                 const result: PermissionResult = response.approved
@@ -158,7 +164,8 @@ export abstract class BasePermissionHandler {
                                 ...request,
                                 completedAt,
                                 status: response.approved ? 'approved' : 'denied',
-                                decision: result.decision
+                                decision: result.decision,
+                                resolution: 'answered',
                             }
                         }
                     } satisfies AgentState;
@@ -166,6 +173,7 @@ export abstract class BasePermissionHandler {
                 });
 
                 logger.debug(`${this.getLogPrefix()} Permission ${response.approved ? 'approved' : 'denied'} for ${pending.toolName}`);
+                return { applied: true };
             }
         );
     }
@@ -190,10 +198,11 @@ export abstract class BasePermissionHandler {
     }
 
     /** Cancel only this provider-owned request; unrelated approvals remain pending. */
-    cancelRequest(id: string): void {
+    cancelRequest(id: string, resolution: PermissionResolution = 'aborted'): void {
         const pending = this.pendingRequests.get(id);
         if (!pending) return;
         this.pendingRequests.delete(id);
+        this.resolved.record(id, resolution);
         pending.resolve({ decision: 'abort' });
         this.notifySettled(id, 'aborted');
         const completedAt = Date.now();
@@ -202,7 +211,7 @@ export abstract class BasePermissionHandler {
             if (!request) return current;
             const { [id]: _, ...requests } = current.requests ?? {};
             return { ...current, requests, completedRequests: {
-                ...current.completedRequests, [id]: { ...request, completedAt, status: 'canceled' },
+                ...current.completedRequests, [id]: { ...request, completedAt, status: 'canceled', resolution },
             } };
         });
     }
@@ -214,13 +223,14 @@ export abstract class BasePermissionHandler {
      * user presses the abort/stop button — it unblocks any pending tool approval so the provider
      * can process the turn cancellation.
      */
-    abortAll(reason: string = 'Aborted by user'): void {
+    abortAll(reason: string = 'Aborted by user', resolution: PermissionResolution = 'aborted'): void {
         const pendingSnapshot = Array.from(this.pendingRequests.entries());
         if (pendingSnapshot.length === 0) return;
 
         this.pendingRequests.clear();
 
         for (const [id, pending] of pendingSnapshot) {
+            this.resolved.record(id, resolution);
             try {
                 pending.resolve({ decision: 'abort' });
             } catch (err) {
@@ -242,7 +252,8 @@ export abstract class BasePermissionHandler {
                     ...request,
                     completedAt,
                     status: 'canceled',
-                    reason
+                    reason,
+                    resolution,
                 };
             }
 
@@ -260,7 +271,7 @@ export abstract class BasePermissionHandler {
      * Reset state for new sessions.
      * This method is idempotent - safe to call multiple times.
      */
-    reset(reason: string = 'Session reset'): void {
+    reset(reason: string = 'Session reset', resolution: PermissionResolution = 'reset'): void {
         // Guard against re-entrant/concurrent resets
         if (this.isResetting) {
             logger.debug(`${this.getLogPrefix()} Reset already in progress, skipping`);
@@ -275,6 +286,7 @@ export abstract class BasePermissionHandler {
 
             // Reject all pending requests from snapshot
             for (const [id, pending] of pendingSnapshot) {
+                this.resolved.record(id, resolution);
                 try {
                     pending.reject(new Error('Session reset'));
                 } catch (err) {
@@ -297,7 +309,8 @@ export abstract class BasePermissionHandler {
                         ...request,
                         completedAt,
                         status: 'canceled',
-                        reason
+                        reason,
+                        resolution,
                     };
                 }
 

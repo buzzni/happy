@@ -241,7 +241,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // previous process is gone and the new one has no record of the id.
     // reset() moves any stale entries to completedRequests with status
     // 'canceled' so the UI reflects what actually happened.
-    permissionHandler.reset('Previous CLI process exited before responding');
+    permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
 
     // Token-level preview frames ride a separate volatile channel and never
     // enter the persisted message queue below.
@@ -677,7 +677,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         if (session.managedRun) registerManagedGracefulStop(gracefulStop);
         drain?.attachLauncher({
             requestEndInput: () => { gracefulStop?.request(); },
-            cancelPendingPermissions: () => { permissionHandler.reset('Session is shutting down'); },
+            cancelPendingPermissions: () => { permissionHandler.reset('Session is shutting down', 'shutdown'); },
             generation: () => startedGeneration()?.observer ?? null,
             hasHeldBackInput: () => pending !== null,
             lastResultInterrupted: () => lastResultInterrupted,
@@ -716,7 +716,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             const isNewSession = session.sessionId !== previousSessionId;
             if (isNewSession) {
                 messageBuffer.addMessage('Starting new Claude session...', 'status');
-                permissionHandler.reset(); // Reset permissions before starting new session
+                permissionHandler.reset(undefined, 'reset'); // Reset permissions before starting new session
                 sdkToLogConverter.resetParentChain(); // Reset parent chain for new conversation
                 logger.debug(`[remote]: New session detected (previous: ${previousSessionId}, current: ${session.sessionId})`);
             } else {
@@ -1300,7 +1300,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 // This generation is gone; no turn of it can still be running.
                 drain?.setQuery(null);
                 drain?.turnEnded();
-                permissionHandler.reset();
+                permissionHandler.reset(undefined, 'generation-ended');
                 modeHash = null;
                 mode = null;
             }
@@ -1359,7 +1359,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
         // Clean up permission handler
         session.policyApprover = null;
-        permissionHandler.reset();
+        permissionHandler.reset(undefined, 'shutdown');
 
         // Reset Terminal
         const t0 = Date.now();
