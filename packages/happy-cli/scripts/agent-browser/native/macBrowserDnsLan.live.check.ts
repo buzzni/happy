@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { chownSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chownSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { networkInterfaces } from 'node:os'
 import { randomBytes } from 'node:crypto'
@@ -33,7 +33,9 @@ function chrome(args: string[], url: string, profile: string): Promise<{ status:
         let out = ''
         child.stdout!.on('data', (d) => { out += d })
         const timer = setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL') } catch { /* gone */ } }, 90_000)
-        child.on('close', (status) => { clearTimeout(timer); resolve({ status, dom: out.length, text: out.slice(0, 2000) }) })
+        // Without this, a failed spawn throws past main()'s finally and leaves the account and tcpdump behind.
+        child.once('error', () => { clearTimeout(timer); resolve({ status: null, dom: out.length, text: out.slice(0, 2000) }) })
+        child.once('close', (status) => { clearTimeout(timer); resolve({ status, dom: out.length, text: out.slice(0, 2000) }) })
     })
 }
 
@@ -41,6 +43,7 @@ async function main() {
     const outPath = process.argv[2]
     assert(outPath, 'usage: macBrowserDnsLan.live.check.ts <evidence.json>')
     assert.equal(process.getuid?.(), 0, 'run with sudo')
+    assert(existsSync(CHROME), `Chrome not found at ${CHROME}`)
     const operatorUid = Number(process.env.SUDO_UID), operatorGid = Number(process.env.SUDO_GID)
     assert(Number.isInteger(operatorUid) && operatorUid >= 501, 'run via sudo from your user')
     assert.notEqual(sh('/usr/bin/dscl', ['.', '-read', `/Users/${NAME}`]).status, 0, `${NAME} already exists`)
