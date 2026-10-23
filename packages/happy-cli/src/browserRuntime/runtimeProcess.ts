@@ -500,6 +500,10 @@ export async function runRuntime(deps: RuntimeProcessDeps = {}): Promise<void> {
             trustedIssuers: config.trustedIssuers,
             agentKey: keys.agentKey,
             revokeGrant: (grantId) => runtime.revokeGrant(grantId),
+            setLocalClientValidator: check => runtime.setLocalClientValidator(check),
+            attachLocalClient: (owner, client, until) => runtime.attachLocalClient(owner, client, until),
+            cleanupLocalClient: (id: string) => runtime.endLocalClient(id),
+            checkLocalClient: (client) => runtime.checkLocalClient(client),
             endSession: async (agentSessionId) => { await runtime.endSession(agentSessionId); reclaim() },
             // Also while an approval or release has not reached the daemon yet: its delivery resumes the session.
             sessionWaiting: async (agentSessionId) => await runtime.sessionWaiting(agentSessionId) || attention.hasUndelivered(agentSessionId),

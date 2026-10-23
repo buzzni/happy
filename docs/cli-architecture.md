@@ -893,3 +893,7 @@ credential read deny as rollback. Publishing the corresponding CLI and exact Hap
 
 Activation is gated by `saycodeAgentBrokerProtocol: 1` in the bundled CLI manifest, so a Happy upgrade before
 the corresponding CLI release retains the old facade. Publish/install acceptance must verify both artifacts.
+
+### Local applications using Agent Browser spaces
+
+`browserRuntime/localClients.ts` owns bounded client delegation separately from daemon session registrations. An existing authenticated session delegates its own space under the same principal; the runtime checks space membership, assignment and tab ownership. Client credentials can request only a narrow AgentGrant and cannot register or join other spaces. `runtime.ts` persists fixed client leases on spaces, fences expired/revoked clients and preserves ordinary reclaim behavior for other spaces. `browserRuntime/localClientSession.ts` holds the owner credential inside the trusted session process, requests human-only one-time approval and issues a private connection file. Claude/Codex wire the existing permission approver; other runners fail closed. `commands/browserClientCommand.ts` provides bounded collection/status/revocation without loading provider runtimes; public CLI issuance is disabled. This is not the Chrome extension bridge. See [the local-client contract](browser-local-client.md) for expiry, downgrade and same-OS-user limitations. Revisit this boundary before adding indefinite renewal, remote clients or a broader extraction API.

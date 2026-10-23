@@ -49,6 +49,16 @@ jobs:
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
 
+    - name: Verify local browser client with Chrome and Unix broker
+      if: matrix.node-version == 24
+      timeout-minutes: 10
+      env:
+        BROWSER_CLIENT_REAL_SMOKE: '1'
+      run: |
+        export CHROME_PATH="$(command -v google-chrome || command -v chromium || command -v chromium-browser)"
+        test -n "$CHROME_PATH"
+        pnpm --filter @buzzni/happy-cli exec vitest run --project browser-poc src/browserRuntime/localClients.poc.test.ts
+
     # `happy server` resolves the self-host runtime and bundled webapp from
     # happy-server-self-host. The server package is JS/TS and lets npm install
     # platform-specific dependencies such as Prisma and sharp normally.

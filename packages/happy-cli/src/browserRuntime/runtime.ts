@@ -89,6 +89,8 @@ const LIST_TASKS_LIMIT = 50
 
 
 export class BrowserRuntime implements BrowserRuntimeApi {
+    private localClientValidator: ((id: string) => boolean) | undefined
+    setLocalClientValidator(check: (id: string) => boolean): void { this.localClientValidator = check }
     readonly leases = new InputLeaseManager()
     private readonly drivers: Map<ProfileId, BrowserDriver>
     private readonly clock: RuntimeClock
@@ -116,6 +118,41 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.cleanup.catch(() => undefined)
         this.recovery = this.cleanup.then(() => this.recoverExistingTasks().catch(() => undefined))
         this.recovery.catch(() => undefined)
+    }
+    /** Broker-only enrollment: existing owner membership authorizes a separate, narrowly scoped client. */
+    async attachLocalClient(owner: AuthContext, client: AgentGrant, expiresAtMs: number): Promise<void> {
+        await this.recovery
+        const spaceId = client.taskSpaceIds[0]
+        if (client.taskSpaceIds.length !== 1 || !spaceId || client.principalId !== owner.credential.principalId
+            || client.workspaceId !== owner.credential.workspaceId || client.machineId !== owner.credential.machineId
+            || client.profileId !== owner.credential.profileId || expiresAtMs <= this.clock.now())
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Invalid local client delegation')
+        const space = this.requireSpace(spaceId)
+        this.checkCredential(owner, 'createTask', space.profileId, spaceId)
+        if (space.endedSessionIds?.includes((owner.credential as AgentGrant).agentSessionId))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Delegating session has ended')
+        const ownerSession = (owner.credential as AgentGrant).agentSessionId
+        if (!space.owner || space.owner.principalId !== owner.credential.principalId
+            || space.owner.workspaceId !== owner.credential.workspaceId || space.owner.machineId !== owner.credential.machineId
+            || !(space.memberSessionIds ?? [space.agentSessionId]).includes(ownerSession))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Delegating session does not own this space')
+        await this.options.store.mutateSpace(spaceId, current => {
+            if (current.endedSessionIds?.includes(ownerSession)) throw new BrowserRuntimeError('SCOPE_DENIED', 'Delegating session has ended')
+            if (current.closed || current.reclaimingSinceMs !== undefined)
+                throw new BrowserRuntimeError('CONFLICT', 'Task space is closed')
+            return { memberSessionIds: [...new Set([...(current.memberSessionIds ?? [current.agentSessionId!]), client.agentSessionId])],
+                localClientLeases: { ...current.localClientLeases, [client.agentSessionId]: expiresAtMs },
+                membershipEvents: [...current.membershipEvents ?? [], { type: 'joined', agentSessionId: client.agentSessionId, atMs: this.clock.now() }] }
+        })
+    }
+    async checkLocalClient(client: AgentGrant): Promise<void> {
+        await this.recovery
+        const space = this.requireSpace(client.taskSpaceIds[0])
+        const auth = { credential: client, verifiedAtMs: this.clock.now() }
+        this.checkCredential(auth, 'createTask', space.profileId, space.taskSpaceId)
+        await this.authorizeSpace(auth, space)
+        if (space.closed || space.reclaimingSinceMs !== undefined || (space.localClientLeases?.[client.agentSessionId] ?? 0) <= this.clock.now())
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Local client connection is closed or expired')
     }
     listSpaces: BrowserRuntimeApi['listSpaces'] = async (auth, req) => {
         await this.recovery
@@ -458,6 +495,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
         if (!space.tabs.includes(req.tabId))
             throw new BrowserRuntimeError('SCOPE_DENIED', 'Tab is not registered to this task space')
+        if (auth.credential.kind === 'agent-grant' && auth.credential.agentSessionId.startsWith('client-')
+            && !this.options.store.listTasks().some(task => task.agentSessionId === (auth.credential as AgentGrant).agentSessionId
+                && task.taskSpaceId === space.taskSpaceId && task.tabs.includes(req.tabId)))
+            throw new BrowserRuntimeError('SCOPE_DENIED', 'Local client may close only its own tabs')
         const refs = this.options.store.listTasks().filter((task) => task.tabs.includes(req.tabId) && (!['succeeded', 'failed',
             'cancelled'].includes(task.status) || this.workers.has(task.taskId)))
         if (refs.length)
@@ -893,7 +934,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             return members.includes(agentSessionId)
         }).map((space) => space.taskSpaceId), ...tasks.map((task) => task.taskSpaceId)])
         for (const taskSpaceId of spaceIds) {
-            await this.options.store.mutateSpace(taskSpaceId, (current) => ({ endedSessionIds: [...new Set([...(current.endedSessionIds ?? []), agentSessionId])] }))
+            await this.options.store.mutateSpace(taskSpaceId, (current) => ({ endedSessionIds: [...new Set([...(current.endedSessionIds ?? []), agentSessionId])],
+                localClientLeases: Object.fromEntries(Object.entries(current.localClientLeases ?? {}).filter(([id]) => id !== agentSessionId)) }))
             const current = this.requireSpace(taskSpaceId)
             const members = current.memberSessionIds ?? [current.agentSessionId].filter(Boolean) as string[]
             if (members.length > 0 && members.every((member) => (current.endedSessionIds ?? []).includes(member)))
@@ -903,6 +945,26 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (!FINISHED_STATUSES.has(task.status))
                 await this.cancelTask(this.requireTask(task.taskId))
         }
+    }
+    private clientCleanupNext = new Map<string, number>()
+    /** Client revocation retries cleanup without touching another session's tabs. */
+    async endLocalClient(agentSessionId: string): Promise<void> {
+        if ((this.clientCleanupNext.get(agentSessionId) ?? 0) > this.clock.now())
+            throw new BrowserRuntimeError('CONFLICT', 'Client cleanup is backing off')
+        await this.endSession(agentSessionId)
+        let pending = false
+        for (const task of this.options.store.listTasks().filter(task => task.agentSessionId === agentSessionId)) {
+            if (this.workers.has(task.taskId) || !FINISHED_STATUSES.has(task.status)) { pending = true; continue }
+            for (const tabId of task.tabs) {
+                if (!this.requireSpace(task.taskSpaceId).tabs.includes(tabId)) continue
+                if (await this.closeSpaceTab(task.profileId, task.taskSpaceId, tabId) !== 'closed') pending = true
+            }
+        }
+        if (pending) {
+            this.clientCleanupNext.set(agentSessionId, this.clock.now() + 60_000)
+            throw new BrowserRuntimeError('CONFLICT', 'Client cleanup awaits a worker or user-controlled tab')
+        }
+        this.clientCleanupNext.delete(agentSessionId)
     }
     /**
      * One reclamation pass: spaces marked for reclamation, and (with spaceIdleReclaimMs)
@@ -918,6 +980,13 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private reclaimTail: Promise<unknown> = Promise.resolve()
     private async reclaimPass(): Promise<SpaceReclaimReport[]> {
         await this.recovery
+        for (const space of this.options.store.listSpaces()) {
+            const expired = Object.entries(space.localClientLeases ?? {}).filter(([, until]) => until <= this.clock.now()).map(([id]) => id)
+            const endedClients = (space.endedSessionIds ?? []).filter(id => id.startsWith('client-')
+                && this.spaceTasks(space.taskSpaceId).some(task => task.agentSessionId === id && task.tabs.some(tab => space.tabs.includes(tab))))
+            for (const id of new Set([...expired, ...endedClients]))
+                await this.endLocalClient(id).catch(() => undefined)
+        }
         const reports: SpaceReclaimReport[] = []
         const idleMs = this.options.spaceIdleReclaimMs
         for (const space of this.options.store.listSpaces()) {
@@ -926,7 +995,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (space.reclaimingSinceMs === undefined) {
                 const tasks = this.spaceTasks(space.taskSpaceId)
                 const lastActivityMs = Math.max(space.createdAtMs, ...tasks.map((task) => Number(task.updatedAtMs)))
-                if (idleMs === undefined || tasks.some((task) => !FINISHED_STATUSES.has(task.status) || this.workers.has(task.taskId))
+                if (Object.values(space.localClientLeases ?? {}).some(until => until > this.clock.now())
+                    || idleMs === undefined || tasks.some((task) => !FINISHED_STATUSES.has(task.status) || this.workers.has(task.taskId))
                     || this.clock.now() - lastActivityMs < idleMs)
                     continue
                 await this.markReclaiming(space.taskSpaceId, 'idle')
@@ -2780,6 +2850,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     }
     private isCredentialLive(auth: AuthContext): boolean {
         const credential = auth.credential
+        if (credential.kind === 'agent-grant' && credential.agentSessionId.startsWith('client-')) {
+            if (this.localClientValidator && !this.localClientValidator(credential.agentSessionId)) return false
+            const space = credential.taskSpaceIds.length === 1 ? this.options.store.getSpace(credential.taskSpaceIds[0]) : undefined
+            if (!space || space.closed || space.reclaimingSinceMs !== undefined
+                || (space.localClientLeases?.[credential.agentSessionId] ?? 0) <= this.clock.now()) return false
+        }
         return credential.expiresAtMs > this.clock.now()
             && !this.options.store.isRevoked(credential.kind === 'agent-grant' ? credential.grantId : credential.capabilityId)
     }

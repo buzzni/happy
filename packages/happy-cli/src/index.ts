@@ -13,7 +13,11 @@ if (args[0] === 'daemon' && args[1] === 'start-sync') loadBrowserTaskEnv(process
 try { captureStandaloneLaunchBootstrap(process.env, args) }
 catch { console.error('Invalid standalone launch bootstrap'); process.exit(1) }
 
-if (args[0] === 'agent') {
+if (args[0] === 'browser-client') {
+  void import('./commands/browserClientCommand').then(async ({ handleBrowserClientCommand }) => {
+    process.exitCode = await handleBrowserClientCommand(args.slice(1))
+  }).catch(() => { console.error('Browser client command unavailable'); process.exitCode = 3 })
+} else if (args[0] === 'agent') {
   try {
     process.exit(handleAgentCommand(args.slice(1)))
   } catch (error) {

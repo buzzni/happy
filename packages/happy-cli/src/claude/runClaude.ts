@@ -748,8 +748,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const lessonProposalTurn = createLessonProposalTurn();
     // Flipped by claudeRemote per turn from that turn's prompt blocks (specs/desktop-next-steps-card).
     const turnCards = createTurnCardSwitch('claude');
+    // Variable to track the current session instance (updated via onSessionReady).
+    // Used by the hook server and the browser connection approver.
+    let currentSession: Session | null = null;
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        browserClientApprover: () => currentSession?.policyApprover ?? null,
         agentControl: principal.kind === 'account' && sandboxPolicyMode !== 'mandatory',
         exitAfterFirstTurn,
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
@@ -766,10 +770,6 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         ...(launchControl ? { admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))) } : {}),
     });
     logger.debug(`[START] Happy MCP server started at ${happyServer.url}`);
-
-    // Variable to track current session instance (updated via onSessionReady callback)
-    // Used by hook server to notify Session when Claude changes session ID
-    let currentSession: Session | null = null;
 
     // Tool policy (aplus-dev-studio specs/agent-tool-policy I1a): every `mcp__*` call goes through
     // the PreToolUse hook to this gate. The daemon cannot yet tell whether a session was started on
