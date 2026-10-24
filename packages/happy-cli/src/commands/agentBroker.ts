@@ -3,7 +3,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 
 export type AgentBrokerResult = { stdout: string; exitCode: 0 | 3; projection?: unknown }
 const MAX_BYTES = 1024 * 1024
-const VERBS = new Set(['whoami', 'ls', 'read', 'wait', 'spawn', 'prompt', 'steer', 'stop'])
+const VERBS = new Set(['whoami', 'ls', 'read', 'wait', 'spawn', 'prompt', 'search', 'steer', 'stop'])
 
 /** Session-local capability; neither arbitrary commands nor caller identity are accepted. */
 export async function startAgentBroker(input: {
