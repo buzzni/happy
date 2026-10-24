@@ -24,6 +24,7 @@ import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
 import { bashStreamSpillStoreFor, removeBashStreamSpillStore, renderBashStreamResult } from "./bashStreamOutput";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
+import { sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 import { readFile } from 'node:fs/promises';
@@ -244,7 +245,16 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
                 command: args.command,
                 cwd: protectedCwd ?? args.cwd,
                 detached: Boolean(handlers.protectedBashCwd),
-                onSpawn: handlers.trackProtectedBashProcess,
+                onSpawn: (child) => {
+                    // aplus-dev-studio-desktop#2111 — recorded at spawn so an interrupt can clean it up later.
+                    sessionBackgroundProcesses.record({
+                        sessionId: handlers.client.sessionId,
+                        child,
+                        command: String(args.command),
+                        ownProcessGroup: Boolean(handlers.protectedBashCwd),
+                    });
+                    handlers.trackProtectedBashProcess?.(child);
+                },
                 spill,
                 onProgress: (progress) => {
                     const call = getActiveBashStreamCall();

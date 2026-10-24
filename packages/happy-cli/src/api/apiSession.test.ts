@@ -21,6 +21,7 @@ const {
     mockNotifyDaemonSessionRuntime,
     mockNotifyDaemonAutomationTurnResult,
     sessionRpcConfigs,
+    sessionRpcMethods,
     registeredCommonHandlers,
 } = vi.hoisted(() => ({
     mockIo: vi.fn(),
@@ -43,6 +44,7 @@ const {
     mockNotifyDaemonSessionRuntime: vi.fn(async () => ({ status: 'ok' })),
     mockNotifyDaemonAutomationTurnResult: vi.fn(async () => ({ status: 'ok' })),
     sessionRpcConfigs: [] as Array<{ requireBoundRequests?: boolean }>,
+    sessionRpcMethods: [] as string[],
     registeredCommonHandlers: vi.fn(),
 }));
 
@@ -81,6 +83,7 @@ vi.mock('@/api/rpc/RpcHandlerManager', () => ({
         onSocketConnect = vi.fn();
         onSocketDisconnect = vi.fn();
         handleRequest = vi.fn(async () => '');
+        registerHandler = vi.fn((method: string) => { sessionRpcMethods.push(method); });
     }
 }));
 
@@ -222,6 +225,14 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 managedTools: { root: '/tmp/happy-test-home/managed-tools', tools: [expect.objectContaining({ id: 'buzzni.moai' })] },
             } },
         );
+    });
+
+    // aplus-dev-studio-desktop#2111 — every session scope answers the interrupt clean-up.
+    it('registers clean-background-processes on the session scope', () => {
+        sessionRpcMethods.length = 0;
+        new ApiSessionClient('fake-token', session);
+
+        expect(sessionRpcMethods).toContain('clean-background-processes');
     });
 
     afterEach(() => {
