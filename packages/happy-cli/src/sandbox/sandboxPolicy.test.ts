@@ -108,6 +108,15 @@ describe('sandboxTrustFloorPaths', () => {
         expect(paths).toContain('/srv/agent/.happy_remote');
     });
 
+    // Fable 리뷰(#939): Saycode CLI 로그인 자격증명(~/.saycode/credentials.v1.json)도 access.key 와
+    // 같은 토큰·키를 담는다. 막지 않으면 mandatory 세션이 그것으로 broker 없이 직접 인증한다.
+    it('covers the Saycode CLI credential home when it exists', () => {
+        expect(sandboxTrustFloorPaths({
+            homeDir: '/home/dev',
+            listHomeEntries: () => ['.saycode', '.saycode-backup', 'workspace'],
+        })).toEqual(['/home/dev/.saycode']);
+    });
+
     it('does not fail when the home directory cannot be listed', () => {
         expect(sandboxTrustFloorPaths({
             homeDir: '/home/dev',

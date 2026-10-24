@@ -22,6 +22,16 @@ describe('session agent broker', () => {
     expect(await (await send({ version: 1, argv })).json()).toEqual({ stdout: '{"ok":true}\n', exitCode: 0 })
     expect(calls).toEqual([argv])
   })
+  it('forwards agent search, which the bundled CLI host serves like the other read verbs', async () => {
+    const calls: string[][] = []
+    const broker = await startAgentBroker({ execute: async (argv) => { calls.push(argv); return { stdout: '{"ok":true}\n', exitCode: 0 } } })
+    cleanup.push(broker.close)
+    const response = await fetch(broker.environment.SAYCODE_AGENT_BROKER_URL, { method: 'POST',
+      headers: { authorization: `Bearer ${broker.environment.SAYCODE_AGENT_BROKER_CAPABILITY}` },
+      body: JSON.stringify({ version: 1, argv: ['search', 'rollback'] }) })
+    expect(response.status).toBe(200)
+    expect(calls).toEqual([['search', 'rollback']])
+  })
   it('serializes spawn admission and revokes active calls on close', async () => {
     let release!: () => void
     let cancelled = false
