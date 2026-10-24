@@ -8,12 +8,13 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MachineMetadataSchema } from '@/api/types';
 import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
 import { handOffCuaToShadowProxy, toolPolicyMachineCapability, toolPolicyMetadataUpdate, isToolPolicyEnabled } from './claudeHook';
 import { createPolicyGrantStore } from './grants';
 import { createToolPolicyGate, type HookVerdict, type PolicyApprovalAnswer, type PolicyApprover, type PreToolUseCall, type ToolPolicyGate } from './policyGate';
-import { ABSENT_MACHINE_POLICY } from './rules';
+import { ABSENT_MACHINE_POLICY, BUILTIN_TABLES } from './rules';
 import { createTargetResolver, type TargetResolver } from './targetResolver';
 
 const FORWARDER = resolve(__dirname, '../../scripts/policy_hook_forwarder.cjs');
@@ -277,7 +278,7 @@ describe('tool policy switch and capability', () => {
     it('is on by default and off with HAPPY_TOOL_POLICY=off', () => {
         expect(isToolPolicyEnabled({})).toBe(true);
         expect(isToolPolicyEnabled({ HAPPY_TOOL_POLICY: 'off' })).toBe(false);
-        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', 'verb-words:all'] });
+        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', 'verb-words:all'], policyVersion: BUILTIN_TABLES.policyVersion });
         expect(toolPolicyMachineCapability({ HAPPY_TOOL_POLICY: 'OFF' })).toBeUndefined();
     });
 
@@ -289,6 +290,15 @@ describe('tool policy switch and capability', () => {
         expect(toolPolicyMetadataUpdate({ ...stored, toolPolicy: on }, undefined)).toEqual(stored);
         expect(toolPolicyMetadataUpdate(stored, undefined)).toBeUndefined();
         expect(toolPolicyMetadataUpdate(null, on)).toBeUndefined();
+    });
+
+    // aplus-dev-studio-desktop #2272: a machine announced before the table version (or under an older table) is refreshed.
+    it('announces the table version and refreshes a capability without it', () => {
+        const on = toolPolicyMachineCapability({})!;
+        const { policyVersion: _version, ...unversioned } = on;
+        const stored = { host: 'mac', toolPolicy: unversioned as unknown };
+        expect(toolPolicyMetadataUpdate(stored, on)).toEqual({ host: 'mac', toolPolicy: on });
+        expect(MachineMetadataSchema.shape.toolPolicy.parse(on)).toEqual(on); // not stripped on the way back in
     });
 });
 
