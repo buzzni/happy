@@ -7,7 +7,9 @@ import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import {
   buildAutomationPrompt,
   computeNextRunAt,
+  previousRunWaitingSessionId,
   shouldWakeFromScriptOutput,
+  withInboxItemInstruction,
   type AutomationAgent,
   type AutomationSchedule,
 } from './automationDomain'
@@ -243,6 +245,11 @@ export interface ServerAutomationExecutorInput {
     worktreePath: string
   }) => Promise<{ ok: true } | { ok: false; dirty: boolean; error: string }>
   isSessionRunning: (sessionId: string) => boolean
+  /**
+   * 자식 세션이 보고한 사용자 입력 대기(질문·계획·권한 승인). 예약 회차의 대기 게이트가 쓴다
+   * (aplus-dev-studio-desktop #2196). 없으면 게이트는 늘 열린다.
+   */
+  isSessionWaitingForUser?: (sessionId: string) => boolean
   /** 매달린 워커 세션에 종료를 요청한다. 실제 종료는 다음 틱의 isSessionRunning 으로 확인한다. */
   stopSession?: (sessionId: string) => void
   cancelScheduledSession?: (input: { sessionId: string; directory: string }) => Promise<boolean>
@@ -448,6 +455,14 @@ function writeWithoutReport(runtimeStore: ServerAutomationRuntimeStore, reportId
 // deployment a day to fix its daemon config before we stop trying.
 const LINK_RETRY_GIVEUP_MS = 24 * 60 * 60 * 1000
 
+/**
+ * 보고 뒤 세션을 프로젝트에 연결하는가. SKIPPED_GATE 의 sessionId 는 이 회차가 띄운 세션이 아니라 기다리는
+ * 앞 대화다(대기 게이트) — 그 대화는 이미 연결됐으므로 건너뛴 회차가 다시 연결하지 않는다.
+ */
+function reportLinksSession(report: PendingAutomationReport): report is PendingAutomationReport & { sessionId: string } {
+  return report.sessionId !== null && report.outcome !== 'SKIPPED_GATE'
+}
+
 function isLinkStillRetryable(
   linked: { ok: boolean; error?: string; skipped?: boolean },
   report: PendingAutomationReport,
@@ -492,7 +507,7 @@ async function flushPendingReports(input: ServerAutomationExecutorInput): Promis
       continue
     }
     if (!result.ok) return
-    if (report.sessionId) {
+    if (reportLinksSession(report)) {
       const linked = await input.linkSession({
         runId: report.runId,
         claimToken: report.claimToken,
@@ -1762,7 +1777,9 @@ async function executeStartedRun(
       }
     }
   }
-  const initialPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
+  const builtPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
+  // 예약 회차는 응답 끝에 받은편지함 요약 한 줄을 남긴다(aplus-dev-studio-desktop #2196). GitHub 작업은 예약 결과가 아니다.
+  const initialPrompt = payload.githubTrigger ? builtPrompt : withInboxItemInstruction(builtPrompt)
   const spawnInput = {
     directory: githubWorktree?.directory ?? payload.directory,
     initialPrompt,
@@ -1975,7 +1992,13 @@ export async function runServerAutomationTick(
     const payload = payloads.get(automation.automationId)!
     const queuedGithubEvents = payload.githubTrigger ? githubQueueDepth(input, automation) : 0
     const githubMode = payload.githubTrigger && queuedGithubEvents === 0 ? 'poll' : 'work'
-    if (!payload.githubTrigger && !payload.conversation
+    // 대기 게이트(aplus-dev-studio-desktop #2196): 대상 대화(이어 쓰는 대화, 아니면 직전 회차 대화)가 사용자 답을
+    // 기다리면 회차를 claim 해 SKIPPED_GATE + 그 대화 id 로 보고한다 — 실행하지 않은 회차가 이력에 남고,
+    // 겹침처럼 매 틱 조용히 미루지 않는다. 보류한 재시도는 이미 시작한 회차라 게이트를 다시 보지 않는다.
+    const waitingSessionId = payload.githubTrigger || retryDue
+      ? null
+      : previousRunWaitingSessionId(payload.conversation?.sessionId ?? schedule.lastSessionId, input)
+    if (!waitingSessionId && !payload.githubTrigger && !payload.conversation
       && schedule.lastSessionId
       && input.isSessionRunning(schedule.lastSessionId)) {
       // 보류한 재시도는 그대로 두고 다음 틱에 다시 본다 — 정규 시각을 당기면 재시도가 정규 실행에 밀려 버려진다.
@@ -2055,7 +2078,9 @@ export async function runServerAutomationTick(
       unreachable?: string
     }
     try {
-      result = await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
+      result = waitingSessionId
+        ? { outcome: 'SKIPPED_GATE', sessionId: waitingSessionId }
+        : await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode)
     } catch (error) {
       input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
       result = { outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_FAILED' }
@@ -2132,7 +2157,7 @@ export async function runServerAutomationTick(
     input.runtimeStore.write({ ...state, pendingReports: [...state.pendingReports, report] })
     const reported = await input.transport.report(report)
     if (reported.ok) {
-      const linked = report.sessionId
+      const linked = reportLinksSession(report)
         ? await input.linkSession({ runId, claimToken, sessionId: report.sessionId })
         : { ok: true }
       const stillRetrying = isLinkStillRetryable(linked, report, input.now)

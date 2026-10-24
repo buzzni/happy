@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { SCRIPT_TIMEOUT_MS, type ScheduledAutomation } from './automationDomain'
+import { SCRIPT_TIMEOUT_MS, withInboxItemInstruction, type ScheduledAutomation } from './automationDomain'
 import { makeAutomation } from './automationTestFixtures'
 import { createAutomationStore, type AutomationStore } from './automationStore'
 import { runAutomationTick, type AutomationTickInput } from './automationTick'
@@ -65,7 +65,8 @@ describe('runAutomationTick', () => {
     expect(input.runScript).not.toHaveBeenCalled()
     expect(input.spawnSession).toHaveBeenCalledWith({
       directory: '/repo/project-1',
-      initialPrompt: '어제 로그를 점검해줘',
+      // 받은편지함 요약 카드 지시(aplus-dev-studio-desktop #2196)는 렌더러 경로처럼 프롬프트 끝에 붙는다.
+      initialPrompt: withInboxItemInstruction('어제 로그를 점검해줘'),
       createdByAccountId: null,
       agent: 'codex',
       sessionSource: 'schedule',
@@ -180,6 +181,54 @@ describe('runAutomationTick', () => {
 
       expect(outcomes).toEqual([{ id: 'auto-1', outcome: 'woke' }])
       expect(vi.mocked(input.isSessionRunning)).toHaveBeenCalledWith('session-done')
+    })
+  })
+
+  // aplus-dev-studio-desktop #2196 — 렌더러 경로와 같은 대기 게이트(specs/_archive/desktop-automation-run-eligibility R1·R3).
+  describe('waiting gate', () => {
+    it('records skipped-waiting naming the waiting conversation, without running the script or spawning', async () => {
+      store.replaceAll([makeDueAutomation({
+        scriptCommand: 'probe',
+        runHistory: [{ at: NOW - 120_000, outcome: 'woke', sessionId: 'session-waiting' }],
+      })])
+      const input = makeInput({
+        isSessionRunning: vi.fn((sessionId: string) => sessionId === 'session-waiting'),
+        isSessionWaitingForUser: vi.fn((sessionId: string) => sessionId === 'session-waiting'),
+      })
+
+      expect(await runAutomationTick(input)).toEqual([{ id: 'auto-1', outcome: 'skipped-waiting' }])
+      expect(input.runScript).not.toHaveBeenCalled()
+      expect(input.spawnSession).not.toHaveBeenCalled()
+      const [saved] = store.list()
+      expect(saved!.runHistory[0]).toEqual({ at: NOW, outcome: 'skipped-waiting', sessionId: null, blockedBySessionId: 'session-waiting' })
+      expect(saved!.nextRunAt).toBe(NOW + 30 * 60_000)
+    })
+
+    it('keeps waiting on the same conversation after earlier skips and runs once the user answered', async () => {
+      store.replaceAll([makeDueAutomation({
+        runHistory: [{ at: NOW - 60_000, outcome: 'skipped-waiting', sessionId: null, blockedBySessionId: 'session-waiting' }],
+      })])
+      let waiting = true
+      const input = makeInput({
+        isSessionRunning: vi.fn((sessionId: string) => waiting && sessionId === 'session-waiting'),
+        isSessionWaitingForUser: vi.fn(() => waiting),
+      })
+
+      expect(await runAutomationTick(input)).toEqual([{ id: 'auto-1', outcome: 'skipped-waiting' }])
+      waiting = false
+      expect(await runAutomationTick({ ...input, now: NOW + 30 * 60_000 })).toEqual([{ id: 'auto-1', outcome: 'woke' }])
+    })
+
+    it('ignores a wait reported by a conversation that is no longer running', async () => {
+      store.replaceAll([makeDueAutomation({
+        runHistory: [{ at: NOW - 120_000, outcome: 'woke', sessionId: 'session-ended' }],
+      })])
+      const input = makeInput({
+        isSessionRunning: vi.fn(() => false),
+        isSessionWaitingForUser: vi.fn(() => true),
+      })
+
+      expect(await runAutomationTick(input)).toEqual([{ id: 'auto-1', outcome: 'woke' }])
     })
   })
 

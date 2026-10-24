@@ -3819,6 +3819,14 @@ export async function startDaemon(): Promise<void> {
       }
       return false;
     };
+    // 예약 대기 게이트(aplus-dev-studio-desktop #2196)용: 자식 세션이 직접 보고한 사용자 입력 대기
+    // (열린 AskUserQuestion 또는 agentState.requests의 권한·계획 승인 — apiSession.reportDaemonRuntime).
+    const isAutomationSessionWaitingForUser = (sessionId: string): boolean => {
+      for (const session of pidToTrackedSession.values()) {
+        if (session.happySessionId === sessionId) return session.runtime?.pendingUserInput === true;
+      }
+      return false;
+    };
     const isAutomationDirectoryInUse = (directory: string): boolean => {
       return isGithubTriggerWorktreeDirectoryInUse({
         directory,
@@ -3878,6 +3886,7 @@ export async function startDaemon(): Promise<void> {
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
         spawnSession: spawnAutomationSession,
         isSessionRunning: isAutomationSessionRunning,
+        isSessionWaitingForUser: isAutomationSessionWaitingForUser,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
@@ -4994,6 +5003,7 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Restored automation worktree sweep failed: ${error instanceof Error ? error.message : error}`);
         }),
         isSessionRunning: isAutomationSessionRunning,
+        isSessionWaitingForUser: isAutomationSessionWaitingForUser,
         stopSession: (sessionId) => {
           stopSession(sessionId, {
             source: 'server-automation',
