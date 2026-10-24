@@ -136,7 +136,8 @@ export function sandboxTrustFloorPaths(input: {
     let happyHomes: string[] = [];
     try {
         happyHomes = listHomeEntries(input.homeDir)
-            .filter((entry) => entry === '.happy' || entry.startsWith('.happy'))
+            // .saycode 는 Saycode CLI 로그인 자격증명(credentials.v1.json)의 홈이다.
+            .filter((entry) => entry === '.happy' || entry.startsWith('.happy') || entry === '.saycode')
             .map((entry) => join(input.homeDir, entry));
     } catch {
         // 홈을 못 읽어도 floor 는 최소한 실행 중 데몬 홈을 덮는다.
