@@ -606,6 +606,17 @@ export type Metadata = {
   flavor?: string
   sandbox?: SandboxConfig | null
   dangerouslySkipPermissions?: boolean | null
+  /**
+   * The permission mode this session applies to its next turn, as the runtime resolved it
+   * (validation, the ambient-default downgrade guard and the sandbox policy already applied).
+   * Published at start and on every change — a client message that switches it, a turn-scoped
+   * abort reset — so any client can read the session's *current* mode, not only the mode the
+   * sender itself last sent or the creation-time `dangerouslySkipPermissions`
+   * (aplus-dev-studio-desktop #2187). Absent on older runtimes; readers treat that as unknown.
+   */
+  permissionMode?: PermissionMode
+  /** When `permissionMode` was last published, on this runtime's clock (ms since epoch). */
+  permissionModeUpdatedAt?: number
   /** Lineage for sessions created via the fork / duplicate flow. */
   parentSessionId?: string
   forkedFromMessageId?: string

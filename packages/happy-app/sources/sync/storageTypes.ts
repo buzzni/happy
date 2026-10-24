@@ -74,6 +74,13 @@ export const MetadataSchema = z.object({
      * A malformed value is dropped rather than failing the whole document.
      */
     source: z.string().optional().catch(undefined),
+    /**
+     * The permission mode the session currently applies, published by happy-cli at start and on
+     * every change (aplus-dev-studio-desktop #2187). A plain string, declared only so the app's
+     * metadata write-back does not strip it; a malformed value is dropped.
+     */
+    permissionMode: z.string().optional().catch(undefined),
+    permissionModeUpdatedAt: z.number().optional().catch(undefined),
 });
 
 export type Metadata = z.infer<typeof MetadataSchema>;

@@ -98,6 +98,7 @@ import {
     publishedSessionModelPin,
     type SessionModelPin,
 } from '@/utils/sessionModelPin';
+import { createSessionPermissionModePublisher, publishedSessionPermissionMode } from '@/utils/sessionPermissionMode';
 import { createEnvelope } from '@slopus/happy-wire';
 import {
     resolveInitialSaycodeAppendSystemPrompt,
@@ -987,9 +988,16 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // message arrives — otherwise the first turn sent from another device is
     // the one that loses the pin.
     sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
+    // The session's current permission mode, readable by every client (aplus-dev-studio-desktop #2187).
+    const permissionModePublisher = createSessionPermissionModePublisher({
+        published: publishedSessionPermissionMode(metadata),
+        updateMetadata: (update) => session.updateMetadata(update),
+    });
+    permissionModePublisher.publish(currentPermissionMode);
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = initialPermissionMode;
+        permissionModePublisher.publish(currentPermissionMode);
         currentModel = initialModelSeed;
         currentFallbackModel = undefined;
         currentCustomSystemPrompt = undefined;
@@ -1258,6 +1266,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 sandboxEnabled,
             );
             currentPermissionMode = messagePermissionMode;
+            permissionModePublisher.publish(currentPermissionMode);
             const ignoredDefaultDowngrade =
                 (previousPermissionMode === 'bypassPermissions' || previousPermissionMode === 'yolo')
                 && message.meta.permissionMode === 'default'
@@ -1494,6 +1503,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 if (ax.step !== 'free' && messagePermissionMode === 'plan') {
                     messagePermissionMode = 'acceptEdits';
                     currentPermissionMode = messagePermissionMode;
+                    permissionModePublisher.publish(currentPermissionMode);
                 }
                 logger.debug('[ax] orchestration applied to user message');
             }
