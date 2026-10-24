@@ -1205,6 +1205,15 @@ function readTurnText(content: unknown): string {
                         // 앞에 두면 직전 턴의 늦은 prompt_suggestion 이 새 턴으로
                         // 새어든다.
                         await measurePreparation(preparation, 'mcp-recovery', () => mcpRecovery.recoverFailedServers());
+                        // The launcher keeps a provider with live background work rather
+                        // than restart it for new settings; model and effort switch here.
+                        // A failed switch still answers, on the old engine.
+                        try {
+                            if (next.mode.model !== mode.model) await response.setModel(next.mode.model);
+                            if (next.mode.effort !== mode.effort) await response.applyFlagSettings({ effortLevel: next.mode.effort ?? null });
+                        } catch (error) {
+                            logger.debug('[claudeRemote] In-place model/effort switch failed', error);
+                        }
                         mode = next.mode;
                         // Content can be structured blocks; only plain text is
                         // usable as a recall query or as review evidence — but

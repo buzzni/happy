@@ -1013,12 +1013,30 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             }
                             const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort);
                             if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
-                                logger.debug('[remote]: mode has changed, pending message');
-                                pending = msg;
-                                drain?.releaseClaim();
-                                return null;
+                                /*
+                                 * A restart ends this provider's input and waits for it to
+                                 * exit, but live background work keeps Claude Code running:
+                                 * every message after this one would wait for that work to
+                                 * end. So the running provider answers it — `claudeRemote`
+                                 * switches model and effort in place — and the old hash
+                                 * stays, so the first message after the work restarts the
+                                 * provider with the settings that need a new process.
+                                 *
+                                 * Not for an isolated turn, which needs its own provider, nor
+                                 * for a managed run, whose model and effort its plan binds.
+                                 */
+                                const keepForBackgroundWork = !msg.isolate && !session.managedRun
+                                    && (backgroundTasks?.tasks?.length ?? 0) > 0;
+                                if (!keepForBackgroundWork) {
+                                    logger.debug('[remote]: mode has changed, pending message');
+                                    pending = msg;
+                                    drain?.releaseClaim();
+                                    return null;
+                                }
+                                logger.debug('[remote]: mode has changed, kept provider for its background work');
+                            } else {
+                                modeHash = msg.hash;
                             }
-                            modeHash = msg.hash;
                             mode = msg.mode;
                             // The batch about to run is what answers the request, so the handle is
                             // attached here rather than where the message was queued: between those
