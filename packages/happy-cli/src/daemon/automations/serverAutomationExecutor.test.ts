@@ -30,6 +30,7 @@ import type { EncryptedServerAutomation } from './serverAutomationCache'
 import type { ServerAutomationRuntimeState } from './serverAutomationRuntimeStore'
 import { MAX_WORKTREE_CLEANUP_ATTEMPTS } from './worktreeCleanupGiveUp'
 import { AGENT_TASK_CLIENT_PATH } from './agentTaskClient'
+import { withInboxItemInstruction } from './automationDomain'
 import { buildSandboxRuntimeConfig } from '@/sandbox/config'
 
 function cacheRecord(generation = 2, migrationPending = false) {
@@ -364,7 +365,7 @@ describe('예약 자동화 커넥터 실제 HTTP 경로 (#3556)', () => {
     expect(prompt).toContain('현재 세션의 도구 목록만으로 미연동을 단정하지')
     expect(prompt).toContain('실제 도구 탐색·호출')
     expect(prompt).toContain('재연동·설정 변경')
-    expect(prompt.endsWith('\n\nprompt')).toBe(true)
+    expect(prompt.endsWith(`\n\n${withInboxItemInstruction('prompt')}`)).toBe(true)
     expect(spawnSession.mock.calls[0]![0].agent).toBe(agent)
   })
 })
@@ -4871,5 +4872,80 @@ describe('one-time and weekly schedules (desktop-schedule-kinds)', () => {
     const base = new Date(fixture.now)
     expect(fixture.store.state().schedules[0]!.nextRunAt)
       .toBe(new Date(base.getFullYear(), base.getMonth(), base.getDate() + 2, 9, 0).getTime())
+  })
+})
+
+// aplus-dev-studio-desktop #2196 — 서버 예약도 렌더러 경로처럼 대상 대화가 사용자 답을 기다리면 회차를 건너뛴다.
+// 계약: outcome SKIPPED_GATE + sessionId(기다리는 대화). 스크립트 게이트의 SKIPPED_GATE는 sessionId가 늘 null이다.
+describe('scheduled run waiting gate', () => {
+  const claimed = { claim: { ok: true, value: { runId: 'run-1', claimToken: 'claim-token' } } }
+  function withLastSession(fixture: ReturnType<typeof setup>, sessionId: string) {
+    const state = fixture.store.read()
+    state.schedules[0]!.lastSessionId = sessionId
+    fixture.store.write(state)
+  }
+  function asConversation(fixture: ReturnType<typeof setup>, sessionId: string) {
+    const payload = fixture.decryptPayload(cacheRecord(), new Uint8Array(32))
+    fixture.input.decryptPayload = () => ({ ...payload, conversation: { sessionId } })
+    fixture.input.resolveMcpSpawnContext = async () => ({ ok: true, value: { mcpCallerGrant: 'grant', mcpConfigProjectId: 'chat:c', bindingStatus: 'BOUND', connectorPolicy: 'optional', requiredConnectors: [] } })
+  }
+
+  it('reports a skipped run naming the waiting previous conversation instead of holding it as an overlap', async () => {
+    const f = setup(claimed)
+    withLastSession(f, 'session-old')
+    f.input.isSessionRunning = vi.fn(() => true)
+    f.input.isSessionWaitingForUser = vi.fn((sessionId: string) => sessionId === 'session-old')
+
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'SKIPPED_GATE' }])
+
+    expect(f.transport.claim).toHaveBeenCalledOnce()
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'COMPLETED', outcome: 'SKIPPED_GATE', sessionId: 'session-old', failureCode: null, degradedCode: null,
+    }))
+    expect(f.resolveMcpSpawnContext).not.toHaveBeenCalled()
+    expect(f.runScript).not.toHaveBeenCalled()
+    expect(f.spawnSession).not.toHaveBeenCalled()
+    // 기다리는 대화는 이미 앞 회차가 연결했다 — 건너뛴 회차가 다시 연결하지 않는다.
+    expect(f.linkSession).not.toHaveBeenCalled()
+    expect(f.store.state().schedules[0]).toMatchObject({ nextRunAt: f.now + 15 * 60_000, lastSessionId: 'session-old' })
+    expect(f.store.state().pendingReports).toEqual([])
+  })
+
+  it('skips a conversation schedule whose target conversation waits for the user', async () => {
+    const f = setup(claimed)
+    asConversation(f, 'ordinary')
+    f.input.isSessionRunning = vi.fn(() => true)
+    f.input.isSessionWaitingForUser = vi.fn(() => true)
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' }))
+    f.input.deliverConversation = deliver
+
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'SKIPPED_GATE' }])
+    expect(deliver).not.toHaveBeenCalled()
+    expect(f.transport.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'SKIPPED_GATE', sessionId: 'ordinary' }))
+  })
+
+  it('ignores a wait on a conversation that is no longer running', async () => {
+    const f = setup(claimed)
+    asConversation(f, 'ordinary')
+    f.input.isSessionRunning = vi.fn(() => false)
+    f.input.isSessionWaitingForUser = vi.fn(() => true)
+    const deliver = vi.fn(async () => ({ ok: true as const, sessionId: 'ordinary' }))
+    f.input.deliverConversation = deliver
+
+    expect(await runServerAutomationTick(f.input)).toEqual([{ automationId: 'automation-1', outcome: 'WOKE' }])
+    expect(deliver).toHaveBeenCalledOnce()
+  })
+
+  it('asks a run that opens a new conversation for the inbox summary line, but delivers a continued conversation its prompt as registered', async () => {
+    const f = setup(claimed)
+    await runServerAutomationTick(f.input)
+    expect(f.spawnSession.mock.calls[0]![0].initialPrompt.endsWith(withInboxItemInstruction('prompt'))).toBe(true)
+
+    const c = setup(claimed)
+    asConversation(c, 'ordinary')
+    const deliver = vi.fn(async (_input: { prompt: string }) => ({ ok: true as const, sessionId: 'ordinary' }))
+    c.input.deliverConversation = deliver as never
+    await runServerAutomationTick(c.input)
+    expect(deliver.mock.calls[0]![0].prompt).toBe('prompt')
   })
 })
