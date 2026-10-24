@@ -560,6 +560,10 @@ export async function startHappyServer(
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
     const browserTask = createBrowserTaskRuntimeClient(client, process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default', options.browserClientApprover);
+    if (browserTask?.localClients) client.rpcHandlerManager.registerHandler('browser-client-apps', async (raw: unknown) => {
+        const request = z.object({ action: z.enum(['list-apps', 'disable-app', 'revoke-app']), appId: z.string().min(1).max(256).optional() }).strict().parse(raw);
+        return browserTask.localClients!.manageApps(request.action, request.appId);
+    });
     const browserTaskRuntime = browserTask?.runtime;
     const browserTaskProfileId = browserTask?.profileId;
     if (browserTaskRuntime) {

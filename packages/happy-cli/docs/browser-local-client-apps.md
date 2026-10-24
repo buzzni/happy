@@ -1,0 +1,11 @@
+# Browser local app consent v2
+
+The broker owns application proof, exact consent scope and revocation. Desktop owns the human choice and uses the authenticated, encrypted session `browser-client-apps` RPC for list/disable/revoke. V1 endpoints and credentials remain separate; old brokers cannot interpret v2 secrets as owner or client credentials.
+
+Initial `browser_task_create_client` requests with `appName` require an explicit `browserClientConsent` answer: 15, 60 or 1440 minutes and a boolean `rememberSameScope`. Missing or malformed answers fail closed. Secrets are written only to a new Git-ignored private Linux file and never returned to the model. `browser_task_reconnect_client` reads proof from that file, rechecks the current owner and exact scope, and atomically replaces it. Requests are not automatically retried after uncertain mutation results.
+
+The registered scope includes principal, workspace, machine, assignment, canonical project root, profile, task space, exact origins and descriptor path. Operations are the fixed restricted v2 client operation set. App names and app IDs alone do not authenticate applications. Automatic approval stays disabled by default, and each lease has its own fixed expiry. Disabling the rule leaves live leases intact; revoking the app durably fences all descendants before cleanup. A stale cleanup does not re-enable access. Restart still requires proof and a current authenticated owner to issue another lease. Clock rollback below the journal watermark fails closed.
+
+Limits: 256 registered apps, 4096 attempted issuance IDs per journal and the existing 16 active connections per principal across v1 and v2 client registries. A full or damaged journal refuses new requests; it is not silently reset. V2 supports a day of short token rotation (2048 grant IDs). App proof is a bearer secret under the existing same-OS-user threat model, not signed executable identity or protection from malicious processes sharing that OS account.
+
+Runtime delivery depends on the base local client PR #931; publishing and Desktop runtime pin changes are separate. Rollback: stop new v2 issuance, revoke registered apps, inspect cleanup, then return to an older runtime while retaining v2 journals. Do not copy v2 credentials into v1 registries or delete user browser profiles/cookies.

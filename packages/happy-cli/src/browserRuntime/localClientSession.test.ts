@@ -79,3 +79,31 @@ it.skipIf(process.platform === 'linux')('refuses issuance on unsupported platfor
     expect(h.requestPolicyApproval).not.toHaveBeenCalled()
     expect(h.broker).not.toHaveBeenCalled()
 })
+
+it.skipIf(process.platform !== 'linux')('v2 writes private app proof only after an explicit duration choice and reconnects without exposing it', async () => {
+    const h = await setup(true)
+    h.requestPolicyApproval.mockResolvedValue({ approved: true, policyGrant: 'once', browserClientConsent: { leaseMinutes: 1440, rememberSameScope: true } } as any)
+    h.broker.mockImplementation(async (_socket, action, _secret, body) => {
+        if (action === 'v2:register-app') {
+            expect(body).toMatchObject({ leaseMinutes: 1440, rememberSameScope: true, projectRoot: h.cwd })
+            return { clientSecret: 'bounded-secret', clientSessionId: 'client-id', profileId: 'main', taskSpaceId: 'space', expiresAtMs: Date.now() + 86400000, appId: 'app-test', appSecret: 'a'.repeat(43) } as any
+        }
+        if (action === 'v2:connect-app') {
+            expect(body).toMatchObject({ appSecret: 'a'.repeat(43), leaseMinutes: 60, outFile: join(h.cwd, 'connection.json') })
+            return { clientSecret: 'replacement-secret', clientSessionId: 'client-next', expiresAtMs: Date.now() + 3600000 } as any
+        }
+        return { revoked: true } as any
+    })
+    const reply = await h.client.create({ ...h.args, appName: 'Dashboard' })
+    expect(JSON.stringify(reply)).not.toMatch(/bounded-secret|aaaaaaa/)
+    const reconnected = await h.client.reconnect('connection.json', 60)
+    expect(JSON.stringify(reconnected)).not.toContain('replacement-secret')
+    expect((await stat(join(h.cwd, 'connection.json'))).mode & 0o777).toBe(0o600)
+    expect(JSON.parse(await readFile(join(h.cwd, 'connection.json'), 'utf8')).clientSecret).toBe('replacement-secret')
+    expect(h.requestPolicyApproval).toHaveBeenCalledTimes(1)
+})
+it.skipIf(process.platform !== 'linux')('v2 refuses old yes-only approval without creating credentials', async () => {
+    const h = await setup(true)
+    await expect(h.client.create({ ...h.args, appName: 'Dashboard' })).rejects.toThrow('explicit browser app consent')
+    expect(h.broker).not.toHaveBeenCalled()
+})

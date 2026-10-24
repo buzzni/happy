@@ -1,3 +1,4 @@
+import { reconnectLocalClient } from './localClientReconnect'
 /** Trusted session-side issuance: parent credentials never enter agent subprocesses. */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -10,7 +11,7 @@ import { z } from 'zod'
 import type { PolicyApprover } from '../toolPolicy/policyGate'
 import { browserClientBrokerCall, handleBrowserClientCommand } from '../commands/browserClientCommand'
 
-export const LOCAL_CLIENT_TOOL_NAMES = ['browser_task_create_client', 'browser_task_list_clients', 'browser_task_revoke_client'] as const
+export const LOCAL_CLIENT_TOOL_NAMES = ['browser_task_create_client', 'browser_task_list_clients', 'browser_task_revoke_client', 'browser_task_reconnect_client'] as const
 export function createLocalClientSession(options: {
     socketPath: string; sessionSecret: string; runtimeUrl: string; cwd: string
     profileId(): Promise<string>; approver(): PolicyApprover | null
@@ -23,9 +24,10 @@ export function createLocalClientSession(options: {
             policy: { reasonCode: 'browser_client_delegation', ruleId: 'browser-local-client', humanOnly: true, grantOffer: 'once' },
             signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
         if (!answer.approved) throw new Error('User did not approve this connection')
+        return answer.browserClientConsent
     }
     return {
-        async create(args: { taskSpaceId: string; origins: string[]; leaseMinutes: number; outFile: string }, signal?: AbortSignal) {
+        async create(args: { taskSpaceId: string; origins: string[]; leaseMinutes: number; outFile: string; appName?: string }, signal?: AbortSignal) {
             const root = await realpath(options.cwd)
             const output = resolve(root, args.outFile)
             const parent = await realpath(dirname(output))
@@ -46,8 +48,10 @@ export function createLocalClientSession(options: {
             try {
                 const pinned = await directory.stat()
                 const profileId = await options.profileId()
-                await approve(LOCAL_CLIENT_TOOL_NAMES[0], { ...args, outFile: file, profileId,
+                const consent = await approve(LOCAL_CLIENT_TOOL_NAMES[0], { ...args, outFile: file, profileId,
+                    ...(args.appName ? { browserClientConsentVersion: 2, leaseMinutes: 15 } : {}),
                     access: 'Read pages and run site-policy-approved actions in client-owned browser tabs' }, signal)
+                if (args.appName && !consent) throw new Error('Client does not support explicit browser app consent')
                 signal?.throwIfAborted()
                 const current = await stat(parent)
                 if (current.dev !== pinned.dev || current.ino !== pinned.ino || await realpath(parent) !== parent)
@@ -55,14 +59,20 @@ export function createLocalClientSession(options: {
                 const responses: unknown[] = []
                 const pinnedFile = `/proc/self/fd/${directory.fd}/${basename(output)}`
                 const code = await dependencies.command(['create', '--space', args.taskSpaceId, '--profile', profileId,
-                    ...args.origins.flatMap(origin => ['--origin', origin]), '--lease-minutes', String(args.leaseMinutes), '--out', pinnedFile], {
-                    allowCreate: true, env: { HAPPY_BROWSER_TASK_SESSION_SECRET: options.sessionSecret,
+                    ...args.origins.flatMap(origin => ['--origin', origin]), '--lease-minutes', String(consent?.leaseMinutes ?? args.leaseMinutes), '--out', pinnedFile], {
+                    allowCreate: true, ...(args.appName && consent ? { appRegistration: { name: args.appName, projectRoot: root, outFile: file, rememberSameScope: consent.rememberSameScope } } : {}), env: { HAPPY_BROWSER_TASK_SESSION_SECRET: options.sessionSecret,
                         HAPPY_BROWSER_TASK_BROKER_SOCKET: options.socketPath, HAPPY_BROWSER_TASK_RUNTIME_URL: options.runtimeUrl },
                     output: value => responses.push(value), broker: dependencies.broker,
                 })
                 if (code !== 0) throw new Error('Connection could not be created')
                 return { ...(responses[0] as Record<string, unknown>), file }
             } finally { await directory.close() }
+        },
+        async reconnect(outFile: string, leaseMinutes: 15 | 60 | 1440, signal?: AbortSignal) {
+            return reconnectLocalClient({ ...options, profileId: await options.profileId() }, outFile, leaseMinutes, signal, dependencies.broker)
+        },
+        async manageApps(action: 'list-apps' | 'disable-app' | 'revoke-app', appId?: string) {
+            return dependencies.broker(options.socketPath, `v2:${action}`, options.sessionSecret, { schemaVersion: 2, profileId: await options.profileId(), ...(appId ? { appId } : {}) })
         },
         async list() { return dependencies.broker(options.socketPath, 'list', options.sessionSecret,
             { schemaVersion: 1, profileId: await options.profileId() }) },
@@ -82,8 +92,9 @@ export function registerLocalClientTools(mcp: McpServer, client: LocalClientSess
         catch { return { isError: true, content: [{ type: 'text' as const, text: 'Browser connection request failed or was not approved. No credentials are returned.' }] } }
     })
     mcp.registerTool(LOCAL_CLIENT_TOOL_NAMES[0], { description: 'Request human approval to give a local server bounded access to one browser task space. Creates a private Linux connection file (must be Git-ignored in repositories); never returns credentials. This is a scoped bearer guardrail, not isolation from malicious processes running as the same OS user.',
-        inputSchema: { taskSpaceId: z.string().min(1), origins: z.array(z.string().url()).min(1), leaseMinutes: z.number().int().min(1).max(60), outFile: z.string().min(1) } },
+        inputSchema: { taskSpaceId: z.string().min(1), origins: z.array(z.string().url()).min(1), leaseMinutes: z.number().int().min(1).max(60), appName: z.string().min(1).max(120).optional().describe('Set an application name to request selectable duration and same-scope automatic approval (v2).'), outFile: z.string().min(1) } },
     (args, extra) => run(() => client.create(args, extra.signal)))
+    mcp.registerTool(LOCAL_CLIENT_TOOL_NAMES[3], { description: 'Reconnect a registered app using its private file and previously approved same-scope rule. No secrets are accepted or returned; changed scope or disabled consent fails.', inputSchema: { outFile: z.string().min(1), leaseMinutes: z.union([z.literal(15), z.literal(60), z.literal(1440)]) } }, (args, extra) => run(() => client.reconnect(args.outFile, args.leaseMinutes, extra.signal)))
     mcp.registerTool(LOCAL_CLIENT_TOOL_NAMES[1], { description: 'List your local browser connections, including those whose connection file was lost.', inputSchema: {} }, () => run(() => client.list()))
     mcp.registerTool(LOCAL_CLIENT_TOOL_NAMES[2], { description: 'Request human approval to revoke one of your browser connections, even without its connection file.', inputSchema: { clientSessionId: z.string().min(1) } },
     (args, extra) => run(() => client.revoke(args.clientSessionId, extra.signal)))

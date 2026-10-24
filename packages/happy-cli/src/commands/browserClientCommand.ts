@@ -9,9 +9,12 @@ import { loadBrowserTaskEnv } from '../daemon/browserTaskEnv'
 const descriptorSchema = z.object({ schemaVersion: z.literal(1), brokerSocket: z.string().min(1), runtimeUrl: z.string(),
     clientSecret: z.string().min(1), clientSessionId: z.string().min(1), profileId: z.string().min(1),
     taskSpaceId: z.string().min(1), expiresAtMs: z.number().int().positive() }).strict()
+const appDescriptorSchema = descriptorSchema.extend({ schemaVersion: z.literal(2), appId: z.string().min(1), appSecret: z.string().min(32), projectRoot: z.string(), outFile: z.string(), origins: z.array(z.string()), name: z.string(), maxLeaseMinutes: z.number() }).strict()
+const anyDescriptor = z.union([descriptorSchema, appDescriptorSchema])
 type Json = Record<string, any>
 interface Dependencies {
     allowCreate?: boolean
+    appRegistration?: { name: string; projectRoot: string; outFile: string; rememberSameScope: boolean }
     env: NodeJS.ProcessEnv
     output(value: unknown): void
     broker(socket: string, action: string, secret: string, body: unknown): Promise<Json>
@@ -25,7 +28,7 @@ function localUrl(value: string): string {
 }
 export function browserClientBrokerCall(socketPath: string, action: string, secret: string, body: unknown): Promise<Json> {
     return new Promise((resolve, reject) => {
-        const req = request({ socketPath, path: `/v1/clients/${action}`, method: 'POST',
+        const req = request({ socketPath, path: action.startsWith('v2:') ? `/v2/clients/${action.slice(3)}` : `/v1/clients/${action}`, method: 'POST',
             headers: { 'content-type': 'application/json', 'x-abp-session-secret': secret } }, res => {
             let raw = ''
             res.on('data', chunk => { raw += chunk; if (raw.length > 1024 * 1024) req.destroy(new Error('Response too large')) })
@@ -50,13 +53,13 @@ async function runtimeCall(url: string, token: string, operation: string, body: 
     if (!res.ok || reply.ok !== true) throw new Error('Runtime refused request')
     return reply.result
 }
-async function readDescriptor(file: string) {
+export async function readBrowserClientDescriptor(file: string) {
     const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
     try {
         const metadata = await handle.stat()
-        if (!metadata.isFile() || metadata.size > 16 * 1024 || (metadata.mode & 0o077) !== 0
+        if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 16 * 1024 || (metadata.mode & 0o077) !== 0
             || (process.getuid && metadata.uid !== process.getuid())) throw new Error('Connection file must be private and owned by the caller')
-        const descriptor = descriptorSchema.parse(JSON.parse(await handle.readFile('utf8')))
+        const descriptor = anyDescriptor.parse(JSON.parse(await handle.readFile('utf8')))
         if (!isAbsolute(descriptor.brokerSocket)) throw new Error('Invalid socket')
         localUrl(descriptor.runtimeUrl)
         return descriptor
@@ -93,7 +96,7 @@ export async function handleBrowserClientCommand(args: string[], overrides: Part
             if (!overrides.allowCreate) throw new Error('Use the approved session tool to create connections')
             const space = required('space'), profile = required('profile'), origins = values.get('origin') ?? [], out = required('out')
             const minutes = Number(values.get('lease-minutes')?.[0] ?? 60)
-            if (!origins.length || !Number.isInteger(minutes) || minutes < 1 || minutes > 60) throw new Error('Invalid scope')
+            if (!origins.length || !Number.isInteger(minutes) || minutes < 1 || minutes > (overrides.appRegistration ? 1440 : 60)) throw new Error('Invalid scope')
             for (const origin of origins) { const url = new URL(origin); if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin) throw new Error('Invalid origin') }
             const env = loadBrowserTaskEnv({ ...deps.env }, undefined, () => {})
             const secret = env.HAPPY_BROWSER_TASK_SESSION_SECRET, socket = env.HAPPY_BROWSER_TASK_BROKER_SOCKET
@@ -103,21 +106,24 @@ export async function handleBrowserClientCommand(args: string[], overrides: Part
             const file = await open(out, 'wx', 0o600)
             let created: Json | undefined
             try {
-                created = await deps.broker(socket, 'register', secret, { schemaVersion: 1, profileId: profile, taskSpaceId: space, origins, leaseMs: minutes * 60_000 })
-                const descriptor = descriptorSchema.parse({ schemaVersion: 1, brokerSocket: socket, runtimeUrl,
+                created = await deps.broker(socket, overrides.appRegistration ? 'v2:register-app' : 'register', secret, overrides.appRegistration
+                    ? { schemaVersion: 2, requestId: randomUUID(), ...overrides.appRegistration, profileId: profile, taskSpaceId: space, origins, leaseMinutes: minutes }
+                    : { schemaVersion: 1, profileId: profile, taskSpaceId: space, origins, leaseMs: minutes * 60_000 })
+                const descriptor = anyDescriptor.parse({ schemaVersion: overrides.appRegistration ? 2 : 1, brokerSocket: socket, runtimeUrl,
+                    ...(overrides.appRegistration ? { appId: created.appId, appSecret: created.appSecret, projectRoot: overrides.appRegistration.projectRoot, outFile: overrides.appRegistration.outFile, origins, name: overrides.appRegistration.name, maxLeaseMinutes: minutes } : {}),
                     clientSecret: created.clientSecret, clientSessionId: created.clientSessionId, profileId: created.profileId,
                     taskSpaceId: created.taskSpaceId, expiresAtMs: created.expiresAtMs })
                 await file.writeFile(JSON.stringify(descriptor) + '\n'); await file.sync()
                 deps.output({ ok: true, file: out, clientSessionId: descriptor.clientSessionId, expiresAtMs: descriptor.expiresAtMs })
             } catch (error) {
-                if (created?.clientSecret) await deps.broker(socket, 'revoke', created.clientSecret, { schemaVersion: 1 }).catch(() => undefined)
+                if (created?.clientSecret) await deps.broker(socket, overrides.appRegistration ? 'v2:revoke-app' : 'revoke', overrides.appRegistration ? secret : created.clientSecret, overrides.appRegistration ? { schemaVersion: 2, profileId: profile, appId: created.appId } : { schemaVersion: 1 }).catch(() => undefined)
                 await rm(out, { force: true }); throw error
             } finally { await file.close() }
             return 0
         }
-        const descriptor = await readDescriptor(required('file'))
+        const descriptor = await readBrowserClientDescriptor(required('file'))
         if (action === 'status' || action === 'revoke') {
-            const result = await deps.broker(descriptor.brokerSocket, action, descriptor.clientSecret, { schemaVersion: 1 })
+            const result = await deps.broker(descriptor.brokerSocket, descriptor.schemaVersion === 2 ? `v2:${action}` : action, descriptor.clientSecret, { schemaVersion: descriptor.schemaVersion })
             // Explicit allowlist: never relay a broker credential by accident.
             deps.output({ ok: true, result: action === 'revoke' ? { revoked: result.revoked === true, cleanupPending: result.cleanupPending === true } : {
                 clientSessionId: result.clientSessionId, taskSpaceId: result.taskSpaceId, profileId: result.profileId,
@@ -128,7 +134,7 @@ export async function handleBrowserClientCommand(args: string[], overrides: Part
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid collection URL')
         const call = async (op: string, body: unknown) => {
             // Each request, especially cleanup, gets a currently valid bounded grant.
-            const grant = await deps.broker(descriptor.brokerSocket, 'grant', descriptor.clientSecret, { schemaVersion: 1 })
+            const grant = await deps.broker(descriptor.brokerSocket, descriptor.schemaVersion === 2 ? 'v2:grant' : 'grant', descriptor.clientSecret, { schemaVersion: descriptor.schemaVersion })
             if (typeof grant.token !== 'string') throw new Error('Missing token')
             return deps.runtime(descriptor.runtimeUrl, grant.token, op, body)
         }
