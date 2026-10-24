@@ -10,6 +10,7 @@ import {
     syncAutomations,
 } from '@/app/automation/automationExecutionService';
 import { inTx } from '@/storage/inTx';
+import { warn } from '@/utils/log';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
 import {
@@ -61,12 +62,23 @@ async function answer(
     operation: () => Promise<{ ok: boolean; value?: unknown; error?: string }>,
     onSuccess?: (value: unknown) => Promise<void>,
 ) {
+    let result: { ok: boolean; value?: unknown; error?: string };
     try {
-        const result = await operation();
-        if (result.ok && onSuccess) await onSuccess(result.value);
-        callback(result.ok ? { ok: true, value: wire(result.value) } : { ok: false, error: result.error });
+        result = await operation();
     } catch {
         callback({ ok: false, error: 'invalid-input' });
+        return;
+    }
+    // ack 먼저. 데몬의 자동화 tick 은 이 ack 를 await 하므로, 커밋이 끝난 결과의 ack 를
+    // fan-out 뒤로 미루면 fan-out 이 늦는 만큼 tick 이 멈추고, fan-out 이 실패하면 이미
+    // 저장된 결과가 invalid-input 으로 둔갑한다 (2026-10-24: ack 하나가 오지 않아 한 머신의
+    // 자동화가 데몬 재시작 전까지 전부 멈췄다).
+    callback(result.ok ? { ok: true, value: wire(result.value) } : { ok: false, error: result.error });
+    if (!result.ok || !onSuccess) return;
+    try {
+        await onSuccess(result.value);
+    } catch (error) {
+        warn({ err: error }, 'automation socket: project update fan-out failed after the ack was sent');
     }
 }
 

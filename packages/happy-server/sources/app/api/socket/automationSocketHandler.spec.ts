@@ -289,6 +289,47 @@ describe('automationSocketHandler', () => {
         );
     });
 
+    it('acknowledges the daemon before the project update fan-out settles', async () => {
+        // 데몬의 자동화 tick 은 이 ack 를 기다린다. fan-out 이 늦으면 ack 도 늦었고,
+        // 2026-10-24 에는 ack 하나가 영영 오지 않아 한 머신의 자동화가 재시작 전까지 멈췄다.
+        const handlers = bind();
+        services.claimAutomationRun.mockResolvedValue({
+            ok: true,
+            value: { runId: 'run-1', claimToken: 'token', projectId: 'project-7' },
+        });
+        let release!: () => void;
+        services.emitProjectAutomationUpdate.mockReturnValueOnce(new Promise<void>((resolve) => { release = resolve; }));
+
+        const callback = vi.fn();
+        const pending = handlers.get('automation-claim')!({
+            automationId: 'automation-1', generation: 3, scheduledFor: 1000,
+        }, callback);
+
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledWith({
+            ok: true, value: { runId: 'run-1', claimToken: 'token', projectId: 'project-7' },
+        }));
+        release();
+        await pending;
+    });
+
+    it('keeps a successful acknowledgement when the project update fan-out fails', async () => {
+        const handlers = bind();
+        services.reportAutomationRun.mockResolvedValue({
+            ok: true, value: { idempotent: false, projectId: 'project-7' },
+        });
+        services.emitProjectAutomationUpdate.mockRejectedValueOnce(new Error('redis down'));
+
+        const callback = vi.fn();
+        await handlers.get('automation-run-report')!({
+            runId: 'run-1', claimToken: 'token', reportId: 'report-1', status: 'COMPLETED',
+            outcome: 'WOKE', sessionId: 'session-1', detailCiphertext: null,
+        }, callback);
+
+        // 보고는 이미 커밋됐다. fan-out 실패를 invalid-input 으로 돌려주면 데몬이 같은 보고를 영영 재시도한다.
+        expect(callback).toHaveBeenCalledWith({ ok: true, value: { idempotent: false, projectId: 'project-7' } });
+        expect(callback).toHaveBeenCalledTimes(1);
+    });
+
     it('scopes a started run to the project the service resolved', async () => {
         const handlers = bind();
         services.startAutomationRun.mockResolvedValue({
