@@ -48,6 +48,7 @@ import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
 import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
+import { registerCleanBackgroundProcessesHandler } from '@/utils/sessionBackgroundProcesses';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
 /** Repairs a Desktop that restarted or reconnected while the meter was showing (Saycode specs/desktop-chat-context-window-meter R12). */
@@ -602,6 +603,8 @@ export class ApiSessionClient extends EventEmitter {
             childEnvBoundary: 'in-session',
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
         });
+        // aplus-dev-studio-desktop#2111 — stops only what this session's runtime recorded at spawn.
+        registerCleanBackgroundProcessesHandler(this.rpcHandlerManager, this.sessionId);
 
         //
         // Create socket
