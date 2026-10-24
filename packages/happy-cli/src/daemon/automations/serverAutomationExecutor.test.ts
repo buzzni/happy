@@ -4936,7 +4936,7 @@ describe('scheduled run waiting gate', () => {
     expect(deliver).toHaveBeenCalledOnce()
   })
 
-  it('asks scheduled runs, including conversation runs, for the inbox summary line', async () => {
+  it('asks a run that opens a new conversation for the inbox summary line, but delivers a continued conversation its prompt as registered', async () => {
     const f = setup(claimed)
     await runServerAutomationTick(f.input)
     expect(f.spawnSession.mock.calls[0]![0].initialPrompt.endsWith(withInboxItemInstruction('prompt'))).toBe(true)
@@ -4946,6 +4946,6 @@ describe('scheduled run waiting gate', () => {
     const deliver = vi.fn(async (_input: { prompt: string }) => ({ ok: true as const, sessionId: 'ordinary' }))
     c.input.deliverConversation = deliver as never
     await runServerAutomationTick(c.input)
-    expect(deliver.mock.calls[0]![0].prompt).toBe(withInboxItemInstruction('prompt'))
+    expect(deliver.mock.calls[0]![0].prompt).toBe('prompt')
   })
 })

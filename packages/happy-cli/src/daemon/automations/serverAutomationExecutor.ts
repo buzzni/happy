@@ -1778,8 +1778,10 @@ async function executeStartedRun(
     }
   }
   const builtPrompt = buildAutomationPrompt(payload.conversation ? payload.prompt : prompt, scriptOutput)
-  // 예약 회차는 응답 끝에 받은편지함 요약 한 줄을 남긴다(aplus-dev-studio-desktop #2196). GitHub 작업은 예약 결과가 아니다.
-  const initialPrompt = payload.githubTrigger ? builtPrompt : withInboxItemInstruction(builtPrompt)
+  // 새 대화를 여는 예약 회차는 응답 끝에 받은편지함 요약 한 줄을 남긴다(aplus-dev-studio-desktop #2196, 렌더러 경로와
+  // 같다). 이어 쓰는 대화에는 붙이지 않는다 — 그 메시지는 사용자 대화에 등록한 요청 그대로 보여야 해서 진단 지침도
+  // 빼는 자리다. GitHub 작업은 예약 결과가 아니다.
+  const initialPrompt = payload.githubTrigger || payload.conversation ? builtPrompt : withInboxItemInstruction(builtPrompt)
   const spawnInput = {
     directory: githubWorktree?.directory ?? payload.directory,
     initialPrompt,
