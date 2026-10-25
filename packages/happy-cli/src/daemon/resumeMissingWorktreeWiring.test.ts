@@ -36,7 +36,12 @@ describe('resume of a session whose worktree was removed', () => {
 
   it('records every automation worktree removal so it can be put back', async () => {
     const source = await runSource()
-    expect(source).toContain('const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(removeGithubTriggerWorktree,')
+    const start = source.indexOf('const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(')
+    expect(start).toBeGreaterThan(0)
+    const removal = source.slice(start, source.indexOf('const resumingSetupTokenSessions', start))
+    expect(removal).toContain('removeGithubTriggerWorktree({')
+    expect(removal).toContain('readHead: readWorktreeHead,')
+    expect(removal).toContain('record: (removed) => githubWorktreeTombstones.record(removed),')
     expect(source).toContain('discardGithubWorktree: discardRememberedGithubWorktree,')
   })
 

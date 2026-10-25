@@ -1215,7 +1215,7 @@ async function cleanupInactiveGithubWorktrees(input: ServerAutomationExecutorInp
       }
       continue
     }
-    if (!worktree.sessionId && input.isDirectoryInUse(worktree.directory)) continue
+    if (input.isDirectoryInUse(worktree.worktreePath) || input.isDirectoryInUse(worktree.directory)) continue
     const discarded = await input.discardGithubWorktree({
       repositoryRoot: worktree.repositoryRoot,
       worktreePath: worktree.worktreePath,

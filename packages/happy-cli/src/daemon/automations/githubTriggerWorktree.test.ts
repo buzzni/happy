@@ -376,6 +376,18 @@ describe('removeGithubTriggerWorktree', () => {
     expect(runCommand).toHaveBeenCalledTimes(1)
   })
 
+  it('reclaims generated artifacts of a dirty worktree while still preserving its source', async () => {
+    const reclaimArtifacts = vi.fn(async () => undefined)
+    const runCommand = commandRunner([' M src/app.ts\n'])
+    const result = await removeGithubTriggerWorktree({
+      repositoryRoot: '/repo', worktreePath: '/happy/automation-worktrees/run-1',
+      runCommand, pathExists: async () => true, reclaimArtifacts,
+    })
+    expect(reclaimArtifacts).toHaveBeenCalledOnce()
+    expect(result).toMatchObject({ ok: false, dirty: true })
+    expect(runCommand).toHaveBeenCalledTimes(1)
+  })
+
   // 2026-08-30 프로덕션 — 리뷰가 끝난 worktree 11개가 지워지지 않고 2.3GB 를 물고
   // 앉아 있었다. 매분 재시도해 누적 1,192회 실패했다.
   //   fatal: working trees containing submodules cannot be moved or removed
@@ -416,6 +428,17 @@ describe('removeGithubTriggerWorktree', () => {
 })
 
 describe('isGithubTriggerWorktreeDirectoryInUse', () => {
+  it('protects nested project sessions and both launch and webhook paths with segment boundaries', () => {
+    const root = '/happy/automation-worktrees/run-1'
+    expect(isGithubTriggerWorktreeDirectoryInUse({
+      directory: root,
+      sessions: [[101, { directory: '/other-scratchpad', happySessionMetadataFromLocalWebhook: { path: `${root}/apps/web` } }]],
+      isPidAlive: () => true,
+    })).toBe(true)
+    expect(isGithubTriggerWorktreeDirectoryInUse({
+      directory: root, sessions: [[101, { directory: `${root}0/apps/web` }]], isPidAlive: () => true,
+    })).toBe(false)
+  })
   it('keeps a pending pre-webhook spawn alive by its persisted launch directory', () => {
     const sessions = new Map([[101, {
       startedBy: 'daemon', pid: 101, directory: '/happy/automation-worktrees/run-1/apps/web',

@@ -4088,7 +4088,7 @@ describe('runServerAutomationTick', () => {
     expect(store.state().githubWorktrees).toHaveLength(1)
   })
 
-  it('does not clean an unassociated journal entry while a restarted session uses its directory', async () => {
+  it.each([null, 'ended-original-session'])('does not clean while a restarted session uses the directory (old session %s)', async (sessionId) => {
     const { input, store, discardGithubWorktree } = setup()
     input.cache = { read: () => ({
       cursor: 0n, serverTime: 0, syncedAt: 0, pendingAcknowledgements: [], automations: [],
@@ -4099,7 +4099,7 @@ describe('runServerAutomationTick', () => {
       githubWorktrees: [{
         automationId: 'automation-1', generation: 2, runId: 'run-old',
         repositoryRoot: '/repo', worktreePath: '/isolated/run-old',
-        directory: '/isolated/run-old/apps/web', sessionId: null, createdAt: 1,
+        directory: '/isolated/run-old/apps/web', sessionId, createdAt: 1,
       }],
     })
 
