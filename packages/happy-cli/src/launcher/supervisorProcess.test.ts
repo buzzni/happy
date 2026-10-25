@@ -31,6 +31,7 @@ import { MANAGED_REPORT_CHILD_FD } from '@/daemon/launch/managedReportCredential
 import { encodeManagedReportCredential } from '@/daemon/launch/managedReportCredential';
 
 const TOKEN = 'process-fixture-token';
+const PROCESS_IPC_BUDGET_MS = 20_000;
 // `@/` alias 를 쓰는 소스를 자식 프로세스에서 그대로 돌리려면 tsconfig 를 명시해야 한다.
 const PACKAGE_ROOT = resolve(__dirname, '../..');
 const TSX_CLI = createRequire(__filename).resolve('tsx/cli');
@@ -174,7 +175,7 @@ process.send?.('ready');
             stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         });
         await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('supervisor did not start')), 20_000);
+            const timer = setTimeout(() => reject(new Error('supervisor did not start')), PROCESS_IPC_BUDGET_MS);
             child!.on('message', () => { clearTimeout(timer); resolve(); });
             let stderr = '';
             child!.stderr?.on('data', (chunk) => { stderr += String(chunk); });
@@ -275,7 +276,8 @@ process.send?.('ready');
     /** Asks the supervisor how many descriptors it currently holds. */
     function fdReport(): Promise<{ fds: number }> {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('no fd report')), 5_000);
+            // The diagnostic round trip shares the child readiness budget on a busy macOS worker.
+            const timer = setTimeout(() => reject(new Error('no fd report')), PROCESS_IPC_BUDGET_MS);
             child!.once('message', (m) => { clearTimeout(timer); resolve(m as never); });
             child!.send('fd-report');
         });

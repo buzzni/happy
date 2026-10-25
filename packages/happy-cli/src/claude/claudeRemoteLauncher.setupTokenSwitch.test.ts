@@ -1,3 +1,5 @@
+import { formatSetupTokenBinding } from '@/daemon/sessionEnv';
+import { readPersonalClaudeCredential } from './personalClaudeCredential';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { claudeRemoteLauncher } from './claudeRemoteLauncher';
@@ -5,8 +7,9 @@ import type { Session } from './session';
 import type { EnhancedMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
-import { requestSetupTokenRebind, reportSetupTokenUsage } from '@/daemon/controlClient';
+import { requestSetupTokenRebind, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
+import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -16,18 +19,20 @@ vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
 vi.mock('./utils/claudeCheckSession', () => ({ claudeCheckSession: () => true }));
 vi.mock('@/daemon/controlClient', async (original) => ({
     ...await original<typeof import('@/daemon/controlClient')>(),
+    requestSetupTokenAvailability: vi.fn(), returnFromPersonalClaude: vi.fn(),
     reportSetupTokenUsage: vi.fn(async () => {}),
     requestSetupTokenRebind: vi.fn(async () => ({ ok: true, environment: {
         CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-second', HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: '{"account":"second"}' } })),
 }));
 
-const saved = { token: process.env.CLAUDE_CODE_OAUTH_TOKEN, binding: process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING };
+vi.mock('./personalClaudeCredential', () => ({ readPersonalClaudeCredential: vi.fn() }));
+const saved = { source: process.env.HAPPY_AI_AUTH_SOURCE, token: process.env.CLAUDE_CODE_OAUTH_TOKEN, binding: process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING };
 beforeEach(() => {
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-first';
     process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = '{"account":"first"}';
 });
 afterEach(() => {
-    for (const [key, value] of [['CLAUDE_CODE_OAUTH_TOKEN', saved.token], ['HAPPY_AI_AUTH_SETUP_TOKEN_BINDING', saved.binding]] as const) {
+    for (const [key, value] of [['HAPPY_AI_AUTH_SOURCE', saved.source], ['CLAUDE_CODE_OAUTH_TOKEN', saved.token], ['HAPPY_AI_AUTH_SETUP_TOKEN_BINDING', saved.binding]] as const) {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     vi.clearAllMocks();
@@ -495,4 +500,132 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             vi.useRealTimers();
         }
     });
+});
+
+it.each(['automatic', 'organization-only', 'authentication'])('keeps one conversation through organization, approved personal continuation and verified organization return (%s)', async (returnMode) => {
+    const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
+    process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
+    let available = false;
+    vi.mocked(requestSetupTokenRebind).mockResolvedValue({ok:false,reason:'NO_ACCOUNT'});
+    vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id,_binding,consent) => ({allLimited:!available && returnMode!=='authentication',availableAccountIds:available?['org-account']:[],consentApproved:!!consent,...(!available && returnMode==='authentication'?{fallbackReason:'organization-authentication' as const}:{})}));
+    vi.mocked(returnFromPersonalClaude).mockResolvedValue({ok:true,environment:{CLAUDE_CODE_OAUTH_TOKEN:'fixture-org-return',HAPPY_AI_AUTH_SETUP_TOKEN_BINDING:original,HAPPY_AI_AUTH_SOURCE:'org-bundle'}});
+    vi.mocked(readPersonalClaudeCredential).mockResolvedValue({accountRef:'a'.repeat(64),label:'pe…@example.test',accessToken:'fixture-personal',expiresAt:Date.now()+600000});
+    const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
+    const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
+        updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
+        sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
+        applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn() };
+    const generations: Array<{token:string|undefined,resume:string|undefined,settingSources?:string[],prompts:string[]}> = [];
+    vi.mocked(query).mockImplementation(({prompt,options}) => {
+        const generation = {token:process.env.CLAUDE_CODE_OAUTH_TOKEN,resume:options?.resume,settingSources:options?.settingSources,prompts:[] as string[]};generations.push(generation);
+        const nth=generations.length;
+        return Object.assign((async function* () {
+            yield {type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none'};
+            for await(const message of prompt as AsyncIterable<SDKUserMessage>) {
+                generation.prompts.push(JSON.stringify(message.message.content));
+                if(nth===1) {
+                    if(returnMode==='authentication') yield {...assistant('auth-refused'),error:'authentication_failed'}; else yield refused;
+                    setTimeout(() => { void (async () => {
+                        const offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer;
+                        await handlers.get('personal-claude-fallback')!({action:'accept',accountRef:offer.accountRef,nonce:offer.nonce,consentProof:'fixture-proof'});
+                    })(); }, 0);
+                    yield {type:'result',subtype:'error_during_execution',is_error:true,errors:[returnMode==='authentication'?'API Error: 401 token expired':'usage limit'],uuid:'refused-personal'};
+                } else {
+                    yield assistant(`personal-${nth}`);
+                    if(nth===2) {
+                        available=true;
+                        if(returnMode!=='organization-only') queue.push('next request after recovery',{permissionMode:'default',model:'claude-sonnet-5'});
+                        else setTimeout(()=>{void(async()=>{
+                            const restored=await handlers.get('personal-claude-fallback')!({action:'restore-organization'});expect(restored.restored).toBe(true);
+                            queue.push('next request after recovery',{permissionMode:'default',model:'claude-sonnet-5'});
+                        })();},0);
+                    }
+                    else {void handlers.get('switch')!();}
+                    yield {type:'result',subtype:'success',result:'done',is_error:false,uuid:`result-personal-${nth}`};
+                    if(nth===3) return;
+                }
+            }
+        })(),{mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
+    });
+    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
+    const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
+        api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),onThinkingChange:vi.fn(),onAbort:vi.fn()};
+    await claudeRemoteLauncher(session as unknown as Session);
+    expect(generations.map(g=>g.resume)).toEqual(['claude-1','claude-1','claude-1']);
+    expect(generations.map(g=>g.token)).toEqual(['sk-ant-oat01-first','fixture-personal','fixture-org-return']);
+    expect(generations.map(g=>g.prompts.length)).toEqual([1,1,1]);
+    expect(client.setPersonalClaudeFallback).toHaveBeenLastCalledWith(undefined);
+    expect(client.setClaudeRuntimeAccount).toHaveBeenLastCalledWith(undefined);
+    expect(generations[1].settingSources).toEqual([]);
+    expect(returnFromPersonalClaude).toHaveBeenCalledOnce();
+    expect(client.setPersonalClaudeFallback.mock.calls.filter(([v])=>v!==undefined).map(([v])=>v.personal?.accountRef??null)).toEqual([null,'a'.repeat(64),null]);
+});
+
+it.each(['authority', 'channel', 'pending-authority', 'pending-recovery'] as const)('reports refused personal input with its request identity (%s)', async kind => {
+    const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
+    process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
+    let recheckFails = false, recovered = false;
+    vi.mocked(requestSetupTokenRebind).mockResolvedValue({ok:false,reason:'NO_ACCOUNT'});
+    vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id,_binding,consent) => {
+        if (recheckFails) throw new Error('daemon unreachable');
+        return recovered ? {allLimited:false,availableAccountIds:['org-return'],consentApproved:false} : {allLimited:true,availableAccountIds:[],consentApproved:!!consent};
+    });
+    vi.mocked(returnFromPersonalClaude).mockResolvedValue({ok:true,environment:{CLAUDE_CODE_OAUTH_TOKEN:'fixture-org-return',HAPPY_AI_AUTH_SETUP_TOKEN_BINDING:original}});
+    vi.mocked(readPersonalClaudeCredential).mockResolvedValue({accountRef:'a'.repeat(64),label:'pe…@example.test',accessToken:'fixture-personal',expiresAt:Date.now()+600000});
+    const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
+    const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
+        updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
+        sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
+        applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn(),failClaudeLaunchTurn:vi.fn() };
+    const generations: Array<{token:string|undefined,prompts:string[];sources:unknown}> = [];
+    vi.mocked(query).mockImplementation(({prompt,options}) => {
+        const generation = {token:process.env.CLAUDE_CODE_OAUTH_TOKEN,prompts:[] as string[],sources:options?.settingSources};generations.push(generation);
+        const nth=generations.length;
+        return Object.assign((async function* () {
+            yield {type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none'};
+            for await(const message of prompt as AsyncIterable<SDKUserMessage>) {
+                generation.prompts.push(JSON.stringify(message.message.content));
+                if(nth===1) {
+                    yield refused;
+                    setTimeout(() => { void (async () => {
+                        const offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer;
+                        await handlers.get('personal-claude-fallback')!({action:'accept',accountRef:offer.accountRef,nonce:offer.nonce,consentProof:'fixture-proof'});
+                    })(); }, 0);
+                    yield {type:'result',subtype:'error_during_execution',is_error:true,errors:['usage limit'],uuid:'refused-personal'};
+                } else {
+                    yield assistant(`personal-${nth}`);
+                    // The second request of this personal generation meets a failing authority recheck.
+                    if(nth===2 && generation.prompts.length===1) setTimeout(()=>{
+                        recheckFails=kind==='authority';
+                        const mode:EnhancedMode={permissionMode:'default',model:kind.startsWith('pending-')?'claude-opus-5':'claude-sonnet-5'};
+                        if(kind==='channel') queue.pushIsolated('blocked channel request',mode,undefined,undefined,'channel-1');
+                        else queue.push('second request while personal',mode);
+                    },0);
+                    yield {type:'result',subtype:'success',result:'done',is_error:false,uuid:`result-personal-${nth}-${generation.prompts.length}`};
+                    if(kind==='pending-recovery' && nth===3) setTimeout(()=>{void handlers.get('switch')!();},20);
+                }
+            }
+            if(nth===2 && kind==='pending-authority') recheckFails=true;
+            if(nth===2 && kind==='pending-recovery') recovered=true;
+            if(nth>1 && kind!=='pending-recovery') setTimeout(()=>{void handlers.get('switch')!();},20);
+        })(),{mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
+    });
+    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
+    const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
+        api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),onThinkingChange:vi.fn(),onAbort:vi.fn()};
+    await claudeRemoteLauncher(session as unknown as Session);
+    expect(generations.map(g=>g.token)).toEqual(kind==='pending-recovery'?['sk-ant-oat01-first','fixture-personal','fixture-org-return']:['sk-ant-oat01-first','fixture-personal']);
+    if(kind==='pending-recovery') {expect(generations[2].prompts).toHaveLength(1);expect(generations[2].sources).not.toEqual([]);}
+    expect(generations[1].prompts).toHaveLength(1);
+    expect(queue.size()).toBe(0);
+    const notices=client.sendSessionEvent.mock.calls.map(([event])=>event.message);
+    if(kind==='pending-recovery') {expect(notices).not.toContain(PERSONAL_RECHECK_NOTICE);expect(client.failClaudeLaunchTurn).not.toHaveBeenCalled();}
+    else {expect(notices).toContain(PERSONAL_RECHECK_NOTICE);expect(client.failClaudeLaunchTurn).toHaveBeenCalledOnce();}
+    if(kind==='channel') {
+        expect(client.setPendingTurnRequestId).toHaveBeenLastCalledWith('channel-1');
+        expect(client.sendFinalAnswerForChannelTurn).toHaveBeenCalledWith(PERSONAL_RECHECK_NOTICE);
+        const notice=client.sendFinalAnswerForChannelTurn.mock.calls.findIndex(([text])=>text===PERSONAL_RECHECK_NOTICE);
+        expect(client.setPendingTurnRequestId.mock.invocationCallOrder.at(-1)).toBeLessThan(client.sendFinalAnswerForChannelTurn.mock.invocationCallOrder[notice]);
+        expect(client.sendFinalAnswerForChannelTurn.mock.invocationCallOrder[notice]).toBeLessThan(client.failClaudeLaunchTurn.mock.invocationCallOrder[0]);
+    }
 });

@@ -131,7 +131,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     return { ok: true, environment }
   }
 
-  async function rebindOnce(sessionId: string, running: string): Promise<RebindResult> {
+  async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
     const { session, recorded } = bound
@@ -145,7 +145,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     // Never move a session back onto a binding older than the one it runs.
     if (bound.state === 'daemon-behind') return failure('STALE', `session ${sessionId} runs a newer binding than this daemon records`)
     // The session missed a switch this daemon finished (its request timed out): catch it up, no new grant.
-    if (bound.state === 'session-behind') {
+    if (!confirmedOnly && bound.state === 'session-behind') {
       try { return { ok: true, environment: await deps.sessionEnvironment('claude', recorded.selection, recorded.binding) } }
       catch (error) { logger.debug(`[setup-token-switch] recorded binding unusable for ${sessionId}; asking Studio: ${(error as Error)?.message}`) }
     }
@@ -154,8 +154,8 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     const tokenProof = !isMachineSetupTokenBinding(binding) && !!binding.tokenProof
     let grant: Record<string, unknown>
     try {
-      const response = await post('rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce,
-        ...(tokenProof ? { credentialProofVersion: 1 } : {}) })
+      const response = await post(confirmedOnly ? 'return' : 'rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce,
+        ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}) })
       const body = await response.json().catch(() => null) as Record<string, unknown> | null
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return { ok: false, reason: 'NO_ACCOUNT' }
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED') return { ok: false, reason: 'APPLY_REQUIRED' }
@@ -169,7 +169,7 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     try {
       environment = await deps.sessionEnvironment('claude', { kind: 'claude-setup-token', managedAccountId: grant.managedAccountId,
         groupScope: binding.groupScope, credentialGeneration: grant.credentialGeneration as number, bindingGrant: grant.bindingGrant,
-        ...(tokenProof ? { credentialProofVersion: 1 } : {}) })
+        ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}) })
     } catch (error) { return failure('BINDING_REJECTED', `grant verification: ${(error as Error)?.message}`) }
     // The session stays with its member and organization; only the account changes.
     const next = parseBinding(environment[SETUP_TOKEN_BINDING_ENV])?.binding
@@ -220,6 +220,24 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
   }
 
   return {
+    async availability(sessionId: string, running: string, personalConsent?: { proof: string; accountRef: string; nonce: string }, organizationFailure?: { kind: 'authentication'; observedAt: number }) {
+      const bound = boundSession(deps, sessionId, running)
+      if (!bound || isMachineSetupTokenBinding(bound.recorded.binding) || !deps.studioOrigin) return { ok: false as const, reason: 'NOT_BOUND' }
+      const binding = bound.recorded.binding
+      try {
+        const response = await post('availability', { machineId: deps.machineId, sessionId, companyId: binding.companyId,
+          bindingNonce: binding.nonce, ...(organizationFailure ? { organizationFailure } : {}), ...(personalConsent ? { personalConsent } : {}), ...(binding.tokenProof ? { credentialProofVersion: 1 } : {}) })
+        const body = await response.json() as Record<string, unknown>
+        if (body.fallbackReason !== undefined && (typeof body.fallbackReason !== 'string' || !['quota-exhausted', 'organization-authentication', 'organization-lookup'].includes(body.fallbackReason))) return { ok: false as const, reason: 'REQUEST_FAILED' as const }
+        if (!response.ok || body.version !== 1 || typeof body.allLimited !== 'boolean' || !Array.isArray(body.availableAccountIds)
+          || !body.availableAccountIds.every(id => typeof id === 'string' && UUID.test(id))) return { ok: false as const, reason: refusal(response.status) }
+        return { ok: true as const, allLimited: body.allLimited, availableAccountIds: body.availableAccountIds as string[], consentApproved: body.consentApproved === true, ...(body.fallbackReason ? { fallbackReason: body.fallbackReason as 'quota-exhausted' | 'organization-authentication' | 'organization-lookup' } : {}) }
+      } catch { return { ok: false as const, reason: 'REQUEST_FAILED' } }
+    },
+    async returnFromPersonal(sessionId: string, running: string, organizationFailure?: { kind: 'authentication'; observedAt: number }) {
+      if (inFlight.has(sessionId)) await inFlight.get(sessionId)
+      return rebindOnce(sessionId, running, true, organizationFailure)
+    },
     /** `running`: the binding record the session itself runs with, so usage is never booked to another account. */
     async reportUsage(sessionId: string, running: string, observation: SetupTokenUsageObservation, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; reason: SwitchFailure }> {
       const shared = sharedSession(sessionId, running)
