@@ -226,6 +226,7 @@ describe('runClaude for a managed Cloud child', () => {
         let metadata: Record<string, unknown> = { path: MANAGED_PROJECT_ROOT };
         sessionClient = {
             sessionId: 'sess-managed-runner',
+            configureInputQueue: vi.fn(),
             suppressNextArchiveSignal: vi.fn(),
             skipExistingMessages: vi.fn(),
             capRuntimeProcessedSeq: vi.fn(),
@@ -317,6 +318,7 @@ describe('runClaude for a managed Cloud child', () => {
         expect(api.sessionSyncClient).toHaveBeenCalledWith(
             expect.objectContaining({ id: 'sess-managed-runner' }),
         );
+        expect(sessionClient.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', true);
         loopDeferred.resolve();
         await run.catch(() => {});
     }, 30_000);

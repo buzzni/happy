@@ -243,6 +243,8 @@ describe('runCodex itself, for a managed child', () => {
     function sessionClientStub() {
         return {
             sessionId: 'sess-1',
+            configureInputQueue: vi.fn(),
+            setInputSteerAvailable: vi.fn(),
             awaitMessageAck: mockAwaitMessageAck,
             sendSessionEvent: mockSendSessionEvent,
             sendSessionProtocolMessage: vi.fn(),
@@ -374,6 +376,7 @@ describe('runCodex itself, for a managed child', () => {
                 principal: { kind: 'managed', startup: { envelope: envelope(), attachment } },
             }).catch(() => { /* the run fails somewhere past the app-server */ });
             expect(mockAwaitMessageAck).toHaveBeenCalled();
+            expect(stub.configureInputQueue).toHaveBeenCalledWith(expect.anything(), 'remote', true);
             expect(mockClientConstructed).toHaveBeenCalled();
         } finally {
             managedSpy.mockRestore();

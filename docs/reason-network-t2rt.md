@@ -381,6 +381,129 @@ ACP/Gemini queue configuration when editing those reserved host files next.
 Existing `happy-wire/src/index.ts` re-exports sessionProtocol, so no common export
 edit or export conflict was introduced.
 
+## PR #951 managed startup CI follow-up (532e478f)
+
+The macOS failure in run `40180291288` was reproduced unchanged on Linux:
+`managedCodexStartup.test.ts` had 5 failures and `managedRunnerStartup.test.ts`
+had 13 (18 failed / 9 passed, plus two unhandled startup rejections). The Claude
+harness catches the startup rejection and waits for an unreached loop/ACK spy,
+so its timeout assertions obscure the same missing `configureInputQueue` method.
+
+This is a test-double gap, not a managed runtime regression. Both account and
+managed branches of `ApiClient.sessionSyncClient()` construct `ApiSessionClient`;
+its queue configuration method is unconditional and its contact capability logic
+explicitly handles the managed principal. The only alternate production session,
+`createOfflineSessionStub()`, already provides the method. The managed attachment
+integration test now asserts that the real factory result provides queue and steer
+configuration. The two runner fixtures now supply their consumed API methods
+(`configureInputQueue`, plus Codex's later `setInputSteerAvailable`), and their
+existing startup controls assert the queue configuration call. No production
+fallback, optional method, authorization or witness contract was changed.
+
+These files are not macOS-only. The workflow's macOS job runs the unit project;
+the Linux smoke job builds and exercises packaged binaries/browser smoke without
+running that unit project. All local checks below use Linux / Node 20.18.3, with
+no platform override for the managed startup files. Native macOS execution remains
+CI's responsibility.
+
+Audit: searched the entire CLI package for `configureInputQueue`, session factories,
+`ApiSessionClient` references/casts, offline creation, user/message callbacks,
+RPC/session stubs and permission-handler fixtures. Runner doubles for ordinary
+Claude, Codex and ACP already provide queue configuration. OpenClaw and partial
+launcher/MCP/permission/steer doubles do not call that API at their tested boundary;
+they remain deliberately partial and were included in verification. Machine API,
+provider app-server, DTO-only and browser-client objects are different contracts,
+not alternative implementations of `ApiSessionClient`.
+
+Verification:
+
+- Red and first green used the ordinary unit setup with only the repeated build
+  global setup disabled in an ignored iteration config. Both requested files
+  changed from 18 failures to **27/27 passing**; with real attachment coverage,
+  the initial green was **35/35** in three files.
+- Standard audit command: `corepack pnpm -C packages/happy-cli exec vitest run
+  --project unit <46 files below> --maxWorkers 1`. Global setup passed CLI
+  `tsc --noEmit`, pkgroll and extension-copy build (existing bin-location and
+  empty-chunk warnings). Result: **41 files passed / 5 failed; 1021 tests passed /
+  52 failed / 2 skipped**, plus one ACP unhandled rejection. Both requested
+  files passed again (27/27), as did the real attachment file (8/8).
+- Of the audit failures, **50** are Unix socket creation failures with
+  `listen EPERM` under `/tmp/happy-mcp-*/mcp.sock`: `startHappyServer.test.ts`
+  (28), `checkpointAgentReader.test.ts` (11), `turnCardTools.test.ts` (9) and
+  `mandatoryMcp.test.ts` (2). These could not be verified in this execution
+  environment; no `configureInputQueue` failure remains. The two native Claude
+  scope tests are opt-in skips (`HAPPY_SCOPE_NATIVE_CLAUDE` unset).
+- The two ACP failures were a 1-second startup wait and a 5-second approval
+  wait, with an associated `Session terminated` rejection. Re-running the
+  unchanged `src/agent/acp/runAcp.test.ts` alone with the iteration config passed
+  **24/24**, without an unhandled error; the aggregate timing failure is still
+  recorded rather than representing the initial audit as green.
+- `git diff --check` passed. There is no Happy preflight script; the standard
+  unit global setup supplied the applicable type/build checks.
+- Separately, `src/codex/codexSteerHandler.test.ts`: **6/6 passed**.
+- Also attempted the matched `src/claude/claude.integration.test.ts` through its
+  `integration-empty` project. Environment setup failed before collecting tests:
+  `Migration failed with exit code null` from the temporary environment's server
+  migration subprocess. This is **not a pass**; no paid-provider scenario ran.
+  The fixture belongs to the direct SDK/MCP path, which never configures an input
+  queue. Its MCP consumer was also attempted in the selected unit files, subject to
+  the Unix-socket restriction above.
+- No release fragment: this follow-up changes only tests and this report. No
+  Desktop files, T1b files, exports, dependency manifests or lockfiles changed.
+- Delivery for this follow-up is **local commit only**. The parent session owns
+  pushing after the PR review bot finishes; no push or PR operation is performed.
+
+Audit unit selection (paths relative to `packages/happy-cli`; standard unit project):
+
+```text
+src/agent/acp/runAcp.test.ts
+src/api/apiSession.test.ts
+src/api/apiSessionContextUsage.test.ts
+src/api/apiSessionManagedOrigin.test.ts
+src/api/apiSessionRuntimeAccount.test.ts
+src/api/apiSessionSocketPath.test.ts
+src/api/turnInputEvidence.test.ts
+src/channel/channelPermissionMembership.test.ts
+src/channel/channelPromptAcceptance.test.ts
+src/channel/channelTurnOrdering.test.ts
+src/checkpoint/checkpointAgentReader.test.ts
+src/claude/claudeLocalLauncher.test.ts
+src/claude/claudeRemote.test.ts
+src/claude/claudeRemoteLauncher.aiAuthObservation.test.ts
+src/claude/claudeRemoteLauncher.setupTokenSwitch.test.ts
+src/claude/claudeRemoteLauncher.standaloneDrain.test.ts
+src/claude/claudeRemoteLauncher.structuredOutput.test.ts
+src/claude/claudeRemoteLauncher.test.ts
+src/claude/claudeRemoteLauncher.transientRetry.test.ts
+src/claude/claudeRemoteLauncherContextUsage.test.ts
+src/claude/initialPrompt.test.ts
+src/claude/runClaude.test.ts
+src/claude/runClaudeOfflineAck.test.ts
+src/claude/session.test.ts
+src/claude/utils/mandatoryMcp.test.ts
+src/claude/utils/permissionHandler.expiry.test.ts
+src/claude/utils/permissionHandler.resolution.test.ts
+src/claude/utils/permissionHandler.test.ts
+src/claude/utils/startHappyServer.test.ts
+src/claude/utils/turnCardTools.test.ts
+src/codex/__tests__/codexApprovalBoundary.test.ts
+src/codex/__tests__/codexUserInput.test.ts
+src/codex/__tests__/permissionHandler.expiry.test.ts
+src/codex/__tests__/permissionHandler.test.ts
+src/codex/codexAppServerClient.test.ts
+src/codex/runCodex.capacityRetry.test.ts
+src/codex/runCodex.channelClear.test.ts
+src/codex/runCodex.lessonProposal.test.ts
+src/codex/runCodex.shutdown.test.ts
+src/daemon/sessionWriteScopeClaude.test.ts
+src/managed/managedApprovalConsumer.test.ts
+src/managed/managedCodexStartup.test.ts
+src/managed/managedRunnerStartup.test.ts
+src/managed/managedStartupAttach.test.ts
+src/openclaw/runOpenClaw.test.ts
+src/toolPolicy/grants.test.ts
+```
+
 ## Known integration boundaries
 
 - Additional-input acceptance records the host's provider handoff. A rejected or
