@@ -42,10 +42,10 @@ Windows에서는 기존 GitHub 자동화 host-command 제한을 유지한다. �
 중첩 저장소·lock·symlink·프로세스/재개 보호·검사 간격·중복 실행을 검증한다.
 원장에 남은 예전 세션이 종료됐어도 같은 폴더의 새 세션을 보호하는 회귀도 포함한다.
 대상 테스트는 `githubWorktreeArtifactReclaim`, `githubTriggerWorktree`,
-`serverAutomationExecutor`, `githubWorktreeTombstones`의 4개 suite다.
+`serverAutomationExecutor`, `githubWorktreeTombstones`, `resumeMissingWorktreeWiring`의 5개 suite다.
 
-2026-10-25 기본 Vitest 설정에서 위 4개 suite의 216개 테스트를 통과했다.
-global setup의 CLI 프로덕션 빌드와 타입 검사도 성공했다. 현재 PC의 실제 호스트에서 격리 fixture로
+2026-10-25 기본 Vitest 설정에서 위 5개 suite의 222개 테스트를 통과했다.
+global setup의 CLI 프로덕션 빌드와 타입 검사도 성공했다. macOS 임시 폴더 fixture는 실제 경로로 만들고, 관리 루트의 symlink 별칭은 계속 거부하는 회귀를 포함한다. 현재 PC의 실제 호스트에서 격리 fixture로
 기본 OS probe를 실행했을 때는 일부 보호된 시스템 프로세스 때문에 `incomplete process inventory`를
 반환했고, 삭제 0건과 dirty 소스 보존을 확인했다. 정상 회수는 실제 Git/파일 fixture와 통제된
 프로세스 관측 입력으로 검증했다. 실제 사용자 데이터 삭제나 실행 중 daemon 교체는 수행하지 않았다.

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -40,7 +40,9 @@ function reclaimer(options: Partial<Parameters<typeof createGithubArtifactReclai
 }
 
 beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), 'github-artifact-reclaim-'))
+  // macOS exposes its temporary directory through /var -> /private/var.
+  // Fixtures use canonical owned paths, just as the production safety gate requires.
+  root = await realpath(await mkdtemp(join(tmpdir(), 'github-artifact-reclaim-')))
   repo = join(root, 'repo')
   managedRoot = join(root, 'automation-worktrees')
   worktreePath = join(managedRoot, 'a'.repeat(24))
@@ -161,6 +163,17 @@ describe('GitHub automation generated artifact reclamation', () => {
     const result = await reclaimer()({ repositoryRoot: repo, worktreePath })
     expect(result.deletedPaths).toEqual([])
     expect(await readFile(join(outside, 'valuable'), 'utf8')).toBe('retain')
+  })
+
+  it('does not accept a symlink alias as its managed root', async () => {
+    const alias = join(root, 'managed-alias')
+    await symlink(managedRoot, alias)
+    const result = await reclaimer({ managedRoot: alias })({
+      repositoryRoot: repo, worktreePath: join(alias, 'a'.repeat(24)),
+    })
+    expect(result.status).toBe('failed')
+    expect(result.deletedPaths).toEqual([])
+    expect(await readFile(join(target, 'downloaded.js'), 'utf8')).toContain('dependency')
   })
 
   it('does not reclaim an unregistered lookalike under the managed namespace', async () => {
