@@ -6,6 +6,8 @@ import { join } from 'node:path'
 const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
   startDaemon: vi.fn(),
+  stopDaemon: vi.fn(),
+  isInstalledVersion: vi.fn(),
 }))
 
 // Exercise the real CLI dispatch, configuration bootstrap and settings I/O,
@@ -16,6 +18,8 @@ vi.mock('@/ui/auth', () => ({}))
 vi.mock('@/daemon/run', () => ({ startDaemon: mocks.startDaemon }))
 vi.mock('@/daemon/controlClient', () => ({
   checkIfDaemonRunningAndCleanupStaleState: async () => true,
+  isDaemonRunningCurrentlyInstalledHappyVersion: mocks.isInstalledVersion,
+  stopDaemon: mocks.stopDaemon,
 }))
 vi.mock('@/utils/spawnHappyCLI', () => ({
   spawnHappyCLI: mocks.spawn,
@@ -34,10 +38,14 @@ describe('daemon MCP config CLI startup', () => {
     happyHome = join(testDirectory, 'pristine-home')
     vi.stubEnv('HAPPY_HOME_DIR', happyHome)
     vi.stubEnv('HAPPY_APLUS_MCP_CONFIG_URL', undefined)
+    vi.stubEnv('HAPPY_APLUS_STUDIO_ORIGIN', undefined)
+    vi.stubEnv('HAPPY_SERVER_URL', 'https://unconfigured-relay.example')
     vi.stubEnv('HAPPY_APLUS_MCP_CALLER_GRANT', 'session-grant')
     vi.stubEnv('HAPPY_APLUS_CAPABILITY_TOKEN', 'session-capability')
     mocks.spawn.mockReturnValue({ unref: vi.fn(), once: vi.fn() }) // daemon start listens for the start-sync exit
     mocks.startDaemon.mockImplementation(async () => undefined)
+    mocks.stopDaemon.mockResolvedValue(undefined)
+    mocks.isInstalledVersion.mockResolvedValue(false)
     vi.spyOn(process, 'exit').mockImplementation(() => undefined as never)
     vi.spyOn(console, 'log').mockImplementation(() => undefined)
   })
@@ -61,6 +69,13 @@ describe('daemon MCP config CLI startup', () => {
   function readPersistedSettings() {
     return JSON.parse(readFileSync(join(happyHome, 'settings.json'), 'utf8'))
   }
+
+  it('still drains a running daemon before spawning a validated replacement', async () => {
+    await runCommand('restart')
+    expect(mocks.stopDaemon).toHaveBeenCalledTimes(1)
+    expect(mocks.spawn).toHaveBeenCalledTimes(1)
+    expect(mocks.stopDaemon.mock.invocationCallOrder[0]).toBeLessThan(mocks.spawn.mock.invocationCallOrder[0])
+  })
 
   it('bootstraps a pristine home, persists a preset and restores it on a later detached start', async () => {
     expect(existsSync(happyHome)).toBe(false)
@@ -136,5 +151,59 @@ describe('daemon MCP config CLI startup', () => {
     expect(mocks.spawn).toHaveBeenCalledTimes(1)
     expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_MCP_CONFIG_URL).toBeUndefined()
     expect(existsSync(join(happyHome, 'settings.json'))).toBe(false)
+  })
+
+  it('defaults a new cloud daemon to the official trusted origin and restores it on restart', async () => {
+    vi.stubEnv('HAPPY_SERVER_URL', undefined)
+    await runCommand('start')
+    expect(readPersistedSettings().aplusStudioOrigin).toBe('https://saycode.ai')
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('https://saycode.ai')
+    expect(process.env.HAPPY_APLUS_STUDIO_ORIGIN).toBeUndefined()
+
+    mocks.startDaemon.mockImplementation(async () => {
+      expect(process.env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('https://saycode.ai')
+    })
+    await runCommand('start-sync')
+    expect(mocks.startDaemon).toHaveBeenCalledTimes(1)
+  })
+
+  it('fills a missing origin for an existing machine whose saved relay is official cloud', async () => {
+    vi.stubEnv('HAPPY_SERVER_URL', undefined)
+    await import('./configuration')
+    writeFileSync(join(happyHome, 'settings.json'), JSON.stringify({
+      schemaVersion: 1, onboardingCompleted: true, machineId: 'legacy', serverUrl: 'https://saycode.ai',
+    }))
+    await runCommand('start')
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('https://saycode.ai')
+    expect(readPersistedSettings()).toMatchObject({ machineId: 'legacy', aplusStudioOrigin: 'https://saycode.ai' })
+  })
+
+  it('saves a self-hosted origin before start-sync and restores it on a later detached start', async () => {
+    vi.stubEnv('HAPPY_APLUS_STUDIO_ORIGIN', 'http://localhost:5174')
+    mocks.startDaemon.mockImplementation(async () => {
+      expect(readPersistedSettings().aplusStudioOrigin).toBe('http://localhost:5174')
+      expect(process.env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('http://localhost:5174')
+    })
+    await runCommand('start-sync')
+    vi.stubEnv('HAPPY_APLUS_STUDIO_ORIGIN', undefined)
+    await runCommand('start')
+    expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('http://localhost:5174')
+  })
+
+  it.each(['start', 'start-sync', 'restart'])('reports malformed settings without stopping a running daemon, starting a replacement or replacing the file (%s)', async command => {
+    vi.stubEnv('HAPPY_SERVER_URL', undefined)
+    await import('./configuration')
+    const file = join(happyHome, 'settings.json')
+    writeFileSync(file, '{broken-json')
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    process.argv = ['node', 'happy', 'daemon', command]
+    vi.resetModules()
+    await import('./main')
+    await vi.waitFor(() => expect(process.exit).toHaveBeenCalledWith(1))
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('Error:'), 'Failed to read settings')
+    expect(mocks.spawn).not.toHaveBeenCalled()
+    expect(mocks.startDaemon).not.toHaveBeenCalled()
+    expect(mocks.stopDaemon).not.toHaveBeenCalled()
+    expect(readFileSync(file, 'utf8')).toBe('{broken-json')
   })
 })

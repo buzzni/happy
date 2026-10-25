@@ -48,6 +48,7 @@ import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
 import { readManagedStartup } from '@/managed/managedStartup';
 import { resolveDaemonMcpConfigEnvironment } from './daemon/daemonMcpConfig'
+import { resolveDaemonStudioOriginEnvironment } from './daemon/daemonStudioOrigin'
 import { waitForDaemonStart } from './daemon/waitForDaemonStart'
 
 
@@ -606,20 +607,6 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       return
 
     } else if (daemonSubcommand === 'start' || daemonSubcommand === 'restart') {
-      // aplus codexcli-daemon-restart-drain R5: an explicit restart — or a start that finds a
-      // daemon of another version — drains the running daemon in the foreground, printing
-      // progress, before the new one starts. Turns keep running; sessions survive.
-      const printProgress = createStopProgressPrinter()
-      if (daemonSubcommand === 'restart') {
-        const parsed = parseDaemonStopArgs('restart', args.slice(2))
-        if (!parsed.ok) {
-          console.error(parsed.error)
-          process.exit(1)
-        }
-        await stopDaemon({ ...parsed.options, onProgress: printProgress })
-      } else if (await isRunningDaemonOfAnotherVersion()) {
-        await stopDaemon({ intent: 'restart', reason: 'user-restart', onProgress: printProgress })
-      }
       // Optional preset name (e.g. `happy daemon start saycode`) resolves to
       // HAPPY_APLUS_MCP_CONFIG_URL so it doesn't need to be exported by hand.
       // An explicitly set env var always wins over the preset.
@@ -633,7 +620,29 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         }
         daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: presetUrl }
       }
-      daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
+      try {
+        daemonEnv = await resolveDaemonStudioOriginEnvironment(daemonEnv, configuration.serverUrl)
+        daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
+      } catch (error) {
+        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Invalid daemon configuration')
+        process.exit(1)
+        return
+      }
+
+      // Validate replacement configuration before draining the running daemon.
+      // aplus codexcli-daemon-restart-drain R5: turns keep running; sessions survive.
+      const printProgress = createStopProgressPrinter()
+      if (daemonSubcommand === 'restart') {
+        const parsed = parseDaemonStopArgs('restart', args.slice(2))
+        if (!parsed.ok) {
+          console.error(parsed.error)
+          process.exit(1)
+          return
+        }
+        await stopDaemon({ ...parsed.options, onProgress: printProgress })
+      } else if (await isRunningDaemonOfAnotherVersion()) {
+        await stopDaemon({ intent: 'restart', reason: 'user-restart', onProgress: printProgress })
+      }
 
       // Spawn detached daemon process.
       // stdio is captured, never ignored: if start-sync dies before its logger
@@ -672,9 +681,20 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       await preflightDaemonControlServer()
       process.exit(0)
     } else if (daemonSubcommand === 'start-sync') {
-      const daemonEnv = await resolveDaemonMcpConfigEnvironment(process.env, { persistExplicit: true })
+      let daemonEnv = process.env
+      try {
+        daemonEnv = await resolveDaemonStudioOriginEnvironment(daemonEnv, configuration.serverUrl)
+        daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
+      } catch (error) {
+        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Invalid daemon configuration')
+        process.exit(1)
+        return
+      }
       if (daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL) {
         process.env.HAPPY_APLUS_MCP_CONFIG_URL = daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL
+      }
+      if (daemonEnv.HAPPY_APLUS_STUDIO_ORIGIN) {
+        process.env.HAPPY_APLUS_STUDIO_ORIGIN = daemonEnv.HAPPY_APLUS_STUDIO_ORIGIN
       }
       await startDaemon()
       process.exit(0)
