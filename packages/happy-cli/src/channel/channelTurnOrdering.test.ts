@@ -72,7 +72,7 @@ function harness(witnessed = false) {
         },
     };
     const queue = new OutgoingMessageQueue(withContextUsageSignals(createOrderedTurnDispatcher(target), () => {}));
-    return { queue, envelopes, state, bindings, evidence, rearm };
+    return { queue, envelopes, state, bindings, evidence, rearm, sendScannerMessage: target.sendClaudeSessionMessage };
 }
 
 const assistant = (text: string, uuid = 'a-1') => ({
@@ -141,6 +141,87 @@ describe('channel turn ordering through the launcher dispatcher', () => {
                 const receiptIndex = h.envelopes.findIndex(envelope => envelope.id.startsWith('task-notification:long-job:receipt'));
                 expect(receiptIndex).toBeGreaterThan(-1);
                 expect(receiptIndex).toBeLessThan(h.envelopes.indexOf(terminal));
+            } finally { h.queue.destroy(); }
+        },
+    );
+
+    it.each([
+        { sdkRunId: undefined, scannerRunId: undefined },
+        { sdkRunId: 'run-1', scannerRunId: 'run-1' },
+        { sdkRunId: 'run-1', scannerRunId: undefined },
+        { sdkRunId: undefined, scannerRunId: 'run-1' },
+    ].flatMap(identity => ['follow-up', 'idle', 'unrelated'].flatMap(phase =>
+        ['sdk', 'scanner'].map(first => ({ ...identity, phase, first })))))(
+        'T2RT-07 consumes completion once (sdk=$sdkRunId, scanner=$scannerRunId, late=$phase, first=$first)',
+        async ({ sdkRunId, scannerRunId, phase, first }) => {
+            const h = harness(true);
+            const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+            const sdk = (message: Parameters<typeof converter.convert>[0]) => {
+                const log = converter.convert(message);
+                expect(log).not.toBeNull(); h.queue.enqueue(log);
+            };
+            const text = (value: string) => sdk({ type: 'assistant', parent_tool_use_id: null,
+                message: { role: 'assistant', content: [{ type: 'text', text: value }] } } as Parameters<typeof converter.convert>[0]);
+            const batch = (id: string) => pendingRequestItem(`channel-${id}`, {
+                inputs: [{ kind: 'channel', channelRequestId: `channel-${id}` }], inputCount: 1,
+            });
+            const finish = (value: string) => {
+                text(value); h.queue.enqueue(finalAnswerItem(value)); h.queue.enqueue(turnEndItem('completed'));
+            };
+            const details = '<task-notification><task-id>long-job</task-id><tool-use-id>launch</tool-use-id>'
+                + '<status>completed</status><summary>Full scanner result</summary></task-notification>';
+            // runClaude's scanner sends directly to the session mapper, independently of the SDK queue.
+            const scanner = () => h.sendScannerMessage({ type: 'user', uuid: 'scanner-detail',
+                origin: { kind: 'task-notification', producer: 'session-task', ...(scannerRunId ? { runId: scannerRunId } : {}) },
+                message: { role: 'user', content: details } });
+            try {
+                h.queue.enqueue(batch('A'));
+                sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+                    { type: 'tool_use', id: 'launch', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+                ] } } as Parameters<typeof converter.convert>[0]);
+                sdk({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+                    { type: 'tool_result', tool_use_id: 'launch', content: 'Command running in background with ID: long-job.' },
+                ] } });
+                h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+                const original = h.evidence.snapshot()!;
+                const receipt = (runId = sdkRunId) => sdk({ type: 'system', subtype: 'task_notification',
+                    task_id: 'long-job', tool_use_id: 'launch', status: 'completed',
+                    ...(runId ? { run_id: runId } : {}), session_id: 'sdk-session',
+                    uuid: '00000000-0000-4000-8000-000000000007', output_file: '/tmp/long-job.output', summary: 'Done' });
+                const duplicate = first === 'sdk' ? scanner : () => receipt();
+                if (first === 'sdk') receipt(); else scanner();
+                text('F begins'); await h.queue.flush();
+                const followUp = h.state.currentTurnId!;
+                expect(h.envelopes.find(e => e.turn === followUp && e.ev.t === 'turn-start')?.ev)
+                    .toMatchObject({ requestId: 'channel-A' });
+                if (phase === 'follow-up') duplicate();
+                finish('F actual final'); await h.queue.flush();
+                if (phase === 'idle') duplicate();
+                h.queue.enqueue(batch('B')); text('B begins'); await h.queue.flush();
+                if (phase === 'unrelated') duplicate();
+                finish('B actual final'); await h.queue.flush();
+
+                const finalF = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'F actual final')!;
+                expect.soft(finalF).toMatchObject({ turn: followUp, ev: { requestId: 'channel-A',
+                    inputEvidence: { rootBatchId: original.rootBatchId, coverage: 'complete', incompleteReasons: [] } } });
+                expect.soft(h.envelopes.filter(e => e.turn === followUp && e.ev.t === 'turn-end')).toHaveLength(1);
+                expect.soft(h.evidence.snapshot(followUp)).toMatchObject({ rootBatchId: original.rootBatchId,
+                    coverage: 'complete', incompleteReasons: [], terminal: true });
+                const finalB = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'B actual final')!;
+                expect.soft(finalB.ev).toMatchObject({ requestId: 'channel-B' });
+                const evidenceB = h.evidence.snapshot(finalB.turn)!;
+                expect.soft(evidenceB).toMatchObject({ coverage: 'complete', incompleteReasons: [],
+                    inputs: [{ kind: 'channel', channelRequestId: 'channel-B' }], terminal: true });
+                expect.soft(evidenceB.rootBatchId).not.toBe(original.rootBatchId);
+                expect.soft(h.rearm).toHaveBeenCalledOnce();
+                expect.soft(h.envelopes).toContainEqual(expect.objectContaining({ id: 'task-notification:long-job',
+                    ev: { t: 'text', text: details } }));
+                expect.soft(h.envelopes).toContainEqual(expect.objectContaining({ id: 'task-notification:long-job:receipt:completed' }));
+                // A resumed run is new input, including after both old receipts lacked run IDs.
+                receipt('run-2'); text('Resumed task'); await h.queue.flush();
+                expect(h.rearm).toHaveBeenCalledTimes(2);
+                expect(h.evidence.snapshot()).toMatchObject({ coverage: 'incomplete',
+                    incompleteReasons: ['background-source-unavailable'] });
             } finally { h.queue.destroy(); }
         },
     );

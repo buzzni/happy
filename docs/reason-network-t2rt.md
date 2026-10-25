@@ -189,6 +189,78 @@ Verification:
   required. The internal queue item and its type stay in their owning modules;
   no package barrel, manifest, lockfile or T1b file is edited.
 
+## Third fixed-SHA cross-review follow-up: T2RT-07 (2026-10-25)
+
+Review base: `495c743f7c99b8d4ac7e7c47c4ecf7140e543dbc`.
+T2RT-07 is accepted. The SDK receipt and the scanner's richer row describe one
+consumed completion, despite their intentionally different display IDs. The mapper
+now records completion identity in its runtime-local state before applying turn
+closure, evidence rearming or channel request rearming. Duplicate observations
+still emit their original text/display ID but cannot close or contaminate an
+already-running follow-up or a later unrelated batch.
+
+Identity uses the task (tool ID when task ID is absent), subagent scope, normalized
+terminal status, and the provider's `run_id` / scanner `origin.runId`. The installed
+SDK documents these run IDs as shared across events and saved notifications, and
+as changing when a task resumes. A distinct explicit run remains a new observation.
+For older/metadata-poor rows, task/status is the available identity; the missing source
+can bind a later explicit run ID to an unidentified receipt rather than consuming
+it again. Once both legacy sources have arrived, a later explicit run is new input. Nonterminal
+Monitor events are not deduplicated. Receipt identifiers remain for the mapper's
+runtime lifetime rather than expiring with the bounded turn/task maps, so late
+scanner delivery cannot turn an already-observed completion into unknown input.
+The ledger stores identifiers only, not transcripts or witness snapshots.
+
+Regression tests use the actual SDK converter → outgoing queue → context-usage
+wrapper → ordered dispatcher → mapper and evidence state. Scanner rows enter via
+the separate session-message method used by the scanner boundary, bypassing the SDK
+queue. Tests cover both delivery orders, both/missing/one-sided run metadata, and
+the second observation arriving during F, after F while idle, or during unrelated
+B. They assert the final-answer's original channel request ID and witness root,
+complete terminal coverage, a single rearm, B's separate input root, and preservation
+of the scanner details and receipt's different display ID. Explicit resumed runs
+remain observable as new input.
+
+Verification:
+
+- First reproduction on unchanged production code: **6 failed / 21 passed** in
+  `channel/channelTurnOrdering.test.ts`. During F, the scanner removed final-answer
+  correlation and degraded the witness; after F, it contaminated B (and removed
+  B's correlation when B was already running). All six called rearm twice.
+- The first correction passed those six cases and the existing mapper regressions
+  (**77/77**). Expanded integration tests then exposed one-sided run metadata:
+  **12 failed / 33 passed**. Binding metadata-poor receipts fixed those cases.
+- An additional resumed-run control exposed **6 failed / 39 passed** when a
+  completion already observed from both legacy sources absorbed a new explicit
+  run. Recording the sources of unidentified receipts fixed this case. The final
+  integration fixtures use the actual isolated channel input descriptor.
+- Final focused iteration: **95/95** across channel ordering (45) and the Claude
+  mapper (50), using the ignored iteration config without global build setup.
+- Final standard related suite: **16 files / 468 tests passed** with
+  `corepack pnpm -C packages/happy-cli exec vitest run --project unit <selection>
+  --maxWorkers 1`. Its standard global setup completed CLI `tsc --noEmit`, pkgroll
+  and extension copy successfully after the final production change.
+- Wire consumer schema regressions: **39/39 passed**, using `corepack pnpm -C
+  packages/happy-wire exec vitest run src/sessionProtocol.test.ts`.
+- `git diff --check` passed. Existing bin-location/empty-chunk build warnings and
+  asynchronously-handled-rejection harness warnings remain. No failing tests in
+  the final selection. Full-suite, live paid-provider, Desktop and packaged
+  acceptance checks were not run.
+
+Related CLI selection (all under `src/`, standard Vitest `--project unit`,
+`--maxWorkers 1`):
+
+- `api/{apiSession,automationTurnTracker,turnInputEvidence}.test.ts`
+- `channel/{channelPermissionMembership,channelTurnEnqueue,channelTurnOrdering}.test.ts`
+- `claude/utils/{sdkToLogConverter,sessionProtocolMapper,sessionScanner}.test.ts`
+- `claude/{claudeContextUsage,claudeLocalLauncher,claudeRemoteLauncher,claudeRemoteLauncher.setupTokenSwitch,claudeRemoteLauncher.transientRetry,runClaude,runClaudeOfflineAck}.test.ts`
+
+
+No finding is deferred. No public API/schema, authority, shared export or T1b-owned
+file changes are needed. This is an internal implementation correction within the
+approved contract, with no design deviation. Only the mapper, its existing channel
+integration test file and this report change. No new files or dependencies.
+
 ## Contract decisions and implementation details
 
 - `UserMessage.serverSeq`, like serverMessageId, comes from the received server row
