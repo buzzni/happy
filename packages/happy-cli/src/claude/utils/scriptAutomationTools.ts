@@ -74,6 +74,16 @@ export function createScriptAutomationTools(options: {
       paused: row.paused, ready: row.ready ?? false, machineId: row.machineId ?? null, nextRunAt: row.nextRunAt ?? null,
       schedule: value.schedule, externalEnabled: value.externalEnabled, action: value.action, inputSchema: value.inputSchema };
   }
+  // A project can hold rows of another machine or an older key version; listing names them without their sealed fields.
+  function listed(row: Row) {
+    try {
+      return summary(row);
+    } catch (error) {
+      const code = error instanceof Error && /^[A-Z0-9_-]{1,100}$/.test(error.message) ? error.message : 'SCRIPT_PAYLOAD_INVALID';
+      return { id: row.id, registrationKey: row.registrationKey, revision: row.revision, generation: row.generation, paused: row.paused,
+        machineId: row.machineId ?? null, readable: false, error: code };
+    }
+  }
   async function list() { return z.object({ automations: z.array(rowSchema) }).parse(await options.request({ operation: 'list' })).automations; }
   async function target() {
     const schema = z.object({ machineId: z.string().optional(), machineAccountId: z.string().optional(), automationProtocolVersion: z.number(), machinePublicKey: z.string(), machineKeyVersion: z.number(), viewerPublicKey: z.string().nullable(), viewerKeyVersion: z.number() });
@@ -146,7 +156,7 @@ export function createScriptAutomationTools(options: {
         return summary(response.automation);
       }
       const rows = await list();
-      if (input.operation === 'list') return rows.map(summary);
+      if (input.operation === 'list') return rows.map(reader ? listed : summary);
       const row = rows.find((row) => row.id === input.automationId);
       if (!row) throw new Error('NOT_FOUND');
       if (input.operation === 'get') return summary(row);

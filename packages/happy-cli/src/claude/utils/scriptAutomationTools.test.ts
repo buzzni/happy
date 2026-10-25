@@ -231,7 +231,9 @@ it('rejects other project/machine/account/key rows before mutations or log reque
     { machinePublicKey: null }, { machinePublicKey: Buffer.from(nacl.box.keyPair().publicKey).toString('base64') },
     { viewerPublicKey: Buffer.from(nacl.box.keyPair().publicKey).toString('base64') }]) {
     f.rows[0] = { ...original, ...patch };
-    for (const operation of [{ operation: 'list' }, { operation: 'set_enabled', automationId: 'script-1', expectedRevision: 1, enabled: false },
+    const [listed] = await f.tools.execute({ operation: 'list' }) as any[];
+    expect(listed).toMatchObject({ id: 'script-1', readable: false }); expect(listed).not.toHaveProperty('name');
+    for (const operation of [{ operation: 'get', automationId: 'script-1' }, { operation: 'set_enabled', automationId: 'script-1', expectedRevision: 1, enabled: false },
       { operation: 'run', automationId: 'script-1', input: {}, idempotencyKey: 'once' }, { operation: 'list_runs', automationId: 'script-1', runId: 'run-1' }]) {
       f.request.mockClear(); await expect(f.tools.execute(operation)).rejects.toThrow();
       expect(f.request.mock.calls.map(([request]) => request.operation)).toEqual(['list']);
@@ -259,7 +261,8 @@ it('fails closed on corrupted machine ciphertext, untrusted senders and wrong lo
     encryptScriptValue({ value, context, viewerPublicKey: f.viewer.publicKey, machinePublicKey: f.machine.publicKey, sender: nacl.box.keyPair() }),
     encryptScriptValue({ value, context, viewerPublicKey: f.viewer.publicKey, machinePublicKey: f.machine.publicKey }),
   ]) {
-    f.rows[0].encrypted = changed; await expect(f.tools.execute({ operation: 'list' })).rejects.toThrow();
+    f.rows[0].encrypted = changed; await expect(f.tools.execute({ operation: 'get', automationId: 'script-1' })).rejects.toThrow();
+    expect(await f.tools.execute({ operation: 'list' })).toMatchObject([{ id: 'script-1', readable: false }]);
   }
   f.rows[0].encrypted = encrypted; f.log('other-run');
   await expect(f.tools.execute({ operation: 'list_runs', automationId: 'script-1', runId: 'run-1' })).rejects.toThrow('SCRIPT_DECRYPT_FAILED');
@@ -327,7 +330,10 @@ it('accepts customer-authenticated configuration and preserves anonymous compat 
     expect(await f.tools.execute({ operation: 'list' })).toMatchObject([{ name: 'Collect' }]);
     f.rows[0].encrypted = encryptScriptValue({ value, context, viewerPublicKey: f.viewer.publicKey, machinePublicKey: f.machine.publicKey });
     if (mode === 'compat') expect(await f.tools.execute({ operation: 'list' })).toMatchObject([{ name: 'Collect' }]);
-    else await expect(f.tools.execute({ operation: 'list' })).rejects.toThrow('PAYLOAD_SENDER_ANONYMOUS');
+    else {
+      await expect(f.tools.execute({ operation: 'get', automationId: 'script-1' })).rejects.toThrow('PAYLOAD_SENDER_ANONYMOUS');
+      expect(await f.tools.execute({ operation: 'list' })).toMatchObject([{ id: 'script-1', readable: false, error: 'PAYLOAD_SENDER_ANONYMOUS' }]);
+    }
   }
 });
 
@@ -348,4 +354,15 @@ it('validates an existing registration scope before updating at the expected rev
   f.rows[0].machineId = 'other'; f.request.mockClear();
   await expect(f.tools.execute({ ...f.input, expectedRevision: 1 })).rejects.toThrow('SCRIPT_MACHINE_KEY_MISMATCH');
   expect(f.request.mock.calls.map(([request]) => request.operation)).toEqual(['target', 'list']);
+});
+
+it('lists readable rows next to rows of another machine or an older key without decrypting the latter', async () => {
+  await writeFile(join(directory, 'collect.mjs'), 'console.log(1)');
+  const f = machineFixture(); await f.tools.execute(f.input);
+  f.rows.unshift({ ...f.rows[0], id: 'legacy-1', registrationKey: 'legacy', machineId: 'old-pc', machineKeyVersion: 1 });
+  const listed = await f.tools.execute({ operation: 'list' }) as any[];
+  expect(listed).toMatchObject([{ id: 'legacy-1', registrationKey: 'legacy', machineId: 'old-pc', readable: false, error: 'SCRIPT_MACHINE_KEY_MISMATCH' },
+    { id: 'script-1', name: 'Collect' }]);
+  expect(listed[0]).not.toHaveProperty('name'); expect(listed[0]).not.toHaveProperty('action');
+  await expect(f.tools.execute({ operation: 'get', automationId: 'legacy-1' })).rejects.toThrow('SCRIPT_MACHINE_KEY_MISMATCH');
 });
