@@ -843,6 +843,7 @@ export async function runCodex(opts: {
      */
     const capacityRetry = createCodexCapacityRetryPolicy(CODEX_CAPACITY_RETRY_DELAYS_MS);
     let turnServerOverloaded = false;
+    let dispatchedWithoutStart = false;
     let capacityRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let capacityRetryGeneration = 0;
     const capacityContinuationModes = new WeakMap<EnhancedMode, number>();
@@ -1907,6 +1908,7 @@ export async function runCodex(opts: {
             // The state object is rebuilt per call, so the correlation fields are carried in and
             // read back out rather than living on it.
             const turnState = {
+                dispatchedInput: dispatchedWithoutStart,
                 currentTurnId,
                 currentProviderTurnId,
                 startedSubagents: codexStartedSubagents,
@@ -1917,6 +1919,7 @@ export async function runCodex(opts: {
                 providerTurnToProtocol: codexProviderTurnToProtocol,
             };
             const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, turnState);
+            if (mapped.envelopes.some(envelope => envelope.ev.t === 'turn-start' || envelope.ev.t === 'turn-end')) dispatchedWithoutStart = false;
             codexPendingRequestId = turnState.pendingRequestId ?? null;
             codexCurrentRequestId = turnState.currentRequestId ?? null;
             currentTurnId = mapped.currentTurnId;
@@ -2307,6 +2310,7 @@ export async function runCodex(opts: {
             const measure = <T>(stage: CodexLatencyStage, action: () => T | Promise<T>): T | Promise<T> =>
                 latency ? latency.measure(stage, action) : action();
 
+            let inputInvalidated = false;
             try {
                 if (!isCurrentCapacityContinuation(message.mode)) continue;
                 /*
@@ -2633,8 +2637,21 @@ export async function runCodex(opts: {
                         if (validInput?.items) messageQueue.queue.unshift(...validInput.items);
                         continue;
                     }
-                    session.setPendingInputEvidence({ inputs: message.inputs ?? [], inputCount: message.inputCount, continuation: message.continuation });
                     const result = await client.sendTurnAndWait(turnPrompt, {
+                        beforeDispatch: () => {
+                            const valid = messageQueue.revalidateBatch(message);
+                            if (valid !== message) {
+                                if (valid?.items) messageQueue.queue.unshift(...valid.items);
+                                inputInvalidated = true;
+                                throw new Error('Codex input was invalidated before dispatch');
+                            }
+                            session.setPendingInputEvidence({ inputs: message.inputs ?? [], inputCount: message.inputCount, continuation: message.continuation });
+                            if (!session.inputEvidence.commitPending()) {
+                                inputInvalidated = true;
+                                throw new Error('Codex continuation was cancelled before dispatch');
+                            }
+                        },
+                        onDispatched: () => { dispatchedWithoutStart = true; },
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
                         ...(memoryIngest ? { onCompleted: memoryIngest.onCompleted,
                             onCompletionObservationSettled: memoryIngest.onSettled } : {}),
@@ -2755,6 +2772,7 @@ export async function runCodex(opts: {
                 } catch (error) {
                     latency?.finish('failed');
                     preemptLessonReview();
+                    if (inputInvalidated) continue;
                     // Only actual errors reach here (process crash, connection failure, etc.)
                     // No task_complete/turn_aborted was ever received for this turn, so the
                     // session-protocol mapper's turn state is left open. Without an explicit
@@ -2774,6 +2792,7 @@ export async function runCodex(opts: {
                     // dispatch or process failure is still the answer to whatever request was waiting
                     // on it; a fresh state object here would drop the id and leave the caller waiting.
                     const failureState: CodexTurnState = {
+                        dispatchedInput: dispatchedWithoutStart,
                         currentTurnId,
                         currentProviderTurnId,
                         startedSubagents: codexStartedSubagents,
@@ -2802,6 +2821,7 @@ export async function runCodex(opts: {
                         difficultyRoutingCommitter.discardPending(message.requestIds ?? [], owningForegroundSignal.aborted ? 'cancelled' : 'failed');
                     }
                     session.setPendingInputEvidence(null);
+                    dispatchedWithoutStart = false;
                     activeLessonTurn = null;
                     lessonProposalTurn.cancel();
                     // specs/linux-checkpoint-enforcement-backend R4 — the checkpoint turn is opened before

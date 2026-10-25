@@ -7,6 +7,8 @@ import type { Thread, ThreadItem, ThreadTurn } from '../codexAppServerTypes';
 
 export type CodexTurnState = {
     currentTurnId: string | null;
+    /** Host observed turn/start written, but no provider start notification has opened its turn yet. */
+    dispatchedInput?: boolean;
     /**
      * Correlation for a turn that answers an external messenger request
      * (Saycode specs/desktop-messenger-channels). Set before the turn opens and consumed by the
@@ -511,10 +513,12 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         }
         if (!state.currentTurnId) {
             // A run that failed before `task_started` reaches its terminal with nothing open. A
-            // channel request waiting on it must still get a correlated answer: without this the
-            // id is stranded and the next unrelated turn inherits it.
-            if (state.pendingRequestId) {
+            // written REST batch still needs a terminal witness. A channel request must also
+            // get its correlated answer so the next unrelated turn cannot inherit its id.
+            if (state.pendingRequestId || state.dispatchedInput) {
                 const strandedRequestId = state.pendingRequestId;
+                const request = strandedRequestId ? { requestId: strandedRequestId } : {};
+                state.dispatchedInput = false;
                 const strandedTurnId = createId();
                 state.pendingRequestId = null;
                 state.currentRequestId = null;
@@ -525,11 +529,11 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
                     activeSubagents,
                     providerSubagentToSessionSubagent,
                     envelopes: [
-                        createEnvelope('agent', { t: 'turn-start', requestId: strandedRequestId }, { turn: strandedTurnId }),
+                        createEnvelope('agent', { t: 'turn-start', ...request }, { turn: strandedTurnId }),
                         createEnvelope('agent', {
                             t: 'turn-end',
                             status: pickTurnEndStatus(message, type),
-                            requestId: strandedRequestId,
+                            ...request,
                         }, { turn: strandedTurnId }),
                     ],
                 };

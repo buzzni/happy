@@ -340,11 +340,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 if (valid?.items) session.queue.queue.unshift(...valid.items);
                 return false;
             }
-            if (batch.continuation && session.client.inputEvidence
-                && !session.client.inputEvidence.isContinuationCurrent(batch.continuation)) return false;
+            const continuation = batch.continuation && session.client.inputEvidence
+                ? session.client.inputEvidence.claimContinuation(batch.continuation) : batch.continuation;
+            if (batch.continuation && !continuation) return false;
             messageQueue.enqueue(pendingRequestItem(batch.channelRequestId ?? null, {
-                inputs: batch.inputs ?? [], inputCount: batch.inputCount,
-                continuation: batch.continuation ? session.client.inputEvidence?.takeContinuation() ?? batch.continuation : undefined,
+                inputs: batch.inputs ?? [], inputCount: batch.inputCount, continuation,
             }));
             return true;
         };
@@ -1015,9 +1015,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
                             dispatchTurn();
                             return { message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode, commitInput: () => {
-                                if (inherited && session.client.inputEvidence
-                                    && !session.client.inputEvidence.isContinuationCurrent(inherited)) return false;
-                                messageQueue.enqueue(pendingRequestItem(null, { inputs: [], inputCount: 0, continuation: inherited }));
+                                const continuation = inherited && session.client.inputEvidence
+                                    ? session.client.inputEvidence.claimContinuation(inherited) : inherited;
+                                if (inherited && !continuation) return false;
+                                messageQueue.enqueue(pendingRequestItem(null, { inputs: [], inputCount: 0, continuation }));
                                 return true;
                             } };
                         }

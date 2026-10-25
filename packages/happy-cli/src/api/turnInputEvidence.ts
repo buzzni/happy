@@ -5,6 +5,7 @@ import { createEnvelope, hubPromptGuardSchema, inputRefSchema, type HubInputAdmi
 
 export type EvidenceBatch = { inputs: InputRef[]; inputCount: number; continuation?: InputEvidenceV1; incompleteReasons?: string[] };
 type AdditionalKind = InputEvidenceV1['additional']['items'][number]['kind'];
+type Attempt = InputEvidenceV1['additional']['items'][number];
 type AttemptState = InputEvidenceV1['additional']['items'][number]['state'];
 type ContinuationKind = InputEvidenceV1['continuation']['kind'];
 export type QueueInputEvidence = { ref: InputRef; guard?: unknown; continuation?: InputEvidenceV1 };
@@ -38,6 +39,11 @@ export class HubInputGate {
 
 export class TurnInputEvidence {
     private pending: EvidenceBatch | null = null;
+    private readonly claimedContinuations = new WeakSet<InputEvidenceV1>();
+    private background: EvidenceBatch | null = null;
+    // Snapshot copies retain exact unresolved attempt identities, including items beyond the wire cap.
+    // Weak keys do not keep discarded queue snapshots alive. Settled tokens are removed from live turns.
+    private readonly attempts = new WeakMap<InputEvidenceV1, Set<Attempt>>();
     private readonly turns = new Map<string, InputEvidenceV1>();
     private current: string | null = null;
     private last: string | null = null;
@@ -51,23 +57,68 @@ export class TurnInputEvidence {
         const turn = ids.map(id => this.backgroundTurns.get(id)).find(Boolean);
         for (const id of ids) this.backgroundTurns.delete(id);
         const source = turn ? this.snapshot(turn) : null;
-        if (!source) return;
-        if (this.current) { this.incomplete('background-co-consumption'); return; }
-        if (this.pending) {
-            this.pending.incompleteReasons = [...(this.pending.incompleteReasons ?? []), 'background-co-consumption'];
+        const reasons = ['background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
+        if (this.current) for (const reason of reasons) this.incomplete(reason, this.current);
+        if (this.pending) this.pending.incompleteReasons = [...(this.pending.incompleteReasons ?? []), ...reasons];
+        if (this.current || this.pending) return;
+        if (this.background) {
+            this.background.incompleteReasons = [...(this.background.incompleteReasons ?? []), ...reasons];
+            return;
+        }
+        if (!source) {
+            this.background = { inputs: [], inputCount: 0, incompleteReasons: ['background-source-unavailable'] };
             return;
         }
         source.continuation = { kind: 'background', state: 'pending', retryId: null,
             previousTurn: { runtimeId: this.runtimeId, turnId: source.turnId },
             rootExclusive: source.inputCount === 1 && source.coverage === 'complete' && source.additional.attempted === 0
                 && source.continuation.rootExclusive !== false };
-        this.pending = { inputs: [], inputCount: 0, continuation: source };
+        this.background = { inputs: [], inputCount: 0, continuation: source };
     }
     constructor(readonly runtimeId: string, private readonly emit: (envelope: SessionEnvelope) => void) {}
     currentTurn(): string | null { return this.current; }
-    setPending(batch: EvidenceBatch | null): void { this.pending = batch; }
+    setPending(batch: EvidenceBatch | null): void {
+        // Background observations survive replacement/cancellation of a batch that never dispatched.
+        const reasons = (this.pending?.incompleteReasons ?? []).filter(reason => reason.startsWith('background-'));
+        if (this.background) reasons.push('background-co-consumption', ...(this.background.incompleteReasons ?? []));
+        if (batch && reasons.length) batch = { ...batch, incompleteReasons: [...(batch.incompleteReasons ?? []), ...reasons] };
+        if (batch) this.background = null;
+        else if (reasons.length && !this.background) this.background = { inputs: [], inputCount: 0, incompleteReasons: reasons };
+        this.pending = batch;
+    }
+    /** Synchronous ownership transfer at the provider write; later input cannot cancel dispatched work. */
+    commitPending(): boolean {
+        if (!this.pending) return false;
+        const continuation = this.pending.continuation;
+        if (continuation && continuation.continuation.kind !== 'background') {
+            const claimed = this.claimContinuation(continuation);
+            if (!claimed) return false;
+            this.pending.continuation = claimed;
+        }
+        return true;
+    }
+    /** Claim before provider dispatch; the receipt can wait in Claude's ordered transcript queue. */
+    claimContinuation(value: InputEvidenceV1): InputEvidenceV1 | undefined {
+        if (!this.isContinuationCurrent(value)) return undefined;
+        const claimed = this.takeContinuation()!;
+        this.claimedContinuations.add(claimed);
+        this.carry = null;
+        return claimed;
+    }
+    private clone(value: InputEvidenceV1): InputEvidenceV1 {
+        const copy = structuredClone(value);
+        this.attempts.set(copy, new Set(this.attempts.get(value)));
+        return copy;
+    }
+    private settleAttempt(value: InputEvidenceV1, attempt: Attempt): void {
+        if (!this.attempts.get(value)?.delete(attempt)) return;
+        value.additional.pending -= 1;
+        if (attempt.state === 'accepted' || attempt.state === 'unknown') value.additional[attempt.state] += 1;
+        const item = value.additional.items.find(item => item.attemptId === attempt.attemptId);
+        if (item) item.state = attempt.state;
+    }
     snapshot(turn = this.current ?? this.last): InputEvidenceV1 | null {
-        return turn && this.turns.has(turn) ? structuredClone(this.turns.get(turn)!) : null;
+        return turn && this.turns.has(turn) ? this.clone(this.turns.get(turn)!) : null;
     }
     private fit(value: InputEvidenceV1): void {
         if (Buffer.byteLength(JSON.stringify(value), 'utf8') <= 65536) return;
@@ -97,7 +148,9 @@ export class TurnInputEvidence {
         }
         const item: InputEvidenceV1['additional']['items'][number] = { attemptId: randomUUID(), kind, state: 'pending' };
         value.additional.attempted += 1;
-        const ordinal = value.additional.attempted;
+        const attempts = this.attempts.get(value) ?? new Set<Attempt>();
+        attempts.add(item);
+        this.attempts.set(value, attempts);
         value.additional.pending += 1;
         if (value.additional.items.length < 128) value.additional.items.push(item);
         else this.incomplete('additional-limit', value.turnId);
@@ -106,15 +159,10 @@ export class TurnInputEvidence {
         return { settle: state => {
             if (settled) return;
             settled = true;
-            // A provider restart can begin a continuation while this ACK is still in flight.
-            // Settle every descendant that inherited the attempt, never a different input root.
-            const descendants = [...this.turns.values()].filter(candidate => candidate !== value
-                && candidate.rootBatchId === value.rootBatchId && candidate.additional.attempted >= ordinal);
-            for (const candidate of [value, ...descendants]) {
-                candidate.additional.pending -= 1;
-                if (state !== 'rejected') candidate.additional[state] += 1;
-                const inheritedItem = candidate.additional.items.find(entry => entry.attemptId === item.attemptId);
-                if (inheritedItem) inheritedItem.state = state;
+            item.state = state;
+            for (const candidate of new Set([value, ...this.turns.values()])) {
+                if (!this.attempts.get(candidate)?.has(item)) continue;
+                this.settleAttempt(candidate, item);
                 this.publish(candidate);
             }
         } };
@@ -139,7 +187,7 @@ export class TurnInputEvidence {
     }
     takeContinuation(): InputEvidenceV1 | undefined {
         if (!this.carry || this.carry.continuation.state !== 'pending') return undefined;
-        const result = structuredClone(this.carry);
+        const result = this.clone(this.carry);
         return result;
     }
     cancelContinuation(state: 'cancelled' | 'replaced' | 'completed'): void {
@@ -153,15 +201,20 @@ export class TurnInputEvidence {
         if (envelope.role !== 'agent' || envelope.subagent || !envelope.turn) return envelope;
         const { ev, turn } = envelope;
         if (ev.t === 'turn-start') {
-            const batch = this.pending;
-            this.pending = null;
-            const inherited = batch?.continuation && this.isContinuationCurrent(batch.continuation)
-                ? this.takeContinuation() : batch?.continuation;
+            const batch = this.pending ?? this.background;
+            const continuation = batch?.continuation;
+            const validContinuation = continuation && (continuation.continuation.kind === 'background'
+                || this.claimedContinuations.has(continuation) || this.isContinuationCurrent(continuation));
+            const inherited = validContinuation
+                ? (this.isContinuationCurrent(continuation) ? this.takeContinuation() : continuation) : undefined;
+            this.pending = this.background = null;
+            if (continuation) this.claimedContinuations.delete(continuation);
             if (inherited && this.carry?.continuation.retryId === inherited.continuation.retryId) this.carry = null;
             const batchId = randomUUID();
             const inputs = inherited?.inputs ?? batch?.inputs ?? [];
             const reasons = [...(inherited?.incompleteReasons ?? []), ...(batch?.incompleteReasons ?? [])];
             if (!batch) reasons.push('unobserved-input');
+            if (continuation && !validContinuation) reasons.push('continuation-invalidated');
             if (inputs.length > 256) reasons.push('input-limit');
             if (inputs.some(ref => !inputRefSchema.safeParse(ref).success)) reasons.push('invalid-input-ref');
             const ids = inputs.filter(ref => ref.kind === 'rest').map(ref => ref.serverMessageId);
@@ -176,6 +229,9 @@ export class TurnInputEvidence {
                 continuation: inherited ? { ...inherited.continuation, state: 'running', previousTurn: { runtimeId: inherited.runtimeId, turnId: inherited.turnId } }
                     : { kind: 'none', state: 'none', previousTurn: null, retryId: null, rootExclusive: null }, terminal: false,
             };
+            this.attempts.set(value, new Set(inherited ? this.attempts.get(inherited) : undefined));
+            // An ACK may settle after a snapshot was queued but before it starts.
+            for (const attempt of this.attempts.get(value)!) if (attempt.state !== 'pending') this.settleAttempt(value, attempt);
             this.fit(value);
             this.turns.set(turn, value);
             this.current = this.last = turn;

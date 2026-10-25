@@ -2333,6 +2333,10 @@ export class CodexAppServerClient {
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
+        /** Must synchronously validate/claim input after all preparation, immediately before writing. */
+        beforeDispatch?: () => void;
+        /** Records a written request even if the ACK/start notification never arrives. */
+        onDispatched?: () => void;
         /** Host observer invoked only after the provider accepts turn/start. */
         onSubmitted?: () => void;
     }): Promise<void> {
@@ -2378,7 +2382,9 @@ export class CodexAppServerClient {
         // We don't await completion here — the caller's event handler
         // tracks task_complete / turn_aborted.
         const observation = this.pendingTurnCompletion?.observation;
-        const result = await this.request('turn/start', params) as { turn?: { id?: string | null } };
+        const result = await (opts?.beforeDispatch || opts?.onDispatched
+            ? this.request('turn/start', params, undefined, opts)
+            : this.request('turn/start', params)) as { turn?: { id?: string | null } };
         try { opts?.onSubmitted?.(); } catch { logger.warn('[CodexAppServer] Submission observer failed'); }
         const turnId = result?.turn?.id;
         if (typeof turnId === 'string' && turnId.length > 0) {
@@ -2421,6 +2427,10 @@ export class CodexAppServerClient {
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>;
+        /** Must synchronously validate/claim input after all preparation, immediately before writing. */
+        beforeDispatch?: () => void;
+        /** Records a written request even if the ACK/start notification never arrives. */
+        onDispatched?: () => void;
         /** Host observer invoked only after the provider accepts turn/start. */
         onSubmitted?: () => void;
         /** Host observer of this native completion, after successful checkpoint apply. */
@@ -2616,7 +2626,8 @@ export class CodexAppServerClient {
     /** Default timeout for RPC requests (ms). */
     private static readonly REQUEST_TIMEOUT_MS = 30_000;
 
-    private request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
+    private request(method: string, params?: unknown, timeoutMs?: number,
+        dispatch?: { beforeDispatch?: () => void; onDispatched?: () => void }): Promise<unknown> {
         if (this.shutdownInputFrozen && method !== 'turn/interrupt') return Promise.reject(new Error('Codex input is frozen for shutdown'));
         const timeout = timeoutMs ?? CodexAppServerClient.REQUEST_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
@@ -2625,7 +2636,10 @@ export class CodexAppServerClient {
                 return;
             }
             // No await between this observer and stdin.write; preparation remains non-drainable until here.
-            if (method === 'turn/start') this.onTurnDispatch?.();
+            if (method === 'turn/start') {
+                dispatch?.beforeDispatch?.();
+                this.onTurnDispatch?.();
+            }
             const id = this.nextId++;
 
             const timer = setTimeout(() => {
@@ -2643,7 +2657,14 @@ export class CodexAppServerClient {
             const msg: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
             const line = JSON.stringify(msg) + '\n';
             logger.debug(`[CodexAppServer] → ${method} (id=${id})`);
-            this.process.stdin.write(line);
+            try {
+                this.process.stdin.write(line);
+                dispatch?.onDispatched?.();
+            } catch (error) {
+                clearTimeout(timer);
+                this.pending.delete(id);
+                reject(error);
+            }
         });
     }
 

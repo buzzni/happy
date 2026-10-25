@@ -38,7 +38,7 @@ guardedPrompt/inputEvidence; senders must disable guarded delivery rather than
 silently removing a guard. Desktop must consume the matching wire contract before
 claiming input/answer attribution.
 
-## Verification record
+## Initial implementation verification record
 
 - Initial red: happy-wire `sessionProtocol.test.ts`: 5 new failures, 34 passes
   (three stripped evidence fields and unsupported evidence/admission events).
@@ -97,6 +97,50 @@ src/agent/acp/runAcp.test.ts
 ```
 - Happy has no `preflight` script or Desktop release-note/guide gate. No Desktop
   source, generated guide, release version, package manifest or lockfile changed.
+
+## Fixed-SHA cross-review follow-up (2026-10-25)
+
+Review base: `f1f7df93be0e7b584fb51eadeb98519b1a5dd2b1`.
+All five findings are accepted. The changes remain within T2rt runtime ownership;
+no public wire/API contract, authority, shared export or T1b-owned file changes.
+This follow-up is a new behavioral commit, without rewriting the review base.
+
+| Finding | Correction | Regression evidence |
+| --- | --- | --- |
+| T2RT-01 | Revalidate the original queue batch and synchronously claim a live continuation in the real client's `turn/start` write path, after interrupt/preparation awaits. `stamp()` refuses cancelled retry snapshots; background inheritance remains a separate case. A claimed dispatch cannot be cancelled by later input; Claude's ordered transcript retains the same runtime-owned claim after its provider write. | Actual client interrupt/preparation races write zero requests; real runner drops a retry replaced during preparation and sends B only; stale start cannot restore A; post-claim start retains its root and a delayed ACK; Claude transient/account-switch retries survive delayed transcript processing. |
+| T2RT-02 | Retain background observations separately from the queued batch and carry co-consumption reasons into a replacing batch. | Both background→B and B→background produce incomplete coverage. |
+| T2RT-03 | Record the background observation even when its source witness has been evicted; mark active/pending coverage incomplete or retain an idle marker until the next turn. | Evict A with 128 subsequent turns, then deliver its notification while active, pending and idle (including pending cleanup); all remain incomplete. |
+| T2RT-04 | Runtime snapshots carry exact unresolved attempt tokens in a WeakMap. ACKs settle only snapshots/turns that inherited that token, including attempts omitted by the wire item cap. No root/ordinal-based propagation. | Two background forks with a common attempt and distinct steer attempts settle independently; run both below and beyond the 128-item cap, validate every emitted wire envelope, and reconcile an ACK between claim and start. |
+| T2RT-05 | Observe successful `stdin.write` separately from provider ACK/start. A written REST batch that fails without `task_started` receives the same synthetic start/failed end, using its pending witness and no channel requestId. | Actual client writes then rejects before start/ACK; runner emits REST start/failed end with A's identity, while preparation failure emits neither. |
+
+The offline session stub is a direct consumer of the new claim check. It now
+retains pending batches in its already-existing local tracker so offline dispatch
+continues to work; its publication methods remain no-ops and it advertises no
+witness capability. This regression was reproduced before fixing the stub.
+
+Verification sequence:
+
+- Added the five review reproductions before the production fixes: **9 failures /
+  196 passes** across evidence state, actual Codex client and capacity runner.
+- After fixes and additional race/offline cases, focused iteration: **210/210**
+  across those same three files. Iteration alone used an ignored Vitest config
+  without build setup; it does not substitute for the standard final run.
+- The first standard regression run exposed three Claude transient/account-switch
+  failures: provider dispatch had occurred, but shutdown cancelled the carry before
+  its ordered transcript was stamped. Added a failing delayed-transcript state
+  test, then made the claim travel with the in-process continuation snapshot.
+  Focused verification after this correction: **5 files / 232 tests passed**.
+- Wire build (including `tsc --noEmit`) and the **39/39** strip/schema tests passed.
+- Standard final CLI run: **32 files / 908 tests passed**. Selection is the original
+  31 files above plus `src/codex/codexAppServerClient.test.ts`, using
+  `corepack pnpm -C packages/happy-cli exec vitest run --project unit <selection>
+  --maxWorkers 2`. Standard global setup's CLI `tsc --noEmit`, pkgroll and extension
+  copy passed. An initial inferred-state TypeScript error was corrected before this
+  successful run. Existing bin/empty-chunk and test-harness warnings remain.
+- `git diff --check` passed. No full-suite, paid-provider or Desktop tests were run.
+- No finding is deferred or rejected. No approved design change was necessary.
+  Real paid providers, Desktop integration and packaged runtime acceptance remain
+  outside this local verification, as in the original report.
 
 ## Contract decisions and implementation details
 

@@ -4,6 +4,7 @@ import { createEnvelope, sessionEnvelopeSchema, type InputRef, type SessionEnvel
 import { HubInputGate, TurnInputEvidence } from './turnInputEvidence';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { AutomationTurnTracker } from './automationTurnTracker';
+import { createOfflineSessionStub } from '@/utils/offlineSessionStub';
 
 const ref = (id: string): InputRef => ({ kind: 'rest', serverMessageId: id, serverSeq: 42 });
 function harness() {
@@ -15,6 +16,81 @@ function harness() {
     return { events, tracker, start, end };
 }
 describe('TurnInputEvidence', () => {
+    it('allows an offline batch to dispatch without publishing evidence', () => {
+        const session = createOfflineSessionStub('test');
+        session.setPendingInputEvidence({ inputs: [ref('offline')], inputCount: 1 });
+        expect(session.inputEvidence.commitPending()).toBe(true);
+    });
+    it('T2RT-01 preserves ownership after the provider write and reconciles an ACK before start', () => {
+        const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        const attempt = h.tracker.attempt('steer');
+        h.tracker.continuePending('codex-capacity'); h.end('a', 'failed');
+        const continuation = h.tracker.takeContinuation()!;
+        h.tracker.setPending({ inputs: [], inputCount: 0, continuation });
+        expect(h.tracker.commitPending()).toBe(true);
+        h.tracker.cancelContinuation('replaced'); attempt.settle('accepted'); h.start('retry');
+        expect(h.tracker.snapshot()).toMatchObject({ rootBatchId: continuation.rootBatchId, inputs: [ref('A')],
+            additional: { pending: 0, accepted: 1 }, continuation: { state: 'running' } });
+    });
+
+    it('retains a claimed Claude retry while its ordered transcript waits behind shutdown cleanup', () => {
+        const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        h.tracker.continuePending('claude-transient'); h.end('a', 'failed');
+        const continuation = h.tracker.claimContinuation(h.tracker.takeContinuation()!)!;
+        h.tracker.cancelContinuation('cancelled');
+        h.tracker.setPending({ inputs: [], inputCount: 0, continuation }); h.start('retry');
+        expect(h.tracker.snapshot()).toMatchObject({ inputs: [ref('A')], coverage: 'complete',
+            continuation: { kind: 'claude-transient', state: 'running' } });
+    });
+    it('T2RT-01 refuses a cancelled snapshot even when a late turn-start arrives', () => {
+        const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        const root = h.tracker.snapshot()!.rootBatchId;
+        h.tracker.continuePending('codex-capacity'); h.end('a', 'failed');
+        const continuation = h.tracker.takeContinuation()!;
+        h.tracker.setPending({ inputs: [], inputCount: 0, continuation });
+        h.tracker.cancelContinuation('replaced'); h.start('stale');
+        expect(h.tracker.snapshot()).toMatchObject({ coverage: 'incomplete', inputs: [], continuation: { kind: 'none' } });
+        expect(h.tracker.snapshot()!.rootBatchId).not.toBe(root);
+    });
+    it.each(['background-first', 'batch-first'])('T2RT-02 preserves co-consumption in %s order', order => {
+        const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        h.tracker.rememberBackground('job', 'a'); h.end('a');
+        if (order === 'background-first') h.tracker.rearmBackground(['job']);
+        h.tracker.setPending({ inputs: [ref('B')], inputCount: 1 });
+        if (order === 'batch-first') h.tracker.rearmBackground(['job']);
+        h.start('b');
+        expect(h.tracker.snapshot()).toMatchObject({ inputs: [ref('B')], coverage: 'incomplete',
+            incompleteReasons: expect.arrayContaining(['background-co-consumption']) });
+    });
+    it.each(['active', 'pending', 'idle'])('T2RT-03 retains background input after source eviction while %s', phase => {
+        const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        h.tracker.rememberBackground('long-job', 'a'); h.end('a');
+        for (let i = 0; i < 128; i++) {
+            h.tracker.setPending({ inputs: [ref(`other-${i}`)], inputCount: 1 }); h.start(`other-${i}`); h.end(`other-${i}`);
+        }
+        expect(h.tracker.snapshot('a')).toBeNull();
+        if (phase !== 'idle') h.tracker.setPending({ inputs: [ref('B')], inputCount: 1 });
+        if (phase === 'active') h.start('b');
+        h.tracker.rearmBackground(['long-job']);
+        if (phase === 'idle') { h.tracker.setPending(null); h.tracker.setPending({ inputs: [ref('B')], inputCount: 1 }); }
+        if (phase !== 'active') h.start('b');
+        expect(h.tracker.snapshot()).toMatchObject({ coverage: 'incomplete',
+            incompleteReasons: expect.arrayContaining(['background-source-unavailable']) });
+    });
+    it.each([0, 128])('T2RT-04 settles only inherited attempts across background forks (prior=%s)', prior => {
+        const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        for (let i = 0; i < prior; i++) h.tracker.attempt('steer').settle('accepted');
+        const common = h.tracker.attempt('steer');
+        h.tracker.rememberBackground('f-job', 'a'); h.tracker.rememberBackground('g-job', 'a'); h.end('a');
+        h.tracker.rearmBackground(['f-job']); h.start('f'); const f = h.tracker.attempt('steer'); h.end('f');
+        h.tracker.rearmBackground(['g-job']); h.start('g'); const g = h.tracker.attempt('steer');
+        f.settle('accepted');
+        expect(h.tracker.snapshot('g')?.additional).toMatchObject({ pending: 2, accepted: prior });
+        common.settle('unknown'); g.settle('rejected');
+        expect(h.tracker.snapshot('f')?.additional).toMatchObject({ pending: 0, accepted: prior + 1, unknown: 1 });
+        expect(h.tracker.snapshot('g')?.additional).toMatchObject({ pending: 0, accepted: prior, unknown: 1 });
+        for (const event of h.events) expect(() => sessionEnvelopeSchema.parse(event)).not.toThrow();
+    });
     it('does not attribute B stored while A runs, then records every B+C batch input', () => {
         const h = harness();
         h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 });
