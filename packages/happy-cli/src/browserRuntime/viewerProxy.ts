@@ -89,6 +89,16 @@ const VIEWER_PATH_RESTORE = "<script>(function(){try{if(location.search||window.
     + "if(typeof p==='string')history.replaceState(null,'',location.pathname+'?path='+encodeURIComponent(p))}catch(e){}})()</script>"
 
 /**
+ * Also in vnc_lite.html's <head>, so it runs before noVNC's module opens its connection:
+ * tells the console that framed the page (same origin only) how the viewer connection
+ * closed. noVNC drops the screen on close, and after a control change (4002) the console
+ * reconnects with a new ticket.
+ */
+const VIEWER_CLOSE_REPORT = "<script>(function(){try{var W=window.WebSocket;if(window.parent===window||!W)return;"
+    + "window.WebSocket=class extends W{constructor(){super(...arguments);this.addEventListener('close',function(e){"
+    + "try{window.parent.postMessage({type:'abp-viewer-closed',code:e.code},location.origin)}catch(x){}})}}}catch(e){}})()</script>"
+
+/**
  * Serves the pinned noVNC client (the Runtime image copies the Debian novnc
  * package files; no CDN). `/viewer/` is vnc_lite.html. Returns false for
  * anything that is not a known file type inside `root` (symlinks resolved).
@@ -115,7 +125,7 @@ export async function serveViewerAsset(root: string, pathname: string, res: Serv
     if (relative === 'vnc_lite.html') {
         const html = body.toString('utf8')
         const end = html.indexOf('</head>')
-        if (end >= 0) body = html.slice(0, end) + VIEWER_PATH_RESTORE + html.slice(end)
+        if (end >= 0) body = html.slice(0, end) + VIEWER_PATH_RESTORE + VIEWER_CLOSE_REPORT + html.slice(end)
     }
     res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff',
         'referrer-policy': 'no-referrer', 'content-security-policy': VIEWER_CSP })

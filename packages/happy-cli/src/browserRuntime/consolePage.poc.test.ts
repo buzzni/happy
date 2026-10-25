@@ -4,10 +4,15 @@
  * pasted id; renewal is requested before expiry and only a host answer
  * (window.parent, same origin) replaces the token.
  */
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { WebSocketServer } from 'ws'
 import { renderConsolePage } from './consolePage'
+import { VIEWER_ASSET_PREFIX, VIEWER_WEBSOCKET_PATH, serveViewerAsset } from './viewerProxy'
 import { HarnessCdp, eventually, findChrome, launchChrome, type LaunchedChrome } from './drivers/pocTestKit'
 
 const chromePath = findChrome()
@@ -19,6 +24,14 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     let chrome: LaunchedChrome
     let harness: HarnessCdp
     let server: http.Server
+    let viewer: WebSocketServer
+    /** Stands in for the pinned noVNC: it only connects to the ticketed path in its address. */
+    const viewerRoot = mkdtempSync(join(tmpdir(), 'abp-console-viewer-'))
+    writeFileSync(join(viewerRoot, 'vnc_lite.html'), '<!doctype html><html><head><title>noVNC</title></head><body><script type="module">'
+        + "new WebSocket('ws://' + location.host + '/' + new URLSearchParams(location.search).get('path'))</script></body></html>")
+    /** Viewer connections by ticket; the Runtime closes the one listed here with that code once it is open. */
+    const viewerTickets: string[] = []
+    const viewerCloses = new Map<string, number>()
     let origin = ''
     const port = () => (server.address() as AddressInfo).port
     const ops: Array<{ op: string; bearer: string; body: Record<string, unknown> }> = []
@@ -53,6 +66,10 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 res.end(`<!doctype html><script>parent.postMessage({ type: 'abp-capability', token: ${JSON.stringify(token('forged', Date.now() + 600_000))}, expiresAtMs: Date.now() + 600_000 }, location.origin)</script>`)
                 return
             }
+            if (url.pathname.startsWith(VIEWER_ASSET_PREFIX)) {
+                void serveViewerAsset(viewerRoot, url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
+                return
+            }
             const m = /^\/v1\/ops\/(\w+)$/.exec(url.pathname)
             if (!m) { res.writeHead(404); res.end(); return }
             let raw = ''
@@ -77,6 +94,13 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 }, delay)
             })
         })
+        viewer = new WebSocketServer({ server, path: VIEWER_WEBSOCKET_PATH })
+        viewer.on('connection', (socket, req) => {
+            const ticket = new URL(req.url ?? '/', 'http://localhost').searchParams.get('ticket') ?? ''
+            viewerTickets.push(ticket)
+            const code = viewerCloses.get(ticket)
+            if (code) setTimeout(() => socket.close(code, 'control changed'), 100)
+        })
         await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
         origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
         chrome = await launchChrome()
@@ -86,7 +110,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     afterAll(async () => {
         harness?.close()
         await chrome?.stop()
+        viewer?.close()
         await new Promise<void>((resolve) => server?.close(() => resolve()))
+        rmSync(viewerRoot, { recursive: true, force: true })
     })
 
     it('uses the fragment capability, strips it, stores nothing, and lists tasks', async () => {
@@ -264,6 +290,47 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         // Also kept on the console window: a preview relay strips the frame's query (vnc_lite.html restores it from here).
         expect(await eventually(() => harness.evaluate(target, 'window.__abpViewerPath'), Boolean, 5_000)).toMatch(/^v1\/viewer\/websockify\?ticket=ticket-/)
         await harness.closeTarget(target)
+    }, 30_000)
+
+    it('reconnects the screen with a fresh ticket when the Runtime closes the viewer after control changed', async () => {
+        ops.length = 0
+        viewerTickets.length = 0
+        // Released after sending input: the Runtime closes that viewer (4002) to prove the input was drained.
+        viewerCloses.set('ticket-1', 4002)
+        try {
+            const cap = token('screen-control', Date.now() + 600_000)
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+            await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+            await eventually(() => viewerTickets.includes('ticket-1'), Boolean, 10_000)
+            const second = await eventually(() => ops.filter((entry) => entry.op === 'viewerTicket')[1], Boolean, 10_000)
+            expect(second).toMatchObject({ bearer: cap, body: { profileId: 'profile-a' } })
+            // The gap before the new connection says so inside the frame.
+            expect(await harness.evaluate(target, `(() => { const s = document.getElementById('screenState'); return !!s && !s.hidden && s.textContent })()`))
+                .toBe('Reconnecting…')
+            await eventually(() => viewerTickets.includes('ticket-2'), Boolean, 10_000)
+            expect(await eventually(() => harness.evaluate(target, `document.getElementById('screenState').hidden`), Boolean, 5_000)).toBe(true)
+            // The new connection stays open: no further tickets.
+            await new Promise((resolve) => setTimeout(resolve, 1_000))
+            expect(ops.filter((entry) => entry.op === 'viewerTicket')).toHaveLength(2)
+            await harness.closeTarget(target)
+        } finally { viewerCloses.clear() }
+    }, 40_000)
+
+    it('does not reconnect the screen after another close (capability expired or revoked)', async () => {
+        ops.length = 0
+        viewerTickets.length = 0
+        viewerCloses.set('ticket-1', 4001)
+        try {
+            const cap = token('screen-revoked', Date.now() + 600_000)
+            const target = await harness.openFrontTab(`${origin}/console#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+            await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+            await eventually(() => viewerTickets.includes('ticket-1'), Boolean, 10_000)
+            await new Promise((resolve) => setTimeout(resolve, 1_500))
+            expect(ops.filter((entry) => entry.op === 'viewerTicket')).toHaveLength(1)
+            await harness.closeTarget(target)
+        } finally { viewerCloses.clear() }
     }, 30_000)
 
     /** The opener page, once its script has run (openFrontTab does not wait for the load). */

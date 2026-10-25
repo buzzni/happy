@@ -15,7 +15,8 @@
  * navigation, restored panel) asks the host at once and every 10 s until answered;
  * in the harness the token can also be pasted, still kept in memory only. An open
  * screen is reconnected with a fresh ticket after each renewal (a viewer connection
- * ends with the capability it was ticketed with). Take over/release use the selected
+ * ends with the capability it was ticketed with), and after the Runtime closed it on a
+ * control change (4002, reported by the viewer frame). Take over/release use the selected
  * tab's own lease epoch from getTask().tabLeases.
  *
  * Studio web opens the page in a new window through its preview relay, which
@@ -161,8 +162,10 @@ padding:10px 12px;border-radius:var(--radius-md);line-height:1.35;font-weight:40
 #actionResult.err{background:var(--danger-soft);color:var(--danger-text);border-color:color-mix(in srgb,var(--destructive) 25%,transparent)}
 /* Live screen: the viewer in a quiet dark frame. */
 .screen-hint{margin:0;font-size:12px;color:var(--muted-foreground)}
-#screenBox{margin-top:12px;border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--border);background:#000;box-shadow:var(--shadow-sm)}
+#screenBox{position:relative;margin-top:12px;border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--border);background:#000;box-shadow:var(--shadow-sm)}
 #screen{display:block;width:100%;aspect-ratio:16/10;min-height:360px;border:0;background:#000}
+#screenState{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;margin:0;font-size:12px;color:#A1A1AA;pointer-events:none}
+#screenState[hidden]{display:none}
 /* Folds: Advanced and Activity. */
 details.fold>summary{cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;list-style:none;min-height:30px;margin:-4px -6px;padding:4px 6px;border-radius:8px;user-select:none}
 details.fold>summary:hover{background:color-mix(in srgb,var(--muted) 50%,var(--background))}
@@ -226,7 +229,7 @@ summary::-webkit-details-marker{display:none}
 <section class="card"><div class="head"><h2><svg aria-hidden="true"><use href="#i-monitor"/></svg><span data-t="screen">Screen</span></h2>
 <button id="openScreen" type="button" data-t="openScreen">Open screen</button></div>
 <p class="screen-hint" data-t="screenHint">input reaches the page only while you hold take over</p>
-<div id="screenBox" hidden><iframe id="screen" title="Browser screen" referrerpolicy="no-referrer"></iframe></div></section>
+<div id="screenBox" hidden><iframe id="screen" title="Browser screen" referrerpolicy="no-referrer"></iframe><p id="screenState" role="status" data-t="reconnecting" hidden>Reconnecting…</p></div></section>
 <section class="card"><details class="fold"><summary><svg aria-hidden="true"><use href="#i-activity"/></svg><span data-t="events">Activity</span></summary><div id="events"></div></details></section>
 </div>
 </main>
@@ -242,7 +245,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  paste:'Paste a capability token',useToken:'Use token',rawTask:'Task details',pickTitle:'Pick a task',pickBody:'Tasks that need you appear on the left.',
  approvalTitle:'Approval required',approve:'Approve',reject:'Reject',control:'Control',takeOver:'Take over',release:'Release',resume:'Resume',stop:'Stop',
  controlHint:'Take over to use the page yourself (login, verification). Release it and the agent continues.',screen:'Screen',openScreen:'Open screen',
- screenHint:'input reaches the page only while you hold take over',events:'Activity',noEvents:'No activity yet',
+ screenHint:'input reaches the page only while you hold take over',reconnecting:'Reconnecting…',events:'Activity',noEvents:'No activity yet',
  notConnected:'not connected',waitingHost:'Waiting for Saycode',connected:'Connected',until:'until',unreadable:'capability is not readable',loading:'loading',
  noTasksTitle:'Nothing needs you',noTasks:'no open tasks',others:function(n){return n+' other open task'+(n>1?'s':'')},live:'live',retrying:'retrying',
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
@@ -256,7 +259,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  paste:'권한 토큰 붙여넣기',useToken:'토큰 사용',rawTask:'작업 상세',pickTitle:'작업을 고르세요',pickBody:'확인이 필요한 작업이 왼쪽에 나타나요.',
  approvalTitle:'승인이 필요해요',approve:'승인',reject:'거절',control:'제어',takeOver:'제어권 가져오기',release:'제어권 반납',resume:'계속 진행',stop:'작업 중지',
  controlHint:'로그인이나 사람 확인처럼 직접 해야 할 때 제어권을 가져오세요. 반납하면 에이전트가 이어서 진행해요.',screen:'화면',openScreen:'화면 보기',
- screenHint:'제어권을 가진 동안에만 입력이 화면에 전달돼요.',events:'활동 기록',noEvents:'아직 활동이 없어요',
+ screenHint:'제어권을 가진 동안에만 입력이 화면에 전달돼요.',reconnecting:'다시 연결 중…',events:'활동 기록',noEvents:'아직 활동이 없어요',
  notConnected:'연결 안 됨',waitingHost:'Saycode 연결 대기 중',connected:'연결됨',until:'까지',unreadable:'권한을 읽을 수 없어요',loading:'불러오는 중',
  noTasksTitle:'지금 확인할 작업이 없어요',noTasks:'열린 작업이 없어요',others:function(n){return '다른 작업 '+n+'개'},live:'실시간 연결됨',retrying:'다시 시도 중',
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
@@ -394,8 +397,16 @@ $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),re
 function openScreen(){S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{profileId:S.profileId}).then(function(r){if(n!==S.screenSeq)return;
  var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path);$('screenBox').hidden=false
-},function(e){if(n!==S.screenSeq)return;S.screenOpen=false;var out=$('actionResult');out.className='err';out.textContent=e.message})}
+},function(e){if(n!==S.screenSeq)return;S.screenOpen=false;$('screenState').hidden=true;var out=$('actionResult');out.className='err';out.textContent=e.message})}
 $('openScreen').onclick=openScreen;
+/**
+ * A viewer that sent input is closed when control changes (4002: proves its input was consumed) and noVNC
+ * drops the screen: reconnect with a new ticket, saying so in the frame until the new viewer page loads.
+ */
+window.addEventListener('message',function(event){var d=event.data;
+ if(event.source!==$('screen').contentWindow||event.origin!==location.origin||!d||d.type!=='abp-viewer-closed'||d.code!==4002||!S.screenOpen)return;
+ $('screenState').hidden=false;openScreen()});
+$('screen').onload=function(){$('screenState').hidden=true};
 // Reload, back navigation or a restored panel arrive without a fragment: ask the host now.
 if(S.token)listTasks();else askHost();
 })();

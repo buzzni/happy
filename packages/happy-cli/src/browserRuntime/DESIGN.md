@@ -240,7 +240,9 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
   inflating it in the Runtime (a 1x1 ZRLE rectangle can expand to 512 KiB). Cost: noVNC uses Hextile
   (more bandwidth over the tunnel).
 - `/viewer/` serves the pinned noVNC client (Runtime image copies Debian bookworm `novnc=1:1.3.0-1`,
-  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`).
+  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The served page reports each
+  viewer WebSocket close code to its same-origin console (`abp-viewer-closed`); on 4002 the console
+  asks for a new ticket and reconnects (noVNC drops the screen on close), showing "reconnecting" in the frame.
 - Harness: `poc.mjs up --viewer runtime` (pocStack `viewer: 'runtime'`) is the production layout — no
   websockify, nothing published but the Runtime. The default harness layout still starts and publishes
   noVNC (`ABP_HARNESS_NOVNC=1`) because A11 probes it directly; A04/A09 inject human input with xdotool
