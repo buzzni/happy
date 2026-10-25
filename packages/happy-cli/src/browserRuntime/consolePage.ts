@@ -140,6 +140,9 @@ font-size:12.5px;font-weight:500;user-select:none;transition:border-color .15s v
 .badge{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--warn-soft);color:var(--warn-text);font-size:11px;font-weight:600;flex:none}
 .menu-panel{position:absolute;top:calc(100% + 6px);left:0;z-index:5;width:min(380px,calc(100vw - 24px));max-height:min(70vh,560px);overflow:auto;padding:12px;
 background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm)}
+/* A list failure is never only inside the closed menu: this line stays in view above the task, with a retry. */
+.notice{display:flex;align-items:center;gap:10px;padding:10px 14px;border-color:color-mix(in srgb,var(--destructive) 35%,var(--border));background:var(--danger-soft);color:var(--danger-text)}
+.notice>span{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}.notice>button{flex:none;height:30px;font-size:12px}
 #tasks{display:flex;flex-direction:column;gap:6px}
 #tasks.muted{padding:10px 4px;font-size:12px;color:var(--muted-foreground)}
 #tasks button{display:grid;grid-template-columns:8px minmax(0,1fr);grid-template-areas:"dot what" ". tid";column-gap:10px;row-gap:3px;align-items:center;width:100%;height:auto;text-align:left;
@@ -240,6 +243,7 @@ summary::-webkit-details-marker{display:none}
 <span class="spacer"></span>
 <span id="capState" class="pill"><i></i><span>not connected</span></span></header>
 <main>
+<div class="card notice" id="notice" role="alert" hidden><svg aria-hidden="true"><use href="#i-shield"/></svg><span id="noticeText"></span><button id="noticeRetry" type="button" data-t="retry">Retry</button></div>
 <section class="card" id="placeholder"><div class="empty"><svg aria-hidden="true"><use href="#i-inbox"/></svg><b data-t="pickTitle">Pick a task</b><span data-t="pickBody">Tasks that need you are in the task menu above.</span></div></section>
 <div id="detail" hidden>
 <section class="card" id="approvalBox" hidden><h2><svg aria-hidden="true"><use href="#i-shield"/></svg><span data-t="approvalTitle">Approval required</span></h2>
@@ -271,14 +275,14 @@ summary::-webkit-details-marker{display:none}
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
-var S={cursor:0,seen:{},task:null,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
+var S={cursor:0,seen:{},task:null,tasks:[],gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000,HOST_ORIGINS=${hostOrigins};
 var Q=new URLSearchParams(location.search),THEME=Q.get('theme');
 if(THEME==='dark'||THEME==='light')document.documentElement.setAttribute('data-theme',THEME);
 var LANG=(Q.get('lang')||navigator.language||'en').toLowerCase().indexOf('ko')===0?'ko':'en';
 var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refresh:'Refresh',advanced:'Advanced',taskId:'Task id',tabId:'Tab id (for take over / release)',watch:'Watch task',
  paste:'Paste a capability token',useToken:'Use token',rawTask:'Task details',pickTitle:'Pick a task',pickBody:'Tasks that need you are in the task menu above.',pickTask:'Pick a task',
- needCount:function(n){return n+(n>1?' tasks need you':' task needs you')},viewMode:'Screen size',fit:'Fit to screen',actual:'Actual size',
+ needCount:function(n){return n+(n>1?' tasks need you':' task needs you')},tasksFailed:'Could not load the tasks',retry:'Retry',viewMode:'Screen size',fit:'Fit to screen',actual:'Actual size',
  fitHint:'The whole screen, scaled to fit the frame',actualHint:'1:1 pixels; scroll the frame to see the rest',
  screenEmptyTitle:'The screen is not open',screenEmptyBody:"Open screen shows the agent's browser here. Take over to use the page yourself (login, verification); release it and the agent continues.",
  approvalTitle:'Approval required',approve:'Approve',reject:'Reject',takeOver:'Take over',release:'Release',resume:'Resume',stop:'Stop',screen:'Screen',openScreen:'Open screen',
@@ -294,7 +298,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  origin:'Site',expires:'Expires',ok:'Done'},
  ko:{title:'에이전트 브라우저',subtitle:'런타임 콘솔',tasks:'작업',refresh:'새로고침',advanced:'고급',taskId:'작업 ID',tabId:'탭 ID (제어권 가져오기/반납용)',watch:'작업 보기',
  paste:'권한 토큰 붙여넣기',useToken:'토큰 사용',rawTask:'작업 상세',pickTitle:'작업을 고르세요',pickBody:'확인이 필요한 작업은 위 작업 메뉴에 나타나요.',pickTask:'작업 선택',
- needCount:function(n){return '확인 필요 '+n+'개'},viewMode:'화면 크기',fit:'화면 맞춤',actual:'실제 크기',
+ needCount:function(n){return '확인 필요 '+n+'개'},tasksFailed:'작업 목록을 불러오지 못했어요',retry:'다시 시도',viewMode:'화면 크기',fit:'화면 맞춤',actual:'실제 크기',
  fitHint:'화면 전체가 보이도록 틀에 맞춰 축소해요',actualHint:'1:1 크기로 보여요. 나머지는 틀 안에서 스크롤하세요',
  screenEmptyTitle:'화면이 아직 열리지 않았어요',screenEmptyBody:'화면 보기를 누르면 에이전트의 브라우저가 여기에 보여요. 로그인이나 사람 확인처럼 직접 해야 할 때 제어권을 가져오고, 반납하면 에이전트가 이어서 진행해요.',
  approvalTitle:'승인이 필요해요',approve:'승인',reject:'거절',takeOver:'제어권 가져오기',release:'제어권 반납',resume:'계속 진행',stop:'작업 중지',screen:'화면',openScreen:'화면 보기',
@@ -321,7 +325,16 @@ function placeMenu(){if(!menu.open)return;menuPanel.style.left='0px';var r=menuP
 menu.addEventListener('toggle',function(){menuBtn.setAttribute('aria-expanded',menu.open?'true':'false');placeMenu()});
 window.addEventListener('resize',placeMenu);
 document.addEventListener('keydown',function(e){if(e.key==='Escape'&&menu.open){menu.open=false;menuBtn.focus()}});
-document.addEventListener('pointerdown',function(e){if(menu.open&&!menu.contains(e.target))menu.open=false});
+function closeMenu(){if(menu.open)menu.open=false}
+document.addEventListener('pointerdown',function(e){if(menu.open&&!menu.contains(e.target))closeMenu()});
+// A click on the screen lands in the viewer frame, where this document sees no pointer event: the frame's own
+// document closes the menu too (same origin; armed on every load, so a reconnected frame keeps it), and the window
+// losing focus to the frame (or to anything else) closes it as well.
+window.addEventListener('blur',closeMenu);
+$('screen').addEventListener('load',function(){try{var d=this.contentDocument;if(d)d.addEventListener('pointerdown',closeMenu,true)}catch(e){}});
+/** A list failure is shown in the notice line above the task, with a retry, not only inside the closed menu. */
+function notice(text){var n=$('notice');n.hidden=!text;$('noticeText').textContent=text||''}
+$('noticeRetry').onclick=function(){listTasks()};
 function menuLabel(){var t=S.task;$('taskMenuLabel').textContent=t?describe(t).label+' · '+t.taskId:T.pickTask;menuName()}
 function needCount(n){var b=$('needCount');b.textContent=String(n);b.hidden=!n;b.title=n?T.needCount(n):'';menuName()}
 /** The summary's accessible name: the label plus how many tasks need the user (a number alone says little). */
@@ -386,7 +399,7 @@ function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.sta
  // The control a user is most likely to need next is the loud one.
  var holding=t.pauseReason==='user-control',released=t.pauseReason==='user-input-complete';
  $('takeOver').className=holding||released?'':'primary';$('release').className=holding?'primary':'';$('resume').className=released?'primary':'';
- markSelected(t.taskId);
+ syncTask(t);markSelected(t.taskId);
  var a=t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a)}
 function renderApproval(a){var box=$('approval');box.textContent='';var d=document.createElement('div');d.className='desc';d.textContent=a.description;
  var m=document.createElement('div');m.className='meta';var o=document.createElement('span');o.textContent=T.origin+' · '+a.origin;
@@ -405,18 +418,24 @@ function taskButton(t){var b=document.createElement('button');b.type='button';b.
  b.appendChild(dot);b.appendChild(id);b.appendChild(document.createTextNode(' '));b.appendChild(what);
  b.onclick=function(){if(menu.open){menu.open=false;menuBtn.focus()}$('taskId').value=t.taskId;$('tabId').value=(t.tabs&&t.tabs[0])||'';watch()};return b}
 function listTasks(){if(!S.token)return;$('tasks').className='muted';$('tasks').textContent=T.loading;
- op('listTasks',{profileId:S.profileId}).then(function(r){var box=$('tasks');box.textContent='';box.className='';
-  if(!r.tasks.length){emptyState(box,T.noTasksTitle,T.noTasks);needCount(0);return}
-  // Tasks waiting for the user come first; the others (running, parked for the agent) are folded away.
-  var others=document.createElement('details'),summary=document.createElement('summary'),folded=0,first=null,need=0;others.appendChild(summary);
-  r.tasks.forEach(function(t){var b=taskButton(t);
-   if(waitsForUser(t)){box.appendChild(b);need++;if(!first)first=t}else{others.appendChild(b);folded++}});
-  needCount(need);
-  if(folded){summary.textContent=T.others(folded);box.appendChild(others)}
-  if(S.task)markSelected(S.task.taskId);
+ op('listTasks',{profileId:S.profileId}).then(function(r){notice('');S.tasks=r.tasks;var first=renderTasks();
   // Opened to deal with something: show the first task that needs the user right away.
-  else if(first&&!$('taskId').value){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}
- },function(e){$('tasks').textContent=e.message;$('tasks').className='warn-text small'})}
+  if(!S.task&&first&&!$('taskId').value){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}
+ },function(e){$('tasks').textContent=e.message;$('tasks').className='warn-text small';notice(T.tasksFailed+' · '+e.message)})}
+/** The menu's list and the badge, from S.tasks. Returns the first task that needs the user. */
+function renderTasks(){var box=$('tasks');box.textContent='';box.className='';
+ if(!S.tasks.length){emptyState(box,T.noTasksTitle,T.noTasks);needCount(0);return null}
+ // Tasks waiting for the user come first; the others (running, parked for the agent) are folded away.
+ var others=document.createElement('details'),summary=document.createElement('summary'),folded=0,first=null,need=0;others.appendChild(summary);
+ S.tasks.forEach(function(t){var b=taskButton(t);
+  if(waitsForUser(t)){box.appendChild(b);need++;if(!first)first=t}else{others.appendChild(b);folded++}});
+ needCount(need);
+ if(folded){summary.textContent=T.others(folded);box.appendChild(others)}
+ if(S.task)markSelected(S.task.taskId);return first}
+/** A task's new state (an action's answer, a subscription refresh) reaches the list and the badge, not only the bar. */
+function syncTask(t){var i=-1;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].taskId===t.taskId)i=k;
+ var old=i>=0?S.tasks[i]:null;if(i>=0)S.tasks[i]=t;else S.tasks.push(t);
+ if(!old||waitsForUser(old)!==waitsForUser(t)||describe(old).label!==describe(t).label)renderTasks()}
 /** Same rule as the Runtime's sessionWaiting: the user's move now (a stale approval on a task being cancelled is not). */
 function waitsForUser(t){if(t.cancelRequested)return false;return !!t.pendingApproval||t.status==='awaiting-user'||t.pauseReason==='user-control'
  ||(t.pauseReason==='grant-expired'&&(t.waitReason==='login'||t.waitReason==='captcha'||t.waitReason==='handoff'))}

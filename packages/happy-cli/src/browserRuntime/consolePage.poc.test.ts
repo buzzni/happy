@@ -32,6 +32,12 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     let holdSubscribe = false
     let listedTasks: Array<Record<string, unknown>> = defaultTasks()
     let taskDetail: Record<string, unknown> | undefined
+    /** Per-task getTask answers, ahead of taskDetail (a list whose tasks the detail must agree with). */
+    let taskDetails: Record<string, Record<string, unknown>> = {}
+    /** When set, listTasks answers this error (a capability the Runtime no longer accepts, say). */
+    let listTasksError: { code: string; message: string } | null = null
+    /** What releaseControl answers: the task as the Runtime reports it after the lease is gone. */
+    let releasedTask: Record<string, unknown> | undefined
 
     beforeAll(async () => {
         server = http.createServer((req, res) => {
@@ -73,17 +79,19 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 const result = m[1] === 'listTasks'
                     ? { tasks: listedTasks }
                     : m[1] === 'getTask'
-                        ? taskDetail ?? { taskId: body.taskId || 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
+                        ? taskDetails[String(body.taskId)] ?? taskDetail ?? { taskId: body.taskId || 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1', 'tab-2'], uncertainActions: [], cancelRequested: false,
                             tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'none' } }, { tabId: 'tab-2', leaseEpoch: 2, owner: { kind: 'none' } }] }
                         : m[1] === 'subscribe'
                             ? { kind: 'events', events: [{ seq: 1, type: 'state-changed', leaseEpoch: 11, data: {} }] }
-                            : m[1] === 'viewerTicket' ? { ticket: `ticket-${ops.filter((entry) => entry.op === 'viewerTicket').length}`, expiresAtMs: Date.now() + 30_000 } : {}
+                            : m[1] === 'viewerTicket' ? { ticket: `ticket-${ops.filter((entry) => entry.op === 'viewerTicket').length}`, expiresAtMs: Date.now() + 30_000 }
+                                : m[1] === 'releaseControl' && releasedTask ? { owner: 'none', task: releasedTask } : {}
+                const error = m[1] === 'listTasks' ? listTasksError : null
                 // A slow task answers late, after the user may have picked another one.
                 // A screen ticket answers after a moment, so a renewal can arrive while the first one is in flight.
                 const delay = m[1] === 'getTask' && body.taskId === 'task-slow' ? 800 : m[1] === 'subscribe' && holdSubscribe ? 5_000 : m[1] === 'viewerTicket' ? 300 : 0
                 setTimeout(() => {
                     res.writeHead(200, { 'content-type': 'application/json' })
-                    res.end(JSON.stringify({ ok: true, result }))
+                    res.end(JSON.stringify(error ? { ok: false, error } : { ok: true, result }))
                 }, delay)
             })
         })
@@ -155,6 +163,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
         await harness.evaluate(target, `document.getElementById('taskId').value = 'task-1'; document.getElementById('connect').click()`)
         await eventually(() => ops.some((entry) => entry.op === 'subscribe'), Boolean, 5_000)
+        // This page's own task (with its tab leases) is shown: a subscribe still arriving from the previous test's page says nothing about it.
+        await eventually(() => harness.evaluate(target, `(document.getElementById('detailId') || {}).textContent`), (id) => id === 'task-1', 5_000)
         await harness.evaluate(target, `document.getElementById('tabId').value = 'tab-2'; document.getElementById('takeOver').click()`)
         expect((await eventually(() => ops.find((entry) => entry.op === 'takeOver'), Boolean, 5_000))?.body).toMatchObject({ tabId: 'tab-2', expectedEpoch: 2 })
         await harness.closeTarget(target)
@@ -203,6 +213,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             // A stale approval on a task being cancelled is nothing to act on.
             { taskId: 'task-cancelling', status: 'paused', pauseReason: 'cancelled-with-unknown-effect', cancelRequested: true, pendingApproval: { approvalId: 'old' }, tabs: [], updatedAtMs: now },
         ]
+        // The task that opens by itself answers getTask as the list described it (the badge follows the shown task's state).
+        taskDetails = { 'task-approval': { ...listedTasks[1], stateVersion: 1, uncertainActions: [], cancelRequested: false, tabLeases: [],
+            pendingApproval: { approvalId: 'a', description: 'Open the site', origin: 'https://site.test', expiresAtMs: now + 60_000, bindingHash: 'h' } } }
         try {
             const cap = token('fold', Date.now() + 600_000)
             // The language is explicit: the page otherwise follows the browser's.
@@ -221,7 +234,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             expect(await eventually(() => harness.evaluate(korean, `(document.querySelector('#tasks summary') || {}).textContent`), Boolean, 10_000)).toBe('다른 작업 3개')
             expect(await harness.evaluate(korean, 'document.documentElement.lang')).toBe('ko')
             await harness.closeTarget(korean)
-        } finally { listedTasks = defaultTasks(); holdSubscribe = false }
+        } finally { listedTasks = defaultTasks(); holdSubscribe = false; taskDetails = {} }
     }, 30_000)
 
     it("keeps the task the user picked when the automatically opened one answers late", async () => {
@@ -329,6 +342,12 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             { taskId: 'task-approval', status: 'paused', pauseReason: 'awaiting-user', pendingApproval: { approvalId: 'a' }, tabs: [], updatedAtMs: now },
             { taskId: 'task-login', status: 'awaiting-user', waitReason: 'login', tabs: [], updatedAtMs: now },
         ]
+        // getTask agrees with the list (the badge follows the task's own state once it is shown).
+        taskDetails = {
+            'task-approval': { ...listedTasks[1], stateVersion: 1, uncertainActions: [], cancelRequested: false, tabLeases: [],
+                pendingApproval: { approvalId: 'a', description: 'Open the site', origin: 'https://site.test', expiresAtMs: now + 60_000, bindingHash: 'h' } },
+            'task-login': { ...listedTasks[2], stateVersion: 1, uncertainActions: [], cancelRequested: false, tabLeases: [] },
+        }
         try {
             const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('menu', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
             await eventually(() => harness.evaluate(target, `document.querySelectorAll('#tasks button').length`), (n) => n === 3, 10_000)
@@ -341,7 +360,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 button: document.getElementById('taskMenuButton').tagName, focusable: document.getElementById('taskMenuButton').tabIndex >= 0,
                 expanded: document.getElementById('taskMenuButton').getAttribute('aria-expanded'),
                 folded: ['eventsPanel', 'advanced'].map((id) => document.getElementById(id).hidden) })`)))
-            expect(closed).toEqual({ open: false, count: '2', label: 'Paused · task-approval', name: 'Paused · task-approval, 2 tasks need you', title: 'Paused',
+            expect(closed).toEqual({ open: false, count: '2', label: 'Needs your approval · task-approval', name: 'Needs your approval · task-approval, 2 tasks need you', title: 'Needs your approval',
                 button: 'SUMMARY', focusable: true, expanded: 'false', folded: [true, true] })
             // Opened from the keyboard it lists the tasks (those needing the user first, as before); picking one closes it and shows that task.
             await harness.evaluate(target, `document.getElementById('taskMenuButton').focus()`)
@@ -353,7 +372,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             await harness.evaluate(target, `document.querySelector('[data-task="task-login"]').click()`)
             await eventually(() => harness.evaluate(target, `document.getElementById('detailId').textContent`), (id) => id === 'task-login', 10_000)
             expect(await harness.evaluate(target, `JSON.stringify({ open: document.getElementById('taskMenu').open, label: document.getElementById('taskMenuLabel').textContent, focus: document.activeElement.id })`))
-                .toBe(JSON.stringify({ open: false, label: 'Paused · task-login', focus: 'taskMenuButton' }))
+                .toBe(JSON.stringify({ open: false, label: 'Login needed · task-login', focus: 'taskMenuButton' }))
             // In a narrow window the open panel stays inside the viewport (slid left of its button, 12px from the edge at most).
             // (The <details> toggle event, which places the panel, is dispatched asynchronously: measure after it.)
             const narrow = JSON.parse(String(await atWidth(target, 360, `new Promise((resolve) => { document.getElementById('taskMenu').open = true; setTimeout(() => {
@@ -372,7 +391,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             expect(await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), (open) => open === false, 5_000)).toBe(false)
             expect(await harness.evaluate(target, `document.activeElement.id`)).toBe('taskMenuButton')
             await harness.closeTarget(target)
-        } finally { listedTasks = defaultTasks() }
+        } finally { listedTasks = defaultTasks(); taskDetails = {} }
     }, 30_000)
 
     it.skipIf(!hasNovnc)('switches the open screen between fit and actual size in place, and keeps the choice across a reconnect', async () => {
@@ -409,6 +428,70 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         expect(ops.filter((entry) => entry.op === 'viewerTicket').length).toBe(2)
         await harness.closeTarget(target)
     }, 40_000)
+
+    it('shows a task list failure above the task with a retry, not only inside the closed menu', async () => {
+        listTasksError = { code: 'UNAUTHORIZED', message: 'capability rejected' }
+        try {
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('list-fail', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => harness.evaluate(target, `!document.getElementById('notice').hidden`), Boolean, 10_000)
+            const shown = JSON.parse(String(await harness.evaluate(target, `(() => { const n = document.getElementById('notice'), r = n.getBoundingClientRect();
+                return JSON.stringify({ role: n.getAttribute('role'), text: document.getElementById('noticeText').textContent, visible: r.width > 0 && r.height > 0,
+                    menuOpen: document.getElementById('taskMenu').open, inMenu: !!n.closest('#taskMenu') }) })()`)))
+            expect(shown).toEqual({ role: 'alert', text: 'Could not load the tasks · UNAUTHORIZED: capability rejected', visible: true, menuOpen: false, inMenu: false })
+            // Retry from the notice; once the list answers, the notice goes away.
+            listTasksError = null
+            ops.length = 0
+            await harness.evaluate(target, `document.getElementById('noticeRetry').click()`)
+            await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 5_000)
+            await eventually(() => harness.evaluate(target, `document.getElementById('notice').hidden`), Boolean, 5_000)
+            expect(await harness.evaluate(target, `document.getElementById('tasks').textContent`)).toContain('task-1')
+            await harness.closeTarget(target)
+        } finally { listTasksError = null }
+    }, 30_000)
+
+    it("updates the number of tasks needing the user from the task's own state changes, not only from a list refresh", async () => {
+        const now = Date.now()
+        const holding = { taskId: 'task-a', status: 'paused', pauseReason: 'user-control', stateVersion: 4, tabs: ['tab-1'], updatedAtMs: now, uncertainActions: [], cancelRequested: false,
+            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'user' } }] }
+        const released = { ...holding, pauseReason: 'user-input-complete', stateVersion: 5, tabLeases: [{ tabId: 'tab-1', leaseEpoch: 8, owner: { kind: 'none' } }] }
+        listedTasks = [holding]; taskDetail = holding; releasedTask = released
+        try {
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('badge', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => harness.evaluate(target, `(document.getElementById('detailId') || {}).textContent`), (id) => id === 'task-a', 10_000)
+            const badge = `JSON.stringify({ count: document.getElementById('needCount').textContent, hidden: document.getElementById('needCount').hidden,
+                name: document.getElementById('taskMenuButton').getAttribute('aria-label'), top: [...document.querySelectorAll('#tasks > button')].map((b) => b.getAttribute('data-task')) })`
+            expect(await harness.evaluate(target, badge)).toBe(JSON.stringify({ count: '1', hidden: false, name: 'You have control · task-a, 1 task needs you', top: ['task-a'] }))
+            ops.length = 0
+            taskDetail = released
+            await harness.evaluate(target, `document.getElementById('release').click()`)
+            await eventually(() => ops.some((entry) => entry.op === 'releaseControl'), Boolean, 5_000)
+            // The answer carries the task: the bar, the badge and the list follow it without another listTasks.
+            await eventually(() => harness.evaluate(target, `document.getElementById('detailTitle').textContent`), (title) => title === 'Released', 5_000)
+            expect(await harness.evaluate(target, badge)).toBe(JSON.stringify({ count: '0', hidden: true, name: 'Released · task-a', top: [] }))
+            expect(ops.filter((entry) => entry.op === 'listTasks').length).toBe(0)
+            await harness.closeTarget(target)
+        } finally { listedTasks = defaultTasks(); taskDetail = undefined; releasedTask = undefined }
+    }, 30_000)
+
+    it('closes the task menu on a click into the screen frame and when the window loses focus', async () => {
+        ops.length = 0
+        const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('menu-frame', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+        await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+        await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+        // The frame's own document (not the initial about:blank one), loaded: the console arms it on load.
+        await eventually(() => harness.evaluate(target, `(() => { try { const w = document.getElementById('screen').contentWindow; return !!w && w.location.pathname.indexOf('/viewer/') === 0 && w.document.readyState === 'complete' } catch (e) { return false } })()`), Boolean, 10_000)
+        // A pointer down inside the frame's document (where the parent sees no event) closes the menu.
+        await harness.evaluate(target, `document.getElementById('taskMenu').open = true`)
+        await eventually(() => harness.evaluate(target, `document.getElementById('taskMenuButton').getAttribute('aria-expanded')`), (v) => v === 'true', 5_000)
+        await harness.evaluate(target, `document.getElementById('screen').contentDocument.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))`)
+        expect(await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), (open) => open === false, 5_000)).toBe(false)
+        // So does the window losing focus (to the frame, or to anything else).
+        await harness.evaluate(target, `document.getElementById('taskMenu').open = true`)
+        await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), Boolean, 5_000)
+        await harness.evaluate(target, `window.dispatchEvent(new Event('blur'))`)
+        expect(await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), (open) => open === false, 5_000)).toBe(false)
+        await harness.closeTarget(target)
+    }, 30_000)
 
     /** The opener page, once its script has run (openFrontTab does not wait for the load). */
     const openStudio = async () => {
