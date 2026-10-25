@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { access, chmod, mkdir, realpath } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 
 import { releaseDanglingSubmoduleWorktreePointers } from './submoduleWorktreePointer'
@@ -32,9 +32,11 @@ export function isGithubTriggerWorktreeDirectoryInUse(input: {
   }]>
   isPidAlive: (pid: number) => boolean
 }): boolean {
+  const root = resolve(input.directory)
   for (const [pid, session] of input.sessions) {
-    const sessionDirectory = session.directory ?? session.happySessionMetadataFromLocalWebhook?.path
-    if (sessionDirectory === input.directory && input.isPidAlive(pid)) return true
+    const directories = [session.directory, session.happySessionMetadataFromLocalWebhook?.path]
+    if (directories.some(directory => directory && (resolve(directory) === root || resolve(directory).startsWith(root + sep)))
+      && input.isPidAlive(pid)) return true
   }
   return false
 }
@@ -45,9 +47,7 @@ async function defaultRunCommand(command: GithubTriggerWorktreeCommand): Promise
   try {
     const result = await execFileAsync(command.executable, command.args, {
       cwd: command.cwd,
-      env: command.environmentVariables
-        ? { ...process.env, ...command.environmentVariables }
-        : process.env,
+      env: { ...process.env, ...command.environmentVariables, GIT_OPTIONAL_LOCKS: '0' },
       timeout: COMMAND_TIMEOUT_MS,
       maxBuffer: COMMAND_MAX_BUFFER,
       encoding: 'utf8',
@@ -83,6 +83,8 @@ export async function removeGithubTriggerWorktree(input: {
   runCommand?: (command: GithubTriggerWorktreeCommand) => Promise<CommandResult>
   releaseSubmodulePointers?: (input: { repositoryRoot: string }) => Promise<{ released: string[] }>
   pathExists?: (path: string) => Promise<boolean>
+  /** Daemon-owned generated artifacts only; source preservation still returns dirty. */
+  reclaimArtifacts?: () => Promise<void>
 }): Promise<
   | { ok: true }
   | { ok: false; dirty: boolean; error: string }
@@ -110,7 +112,10 @@ export async function removeGithubTriggerWorktree(input: {
     // 무엇이 막고 있는지 말한다 — 원인을 알려고 사람이 git status 를 다시 치게
     // 만들면 그만큼 worktree 가 더 오래 남는다.
     const blocking = describeUnsavedWorktreeChanges(status.stdout).join(', ')
-    return { ok: false, dirty: true, error: `GitHub automation worktree is dirty (${blocking})` }
+    let error = `GitHub automation worktree is dirty (${blocking})`
+    try { await input.reclaimArtifacts?.() }
+    catch (cause) { error += `; artifact reclamation failed: ${cause instanceof Error ? cause.message : String(cause)}` }
+    return { ok: false, dirty: true, error }
   }
   const removed = await commandOrError(runCommand, {
     executable: 'git',

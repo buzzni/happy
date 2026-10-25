@@ -253,6 +253,7 @@ import {
   prepareGithubTriggerWorktree,
   removeGithubTriggerWorktree,
 } from './automations/githubTriggerWorktree';
+import { createGithubArtifactReclaimer } from './automations/githubWorktreeArtifactReclaim';
 import {
   createGithubWorktreeTombstoneStore,
   readWorktreeHead,
@@ -2806,7 +2807,18 @@ export async function startDaemon(): Promise<void> {
     const githubWorktreeTombstones = createGithubWorktreeTombstoneStore({
       filePath: join(configuration.happyHomeDir, 'automation-worktree-tombstones.json'),
     });
-    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(removeGithubTriggerWorktree, {
+    const reclaimGithubArtifacts = createGithubArtifactReclaimer({
+      managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
+      isDirectoryInUse: directory => !launchReadiness.isReady() || pendingMachineStarts.size > 0
+        || resumingSetupTokenSessions.size > 0 || isAutomationDirectoryInUse(directory),
+    });
+    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(input => removeGithubTriggerWorktree({
+      ...input,
+      reclaimArtifacts: async () => {
+        const report = await reclaimGithubArtifacts(input);
+        if (report.status !== 'deferred') logger.debug(`[DAEMON RUN] [github-artifact-reclaim] ${JSON.stringify(report)}`);
+      },
+    }), {
       readHead: readWorktreeHead,
       record: (removed) => githubWorktreeTombstones.record(removed),
     });

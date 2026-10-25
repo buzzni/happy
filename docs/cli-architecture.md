@@ -1,5 +1,18 @@
 # CLI Architecture
 
+## GitHub automation artifact lifecycle
+
+The journal-driven worktree discard path retains dirty source while
+`daemon/automations/githubWorktreeArtifactReclaim` reclaims old ignored dependencies
+and build outputs in registered daemon-owned automation worktrees. It verifies
+Git ownership, tracked descendants, nested repositories, recent activity and
+daemon/OS process use immediately before deletion. Incomplete process observation
+preserves the files. Receipts outside Git worktrees retain the daily check interval
+across restarts; the existing automation tick owns retries. Clean worktree deletion
+and tombstone-based Chat resume keep their existing lifecycle.
+The policy and reconsideration boundaries are in
+[the implementation plan](plans/github-automation-artifact-reclaim.md).
+
 ## Worktree Git write ownership
 
 Ticket-validated worktree writes share Desktop's common Git directory lock.
