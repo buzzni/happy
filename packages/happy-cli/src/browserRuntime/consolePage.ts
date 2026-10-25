@@ -15,7 +15,8 @@
  * navigation, restored panel) asks the host at once and every 10 s until answered;
  * in the harness the token can also be pasted, still kept in memory only. An open
  * screen is reconnected with a fresh ticket after each renewal (a viewer connection
- * ends with the capability it was ticketed with). Take over/release use the selected
+ * ends with the capability it was ticketed with), and after the Runtime closed it on a
+ * control change (4002, reported by the viewer frame). Take over/release use the selected
  * tab's own lease epoch from getTask().tabLeases.
  *
  * Studio web opens the page in a new window through its preview relay, which
@@ -201,8 +202,10 @@ padding:10px 12px;border-radius:var(--radius-md);line-height:1.35;font-weight:40
 .seg>button{border-radius:0}.seg>button:first-child{border-radius:var(--radius-sm) 0 0 var(--radius-sm)}.seg>button:last-child{border-radius:0 var(--radius-sm) var(--radius-sm) 0;margin-left:-1px}
 .seg>button[aria-pressed="true"]{border-color:var(--primary);background:var(--surface-active);color:var(--primary-text);position:relative;z-index:1}
 @media (max-width:480px){.screen-head .row{margin-left:0;flex:1 1 100%}.screen-head .seg{margin-left:auto}}
-#screenBox{flex:1 1 auto;min-height:240px;border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--border);background:#000;box-shadow:var(--shadow-sm)}
+#screenBox{position:relative;flex:1 1 auto;min-height:240px;border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--border);background:#000;box-shadow:var(--shadow-sm)}
 #screen{display:block;width:100%;height:100%;border:0;background:#000}
+#screenState{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;margin:0;font-size:12px;color:#A1A1AA;pointer-events:none}
+#screenState[hidden]{display:none}
 #screenEmpty{flex:1 1 auto;min-height:160px;display:flex;align-items:center;justify-content:center}
 /* Folds: Activity and Advanced are buttons in the screen's head line; their panels open under the screen, closed by default. */
 button.fold{height:30px;padding:0 10px;font-size:12px;color:var(--muted-foreground);border-color:transparent;background:transparent}
@@ -272,7 +275,7 @@ dialog input[type="checkbox"]{width:16px;height:16px;flex:none;padding:0;margin:
 <div class="row"><button id="eventsToggle" class="fold" type="button" aria-expanded="false" aria-controls="eventsPanel" data-t="events">Activity</button><button id="advancedToggle" class="fold" type="button" aria-expanded="false" aria-controls="advanced" data-t="advanced">Advanced</button>
 <span class="seg" id="viewGroup" role="group" aria-label="Screen size"><button id="fitToggle" type="button" aria-pressed="true" data-t="fit">Fit to screen</button><button id="actualSize" type="button" aria-pressed="false" data-t="actual">Actual size</button></span>
 <button id="openScreen" type="button" data-t="openScreen">Open screen</button></div></div>
-<div id="screenBox" hidden><iframe id="screen" title="Browser screen" referrerpolicy="no-referrer"></iframe></div>
+<div id="screenBox" hidden><iframe id="screen" title="Browser screen" referrerpolicy="no-referrer"></iframe><p id="screenState" role="status" data-t="reconnecting" hidden>Reconnecting…</p></div>
 <section class="card" id="screenEmpty"><div class="empty"><svg aria-hidden="true"><use href="#i-monitor"/></svg><b data-t="screenEmptyTitle">The screen is not open</b><span data-t="screenEmptyBody">Open screen shows the agent's browser here. Take over to use the page yourself (login, verification); release it and the agent continues.</span></div></section>
 <section class="card fold-panel" id="eventsPanel" hidden><h2><svg aria-hidden="true"><use href="#i-activity"/></svg><span data-t="events">Activity</span></h2><div id="events"></div></section>
 <section class="card fold-panel" id="advanced" hidden><h2><svg aria-hidden="true"><use href="#i-settings"/></svg><span data-t="advanced">Advanced</span></h2>
@@ -303,7 +306,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  fitHint:'The whole screen, scaled to fit the frame',actualHint:'1:1 pixels. Without control the wheel pans the frame; with control it reaches the page (drag the scrollbars to pan)',
  screenEmptyTitle:'The screen is not open',screenEmptyBody:"Open screen shows the agent's browser here. Take over to use the page yourself (login, verification); release it and the agent continues.",
  approvalTitle:'Approval required',approve:'Approve',reject:'Reject',takeOver:'Take over',release:'Release',resume:'Resume',stop:'Stop',screen:'Screen',openScreen:'Open screen',
- screenHint:'input reaches the page only while you hold take over',events:'Activity',noEvents:'No activity yet',
+ screenHint:'input reaches the page only while you hold take over',reconnecting:'Reconnecting…',events:'Activity',noEvents:'No activity yet',
  notConnected:'not connected',waitingHost:'Waiting for Saycode',connected:'Connected',until:'until',unreadable:'capability is not readable',loading:'loading',
  noTasksTitle:'Nothing needs you',noTasks:'no open tasks',others:function(n){return n+' other open task'+(n>1?'s':'')},live:'live',retrying:'retrying',
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
@@ -319,7 +322,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  fitHint:'화면 전체가 보이도록 틀에 맞춰 축소해요',actualHint:'1:1 크기로 보여요. 제어권이 없을 때는 휠로 틀을 이동하고, 제어권을 가지면 휠이 페이지에 전달돼요(틀 이동은 스크롤바)',
  screenEmptyTitle:'화면이 아직 열리지 않았어요',screenEmptyBody:'화면 보기를 누르면 에이전트의 브라우저가 여기에 보여요. 로그인이나 사람 확인처럼 직접 해야 할 때 제어권을 가져오고, 반납하면 에이전트가 이어서 진행해요.',
  approvalTitle:'승인이 필요해요',approve:'승인',reject:'거절',takeOver:'제어권 가져오기',release:'제어권 반납',resume:'계속 진행',stop:'작업 중지',screen:'화면',openScreen:'화면 보기',
- screenHint:'제어권을 가진 동안에만 입력이 화면에 전달돼요.',events:'활동 기록',noEvents:'아직 활동이 없어요',
+ screenHint:'제어권을 가진 동안에만 입력이 화면에 전달돼요.',reconnecting:'다시 연결 중…',events:'활동 기록',noEvents:'아직 활동이 없어요',
  notConnected:'연결 안 됨',waitingHost:'Saycode 연결 대기 중',connected:'연결됨',until:'까지',unreadable:'권한을 읽을 수 없어요',loading:'불러오는 중',
  noTasksTitle:'지금 확인할 작업이 없어요',noTasks:'열린 작업이 없어요',others:function(n){return '다른 작업 '+n+'개'},live:'실시간 연결됨',retrying:'다시 시도 중',
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
@@ -606,8 +609,16 @@ function openScreen(){S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{p
  var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;window.__abpViewerFit=S.fit;window.__abpViewerControl=holding();
  // scale=1 only as a fallback for a client without the Runtime's hook: the hook reads the choice from __abpViewerFit.
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path)+(S.fit?'&scale=1':'');$('screenBox').hidden=false;$('screenEmpty').hidden=true
-},function(e){if(n!==S.screenSeq)return;S.screenOpen=false;var out=$('actionResult');out.className='err';out.textContent=e.message})}
+},function(e){if(n!==S.screenSeq)return;S.screenOpen=false;$('screenState').hidden=true;var out=$('actionResult');out.className='err';out.textContent=e.message})}
 $('openScreen').onclick=openScreen;
+/**
+ * A viewer that sent input is closed when control changes (4002: proves its input was consumed) and noVNC
+ * drops the screen: reconnect with a new ticket, saying so in the frame until the new viewer page loads.
+ */
+window.addEventListener('message',function(event){var d=event.data;
+ if(event.source!==$('screen').contentWindow||event.origin!==location.origin||!d||d.type!=='abp-viewer-closed'||d.code!==4002||!S.screenOpen)return;
+ $('screenState').hidden=false;openScreen()});
+$('screen').onload=function(){$('screenState').hidden=true};
 /**
  * Fit (whole screen scaled into the frame, aspect kept) or actual size (1:1, scrolled): noVNC's scaleViewport on the open
  * frame's RFB object, in place. The choice is also left on this window for the next frame (renewal reconnect). Never

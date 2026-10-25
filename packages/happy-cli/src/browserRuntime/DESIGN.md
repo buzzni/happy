@@ -240,12 +240,14 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
   inflating it in the Runtime (a 1x1 ZRLE rectangle can expand to 512 KiB). Cost: noVNC uses Hextile
   (more bandwidth over the tunnel).
 - `/viewer/` serves the pinned noVNC client (Runtime image copies Debian bookworm `novnc=1:1.3.0-1`,
-  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The Runtime adds two inline scripts to
+  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The Runtime adds three inline scripts to
   `vnc_lite.html` only: one before noVNC's module hands the page's RFB object to its same-origin console as
   `window.__abpRfb` (first assignment of `scaleViewport`, initial value from the console's
   `__abpViewerFit`; `viewOnly` from `__abpViewerControl` = the user holds the shown task's control, so
   without control a wheel over an actual-size screen pans the frame instead of being swallowed), one
-  last in `<head>` restores `?path=` a relay stripped. Fit / actual size in the
+  last in `<head>` restores `?path=` a relay stripped. The third reports each viewer WebSocket close code
+  to the same-origin console (`abp-viewer-closed`); on 4002 the console asks for a new ticket and reconnects
+  (noVNC drops the screen on close), showing "reconnecting" in the frame. Fit / actual size in the
   console is therefore noVNC's own `scaleViewport` switched in place (same frame, same ticket; the lease
   and capability are untouched); `resizeSession` is never set, so the display size never changes the
   remote resolution. Verified with the pinned 1.3.0 (class accessor) and Debian 1.0.0 (prototype accessor).

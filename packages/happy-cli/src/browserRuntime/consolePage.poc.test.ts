@@ -4,14 +4,16 @@
  * pasted id; renewal is requested before expiry and only a host answer
  * (window.parent, same origin) replaces the token.
  */
-import { existsSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { WebSocketServer } from 'ws'
 import { renderConsolePage } from './consolePage'
+import { VIEWER_ASSET_PREFIX, VIEWER_WEBSOCKET_PATH, serveViewerAsset } from './viewerProxy'
 import { HarnessCdp, eventually, findChrome, launchChrome, type LaunchedChrome } from './drivers/pocTestKit'
-import { serveViewerAsset } from './viewerProxy'
 
 const chromePath = findChrome()
 /**
@@ -35,6 +37,24 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     let chrome: LaunchedChrome
     let harness: HarnessCdp
     let server: http.Server
+    let viewer: WebSocketServer
+    /**
+     * Stands in for the pinned noVNC: it connects to the ticketed path in its address, takes the socket only if it
+     * passes noVNC 1.3.0's raw-channel check (core/websock.js attach() reads the props off the instance's own
+     * prototype), and then speaks first.
+     */
+    const viewerRoot = mkdtempSync(join(tmpdir(), 'abp-console-viewer-'))
+    writeFileSync(join(viewerRoot, 'vnc_lite.html'), '<!doctype html><html><head><title>noVNC</title></head><body><script type="module">'
+        + "const s = new WebSocket('ws://' + location.host + '/' + new URLSearchParams(location.search).get('path'));"
+        + 'const props = [...Object.keys(s), ...Object.getOwnPropertyNames(Object.getPrototypeOf(s))];'
+        + "if (['send', 'close', 'binaryType', 'onerror', 'onmessage', 'onopen', 'protocol', 'readyState'].every((p) => props.includes(p)))"
+        + " s.onopen = () => s.send('RFB 003.008\\n')</script></body></html>")
+    let useFixtureViewer = false
+    /** Viewer connections by ticket; the Runtime closes the one listed here with that code once it is open. */
+    const viewerTickets: string[] = []
+    /** Tickets whose viewer took the socket and spoke. */
+    const viewerHandshakes: string[] = []
+    const viewerCloses = new Map<string, number>()
     let origin = ''
     const port = () => (server.address() as AddressInfo).port
     const ops: Array<{ op: string; bearer: string; body: Record<string, unknown> }> = []
@@ -57,9 +77,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         server = http.createServer((req, res) => {
             const url = new URL(req.url ?? '/', 'http://localhost')
             if (url.pathname === '/console') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(renderConsolePage()); return }
-            if (url.pathname.startsWith('/viewer/')) {
-                // The real noVNC client, as the Runtime serves it; its WebSocket finds no upstream here and just disconnects.
-                serveViewerAsset(novncDir ?? '/nonexistent', url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
+            if (url.pathname.startsWith(VIEWER_ASSET_PREFIX)) {
+                // Keep the real noVNC client for the fit/input tests; close-code tests use the small socket fixture.
+                serveViewerAsset(useFixtureViewer ? viewerRoot : novncDir ?? '/nonexistent', url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
                 return
             }
             if (url.pathname === '/console-hosted') {
@@ -115,6 +135,14 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
                 }, delay)
             })
         })
+        viewer = new WebSocketServer({ server, path: VIEWER_WEBSOCKET_PATH })
+        viewer.on('connection', (socket, req) => {
+            const ticket = new URL(req.url ?? '/', 'http://localhost').searchParams.get('ticket') ?? ''
+            viewerTickets.push(ticket)
+            socket.once('message', () => viewerHandshakes.push(ticket))
+            const code = viewerCloses.get(ticket)
+            if (code) setTimeout(() => socket.close(code, 'control changed'), 100)
+        })
         await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
         origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
         chrome = await launchChrome()
@@ -124,7 +152,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     afterAll(async () => {
         harness?.close()
         await chrome?.stop()
+        viewer?.close()
         await new Promise<void>((resolve) => server?.close(() => resolve()))
+        rmSync(viewerRoot, { recursive: true, force: true })
     })
 
     it('uses the fragment capability, strips it, stores nothing, and lists tasks', async () => {
@@ -307,6 +337,52 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         // Also kept on the console window: a preview relay strips the frame's query (vnc_lite.html restores it from here).
         expect(await eventually(() => harness.evaluate(target, 'window.__abpViewerPath'), Boolean, 5_000)).toMatch(/^v1\/viewer\/websockify\?ticket=ticket-/)
         await harness.closeTarget(target)
+    }, 30_000)
+
+    it('reconnects the screen with a fresh ticket when the Runtime closes the viewer after control changed', async () => {
+        ops.length = 0
+        viewerTickets.length = 0
+        viewerHandshakes.length = 0
+        // Released after sending input: the Runtime closes that viewer (4002) to prove the input was drained.
+        useFixtureViewer = true
+        viewerCloses.set('ticket-1', 4002)
+        try {
+            const cap = token('screen-control', Date.now() + 600_000)
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+            await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+            await eventually(() => viewerTickets.includes('ticket-1'), Boolean, 10_000)
+            const second = await eventually(() => ops.filter((entry) => entry.op === 'viewerTicket')[1], Boolean, 10_000)
+            expect(second).toMatchObject({ bearer: cap, body: { profileId: 'profile-a' } })
+            // The gap before the new connection says so inside the frame.
+            expect(await harness.evaluate(target, `(() => { const s = document.getElementById('screenState'); return !!s && !s.hidden && s.textContent })()`))
+                .toBe('Reconnecting…')
+            await eventually(() => viewerTickets.includes('ticket-2'), Boolean, 10_000)
+            expect(await eventually(() => harness.evaluate(target, `document.getElementById('screenState').hidden`), Boolean, 5_000)).toBe(true)
+            // The new connection stays open: no further tickets.
+            await new Promise((resolve) => setTimeout(resolve, 1_000))
+            expect(ops.filter((entry) => entry.op === 'viewerTicket')).toHaveLength(2)
+            // The close report leaves noVNC a socket it accepts, on both connections.
+            expect(viewerHandshakes).toEqual(['ticket-1', 'ticket-2'])
+            await harness.closeTarget(target)
+        } finally { viewerCloses.clear(); useFixtureViewer = false }
+    }, 40_000)
+
+    it('does not reconnect the screen after another close (capability expired or revoked)', async () => {
+        ops.length = 0
+        viewerTickets.length = 0
+        useFixtureViewer = true
+        viewerCloses.set('ticket-1', 4001)
+        try {
+            const cap = token('screen-revoked', Date.now() + 600_000)
+            const target = await harness.openFrontTab(`${origin}/console#abp-cap=${cap}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 10_000)
+            await harness.evaluate(target, `document.getElementById('openScreen').click()`)
+            await eventually(() => viewerTickets.includes('ticket-1'), Boolean, 10_000)
+            await new Promise((resolve) => setTimeout(resolve, 1_500))
+            expect(ops.filter((entry) => entry.op === 'viewerTicket')).toHaveLength(1)
+            await harness.closeTarget(target)
+        } finally { viewerCloses.clear(); useFixtureViewer = false }
     }, 30_000)
 
     const withSession = async <T>(targetId: string, fn: (sessionId: string) => Promise<T>): Promise<T> => {

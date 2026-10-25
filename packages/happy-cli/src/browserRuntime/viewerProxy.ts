@@ -89,6 +89,17 @@ const VIEWER_PATH_RESTORE = "<script>(function(){try{if(location.search||window.
     + "if(typeof p==='string')history.replaceState(null,'',location.pathname+'?path='+encodeURIComponent(p))}catch(e){}})()</script>"
 
 /**
+ * Also in vnc_lite.html's <head>, so it runs before noVNC's module opens its connection:
+ * tells the console that framed the page (same origin only) how the viewer connection
+ * closed. noVNC drops the screen on close, and after a control change (4002) the console
+ * reconnects with a new ticket. The constructor is wrapped, not subclassed: noVNC 1.3.0
+ * rejects a socket whose own prototype does not carry the WebSocket members.
+ */
+const VIEWER_CLOSE_REPORT = "<script>(function(){try{var W=window.WebSocket;if(window.parent===window||!W)return;"
+    + "window.WebSocket=new Proxy(W,{construct:function(t,a,n){var s=Reflect.construct(t,a,n);s.addEventListener('close',function(e){"
+    + "try{window.parent.postMessage({type:'abp-viewer-closed',code:e.code},location.origin)}catch(x){}});return s}})}catch(e){}})()</script>"
+
+/**
  * Put before vnc_lite.html's own module script (module scripts run in document
  * order, so this sees the RFB class first). Fit / actual size is noVNC's own
  * `scaleViewport` (its input coordinates follow the scale; a CSS transform of
@@ -140,7 +151,7 @@ export async function serveViewerAsset(root: string, pathname: string, res: Serv
         const firstModule = html.indexOf('<script type="module"')
         if (firstModule >= 0) html = html.slice(0, firstModule) + VIEWER_FIT_HOOK + html.slice(firstModule)
         const end = html.indexOf('</head>')
-        if (end >= 0) html = html.slice(0, end) + VIEWER_PATH_RESTORE + html.slice(end)
+        if (end >= 0) html = html.slice(0, end) + VIEWER_PATH_RESTORE + VIEWER_CLOSE_REPORT + html.slice(end)
         body = html
     }
     res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff',
