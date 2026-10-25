@@ -1025,14 +1025,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                  *
                                  * Not for an isolated turn, which needs its own provider, nor
                                  * for a managed run, whose model and effort its plan binds,
-                                 * nor for a changed tool policy: tool lists are query options
-                                 * only, and the running provider would still allow what the
-                                 * message disallows.
+                                 * nor for a changed tool policy or plan mode: both reach the
+                                 * SDK only at launch, and the running provider would still
+                                 * allow what the message disallows.
                                  */
                                 const keepForBackgroundWork = !msg.isolate && !session.managedRun
                                     && (backgroundTasks?.tasks?.length ?? 0) > 0
                                     && isDeepStrictEqual(mode?.allowedTools, msg.mode.allowedTools)
-                                    && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools);
+                                    && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools)
+                                    && (mode?.permissionMode === 'plan') === (msg.mode.permissionMode === 'plan');
                                 if (!keepForBackgroundWork) {
                                     logger.debug('[remote]: mode has changed, pending message');
                                     pending = msg;

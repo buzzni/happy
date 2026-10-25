@@ -197,10 +197,63 @@ describe('Claude model changes across provider restarts', () => {
         expect(launches[1]).toMatchObject({ model: 'claude-fable-5-1', effort: 'high', systemPrompt: { append: expect.stringContaining('turn context B') } });
     }, 15_000);
 
-    it('never answers a changed tool policy on the provider that still runs the old one, background work or not', async () => {
+    it('tries a failed in-place model switch again on the next turn', async () => {
+        const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5', appendSystemPrompt: 'turn context A' };
+        const after: EnhancedMode = { ...before, model: 'claude-fable-5-1', appendSystemPrompt: 'turn context B' };
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const received: string[] = [];
+        const setModel = vi.fn(async () => {})
+            .mockRejectedValueOnce(new Error('control request failed'));
+        const client = {
+            sessionId: 'background-model-retry-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    received.push(String(message.message.content));
+                    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'ci-watch', task_type: 'local_bash', description: 'watch CI' }] };
+                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: `result-${received.length}` };
+                    if (received.length === 3) {
+                        void handlers.get('switch')!();
+                        return;
+                    }
+                    queue.push(`turn-${received.length}`, after);
+                }
+            })();
+            return Object.assign(response, {
+                mcpServerStatus: async () => [], setPermissionMode: async () => {},
+                setModel, applyFlagSettings: async () => {},
+            }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('turn-0', before);
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        await claudeRemoteLauncher(session);
+        // The failed switch still answers, and the next turn asks for the model again.
+        expect(received).toEqual(['turn-0', 'turn-1', 'turn-2']);
+        expect(setModel.mock.calls).toEqual([['claude-fable-5-1'], ['claude-fable-5-1']]);
+    });
+
+    it.each([
         // Tool lists are query options only; the running provider would still allow what the message disallows.
+        ['a changed tool policy', { disallowedTools: ['Write'] }],
+        // Plan mode reaches the SDK only at launch; the running provider would act outside it.
+        ['a switch to plan mode', { permissionMode: 'plan' }],
+    ] as const)('never answers %s on the provider that still runs the old one, background work or not', async (_change, override) => {
         const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
-        const narrowed: EnhancedMode = { ...before, disallowedTools: ['Write'] };
+        const narrowed: EnhancedMode = { ...before, ...override } as EnhancedMode;
         const queue = new MessageQueue2<EnhancedMode>(hashObject);
         const handlers = new Map<string, () => Promise<unknown>>();
         const received: string[] = [];
