@@ -765,10 +765,15 @@ export class PermissionHandler implements PolicyApprover {
         this.pendingRequests.delete(id);
         this.expiry.clear(id);
         this.resolved.record(id, 'answered');
-        // Answered here or in Desktop — either way the external button is dead now.
+        // Capture membership before withdrawing the channel button.
+        const accepted = this.session.client.recordPermissionInput?.(id, pending.toolName, message,
+            this.channelBindings.get(id)?.turnId);
         this.withdrawChannelBinding(id, 'answered');
-
         this.handlePermissionResponse(message, pending);
+        const forwardsText = message.approved
+            ? Boolean(message.updatedInput) && !['exit_plan_mode', 'ExitPlanMode'].includes(pending.toolName)
+            : Boolean(message.reason);
+        accepted?.(forwardsText ? 'accepted' : 'rejected');
 
         const completedAt = Date.now();
         this.session.client.updateAgentState((currentState) => {

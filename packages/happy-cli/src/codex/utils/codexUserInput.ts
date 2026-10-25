@@ -42,7 +42,7 @@ function questionsFromRequest(value: unknown): Question[] | null {
 export function installCodexUserInputBoundary(options: {
     client: CodexAppServerClient;
     permissionHandler: CodexPermissionHandler;
-    session: Pick<ApiSessionClient, 'sendSessionProtocolMessage'>;
+    session: Pick<ApiSessionClient, 'sendSessionProtocolMessage'> & Partial<Pick<ApiSessionClient, 'runtimeId'>>;
     protocolTurnId(nativeTurnId: string): string | undefined;
 }): void {
     const { client, permissionHandler } = options;
@@ -57,11 +57,15 @@ export function installCodexUserInputBoundary(options: {
             title: 'request_user_input', description: 'request_user_input', args: { questions },
         }, { turn }));
         const cancel = () => permissionHandler.cancelRequest(permissionId);
-        const pending = permissionHandler.handleToolCall(permissionId, 'request_user_input', { questions });
+        const pending = permissionHandler.handleToolCall(permissionId, 'request_user_input', { questions }, turn
+            ? { channelTurn: { turnId: turn, channelRequestId: null, runtimeId: options.session.runtimeId ?? '' } } : undefined);
         signal.addEventListener('abort', cancel, { once: true });
         if (signal.aborted) cancel();
+        let settleInputEvidence: ((state?: 'accepted' | 'rejected' | 'unknown') => void) | undefined;
+        let delivered = false;
         try {
             const result = await pending;
+            settleInputEvidence = result.settleInputEvidence;
             if (result.decision !== 'approved' || signal.aborted) return { answers: {} };
             const values = result.updatedInput?.answers;
             if (!record(values)) return { answers: {} };
@@ -76,10 +80,12 @@ export function installCodexUserInputBoundary(options: {
                 // One answer is one string, even when a free-text answer contains commas.
                 entries.push([question.answerKey, { answers: [answer] }]);
             }
+            delivered = true;
             return { answers: Object.fromEntries(entries) };
         } catch {
             return { answers: {} };
         } finally {
+            settleInputEvidence?.(delivered ? 'accepted' : 'rejected');
             signal.removeEventListener('abort', cancel);
             options.session.sendSessionProtocolMessage(createEnvelope('agent', { t: 'tool-call-end', call: permissionId }, { turn }));
         }

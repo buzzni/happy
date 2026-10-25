@@ -1,10 +1,11 @@
+import type { QueueInputEvidence } from '@/api/turnInputEvidence';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import type { PendingAttachment, QueueLatencyTrace } from '@/utils/MessageQueue2';
 import type { InputAttendance } from '@/api/turnAttendance';
 
 type CodexUserTextQueue<T> = {
-    push: (message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance) => void;
-    pushIsolateAndClear: (message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance) => string[] | void;
+    push: (message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance, evidence?: QueueInputEvidence) => void;
+    pushIsolateAndClear: (message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance, evidence?: QueueInputEvidence) => string[] | void;
 };
 
 export function isCodexClearText(text: string): boolean {
@@ -41,15 +42,18 @@ export function enqueueCodexUserText<T>(opts: {
     latencyTrace?: QueueLatencyTrace;
     /** Who sent it (codexcli-approval-session-binding R10a); decides whether its turn is unattended. */
     attendance?: InputAttendance;
+    evidence?: QueueInputEvidence;
 }): 'clear' | 'queued' {
     if (isCodexClearText(opts.text)) {
-        if (opts.attendance) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance);
+        if (opts.evidence) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance, opts.evidence);
+        else if (opts.attendance) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance);
         else if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);
         else opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments);
         return 'clear';
     }
 
-    if (opts.attendance) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace, opts.attendance);
+    if (opts.evidence) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace, opts.attendance, opts.evidence);
+    else if (opts.attendance) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace, opts.attendance);
     else if (opts.latencyTrace) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace);
     else opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds);
     return 'queued';

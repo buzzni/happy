@@ -171,6 +171,9 @@ describe('a managed startup', () => {
         const client = api.sessionSyncClient(startup!.attachment.session);
         try {
             expect(client.sessionId).toBe(SESSION_ID);
+            // Managed attachment returns the full session API used by both runners.
+            expect(client.configureInputQueue).toBeTypeOf('function');
+            expect(client.setInputSteerAvailable).toBeTypeOf('function');
             // A managed client refuses to exist on any other origin, so its
             // existence is the assertion that the two agree.
             expect(client.getManagedOrigin()).toBe(new URL(serverUrl).origin);

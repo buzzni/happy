@@ -97,6 +97,9 @@ let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', cod
 
 function sessionStub() {
     return {
+        configureInputQueue: vi.fn(), setInputSteerAvailable: vi.fn(), setPendingInputEvidence: vi.fn(),
+        queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
+        inputEvidence: { attempt: vi.fn(() => ({ settle: vi.fn() })), cancelContinuation: vi.fn(), continuePending: vi.fn(), takeContinuation: vi.fn() },
         sessionId: 'sess-1',
         runtimeId: 'runtime-test',
         awaitMessageAck: vi.fn(async () => ({ ok: true })),

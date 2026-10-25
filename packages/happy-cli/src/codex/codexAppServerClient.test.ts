@@ -349,6 +349,43 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(runtime['cua-driver']).toBe(org);
     });
 
+    it.each(['interrupt', 'preparation'])('T2RT-01 rechecks input after the %s await at the actual write', async boundary => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const writes: string[] = [];
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            if (message.method === 'turn/start') {
+                writes.push(message.method);
+                pushJsonLine(stdout, { id: message.id, result: { turn: { id: 'late' } } });
+                pushJsonLine(stdout, { method: 'turn/completed', params: { threadId: 'thread', turn: { id: 'late', status: 'completed' } } });
+            }
+        } }));
+        const client = new CodexAppServerClient();
+        try {
+            await client.connect(); (client as any)._threadId = 'thread';
+            let cancelled = false;
+            const beforeDispatch = vi.fn(() => { if (cancelled) throw new Error('input replaced'); });
+            const onDispatched = vi.fn();
+            if (boundary === 'interrupt') (client as any).pendingInterrupt = Promise.resolve().then(() => { cancelled = true; });
+            const options = { beforeDispatch, onDispatched, beforeTurn: async () => {
+                if (boundary === 'preparation') { await Promise.resolve(); cancelled = true; }
+            } };
+            await expect(client.sendTurnAndWait('stale retry', options)).rejects.toThrow('input replaced');
+            expect(beforeDispatch).toHaveBeenCalledOnce(); expect(onDispatched).not.toHaveBeenCalled(); expect(writes).toEqual([]);
+        } finally { await client.disconnect(); }
+    });
+    it('T2RT-05 observes the actual write even when turn/start fails before a start notification', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            if (message.method === 'turn/start') pushJsonLine(stdout, { id: message.id, error: { code: -32603, message: 'start failed' } });
+        } }));
+        const client = new CodexAppServerClient();
+        const onDispatched = vi.fn(); const onSubmitted = vi.fn();
+        try {
+            await client.connect(); (client as any)._threadId = 'thread';
+            await expect(client.sendTurnAndWait('REST input', { onDispatched, onSubmitted })).rejects.toThrow('start failed');
+            expect(onDispatched).toHaveBeenCalledOnce(); expect(onSubmitted).not.toHaveBeenCalled();
+        } finally { await client.disconnect(); }
+    });
     it('marks memory submission only after turn/start acceptance, preserving pending startup on preparation failure', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
         const client = new CodexAppServerClient();

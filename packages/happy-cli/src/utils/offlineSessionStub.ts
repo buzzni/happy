@@ -11,6 +11,8 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import type { ApiSessionClient } from '@/api/apiSession';
 
 /**
@@ -35,8 +37,18 @@ import type { ApiSessionClient } from '@/api/apiSession';
  */
 export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
     const stub = new EventEmitter();
+    const inputEvidence = new TurnInputEvidence(randomUUID(), () => {});
     return Object.assign(stub, {
         sessionId: `offline-${sessionTag}`,
+        // Offline input is unwitnessed: never advertise capability or publish a fabricated receipt.
+        inputEvidence,
+        configureInputQueue: () => {},
+        setInputMode: () => {},
+        setInputSteerAvailable: () => {},
+        setPendingInputEvidence: (batch: EvidenceBatch | null) => inputEvidence.setPending(batch),
+        startClaudeInputEvidence: () => {},
+        continueClaudeInputEvidence: () => {},
+        recordPermissionInput: () => () => {},
         sendCodexMessage: () => {},
         sendAgentMessage: () => {},
         sendClaudeSessionMessage: () => {},

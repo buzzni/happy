@@ -1,3 +1,5 @@
+import { HubInputGate, TurnInputEvidence, type QueueInputEvidence, type EvidenceBatch } from './turnInputEvidence';
+import type { MessageQueue2 } from '@/utils/MessageQueue2';
 import type { SetupTokenRotationState } from './types';
 import { logger } from '@/ui/logger'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
@@ -27,6 +29,8 @@ import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayM
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
+    startClaudeInputTurn,
+    observeClaudeBackgroundInput,
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
     mapClaudeStructuredOutput,
@@ -396,6 +400,91 @@ export class ApiSessionClient extends EventEmitter {
      * never checked. A session id cannot do this job: it survives the process.
      */
     readonly runtimeId: string = randomUUID();
+    readonly inputEvidence = new TurnInputEvidence(this.runtimeId, envelope => this.sendSessionProtocolMessage(envelope));
+    readonly inputGate: HubInputGate;
+    private inputEvidenceSupported = false;
+    private contactSteer = false;
+    private pendingClaudeEvidence = false;
+    private invalidateGuardedInputs: (() => void) | null = null;
+    private rejectedInputs = new Set<string>();
+    private acceptedInputs = new Set<string>();
+    private readonly inputToolTurns = new Map<string, string>();
+
+    configureInputQueue<T>(queue: MessageQueue2<T>, mode: 'local' | 'remote', evidence: boolean): void {
+        this.inputEvidenceSupported = evidence;
+        queue.setInputValidator(input => this.admitInput(input), input => { this.admitInput(input, true); });
+        this.invalidateGuardedInputs = () => queue.discardInvalid();
+        this.setInputMode(mode);
+    }
+    setInputMode(mode: 'remote' | 'local' | 'transitioning'): void {
+        this.inputGate.transition(mode);
+        this.invalidateGuardedInputs?.();
+        this.pendingMessages = this.pendingMessages.filter(message => this.admitInput(this.queueInput(message)));
+        const agentContact: NonNullable<Metadata['runtimeCapabilities']>['agentContact'] = {
+            v: 1, runtimeId: this.runtimeId, principal: this.managed ? 'managed' : 'account',
+            prompt: !this.managed && mode === 'remote', steer: !this.managed && mode === 'remote' && this.contactSteer,
+            inputEvidence: !this.managed && this.inputEvidenceSupported && mode === 'remote' ? 1 : null, guardedPrompt: 1,
+            mode, modeEpoch: this.inputGate.modeEpoch,
+        };
+        this.updateMetadata(meta => ({ ...meta, runtimeCapabilities: { ...meta.runtimeCapabilities, agentContact } }));
+    }
+    setInputSteerAvailable(available: boolean): void { this.contactSteer = available; this.setInputMode(this.inputGate.mode); }
+    queueInput(message: UserMessage): QueueInputEvidence {
+        return { ref: message.serverMessageId
+            ? { kind: 'rest', serverMessageId: message.serverMessageId, serverSeq: message.serverSeq ?? null }
+            : { kind: 'unidentified', runtimeInputId: randomUUID() },
+            ...(message.meta && Object.hasOwn(message.meta, 'hubPrompt') ? { guard: message.meta.hubPrompt ?? null } : {}) };
+    }
+    admitInput(input: QueueInputEvidence, publishAccepted = false): boolean {
+        if (input.continuation && !this.inputEvidence.isContinuationCurrent(input.continuation)) return false;
+        if (input.guard === undefined) return true;
+        const admission = this.inputGate.check(input);
+        if (!admission) return false;
+        if (admission.state === 'rejected') {
+            if (!this.rejectedInputs.has(admission.serverMessageId)) {
+                this.rejectedInputs.add(admission.serverMessageId);
+                if (this.rejectedInputs.size > 1024) this.rejectedInputs.delete(this.rejectedInputs.values().next().value!);
+                this.sendSessionProtocolMessage(createEnvelope('agent', admission));
+            }
+            return false;
+        }
+        if (publishAccepted && !this.acceptedInputs.has(admission.serverMessageId)) {
+            this.acceptedInputs.add(admission.serverMessageId);
+            if (this.acceptedInputs.size > 1024) this.acceptedInputs.delete(this.acceptedInputs.values().next().value!);
+            this.sendSessionProtocolMessage(createEnvelope('agent', admission));
+        }
+        return true;
+    }
+    setPendingInputEvidence(batch: EvidenceBatch | null): void { this.inputEvidence.setPending(batch); }
+    startClaudeInputEvidence(batch: EvidenceBatch): void {
+        this.inputEvidence.setPending(batch);
+        this.pendingClaudeEvidence = true;
+    }
+    private ensureClaudeInputEvidence(): void {
+        if (this.pendingClaudeEvidence) this.enqueueSessionProtocolEnvelopes(startClaudeInputTurn(this.claudeSessionProtocolState).envelopes, false);
+    }
+    continueClaudeInputEvidence(kind: Parameters<TurnInputEvidence['continuePending']>[0]): void {
+        this.ensureClaudeInputEvidence();
+        this.inputEvidence.continuePending(kind);
+    }
+    /** Tool membership, rather than the mutable current turn, binds a permission answer. */
+    recordPermissionInput(id: string, tool: string, response: unknown, turn?: string): (state?: 'accepted' | 'rejected' | 'unknown') => void {
+        if (!this.inputEvidenceSupported) return () => undefined;
+        const value = response as Record<string, unknown> | null;
+        const question = tool === 'AskUserQuestion' || tool === 'request_user_input';
+        const known = new Set(['id', 'approved', 'decision', 'updatedInput', 'reason', 'mode', 'allowTools', 'policyGrant', 'receivedAt', 'channelClaim']);
+        const owningTurn = turn ?? this.inputToolTurns.get(id) ?? null;
+        if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !known.has(key))
+            || ('updatedInput' in value && (typeof value.updatedInput !== 'object' || value.updatedInput === null || Array.isArray(value.updatedInput)))
+            || ('reason' in value && typeof value.reason !== 'string')) {
+            const affectedTurn = owningTurn ?? this.inputEvidence.currentTurn();
+            if (affectedTurn) this.inputEvidence.incomplete('unknown-permission-shape', affectedTurn);
+        }
+        const textual = value && (Object.hasOwn(value, 'updatedInput') || (typeof value.reason === 'string' && value.reason.length > 0));
+        if (!question && !textual) return () => undefined;
+        const attempt = this.inputEvidence.attempt(question ? 'question-answer' : 'permission-text', turn ?? this.inputToolTurns.get(id) ?? null);
+        return (state = 'accepted') => attempt.settle(state);
+    }
     /** Permission prompts waiting for their tool call's turn to be mapped. */
     private readonly pendingChannelPermissionBinds = new Map<string, (context: {
         turnId: string; channelRequestId: string | null; runtimeId: string;
@@ -464,6 +553,8 @@ export class ApiSessionClient extends EventEmitter {
     private skipExistingMessagesThroughSeq: number | null = null;
     private skippedInitialMessageSeqs = new Set<number>();
     private claudeSessionProtocolState: ClaudeSessionProtocolState = {
+        onBackgroundInputLaunch: (id, turn) => this.inputEvidence.rememberBackground(id, turn),
+        onBackgroundInputRearm: (ids, reasons, nextTurn) => this.inputEvidence.rearmBackground(ids, reasons, nextTurn),
         currentTurnId: null,
         uuidToProviderSubagent: new Map<string, string>(),
         taskPromptToSubagents: new Map<string, string[]>(),
@@ -585,6 +676,7 @@ export class ApiSessionClient extends EventEmitter {
         // configured for.
         this.managed = managed ? { serverOrigin: assertManagedServerOrigin(managed) } : null;
         this.sessionId = session.id;
+        this.inputGate = new HubInputGate(session.id, this.runtimeId, Boolean(this.managed));
         this.metadata = session.metadata;
         this.metadataVersion = session.metadataVersion;
         this.agentState = session.agentState;
@@ -734,7 +826,7 @@ export class ApiSessionClient extends EventEmitter {
                             : 'unknown',
                     });
                     const messageId = data.body.message.id;
-                    this.deliverInput(() => this.routeIncomingMessage(body, messageId));
+                    this.deliverInput(() => this.routeIncomingMessage(body, messageId, messageSeq));
                     this.lastSeq = Math.max(this.lastSeq, messageSeq);
                 } else if (data.body.t === 'update-session') {
                     if (data.body.metadata && data.body.metadata.version > this.metadataVersion) {
@@ -829,7 +921,10 @@ export class ApiSessionClient extends EventEmitter {
     onUserMessage(callback: (data: UserMessage) => void) {
         this.pendingMessageCallback = callback;
         while (this.shutdownReceiveSeq === null && this.pendingMessages.length > 0) {
-            this.deliverInput(() => callback(this.pendingMessages.shift()!));
+            this.deliverInput(() => {
+                const message = this.pendingMessages.shift()!;
+                if (this.admitInput(this.queueInput(message))) callback(message);
+            });
         }
     }
 
@@ -1025,12 +1120,14 @@ export class ApiSessionClient extends EventEmitter {
         };
     }
 
-    private routeIncomingMessage(message: unknown, serverMessageId?: string) {
+    private routeIncomingMessage(message: unknown, serverMessageId?: string, serverSeq?: number) {
         const userResult = UserMessageSchema.safeParse(message);
         if (userResult.success) {
             const incoming: UserMessage = serverMessageId
-                ? { ...userResult.data, serverMessageId }
+                ? { ...userResult.data, serverMessageId, serverSeq }
                 : userResult.data;
+            if (!this.admitInput(this.queueInput(incoming))) return;
+            this.inputEvidence.cancelContinuation('replaced');
             const automationRunId = incoming.meta?.sentFrom === 'automation' ? automationRunIdFromLocalKey(incoming.localKey) : null;
             const userMessage = automationRunId
                 ? { ...incoming, content: { ...incoming.content, text: buildScheduledRunPrompt(incoming.content.text) } }
@@ -1132,7 +1229,7 @@ export class ApiSessionClient extends EventEmitter {
 
                 try {
                     const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
-                    this.deliverInput(() => this.routeIncomingMessage(body, message.id));
+                    this.deliverInput(() => this.routeIncomingMessage(body, message.id, message.seq));
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
                         sessionId: this.sessionId,
@@ -1634,7 +1731,7 @@ export class ApiSessionClient extends EventEmitter {
     sendFinalAnswerForChannelTurn(text: string): void {
         // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
-        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
+        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text, true);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
     }
 
@@ -1700,14 +1797,20 @@ export class ApiSessionClient extends EventEmitter {
         this.applyClaudeSessionMessageSideEffects(body);
     }
 
+    observeClaudeBackgroundInput(message: RawJSONLines): void {
+        observeClaudeBackgroundInput(message, this.claudeSessionProtocolState);
+    }
+
     /** A launch that died before its first message: fail its turn, opening one if none is open. */
     failClaudeLaunchTurn() {
+        this.ensureClaudeInputEvidence();
         const mapped = failClaudeLaunchTurn(this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
     closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
+        this.ensureClaudeInputEvidence();
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
@@ -1741,6 +1844,7 @@ export class ApiSessionClient extends EventEmitter {
             { turn: turnId },
         ));
 
+        this.claudeSessionProtocolState.backgroundCompletions?.endTurn(turnId);
         this.claudeSessionProtocolState.currentTurnId = null;
         // Cleared for the same reason the mapper clears them: an id left behind here would be
         // stamped onto whatever turn opens next, which answers the wrong request.
@@ -1764,6 +1868,12 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true, localId?: string) {
+        if (this.inputEvidenceSupported) envelope = this.inputEvidence.stamp(envelope);
+        if (envelope.role === 'agent' && !envelope.subagent && envelope.ev.t === 'turn-start') this.pendingClaudeEvidence = false;
+        if (envelope.role === 'agent' && !envelope.subagent && envelope.turn && envelope.ev.t === 'tool-call-start') {
+            this.inputToolTurns.set(envelope.ev.call, envelope.turn);
+            while (this.inputToolTurns.size > 512) this.inputToolTurns.delete(this.inputToolTurns.keys().next().value!);
+        }
         this.applySessionProtocolRuntimeSideEffects(envelope);
 
         const content = {
@@ -1779,7 +1889,13 @@ export class ApiSessionClient extends EventEmitter {
 
     private applySessionProtocolRuntimeSideEffects(envelope: SessionEnvelope) {
         const settledAutomationTurn = this.automationTurns.observe(envelope);
-        if (settledAutomationTurn?.status === 'failed') {
+        if (envelope.ev.t === 'turn-input-evidence' && envelope.ev.inputEvidence.terminal
+            && ['cancelled', 'replaced'].includes(envelope.ev.inputEvidence.continuation.state)) {
+            for (const result of this.automationTurns.retryAbandoned()) this.reportAutomationTurn(result);
+        }
+        if (settledAutomationTurn && envelope.ev.t === 'turn-end' && envelope.ev.inputEvidence?.continuation.state === 'pending') {
+            this.automationTurns.carry(settledAutomationTurn);
+        } else if (settledAutomationTurn?.status === 'failed') {
             // The launcher decides on a retry right after it closes the turn; ask once it has.
             setTimeout(() => {
                 if (this.transientRetryPending) this.automationTurns.carry(settledAutomationTurn);

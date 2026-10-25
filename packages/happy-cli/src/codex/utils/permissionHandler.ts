@@ -252,7 +252,8 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
                 resolve,
                 reject,
                 toolName,
-                input
+                input,
+                evidenceTurnId: context?.channelTurn?.turnId,
             });
 
             // Update agent state with pending request

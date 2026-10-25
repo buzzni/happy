@@ -889,6 +889,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         disallowedTools: mode.disallowedTools,
         effort: mode.effort,
     }));
+    session.configureInputQueue(messageQueue, options.startingMode === 'remote' ? 'remote' : 'local', true);
     if (launchControl) {
         // Only the launch-bound local channel can drain this runtime; never a session RPC.
         const gate = new RuntimeProducerGate({
@@ -1427,7 +1428,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             // Whatever this flushed will never run, so its routing decisions are
             // dead. The floor never moved for them — they were only ever pending.
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source)),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source), session.queueInput(message)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /compact command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1445,7 +1446,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             difficultyRoutingCommitter.requestEpoch();
             deferredContinuation.prepare(message.content.text);
             difficultyRoutingCommitter.discardPending(
-                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source)),
+                messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, currentEnhancedMode(), attachmentsForThisMessage, undefined, inputAttendanceFromMeta(message.meta, session.getMetadata()?.source), session.queueInput(message)),
                 'superseded',
             );
             logger.debugLargeJson('[start] /clear command pushed to queue:', safeUserMessageDebugPayload(message));
@@ -1660,6 +1661,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                     : localDecision ? [localDecision.clientRequestId] : undefined,
                 latencyTrace,
                 inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
+                session.queueInput(message),
             );
             deferredTurn?.commit();
             if (routed) {

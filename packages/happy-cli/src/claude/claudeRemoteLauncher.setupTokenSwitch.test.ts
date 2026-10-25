@@ -1,3 +1,8 @@
+import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
+import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapClaudeChannelFinalAnswer,
+    startClaudeInputTurn, failClaudeLaunchTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
+import type { SessionEnvelope, SessionTurnEndStatus, InputEvidenceV1 } from '@slopus/happy-wire';
+import type { RawJSONLines } from './types';
 import { formatSetupTokenBinding } from '@/daemon/sessionEnv';
 import { readPersonalClaudeCredential } from './personalClaudeCredential';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -42,6 +47,35 @@ const assistant = (id: string) => ({ type: 'assistant', uuid: `uuid-${id}`, sess
     message: { id, role: 'assistant', model: 'claude-sonnet-5', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 1, output_tokens: 1 } } });
 const refused = { type: 'rate_limit_event', uuid: 'rl-1', session_id: 'claude-1',
     rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: Math.floor(Date.now() / 1000) + 3600 } };
+
+function attachInputEvidence(client: {
+    sendClaudeSessionMessage: ReturnType<typeof vi.fn>; setPendingTurnRequestId: ReturnType<typeof vi.fn>;
+    sendFinalAnswerForChannelTurn: ReturnType<typeof vi.fn>; closeClaudeSessionTurn: ReturnType<typeof vi.fn>;
+    failClaudeLaunchTurn?: ReturnType<typeof vi.fn>;
+}) {
+    const events: SessionEnvelope[] = [];
+    const tracker = new TurnInputEvidence('host', event => events.push(event));
+    const state: ClaudeSessionProtocolState = { currentTurnId: null };
+    let pending = false;
+    const accept = (envelopes: SessionEnvelope[]) => {
+        for (const envelope of envelopes) {
+            if (envelope.ev.t === 'turn-start') pending = false;
+            events.push(tracker.stamp(envelope));
+        }
+    };
+    const ensure = () => { if (pending) accept(startClaudeInputTurn(state).envelopes); };
+    Object.assign(client, {
+        inputEvidence: tracker,
+        startClaudeInputEvidence: (batch: EvidenceBatch) => { tracker.setPending(batch); pending = true; },
+        continueClaudeInputEvidence: (kind: InputEvidenceV1['continuation']['kind']) => { ensure(); tracker.continuePending(kind); },
+    });
+    client.setPendingTurnRequestId.mockImplementation((id: string | null) => { state.pendingRequestId = id; });
+    client.sendClaudeSessionMessage.mockImplementation((body: RawJSONLines) => accept(mapClaudeLogMessageToSessionEnvelopes(body, state).envelopes));
+    client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => accept(mapClaudeChannelFinalAnswer(state, text, true).envelopes));
+    client.closeClaudeSessionTurn.mockImplementation((status: SessionTurnEndStatus) => { ensure(); accept(closeClaudeTurnWithStatus(state, status).envelopes); });
+    client.failClaudeLaunchTurn?.mockImplementation(() => { ensure(); accept(failClaudeLaunchTurn(state).envelopes); });
+    return { events, tracker };
+}
 
 describe('setup-token account switch in the remote launcher (Saycode specs/claude-setup-token-account-selection)', () => {
     // Saycode specs/managed-account-session-continuation — the daemon moved this conversation at resume.
@@ -174,6 +208,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
                 applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
+            const witness = attachInputEvidence(client);
             const generations: Array<{ token?: string; resume?: string; prompts: string[] }> = [];
             vi.mocked(query).mockImplementation(({ prompt, options }) => {
                 const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[] };
@@ -196,7 +231,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 })();
                 return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
             });
-            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' }, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
             const session: Record<string, unknown> = {
                 lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
                 cancelLessonReview: vi.fn(),
@@ -210,6 +246,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
             expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
+            const ends = witness.events.filter(event => event.ev.t === 'turn-end');
+            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
+                continuation: { kind: 'claude-account-switch', state: 'pending' } } });
+            expect(ends.at(-1)?.ev).toMatchObject({ inputEvidence: { inputCount: 1,
+                inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
+                terminal: true, continuation: { kind: 'claude-account-switch', state: 'completed' } } });
             const running = `shared-machine:${SHARED_A}`;
             expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
             expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
@@ -377,6 +419,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
                 applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
+            const witness = attachInputEvidence(client);
             const generations: Array<{ token?: string; prompts: string[] }> = [];
             vi.mocked(query).mockImplementation(({ prompt, options }) => {
                 const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, prompts: [] as string[] };
@@ -399,7 +442,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 })();
                 return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
             });
-            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' }, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
             const session: Record<string, unknown> = {
                 lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
                 cancelLessonReview: vi.fn(),
@@ -413,6 +457,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations).toHaveLength(1);
             if (action === 'stop') {
                 await handlers.get('abort')!();
+                expect(witness.tracker.snapshot()).toMatchObject({ terminal: true, continuation: { state: 'cancelled' } });
                 const notices = client.sendSessionEvent.mock.calls.filter(([event]) => 'setupTokenRotation' in event).length;
                 await vi.advanceTimersByTimeAsync(5 * 60000);
                 expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
@@ -428,6 +473,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
+            const ends = witness.events.filter(event => event.ev.t === 'turn-end');
+            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
+                continuation: { kind: 'claude-account-switch', state: 'pending' } } });
+            expect(ends.at(-1)?.ev).toMatchObject({ inputEvidence: { inputCount: 1,
+                inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
+                terminal: true, continuation: { kind: 'claude-account-switch', state: 'completed' } } });
             expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
         } finally {
             vi.useRealTimers();
@@ -513,11 +564,15 @@ function pinnedSdkControls() {
     };
 }
 
-it.each(['automatic', 'organization-only', 'authentication'])('keeps one conversation through organization, approved personal continuation and verified organization return (%s)', async (returnMode) => {
+it.each(['automatic', 'organization-only', 'authentication', 'consent-during-rebind'].flatMap(returnMode => [false, true].map(witnessed => ({ returnMode, witnessed }))))('keeps one conversation through organization, approved personal continuation and verified organization return ($returnMode, evidence=$witnessed)', async ({ returnMode, witnessed }) => {
     const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
     process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
     let available = false;
-    vi.mocked(requestSetupTokenRebind).mockResolvedValue({ok:false,reason:'NO_ACCOUNT'});
+    let finishRebind: (() => void) | undefined;
+    vi.mocked(requestSetupTokenRebind).mockImplementation(async () => {
+        if (returnMode !== 'consent-during-rebind') return { ok: false, reason: 'NO_ACCOUNT' };
+        return new Promise(resolve => { finishRebind = () => resolve({ ok: false, reason: 'NO_ACCOUNT' }); });
+    });
     vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id,_binding,consent) => ({allLimited:!available && returnMode!=='authentication',availableAccountIds:available?['org-account']:[],consentApproved:!!consent,...(!available && returnMode==='authentication'?{fallbackReason:'organization-authentication' as const}:{})}));
     vi.mocked(returnFromPersonalClaude).mockResolvedValue({ok:true,environment:{CLAUDE_CODE_OAUTH_TOKEN:'fixture-org-return',HAPPY_AI_AUTH_SETUP_TOKEN_BINDING:original,HAPPY_AI_AUTH_SOURCE:'org-bundle'}});
     vi.mocked(readPersonalClaudeCredential).mockResolvedValue({accountRef:'a'.repeat(64),label:'pe…@example.test',accessToken:'fixture-personal',expiresAt:Date.now()+600000});
@@ -526,6 +581,7 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
         updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
         sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
         applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn() };
+    const evidence = witnessed ? attachInputEvidence(client) : null;
     const generations: Array<{token:string|undefined,resume:string|undefined,settingSources?:string[],prompts:string[]}> = [];
     vi.mocked(query).mockImplementation(({prompt,options}) => {
         const generation = {token:process.env.CLAUDE_CODE_OAUTH_TOKEN,resume:options?.resume,settingSources:options?.settingSources,prompts:[] as string[]};generations.push(generation);
@@ -537,8 +593,10 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
                 if(nth===1) {
                     if(returnMode==='authentication') yield {...assistant('auth-refused'),error:'authentication_failed'}; else yield refused;
                     setTimeout(() => { void (async () => {
+                        if (returnMode === 'consent-during-rebind') await vi.waitFor(() => expect(finishRebind).toBeTypeOf('function'));
                         const offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer;
                         await handlers.get('personal-claude-fallback')!({action:'accept',accountRef:offer.accountRef,nonce:offer.nonce,consentProof:'fixture-proof'});
+                        finishRebind?.();
                     })(); }, 0);
                     yield {type:'result',subtype:'error_during_execution',is_error:true,errors:[returnMode==='authentication'?'API Error: 401 token expired':'usage limit'],uuid:'refused-personal'};
                 } else {
@@ -558,10 +616,19 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
             }
         })(),{...pinnedSdkControls(),mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
     });
-    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
+    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'}, undefined, undefined, undefined, undefined,
+        { ref: { kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 } });
     const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
         api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),onThinkingChange:vi.fn(),onAbort:vi.fn()};
     await claudeRemoteLauncher(session as unknown as Session);
+    if (evidence) {
+        const starts = evidence.events.filter(event => event.ev.t === 'turn-start');
+        const original = (starts[0].ev as { inputEvidence: InputEvidenceV1 }).inputEvidence;
+        expect(starts[1].ev).toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId,
+            inputs: [{ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 }],
+            continuation: { kind: 'claude-account-switch', state: 'running' } } });
+        expect(starts[2].ev).not.toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId } });
+    }
     expect(generations.map(g=>g.resume)).toEqual(['claude-1','claude-1','claude-1']);
     expect(generations.map(g=>g.token)).toEqual(['sk-ant-oat01-first','fixture-personal','fixture-org-return']);
     expect(generations.map(g=>g.prompts.length)).toEqual([1,1,1]);
@@ -572,7 +639,7 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
     expect(client.setPersonalClaudeFallback.mock.calls.filter(([v])=>v!==undefined).map(([v])=>v.personal?.accountRef??null)).toEqual([null,'a'.repeat(64),null]);
 });
 
-it.each(['authority', 'channel', 'pending-authority', 'pending-recovery'] as const)('reports refused personal input with its request identity (%s)', async kind => {
+it.each((['authority', 'channel', 'pending-authority', 'pending-recovery'] as const).flatMap(kind => [false, true].map(witnessed => ({ kind, witnessed }))))('reports refused personal input with its request identity ($kind, evidence=$witnessed)', async ({ kind, witnessed }) => {
     const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
     process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
     let recheckFails = false, recovered = false;
@@ -588,6 +655,7 @@ it.each(['authority', 'channel', 'pending-authority', 'pending-recovery'] as con
         updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
         sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
         applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn(),failClaudeLaunchTurn:vi.fn() };
+    const evidence = witnessed ? attachInputEvidence(client) : null;
     const generations: Array<{token:string|undefined,prompts:string[];sources:unknown}> = [];
     vi.mocked(query).mockImplementation(({prompt,options}) => {
         const generation = {token:process.env.CLAUDE_CODE_OAUTH_TOKEN,prompts:[] as string[],sources:options?.settingSources};generations.push(generation);
@@ -621,11 +689,19 @@ it.each(['authority', 'channel', 'pending-authority', 'pending-recovery'] as con
             if(nth>1 && kind!=='pending-recovery') setTimeout(()=>{void handlers.get('switch')!();},20);
         })(),{...pinnedSdkControls(),mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
     });
-    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
+    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'}, undefined, undefined, undefined, undefined,
+        { ref: { kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 } });
     const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
         api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),onThinkingChange:vi.fn(),onAbort:vi.fn()};
     await claudeRemoteLauncher(session as unknown as Session);
     expect(generations.map(g=>g.token)).toEqual(kind==='pending-recovery'?['sk-ant-oat01-first','fixture-personal','fixture-org-return']:['sk-ant-oat01-first','fixture-personal']);
+    if (evidence) {
+        const starts = evidence.events.filter(event => event.ev.t === 'turn-start');
+        const original = (starts[0].ev as { inputEvidence: InputEvidenceV1 }).inputEvidence;
+        expect(starts[1].ev).toMatchObject({ inputEvidence: { rootBatchId: original.rootBatchId,
+            inputs: [{ kind: 'rest', serverMessageId: 'refused-input', serverSeq: 1 }],
+            continuation: { kind: 'claude-account-switch', state: 'running' } } });
+    }
     if(kind==='pending-recovery') {expect(generations[2].prompts).toHaveLength(1);expect(generations[2].sources).not.toEqual([]);}
     expect(generations[1].prompts).toHaveLength(1);
     expect(queue.size()).toBe(0);

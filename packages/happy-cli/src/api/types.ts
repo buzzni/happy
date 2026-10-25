@@ -389,6 +389,8 @@ export type Machine = {
  * Message metadata schema
  */
 export const MessageMetaSchema = z.object({
+  // Retain malformed/unknown versions for explicit rejection; never strip into ordinary input.
+  hubPrompt: z.unknown().optional(),
   sentFrom: z.string().optional(), // Source identifier
   // aplus-dev-studio specs/codexcli-approval-session-binding R10a — who sent this turn. Declared so
   // the strip-unknown parse keeps them for `inputAttendanceFromMeta`; `.catch` because a malformed
@@ -487,6 +489,7 @@ export const UserMessageSchema = z.object({
 // encrypted client payload cannot choose or spoof this value.
 export type UserMessage = z.infer<typeof UserMessageSchema> & {
   serverMessageId?: string
+  serverSeq?: number
 }
 
 /**
@@ -554,6 +557,8 @@ export type Metadata = {
   version?: string,
   setupTokenRotation?: { version: 1; principalType: 'machine'; bindingVersion: 0 | 2 },
   runtimeCapabilities?: {
+    agentContact?: { v: 1; runtimeId: string; principal: 'account' | 'managed'; prompt: boolean; steer: boolean;
+      inputEvidence: 1 | null; guardedPrompt: 1 | null; mode: 'remote' | 'local' | 'transitioning'; modeEpoch: number },
     saycodeSystemPromptPreference?: boolean,
     /**
      * aplus-dev-studio specs/codexcli-approval-session-binding R15 — this runtime records every

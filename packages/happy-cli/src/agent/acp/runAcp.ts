@@ -540,6 +540,7 @@ export async function runAcp(opts: {
     ...(launchControl ? { sessionOptions: { trackShutdownStorage: true } } : {}),
     onSessionSwap: (newSession) => {
       session = newSession;
+      newSession.configureInputQueue(messageQueue, 'remote', false);
       if (permissionHandler) {
         permissionHandler.updateSession(newSession);
       }
@@ -577,6 +578,7 @@ export async function runAcp(opts: {
   permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
   const sessionManager = new AcpSessionManager();
   const messageQueue = new MessageQueue2<AcpSwitchMode>((mode) => hashObject(mode));
+  session.configureInputQueue(messageQueue, 'remote', false);
   let currentPermissionMode: string | undefined;
   let currentModel: string | null | undefined;
   let modeSelector: AcpConfigSelector | null = null;
@@ -1007,7 +1009,7 @@ export async function runAcp(opts: {
       messageQueue.push(deferredTurn?.text ?? message.content.text, {
         permissionMode: currentPermissionMode,
         model: currentModel,
-      }, undefined, undefined, undefined, attendance);
+      }, undefined, undefined, undefined, attendance, session.queueInput(message));
       deferredTurn?.commit();
     } catch (error) {
       deferredTurn?.rollback();

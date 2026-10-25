@@ -1,3 +1,5 @@
+import { logger } from '@/ui/logger';
+import { BACKGROUND_HISTORY_LIMIT, BackgroundCompletionTracker } from './backgroundCompletionTracker';
 import { createId } from '@paralleldrive/cuid2';
 import type { RawJSONLines } from '@/claude/types';
 import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
@@ -13,6 +15,16 @@ import {
 import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
 import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
+
+type BackgroundEvidenceLaunch = {
+    taskId: string;
+    toolUseId?: string;
+    runId?: string;
+    subagent?: string;
+    turnId?: string;
+    /** Null is a witnessed non-channel launch; undefined means its owner was not observed. */
+    requestId: string | null | undefined;
+};
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
@@ -35,6 +47,11 @@ export type ClaudeSessionProtocolState = {
     currentRequestId?: string | null;
     /** Background task id/tool call id → the channel request that launched it. */
     backgroundTaskRequestIds?: Map<string, string>;
+    /** Evidence-only proof state. Never read by channel routing. */
+    backgroundEvidenceLaunches?: Map<string, BackgroundEvidenceLaunch>;
+    backgroundCompletions?: BackgroundCompletionTracker;
+    onBackgroundInputLaunch?: (id: string, turnId: string) => void;
+    onBackgroundInputRearm?: (ids: string[], incompleteReasons?: string[], nextTurn?: boolean) => void;
     uuidToProviderSubagent?: Map<string, string>;
     taskPromptToSubagents?: Map<string, string[]>;
     providerSubagentToSessionSubagent?: Map<string, string>;
@@ -160,6 +177,125 @@ function rearmBackgroundTaskRequest(state: ClaudeSessionProtocolState, ids: { ta
     if (!state.currentTurnId && !state.pendingRequestId) state.pendingRequestId = requestId;
     if (ids.taskId) requests?.delete(ids.taskId);
     if (ids.toolUseId) requests?.delete(ids.toolUseId);
+}
+
+function extractEvidenceNotificationIds(content: string | null): { taskId?: string; toolUseId?: string; status?: string; recognized: boolean } {
+    const text = content?.trim() ?? '';
+    const tasks = [...text.matchAll(/<task-id>\s*([^<\s]+)\s*<\/task-id>/g)];
+    const tools = [...text.matchAll(/<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/g)];
+    const statuses = [...text.matchAll(/<status>\s*([^<\s]+)\s*<\/status>/g)];
+    return {
+        taskId: tasks[0]?.[1], toolUseId: tools[0]?.[1], status: statuses[0]?.[1],
+        recognized: text.startsWith('<task-notification>') && text.endsWith('</task-notification>')
+            && text.indexOf('<task-notification>', 1) === -1 && tasks.length <= 1 && tools.length <= 1 && statuses.length === 1
+            && (text.match(/<\/?(?:task-id|tool-use-id|status)\b[^>]*>/g)?.length ?? 0) === 2 * (tasks.length + tools.length + statuses.length),
+    };
+}
+
+/** Observe consumption proof without changing routing or turn lifecycle. */
+function observeBackgroundCompletion(
+    state: ClaudeSessionProtocolState, message: RawJSONLines, text: string | null,
+    subagent: string | undefined,
+): void {
+    const nextTurn = message.type === 'user' && (message as { origin?: { kind?: string } }).origin?.kind === 'task-notification'
+        && (message as { happyTaskNotification?: boolean }).happyTaskNotification !== true;
+    const raw = message as { task_id?: unknown; tool_use_id?: unknown; status?: unknown; run_id?: unknown; origin?: { runId?: unknown } };
+    const ids = message.type === 'system' ? {
+        taskId: typeof raw.task_id === 'string' && raw.task_id ? raw.task_id : undefined,
+        toolUseId: typeof raw.tool_use_id === 'string' && raw.tool_use_id ? raw.tool_use_id : undefined,
+        status: raw.status, recognized: true,
+    } : extractEvidenceNotificationIds(text);
+    const status = ids.recognized && typeof ids.status === 'string'
+        && /^(completed|failed|stopped|cancelled|killed)$/.test(ids.status)
+        ? ids.status === 'cancelled' || ids.status === 'killed' ? 'stopped' : ids.status : undefined;
+    const rawRun = message.type === 'system' ? raw.run_id : raw.origin?.runId;
+    const run = typeof rawRun === 'string' && rawRun ? rawRun : null;
+    const tracker = state.backgroundCompletions ??= new BackgroundCompletionTracker();
+    const { decision, unique } = tracker.completion({ taskId: ids.taskId, toolUseId: ids.toolUseId }, run, status, state.currentTurnId, subagent);
+    // Irreversible for this runtime. Check after observation too: it may cause the first loss.
+    // Neither a retained exact run nor replayed starts can restore evidence proof.
+    if (tracker.historyLost) {
+        state.onBackgroundInputRearm?.([], ['background-consumption-unproven'], nextTurn);
+        logUnprovenBackgroundEvidence(ids, run, 'history-lost');
+        return;
+    }
+    const launch = findBackgroundEvidenceLaunch(state, ids, subagent);
+    const conflict = launch && ((run && launch.runId && run !== launch.runId)
+        || (ids.toolUseId && launch.toolUseId && ids.toolUseId !== launch.toolUseId));
+    // The producer guarantees run identity per task, not across recycled task/tool aliases.
+    const sameRun = run && run === launch?.runId && ids.taskId && ids.taskId === launch?.taskId;
+    const requestId = launch?.requestId;
+    const busy = requestId && (state.currentTurnId ? state.currentRequestId !== requestId
+        : state.pendingRequestId && state.pendingRequestId !== requestId);
+    // Default deny. Neither parsing failure nor a fresh alias/ledger key proves uniqueness.
+    // This predicate controls evidence only; routing uses main's independent request map.
+    const proven = !!(status && launch && requestId !== undefined && !conflict && !busy && (sameRun || unique));
+    // Proven duplicate observations remain harmless to a running follow-up (T2RT-07).
+    if (decision === 'duplicate' && (!launch || sameRun) && !conflict) {
+        if (nextTurn) state.onBackgroundInputRearm?.([], ['background-consumption-unproven'], true);
+        return;
+    }
+    if (!proven) {
+        state.onBackgroundInputRearm?.([], ['background-consumption-unproven'], nextTurn);
+        logUnprovenBackgroundEvidence(ids, run, busy ? 'another-request-active' : 'launch-identity-unproven');
+        return;
+    }
+    // A receipt on the SDK stream proves observation, not provider consumption.
+    const reasons = message.type === 'system' ? ['background-consumption-unproven']
+        : decision === 'uncertain' ? ['background-completion-uncertain'] : [];
+    state.onBackgroundInputRearm?.([launch?.taskId ?? ids.taskId, launch?.toolUseId ?? ids.toolUseId]
+        .filter((id): id is string => Boolean(id)), reasons, nextTurn);
+    // Consume only evidence mappings; main's request map is managed separately.
+    if (launch && message.type !== 'system') state.backgroundEvidenceLaunches?.delete(JSON.stringify([launch.subagent ?? null, launch.taskId]));
+}
+
+function logUnprovenBackgroundEvidence(ids: { taskId?: string; toolUseId?: string }, run: string | null, reason: string): void {
+    logger.debug('[claude] Background consumption not proven', {
+        reason, taskId: ids.taskId?.slice(0, 128), toolUseId: ids.toolUseId?.slice(0, 128), runId: run?.slice(0, 128),
+    });
+}
+
+function findBackgroundEvidenceLaunch(
+    state: ClaudeSessionProtocolState, ids: { taskId?: string; toolUseId?: string }, subagent?: string,
+): BackgroundEvidenceLaunch | undefined {
+    if (ids.taskId) return state.backgroundEvidenceLaunches?.get(JSON.stringify([subagent ?? null, ids.taskId]));
+    if (!ids.toolUseId) return undefined;
+    const matches = [...(state.backgroundEvidenceLaunches?.values() ?? [])]
+        .filter(launch => launch.subagent === subagent && launch.toolUseId === ids.toolUseId);
+    return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** Hidden Task calls are also owned by this turn, but deliberately have no permission membership. */
+function backgroundEvidenceLaunchRequest(state: ClaudeSessionProtocolState, toolUseId?: string): string | null | undefined {
+    if (!toolUseId) return undefined;
+    const membership = state.toolCallTurns?.get(toolUseId);
+    if (membership) return membership.requestId;
+    return state.hiddenParentToolCalls?.has(toolUseId) ? state.currentRequestId ?? null : undefined;
+}
+
+function rememberBackgroundEvidenceLaunch(state: ClaudeSessionProtocolState, launch: BackgroundEvidenceLaunch): void {
+    const tracker = state.backgroundCompletions ??= new BackgroundCompletionTracker();
+    if (tracker.historyLost) return;
+    const entries = state.backgroundEvidenceLaunches ??= new Map<string, BackgroundEvidenceLaunch>();
+    const key = JSON.stringify([launch.subagent ?? null, launch.taskId]);
+    const previous = entries.get(key);
+    // SDK run IDs sort in opening order. A delayed task_started cannot replace a newer launch.
+    if (launch.runId && previous?.runId && launch.runId < previous.runId) return;
+    const generation = launch.toolUseId ? state.toolCallTurns?.get(launch.toolUseId)?.turnId
+        ?? (state.hiddenParentToolCalls?.has(launch.toolUseId) ? state.currentTurnId ?? undefined : undefined) : undefined;
+    tracker.launch(
+        { taskId: launch.taskId, toolUseId: launch.toolUseId }, launch.runId ?? null, launch.subagent, generation);
+    if (tracker.historyLost) return;
+    if (Buffer.byteLength(JSON.stringify(launch), 'utf8') > 4096) {
+        tracker.historyLost = true;
+        return;
+    }
+    entries.delete(key);
+    entries.set(key, { ...launch, turnId: generation });
+    while (entries.size > BACKGROUND_HISTORY_LIMIT) {
+        entries.delete(entries.keys().next().value!);
+        tracker.historyLost = true;
+    }
 }
 
 function isSubagentTool(name: string): boolean {
@@ -576,6 +712,7 @@ function ensureTurn(state: ClaudeSessionProtocolState, envelopes: SessionEnvelop
     const requestId = state.pendingRequestId ?? undefined;
     envelopes.push(createEnvelope('agent', { t: 'turn-start', ...(requestId ? { requestId } : {}) }, { turn: turnId }));
     state.currentTurnId = turnId;
+    state.backgroundCompletions?.attachTurn(turnId);
     state.currentRequestId = requestId ?? null;
     state.pendingRequestId = null;
     return turnId;
@@ -606,6 +743,7 @@ function closeTurn(
         { turn: turnId },
     ));
     forgetToolCallTurns(state, turnId);
+    state.backgroundCompletions?.endTurn(turnId);
     state.currentTurnId = null;
     state.currentRequestId = null;
     clearSubagentTracking(state);
@@ -631,16 +769,39 @@ function toToolArgs(input: unknown): Record<string, unknown> {
     return { input };
 }
 
+/** Ordered SDK background observations feed evidence only, never channel ownership or turn closure. */
+export function observeClaudeBackgroundInput(message: RawJSONLines, state: ClaudeSessionProtocolState): void {
+    const notification = message as { subtype?: unknown; task_id?: unknown; run_id?: unknown; tool_use_id?: unknown };
+    // SDK subagent observations cannot establish root-turn consumption.
+    const subagent = (message as { parent_tool_use_id?: string }).parent_tool_use_id;
+    if (notification.subtype === 'task_started' && typeof notification.task_id === 'string') {
+        const runId = typeof notification.run_id === 'string' ? notification.run_id : undefined;
+        const toolUseId = typeof notification.tool_use_id === 'string' ? notification.tool_use_id : undefined;
+        (state.backgroundCompletions ??= new BackgroundCompletionTracker()).started({ taskId: notification.task_id, toolUseId }, runId ?? null, subagent);
+        rememberBackgroundEvidenceLaunch(state, { taskId: notification.task_id, toolUseId, runId, subagent,
+            requestId: backgroundEvidenceLaunchRequest(state, toolUseId) });
+    }
+    if (notification.subtype === 'task_notification') observeBackgroundCompletion(state, message, sdkBackgroundTaskCompletion(message), subagent);
+}
+
+/** A batch was dispatched, even when the provider produces no assistant text. */
+export function startClaudeInputTurn(state: ClaudeSessionProtocolState): ClaudeMapperResult {
+    const envelopes: SessionEnvelope[] = [];
+    ensureTurn(state, envelopes);
+    return { currentTurnId: state.currentTurnId, envelopes };
+}
+
 /** An authoritative result may be the first activity of a channel turn. */
 export function mapClaudeChannelFinalAnswer(
     state: ClaudeSessionProtocolState,
     text: string,
+    includeInputEvidenceFinal = false,
 ): ClaudeMapperResult {
     const envelopes: SessionEnvelope[] = [];
     const requestId = state.currentTurnId ? state.currentRequestId : state.pendingRequestId;
-    if (requestId && typeof text === 'string' && text.trim().length > 0) {
+    if ((requestId || includeInputEvidenceFinal) && typeof text === 'string' && text.trim().length > 0) {
         const turn = ensureTurn(state, envelopes);
-        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, requestId }, { turn }));
+        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, ...(requestId ? { requestId } : {}) }, { turn }));
     }
     return { currentTurnId: state.currentTurnId, envelopes };
 }
@@ -738,6 +899,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
         // follow-up turn on the same ordered stream; the transcript row of an idle notification
         // reaches us only through the scanner, which can be late.
         const notification = message as { subtype?: unknown; task_id?: unknown; tool_use_id?: unknown };
+        observeClaudeBackgroundInput(message, state);
         if (notification.subtype === 'task_notification') {
             rearmBackgroundTaskRequest(state, {
                 ...(typeof notification.task_id === 'string' ? { taskId: notification.task_id } : {}),
@@ -855,6 +1017,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             // (specs/midturn-task-notification-sync R2). Emit the user text
             // and leave the turn state untouched.
             if ((message as { happyTaskNotification?: unknown }).happyTaskNotification === true) {
+                observeBackgroundCompletion(state, message, message.message.content, subagent);
                 rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
                 envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
                 return {
@@ -871,6 +1034,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                 // what is open as any user row does, but never open-and-close an empty turn for a
                 // waiting request: that would answer it before the follow-up does.
                 if (state.currentTurnId) closeTurn(state, 'completed', envelopes);
+                observeBackgroundCompletion(state, message, message.message.content, subagent);
                 rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
                 envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
             } else {
@@ -922,6 +1086,14 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                     : extractBackgroundTaskId((block as { content?: unknown }).content);
                 // Task parent calls are hidden from the transcript, but their result still carries
                 // the launch id needed to correlate the later notification.
+                if (backgroundTaskId && state.currentTurnId) {
+                    state.onBackgroundInputLaunch?.(backgroundTaskId, state.currentTurnId);
+                    state.onBackgroundInputLaunch?.(block.tool_use_id, state.currentTurnId);
+                    const previous = findBackgroundEvidenceLaunch(state, { taskId: backgroundTaskId }, subagent);
+                    rememberBackgroundEvidenceLaunch(state, { taskId: backgroundTaskId, toolUseId: block.tool_use_id, subagent,
+                        runId: previous && previous.toolUseId === block.tool_use_id && previous.turnId === state.currentTurnId ? previous.runId : undefined,
+                        requestId: backgroundEvidenceLaunchRequest(state, block.tool_use_id) });
+                }
                 if (backgroundTaskId && state.currentRequestId) {
                     rememberBackgroundTaskRequest(state, backgroundTaskId, state.currentRequestId);
                     rememberBackgroundTaskRequest(state, block.tool_use_id, state.currentRequestId);

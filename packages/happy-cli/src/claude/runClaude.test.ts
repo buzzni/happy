@@ -154,6 +154,8 @@ async function startRemoteRunClaudeHarness(opts: {
     const updateAgentState = opts.updateAgentState ?? vi.fn();
     const registerHandler = opts.registerHandler ?? vi.fn();
     const sessionClient = {
+        configureInputQueue: vi.fn(),
+        queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
         sessionId: 'happy-session-1',
         tracksShutdownStorage: true,
         confirmShutdownCursor: vi.fn(async () => true),
@@ -891,6 +893,8 @@ describe('runClaude remote JSONL scanner', () => {
     it('does not forward terminal JSONL messages while local mode owns the transcript', async () => {
         const sentMessages: unknown[] = [];
         const sessionClient = {
+        configureInputQueue: vi.fn(),
+        queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
             sessionId: 'happy-session-1',
             suppressNextArchiveSignal: vi.fn(),
             skipExistingMessages: vi.fn(),
@@ -1000,6 +1004,8 @@ describe('runClaude remote JSONL scanner', () => {
             slashCommands: ['goal'],
         };
         const sessionClient = {
+        configureInputQueue: vi.fn(),
+        queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
             sessionId: 'happy-session-1',
             suppressNextArchiveSignal: vi.fn(),
             skipExistingMessages: vi.fn(),

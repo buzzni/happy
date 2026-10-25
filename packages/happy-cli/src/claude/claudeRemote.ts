@@ -215,6 +215,7 @@ export async function claudeRemote(opts: {
         mode: EnhancedMode,
         channelRequestId?: string,
         latency?: ClaudeTurnLatencyInput,
+        commitInput?: () => boolean,
     } | null>,
     checkpointGuidance?: () => Promise<string>,
     beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
@@ -410,6 +411,7 @@ async function runClaudeRemote(
 
     // Handle /clear command
     if (specialCommand.type === 'clear') {
+        if (opts.signal?.aborted || initial.commitInput?.() === false) return 'not-started' as const;
         reviewLifecycle.completedAssistantTurns = 0;
         if (opts.onCompletionEvent) {
             opts.onCompletionEvent('Context was reset');
@@ -743,6 +745,7 @@ function readTurnText(content: unknown): string {
         || opts.beginChannelExecution?.(initial.channelRequestId) !== true)) {
         return 'not-started' as const;
     }
+    if (opts.signal?.aborted || initial.commitInput?.() === false) return 'not-started' as const;
     // Start the loop
     const queryStartedAt = Date.now();
     const response = query({
@@ -1234,6 +1237,7 @@ function readTurnText(content: unknown): string {
                          */
                         const withBlock = await withLessons(next.message, preparation);
                         if (queryClosed || messages.done || opts.signal?.aborted) return;
+                        if (next.commitInput?.() === false) { messages.end(); return; }
                         activateTurnLatency(next.latency, preparation);
                         messages.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: withBlock } });
                         // Steering may only follow the primary input, never overtake its recall.

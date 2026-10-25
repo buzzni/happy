@@ -1,8 +1,12 @@
+import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
+import type { SessionEnvelope } from '@slopus/happy-wire';
+import type { UserMessage } from '@/api/types';
 /**
  * A turn that Codex ends with "Selected model is at capacity" is continued automatically —
  * driven through the real consumer loop and the real `MessageQueue2`, with only the
  * app-server client, the API and the process boundary faked (same harness as
- * runCodex.channelClear.test.ts).
+ * runCodex.channelClear.test.ts). The synchronous write-failure scenario delegates
+ * to the actual app-server client's sendTurnAndWait/sendTurn/request methods.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ExecSyncOptions } from 'node:child_process';
@@ -54,10 +58,12 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
     return { ...original, MessageQueue2: Recorded };
 });
 
-const protocolMessages: { ev?: { t?: string; requestId?: string; nonce?: string; text?: string; status?: string } }[] = [];
-type Outcome = 'overloaded' | 'ok';
-let script: { outcome: Outcome; after?: () => void | Promise<void> }[] = [];
+const protocolMessages: SessionEnvelope[] = [];
+let runtimeEvidence: TurnInputEvidence;
+type Outcome = 'overloaded' | 'ok' | 'write-failure' | 'prepare-failure' | 'sync-write-failure';
+let script: { outcome: Outcome; beforeWrite?: () => Promise<void>; after?: () => void | Promise<void> }[] = [];
 let turnsSent: string[] = [];
+let failingWrites = 0;
 let eventHandler: ((msg: unknown) => void) | null = null;
 
 const OVERLOADED = {
@@ -70,8 +76,9 @@ const OVERLOADED = {
     },
 };
 
-vi.mock('@/codex/codexAppServerClient', () => ({
-    CodexAppServerClient: class {
+vi.mock('@/codex/codexAppServerClient', async (importOriginal) => {
+    const { CodexAppServerClient: ActualClient } = await importOriginal<typeof import('@/codex/codexAppServerClient')>();
+    return { CodexAppServerClient: class {
         setCuaShadow = () => {};
         setEventHandler = vi.fn((handler: (msg: unknown) => void) => { eventHandler = handler; });
         setApprovalHandler = vi.fn();
@@ -83,9 +90,27 @@ vi.mock('@/codex/codexAppServerClient', () => ({
         async resumeThread() { return { id: 'thread-1' }; }
         async startThread() { return { id: 'thread-1' }; }
         clearThreadState = vi.fn();
-        async sendTurnAndWait(input: unknown) {
-            turnsSent.push(String(input));
+        async sendTurnAndWait(input: unknown, options?: { beforeDispatch?: () => void; onDispatched?: () => void }) {
             const step = script.shift() ?? { outcome: 'ok' as const };
+            await step.beforeWrite?.();
+            if (step.outcome === 'prepare-failure') { closeQueue(); throw new Error('preparation failed'); }
+            if (step.outcome === 'sync-write-failure') {
+                // Exercise the actual sendTurnAndWait → sendTurn → request → stdin.write path.
+                // Only the process boundary is fake; the real runner owns catch/finally settlement.
+                const actual = new ActualClient();
+                Object.assign(actual, { _threadId: 'thread-1', process: { stdin: { writable: true, write: (line: string) => {
+                    failingWrites += 1;
+                    expect(JSON.parse(line).method).toBe('turn/start');
+                    expect(runtimeEvidence.takeContinuation()).toBeUndefined(); // already claimed
+                    throw new Error('synchronous stdin write failure');
+                } } } });
+                try { return await actual.sendTurnAndWait(String(input), options); }
+                finally { closeQueue(); }
+            }
+            options?.beforeDispatch?.();
+            turnsSent.push(String(input));
+            options?.onDispatched?.();
+            if (step.outcome === 'write-failure') { closeQueue(); throw new Error('transport failed before start notification'); }
             eventHandler?.({ type: 'task_started', turn_id: `turn-${turnsSent.length}` });
             if (step.outcome === 'ok') eventHandler?.({ type: 'agent_message', phase: 'final_answer', message: 'fixed', turn_id: `turn-${turnsSent.length}` });
             eventHandler?.(step.outcome === 'overloaded'
@@ -104,8 +129,8 @@ vi.mock('@/codex/codexAppServerClient', () => ({
         clearGoal = vi.fn();
         disconnect = vi.fn(async () => {});
         dispose = vi.fn(async () => {});
-    },
-}));
+    } };
+});
 
 let onConnect: (() => Promise<void>) | null = null;
 let onUserMessage: ((message: { content: { type: 'text'; text: string } }) => unknown) | null = null;
@@ -114,13 +139,21 @@ const sessionEvents: { message?: string }[] = [];
 let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', codexThreadId: 'thread-1' };
 
 function sessionStub() {
+    const evidence = runtimeEvidence = new TurnInputEvidence('runtime-test', envelope => protocolMessages.push(envelope));
     return {
+        inputEvidence: evidence,
+        configureInputQueue: (queue: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>) => {
+            queue.setInputValidator(input => !input.continuation || evidence.isContinuationCurrent(input.continuation));
+        },
+        setInputSteerAvailable: vi.fn(),
+        setPendingInputEvidence: (batch: EvidenceBatch | null) => evidence.setPending(batch),
+        queueInput: (message: UserMessage) => ({ ref: { kind: 'rest', serverMessageId: message.serverMessageId ?? 'test-input', serverSeq: message.serverSeq ?? 1 } }),
         sessionId: 'sess-1',
         runtimeId: 'runtime-test',
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
         sendSessionEvent: vi.fn((event: { message?: string }) => { sessionEvents.push(event); }),
         sendSessionProtocolMessage: vi.fn((envelope: typeof protocolMessages[number]) => {
-            protocolMessages.push(envelope);
+            protocolMessages.push(evidence.stamp(envelope));
             const ev = envelope.ev;
             if (ev?.t === 'channel-ready') queueMicrotask(() => {
                 void rpc.get('channel-authorize')?.({ requestId: ev.requestId, expectedRuntimeId: 'runtime-test', nonce: ev.nonce, decision: 'allow' });
@@ -159,7 +192,7 @@ const closeQueue = () => { queues[0]!.close(); };
 
 describe('automatic continuation after a capacity failure', () => {
     beforeEach(() => {
-        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; script = []; eventHandler = null; onUserMessage = null; reportCapacityFailure.mockClear();
+        protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; failingWrites = 0; script = []; eventHandler = null; onUserMessage = null; reportCapacityFailure.mockClear();
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-1' };
         // Run from inside a Saycode session, the runner would otherwise pick up that
         // session's own lesson host, reconnect target and sandbox settings, and never exit.
@@ -197,16 +230,70 @@ describe('automatic continuation after a capacity failure', () => {
     const continuations = () => turnsSent.filter(text => text.includes(CODEX_CAPACITY_CONTINUE_PROMPT));
     const notices = () => sessionEvents.filter(e => e.message?.includes('at capacity') && e.message.includes('continuing automatically'));
 
+    it('T2RT-06 settles the original retry when the actual stdin.write throws after claim', async () => {
+        script = [{ outcome: 'overloaded' }, { outcome: 'sync-write-failure' }];
+        await run(async () => {
+            queues[0]!.pushIsolated('original A', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'A', serverSeq: 1 } });
+        });
+        const start = protocolMessages.find(event => event.ev.t === 'turn-start')!;
+        expect(failingWrites).toBe(1);
+        expect(runtimeEvidence.snapshot(start.turn)).toMatchObject({ terminal: true, continuation: { state: 'cancelled' } });
+        expect(protocolMessages.at(-1)?.ev).toMatchObject({ t: 'turn-input-evidence', inputEvidence: {
+            turnId: start.turn, terminal: true, continuation: { state: 'cancelled' },
+        } });
+        expect(protocolMessages.filter(event => event.ev.t === 'turn-start')).toHaveLength(1);
+        expect(turnsSent).toHaveLength(1);
+    }, 60_000);
+    it('T2RT-01 drops a retry replaced while the client prepares its write', async () => {
+        script = [{ outcome: 'overloaded' }, { outcome: 'ok', beforeWrite: async () => {
+            await Promise.resolve();
+            runtimeEvidence.cancelContinuation('replaced');
+            queues[0]!.pushIsolated('replacement B', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'B', serverSeq: 2 } });
+        } }, { outcome: 'ok', after: closeQueue }];
+        await run(async () => {
+            queues[0]!.pushIsolated('original A', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'A', serverSeq: 1 } });
+        });
+        expect(turnsSent).toHaveLength(2); expect(continuations()).toHaveLength(0);
+        expect(turnsSent[1]).toContain('replacement B');
+        expect(runtimeEvidence.snapshot(protocolMessages.find(event => event.ev.t === 'turn-start')!.turn)).toMatchObject({ terminal: true, continuation: { state: 'replaced' } });
+        expect(protocolMessages.filter(event => event.ev.t === 'turn-start')).toHaveLength(2);
+        expect(runtimeEvidence.snapshot()).toMatchObject({ inputs: [{ kind: 'rest', serverMessageId: 'B', serverSeq: 2 }],
+            continuation: { kind: 'none' } });
+    }, 60_000);
+    it.each(['write-failure', 'prepare-failure'] as const)('T2RT-05 witnesses only dispatched REST failures: %s', outcome => {
+        script = [{ outcome }];
+        return run(async () => {
+            queues[0]!.pushIsolated('A', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'A', serverSeq: 1 } });
+        }).then(() => {
+            const starts = protocolMessages.filter(event => event.ev.t === 'turn-start');
+            const ends = protocolMessages.filter(event => event.ev.t === 'turn-end');
+            expect(starts).toHaveLength(outcome === 'write-failure' ? 1 : 0);
+            expect(ends).toHaveLength(outcome === 'write-failure' ? 1 : 0);
+            if (outcome === 'write-failure') expect(ends[0].ev).toMatchObject({ status: 'failed', inputEvidence: {
+                inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], terminal: true } });
+        });
+    }, 60_000);
     it('continues the same thread once the overloaded turn has ended', async () => {
         script = [{ outcome: 'overloaded' }, { outcome: 'ok', after: closeQueue }];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(turnsSent).toHaveLength(2);
         expect(turnsSent[0]).toContain('fix the bug');
         expect(turnsSent[1]).toContain(CODEX_CAPACITY_CONTINUE_PROMPT);
         expect(notices()).toHaveLength(1);
+        const ends = protocolMessages.filter(event => event.ev.t === 'turn-end');
+        expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
+            continuation: { kind: 'codex-capacity', state: 'pending' } } });
+        expect(ends[1].ev).toMatchObject({ inputEvidence: { inputCount: 1,
+            inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
+            terminal: true, continuation: { kind: 'codex-capacity', state: 'completed' } } });
     }, 60_000);
 
     it('gives up after the retry budget and leaves the failure to the user', async () => {
@@ -216,7 +303,8 @@ describe('automatic continuation after a capacity failure', () => {
             { outcome: 'overloaded', after: () => { setTimeout(closeQueue, 200); } },
         ];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(turnsSent).toHaveLength(3);
@@ -233,7 +321,8 @@ describe('automatic continuation after a capacity failure', () => {
             { outcome: 'ok', after: async () => { await sleep(100); setTimeout(closeQueue, 100); } },
         ];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(turnsSent).toHaveLength(2);
@@ -250,7 +339,8 @@ describe('automatic continuation after a capacity failure', () => {
             },
         }];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(rpc.has('abort')).toBe(true);
@@ -266,7 +356,8 @@ describe('automatic continuation after a capacity failure', () => {
             },
         }];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
         expect(continuations()).toHaveLength(0);
         expect(notices()).toHaveLength(0);

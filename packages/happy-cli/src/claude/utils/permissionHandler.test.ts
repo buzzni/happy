@@ -124,6 +124,27 @@ function createRecordingSessionStub(): {
     };
 }
 
+describe('permission text provider handoff', () => {
+    it.each([
+        { tool: 'AskUserQuestion', response: { approved: true, updatedInput: { answers: { q: 'answer' } } }, state: 'accepted' },
+        { tool: 'Bash', response: { approved: false, reason: 'use another command' }, state: 'accepted' },
+        { tool: 'Bash', response: { approved: false, updatedInput: { command: 'ignored' } }, state: 'rejected' },
+        { tool: 'ExitPlanMode', response: { approved: true, updatedInput: { plan: 'ignored' } }, state: 'rejected' },
+    ])('records before resolving $tool and settles $state', async ({ tool, response, state }) => {
+        const stub = createRecordingSessionStub();
+        const order: string[] = [];
+        stub.session.client.recordPermissionInput = (id, toolName) => {
+            expect(id).toBe('tool-call-1'); expect(toolName).toBe(tool); order.push('pending');
+            return result => { order.push(result!); };
+        };
+        const handler = new PermissionHandler(stub.session);
+        const result = handler.handleToolCall(tool, {}, { permissionMode: 'default' }, stubOptions());
+        const observed = result.then(() => { order.push('provider'); });
+        await stub.answer({ id: 'tool-call-1', ...response }); await observed;
+        expect(order).toEqual(['pending', state, 'provider']);
+    });
+});
+
 describe('PermissionHandler external channel answers', () => {
     const CLAIM = { turnId: 'turn-a', channelRequestId: 'req-1', runtimeId: 'runtime-1' };
 

@@ -332,7 +332,7 @@ describe('session protocol schemas', () => {
     const ev = { t: 'plan', steps: [{ text: 'Write the failing test', status: 'completed' }, { text: 'Fix the parser', status: 'in_progress' }] };
     const parsed = sessionEnvelopeSchema.safeParse({ id: 'a', time: 1, role: 'agent', ev });
     expect(parsed.success && parsed.data.ev).toEqual(ev);
-    expect(sessionEventSchema.safeParse({ ...ev, steps: [] }).success).toBe(false);
+    expect(sessionEventSchema.safeParse({ ...ev, steps: [] }).success).toBe(true);
     expect(sessionEventSchema.safeParse({ ...ev, steps: [{ text: 'x', status: 'blocked' }] }).success).toBe(false);
   });
 
@@ -519,5 +519,29 @@ describe('structured-output event', () => {
     expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing', reason: 'not_produced', value: {} }).success).toBe(false);
     expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 1, status: 'missing', reason: 'other' }).success).toBe(false);
     expect(sessionEventSchema.safeParse({ t: 'structured-output', v: 2, status: 'ok', value: {} }).success).toBe(false);
+  });
+});
+
+// T2rt: the transport parses envelopes before storing them; type-only additions are insufficient.
+describe('input evidence transport', () => {
+  const evidence = {
+    v: 1, runtimeId: 'runtime', turnId: 'turn', batchId: 'batch', rootBatchId: 'batch',
+    revision: 1, inputCount: 1, inputs: [{ kind: 'rest', serverMessageId: 'message', serverSeq: 7 }],
+    coverage: 'complete', incompleteReasons: [],
+    additional: { attempted: 0, accepted: 0, pending: 0, unknown: 0, items: [] },
+    continuation: { kind: 'none', state: 'none', previousTurn: null, retryId: null, rootExclusive: null },
+    terminal: false,
+  };
+  it.each(['turn-start', 'final-answer', 'turn-end', 'turn-input-evidence'])('retains %s evidence after JSON roundtrip', t => {
+    const ev = { t, text: 'answer', status: 'completed', inputEvidence: evidence };
+    const parsed = sessionEnvelopeSchema.parse(JSON.parse(JSON.stringify(createEnvelope('agent', sessionEventSchema.parse(ev), { turn: 'turn' })))).ev;
+    expect(parsed).toHaveProperty('inputEvidence', evidence);
+  });
+  it('preserves server-bound admission and allows an explicit empty plan', () => {
+    const admission = { t: 'hub-input-admission', v: 1, serverMessageId: 'm', targetSessionId: 's',
+      expectedRuntimeId: 'old', observedRuntimeId: 'new', expectedModeEpoch: 1, observedModeEpoch: 2,
+      state: 'rejected', reason: 'runtime-mismatch' };
+    expect(sessionEventSchema.parse(admission)).toEqual(admission);
+    expect(sessionEventSchema.parse({ t: 'plan', steps: [] })).toEqual({ t: 'plan', steps: [] });
   });
 });
