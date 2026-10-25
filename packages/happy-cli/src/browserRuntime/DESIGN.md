@@ -240,7 +240,20 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
   inflating it in the Runtime (a 1x1 ZRLE rectangle can expand to 512 KiB). Cost: noVNC uses Hextile
   (more bandwidth over the tunnel).
 - `/viewer/` serves the pinned noVNC client (Runtime image copies Debian bookworm `novnc=1:1.3.0-1`,
-  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`).
+  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The Runtime adds two inline scripts to
+  `vnc_lite.html` only: one before noVNC's module hands the page's RFB object to its same-origin console as
+  `window.__abpRfb` (first assignment of `scaleViewport`, initial value from the console's
+  `__abpViewerFit`; `viewOnly` from `__abpViewerControl` = the user holds the shown task's control, so
+  without control a wheel over an actual-size screen pans the frame instead of being swallowed), one
+  last in `<head>` restores `?path=` a relay stripped. Fit / actual size in the
+  console is therefore noVNC's own `scaleViewport` switched in place (same frame, same ticket; the lease
+  and capability are untouched); `resizeSession` is never set, so the display size never changes the
+  remote resolution. Verified with the pinned 1.3.0 (class accessor) and Debian 1.0.0 (prototype accessor).
+- Console (`GET /console`, consolePage.ts; aplus `agent-browser-screen-first`): one column that fills the
+  window — header with the task menu (`#taskMenu`, `#needCount` = tasks needing the user, shown while
+  closed), approval card when one is pending, one state + control bar, then the screen taking the width
+  and the remaining height; Activity and Advanced are buttons on the screen's head line whose panels
+  open under it, closed by default. Fit (`#fitToggle`) / actual size (`#actualSize`) as above.
 - Harness: `poc.mjs up --viewer runtime` (pocStack `viewer: 'runtime'`) is the production layout — no
   websockify, nothing published but the Runtime. The default harness layout still starts and publishes
   noVNC (`ABP_HARNESS_NOVNC=1`) because A11 probes it directly; A04/A09 inject human input with xdotool
