@@ -53,7 +53,9 @@ function fresh(proof: HappySessionExecutionProof) {
 }
 
 /** Only a new session can acquire this immutable relation. Existing rows require exact replay. */
-export async function createExecutionBoundSession(ownerAccountId: string, rawBody: unknown, rawProof: unknown) {
+export async function createExecutionBoundSession(ownerAccountId: string, rawBody: unknown, rawProof: unknown,
+  participate?: (tx: Prisma.TransactionClient, session: { id: string }, created: boolean) => Promise<void>,
+  checkParticipation?: () => void) {
   const verified = await verifySessionExecutionCreate(ownerAccountId, rawBody, rawProof);
   const { body, proof, ticketDigest, createProofDigest } = verified;
   const ticket = proof.ticket.body;
@@ -76,7 +78,10 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
             binding.machineId === ticket.machineId && binding.launchId === ticket.launchId &&
             binding.initialNonce === ticket.initialNonce && binding.operationId === ticket.operationId &&
             binding.ticketDigest === ticketDigest && binding.createProofDigest === createProofDigest &&
-            binding.sessionTagHash === ticket.sessionTagHash && binding.sessionCreateBodyHash === ticket.sessionCreateBodyHash) return existing;
+            binding.sessionTagHash === ticket.sessionTagHash && binding.sessionCreateBodyHash === ticket.sessionCreateBodyHash) {
+            await participate?.(tx, existing, false);
+            return existing;
+          }
           conflict();
         }
         const session = await tx.session.create({ data: {
@@ -91,8 +96,10 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
           approvalId: ticket.approvalId, deviceKeyId: ticket.deviceKeyId, sessionTagHash: ticket.sessionTagHash,
           sessionCreateBodyHash: ticket.sessionCreateBodyHash, ticketDigest, createProofDigest,
         } });
+        await participate?.(tx, session, true);
         const account = await tx.account.update({ where: { id: ownerAccountId }, data: { seq: { increment: 1 } }, select: { seq: true } });
         fresh(proof);
+        checkParticipation?.();
         afterTx(tx, () => eventRouter.emitUpdate({ userId: ownerAccountId,
           payload: buildNewSessionUpdate(session, account.seq, randomKeyNaked(12)), recipientFilter: { type: 'user-scoped-only' } }));
         return session;
