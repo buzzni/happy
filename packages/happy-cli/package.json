@@ -96,6 +96,7 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "test:browser-poc": "vitest run --project browser-poc",
+    "browser-poc:setup": "test -d .cache/novnc-1.3.0 || git clone --depth 1 --branch v1.3.0 https://github.com/novnc/noVNC.git .cache/novnc-1.3.0",
     "bundle:server": "node scripts/bundle-server.cjs",
     "bundle:server:all": "node scripts/bundle-server.cjs --all-platforms",
     "bundle:webapp": "node scripts/bundle-webapp.cjs",

@@ -7,15 +7,26 @@
 import { existsSync } from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { renderConsolePage } from './consolePage'
 import { HarnessCdp, eventually, findChrome, launchChrome, type LaunchedChrome } from './drivers/pocTestKit'
 import { serveViewerAsset } from './viewerProxy'
 
 const chromePath = findChrome()
-/** The distro noVNC client the Runtime serves at /viewer/ (fit/actual size drives its real RFB object). */
-const novncDir = process.env.ABP_VIEWER_ASSETS_DIR ?? '/usr/share/novnc'
-const hasNovnc = existsSync(`${novncDir}/vnc_lite.html`)
+/**
+ * The noVNC client the Runtime serves at /viewer/ (fit/actual size drives its real RFB object): the pinned 1.3.0 that
+ * the Runtime image ships, from the package's cache (`pnpm browser-poc:setup` clones it there), else
+ * ABP_VIEWER_ASSETS_DIR, else the distro package (Debian ships 1.0.0, a different RFB accessor shape).
+ */
+const NOVNC_CACHE = join(__dirname, '..', '..', '.cache', 'novnc-1.3.0')
+const novncDir = [NOVNC_CACHE, process.env.ABP_VIEWER_ASSETS_DIR, '/usr/share/novnc']
+    .find((dir): dir is string => !!dir && existsSync(join(dir, 'vnc_lite.html')))
+const hasNovnc = novncDir !== undefined
+// A skip here is a coverage hole, not a pass: say what is missing instead of going quiet.
+if (!chromePath) console.warn('[consolePage.poc] no Chrome found (set CHROME_PATH): the real-Chrome console suite is skipped')
+else if (!hasNovnc) console.warn('[consolePage.poc] no noVNC client found (run `pnpm browser-poc:setup` or set ABP_VIEWER_ASSETS_DIR): fit/actual size is not covered')
+else if (novncDir !== NOVNC_CACHE) console.warn(`[consolePage.poc] using noVNC at ${novncDir}, not the pinned 1.3.0 (run \`pnpm browser-poc:setup\`)`)
 const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
 const token = (tag: string, expiresAtMs: number) =>
     `abp2.${b64({ alg: 'EdDSA', kid: 'k', typ: 'abp-cap' })}.${b64({ kind: 'interactive', profileId: 'profile-a', principalId: 'user-1', viewerSessionId: 'viewer-this', capabilityId: tag, expiresAtMs })}.sig-${tag}`
@@ -47,7 +58,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             if (url.pathname === '/console') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(renderConsolePage()); return }
             if (url.pathname.startsWith('/viewer/')) {
                 // The real noVNC client, as the Runtime serves it; its WebSocket finds no upstream here and just disconnects.
-                serveViewerAsset(novncDir, url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
+                serveViewerAsset(novncDir ?? '/nonexistent', url.pathname, res).then((served) => { if (!served) { res.writeHead(404); res.end() } })
                 return
             }
             if (url.pathname === '/console-hosted') {

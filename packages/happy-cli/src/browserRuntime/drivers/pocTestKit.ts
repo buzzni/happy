@@ -15,12 +15,15 @@ import { join } from 'node:path'
 import { inflateSync } from 'node:zlib'
 import { CdpConnection } from './cdpConnection'
 
-const MAC_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+/** Where a desktop Chrome usually is; CHROME_PATH overrides. A suite that finds none skips and says so. */
+const CHROME_CANDIDATES = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser',
+]
 
 export function findChrome(): string | undefined {
     if (process.env.CHROME_PATH && existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH
-    if (existsSync(MAC_CHROME)) return MAC_CHROME
-    return undefined
+    return CHROME_CANDIDATES.find((candidate) => existsSync(candidate))
 }
 
 export interface LaunchedChrome {
