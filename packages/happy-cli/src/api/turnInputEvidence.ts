@@ -53,11 +53,11 @@ export class TurnInputEvidence {
         this.backgroundTurns.set(id, turn);
         while (this.backgroundTurns.size > 200) this.backgroundTurns.delete(this.backgroundTurns.keys().next().value!);
     }
-    rearmBackground(ids: string[]): void {
+    rearmBackground(ids: string[], incompleteReasons: string[] = []): void {
         const turn = ids.map(id => this.backgroundTurns.get(id)).find(Boolean);
         for (const id of ids) this.backgroundTurns.delete(id);
         const source = turn ? this.snapshot(turn) : null;
-        const reasons = ['background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
+        const reasons = [...incompleteReasons, 'background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
         if (this.current) for (const reason of reasons) this.incomplete(reason, this.current);
         if (this.pending) this.pending.incompleteReasons = [...(this.pending.incompleteReasons ?? []), ...reasons];
         if (this.current || this.pending) return;
@@ -66,14 +66,14 @@ export class TurnInputEvidence {
             return;
         }
         if (!source) {
-            this.background = { inputs: [], inputCount: 0, incompleteReasons: ['background-source-unavailable'] };
+            this.background = { inputs: [], inputCount: 0, incompleteReasons: [...incompleteReasons, 'background-source-unavailable'] };
             return;
         }
         source.continuation = { kind: 'background', state: 'pending', retryId: null,
             previousTurn: { runtimeId: this.runtimeId, turnId: source.turnId },
             rootExclusive: source.inputCount === 1 && source.coverage === 'complete' && source.additional.attempted === 0
                 && source.continuation.rootExclusive !== false };
-        this.background = { inputs: [], inputCount: 0, continuation: source };
+        this.background = { inputs: [], inputCount: 0, continuation: source, incompleteReasons };
     }
     constructor(readonly runtimeId: string, private readonly emit: (envelope: SessionEnvelope) => void) {}
     currentTurn(): string | null { return this.current; }

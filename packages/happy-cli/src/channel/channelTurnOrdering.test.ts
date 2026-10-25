@@ -6,6 +6,7 @@ import { createSessionScanner } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
 import { OutgoingMessageQueue } from '@/claude/utils/OutgoingMessageQueue';
 import { SDKToLogConverter } from '@/claude/utils/sdkToLogConverter';
+import { logger } from '@/ui/logger';
 import { withContextUsageSignals } from '@/claude/claudeContextUsage';
 import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import {
@@ -40,7 +41,7 @@ function harness(witnessed = false) {
     const envelopes: SessionEnvelope[] = [];
     const evidence = new TurnInputEvidence('host', envelope => envelopes.push(envelope));
     const append = (batch: SessionEnvelope[]) => envelopes.push(...batch.map(envelope => witnessed ? evidence.stamp(envelope) : envelope));
-    const rearm = vi.fn((ids: string[]) => evidence.rearmBackground(ids));
+    const rearm = vi.fn((ids: string[], reasons?: string[]) => evidence.rearmBackground(ids, reasons));
     const state: ClaudeSessionProtocolState = { currentTurnId: null,
         ...(witnessed ? { onBackgroundInputLaunch: (id: string, turn: string) => evidence.rememberBackground(id, turn),
             onBackgroundInputRearm: rearm } : {}) };
@@ -232,7 +233,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
                 receipt('run-2'); text('Resumed task'); await h.queue.flush();
                 expect(h.rearm).toHaveBeenCalledTimes(ambiguous ? 3 : 2);
                 expect(h.evidence.snapshot()).toMatchObject({ coverage: 'incomplete',
-                    incompleteReasons: ['background-source-unavailable'] });
+                    incompleteReasons: expect.arrayContaining(['background-source-unavailable']) });
             } finally { h.queue.destroy(); }
         },
     );
@@ -362,6 +363,101 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             if (idle) expect.soft(final).not.toHaveProperty('requestId');
             else expect.soft(final).toMatchObject({ requestId: 'channel-B' });
             expect.soft(h.evidence.snapshot()).toMatchObject({ coverage: 'incomplete', terminal: true });
+        } finally { h.queue.destroy(); }
+    }, 15000);
+
+    it.each(['sdk', 'scanner'].flatMap(source => ['before-result', 'after-result', 'tool-only'].map(start => ({ source, start }))))(
+        'round 5 routes an exact retained launch after completion eviction ($source, $start)', async ({ source, start }) => {
+        const h = harness(true);
+        const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+        const sdk = (message: Parameters<typeof converter.convert>[0]) => h.queue.enqueue(converter.convert(message));
+        const completion = (task: string, run?: string, tool?: string): Parameters<typeof converter.convert>[0] => ({ type: 'system' as const, subtype: 'task_notification' as const,
+            task_id: task, ...(run ? { run_id: run } : {}), ...(tool ? { tool_use_id: tool } : {}), status: 'completed' as const,
+            session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000005', output_file: '/tmp/job.output', summary: 'Done' });
+        const debug = vi.spyOn(logger, 'debug');
+        try {
+            // Evict the same task's old run, not just unrelated tasks.
+            for (let i = 0; i < 205; i++) {
+                sdk(completion(i === 0 ? 'job' : `other-${i}`, `run-${i}`));
+                h.queue.enqueue(assistant('old response')); h.queue.enqueue(turnEndItem('completed'));
+                await h.queue.flush();
+            }
+            expect(h.state.backgroundCompletions?.historyLost).toBe(true);
+            h.queue.enqueue(pendingRequestItem('channel-A', { inputs: [{ kind: 'channel', channelRequestId: 'channel-A' }], inputCount: 1 }));
+            sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+                { type: 'tool_use', id: 'launch-new', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+            ] } } as Parameters<typeof converter.convert>[0]);
+            const started = () => sdk({ type: 'system', subtype: 'task_started', task_id: 'job', run_id: 'run-new', tool_use_id: 'launch-new',
+                description: 'New run', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000015' });
+            if (start === 'before-result') started();
+            sdk({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+                { type: 'tool_result', tool_use_id: 'launch-new', content: 'Command running in background with ID: job.' },
+            ] } });
+            if (start === 'after-result') started();
+            h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            const original = h.evidence.snapshot()!;
+            // A late earlier run must not take the new launch, even with a matching tool ID.
+            if (start !== 'tool-only') {
+                h.sendScannerMessage({ type: 'user', uuid: 'old-run', origin: { kind: 'task-notification', runId: 'run-0' },
+                    message: { role: 'user', content: '<task-notification><task-id>job</task-id><tool-use-id>launch-new</tool-use-id><status>completed</status></task-notification>' } });
+                h.queue.enqueue(assistant('late old result')); h.queue.enqueue(finalAnswerItem('late old result'));
+                h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+                expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'late old result')?.ev).not.toHaveProperty('requestId');
+                expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
+                expect(debug).toHaveBeenCalledWith('[claude] Background completion not routed', expect.objectContaining({ reason: 'launch-identity-unproven' }));
+            }
+            const run = start === 'tool-only' ? undefined : 'run-new';
+            const tool = start === 'tool-only' ? 'launch-new' : undefined;
+            if (source === 'sdk') sdk(completion('job', run, tool));
+            else h.sendScannerMessage({ type: 'user', uuid: 'new-run', origin: { kind: 'task-notification', ...(run ? { runId: run } : {}) },
+                message: { role: 'user', content: `<task-notification><task-id>job</task-id>${tool ? `<tool-use-id>${tool}</tool-use-id>` : ''}<status>completed</status></task-notification>` } });
+            h.queue.enqueue(assistant('actual final')); h.queue.enqueue(finalAnswerItem('actual final'));
+            h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'actual final')?.ev)
+                .toMatchObject({ requestId: 'channel-A', inputEvidence: { rootBatchId: original.rootBatchId,
+                    coverage: 'incomplete', incompleteReasons: expect.arrayContaining(['background-completion-uncertain']) } });
+        } finally { debug.mockRestore(); h.queue.destroy(); }
+    });
+
+    it.each(['tasks', 'runs'])('round 5 bounds retained launch identities for %s and signals an unroutable completion', async kind => {
+        const h = harness(true);
+        const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+        const sdk = (message: Parameters<typeof converter.convert>[0]) => h.queue.enqueue(converter.convert(message));
+        try {
+            h.queue.enqueue(pendingRequestItem('channel-A', { inputs: [{ kind: 'channel', channelRequestId: 'channel-A' }], inputCount: 1 }));
+            for (let i = 0; i < 600; i++) {
+                const taskId = kind === 'tasks' ? `job-${i}` : 'job';
+                sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+                    { type: 'tool_use', id: `launch-${i}`, name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+                ] } } as Parameters<typeof converter.convert>[0]);
+                sdk({ type: 'system', subtype: 'task_started', task_id: taskId, run_id: `run-${String(i).padStart(4, '0')}`, tool_use_id: `launch-${i}`,
+                    description: 'New run', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000025' });
+                sdk({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+                    { type: 'tool_result', tool_use_id: `launch-${i}`, content: `Command running in background with ID: ${taskId}.` },
+                ] } });
+            }
+            h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            expect(h.state.backgroundTaskLaunches?.size).toBe(kind === 'tasks' ? 200 : 1);
+            // A registered run without a witnessed spawning call proves no channel ownership.
+            sdk({ type: 'system', subtype: 'task_started', task_id: 'orphan', run_id: 'orphan-run', tool_use_id: 'unseen-call',
+                description: 'Detached task', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000045' });
+            sdk({ type: 'system', subtype: 'task_notification', task_id: 'orphan', run_id: 'orphan-run', tool_use_id: 'unseen-call',
+                status: 'completed', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000055', output_file: '/tmp/job.output', summary: 'Done' });
+            h.queue.enqueue(assistant('orphan answer')); h.queue.enqueue(finalAnswerItem('orphan answer'));
+            h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'orphan answer')?.ev).not.toHaveProperty('requestId');
+            expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
+            for (const i of [0, 599]) {
+                sdk({ type: 'system', subtype: 'task_notification', task_id: kind === 'tasks' ? `job-${i}` : 'job', run_id: `run-${String(i).padStart(4, '0')}`, tool_use_id: `launch-${i}`,
+                    status: 'completed', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000035', output_file: '/tmp/job.output', summary: 'Done' });
+                h.queue.enqueue(assistant(`answer-${i}`)); h.queue.enqueue(finalAnswerItem(`answer-${i}`));
+                h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+                const final = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === `answer-${i}`)!.ev;
+                if (i === 0) {
+                    expect(final).not.toHaveProperty('requestId');
+                    expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
+                } else expect(final).toMatchObject({ requestId: 'channel-A' });
+            }
         } finally { h.queue.destroy(); }
     }, 15000);
 

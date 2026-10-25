@@ -504,6 +504,97 @@ src/openclaw/runOpenClaw.test.ts
 src/toolPolicy/grants.test.ts
 ```
 
+## Round 5: route proven launches after completion eviction (2026-10-25)
+
+Started from `281f5a02`, directly above the parent-integrated review fix `3aa3b97d`.
+The stopped-batch and oversized-final-answer fixes are preserved. This follow-up
+supersedes round 4's blanket refusal to route every `uncertain` completion; it does
+not weaken completion deduplication or restore complete evidence after history loss.
+
+The old task/tool → request map did not say which run owned a retained channel
+request. It is replaced with one launch record per `(subagent, taskId)`, containing
+the tool-use ID, optional run ID and original request ID. `task_started` binds its
+run to the spawning tool's actual turn membership (including hidden Task calls),
+or to the same retained launch. A matching tool result preserves that run binding,
+regardless of whether start or result arrived first. Neither path borrows the
+request of an unrelated currently active turn. Older SDK run IDs cannot overwrite
+a newer launch; the installed SDK explicitly guarantees lexical opening order.
+
+Routing proof and evidence completeness are now separate:
+
+- A retained task/run match, or an explicit matching launch tool ID without a
+  conflicting run, can rearm the original channel even when completion history
+  has overflowed. The follow-up retains available source/root evidence, but adds
+  `background-completion-uncertain` and stays `coverage=incomplete`.
+- A run or tool mismatch vetoes routing. In particular, an evicted earlier run
+  cannot consume the mapping for its successor, even if its tool ID matches.
+- An unproven uncertain completion leaves the newer launch available, adds
+  `background-request-unrouted` alongside the existing unknown-source reasons,
+  and writes `[claude] Background completion not routed` to the file logger.
+  Missing launch mappings or an occupied different channel also get that signal;
+  an active/pending unrelated request is never replaced. Log identity fields are
+  bounded and contain no provider output or prompt text.
+- Launch memory has its own **200-record / 4096-byte-per-record** limit. Repeated
+  runs of one task replace one record instead of accumulating run sets. Consumed
+  matched launches are removed; evicted mappings cannot be reconstructed from
+  the currently active channel. Completion tombstones retain their existing,
+  separate 200-record budget and conservative unknown-history behavior. A known
+  non-channel launch is distinct from an unobserved owner, so a detached run with
+  matching task/run IDs still produces the unrouted signal if ownership is absent.
+  Revisit these budgets if the new diagnostics show routine eviction of active
+  launches; increasing retention must not turn a cache miss into routing proof.
+
+The two new coverage reasons use the existing bounded string-list contract. No
+wire schema, public command, channel request slot, authority, dependency, barrel
+or T1b file changes are needed. Changes stay in the mapper, internal evidence
+callback/state, real-path ordering tests and this report (five existing files).
+
+Verification:
+
+- TDD red: **7 new integration cases failed** on the real SDK converter → outgoing
+  queue → context/ordered dispatcher → mapper/evidence path, with scanner delivery
+  through its independent session boundary. Exact completions lost `channel-A`;
+  unproven old completions lacked the new observability reason/log. Two additional
+  failing assertions covered registered but ownerless runs before the final fix.
+- The final regression selection includes SDK-first/scanner completions, start
+  before/after tool result, explicit tool-only launch identity, an earlier run
+  delivered before the new run, and 600 distinct tasks / 600 runs of one task.
+  New exact follow-ups must retain `channel-A` and the available source root while
+  incomplete; old/evicted completions must not route or consume the new launch.
+- Existing **24 T2RT-07 cases** retain their channel/root/coverage/dedup assertions.
+  The old exact reason-array assertion now requires its existing reason via
+  `arrayContaining`, allowing the newly required observable unrouted reason.
+  Existing **4 T2RT-09 eviction cases** remain unchanged. The hidden Task
+  scanner-only path is covered by the existing mapper tests.
+- Final standard related run: **10 files / 424 tests passed**, including all
+  eight round-5 cases, the 24 T2RT-07 cases and the four T2RT-09 cases. Standard
+  global setup passed CLI `tsc --noEmit`, pkgroll and extension-copy build against
+  the final changes. Existing bin-location/empty-chunk build warnings remain.
+- An earlier aggregate run had four existing `runClaude` loop-spy wait timeouts;
+  its isolated rerun passed 62/62, and the final standard run above passed them
+  all again. No startup-test timeout or fixture behavior was changed this round.
+- `git diff --check` passed. No whole-suite, live paid-provider, native macOS,
+  Desktop or packaged-release acceptance is claimed.
+
+Final standard unit selection (`corepack pnpm -C packages/happy-cli exec vitest
+run --project unit <files> --maxWorkers 1`):
+
+```text
+src/channel/channelTurnOrdering.test.ts
+src/claude/utils/sessionProtocolMapper.test.ts
+src/api/turnInputEvidence.test.ts
+src/api/apiSession.test.ts
+src/claude/utils/sdkToLogConverter.test.ts
+src/claude/utils/sessionScanner.test.ts
+src/claude/claudeRemoteLauncher.test.ts
+src/claude/claudeRemoteLauncher.transientRetry.test.ts
+src/claude/claudeRemoteLauncher.setupTokenSwitch.test.ts
+src/claude/runClaude.test.ts
+```
+
+Delivery: a new behavioral commit and normal push on the existing branch, as
+requested for round 5. No history rewriting, new PR, merge, release or deployment.
+
 ## Known integration boundaries
 
 - Additional-input acceptance records the host's provider handoff. A rejected or

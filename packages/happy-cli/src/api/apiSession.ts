@@ -553,7 +553,7 @@ export class ApiSessionClient extends EventEmitter {
     private skippedInitialMessageSeqs = new Set<number>();
     private claudeSessionProtocolState: ClaudeSessionProtocolState = {
         onBackgroundInputLaunch: (id, turn) => this.inputEvidence.rememberBackground(id, turn),
-        onBackgroundInputRearm: ids => this.inputEvidence.rearmBackground(ids),
+        onBackgroundInputRearm: (ids, reasons) => this.inputEvidence.rearmBackground(ids, reasons),
         currentTurnId: null,
         uuidToProviderSubagent: new Map<string, string>(),
         taskPromptToSubagents: new Map<string, string[]>(),
