@@ -2074,6 +2074,10 @@ export async function runServerAutomationTick(
           advanceSchedule(input, automation.automationId, payload, now)
           deferInactiveGithubIssueProgressMarkerCleanup(input, automation, payload)
           if (payload.githubTrigger) schedulePendingGithubEvent(input, automation, now)
+        } else if (claim.error === 'active-run') {
+          // 즉시 실행 요청은 due 로 남겨 두고 다음 틱에 다시 본다. 서버가 아직 이 자동화의
+          // run 을 쥐고 있다는 뜻이다 — 버려진 run 의 lease 가 만료되기까지 매 틱 여기로 온다.
+          input.logDebug?.(`[server-automation] ${automation.automationId} claim refused: active-run; the server still holds a run for this automation, retrying next tick`)
         }
         continue
       }

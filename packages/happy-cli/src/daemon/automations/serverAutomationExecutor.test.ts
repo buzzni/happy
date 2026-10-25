@@ -407,7 +407,7 @@ describe('runServerAutomationTick', () => {
   })
 
   it('keeps an immediate run request due while another run is active', async () => {
-    const { input, store, transport, now } = setup({ claim: { ok: false, error: 'active-run' } })
+    const { input, store, transport, now, logDebug } = setup({ claim: { ok: false, error: 'active-run' } })
     const requestedAt = now - 1_000
     store.write({
       ...store.read(),
@@ -427,6 +427,9 @@ describe('runServerAutomationTick', () => {
       automationId: 'automation-1', generation: 2, scheduledFor: requestedAt,
     })
     expect(store.state().schedules[0]!.nextRunAt).toBe(requestedAt)
+    // 2026-10-25 — 버려진 run 의 lease 가 남은 6분 동안 매 틱 여기로 와서 조용히 넘어갔다.
+    // 로그 한 줄이 없으면 "due 인데 안 돈다" 를 설명할 수 없다.
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('automation-1 claim refused: active-run'))
   })
 
   it('advances a scheduled slot when another run is already active', async () => {
