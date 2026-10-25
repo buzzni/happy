@@ -1,5 +1,6 @@
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
@@ -46,7 +47,7 @@ import { publishClaudePromptSuggestion } from './promptSuggestionMetadata';
 import { createStreamDeltaRelay } from './streamDeltaRelay';
 import { contextUsageSignalItem, withContextUsageSignals } from './claudeContextUsage';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
-import { claudeNotSignedInNotice, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
+import { claudeNotSignedInNotice, isClaudeAuthenticationFailure, isClaudeTokenRefreshFailure, describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 import { buildMandatoryRemoteDenyRules, resolveClaudeRemoteSandbox } from '@/sandbox/claudeSdkSandbox';
 
 interface PermissionsField {
@@ -56,9 +57,12 @@ interface PermissionsField {
     allowedTools?: string[];
 }
 
+import { createPersonalClaudeFallback, PersonalClaudeRecheckRequired, PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
+import { readPersonalClaudeCredential } from './personalClaudeCredential';
+import { readSetupTokenResumeSelection, isMachineSetupTokenBinding } from '@/daemon/sessionEnv';
 import { createLessonTurnObservations } from '@/memory/lessonTurnObservations';
 import { createSetupTokenAccountSwitching, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE } from './setupTokenAccountSwitching';
-import { reportSetupTokenUsage, requestSetupTokenRebind } from '@/daemon/controlClient';
+import { reportSetupTokenUsage, requestSetupTokenRebind, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import {
     CLAUDE_TRANSIENT_CONTINUE_PROMPT,
     CLAUDE_TRANSIENT_RETRY_DELAYS_MS,
@@ -146,6 +150,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         session.cancelLessonReview();
         // Stop means stop: a retry waiting to fire must not restart the work (and exit/switch end it too).
         transientRetry.cancel();
+        personalFallback?.cancelPending();
         setupTokenSwitching?.cancelForStop();
         if (abortController && !abortController.signal.aborted) {
             /*
@@ -166,6 +171,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
         session.client.markCurrentTurnAborted?.(); // optional: test doubles of the client omit it; the abort must not depend on it
         session.onAbort();
+        personalFallback?.cancelPending();
         setupTokenSwitching?.cancelForStop();
         /*
          * Only a retry was waiting (specs/claude-transient-retry R5a): the stop ends the wait. The
@@ -381,7 +387,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * the terminal is what makes a candidate deliverable, so a failed run reported as completed
      * would relay whatever text happened to be standing (Saycode specs/desktop-messenger-channels).
      */
-    let lastResultSucceeded = true;
+    let lastResultSucceeded = true, lastOrganizationAuthenticationFailed = false;
     /** The drain reads it: after its interrupt Claude Code exits 1, which only an interrupted turn explains. */
     let lastResultInterrupted = false;
     /*
@@ -411,9 +417,54 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
      * (Saycode specs/shared-pc-session-account-continuation).
      */
     const runningAuthority = () => process.env[SETUP_TOKEN_BINDING_ENV] ?? sharedMachineSetupTokenAuthority(process.env);
+    const initialPersonalAuthority = (() => { try { return readSetupTokenResumeSelection({ [SETUP_TOKEN_BINDING_ENV]: process.env[SETUP_TOKEN_BINDING_ENV]! })?.binding } catch { return undefined } })();
+    const personalFallback = initialPersonalAuthority && !isMachineSetupTokenBinding(initialPersonalAuthority) && !session.managedRun && !session.exitAfterFirstTurn ? createPersonalClaudeFallback({
+        env: process.env, now: Date.now, binding: () => process.env[SETUP_TOKEN_BINDING_ENV], busy: () => session.thinking || lastTurnChannel,
+        availability: (binding, consent, failure) => requestSetupTokenAvailability(session.client.sessionId, binding, consent, failure),
+        personal: readPersonalClaudeCredential,
+        rebind: (binding, failure) => returnFromPersonalClaude(session.client.sessionId, binding, failure),
+        notify: message => session.client.sendSessionEvent({ type: 'message', message }),
+    }) : null;
+    const recheckPersonalInput = async (message: { channelRequestId?: string } | null) => {
+        if (!message) return;
+        try {
+            await personalFallback?.beforeUserTurn();
+            if (message.channelRequestId && personalFallback?.identity()) throw new PersonalClaudeRecheckRequired();
+        } catch (error) {
+            if (error instanceof PersonalClaudeRecheckRequired) {
+                launchFailure = PERSONAL_RECHECK_NOTICE;
+                // Bind the refusal in order, after the previous turn's queued terminal.
+                messageQueue.enqueue(pendingRequestItem(message.channelRequestId ?? null));
+                if (message.channelRequestId) messageQueue.enqueue(finalAnswerItem(PERSONAL_RECHECK_NOTICE));
+            }
+            throw error;
+        }
+    };
+    session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown }) => {
+        if (!personalFallback) return { version: 1, supported: false };
+        if (params.action === 'restore-organization') {
+            const restored = await personalFallback.restoreOrganization();
+            // Control requests must not reach an old SDK process that still holds the personal token.
+            const deadline = Date.now() + 10_000;
+            while (restored && providerStale() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+            return { version: 1, supported: true, restored: restored && !providerStale() };
+        }
+        if (params.action === 'accept') {
+            if (typeof params.accountRef !== 'string' || typeof params.nonce !== 'string' || typeof params.consentProof !== 'string') throw new Error('CLAUDE_PERSONAL_CONSENT_REQUIRED');
+            const continueRefusal = setupTokenSwitching?.hasAccountRefusal() || lastOrganizationAuthenticationFailed;
+            await personalFallback.accept(params.accountRef, params.nonce, params.consentProof);
+            setupTokenSwitching?.cancelForStop();
+            // Explicit consent continues the refused quota/authentication turn once, never a successful/channel turn.
+            if (!lastResultSucceeded && !lastTurnChannel && continueRefusal) continuation = lastTurnMode;
+            return { version: 1, supported: true, accepted: true };
+        }
+        if (params.action !== 'status') throw new Error('CLAUDE_PERSONAL_FALLBACK_INVALID_ACTION');
+        return { version: 1, supported: true, offer: await personalFallback.status() };
+    });
+    let providerCredentialGeneration = 0;
     const setupTokenSwitching = runningAuthority() ? createSetupTokenAccountSwitching({
         sessionId: () => session.client.sessionId ?? null,
-        binding: () => providerBinding ?? runningAuthority(),
+        binding: () => personalFallback?.identity() ? undefined : providerBinding ?? runningAuthority(),
         report: reportSetupTokenUsage,
         rebind: requestSetupTokenRebind,
         applyEnvironment: (environment) => { for (const [key, value] of Object.entries(environment)) process.env[key] = value; },
@@ -439,7 +490,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     /** A refused turn to continue as the first turn of the next provider (set by a switch). */
     let continuation: EnhancedMode | null = null;
     /** The provider runs on a binding the session has since switched away from. */
-    const providerStale = () => providerRunning && providerBinding !== undefined && providerBinding !== runningAuthority();
+    const providerStale = () => providerRunning && (providerCredentialGeneration !== (personalFallback?.generation() ?? 0) || providerBinding !== undefined && providerBinding !== runningAuthority());
 
     let backgroundTasks: NonNullable<Metadata['claudeBackgroundTasks']> | undefined;
     function publishBackgroundTasks(next: NonNullable<Metadata['claudeBackgroundTasks']>) {
@@ -448,14 +499,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     function onMessage(message: SDKMessage) {
+        if (isClaudeAuthenticationFailure(message) && !personalFallback?.identity()) { lastOrganizationAuthenticationFailed = true; personalFallback?.noteOrganizationAuthentication(true); }
         sideQuestion.noteMainMessage(message);
         transientRetry.observe(message);
-        if ((message as { type?: unknown }).type === 'rate_limit_event') {
+        if (!personalFallback?.identity() && (message as { type?: unknown }).type === 'rate_limit_event') {
             setupTokenSwitching?.onRateLimitEvent((message as { rate_limit_info?: unknown }).rate_limit_info);
         }
         if (message.type === 'system' && message.subtype === 'init') {
             providerRunning = true;
             providerBinding = runningAuthority();
+            providerCredentialGeneration = personalFallback?.generation() ?? 0;
+            if (personalFallback && initialPersonalAuthority) session.client.setPersonalClaudeFallback({ companyId: initialPersonalAuthority.companyId,
+                machineId: initialPersonalAuthority.machineId, generation: personalFallback.generation(), personal: personalFallback.identity() });
             session.client.setClaudeRuntimeAccount(process.env[SETUP_TOKEN_BINDING_ENV]);
             // The level signal is per provider process. Until its first full
             // snapshot, older CLIs still use this generation's transcript.
@@ -500,6 +555,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             lastResultSucceeded = result.subtype === 'success' && result.is_error !== true;
             lastResultInterrupted = result.subtype === 'error_during_execution';
             const notSignedIn = claudeNotSignedInNotice(result);
+            if (lastResultSucceeded) { lastOrganizationAuthenticationFailed = false; personalFallback?.noteOrganizationAuthentication(false); }
             if (notSignedIn) session.client.sendSessionEvent({ type: 'message', message: notSignedIn });
             if (isClaudeTokenRefreshFailure(result)) {
                 logger.warn(`[claude-auth] OAuth token refresh failed this turn (session process ${process.pid}); a retry may succeed. Concurrent refreshes or a locked keychain are the usual causes.`);
@@ -771,6 +827,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
             providerRunning = false;
+            const optionsCredentialGeneration = personalFallback?.generation() ?? 0;
+            const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -803,6 +861,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         : {}),
                     path: session.path,
                     managedSettingsLockdown: session.managedSettingsLockdown,
+                    personalClaudeAuth: personalFallback?.identity() ? { oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? '' } : undefined,
                     managedRun: session.managedRun,
                     /*
                      * A fresh observer for **this** generation.
@@ -858,19 +917,23 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         return permissionHandler.isAborted(toolCallId);
                     },
                     nextMessage: async () => {
-                        await messageQueue.flush();
+                        // Personal consent can arrive while evidence/transcript delivery is draining.
+                        // Capture the refused turn's mode synchronously, before yielding to that consent.
                         if (mode) lastTurnMode = mode;
+                        await messageQueue.flush();
                         const wasAccountRefused = setupTokenSwitching?.hasAccountRefusal();
                         const accountSwitch = await setupTokenSwitching?.switchIfWanted();
                         if (accountSwitch?.switched && accountSwitch.continueAfter && !lastResultSucceeded && !lastTurnChannel && !controller.signal.aborted) {
                             continuation = mode ?? lastTurnMode;
                         }
-                        if (wasAccountRefused && accountSwitch && !accountSwitch.switched && !setupTokenSwitching?.backgroundSignal()
+                        // Consent accepted during the lookup has already selected a continuation.
+                        // Cancelling the old organization wait must not cancel that input witness.
+                        if (wasAccountRefused && accountSwitch && !accountSwitch.switched && !continuation && !setupTokenSwitching?.backgroundSignal()
                             && session.client.inputEvidence?.snapshot()?.continuation.kind === 'claude-account-switch') {
                             session.client.inputEvidence.cancelContinuation('cancelled');
                         }
                         // A running provider keeps the token it started with: end it, the loop resumes the conversation.
-                        if (providerStale()) return null;
+                        if (providerOptionsStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
                             if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
@@ -886,6 +949,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
                             let p = pending;
                             pending = null;
+                            await recheckPersonalInput(p);
+                            if (providerOptionsStale()) {
+                                pending = p;
+                                drain?.releaseClaim();
+                                return null;
+                            }
                             // This is the path an isolated channel turn actually takes: it was
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
@@ -968,11 +1037,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // A refused turn waiting for an organization account in the background
                             // (Saycode specs/claude-setup-token-managed-sync R7).
                             const switchWake = setupTokenSwitching?.backgroundSignal() ?? null;
-                            const wakes = [retryWake, switchWake].filter((signal): signal is AbortSignal => signal !== null);
+                            const personalWake = personalFallback?.signal() ?? null;
+                            const wakes = [retryWake, switchWake, personalWake].filter((signal): signal is AbortSignal => signal !== null);
                             msg = await session.queue.waitForMessagesAndGetAsString(
                                 wakes.length ? AbortSignal.any([controller.signal, ...wakes]) : controller.signal,
                                 drain ? () => drain.claimTurn() : undefined,
                             );
+                            if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
                             if (!msg && switchWake?.aborted && !controller.signal.aborted) {
                                 // A wait an ended provider left behind leaves the finished switch to the live generation.
                                 if (providerEnded) return null;
@@ -982,7 +1053,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 if (accountSwitch.switched && accountSwitch.continueAfter && !lastResultSucceeded && !lastTurnChannel) {
                                     continuation = mode ?? lastTurnMode;
                                 }
-                                if (providerStale()) return null;
+                                if (providerOptionsStale()) return null;
                                 if (!providerRunning && continuation) {
                                     if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
                                         session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput(), {
@@ -1025,6 +1096,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         }
                         // The user's own input replaces a waiting retry, and a background wait for an account.
                         if (msg) {
+                            lastOrganizationAuthenticationFailed = false;
                             if (!msg.continuation) session.client.inputEvidence?.cancelContinuation('replaced');
                             transientRetry.userTurnStarted(); setupTokenSwitching?.userTurnStarted();
                         }
@@ -1049,9 +1121,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
                         // A switch that failed at the boundary is tried again before this message reaches the used-up
                         // account. The user's own message replaces the automatic continuation.
-                        if (msg && !providerStale()) await setupTokenSwitching?.switchIfWanted();
+                        await recheckPersonalInput(msg);
+                        if (msg && !personalFallback?.identity() && !providerStale()) await setupTokenSwitching?.switchIfWanted();
                         // A message that arrives after a switch (another boundary, or while it ran) belongs to the next provider.
-                        if (msg && providerStale()) {
+                        if (msg && providerOptionsStale()) {
                             pending = msg;
                             drain?.releaseClaim();
                             return null;
@@ -1068,12 +1141,36 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             }
                             const engineModeChanged = mode && (mode.model !== msg.mode.model || mode.effort !== msg.mode.effort);
                             if ((modeHash && msg.hash !== modeHash) || engineModeChanged || msg.isolate) {
-                                logger.debug('[remote]: mode has changed, pending message');
-                                pending = msg;
-                                drain?.releaseClaim();
-                                return null;
+                                /*
+                                 * A restart ends this provider's input and waits for it to
+                                 * exit, but live background work keeps Claude Code running:
+                                 * every message after this one would wait for that work to
+                                 * end. So the running provider answers it — `claudeRemote`
+                                 * switches model and effort in place — and the old hash
+                                 * stays, so the first message after the work restarts the
+                                 * provider with the settings that need a new process.
+                                 *
+                                 * Not for an isolated turn, which needs its own provider, nor
+                                 * for a managed run, whose model and effort its plan binds,
+                                 * nor for a changed tool policy or plan mode: both reach the
+                                 * SDK only at launch, and the running provider would still
+                                 * allow what the message disallows.
+                                 */
+                                const keepForBackgroundWork = !msg.isolate && !session.managedRun
+                                    && (backgroundTasks?.tasks?.length ?? 0) > 0
+                                    && isDeepStrictEqual(mode?.allowedTools, msg.mode.allowedTools)
+                                    && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools)
+                                    && (mode?.permissionMode === 'plan') === (msg.mode.permissionMode === 'plan');
+                                if (!keepForBackgroundWork) {
+                                    logger.debug('[remote]: mode has changed, pending message');
+                                    pending = msg;
+                                    drain?.releaseClaim();
+                                    return null;
+                                }
+                                logger.debug('[remote]: mode has changed, kept provider for its background work');
+                            } else {
+                                modeHash = msg.hash;
                             }
-                            modeHash = msg.hash;
                             mode = msg.mode;
                             // The batch about to run is what answers the request, so the handle is
                             // attached here rather than where the message was queued: between those
@@ -1263,7 +1360,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             && !session.managedRun && !session.exitAfterFirstTurn && !controller.signal.aborted
                             && !pending && session.queue.size() === 0 && !gracefulStop?.requested()
                             ? { mode: turnMode, hash: modeHash } : null);
-                        const accountRetry = !lastResultSucceeded && !lastTurnChannel && setupTokenSwitching?.hasAccountRefusal();
+                        const accountRetry = !lastResultSucceeded && !lastTurnChannel
+                            && (setupTokenSwitching?.hasAccountRefusal() || (personalFallback && lastOrganizationAuthenticationFailed));
                         if (retry?.kind === 'scheduled' || accountRetry) messageQueue.enqueue({
                             __inputContinuation: accountRetry ? 'claude-account-switch' : 'claude-transient',
                         });
@@ -1321,7 +1419,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 if (!exitReason) {
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
-                    if (setupTokenSwitching?.hasAccountRefusal()) {
+                    if (e instanceof PersonalClaudeRecheckRequired) { launchFailure = PERSONAL_RECHECK_NOTICE; }
+                    else if (setupTokenSwitching?.hasAccountRefusal()) {
                         await messageQueue.flush();
                         if (!lastTurnChannel) session.client.continueClaudeInputEvidence?.('claude-account-switch');
                         session.client.closeClaudeSessionTurn('failed');
@@ -1437,6 +1536,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         transientRetry.cancel();
         session.client.inputEvidence?.cancelContinuation('cancelled');
         session.client.setInputSteerAvailable?.(false);
+        personalFallback?.cancel();
+        if (personalFallback) { session.client.setPersonalClaudeFallback(undefined); session.client.setClaudeRuntimeAccount(undefined); }
         setupTokenSwitching?.dispose();
 
         // Clean up permission handler

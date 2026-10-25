@@ -856,3 +856,10 @@ describe('buildSessionRequesterEnv', () => {
         expect(sanitizeChildEnv({ ...env, SAFE: 'kept' })).toEqual({ SAFE: 'kept' })
     })
 })
+
+it('does not accept personal descriptors or ownership through request environment', () => {
+    expect(buildSpawnRequestEnvironment({}, {
+        SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo', SAYCODE_AGENT_PERSONAL: 'true',
+        SAYCODE_AGENT_OWNER: 'someone', SAYCODE_AGENT_IDENTITY_DESCRIPTOR: 'forged',
+    })).toEqual({ SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: '/repo' })
+})

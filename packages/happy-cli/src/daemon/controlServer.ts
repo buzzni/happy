@@ -497,6 +497,15 @@ export function startDaemonControlServer({
       const switcher = getSetupTokenAccountSwitch();
       return switcher ? switcher.reportUsage(request.body.sessionId, request.body.binding, request.body.observation, signal) : { ok: false as const, reason: 'STUDIO_UNAVAILABLE' as const };
     });
+    for (const action of ['availability', 'return'] as const) typed.post(`/setup-token/${action}`, {
+      bodyLimit: 16384,
+      schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), organizationFailure: z.object({ kind: z.literal('authentication'), observedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict().optional(), personalConsent: z.object({ proof: z.string().min(1).max(4096), accountRef: z.string().regex(/^[a-f0-9]{64}$/), nonce: z.string().regex(/^[a-f0-9]{48}$/) }).strict().optional() }).strict() },
+    }, async (request) => {
+      const switcher = getSetupTokenAccountSwitch()
+      if (!switcher) return { ok: false as const, reason: 'STUDIO_UNAVAILABLE' }
+      return action === 'availability' ? switcher.availability(request.body.sessionId, request.body.binding, request.body.personalConsent, request.body.organizationFailure)
+        : switcher.returnFromPersonal(request.body.sessionId, request.body.binding, request.body.organizationFailure)
+    });
     typed.post('/setup-token/rebind', {
       bodyLimit: 4096,
       schema: { body: z.object({ sessionId: z.string().min(1).max(128), binding: z.string().min(1).max(8192), observation: setupTokenObservation.optional() }).strict() },

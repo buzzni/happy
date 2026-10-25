@@ -27,6 +27,7 @@ export function buildClaudeTitleQueryOptions(base: QueryOptions, input: {
     signal: AbortSignal;
 }): QueryOptions {
     return {
+        personalClaudeAuth: base.personalClaudeAuth,
         cwd: base.cwd,
         settingSources: base.settingSources,
         sandbox: base.sandbox,

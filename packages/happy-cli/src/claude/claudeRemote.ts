@@ -141,6 +141,7 @@ export async function claudeRemote(opts: {
     mcpServers?: Record<string, any>,
     claudeEnvVars?: Record<string, string>,
     managedSettingsLockdown?: boolean,
+    personalClaudeAuth?: QueryOptions['personalClaudeAuth'],
     /** 관리 실행인가. 마지막 경계에서 계획을 덮을지 정한다. */
     managedRun?: boolean,
     /**
@@ -507,6 +508,7 @@ async function runClaudeRemote(
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
     const assembledOptions: QueryOptions = {
+        personalClaudeAuth: opts.personalClaudeAuth,
         cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,
@@ -1208,7 +1210,18 @@ function readTurnText(content: unknown): string {
                         // 앞에 두면 직전 턴의 늦은 prompt_suggestion 이 새 턴으로
                         // 새어든다.
                         await measurePreparation(preparation, 'mcp-recovery', () => mcpRecovery.recoverFailedServers());
-                        mode = next.mode;
+                        // The launcher keeps a provider with live background work rather
+                        // than restart it for new settings; model and effort switch here.
+                        // A failed switch still answers, on the old engine, and is
+                        // remembered as not applied so the next turn tries again.
+                        let { model, effort } = mode;
+                        try {
+                            if (next.mode.model !== model) { await response.setModel(next.mode.model); model = next.mode.model; }
+                            if (next.mode.effort !== effort) { await response.applyFlagSettings({ effortLevel: next.mode.effort ?? null }); effort = next.mode.effort; }
+                        } catch (error) {
+                            logger.debug('[claudeRemote] In-place model/effort switch failed', error);
+                        }
+                        mode = { ...next.mode, model, effort };
                         // Content can be structured blocks; only plain text is
                         // usable as a recall query or as review evidence — but
                         // the blocks themselves are what gets sent, so recall

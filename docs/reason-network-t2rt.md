@@ -889,7 +889,8 @@ Verification:
 - Live paid-provider runs, Desktop reconstruction/UI, distributed crash recovery,
   registry packaging and cross-repository integration are not established by unit tests.
 
-Status: T2rt implementation and scoped verification complete (2026-10-25).
+Historical status before the 2026-10-26 rescope: T2rt implementation and scoped
+verification complete (2026-10-25).
 The requested branch is `feat/rn-t2rt-input-evidence`, based on origin/main
 `9ee84191cf6e6b2739987be3f5488ef511c6474f`. The independent working clone is
 `/home/walter/workspace/aplus-dev-studio-desktop/.aplus/worktrees/rn-ext/happy-t2rt`.
@@ -909,7 +910,8 @@ Tests removed/reworked: the T2RT-07 duplicate routing matrix, T2RT-08 resumed-ru
 routing assertions, T2RT-09 routing refusal, T2RT-10/11/12 default-deny/status/alias
 routing matrix, T2RT-13 history-loss/recovery routing assertions and launch-map
 routing stress expectations. These no longer define #951's behavior. Retained
-or rewritten evidence coverage includes T2RT-02/03 active/pending/idle delivery
+or rewritten evidence coverage includes all 24 T2RT-07 SDK/scanner ordering
+variants with their routing assertions removed, T2RT-02/03 active/pending/idle delivery
 and witness eviction, identity/status uncertainty, bounded history, actual scanner
 metadata from both locations, SDK observation without routing, consumed-scanner
 positive proof and the two reviewer risk classes with incomplete evidence.
@@ -950,5 +952,98 @@ non-channel final publication changing main's default; the explicit evidence
 opt-in corrected it. Final rescope selection, including the extra scanner-staging regression: **4 files /
 141 tests passed**; standard typecheck/build passed again. `git diff --check` passed.
 
-Main merge and final validation: pending. No paid-provider, Desktop or packaged
-runtime acceptance is claimed.
+## Regular main merge and personal-fallback integration (2026-10-26)
+
+Final merge target: `19aa650ee001efa5198b7c6f1c51d67e10c7b38f` (`origin/main`). Main advanced after the first
+validation against `0aac5971`; the uncommitted merge was restarted on the latest
+main with all four local change files preserved byte-for-byte. The committed
+rescope and all existing history remain unchanged.
+Resolve the two conflict files by retaining both import groups, main's
+organization-authentication reset before T2rt's replacement cancellation,
+`PersonalClaudeRecheckRequired` before the account-refusal flush/close, and both
+cleanup paths. No dependency versions or lockfile changed (the CLI version and a
+development script changed upstream), so no dependency reinstall is needed.
+
+The trial resolution reproduced **7 five-second timeouts / 10 passes**. The
+cause is T2rt's added `await messageQueue.flush()` before main saved `lastTurnMode`:
+consent arrives while output is draining, sees a null mode despite a refused
+result, and schedules no continuation. Save the mode synchronously before the
+flush; no timeout increase. With that correction all seven original scenarios
+pass. The expanded tests run the same scenarios with and without real witness
+state and assert the continued original REST identity/root.
+
+Additional evidence integration reproductions:
+
+- An organization authentication failure may lead to approved personal
+  continuation without an organization quota refusal. The expanded suite was
+  **23 passed / 1 failed**: only that evidence-enabled scenario lost its root
+  and became unidentified. Retain an account-switch witness for this existing
+  personal-fallback flow, without changing when main permits continuation.
+- Consent during an in-flight organization rebind cancels the organization wait.
+  T2rt's old cancellation check then cancelled the already-selected personal
+  continuation's witness. The focused reproduction was **1 passed / 1 failed**
+  (24 skipped); the evidence-disabled main behavior passed. Preserve the witness
+  when a continuation has already been selected. This regression uses a held
+  rebind promise, without artificial timeout extensions.
+
+First merged related CLI validation (`0aac5971`): **41 files / 1095 tests: 1093 passed, 2 environmental
+failures**. All **26 setup-token/personal-fallback cases** passed, including the
+seven original main scenarios, their witness-enabled variants and consent during
+an in-flight rebind. All channel, mapper, input-evidence, API session, managed
+startup and other launcher cases in the selection passed. Standard global setup
+passed CLI typecheck, pkgroll and extension-copy build.
+
+The two failures are the real-supervisor cases in
+`daemon/launch/managedLauncherBoot.test.ts`: before opening their Unix sockets,
+`assertTrustedRoot` rejects `/tmp`'s sandbox owner (UID 65534; process UID 1000).
+Both that test file and `launcher/generationManifest.ts` are unchanged from
+`9ee84191` and `origin/main`. This is an environmental ownership failure, not an
+observed socket EPERM, and is not counted as a pass. No security check, filesystem
+ownership or test assertion was changed to bypass it. The other four managed
+startup files and `managedLauncherBinding.test.ts` passed.
+
+Selection (all under `packages/happy-cli`, expanded to individual `src/...`
+arguments before calling `corepack pnpm -C packages/happy-cli exec vitest run
+--project unit <files> --maxWorkers 2`): all `src/channel/*.test.ts`,
+`src/claude/*Launcher*.test.ts`, `src/managed/*Startup*.test.ts` and
+`src/daemon/launch/managedLauncher*.test.ts`, plus:
+
+```text
+src/api/{apiSession,automationTurnTracker,turnInputEvidence,types}.test.ts
+src/claude/{claudeContextUsage,claudeRemote,personalClaudeCredential,personalClaudeFallback,runClaude,runClaudeOfflineAck,setupTokenAccountSwitching}.test.ts
+src/claude/utils/{permissionHandler,sdkToLogConverter,sessionProtocolMapper,sessionScanner}.test.ts
+src/codex/{codexAppServerClient,runCodex.capacityRetry}.test.ts
+src/codex/{utils,__tests__}/sessionProtocolMapper.test.ts
+src/utils/MessageQueue2.test.ts
+```
+
+Wire build/typecheck and **39/39** wire schema tests passed. A separate final CLI
+typecheck passed. `git diff --check` passed. Existing empty-chunk/bin-location
+build warnings and listener/asynchronously-handled-rejection harness warnings
+remain. No whole-suite, paid-provider, Desktop or packaged runtime acceptance is
+claimed. No other branch, PR creation, rebase, force-push, tag or release action
+is part of this delivery.
+
+
+Final review also retains the full 24-case reviewer evidence ordering matrix
+(both delivery orders, four run-metadata combinations and follow-up/idle/unrelated
+arrival phases). Its superseded routing assertions are removed: SDK observation
+is incomplete unless consumption was already witnessed, exact SDK duplicates of
+consumed scanner input do not contaminate unrelated evidence, and scanner closure
+continues to follow main. Twelve scanner status/run proof cases mirror the SDK
+uncertainty matrix without changing main routing. Final focused validation of
+these retained cases and the unchanged compatibility suites passed **4 files /
+177 tests**, including all 24 ordering cases and 12 scanner proof cases.
+
+Latest-main final related validation: **41 files / 1171 tests passed**, including
+all **82 channel ordering/evidence cases**, all **26 personal/account-switch
+cases**, the unchanged **15 channel / 50 mapper compatibility cases**, and the
+Codex permission-handler consumer affected by latest main. Standard global setup
+again passed CLI typecheck, pkgroll and extension-copy build. The selection is the
+first merged selection above with the known environmental boot suite removed and
+`src/codex/__tests__/permissionHandler.test.ts` added. The two earlier boot failures
+remain reported separately, not counted as passes or repeated without a changed
+environment; both test and manifest check remain unchanged. No socket EPERM was
+observed in this final selection. `git diff --check` passed. Delivery is the
+rescope commit followed by one regular latest-main merge and a normal push to
+`feat/rn-t2rt-input-evidence`.

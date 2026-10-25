@@ -25,6 +25,8 @@ const recordSchema = z.object({
 }).strict()
 type ClientRecord = z.infer<typeof recordSchema>
 export interface LocalClientOptions {
+    storage?: { file: string; maxLeaseMs: number; maxGrants: number }
+    otherActiveCount?: (principalId: string) => number
     stateDir: string
     agentKey: string | Buffer
     now(): number
@@ -41,10 +43,11 @@ const hash = (secret: string) => createHash('sha256').update(secret).digest('hex
 const denied = () => new BrowserRuntimeError('UNAUTHORIZED', 'Client credential is invalid, expired or revoked')
 
 export async function openLocalClients(options: LocalClientOptions) {
-    const file = join(options.stateDir, 'browser-local-clients.json')
+    const file = join(options.stateDir, options.storage?.file ?? 'browser-local-clients.json')
+    const registerSchema = registrationRequest.extend({ leaseMs: z.number().int().min(1_000).max(options.storage?.maxLeaseMs ?? MAX_LEASE_MS) })
     let records: Record<string, ClientRecord> = {}
     try {
-        records = z.object({ schemaVersion: z.literal(1), clients: z.record(z.string(), recordSchema) }).strict()
+        records = z.object({ schemaVersion: z.literal(1), clients: z.record(z.string(), recordSchema.extend({ grantIds: z.array(id).max(options.storage?.maxGrants ?? 256) })) }).strict()
             .parse(JSON.parse(await readFile(file, 'utf8'))).clients
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Local client registry is unreadable')
@@ -104,7 +107,20 @@ export async function openLocalClients(options: LocalClientOptions) {
     }
     const metadata = (r: ClientRecord) => ({ schemaVersion: 1, clientSessionId: r.clientSessionId, profileId: r.profileId,
         taskSpaceId: r.taskSpaceId, origins: r.origins, operations: OPERATIONS, expiresAtMs: r.expiresAtMs })
+    const activeCount = (principal: string) => Object.values(records).filter(r => !r.revoking && r.expiresAtMs > options.now() && r.principalId === principal).length
     return {
+        activeCount,
+        hasClient: (clientId: string) => Boolean(records[clientId]),
+        /** Trusted registry recovery; never exposed as an unauthenticated broker action. */
+        revokeMatching: (matches: (clientId: string) => boolean) => exclusive(async () => {
+            let cleanupPending = false
+            for (const record of Object.values(records)) {
+                if (!matches(record.clientSessionId)) continue
+                try { cleanupPending = (await revoke(record)).cleanupPending || cleanupPending }
+                catch { cleanupPending = true }
+            }
+            return { revoked: true, cleanupPending }
+        }),
         isActive: (id: string) => Boolean(records[id] && !records[id].revoking && records[id].expiresAtMs > options.now()),
         sweep,
         drain: () => tail.then(() => undefined),
@@ -125,7 +141,7 @@ export async function openLocalClients(options: LocalClientOptions) {
                 return revoke(target)
             }
             if (action === 'register') {
-                const parsed = registrationRequest.safeParse(raw)
+                const parsed = registerSchema.safeParse(raw)
                 if (!parsed.success) throw new BrowserRuntimeError('INVALID_REQUEST', 'Invalid client registration')
                 const req = parsed.data
                 const owner = await options.owner(secret, req.profileId)
@@ -133,9 +149,8 @@ export async function openLocalClients(options: LocalClientOptions) {
                 const ownerGrant = owner.credential
                 if (req.origins.some(o => !ownerGrant.allowedOrigins.includes(o)))
                     throw new BrowserRuntimeError('SCOPE_DENIED', 'Client origin is outside owner policy')
-                const now = options.now()
-                if (Object.values(records).filter(r => !r.revoking && r.expiresAtMs > now && r.principalId === owner.credential.principalId).length >= 16) throw new BrowserRuntimeError('CONFLICT', 'Too many local client connections')
-                const clientSecret = randomBytes(32).toString('base64url')
+                if (activeCount(owner.credential.principalId) + (options.otherActiveCount?.(owner.credential.principalId) ?? 0) >= 16) throw new BrowserRuntimeError('CONFLICT', 'Too many local client connections')
+                const now = options.now(), clientSecret = randomBytes(32).toString('base64url')
                 const r: ClientRecord = { clientSessionId: `client-${randomUUID()}`, secretHash: hash(clientSecret),
                     principalId: owner.credential.principalId, workspaceId: owner.credential.workspaceId, machineId: owner.credential.machineId,
                     profileId: owner.credential.profileId, assignmentId: owner.credential.assignmentId,
@@ -161,7 +176,7 @@ export async function openLocalClients(options: LocalClientOptions) {
             if (action === 'status') return metadata(r)
             const now = options.now()
             if (!r.lastGrant || (r.lastGrant.expiresAtMs !== r.expiresAtMs && r.lastGrant.expiresAtMs - now < 180_000)) {
-                if (r.grantIds.length >= 256) throw new BrowserRuntimeError('CONFLICT', 'Client grant limit reached')
+                if (r.grantIds.length >= (options.storage?.maxGrants ?? 256)) throw new BrowserRuntimeError('CONFLICT', 'Client grant limit reached')
                 const grantId = `grant-${randomUUID()}`
                 r.lastGrant = { grantId, issuedAtMs: now, expiresAtMs: Math.min(now + TOKEN_MS, r.expiresAtMs) }
                 r.grantIds.push(grantId)

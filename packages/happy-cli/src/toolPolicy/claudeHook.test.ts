@@ -128,6 +128,31 @@ describe('Claude PreToolUse policy hook', () => {
         expect(recent[recent.length - 1].map((r) => r.reasonCode)).toEqual(['user_denied', 'recently_denied']);
     });
 
+    it('ask → declined with a reason hands the model the R12 text followed by the person\'s reason', async () => {
+        const asked: Asked[] = [];
+        const { port, secretFile, recent } = await setup({ approver: approverAnswering({ approved: false, policyGrant: 'once', userReason: '비용이 커요' }, asked) });
+        const result = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        const reason = decision(result.stdout).permissionDecisionReason ?? '';
+        expect(decision(result.stdout).permissionDecision).toBe('deny');
+        expect(reason).toMatch(/^도구 정책으로 막힘: .*거절.*우회하지 마라.*\n\nUser's reason: 비용이 커요$/s);
+        // The audit names the outcome only; what the person wrote stays out of the log.
+        expect(JSON.stringify(recent)).not.toContain('비용이 커요');
+    });
+
+    it('ask → declined by a client that only sends the legacy reason still carries it as the person\'s reason', async () => {
+        const asked: Asked[] = [];
+        const { port, secretFile } = await setup({ approver: approverAnswering({ approved: false, policyGrant: 'once', reason: 'not now' }, asked) });
+        const result = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        expect(decision(result.stdout).permissionDecisionReason).toMatch(/우회하지 마라.*\n\nUser's reason: not now$/s);
+    });
+
+    it('ask → declined with a blank own reason falls back to the legacy reason', async () => {
+        const asked: Asked[] = [];
+        const { port, secretFile } = await setup({ approver: approverAnswering({ approved: false, policyGrant: 'once', userReason: '  \u0000 ', reason: 'not now' }, asked) });
+        const result = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        expect(decision(result.stdout).permissionDecisionReason).toMatch(/우회하지 마라.*\n\nUser's reason: not now$/s);
+    });
+
     it('blocks a policy-blocked call with the app, the alternative and the no-bypass line', async () => {
         const { port, secretFile } = await setup({ approver: null, resolver: TERMINAL_RESOLVER });
         const result = await runHook([String(port), secretFile], payload('mcp__cua-driver__type_text', { pid: 11, text: 'rm -rf ~' }));

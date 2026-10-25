@@ -45,3 +45,25 @@ it('rejects readable-by-others descriptors and cancels on collection failure wit
     expect(h.runtime.mock.calls.at(-1)?.[2]).toBe('cancel')
     expect(JSON.stringify(h.output)).not.toContain('secret-token')
 })
+it('rolls back a cancelled v2 registration with new app proof instead of the owner credential', async () => {
+    const h = await setup(), controller = new AbortController()
+    const calls: { action: string; secret: string; body: unknown }[] = []
+    const broker = async (_socket: string, action: string, secret: string, body: unknown) => {
+        calls.push({ action, secret, body })
+        if (action === 'v2:register-app') {
+            controller.abort(new Error('Owner exited after registration'))
+            return { appId: 'app-one', appSecret: 'a'.repeat(43), clientSecret: 'client-secret', clientSessionId: 'client-one',
+                profileId: 'main', taskSpaceId: 's', expiresAtMs: Date.now() + 60_000 }
+        }
+        expect(secret).not.toBe('owner-secret')
+        return { revoked: true }
+    }
+    const result = await handleBrowserClientCommand(['create', '--space', 's', '--profile', 'main', '--origin', 'https://fixture.test', '--lease-minutes', '15', '--out', h.file], {
+        ...h.deps, broker, signal: controller.signal,
+        appRegistration: { name: 'Dashboard', projectRoot: h.file.slice(0, h.file.lastIndexOf('/')), outFile: h.file, rememberSameScope: true },
+    })
+    expect(result).toBe(3)
+    expect(calls.at(-1)).toEqual({ action: 'v2:revoke-app-proof', secret: 'a'.repeat(43), body: { schemaVersion: 2, appId: 'app-one' } })
+    await expect(stat(h.file)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(JSON.stringify(h.output)).not.toMatch(/aaaaaaa|owner-secret|client-secret/)
+})

@@ -312,6 +312,25 @@ describe('automationSocketHandler', () => {
         await pending;
     });
 
+    it('answers invalid-input when the result cannot be put on the wire, instead of leaving the ack unanswered', async () => {
+        // ack 를 fan-out 앞으로 옮기면서 wire() 를 감싸던 try 가 빠지면, 직렬화 예외가 핸들러 밖으로
+        // 새어 ack 없는 요청이 된다 — 데몬 쪽에서는 30초 타임아웃으로만 보인다.
+        const handlers = bind();
+        services.claimAutomationRun.mockResolvedValue({
+            ok: true,
+            value: { get runId(): string { throw new Error('unserializable'); } },
+        });
+
+        const callback = vi.fn();
+        await handlers.get('automation-claim')!({
+            automationId: 'automation-1', generation: 3, scheduledFor: 1000,
+        }, callback);
+
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-input' });
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(services.emitProjectAutomationUpdate).not.toHaveBeenCalled();
+    });
+
     it('keeps a successful acknowledgement when the project update fan-out fails', async () => {
         const handlers = bind();
         services.reportAutomationRun.mockResolvedValue({

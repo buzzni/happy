@@ -29,4 +29,8 @@ describe('SESSION_EVENT_TYPES', () => {
         expect(values).toContain('message-hidden');
         expect(values).toContain('message-unhidden');
     });
+
+    it('exposes turn-ready for the content-free signal that a session went idle', () => {
+        expect(SESSION_EVENT_TYPES.TURN_READY).toBe('turn-ready');
+    });
 });

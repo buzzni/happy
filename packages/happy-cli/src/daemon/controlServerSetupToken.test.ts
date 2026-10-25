@@ -15,7 +15,7 @@ async function control(switcher: SetupTokenAccountSwitch | null) {
 
 describe('setup-token control routes (specs/claude-setup-token-account-selection)', () => {
   it('forwards a session usage report and a switch request, authenticated by the control secret', async () => {
-    const switcher = {
+    const switcher = { availability: vi.fn(async () => ({ ok: true as const, allLimited: true, availableAccountIds: [], consentApproved: true })), returnFromPersonal: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'fixture-org' } })),
       reportUsage: vi.fn(async () => ({ ok: true as const })),
       rebind: vi.fn(async () => ({ ok: true as const, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })),
     }
@@ -27,6 +27,13 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect(switcher.rebind).not.toHaveBeenCalled()
       expect(await (await post('/setup-token/usage', { sessionId: 'session-a', binding: '{}', observation })).json()).toEqual({ ok: true })
       expect(switcher.reportUsage).toHaveBeenCalledWith('session-a', '{}', observation, expect.any(AbortSignal))
+      const organizationFailure={kind:'authentication',observedAt:1000}
+      const personalConsent={proof:'fixture-proof',accountRef:'a'.repeat(64),nonce:'b'.repeat(48)}
+      expect((await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent,organizationFailure},false)).status).toBe(401)
+      expect(await (await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent,organizationFailure})).json()).toMatchObject({ok:true,allLimited:true,consentApproved:true})
+      expect(switcher.availability).toHaveBeenCalledWith('session-a','{}',personalConsent,organizationFailure)
+      expect(await (await post('/setup-token/return',{sessionId:'session-a',binding:'{}',organizationFailure})).json()).toMatchObject({ok:true})
+      expect(switcher.returnFromPersonal).toHaveBeenCalledWith('session-a','{}',organizationFailure)
       expect(await (await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}' })).json()).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })
       const finalRefusal = { observedAt: 10, reason: 'rate-limited', retryAt: null, windows: [] };
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', observation: finalRefusal })).status).toBe(200);
@@ -39,7 +46,7 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
     let cancelled = false;
     let started!: () => void;
     const ready = new Promise<void>(resolve => { started = resolve });
-    const switcher = { reportUsage: vi.fn(), rebind: vi.fn<SetupTokenAccountSwitch['rebind']>(async (_id, _binding, _observation, signal) => {
+    const switcher = { availability: vi.fn(), returnFromPersonal: vi.fn(), reportUsage: vi.fn(), rebind: vi.fn<SetupTokenAccountSwitch['rebind']>(async (_id, _binding, _observation, signal) => {
       started();
       await new Promise<void>(resolve => signal!.addEventListener('abort', () => { cancelled = true; resolve() }, { once: true }));
       return { ok: false, reason: 'REQUEST_FAILED' };

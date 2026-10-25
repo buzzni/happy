@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
     findAutomationRun: vi.fn(),
     dispatchSessionEventPush: vi.fn(),
     emitEphemeral: vi.fn(),
+    persistTurnReadySessionEvent: vi.fn(),
 }));
 
 vi.mock('@/storage/db', () => ({
@@ -22,6 +23,7 @@ vi.mock('@/storage/db', () => ({
     },
 }));
 vi.mock('@/app/push/pushDispatch', () => ({ dispatchSessionEventPush: mocks.dispatchSessionEventPush }));
+vi.mock('@/app/events/persistSessionEvent', () => ({ persistTurnReadySessionEvent: mocks.persistTurnReadySessionEvent }));
 vi.mock('@/app/events/eventRouter', () => ({
     buildSessionEventEphemeral: vi.fn(() => ({ type: 'session-event' })),
     eventRouter: { emitEphemeral: mocks.emitEphemeral },
@@ -94,6 +96,52 @@ describe('pushRoutes automation completion', () => {
 
         expect(response.statusCode).toBe(200);
         expect(mocks.findAutomationRun).not.toHaveBeenCalled();
+        expect(mocks.emitEphemeral).toHaveBeenCalledOnce();
+        expect(mocks.dispatchSessionEventPush).toHaveBeenCalledOnce();
+    });
+});
+
+describe('pushRoutes turn-ready event', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mocks.findSession.mockResolvedValue({ id: 'session-1' });
+        mocks.findAutomationRun.mockResolvedValue(null);
+        mocks.persistTurnReadySessionEvent.mockResolvedValue({ id: 'event-1', seq: 1 });
+    });
+
+    it('records a turn-ready event when the session reports done', async () => {
+        const response = await sendDone(await makeApp());
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.persistTurnReadySessionEvent).toHaveBeenCalledWith('session-1');
+    });
+
+    it('does not record a turn-ready event for a SILENT automation session', async () => {
+        mocks.findAutomationRun.mockResolvedValue({ id: 'run-1' });
+        await sendDone(await makeApp());
+
+        expect(mocks.persistTurnReadySessionEvent).not.toHaveBeenCalled();
+    });
+
+    it('does not record a turn-ready event for attention-required events', async () => {
+        const app = await makeApp();
+        for (const kind of ['permission', 'question']) {
+            await app.inject({
+                method: 'POST',
+                url: '/v1/sessions/session-1/push-event',
+                headers: { authorization: 'Bearer test' },
+                payload: { kind, title: 'Needs you', body: 'Session' },
+            });
+        }
+
+        expect(mocks.persistTurnReadySessionEvent).not.toHaveBeenCalled();
+    });
+
+    it('still notifies when recording the turn-ready event fails', async () => {
+        mocks.persistTurnReadySessionEvent.mockRejectedValue(new Error('db down'));
+        const response = await sendDone(await makeApp());
+
+        expect(response.statusCode).toBe(200);
         expect(mocks.emitEphemeral).toHaveBeenCalledOnce();
         expect(mocks.dispatchSessionEventPush).toHaveBeenCalledOnce();
     });

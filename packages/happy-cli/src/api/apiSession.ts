@@ -617,7 +617,9 @@ export class ApiSessionClient extends EventEmitter {
     private providerUsageEventIds = new Set<string>();
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
     private readonly runtimeAccount = new ClaudeRuntimeAccountPublisher(() => this.sessionId, frame => this.emitSessionStream(frame));
-    setClaudeRuntimeAccount(binding: string | undefined) { if (!this.closed) this.runtimeAccount.update(binding); }
+    private personalClaudeFallback: Parameters<ClaudeRuntimeAccountPublisher['update']>[1];
+    setPersonalClaudeFallback(value: Parameters<ClaudeRuntimeAccountPublisher['update']>[1]) { this.personalClaudeFallback = value; }
+    setClaudeRuntimeAccount(binding: string | undefined) { if (!this.closed) this.runtimeAccount.update(binding, this.personalClaudeFallback); }
     private readonly contextUsage = new ClaudeContextUsageTracker((snapshot) => {
         this.contextUsageTakeDownRepeats = this.contextUsage.hasValue() ? 0 : CONTEXT_USAGE_TAKE_DOWN_REPEATS;
         this.emitSessionStream(snapshot);
