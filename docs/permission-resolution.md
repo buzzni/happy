@@ -102,15 +102,18 @@ A `permission` answer with `approved: false` can carry two texts. The model's de
 
 - `userReason` — only what the person wrote. The runtime keeps its default instruction in front:
   `<default>\n\nUser's reason: <userReason>`. Control characters (except tab and line feed) are dropped, the
-  text is trimmed, and anything past 2,000 characters is cut with `…`. Wins when both fields are sent.
+  text is trimmed, and anything past 2,000 characters is cut with `…`. Wins when both fields are sent, unless it
+  cleans to nothing — then the answer is read as if only `reason` had been sent.
 - `reason` — a complete message, sent verbatim. Desktop builds that predate `userReason` join the default
   sentence and the person's reason themselves and send it here, so it is not prefixed again.
 - Neither (or only whitespace) — the default instruction alone.
 
 Defaults: a tool deny uses the "The user doesn't want to proceed with this tool use…" instruction, a rejected
 plan uses `Plan rejected`. A tool policy `ask` (`src/toolPolicy/policyGate.ts`) uses the `user_denied` blocked
-text, and there `userReason ?? reason` is read as the person's own reason, because no client ever put a default
-sentence into a policy deny. The policy audit log records the outcome only, never the reason.
+text, and there the cleaned `userReason`, else `reason`, is read as the person's own reason (`composePolicyDenyMessage`),
+because no client ever put a default sentence into a policy deny. The policy audit log records the outcome only,
+never the reason. `completedRequests[id].reason` keeps the cleaned `userReason` when there is one, else `reason` as it came
+(`recordedDenyReason`), so the record clients show agrees with what the model was told.
 Codex and ACP runtimes do not read either field.
 
 ## Why this is stable now

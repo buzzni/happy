@@ -30,7 +30,7 @@ import { BUILTIN_TABLES, type CuaAction, type MachinePolicy, type ToolPolicyTabl
 import type { PolicyGrantStore } from './grants';
 import type { TargetResolver } from './targetResolver';
 import type { ToolPolicyAuditLog, ToolPolicyOutcome } from './audit';
-import { composeDenyMessage } from '@/utils/permissionDenyMessage';
+import { composePolicyDenyMessage } from '@/utils/permissionDenyMessage';
 
 export const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -142,10 +142,10 @@ export function createToolPolicyGate(deps: {
         });
     };
 
-    // `userReason` goes to the model only; the audit records the outcome, never what the person wrote.
-    const refuse = (call: PreToolUseCall, verdict: PolicyVerdict, reasonCode: string, outcome: ToolPolicyOutcome, userReason?: string): HookVerdict => {
+    // The answer's reason goes to the model only; the audit records the outcome, never what the person wrote.
+    const refuse = (call: PreToolUseCall, verdict: PolicyVerdict, reasonCode: string, outcome: ToolPolicyOutcome, answer: Pick<PolicyApprovalAnswer, 'reason' | 'userReason'> = {}): HookVerdict => {
         audit(call, verdict, outcome, 'blocked', reasonCode);
-        return { kind: 'deny', reasonCode, reason: composeDenyMessage(blockedMessage({ ...verdict, reasonCode }, call.toolName, tables), { userReason }) };
+        return { kind: 'deny', reasonCode, reason: composePolicyDenyMessage(blockedMessage({ ...verdict, reasonCode }, call.toolName, tables), answer) };
     };
 
     const evaluate = async (call: PreToolUseCall, args: Record<string, unknown>): Promise<PolicyVerdict> => {
@@ -210,7 +210,7 @@ export function createToolPolicyGate(deps: {
                 });
                 if (!answer.approved) {
                     deps.grants.recordDenial(verdict.denialKey);
-                    return refuse(call, verdict, 'user_denied', 'denied', answer.userReason ?? answer.reason);
+                    return refuse(call, verdict, 'user_denied', 'denied', answer);
                 }
                 if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys);
                 audit(call, verdict, 'approved', 'ask');

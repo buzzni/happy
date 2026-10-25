@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeDenyMessage, USER_REASON_MAX_LENGTH } from './permissionDenyMessage';
+import { composeDenyMessage, composePolicyDenyMessage, recordedDenyReason, USER_REASON_MAX_LENGTH } from './permissionDenyMessage';
 
 const DEFAULT = 'The tool use was rejected. STOP and wait.';
 
@@ -50,5 +50,31 @@ describe('composeDenyMessage', () => {
 
     it('ignores a non-string value an untyped RPC payload may carry', () => {
         expect(composeDenyMessage(DEFAULT, { userReason: 42 as unknown as string, reason: 'legacy' })).toBe('legacy');
+    });
+});
+
+describe('composePolicyDenyMessage', () => {
+    it('reads the legacy `reason` as the person\'s own, since no client put a default into a policy deny', () => {
+        expect(composePolicyDenyMessage(DEFAULT, { reason: 'not now' })).toBe(`${DEFAULT}\n\nUser's reason: not now`);
+    });
+
+    it('prefers `userReason`, and falls back to `reason` when `userReason` cleans to nothing', () => {
+        expect(composePolicyDenyMessage(DEFAULT, { reason: 'legacy', userReason: '비용이 커요' })).toBe(`${DEFAULT}\n\nUser's reason: 비용이 커요`);
+        expect(composePolicyDenyMessage(DEFAULT, { reason: 'not now', userReason: '   ' })).toBe(`${DEFAULT}\n\nUser's reason: not now`);
+        expect(composePolicyDenyMessage(DEFAULT, { reason: 'not now', userReason: '\u0000\u001b' })).toBe(`${DEFAULT}\n\nUser's reason: not now`);
+    });
+
+    it('cleans the legacy reason the same way', () => {
+        expect(composePolicyDenyMessage(DEFAULT, { reason: '  a\u0000b  ' })).toBe(`${DEFAULT}\n\nUser's reason: ab`);
+        expect(composePolicyDenyMessage(DEFAULT, { reason: ' ', userReason: ' ' })).toBe(DEFAULT);
+    });
+});
+
+describe('recordedDenyReason', () => {
+    it('records the cleaned person\'s reason first, and the legacy `reason` as it came otherwise', () => {
+        expect(recordedDenyReason({ userReason: '  use staging\u0000 ', reason: 'legacy' })).toBe('use staging');
+        expect(recordedDenyReason({ userReason: '   ', reason: 'legacy' })).toBe('legacy');
+        expect(recordedDenyReason({ reason: 'legacy' })).toBe('legacy');
+        expect(recordedDenyReason({})).toBeUndefined();
     });
 });

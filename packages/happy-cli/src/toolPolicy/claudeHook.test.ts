@@ -146,6 +146,13 @@ describe('Claude PreToolUse policy hook', () => {
         expect(decision(result.stdout).permissionDecisionReason).toMatch(/우회하지 마라.*\n\nUser's reason: not now$/s);
     });
 
+    it('ask → declined with a blank own reason falls back to the legacy reason', async () => {
+        const asked: Asked[] = [];
+        const { port, secretFile } = await setup({ approver: approverAnswering({ approved: false, policyGrant: 'once', userReason: '  \u0000 ', reason: 'not now' }, asked) });
+        const result = await runHook([String(port), secretFile], payload('mcp__gmail__send_email'));
+        expect(decision(result.stdout).permissionDecisionReason).toMatch(/우회하지 마라.*\n\nUser's reason: not now$/s);
+    });
+
     it('blocks a policy-blocked call with the app, the alternative and the no-bypass line', async () => {
         const { port, secretFile } = await setup({ approver: null, resolver: TERMINAL_RESOLVER });
         const result = await runHook([String(port), secretFile], payload('mcp__cua-driver__type_text', { pid: 11, text: 'rm -rf ~' }));

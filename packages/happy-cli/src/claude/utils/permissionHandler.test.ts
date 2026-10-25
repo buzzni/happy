@@ -724,6 +724,31 @@ describe('a denied tool use tells the model the person\'s reason (aplus-dev-stud
         return stub.answer({ id: 'tool-call-1', approved: false, ...answer }).then(() => decided);
     }
 
+    async function completedReason(answer: Record<string, unknown>) {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        const decided = handler.handleToolCall('Bash', { command: 'rm -rf build' }, { permissionMode: 'default' }, stubOptions());
+        await stub.answer({ id: 'tool-call-1', approved: false, ...answer });
+        await decided;
+        const completed = (stub.state() as { completedRequests: Record<string, Record<string, unknown>> }).completedRequests;
+        return completed['tool-call-1'];
+    }
+
+    it('records the person\'s own reason on the completed request, so clients show what the model was told', async () => {
+        await expect(completedReason({ userReason: ' use the staging build ', reason: 'something else' }))
+            .resolves.toMatchObject({ status: 'denied', reason: 'use the staging build' });
+    });
+
+    it('records the legacy reason as it came when there is no reason of the person\'s own', async () => {
+        await expect(completedReason({ userReason: '  ', reason: 'assembled by an older Desktop' }))
+            .resolves.toMatchObject({ status: 'denied', reason: 'assembled by an older Desktop' });
+        await expect(completedReason({})).resolves.toMatchObject({ status: 'denied', reason: undefined });
+    });
+
+    it('falls back to the legacy reason when the person\'s own one is blank', async () => {
+        await expect(deny('Bash', { userReason: ' \u0000 ', reason: 'legacy text' })).resolves.toEqual({ behavior: 'deny', message: 'legacy text' });
+    });
+
     it('keeps the default instruction in front of the person\'s own reason', async () => {
         await expect(deny('Bash', { userReason: 'use the staging build' }))
             .resolves.toEqual({ behavior: 'deny', message: `${TOOL_DENY}\n\nUser's reason: use the staging build` });

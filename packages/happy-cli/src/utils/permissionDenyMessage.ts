@@ -7,7 +7,8 @@
  * - `reason` — a complete message, used verbatim. Desktop builds up to happy-cli .357 send the default
  *   sentence and the person's reason already joined here; prefixing it again would repeat the sentence.
  *
- * `userReason` wins when both are sent.
+ * `userReason` wins when both are sent, unless it cleans to nothing (blank, or control characters only):
+ * then `reason` is used as if `userReason` had not been sent.
  */
 
 /** Desktop's reason input stops at 2,000 characters (`PermissionDenyReason.tsx` maxLength). */
@@ -21,6 +22,22 @@ export function composeDenyMessage(defaultMessage: string, answer: { reason?: st
     if (userReason) return `${defaultMessage}\n\nUser's reason: ${userReason}`;
     if (typeof answer.reason === 'string' && answer.reason.trim()) return answer.reason;
     return defaultMessage;
+}
+
+/**
+ * A tool policy deny never carried a default sentence from any client, so there the legacy `reason`
+ * is the person's own too and goes after the blocked text like `userReason` does.
+ */
+export function composePolicyDenyMessage(defaultMessage: string, answer: { reason?: string; userReason?: string }): string {
+    return composeDenyMessage(defaultMessage, { userReason: cleanUserReason(answer.userReason) ?? answer.reason });
+}
+
+/**
+ * The reason kept on `completedRequests[id]`, which clients show as the denial's reason. The person's
+ * own one first, so the record and the model agree; otherwise the legacy `reason` as it came.
+ */
+export function recordedDenyReason(answer: { reason?: string; userReason?: string }): string | undefined {
+    return cleanUserReason(answer.userReason) ?? answer.reason;
 }
 
 /** The person's reason as the model may read it, or undefined when there is none. */

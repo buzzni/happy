@@ -26,7 +26,7 @@ import { APPROVAL_TIMEOUT_ABORT_REASON, type PermissionPolicyMeta, type PolicyAp
 import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from "@/utils/permissionResolution";
 import { ApprovalExpiryTimers, withoutExpiresAt } from "@/utils/approvalExpiry";
 import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
-import { composeDenyMessage } from "@/utils/permissionDenyMessage";
+import { composeDenyMessage, recordedDenyReason } from "@/utils/permissionDenyMessage";
 
 export type { PermissionAck };
 
@@ -784,7 +784,7 @@ export class PermissionHandler implements PolicyApprover {
                         ...request,
                         completedAt,
                         status: message.approved ? 'approved' : 'denied',
-                        reason: message.reason,
+                        reason: recordedDenyReason(message),
                         mode: message.mode,
                         allowTools: message.allowTools,
                         resolution: 'answered',
