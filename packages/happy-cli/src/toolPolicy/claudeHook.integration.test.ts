@@ -112,6 +112,17 @@ describe('tool policy with the real Claude CLI', () => {
         expect(ran).toContain('fake {"to":"a@b.c"}');
     }, 180_000);
 
+    it('hands the model the person\'s reason when they decline (aplus-dev-studio specs/permission-deny-reason)', async (ctx) => {
+        if (!await isClaudeAvailable(tmpdir())) ctx.skip();
+        const approver: PolicyApprover = { requestPolicyApproval: async () => ({ approved: false, policyGrant: 'once', userReason: '비용이 커요 (r7731)' }) };
+        const { messages, ran } = await runWithPolicy(approver,
+            'Call the tool mcp__fake__send_mail exactly once with to=a@b.c. Do not retry. Report the result verbatim.');
+        const denied = messages.flatMap((m) => m.type === 'user' && Array.isArray(m.message.content) ? m.message.content : [])
+            .flatMap((block) => block.type === 'tool_result' && block.is_error ? [JSON.stringify(block.content)] : []);
+        expect(denied.some((text) => text.includes('우회하지 마라') && text.includes("User's reason: 비용이 커요 (r7731)"))).toBe(true);
+        expect(ran).not.toContain('fake ');
+    }, 180_000);
+
     it('blocks the call when the forwarder cannot even start', async (ctx) => {
         // The forwarder fails closed only once it runs. A hook command that never starts (the
         // daemon's node gone after an upgrade) is left to Claude's `onFailure: "block"`, which the
