@@ -8,12 +8,13 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MachineMetadataSchema } from '@/api/types';
 import { startHookServer, type HookServer } from '@/claude/utils/startHookServer';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
 import { handOffCuaToShadowProxy, toolPolicyMachineCapability, toolPolicyMetadataUpdate, isToolPolicyEnabled } from './claudeHook';
 import { createPolicyGrantStore } from './grants';
 import { createToolPolicyGate, type HookVerdict, type PolicyApprovalAnswer, type PolicyApprover, type PreToolUseCall, type ToolPolicyGate } from './policyGate';
-import { ABSENT_MACHINE_POLICY } from './rules';
+import { ABSENT_MACHINE_POLICY, BUILTIN_TABLES } from './rules';
 import { createTargetResolver, type TargetResolver } from './targetResolver';
 
 const FORWARDER = resolve(__dirname, '../../scripts/policy_hook_forwarder.cjs');
@@ -51,7 +52,7 @@ async function setup(options: { approver: PolicyApprover | null; resolver?: Targ
         grants,
         audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => 's1', publishRecent: (r) => recent.push(r) }),
         approver: () => options.approver,
-        unattended: options.unattended ?? false,
+        unattended: () => options.unattended ?? false,
         terminalPrompt: () => options.terminalPrompt ?? false,
         platform: 'darwin',
         approvalTimeoutMs: options.approvalTimeoutMs,
@@ -236,11 +237,33 @@ describe('Claude PreToolUse policy hook', () => {
             grants: createPolicyGrantStore(),
             audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-abort-')), 'a.jsonl'), sessionId: () => null }),
             approver: () => approverAnswering({ approved: true, policyGrant: 'session' }, asked),
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         await expect(gate.decide({ toolName: 'mcp__gmail__send_email', toolInput: {} }, controller.signal)).resolves.toMatchObject({ kind: 'deny', reasonCode: 'aborted' });
         expect(asked).toHaveLength(0);
+    });
+
+    it('reads the turn\'s attendance on every decision (codexcli-approval-session-binding R10a, Q9)', async () => {
+        const asked: Asked[] = [];
+        let unattended = true;
+        const gate = createToolPolicyGate({
+            loadMachinePolicy: () => ABSENT_MACHINE_POLICY,
+            resolver: NOTES_RESOLVER,
+            grants: createPolicyGrantStore(),
+            audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-attendance-')), 'a.jsonl'), sessionId: () => null }),
+            approver: () => approverAnswering({ approved: true, policyGrant: 'once' }, asked),
+            unattended: () => unattended,
+            platform: 'darwin',
+        });
+        const call = { toolName: 'mcp__gmail__send_email', toolInput: {} };
+        await expect(gate.decide(call, new AbortController().signal)).resolves.toMatchObject({ kind: 'deny', reasonCode: 'unattended_no_approver' });
+        expect(asked).toHaveLength(0);
+
+        // A person wrote during the turn: the next ask waits for them.
+        unattended = false;
+        await expect(gate.decide(call, new AbortController().signal)).resolves.toEqual({ kind: 'allow' });
+        expect(asked).toHaveLength(1);
     });
 
     it('leaves Saycode\'s own tools alone', async () => {
@@ -255,7 +278,7 @@ describe('tool policy switch and capability', () => {
     it('is on by default and off with HAPPY_TOOL_POLICY=off', () => {
         expect(isToolPolicyEnabled({})).toBe(true);
         expect(isToolPolicyEnabled({ HAPPY_TOOL_POLICY: 'off' })).toBe(false);
-        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge'] });
+        expect(toolPolicyMachineCapability({})).toEqual({ version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', 'verb-words:all'], policyVersion: BUILTIN_TABLES.policyVersion });
         expect(toolPolicyMachineCapability({ HAPPY_TOOL_POLICY: 'OFF' })).toBeUndefined();
     });
 
@@ -267,6 +290,15 @@ describe('tool policy switch and capability', () => {
         expect(toolPolicyMetadataUpdate({ ...stored, toolPolicy: on }, undefined)).toEqual(stored);
         expect(toolPolicyMetadataUpdate(stored, undefined)).toBeUndefined();
         expect(toolPolicyMetadataUpdate(null, on)).toBeUndefined();
+    });
+
+    // aplus-dev-studio-desktop #2272: a machine announced before the table version (or under an older table) is refreshed.
+    it('announces the table version and refreshes a capability without it', () => {
+        const on = toolPolicyMachineCapability({})!;
+        const { policyVersion: _version, ...unversioned } = on;
+        const stored = { host: 'mac', toolPolicy: unversioned as unknown };
+        expect(toolPolicyMetadataUpdate(stored, on)).toEqual({ host: 'mac', toolPolicy: on });
+        expect(MachineMetadataSchema.shape.toolPolicy.parse(on)).toEqual(on); // not stripped on the way back in
     });
 });
 
@@ -280,7 +312,7 @@ describe('decision latency', () => {
             grants,
             audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-lat-')), 'a.jsonl'), sessionId: () => null }),
             approver: () => null,
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         const samples: number[] = [];
@@ -301,7 +333,7 @@ describe('decision latency', () => {
             grants: createPolicyGrantStore(),
             audit: createToolPolicyAuditLog({ path: join(mkdtempSync(join(tmpdir(), 'policy-lat-')), 'a.jsonl'), sessionId: () => null }),
             approver: () => approverAnswering({ approved: false, policyGrant: 'once' }, asked),
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         await gate.decide({ toolName: 'mcp__cua-driver__click', toolInput: { pid: 13 } }, new AbortController().signal);

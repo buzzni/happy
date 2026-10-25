@@ -8,6 +8,7 @@ import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from
 import type { SandboxConfig } from '@/persistence'
 import type { SessionSource } from '@/utils/sessionSource'
 import type { PermissionPolicyMeta } from '@/toolPolicy/policyGate'
+import type { PermissionResolution } from '@/utils/permissionResolution'
 import type { ToolPolicyAuditRecord } from '@/toolPolicy/audit'
 import { AutonomousQualityGateCapabilityAdvertisementSchema } from './autonomousQualityGateProtocol'
 
@@ -296,8 +297,10 @@ export const MachineMetadataSchema = z.object({
    * `enforcement` names the adapters in force (I1b adds `cua-proxy`, `codex-bridge`); a plain string
    * array so a newer daemon's value never makes an older client drop the field. Absent: no policy
    * (older daemon, or `HAPPY_TOOL_POLICY=off`) — Desktop must not claim rules are enforced.
+   * `policyVersion`: the table this daemon decides by, so Desktop stops labelling tools from its own
+   * PC's table when they differ (aplus-dev-studio-desktop #2272).
    */
-  toolPolicy: z.object({ version: z.literal(1), enforcement: z.array(z.string()) }).optional(),
+  toolPolicy: z.object({ version: z.literal(1), enforcement: z.array(z.string()), policyVersion: z.string().optional() }).optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound machine-scope requests (BYOS only). */
   rpcBinding: rpcBindingCapabilitySchema.optional(),
   /** aplus-dev-studio specs/e2ee-machine-control-boundary 4b-3 — runs `spawn-with-sealed-env`. */
@@ -387,6 +390,12 @@ export type Machine = {
  */
 export const MessageMetaSchema = z.object({
   sentFrom: z.string().optional(), // Source identifier
+  // aplus-dev-studio specs/codexcli-approval-session-binding R10a — who sent this turn. Declared so
+  // the strip-unknown parse keeps them for `inputAttendanceFromMeta`; `.catch` because a malformed
+  // value must degrade to "unknown" (a person, who is waited for), never drop the user's turn.
+  turnTrigger: z.string().optional().catch(undefined), // Desktop: user / schedule / autopilot / …
+  source: z.string().optional().catch(undefined), // daemon writers: autonomous-quality-gate / agent-browser / byos-offline
+  delegatedAttendance: z.enum(['unattended', 'attended']).optional().catch(undefined), // R12, from a delegating parent
   permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'read-only', 'safe-yolo', 'yolo']).optional(), // Permission mode for this message
   model: z.string().nullable().optional(), // Model name for this message (null = reset)
   // Whether `model` is a pin the user chose or a per-turn pick a client router
@@ -546,6 +555,12 @@ export type Metadata = {
   setupTokenRotation?: { version: 1; principalType: 'machine'; bindingVersion: 0 | 2 },
   runtimeCapabilities?: {
     saycodeSystemPromptPreference?: boolean,
+    /**
+     * aplus-dev-studio specs/codexcli-approval-session-binding R15 — this runtime records every
+     * resolution, declines unattended prompts after the wait and puts `expiresAt` on them. Absent:
+     * an older runtime (or an agent without the wait), which never expires anything.
+     */
+    approvalLifecycle?: 1,
   },
   /** aplus-dev-studio specs/e2ee-machine-control-boundary R18 — reads bound session-scope requests. */
   rpcBinding?: RpcBindingCapability,
@@ -591,6 +606,17 @@ export type Metadata = {
   flavor?: string
   sandbox?: SandboxConfig | null
   dangerouslySkipPermissions?: boolean | null
+  /**
+   * The permission mode this session applies to its next turn, as the runtime resolved it
+   * (validation, the ambient-default downgrade guard and the sandbox policy already applied).
+   * Published at start and on every change — a client message that switches it, a turn-scoped
+   * abort reset — so any client can read the session's *current* mode, not only the mode the
+   * sender itself last sent or the creation-time `dangerouslySkipPermissions`
+   * (aplus-dev-studio-desktop #2187). Absent on older runtimes; readers treat that as unknown.
+   */
+  permissionMode?: PermissionMode
+  /** When `permissionMode` was last published, on this runtime's clock (ms since epoch). */
+  permissionModeUpdatedAt?: number
   /** Lineage for sessions created via the fork / duplicate flow. */
   parentSessionId?: string
   forkedFromMessageId?: string
@@ -663,6 +689,12 @@ export type AgentState = {
       createdAt: number,
       /** aplus-dev-studio specs/agent-tool-policy R11 — present only on a tool policy `ask`. */
       policy?: PermissionPolicyMeta
+      /**
+       * aplus-dev-studio specs/codexcli-approval-session-binding R13 — when an unattended wait is
+       * declined, on this process's clock. For display only: clients add `expiresAt - createdAt`
+       * to the moment they first saw the request rather than comparing clocks.
+       */
+      expiresAt?: number
     }
   }
   completedRequests?: {
@@ -677,6 +709,8 @@ export type AgentState = {
       mode?: PermissionMode,
       decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort',
       allowTools?: string[]
+      /** codexcli-approval-session-binding plan §3.4 — which path settled it. Older clients ignore it. */
+      resolution?: PermissionResolution
     }
   }
   agentGoalStatus?: AgentGoalStatus

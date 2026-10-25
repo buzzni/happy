@@ -48,6 +48,7 @@ import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
 import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
+import { createTurnSequence, registerCleanBackgroundProcessesHandler, sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 
 const DAEMON_RUNTIME_REPORT_MAX_INTERVAL_MS = 30_000;
 /** Repairs a Desktop that restarted or reconnected while the meter was showing (Saycode specs/desktop-chat-context-window-meter R12). */
@@ -518,6 +519,8 @@ export class ApiSessionClient extends EventEmitter {
     private currentMode: 'local' | 'remote' = 'remote';
     private lastUserInteractionAt: number | undefined;
     private lastTurnEndAt: number | undefined;
+    /** aplus-dev-studio-desktop#2111 — which turn a background process belongs to (see sessionBackgroundProcesses). */
+    private readonly turns = createTurnSequence();
     private assistantTurns = 0;
     private providerTokens = 0;
     private providerUsageEventIds = new Set<string>();
@@ -602,6 +605,8 @@ export class ApiSessionClient extends EventEmitter {
             childEnvBoundary: 'in-session',
             machineRun: { profileRegistry: TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, managedTools: hostManagedMachineTools(configuration.happyHomeDir) },
         });
+        // aplus-dev-studio-desktop#2111 — stops only what this session's runtime recorded at spawn.
+        registerCleanBackgroundProcessesHandler(this.rpcHandlerManager, this.sessionId);
 
         //
         // Create socket
@@ -1976,6 +1981,9 @@ export class ApiSessionClient extends EventEmitter {
         if (process.env.DEBUG) { // too verbose for production
             logger.debug(`[API] Sending keep alive message: ${thinking}`);
         }
+        // Every runner reports its thinking state here; a turn starts on idle → thinking.
+        // Observed before the archive recheck below, which only skips the send.
+        this.turns.observeThinking(thinking);
         // A reconnect recheck is reading the server-side `active` flag to
         // decide if we were archived while disconnected — a keepalive now
         // would set active=true and mask it. Skip; the next tick resumes.
@@ -1991,6 +1999,20 @@ export class ApiSessionClient extends EventEmitter {
             mode
         });
         this.reportDaemonRuntime(thinking);
+    }
+
+    /** The turn running now, or null between turns (aplus-dev-studio-desktop#2111). */
+    currentTurnId(): number | null {
+        return this.turns.current();
+    }
+
+    /**
+     * Called first thing by a runtime's abort handler, before it awaits anything, so the
+     * interrupted turn is marked by the time the abort RPC answers and Desktop sends
+     * `clean-background-processes`. Between turns there is nothing to mark.
+     */
+    markCurrentTurnAborted(): void {
+        sessionBackgroundProcesses.markTurnAborted(this.sessionId, this.turns.current());
     }
 
     private reportDaemonRuntime(thinking: boolean, force = false) {

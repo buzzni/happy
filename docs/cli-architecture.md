@@ -876,6 +876,8 @@ machine-v2 binding을 보존한다. v1에 서버 operation 계약을 추가할 �
 ## Session-local agent control broker
 
 Account Claude/Codex hosts opt into `commands/sessionAgentBroker` through the existing Happy MCP host lifecycle.
+A mandatory Claude host opts in only for the same-UID session write-scope launch; the agent-sbx launcher's env
+allowlist drops `SAYCODE_AGENT_*`, so no provider there could reach a broker.
 The broker snapshots the current session, directory, runtime credential home and sandbox environment before the
 provider starts. Its loopback-only `commands/agentBroker` endpoint accepts only version 1 agent argv with a random
 per-host capability; browser origins, caller env/cwd and arbitrary commands are refused. It uses the same runtime

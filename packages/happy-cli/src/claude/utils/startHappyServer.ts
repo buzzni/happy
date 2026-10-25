@@ -1,6 +1,7 @@
 import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
+import type { DelegatedAttendance } from '@/api/turnAttendance';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
 import { localToolAgentContext, requestLocalToolAgent } from '@/daemon/localToolAgentRelay';
 /**
@@ -25,6 +26,7 @@ import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
 import { bashStreamSpillStoreFor, removeBashStreamSpillStore, renderBashStreamResult } from "./bashStreamOutput";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
+import { sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 import { readFile } from 'node:fs/promises';
@@ -61,6 +63,8 @@ export interface HappyServerHandlers {
     turnCards?: TurnCards;
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
+    /** aplus-dev-studio-desktop#2111 — the runner's current turn; absent means bash_stream records belong to no turn. */
+    currentTurnId?: () => number | null;
     browserTaskRuntime?: RuntimeClient;
     browserLocalClients?: LocalClientSession;
     /** The granted profile: fixed, or (execution machine H) the one the broker's grant names. */
@@ -246,7 +250,17 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
                 command: args.command,
                 cwd: protectedCwd ?? args.cwd,
                 detached: Boolean(handlers.protectedBashCwd),
-                onSpawn: handlers.trackProtectedBashProcess,
+                onSpawn: (child) => {
+                    // aplus-dev-studio-desktop#2111 — recorded at spawn so an interrupt can clean it up later.
+                    sessionBackgroundProcesses.record({
+                        sessionId: handlers.client.sessionId,
+                        child,
+                        command: String(args.command),
+                        ownProcessGroup: Boolean(handlers.protectedBashCwd),
+                        turnId: handlers.currentTurnId?.() ?? null,
+                    });
+                    handlers.trackProtectedBashProcess?.(child);
+                },
                 spill,
                 onProgress: (progress) => {
                     const call = getActiveBashStreamCall();
@@ -550,11 +564,14 @@ export async function startHappyServer(
         /** The agent process runs under the sandbox-runtime wrapper, whose Linux seccomp denies AF_UNIX to the bridge. */
         wrappedSandbox?: boolean;
         admitTool?: <T>(work: () => Promise<T>) => Promise<T>;
+        /** The current turn's attendance, handed to children this session delegates to (R12). */
+        delegatedAttendance?: () => DelegatedAttendance | null;
         proposeLesson?: (input: { token: string; proposal: unknown }) => { accepted: boolean };
         /** specs/desktop-next-steps-card — whether the running turn's client draws the card. */
         turnCards?: TurnCards;
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
+        currentTurnId?: () => number | null;
     } = {},
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
@@ -637,6 +654,7 @@ export async function startHappyServer(
             turnCards: options.turnCards,
             protectedBashCwd: options.protectedBashCwd,
             trackProtectedBashProcess: options.trackProtectedBashProcess,
+            currentTurnId: options.currentTurnId,
             browserTaskRuntime,
             browserTaskProfileId,
             browserLocalClients: browserTask?.localClients,
@@ -687,7 +705,9 @@ export async function startHappyServer(
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
         throw error;
     });
-    const agentBroker = options.agentControl ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool) : null;
+    const agentBroker = options.agentControl
+        ? await startSessionAgentBroker(client.sessionId, process.env, options.admitTool, undefined, options.delegatedAttendance)
+        : null;
     // Env for the stdio bridge. Codex and ACP agents receive it over JSON-RPC, not argv.
     const bridgeEnv: Record<string, string> = socketPath
         ? { SAYCODE_MCP_SOCKET: socketPath, SAYCODE_MCP_TOKEN: token }

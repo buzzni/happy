@@ -32,6 +32,13 @@ describe('createSessionMetadata', () => {
     });
 
     // aplus-dev-studio specs/e2ee-machine-control-boundary R18 — sealed with the session key.
+    it('advertises the approval lifecycle only for a runner that wires it (codexcli-approval-session-binding T24)', () => {
+        expect(createSessionMetadata({ flavor: 'claude', machineId: 'm', approvalLifecycle: true }).metadata.runtimeCapabilities)
+            .toEqual({ saycodeSystemPromptPreference: true, approvalLifecycle: 1 });
+        expect(createSessionMetadata({ flavor: 'gemini', machineId: 'm' }).metadata.runtimeCapabilities)
+            .toEqual({ saycodeSystemPromptPreference: true });
+    });
+
     it('advertises bound session RPCs', () => {
         const { metadata } = createSessionMetadata({ flavor: 'claude', machineId: 'machine-1' });
 

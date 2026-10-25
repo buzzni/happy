@@ -436,18 +436,33 @@ function keyCheck(tool: string, args: Record<string, unknown>, platform: NodeJS.
 }
 
 /**
- * R8 verb dictionary: the first of the first two words that is an exact dictionary word — unless
- * the first word is a noun the dictionary also lists (`message`, `email`) and the second is a read
- * verb (`message_list`): that tool reads.
+ * R8 verb dictionary: every word of the tool name (`_`, `-`, `.` and camelCase boundaries) against the
+ * dictionary, the strongest grade winning — high > write. A dictionary noun (`message`, `email`) is a noun,
+ * not a verb, as the first word before a read verb (`message_list`, the old two-word window, unchanged) and
+ * from the third word on after a read verb in the same clause (`get_latest_release`, not `get_quote_and_trade`).
+ * Splitting acronyms (`bulkURLDelete`) or not (`DElete`) are both tried, so no name reads weaker than before.
  */
 export function verbOf(tool: string, tables: ToolPolicyTables = BUILTIN_TABLES): 'high' | 'write' | null {
-    const words = tool.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().split(/[_\-.]+/).filter(Boolean).slice(0, 2);
-    if (words.length === 2 && tables.mcp.nounFirstWords.includes(words[0]) && tables.mcp.readVerbs.includes(words[1])) return null;
-    for (const word of words) {
-        if (tables.mcp.highRiskVerbs.includes(word)) return 'high';
-        if (tables.mcp.writeVerbs.includes(word)) return 'write';
-    }
-    return null;
+    const camel = tool.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+    const grade = Math.max(verbGrade(camel, tables), verbGrade(camel.replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2'), tables));
+    return grade === 2 ? 'high' : grade === 1 ? 'write' : null;
+}
+
+const CLAUSE_WORDS = ['and', 'then', 'or'];
+
+function verbGrade(name: string, tables: ToolPolicyTables): number {
+    const { mcp } = tables;
+    const words = name.toLowerCase().split(/[_\-.]+/).filter(Boolean);
+    // A read verb covers only its own clause: `get_quote_and_trade` trades.
+    const readBefore = (index: number) => {
+        const clause = words.slice(0, index);
+        const start = Math.max(...CLAUSE_WORDS.map((word) => clause.lastIndexOf(word))) + 1;
+        return clause.slice(start).some((word) => mcp.readVerbs.includes(word));
+    };
+    const noun = (word: string, index: number) => mcp.nounFirstWords.includes(word)
+        && (index === 0 ? mcp.readVerbs.includes(words[1]) : index >= 2 && readBefore(index));
+    return Math.max(0, ...words.map((word, index) => noun(word, index) ? 0
+        : mcp.highRiskVerbs.includes(word) ? 2 : mcp.writeVerbs.includes(word) ? 1 : 0));
 }
 
 function asArray(value: unknown): unknown[] {

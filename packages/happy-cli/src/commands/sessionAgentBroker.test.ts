@@ -28,6 +28,35 @@ describe('trusted session agent execution', () => {
     expect(filterCredentialsFromEnv({ SAYCODE_AGENT_BROKER_CAPABILITY: 'session-only', GH_TOKEN: 'account-secret' }))
       .toEqual({ SAYCODE_AGENT_BROKER_CAPABILITY: 'session-only' })
   })
+  // Fable 리뷰(#939): the CLI refuses a mandatory session's unsandboxed delegation from these two
+  // values, so the broker must hand the host its own copy rather than lose them on the way.
+  it('keeps the session sandbox policy in the host env the bundled CLI decides from', async () => {
+    const root = await fixture(), entrypoint = join(root, 'cli.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,mode:process.env.HAPPY_SANDBOX_POLICY_MODE,config:process.env.HAPPY_PROJECT_SANDBOX_CONFIG})}))`)
+    const config = JSON.stringify({ enabled: true })
+    const env: NodeJS.ProcessEnv = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: root, HAPPY_SANDBOX_POLICY_MODE: 'mandatory', HAPPY_PROJECT_SANDBOX_CONFIG: config }
+    const broker = await startSessionAgentBroker('parent', env, undefined, entrypoint)
+    try {
+      const response = await fetch(env.SAYCODE_AGENT_BROKER_URL!, { method: 'POST', headers: { authorization: `Bearer ${env.SAYCODE_AGENT_BROKER_CAPABILITY}` },
+        body: JSON.stringify({ version: 1, argv: ['spawn', '--agent', 'gemini', '--prompt', 'x'] }) })
+      expect(JSON.parse((await response.json() as { stdout: string }).stdout)).toEqual({ ok: true, mode: 'mandatory', config })
+    } finally { await broker!.close() }
+  })
+  it('hands the bundled CLI this session\'s current turn attendance on every call, never an inherited one (R12)', async () => {
+    const root = await fixture(), entrypoint = join(root, 'cli.mjs')
+    await writeFile(entrypoint, `console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,attendance:process.env.SAYCODE_DELEGATED_ATTENDANCE ?? null})}))`)
+    let attendance: 'unattended' | 'attended' | null = 'unattended'
+    const execute = createAgentHostExecutor({
+      sessionId: 'current', directory: root, env: { SAYCODE_DELEGATED_ATTENDANCE: 'unattended' }, entrypoint, delegatedAttendance: () => attendance,
+    })
+    const read = async () => JSON.parse((await execute(['spawn'], new AbortController().signal)).stdout).attendance
+    expect(await read()).toBe('unattended')
+    attendance = 'attended'
+    expect(await read()).toBe('attended')
+    // Unknown here: the inherited value is not passed on.
+    attendance = null
+    expect(await read()).toBeNull()
+  })
   it('rotates the contact on resume, clears it on close and honors the runtime admission gate', async () => {
     const env: NodeJS.ProcessEnv = { SAYCODE_AGENT_ENV: '1', SAYCODE_AGENT_ROOT: process.cwd() }
     let admitted = 0

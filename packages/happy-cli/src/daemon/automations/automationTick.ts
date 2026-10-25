@@ -17,8 +17,10 @@ import {
   buildAutomationPrompt,
   claimDueAutomation,
   isAutomationDue,
+  previousRunWaitingSessionId,
   SCRIPT_TIMEOUT_MS,
   shouldWakeFromScriptOutput,
+  withInboxItemInstruction,
   type AutomationAgent,
   type AutomationRunOutcome,
   type ScheduledAutomation,
@@ -31,6 +33,8 @@ export interface AutomationTickInput {
   runScript: (input: { command: string; cwd: string; timeout: number }) => Promise<{ ok: boolean; stdout: string; error?: string }>
   spawnSession: (input: { directory: string; initialPrompt: string; createdByAccountId: string | null; agent: AutomationAgent; sessionSource: 'schedule' }) => Promise<{ ok: true; sessionId: string } | { ok: false; error: string }>
   isSessionRunning: (sessionId: string) => boolean
+  /** 자식 세션이 보고한 사용자 입력 대기(질문·계획·권한 승인). 없으면 대기 게이트는 늘 열린다. */
+  isSessionWaitingForUser?: (sessionId: string) => boolean
   logDebug?: (message: string) => void
 }
 
@@ -74,12 +78,19 @@ export async function runAutomationTick(input: AutomationTickInput): Promise<Aut
 interface ClaimedRunResult {
   outcome: AutomationRunOutcome
   sessionId: string | null
+  blockedBySessionId?: string
 }
 
 async function runClaimedAutomation(
   automation: ScheduledAutomation,
   input: AutomationTickInput,
 ): Promise<ClaimedRunResult> {
+  // 대기 게이트(aplus-dev-studio-desktop #2196): 사용자의 차례인 대화 위에 회차를 쌓지 않는다. 겹침보다 우선한다.
+  const waitingSessionId = previousRunWaitingSessionId(automation.runHistory, input)
+  if (waitingSessionId !== null) {
+    return { outcome: 'skipped-waiting', sessionId: null, blockedBySessionId: waitingSessionId }
+  }
+
   // 겹침 가드(R5): 직전 woke 세션이 아직 일하는 중이면 새 세션을 얹지 않는다.
   // 기록이 실행 중인 세션을 가리켜야 사용자가 겹침 스킵의 원인을 찾을 수 있다.
   const runningSessionId = findRunningWokeSessionId(automation, input.isSessionRunning)
@@ -106,7 +117,7 @@ async function runClaimedAutomation(
 
   const spawned = await input.spawnSession({
     directory: automation.directory,
-    initialPrompt: buildAutomationPrompt(automation.prompt, scriptOutput),
+    initialPrompt: withInboxItemInstruction(buildAutomationPrompt(automation.prompt, scriptOutput)),
     // 세션은 데몬 소유자 자격증명으로 뜨지만 귀속(누가 등록했나)은 남긴다.
     createdByAccountId: automation.createdByAccountId ?? null,
     agent: automation.agent ?? 'claude',
@@ -131,7 +142,12 @@ function findRunningWokeSessionId(
 function recordOutcome(input: AutomationTickInput, id: string, result: ClaimedRunResult): void {
   // appendRunRecord 경유 — 최신순 이력 + 연속 error 3회 자동 일시정지(R9·R10).
   input.store.update(id, (automation) =>
-    appendRunRecord(automation, { at: input.now, outcome: result.outcome, sessionId: result.sessionId }))
+    appendRunRecord(automation, {
+      at: input.now,
+      outcome: result.outcome,
+      sessionId: result.sessionId,
+      ...(result.blockedBySessionId ? { blockedBySessionId: result.blockedBySessionId } : {}),
+    }))
 }
 
 function failureMessage(error: unknown): string {

@@ -1,9 +1,10 @@
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import type { PendingAttachment, QueueLatencyTrace } from '@/utils/MessageQueue2';
+import type { InputAttendance } from '@/api/turnAttendance';
 
 type CodexUserTextQueue<T> = {
-    push: (message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace) => void;
-    pushIsolateAndClear: (message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace) => string[] | void;
+    push: (message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance) => void;
+    pushIsolateAndClear: (message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance) => string[] | void;
 };
 
 export function isCodexClearText(text: string): boolean {
@@ -38,14 +39,18 @@ export function enqueueCodexUserText<T>(opts: {
     /** Routing request ids for this text, carried through to the engine boundary. */
     requestIds?: string[];
     latencyTrace?: QueueLatencyTrace;
+    /** Who sent it (codexcli-approval-session-binding R10a); decides whether its turn is unattended. */
+    attendance?: InputAttendance;
 }): 'clear' | 'queued' {
     if (isCodexClearText(opts.text)) {
-        if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);
+        if (opts.attendance) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance);
+        else if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);
         else opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments);
         return 'clear';
     }
 
-    if (opts.latencyTrace) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace);
+    if (opts.attendance) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace, opts.attendance);
+    else if (opts.latencyTrace) opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds, opts.latencyTrace);
     else opts.queue.push(opts.text, opts.mode, opts.attachments, opts.requestIds);
     return 'queued';
 }

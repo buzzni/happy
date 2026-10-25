@@ -180,6 +180,7 @@ import {
     publishedSessionModelPin,
     type SessionModelPin,
 } from '@/utils/sessionModelPin';
+import { createSessionPermissionModePublisher, publishedSessionPermissionMode } from '@/utils/sessionPermissionMode';
 
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
@@ -196,6 +197,7 @@ import { CUA_DRIVER_SERVER, CUA_SHADOW_TOOL_TIMEOUT_SECONDS, codexCuaShadowConfi
 import { REMOTE_GRANT_TTL_MS } from '@/toolPolicy/grants';
 import { toolPolicyAdapterEnv } from '@/toolPolicy/policyClient';
 import { createToolPolicyRuntime, type ToolPolicyRuntime } from '@/toolPolicy/runtime';
+import { consumeDelegatedAttendance, delegatedAttendanceFor, initialPromptAttendance, inputAttendanceFromMeta, TurnAttendanceState } from '@/api/turnAttendance';
 import { isDelegatedDifficultyRoutingMessage } from '@/difficultyRouting';
 
 /** See the Claude counterpart. */
@@ -369,6 +371,7 @@ export async function runCodex(opts: {
         ...(forkedFromMessageId ? { forkedFromMessageId } : {}),
         ...(createdByAccountId ? { createdBy: { accountId: createdByAccountId, displayName: createdByDisplayName } } : {}),
         source,
+        approvalLifecycle: true,
     });
 
     const skillCommands = await discoverCodexSkillCommands();
@@ -570,12 +573,19 @@ export async function runCodex(opts: {
     // message arrives — otherwise the first turn sent from another device is
     // the one that loses the pin.
     sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
+    // The session's current permission mode, readable by every client (aplus-dev-studio-desktop #2187).
+    const permissionModePublisher = createSessionPermissionModePublisher({
+        published: publishedSessionPermissionMode(metadata),
+        updateMetadata: (update) => session.updateMetadata(update),
+    });
+    permissionModePublisher.publish(currentPermissionMode);
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = withoutTurnScopedBlocks(initialSaycodePromptBlocks);
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
+        permissionModePublisher.publish(currentPermissionMode);
         currentModel = explicitInitialModel;
         currentEffort = initialEffortSeed;
         sessionModelPinPublisher.reset();
@@ -612,6 +622,7 @@ export async function runCodex(opts: {
         );
         if (messagePermissionMode !== currentPermissionMode) {
             currentPermissionMode = messagePermissionMode;
+            permissionModePublisher.publish(currentPermissionMode);
             logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
         } else {
             logger.debug(`[Codex] Keeping current permission mode: ${currentPermissionMode ?? 'default (effective)'}`);
@@ -771,6 +782,7 @@ export async function runCodex(opts: {
                 queue: messageQueue,
                 attachments: attachmentsForThisMessage,
                 latencyTrace,
+                attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
                 // Travels beside the mode so the engine boundary below can commit
                 // this decision — and so a batch keeps every merged request's id.
                 requestIds: routed
@@ -849,6 +861,11 @@ export async function runCodex(opts: {
         toolPolicyServer?.stop();
         toolPolicy?.dispose();
     };
+    // Whether anyone can answer this run's prompts, turn by turn (codexcli-approval-session-binding
+    // R10a). Created once the run-once marker is settled below; a spawned child learns its parent's
+    // attendance from env (R12).
+    const delegatedAttendance = consumeDelegatedAttendance(process.env);
+    let turnAttendance: TurnAttendanceState | null = null;
     session.onUserMessage((message) => {
         // R13: the person's next message lifts "you just declined this" memory.
         toolPolicy?.grants.onUserMessage();
@@ -867,6 +884,8 @@ export async function runCodex(opts: {
             logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
             return;
         }
+        // A person writing lifts the running turn's unattended waits; automatic input does not (R10).
+        turnAttendance?.inputArrived(inputAttendanceFromMeta(message.meta, session.getMetadata()?.source));
         const latencyTrace = captureCodexLatencyTrace(message.meta?.latencyTrace, diagnostic => session.sendTurnLatency(diagnostic));
         const accept = () => {
             preemptLessonReview();
@@ -904,7 +923,7 @@ export async function runCodex(opts: {
                 saycodeSystemPromptEnabled: currentSaycodeSystemPromptEnabled,
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
-            });
+            }, undefined, initialPromptAttendance(delegatedAttendance, source));
             logger.debug('[START] Delivered initial prompt from HAPPY_INITIAL_PROMPT');
         },
         reportStarted: response ? async () => {
@@ -932,6 +951,7 @@ export async function runCodex(opts: {
     // the automation daemon. This prevents an incomplete or accidentally resumed
     // startup from treating a later interactive message as the automation turn.
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn && initialPromptDelivered;
+    turnAttendance = new TurnAttendanceState(exitAfterFirstTurn);
     // Set once the run-once turn has ended; from then on the session only waits for its capacity continuation.
     let runOnceTurnEnded = false;
     let thinking = false;
@@ -1058,6 +1078,8 @@ export async function runCodex(opts: {
      */
     async function handleAbort() {
         if (runtimeGate?.isFrozen()) return;
+        // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
+        session.markCurrentTurnAborted?.(); // optional: test doubles of the session omit it; the abort must not depend on it
         preemptLessonReview();
         // Stop means stop: a capacity continuation waiting to fire must not restart the work.
         cancelCapacityRetry();
@@ -1481,10 +1503,11 @@ export async function runCodex(opts: {
     });
 
     permissionHandler = new CodexPermissionHandler(session);
+    permissionHandler.setAttendance(turnAttendance);
     // Drop any permission requests left in agent state from a previous CLI
     // process that died while a tool prompt was open — see the matching
     // call in claudeRemoteLauncher for the full rationale.
-    permissionHandler.reset('Previous CLI process exited before responding');
+    permissionHandler.reset('Previous CLI process exited before responding', 'runtime-restart');
     reasoningProcessor = new ReasoningProcessor((message) => {
         const envelopes = mapCodexProcessorMessageToSessionEnvelopes(message, { currentTurnId });
         for (const envelope of envelopes) {
@@ -1910,6 +1933,7 @@ export async function runCodex(opts: {
         browserClientApprover: () => permissionHandler,
         agentControl: accountToken !== null,
         exitAfterFirstTurn,
+        delegatedAttendance: () => turnAttendance ? delegatedAttendanceFor(turnAttendance.current()) : null,
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
         // CodexAppServerClient wraps `codex app-server` (and so the bridge) with sandbox-runtime.
         wrappedSandbox: checkpointComposition.sandboxConfig?.enabled === true && process.platform !== 'win32',
@@ -1919,6 +1943,7 @@ export async function runCodex(opts: {
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+        currentTurnId: () => session.currentTurnId?.() ?? null,
     });
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.
@@ -1964,7 +1989,7 @@ export async function runCodex(opts: {
             sessionId: () => session.sessionId,
             publishRecent: (recent) => session.updateAgentState((state) => ({ ...state, toolPolicy: { recent } })),
             approver: () => permissionHandler,
-            unattended: exitAfterFirstTurn,
+            unattended: () => turnAttendance?.policyUnattended() ?? exitAfterFirstTurn,
             terminalPrompt: () => false,
             grantTtlMs: REMOTE_GRANT_TTL_MS,
         });
@@ -2265,6 +2290,8 @@ export async function runCodex(opts: {
              * turn actually takes.
              */
             codexPendingRequestId = message.channelRequestId ?? null;
+            // The same point classifies the turn by its own inputs (codexcli-approval-session-binding R10a).
+            turnAttendance?.startTurn({ allUnattended: message.allUnattended, channel: message.channelRequestId !== undefined });
             const latency = createCodexTurnLatency(message, diagnostic => session.sendTurnLatency(diagnostic));
             activeLatency = latency;
             const measure = <T>(stage: CodexLatencyStage, action: () => T | Promise<T>): T | Promise<T> =>
@@ -2302,7 +2329,7 @@ export async function runCodex(opts: {
                     codexStartedSubagents = new Set<string>();
                     codexActiveSubagents = new Set<string>();
                     codexProviderSubagentToSessionSubagent = new Map<string, string>();
-                    permissionHandler.reset();
+                    permissionHandler.reset(undefined, 'reset');
                     reasoningProcessor.abort();
                     diffProcessor.reset();
                     appendSystemPromptInjected = false;
@@ -2702,7 +2729,7 @@ export async function runCodex(opts: {
                                 }
                                 return;
                             }
-                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode);
+                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode, undefined, turnAttendance?.continuationInput());
                         }, retry.delayMs);
                     }
                 } catch (error) {
@@ -2767,8 +2794,9 @@ export async function runCodex(opts: {
                         logger.debug('[codex]: checkpoint abortTurn failed', error);
                     }
                     authRecovery.endTurn();
-                    // Reset permission handler, reasoning processor, and diff processor
-                    permissionHandler.reset();
+                    // Reset permission handler, reasoning processor, and diff processor.
+                    // Every turn ends here; a stop already recorded its requests as `aborted`.
+                    permissionHandler.reset(undefined, 'turn-ended');
                     reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
                     diffProcessor.reset();
                     thinking = false;

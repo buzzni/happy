@@ -1,3 +1,4 @@
+import type { TurnAttendanceState } from '@/api/turnAttendance';
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import type { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
@@ -93,6 +94,12 @@ export class Session {
      */
     policyApprover: PolicyApprover | null = null;
 
+    /**
+     * Whether anyone can answer this turn's prompts (codexcli-approval-session-binding R10a). Owned
+     * by the run, which also feeds the tool policy gate from it; the remote launcher sets each turn.
+     */
+    readonly turnAttendance: TurnAttendanceState | null;
+
     /** Tool policy R9: the MCP tool names of Claude's init message, for the coverage audit. */
     policyToolsSeen: ((tools: string[]) => void) | null = null;
     
@@ -141,7 +148,9 @@ export class Session {
         startingMode?: 'local' | 'remote',
         exitAfterFirstTurn?: boolean,
         outputFormat?: ClaudeOutputFormat,
+        turnAttendance?: TurnAttendanceState,
     }) {
+        this.turnAttendance = opts.turnAttendance ?? null;
         this.scopeProcessSandbox = opts.scopeProcessSandbox;
         this.path = opts.path;
         this.api = opts.api;

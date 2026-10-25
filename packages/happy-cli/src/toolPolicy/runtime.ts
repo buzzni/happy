@@ -30,7 +30,8 @@ export function createToolPolicyRuntime(input: {
     sessionId: () => string | null;
     publishRecent: (recent: ToolPolicyAuditRecord[]) => void;
     approver: () => PolicyApprover | null;
-    unattended: boolean;
+    /** Read on every decision: the current turn's attendance (codexcli-approval-session-binding R10a). */
+    unattended: () => boolean;
     terminalPrompt: () => boolean;
     grantTtlMs: number | null;
 }): ToolPolicyRuntime {

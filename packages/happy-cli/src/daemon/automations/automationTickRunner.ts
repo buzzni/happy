@@ -21,9 +21,20 @@ export interface AutomationTickRunner {
 export function createAutomationTickRunner(opts: {
   runTick: () => Promise<unknown>
   logDebug?: (message: string) => void
+  /**
+   * 이 시간을 넘긴 tick 은 멈춘 것으로 보고 가드를 풀어 다음 하트비트가 새 tick 을
+   * 시작하게 한다. 없으면 이전 tick 이 끝날 때까지 무한히 기다린다 — 2026-10-22·10-24 에
+   * 그 대기가 데몬 재시작 전까지 이어져 GitHub 트리거·예약이 조용히 멈췄다.
+   */
+  stalledAfterMs?: number
+  now?: () => number
 }): AutomationTickRunner {
+  const now = opts.now ?? Date.now
   let running = false
   let paused = false
+  let startedAt = 0
+  // 버려진 tick 이 뒤늦게 끝나며 지금 도는 tick 의 가드를 풀지 못하게 한다.
+  let generation = 0
   const runner: AutomationTickRunner = {
     isRunning: () => running,
     pause() {
@@ -39,10 +50,19 @@ export function createAutomationTickRunner(opts: {
         return
       }
       if (running) {
-        opts.logDebug?.('[automation-tick] previous tick still running; skipping this heartbeat')
-        return
+        const elapsedMs = now() - startedAt
+        const elapsed = `${Math.round(elapsedMs / 1000)}s`
+        if (opts.stalledAfterMs === undefined || elapsedMs < opts.stalledAfterMs) {
+          opts.logDebug?.(`[automation-tick] previous tick still running for ${elapsed}; skipping this heartbeat`)
+          return
+        }
+        // 예외는 가드를 풀지만, 끝나지 않는 await 는 아무것도 풀지 않는다. 그 tick 은 버리고
+        // 소리 내어 새로 시작한다 — 조용히 영구 정지하는 것보다 낫다.
+        opts.logDebug?.(`[automation-tick] tick stalled for ${elapsed}; abandoning it and starting a new tick`)
       }
       running = true
+      startedAt = now()
+      const mine = ++generation
       // detach: 하트비트를 막지 않는다. 실패는 로그만 — 가드는 항상 해제해
       // 한 번의 예외가 자동화를 영구 정지시키지 않게 한다.
       void Promise.resolve()
@@ -51,7 +71,7 @@ export function createAutomationTickRunner(opts: {
           opts.logDebug?.(`[automation-tick] tick failed: ${error instanceof Error ? error.message : String(error)}`)
         })
         .finally(() => {
-          running = false
+          if (mine === generation) running = false
         })
     },
   }

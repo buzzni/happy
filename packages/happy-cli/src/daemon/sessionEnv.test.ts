@@ -233,6 +233,24 @@ describe('buildSpawnRequestEnvironment', () => {
         })
     })
 
+    it('keeps the delegating parent\'s attendance a happy agent spawn request carries (R12)', () => {
+        // The broker hands it to the bundled CLI, which puts it in the spawn request; the
+        // SAYCODE_ prefix scrub ate it, so a scheduled run's child waited forever (I7 review H1).
+        expect(buildSpawnRequestEnvironment({}, { SAYCODE_DELEGATED_ATTENDANCE: 'unattended', PROJECT_TOKEN: 'p' }))
+            .toEqual({ SAYCODE_DELEGATED_ATTENDANCE: 'unattended', PROJECT_TOKEN: 'p' })
+        expect(buildSpawnRequestEnvironment({}, { SAYCODE_DELEGATED_ATTENDANCE: 'attended' }))
+            .toEqual({ SAYCODE_DELEGATED_ATTENDANCE: 'attended' })
+    })
+
+    it.each([
+        ['an unknown value', { SAYCODE_DELEGATED_ATTENDANCE: 'channel' }],
+        ['a case variant of the value', { SAYCODE_DELEGATED_ATTENDANCE: 'Unattended' }],
+        ['a case variant of the name', { saycode_delegated_attendance: 'unattended' }],
+        ['an empty value', { SAYCODE_DELEGATED_ATTENDANCE: '' }],
+    ])('drops the delegated attendance for %s', (_reason, requested) => {
+        expect(buildSpawnRequestEnvironment({}, requested)).toEqual({})
+    })
+
     it('never lets the request overwrite daemon-owned auth', () => {
         expect(buildSpawnRequestEnvironment(
             { CLAUDE_CODE_OAUTH_TOKEN: 'trusted' },

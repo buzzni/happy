@@ -107,6 +107,7 @@ export async function runBashStream(input: RunBashStreamInput): Promise<RunBashS
       env: sanitizeChildEnv(env ?? process.env, { boundary: 'in-session' }),
       detached,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
     onSpawn?.(child);
 

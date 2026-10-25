@@ -266,6 +266,8 @@ import { normalizeSessionSource } from '@/utils/sessionSource';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BROKER_ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
+// 자동화 claim/start/heartbeat/report ack 대기 상한. 상한이 없으면 ack 한 번의 누락이 tick 을 영구 정지시킨다.
+const AUTOMATION_ACK_TIMEOUT_MS = 30_000;
 /*
  * How often the connection supervisor re-reads the socket's actual state.
  *
@@ -2550,12 +2552,29 @@ export class ApiMachineClient {
     }
 
     serverAutomationTransport(): ServerAutomationTransport {
+        const bounded = () => this.socket.timeout(AUTOMATION_ACK_TIMEOUT_MS);
         return {
-            claim: (input) => this.socket.emitWithAck('automation-claim', input),
-            start: (input) => this.socket.emitWithAck('automation-run-start', input),
-            heartbeat: (input) => this.socket.emitWithAck('automation-run-heartbeat', input),
-            report: (input) => this.socket.emitWithAck('automation-run-report', input),
+            claim: (input) => this.automationAck('automation-claim', bounded().emitWithAck('automation-claim', input)),
+            start: (input) => this.automationAck('automation-run-start', bounded().emitWithAck('automation-run-start', input)),
+            heartbeat: (input) => this.automationAck('automation-run-heartbeat', bounded().emitWithAck('automation-run-heartbeat', input)),
+            report: (input) => this.automationAck('automation-run-report', bounded().emitWithAck('automation-run-report', input)),
         };
+    }
+
+    /**
+     * 자동화 tick 은 이 ack 를 await 한다. 상한 없이 기다리면 서버가 ack 를 한 번만 빠뜨려도
+     * tick 이 영원히 끝나지 않고, 이 머신의 GitHub 트리거·예약 전체가 데몬 재시작 전까지
+     * 조용히 멈춘다 (2026-10-22, 2026-10-24 — 소켓과 다른 ack 는 모두 정상이었다).
+     * 타임아웃은 전송 실패로 돌려 다음 tick 이 claim·보고를 다시 시도하게 한다.
+     */
+    private automationAck(
+        event: string,
+        ack: Promise<{ ok: boolean; value?: unknown; error?: string }>,
+    ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+        return ack.catch((error: unknown) => {
+            logger.debug(`[API MACHINE] ${event} ack timed out after ${AUTOMATION_ACK_TIMEOUT_MS}ms: ${error instanceof Error ? error.message : String(error)}`);
+            return { ok: false, error: 'ack-timeout' };
+        });
     }
 
     deliverAutomationConversation(input: AutomationConversationDeliverRequest): Promise<{ ok: boolean; value?: unknown; error?: string }> {
