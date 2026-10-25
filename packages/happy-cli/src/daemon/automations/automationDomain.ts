@@ -17,7 +17,11 @@ export type AutomationSchedule =
   /** 고른 요일(0=일요일, Date#getDay)의 실행 PC 현지 시각마다. 서버 예약 payload 전용. */
   | { kind: 'weekly'; days: readonly number[]; hour: number; minute: number }
 
-export type AutomationRunOutcome = 'woke' | 'skipped-gate' | 'skipped-overlap' | 'silent' | 'error'
+/**
+ * `skipped-waiting`(aplus-dev-studio-desktop #2196): 직전 회차 대화가 사용자 답을 기다려 건너뛴 회차.
+ * 데스크탑은 PR #2089부터 이 값을 안다. 구버전 데몬은 모르는 outcome 레코드를 버린다(parseRunHistory).
+ */
+export type AutomationRunOutcome = 'woke' | 'skipped-gate' | 'skipped-overlap' | 'skipped-waiting' | 'silent' | 'error'
 
 export type AutomationAgent = 'claude' | 'codex' | 'gemini' | 'grok' | 'openclaw' | 'opencode'
 
@@ -25,6 +29,8 @@ export interface AutomationRunRecord {
   at: number
   outcome: AutomationRunOutcome
   sessionId: string | null
+  /** skipped-waiting 전용 — 기다리는 대화. 이력 상한(20)에 woke 기록이 밀려나도 같은 대화로 게이트를 이어간다. */
+  blockedBySessionId?: string
 }
 
 export interface ScheduledAutomation {
@@ -82,7 +88,7 @@ export function findOversizedUpsertField(automation: ScheduledAutomation): strin
   return null
 }
 
-const RUN_OUTCOMES = new Set<AutomationRunOutcome>(['woke', 'skipped-gate', 'skipped-overlap', 'silent', 'error'])
+const RUN_OUTCOMES = new Set<AutomationRunOutcome>(['woke', 'skipped-gate', 'skipped-overlap', 'skipped-waiting', 'silent', 'error'])
 
 function stringValue(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null
@@ -131,7 +137,13 @@ function parseRunHistory(value: unknown): AutomationRunRecord[] {
     const record = row as Record<string, unknown>
     const at = finiteNumber(record.at)
     if (at === null || !RUN_OUTCOMES.has(record.outcome as AutomationRunOutcome)) continue
-    records.push({ at, outcome: record.outcome as AutomationRunOutcome, sessionId: stringValue(record.sessionId) })
+    const blockedBySessionId = record.outcome === 'skipped-waiting' ? stringValue(record.blockedBySessionId) : null
+    records.push({
+      at,
+      outcome: record.outcome as AutomationRunOutcome,
+      sessionId: stringValue(record.sessionId),
+      ...(blockedBySessionId ? { blockedBySessionId } : {}),
+    })
     if (records.length >= MAX_RUN_HISTORY) break
   }
   return records
@@ -333,6 +345,57 @@ export function appendRunRecord(automation: ScheduledAutomation, record: Automat
     streak += 1
   }
   return { ...automation, runHistory, paused: automation.paused || streak >= AUTO_PAUSE_ERROR_STREAK }
+}
+
+/** 데몬이 아는 세션 상태 — 프로세스 생존과 자식 세션이 보고한 사용자 입력 대기(`pendingUserInput`). */
+export interface AutomationSessionWaitProbe {
+  isSessionRunning: (sessionId: string) => boolean
+  isSessionWaitingForUser?: (sessionId: string) => boolean
+}
+
+/**
+ * 대기 게이트(aplus-dev-studio-desktop #2196) — 데스크탑 렌더러 경로 `previousRunBlocker`
+ * (src/domain/automationRunEligibility.ts)의 `skipped-waiting` 판정을 옮겼다. 직전 회차 대화가 질문 답변·
+ * 계획 승인·권한 승인을 기다리면 새 회차를 쌓지 않고, 그 대화 id를 돌려준다. 사용자의 차례인데 회차를
+ * 쌓으면 같은 승인 대기가 회차마다 늘어난다. 끝난 대화(프로세스 없음 = `active === false`)에 남은 낡은
+ * 대기는 보지 않는다 — 영구히 게이트를 닫으면 안 된다. 대기 신호가 없으면 열린다(fail-open).
+ *
+ * 대상은 이력(최신순)에서 woke 회차의 대화, 또는 skipped-waiting이 남긴 대화다 — 오래 기다리면 woke 기록이
+ * 상한 20개 밖으로 밀려나므로. 기존 대화에 이어 쓰는 예약은 그 대화 id 하나를 넘긴다.
+ */
+export function previousRunWaitingSessionId(
+  target: readonly AutomationRunRecord[] | string | null | undefined,
+  probe: AutomationSessionWaitProbe,
+): string | null {
+  let sessionId: string | null | undefined
+  if (typeof target === 'string' || !target) {
+    sessionId = target
+  } else {
+    const latest = target.find((record) => record.outcome === 'woke' && record.sessionId
+      || record.outcome === 'skipped-waiting' && record.blockedBySessionId)
+    sessionId = latest?.outcome === 'woke' ? latest.sessionId : latest?.blockedBySessionId
+  }
+  if (!sessionId || !probe.isSessionRunning(sessionId)) return null
+  return probe.isSessionWaitingForUser?.(sessionId) === true ? sessionId : null
+}
+
+/**
+ * 받은편지함 요약 카드 지시(aplus-dev-studio-desktop specs/_archive/desktop-automation-run-eligibility R4).
+ * 데스크탑 `src/domain/automationInboxItem.ts`의 렌더러 경로 지시문과 글자 그대로 같아야 한다 — 데스크탑이
+ * 응답 끝의 `::inbox-item{title summary}` 한 줄을 카드 제목·요약으로 읽는다(40·120은 상한 80·240의 절반).
+ */
+const INBOX_ITEM_INSTRUCTION = [
+  '## 결과 요약',
+  '',
+  '응답의 맨 끝에 빈 줄을 하나 둔 뒤, 받은편지함 카드에 보일 요약을 단독 줄로 정확히 1개 쓰세요.',
+  '::inbox-item{title="결과 제목(40자 이내)" summary="한두 문장 요약(120자 이내)"}',
+  '제목과 요약은 사용자 요청과 같은 언어로 쓰고, 속성값에는 큰따옴표·중괄호·줄바꿈을 쓰지 마세요.',
+  '알릴 내용이 없어 [SILENT]로 답할 때는 이 줄을 쓰지 마세요.',
+].join('\n')
+
+/** 예약 회차 프롬프트 끝에 요약 디렉티브 지시를 붙인다. GitHub 트리거 작업 프롬프트에는 쓰지 않는다. */
+export function withInboxItemInstruction(prompt: string): string {
+  return `${prompt}\n\n${INBOX_ITEM_INSTRUCTION}`
 }
 
 /**

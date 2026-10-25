@@ -1483,6 +1483,28 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    it.each([
+        // The same-UID write-scope launch keeps the provider env, and its trust floor denies access.key (#898).
+        [true, true],
+        // The agent-sbx launcher drops every SAYCODE_AGENT_* key, so a broker there would serve no one.
+        [false, false],
+    ])('starts the session agent broker under a mandatory sandbox policy when scoped=%s: %s', async (scoped, agentControl) => {
+        const { StandaloneLaunchControl } = await import('@/daemon/standaloneLaunchControl');
+        const parent = await StandaloneLaunchControl.open('claude-broker-instance');
+        try {
+            if (scoped) {
+                mockScopeBootstrap.mockReturnValueOnce(parent.reserve('claude-broker-launch'));
+                process.env.HAPPY_WRITE_SCOPE_SESSION = '1';
+            }
+            process.env.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
+            process.env.HAPPY_PROJECT_SANDBOX_CONFIG = JSON.stringify({ enabled: true });
+            const harness = await startRemoteRunClaudeHarness({ runOptions: { startedBy: 'daemon' } });
+
+            expect(mockStartHappyServer).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agentControl, mandatorySandbox: true, sameUidSandbox: scoped }));
+            await harness.finish();
+        } finally { await parent.close(); }
+    });
+
     it.each(['auto', 'user'])('preserves durable message identity for %s routing receipts', async (modelSource) => {
         const harness = await startRemoteRunClaudeHarness();
         harness.sessionClient.hasTitle.mockReturnValue(true);

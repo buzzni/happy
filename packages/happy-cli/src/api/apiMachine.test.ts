@@ -206,6 +206,7 @@ describe('ApiMachineClient socket reconnection', () => {
             }),
             emit: vi.fn(),
             emitWithAck: vi.fn(),
+            timeout: vi.fn(() => mockSocket),
             close: vi.fn(),
             io: {
                 on: vi.fn()
@@ -1999,6 +2000,30 @@ describe('ApiMachineClient socket reconnection', () => {
         expect(mockSocket.emitWithAck).toHaveBeenCalledWith('automation-claim', {
             automationId: 'automation-1', generation: 2, scheduledFor: 10,
         });
+        client.shutdown();
+    });
+
+    it('turns an unanswered automation ack into a transport failure instead of waiting forever', async () => {
+        // 2026-10-24: 서버가 automation ack 하나를 돌려주지 않아 tick 이 영원히 걸렸고
+        // 데몬 재시작 전까지 GitHub 트리거·예약이 모두 멈췄다. 소켓 자체는 멀쩡했다.
+        const timedOut = vi.fn(async () => {
+            throw new Error('operation has timed out');
+        });
+        mockSocket.timeout = vi.fn(() => ({ emitWithAck: timedOut }));
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        client.connect();
+        const transport = (client as any).serverAutomationTransport();
+
+        await expect(transport.claim({ automationId: 'automation-1', generation: 2, scheduledFor: 10 }))
+            .resolves.toEqual({ ok: false, error: 'ack-timeout' });
+        await expect(transport.report({ runId: 'run-1', claimToken: 'token', reportId: 'report-1' }))
+            .resolves.toEqual({ ok: false, error: 'ack-timeout' });
+
+        expect(mockSocket.timeout).toHaveBeenCalledWith(30_000);
+        expect(timedOut).toHaveBeenCalledWith('automation-claim', { automationId: 'automation-1', generation: 2, scheduledFor: 10 });
+        expect(timedOut).toHaveBeenCalledWith('automation-run-report', { runId: 'run-1', claimToken: 'token', reportId: 'report-1' });
+        expect(mockSocket.emitWithAck).not.toHaveBeenCalledWith('automation-claim', expect.anything());
+        expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining('automation-claim ack timed out'));
         client.shutdown();
     });
 });

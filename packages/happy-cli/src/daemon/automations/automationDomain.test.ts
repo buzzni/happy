@@ -9,10 +9,12 @@ import {
   MIN_INTERVAL_MINUTES,
   parseScheduledAutomation,
   parseScheduledAutomations,
+  previousRunWaitingSessionId,
   rebaseAutomationsOnLaunch,
   SCRIPT_STDOUT_CAP_CHARS,
   serializeScheduledAutomations,
   shouldWakeFromScriptOutput,
+  withInboxItemInstruction,
   type ScheduledAutomation,
 } from './automationDomain'
 import { makeAutomation } from './automationTestFixtures'
@@ -410,5 +412,72 @@ describe('run history and auto-pause (R9, R10)', () => {
     const paused = makeAutomation({ paused: true })
     const next = appendRunRecord(paused, { at: 1, outcome: 'woke', sessionId: 'session-1' })
     expect(next.paused).toBe(true)
+  })
+})
+
+// aplus-dev-studio-desktop #2196 — 데스크탑 렌더러 경로(src/domain/automationRunEligibility.ts)와 같은 대기 게이트.
+describe('previousRunWaitingSessionId', () => {
+  const probe = (waiting: readonly string[], running: readonly string[] = waiting) => ({
+    isSessionRunning: (sessionId: string) => running.includes(sessionId),
+    isSessionWaitingForUser: (sessionId: string) => waiting.includes(sessionId),
+  })
+
+  it('names the previous woke conversation while it waits for the user', () => {
+    const history = [
+      { at: 2, outcome: 'skipped-gate' as const, sessionId: null },
+      { at: 1, outcome: 'woke' as const, sessionId: 'session-1' },
+    ]
+    expect(previousRunWaitingSessionId(history, probe(['session-1']))).toBe('session-1')
+  })
+
+  it('keeps blocking on the conversation a skipped-waiting record names after the woke record left the history', () => {
+    const history = [{ at: 1, outcome: 'skipped-waiting' as const, sessionId: null, blockedBySessionId: 'session-1' }]
+    expect(previousRunWaitingSessionId(history, probe(['session-1']))).toBe('session-1')
+  })
+
+  it('ignores a stale wait on a conversation that is no longer running (active === false)', () => {
+    const history = [{ at: 1, outcome: 'woke' as const, sessionId: 'session-1' }]
+    expect(previousRunWaitingSessionId(history, probe(['session-1'], []))).toBeNull()
+  })
+
+  it('opens the gate when the conversation is running but not waiting, or there is no previous run', () => {
+    expect(previousRunWaitingSessionId([{ at: 1, outcome: 'woke', sessionId: 'session-1' }], probe([], ['session-1']))).toBeNull()
+    expect(previousRunWaitingSessionId([], probe(['session-1']))).toBeNull()
+  })
+
+  it('accepts a single target conversation id (server-backed schedules)', () => {
+    expect(previousRunWaitingSessionId('ordinary', probe(['ordinary']))).toBe('ordinary')
+    expect(previousRunWaitingSessionId(null, probe(['ordinary']))).toBeNull()
+  })
+})
+
+describe('skipped-waiting run records', () => {
+  it('round-trips skipped-waiting with the conversation it waited on', () => {
+    const automation = appendRunRecord(makeAutomation(), { at: 5, outcome: 'skipped-waiting', sessionId: null, blockedBySessionId: 'session-1' })
+    const [parsed] = parseScheduledAutomations(serializeScheduledAutomations([automation]))
+    expect(parsed!.runHistory[0]).toEqual({ at: 5, outcome: 'skipped-waiting', sessionId: null, blockedBySessionId: 'session-1' })
+  })
+
+  it('does not keep blockedBySessionId on other outcomes', () => {
+    const [parsed] = parseScheduledAutomations(JSON.stringify([{
+      ...makeAutomation(),
+      runHistory: [{ at: 5, outcome: 'skipped-gate', sessionId: null, blockedBySessionId: 'session-1' }],
+    }]))
+    expect(parsed!.runHistory[0]).toEqual({ at: 5, outcome: 'skipped-gate', sessionId: null })
+  })
+})
+
+describe('withInboxItemInstruction', () => {
+  it('appends the desktop renderer summary-card instruction verbatim', () => {
+    expect(withInboxItemInstruction('어제 로그를 점검해줘')).toBe([
+      '어제 로그를 점검해줘',
+      '',
+      '## 결과 요약',
+      '',
+      '응답의 맨 끝에 빈 줄을 하나 둔 뒤, 받은편지함 카드에 보일 요약을 단독 줄로 정확히 1개 쓰세요.',
+      '::inbox-item{title="결과 제목(40자 이내)" summary="한두 문장 요약(120자 이내)"}',
+      '제목과 요약은 사용자 요청과 같은 언어로 쓰고, 속성값에는 큰따옴표·중괄호·줄바꿈을 쓰지 마세요.',
+      '알릴 내용이 없어 [SILENT]로 답할 때는 이 줄을 쓰지 마세요.',
+    ].join('\n'))
   })
 })

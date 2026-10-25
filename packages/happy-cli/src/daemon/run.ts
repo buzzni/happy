@@ -253,6 +253,7 @@ import {
   prepareGithubTriggerWorktree,
   removeGithubTriggerWorktree,
 } from './automations/githubTriggerWorktree';
+import { createGithubArtifactReclaimer } from './automations/githubWorktreeArtifactReclaim';
 import {
   createGithubWorktreeTombstoneStore,
   readWorktreeHead,
@@ -516,6 +517,8 @@ async function readDifficultyRoutingHostElection(input: {
 
 export const DIFFICULTY_ROUTING_ELECTION_POLL_MS = 15_000;
 const DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS = 15 * 60_000;
+// 서버 자동화 tick 이 이 시간을 넘기면 멈춘 것으로 보고 버린다 (정상 tick 은 1분 안에 끝난다).
+const SERVER_AUTOMATION_TICK_STALL_MS = 10 * 60_000;
 
 /**
  * Doubling delay while the route stays unreachable, capped at 15 minutes. A
@@ -2804,7 +2807,18 @@ export async function startDaemon(): Promise<void> {
     const githubWorktreeTombstones = createGithubWorktreeTombstoneStore({
       filePath: join(configuration.happyHomeDir, 'automation-worktree-tombstones.json'),
     });
-    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(removeGithubTriggerWorktree, {
+    const reclaimGithubArtifacts = createGithubArtifactReclaimer({
+      managedRoot: join(configuration.happyHomeDir, 'automation-worktrees'),
+      isDirectoryInUse: directory => !launchReadiness.isReady() || pendingMachineStarts.size > 0
+        || resumingSetupTokenSessions.size > 0 || isAutomationDirectoryInUse(directory),
+    });
+    const discardRememberedGithubWorktree = rememberGithubWorktreeRemoval(input => removeGithubTriggerWorktree({
+      ...input,
+      reclaimArtifacts: async () => {
+        const report = await reclaimGithubArtifacts(input);
+        if (report.status !== 'deferred') logger.debug(`[DAEMON RUN] [github-artifact-reclaim] ${JSON.stringify(report)}`);
+      },
+    }), {
       readHead: readWorktreeHead,
       record: (removed) => githubWorktreeTombstones.record(removed),
     });
@@ -3819,6 +3833,14 @@ export async function startDaemon(): Promise<void> {
       }
       return false;
     };
+    // 예약 대기 게이트(aplus-dev-studio-desktop #2196)용: 자식 세션이 직접 보고한 사용자 입력 대기
+    // (열린 AskUserQuestion 또는 agentState.requests의 권한·계획 승인 — apiSession.reportDaemonRuntime).
+    const isAutomationSessionWaitingForUser = (sessionId: string): boolean => {
+      for (const session of pidToTrackedSession.values()) {
+        if (session.happySessionId === sessionId) return session.runtime?.pendingUserInput === true;
+      }
+      return false;
+    };
     const isAutomationDirectoryInUse = (directory: string): boolean => {
       return isGithubTriggerWorktreeDirectoryInUse({
         directory,
@@ -3878,6 +3900,7 @@ export async function startDaemon(): Promise<void> {
         runScript: (input) => runAutomationScript({ ...input, allowedRoot: automationAllowedRoot }),
         spawnSession: spawnAutomationSession,
         isSessionRunning: isAutomationSessionRunning,
+        isSessionWaitingForUser: isAutomationSessionWaitingForUser,
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
@@ -4994,6 +5017,7 @@ export async function startDaemon(): Promise<void> {
           logger.debug(`[DAEMON RUN] Restored automation worktree sweep failed: ${error instanceof Error ? error.message : error}`);
         }),
         isSessionRunning: isAutomationSessionRunning,
+        isSessionWaitingForUser: isAutomationSessionWaitingForUser,
         stopSession: (sessionId) => {
           stopSession(sessionId, {
             source: 'server-automation',
@@ -5004,6 +5028,9 @@ export async function startDaemon(): Promise<void> {
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+      // 정상 tick 은 1분 하트비트 안에 끝난다 (spawn webhook 대기 최대 60초, gh·git 호출은
+      // 각자 상한이 있다). 이를 10배 넘기면 끝나지 않는 await 다 — 버리고 새로 시작한다.
+      stalledAfterMs: SERVER_AUTOMATION_TICK_STALL_MS,
     });
     const sessionFollowupSyncState = createSessionFollowupSyncState();
     const sessionFollowupTickRunner = createAutomationTickRunner({

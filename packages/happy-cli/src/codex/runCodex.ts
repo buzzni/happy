@@ -180,6 +180,7 @@ import {
     publishedSessionModelPin,
     type SessionModelPin,
 } from '@/utils/sessionModelPin';
+import { createSessionPermissionModePublisher, publishedSessionPermissionMode } from '@/utils/sessionPermissionMode';
 
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
@@ -572,12 +573,19 @@ export async function runCodex(opts: {
     // message arrives — otherwise the first turn sent from another device is
     // the one that loses the pin.
     sessionModelPinPublisher.publish({ specifiesModel: false, specifiesEffort: false });
+    // The session's current permission mode, readable by every client (aplus-dev-studio-desktop #2187).
+    const permissionModePublisher = createSessionPermissionModePublisher({
+        published: publishedSessionPermissionMode(metadata),
+        updateMetadata: (update) => session.updateMetadata(update),
+    });
+    permissionModePublisher.publish(currentPermissionMode);
     let currentAppendSystemPrompt: string | undefined = initialAppendSystemPrompt;
     let currentSaycodeSystemPromptEnabled: boolean | undefined = initialSaycodeSystemPromptEnabled;
     let currentSaycodePromptBlocks: CodexEnhancedMode['saycodePromptBlocks'] = withoutTurnScopedBlocks(initialSaycodePromptBlocks);
 
     const resetTurnScopedOptions = () => {
         currentPermissionMode = DEFAULT_CODEX_PERMISSION_MODE;
+        permissionModePublisher.publish(currentPermissionMode);
         currentModel = explicitInitialModel;
         currentEffort = initialEffortSeed;
         sessionModelPinPublisher.reset();
@@ -614,6 +622,7 @@ export async function runCodex(opts: {
         );
         if (messagePermissionMode !== currentPermissionMode) {
             currentPermissionMode = messagePermissionMode;
+            permissionModePublisher.publish(currentPermissionMode);
             logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
         } else {
             logger.debug(`[Codex] Keeping current permission mode: ${currentPermissionMode ?? 'default (effective)'}`);
@@ -1069,6 +1078,8 @@ export async function runCodex(opts: {
      */
     async function handleAbort() {
         if (runtimeGate?.isFrozen()) return;
+        // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
+        session.markCurrentTurnAborted?.(); // optional: test doubles of the session omit it; the abort must not depend on it
         preemptLessonReview();
         // Stop means stop: a capacity continuation waiting to fire must not restart the work.
         cancelCapacityRetry();
@@ -1919,6 +1930,7 @@ export async function runCodex(opts: {
     const turnCards = createTurnCardSwitch('codex');
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
+        browserClientApprover: () => permissionHandler,
         agentControl: accountToken !== null,
         exitAfterFirstTurn,
         delegatedAttendance: () => turnAttendance ? delegatedAttendanceFor(turnAttendance.current()) : null,
@@ -1931,6 +1943,7 @@ export async function runCodex(opts: {
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+        currentTurnId: () => session.currentTurnId?.() ?? null,
     });
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.

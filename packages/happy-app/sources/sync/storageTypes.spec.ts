@@ -55,6 +55,26 @@ describe('MetadataSchema', () => {
         expect(metadata.path).toBe('/tmp/project');
         expect(metadata.source).toBeUndefined();
     });
+
+    // aplus-dev-studio-desktop #2187: the session's current permission mode must survive the
+    // app's metadata write-back, or every other client loses it after a title change here.
+    it('preserves the CLI-published current permission mode through a parse round-trip', () => {
+        const metadata = MetadataSchema.parse({
+            path: '/tmp/project', host: 'local-machine', permissionMode: 'safe-yolo', permissionModeUpdatedAt: 123,
+        });
+        const roundTrip = MetadataSchema.parse(JSON.parse(JSON.stringify(metadata)));
+        expect(roundTrip.permissionMode).toBe('safe-yolo');
+        expect(roundTrip.permissionModeUpdatedAt).toBe(123);
+    });
+
+    it('drops a malformed permission mode instead of failing the whole metadata', () => {
+        const metadata = MetadataSchema.parse({
+            path: '/tmp/project', host: 'local-machine', permissionMode: { mode: 'yolo' }, permissionModeUpdatedAt: 'soon',
+        });
+        expect(metadata.path).toBe('/tmp/project');
+        expect(metadata.permissionMode).toBeUndefined();
+        expect(metadata.permissionModeUpdatedAt).toBeUndefined();
+    });
 });
 
 describe('MachineMetadataSchema', () => {

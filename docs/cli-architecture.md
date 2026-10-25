@@ -1,5 +1,18 @@
 # CLI Architecture
 
+## GitHub automation artifact lifecycle
+
+The journal-driven worktree discard path retains dirty source while
+`daemon/automations/githubWorktreeArtifactReclaim` reclaims old ignored dependencies
+and build outputs in registered daemon-owned automation worktrees. It verifies
+Git ownership, tracked descendants, nested repositories, recent activity and
+daemon/OS process use immediately before deletion. Incomplete process observation
+preserves the files. Receipts outside Git worktrees retain the daily check interval
+across restarts; the existing automation tick owns retries. Clean worktree deletion
+and tombstone-based Chat resume keep their existing lifecycle.
+The policy and reconsideration boundaries are in
+[the implementation plan](plans/github-automation-artifact-reclaim.md).
+
 ## Worktree Git write ownership
 
 Ticket-validated worktree writes share Desktop's common Git directory lock.
@@ -876,6 +889,8 @@ machine-v2 binding을 보존한다. v1에 서버 operation 계약을 추가할 �
 ## Session-local agent control broker
 
 Account Claude/Codex hosts opt into `commands/sessionAgentBroker` through the existing Happy MCP host lifecycle.
+A mandatory Claude host opts in only for the same-UID session write-scope launch; the agent-sbx launcher's env
+allowlist drops `SAYCODE_AGENT_*`, so no provider there could reach a broker.
 The broker snapshots the current session, directory, runtime credential home and sandbox environment before the
 provider starts. Its loopback-only `commands/agentBroker` endpoint accepts only version 1 agent argv with a random
 per-host capability; browser origins, caller env/cwd and arbitrary commands are refused. It uses the same runtime
@@ -893,3 +908,7 @@ credential read deny as rollback. Publishing the corresponding CLI and exact Hap
 
 Activation is gated by `saycodeAgentBrokerProtocol: 1` in the bundled CLI manifest, so a Happy upgrade before
 the corresponding CLI release retains the old facade. Publish/install acceptance must verify both artifacts.
+
+### Local applications using Agent Browser spaces
+
+`browserRuntime/localClients.ts` owns bounded client delegation separately from daemon session registrations. An existing authenticated session delegates its own space under the same principal; the runtime checks space membership, assignment and tab ownership. Client credentials can request only a narrow AgentGrant and cannot register or join other spaces. `runtime.ts` persists fixed client leases on spaces, fences expired/revoked clients and preserves ordinary reclaim behavior for other spaces. `browserRuntime/localClientSession.ts` holds the owner credential inside the trusted session process, requests human-only one-time approval and issues a private connection file. Claude/Codex wire the existing permission approver; other runners fail closed. `commands/browserClientCommand.ts` provides bounded collection/status/revocation without loading provider runtimes; public CLI issuance is disabled. This is not the Chrome extension bridge. See [the local-client contract](browser-local-client.md) for expiry, downgrade and same-OS-user limitations. Revisit this boundary before adding indefinite renewal, remote clients or a broader extraction API.
