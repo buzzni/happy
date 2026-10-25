@@ -755,6 +755,43 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await harness.evaluate(studio, 'window.__console.close()')
         await harness.closeTarget(studio)
     }, 30_000)
+    it('limits conversation links to that conversation and never picks another on an empty match', async () => {
+        holdSubscribe = true
+        listedTasks = [
+            { taskId: 'mine', agentSessionId: 'current', status: 'paused', tabs: ['tab-1'] },
+            { taskId: 'other', agentSessionId: 'different', status: 'awaiting-user', tabs: ['tab-2'] },
+        ]
+        taskDetail = { ...listedTasks[0], approvalMode: { mode: 'manual', origins: [], availableOrigins: [origin], runtimeId: 'runtime-test' } }
+        const cap = token('scoped', Date.now() + 600_000)
+        const target = await harness.openFrontTab(`${origin}/console?agentSessionId=current#abp-cap=${cap}`)
+        const empty = await harness.openFrontTab(`${origin}/console?agentSessionId=missing#abp-cap=${cap}`)
+        try {
+            await eventually(() => harness.evaluate(target, 'document.getElementById("tasks").textContent'), text => text.includes('mine'))
+            expect(await harness.evaluate(target, `document.querySelector('[data-task="other"]') !== null`)).toBe(false)
+            expect(await eventually(() => harness.evaluate(target, 'document.getElementById("detailId")?.textContent'), text => text === 'mine')).toBe('mine')
+            expect(await eventually(() => harness.evaluate(empty, 'document.getElementById("tasks").textContent'), text => !text.includes('Loading'))).not.toContain('other')
+            expect(await harness.evaluate(empty, 'document.getElementById("detail").hidden')).toBe(true)
+        } finally { await harness.closeTarget(target); await harness.closeTarget(empty); taskDetail = undefined; listedTasks = defaultTasks(); holdSubscribe = false }
+    }, 30_000)
+
+    it('selects a new conversation task after the scoped list was empty', async () => {
+        holdSubscribe = true
+        listedTasks = [{ taskId: 'before-empty', agentSessionId: 'current', status: 'awaiting-user', tabs: ['tab-1'] }]
+        taskDetail = { ...listedTasks[0] }
+        const target = await harness.openFrontTab(`${origin}/console?agentSessionId=current#abp-cap=${token('empty', Date.now() + 600_000)}`)
+        try {
+            await eventually(() => harness.evaluate(target, 'document.getElementById("detailId")?.textContent'), t => t === 'before-empty')
+            listedTasks = []
+            await harness.evaluate(target, 'document.getElementById("refreshTasks").click()')
+            await eventually(() => harness.evaluate(target, 'document.getElementById("detail").hidden'), v => v === true)
+            expect(await harness.evaluate(target, 'document.getElementById("taskId").value')).toBe('')
+            listedTasks = [{ taskId: 'after-empty', agentSessionId: 'current', status: 'paused', tabs: ['tab-2'] }]
+            taskDetail = { ...listedTasks[0] }
+            await harness.evaluate(target, 'document.getElementById("refreshTasks").click()')
+            expect(await eventually(() => harness.evaluate(target, 'document.getElementById("detailId")?.textContent'), t => t === 'after-empty')).toBe('after-empty')
+        } finally { await harness.closeTarget(target); taskDetail = undefined; listedTasks = defaultTasks(); holdSubscribe = false }
+    }, 30_000)
+
     it('confirms Auto scope, preserves pending approval, handles Escape and disables Auto', async () => {
         ops.length = 0; holdSubscribe = true
         taskDetail = { taskId: 'task-1', status: 'awaiting-user', stateVersion: 3, tabs: ['tab-1'],
@@ -773,8 +810,9 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             await harness.conn.send('Target.detachFromTarget', { sessionId })
             await eventually(() => harness.evaluate(target, 'document.getElementById("autoDialog").open'), open => open === false)
             expect(await eventually(() => harness.evaluate(target, 'document.activeElement.id'), id => id === 'autoMode')).toBe('autoMode')
-            await harness.evaluate(target, 'document.getElementById("autoMode").click();document.getElementById("autoConfirm").click()')
+            await harness.evaluate(target, 'document.getElementById("approvalAutoMode").click();document.getElementById("autoConfirm").click()')
             await eventually(() => harness.evaluate(target, 'document.getElementById("autoMode").getAttribute("aria-pressed")'), value => value === 'true')
+            expect(await harness.evaluate(target, 'document.activeElement.id')).toBe('autoMode')
             expect(ops.find(entry => entry.op === 'approve')?.body).toMatchObject({ taskId: 'task-1', mode: 'auto', origins: [origin], runtimeId: 'runtime-test' })
             expect(ops.find(entry => entry.op === 'approve')?.body.approvalId).toBeUndefined()
             expect(await harness.evaluate(target, 'document.getElementById("approvalBox").hidden')).toBe(false)

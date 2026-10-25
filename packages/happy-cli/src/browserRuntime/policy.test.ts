@@ -262,6 +262,10 @@ describe('task Auto classification', () => {
         'never interprets %s as a harmless disclosure', name => {
             expect(classifySiteAction(sites, step, { ...element, currentName: name }, scope)).toBe('requires-approval')
         })
+    it.each(['/posts/1', '/orders', '/report?saved=1'])('does not mistake content URL %s for an effectful button', path => {
+        expect(classifySiteAction(sites, step, { ...element, pageUrl: scope[0] + path }, scope)).toBe('auto')
+        expect(classifySiteAction(sites, step, { ...element, pageUrl: scope[0] + path, currentName: 'Save' }, scope)).toBe('requires-approval')
+    })
     it('keeps explicit site approval rules, forms, sensitive context and unlabeled controls', () => {
         expect(classifySiteAction([{ origin: scope[0], actions: [{ match: { kinds: ['click'] }, risk: 'requires-approval' }] }], step, element, scope)).toBe('requires-approval')
         expect(classifySiteAction(sites, step, { ...element, formAction: scope[0] + '/search' }, scope)).toBe('requires-approval')

@@ -399,3 +399,7 @@ At the bound, manual revocation remains possible while further enables require a
 task. Failed requests are retriable only while no newer user choice superseded them;
 in-flight requests never report success early. UI-evidence comparison applies only to
 clicks that actually gained permission from Auto, preserving manual/site-auto behavior.
+
+### Desktop approval entry
+
+The console advertises task-scoped controls with `window.__abpTaskAutoControls === 1`. Desktop scoped launches withhold the interactive capability until this marker is confirmed. An older console never receives it through that path. `agentSessionId` is a UI selection hint, not authority: the task API still checks the capability owner/profile. An empty scope clears the previous selection and never picks another conversation. Approval cards share the explicit scope dialog; changing mode does not answer their pending approval.

@@ -249,8 +249,9 @@ function isLocalUiInteraction(element: ElementDescription): boolean {
     if (!element.uiAction || element.form || element.formAction || element.linkUrl || element.submitsForm) return false
     const name = (element.currentName ?? element.name).trim()
     if (!name || name.length > 120) return false
-    const context = `${name} ${element.pageUrl}`.toLowerCase()
-    if (/send|submit|publish|upload|delete|remove|erase|pay|purchase|checkout|transfer|permission|sharing|security|password|consent|agree|save|post|reply|confirm|approve|accept|apply|order|merge|전송|보내|제출|게시|업로드|삭제|제거|결제|구매|송금|권한|공유|보안|비밀번호|동의|저장|답글|확인|승인|수락|주문|병합/.test(context)) return false
+    const context = element.pageUrl.toLowerCase()
+    if (/send|submit|publish|upload|delete|remove|erase|pay|purchase|checkout|transfer|permission|sharing|security|password|consent|agree|save|post|reply|confirm|approve|accept|apply|order|merge|전송|보내|제출|게시|업로드|삭제|제거|결제|구매|송금|권한|공유|보안|비밀번호|동의|저장|답글|확인|승인|수락|주문|병합/.test(name.toLowerCase())) return false
+    if (/send|submit|publish|upload|delete|remove|erase|pay|purchase|checkout|transfer|permission|sharing|security|password|consent|agree|reply|confirm|approve|accept|apply|merge|전송|보내|제출|게시|업로드|삭제|제거|결제|구매|송금|권한|공유|보안|비밀번호|동의|저장|답글|확인|승인|수락|주문|병합/.test(context)) return false
     const role = element.currentRole ?? element.role
     return element.uiAction === 'tab' ? role === 'tab' : role === 'button'
 }
