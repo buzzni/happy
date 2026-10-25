@@ -142,6 +142,53 @@ Verification sequence:
   Real paid providers, Desktop integration and packaged runtime acceptance remain
   outside this local verification, as in the original report.
 
+## SDK delivery and failed-write follow-up (2026-10-25)
+
+Review base: `dcbfb2453ce262e0d8c49a6c3745961ec0483ad0`.
+T2RT-01/04/05 remain closed. The prior T2RT-02/03 tests established the state
+transition only; they did not establish SDK delivery through the outgoing filter.
+Both reopened findings and T2RT-06 are accepted and implemented in this follow-up.
+
+| Finding | Correction and executed reproduction |
+| --- | --- |
+| T2RT-02 | `OutgoingMessageQueue.enqueue` preserves converted SDK `system/task_notification` as an internal ordered item. The existing dispatcher unwraps it into the normal session mapper; ordinary system logs remain filtered. Tests run the real SDK converter, outgoing queue, context-usage wrapper, dispatcher and mapper, with real background launch/result messages and delayed assistant output. B's final/end witness is incomplete before any scanner row arrives, with the notification arriving while B is active, pending, or before B is queued. |
+| T2RT-03 | The same production-path scenarios first process 128 later turns to evict A. The SDK notification then marks B incomplete with `background-source-unavailable` in all three arrival states. No test directly invokes `rearmBackground()` as its stimulus; only the mapper's real callback does so. |
+| T2RT-06 | The runner's catch settles a pending claim when no successful write was observed, before finally clears the batch. It publishes a terminal `cancelled` evidence revision for the original continuation, preserving its turn/root rather than inventing a dispatched retry. The regression runs the real consumer loop and `CodexAppServerClient.sendTurnAndWait` → `sendTurn` → `request`; the failed dispatch uses a fake process stdin whose `write()` throws synchronously after claim. Initial overload and external API boundaries remain scripted. The test verifies one attempted failing write, the original terminal revision, and no extra turn-start. |
+
+Verification:
+
+- Before production changes: **7 failed / 36 passed** in
+  `channel/channelTurnOrdering.test.ts` and `codex/runCodex.capacityRetry.test.ts`.
+  Six SDK-path cases ended B with complete coverage; the actual failed-write case
+  left A pending and nonterminal.
+- After correction: both files passed, **43/43 tests**.
+- Standard validation caught a missing method in the existing Codex lesson
+  fixture; the fixture now implements the new settlement method. That run also
+  exposed an unmodified ACP test's timing race: it waits for session creation but
+  calls the kill handler before registration, leaving a run that affects the next
+  test. No ACP implementation/test was changed. Isolated consumer rerun passed
+  **58/58** across the two files.
+- Final standard CLI selection: **34 files / 960 tests; 959 passed, 1 startup
+  timeout** in the unmodified `claude/runClaude.test.ts` harness's `mockLoop`
+  wait (line 260, before its scenario). That entire file then passed **62/62** in
+  isolation without code/test changes. The ACP suite passed in this final run.
+  These are separate results, not a claim that the bulk run was all green.
+- Selection: the original 31 files above plus `codex/codexAppServerClient.test.ts`,
+  `claude/utils/sdkToLogConverter.test.ts` and `claude/claudeContextUsage.test.ts`
+  (all under `src/`). Command: `corepack pnpm -C packages/happy-cli exec vitest run
+  --project unit <selection> --maxWorkers 1`. Standard global setup completed CLI
+  `tsc --noEmit`, pkgroll and extension copy successfully. Isolated reruns used
+  the ignored iteration config without repeating the already-passed build.
+- Wire: `corepack pnpm -C packages/happy-wire build` (including typecheck) passed;
+  `sessionProtocol.test.ts` passed **39/39**. `git diff --check` passed.
+- Existing bin/empty-chunk and harness listener/rejection warnings remain.
+  Full-suite, paid-provider, Desktop integration and packaged acceptance were not
+  run. The unrelated startup timing races are follow-up test-harness work, not
+  changes bundled into this runtime fix.
+- No finding is deferred. No public schema/authority change or design change is
+  required. The internal queue item and its type stay in their owning modules;
+  no package barrel, manifest, lockfile or T1b file is edited.
+
 ## Contract decisions and implementation details
 
 - `UserMessage.serverSeq`, like serverMessageId, comes from the received server row

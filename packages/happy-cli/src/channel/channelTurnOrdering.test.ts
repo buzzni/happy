@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OutgoingMessageQueue } from '@/claude/utils/OutgoingMessageQueue';
+import { SDKToLogConverter } from '@/claude/utils/sdkToLogConverter';
+import { withContextUsageSignals } from '@/claude/claudeContextUsage';
+import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import {
     closeClaudeTurnWithStatus,
     mapClaudeChannelFinalAnswer,
@@ -28,28 +31,34 @@ import { installChannelPermissionWiring } from './channelPermissionWiring';
  * the question is whether the envelopes come out as `turn-start → text → final-answer → turn-end`
  * under one request id.
  */
-function harness() {
+function harness(witnessed = false) {
     const envelopes: SessionEnvelope[] = [];
-    const state: ClaudeSessionProtocolState = { currentTurnId: null };
+    const evidence = new TurnInputEvidence('host', envelope => envelopes.push(envelope));
+    const append = (batch: SessionEnvelope[]) => envelopes.push(...batch.map(envelope => witnessed ? evidence.stamp(envelope) : envelope));
+    const rearm = vi.fn((ids: string[]) => evidence.rearmBackground(ids));
+    const state: ClaudeSessionProtocolState = { currentTurnId: null,
+        ...(witnessed ? { onBackgroundInputLaunch: (id: string, turn: string) => evidence.rememberBackground(id, turn),
+            onBackgroundInputRearm: rearm } : {}) };
     const bindings: {
         permissionId: string; toolName: string; instanceSeq: number;
         turnId: string | null; requestId: string | null;
     }[] = [];
     const target = {
+        setPendingInputEvidence: (batch: EvidenceBatch) => evidence.setPending(batch),
         setPendingTurnRequestId: (requestId: string | null) => { state.pendingRequestId = requestId; },
         sendFinalAnswerForChannelTurn: (text: string) => {
-            envelopes.push(...mapClaudeChannelFinalAnswer(state, text).envelopes);
+            append(mapClaudeChannelFinalAnswer(state, text).envelopes);
         },
         sendStructuredOutput: (envelope: Parameters<typeof mapClaudeStructuredOutput>[1]) => {
-            envelopes.push(...mapClaudeStructuredOutput(state, envelope).envelopes);
+            append(mapClaudeStructuredOutput(state, envelope).envelopes);
         },
         closeClaudeSessionTurn: (status: SessionTurnEndStatus) => {
-            envelopes.push(...closeClaudeTurnWithStatus(state, status).envelopes);
+            append(closeClaudeTurnWithStatus(state, status).envelopes);
         },
         sendClaudeSessionMessage: (logMessage: unknown) => {
             const mapped = mapClaudeLogMessageToSessionEnvelopes(logMessage as never, state);
             state.currentTurnId = mapped.currentTurnId;
-            envelopes.push(...mapped.envelopes);
+            append(mapped.envelopes);
         },
         // Records the turn the binding was applied against, which is the whole question.
         bindChannelPermission: (permissionId: string, toolName: string, instanceSeq: number) => {
@@ -62,8 +71,8 @@ function harness() {
             });
         },
     };
-    const queue = new OutgoingMessageQueue(createOrderedTurnDispatcher(target));
-    return { queue, envelopes, state, bindings };
+    const queue = new OutgoingMessageQueue(withContextUsageSignals(createOrderedTurnDispatcher(target), () => {}));
+    return { queue, envelopes, state, bindings, evidence, rearm };
 }
 
 const assistant = (text: string, uuid = 'a-1') => ({
@@ -84,6 +93,58 @@ function requestIds(envelopes: SessionEnvelope[]) {
 }
 
 describe('channel turn ordering through the launcher dispatcher', () => {
+    it.each([false, true].flatMap(evicted => ['active', 'pending', 'idle'].map(phase => ({ evicted, phase }))))(
+        'T2RT-02/03 delivers SDK notification before B ends (evicted=$evicted, phase=$phase)', async ({ evicted, phase }) => {
+            const h = harness(true);
+            const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+            const sdk = (message: Parameters<typeof converter.convert>[0], delay?: number) => {
+                const log = converter.convert(message);
+                expect(log).not.toBeNull(); h.queue.enqueue(log, { delay });
+            };
+            const batch = (id: string) => pendingRequestItem(null, {
+                inputs: [{ kind: 'rest', serverMessageId: id, serverSeq: 1 }], inputCount: 1,
+            });
+            const text = (value: string) => ({ type: 'assistant' as const, parent_tool_use_id: null,
+                message: { role: 'assistant', content: [{ type: 'text', text: value }] } } as Parameters<typeof converter.convert>[0]);
+            try {
+                h.queue.enqueue(batch('A'));
+                sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+                    { type: 'tool_use', id: 'launch', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+                ] } } as Parameters<typeof converter.convert>[0], 250);
+                sdk({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+                    { type: 'tool_result', tool_use_id: 'launch', content: 'Command running in background with ID: long-job.' },
+                ] } });
+                h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+                const original = h.evidence.snapshot()!;
+                if (evicted) {
+                    for (let i = 0; i < 128; i++) {
+                        h.queue.enqueue(batch(`other-${i}`)); sdk(text(`other-${i}`)); h.queue.enqueue(turnEndItem('completed'));
+                    }
+                    await h.queue.flush(); expect(h.evidence.snapshot(original.turnId)).toBeNull();
+                }
+                if (phase !== 'idle') h.queue.enqueue(batch('B'));
+                if (phase === 'active') sdk(text('B begins'), 250);
+                sdk({ type: 'system', subtype: 'task_notification', task_id: 'long-job', tool_use_id: 'launch',
+                    status: 'completed', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000001',
+                    output_file: '/tmp/long-job.output', summary: 'Background task completed' });
+                // Unrelated system messages must remain filtered.
+                sdk({ type: 'system', subtype: 'init', session_id: 'sdk-session' } as Parameters<typeof converter.convert>[0]);
+                if (phase === 'idle') h.queue.enqueue(batch('B'));
+                sdk(text('B finishes')); h.queue.enqueue(finalAnswerItem('B finishes')); h.queue.enqueue(turnEndItem('completed'));
+                await h.queue.flush(); // The scanner has not run; B's durable terminal must already be safe.
+                const terminal = h.envelopes.filter(envelope => envelope.ev.t === 'turn-end').at(-1)!;
+                expect(terminal.ev).toMatchObject({ inputEvidence: { inputs: [{ kind: 'rest', serverMessageId: 'B', serverSeq: 1 }],
+                    terminal: true, coverage: 'incomplete', incompleteReasons: expect.arrayContaining([
+                        evicted ? 'background-source-unavailable' : 'background-co-consumption',
+                    ]) } });
+                expect(h.rearm).toHaveBeenCalledOnce();
+                const receiptIndex = h.envelopes.findIndex(envelope => envelope.id.startsWith('task-notification:long-job:receipt'));
+                expect(receiptIndex).toBeGreaterThan(-1);
+                expect(receiptIndex).toBeLessThan(h.envelopes.indexOf(terminal));
+            } finally { h.queue.destroy(); }
+        },
+    );
+
     it('emits start, text, final answer and terminal in order under one request id', async () => {
         const { queue, envelopes } = harness();
 

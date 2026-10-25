@@ -105,6 +105,16 @@ export class TurnInputEvidence {
         this.carry = null;
         return claimed;
     }
+    /** Called only when a claimed provider dispatch failed before any write was observed. */
+    cancelPendingDispatch(): void {
+        const claimed = this.pending?.continuation;
+        if (!claimed || !this.claimedContinuations.delete(claimed)) return;
+        const source = this.turns.get(claimed.turnId) ?? claimed;
+        if (source.continuation.retryId !== claimed.continuation.retryId || source.continuation.state !== 'pending') return;
+        source.continuation.state = 'cancelled';
+        source.terminal = true;
+        this.publish(source);
+    }
     private clone(value: InputEvidenceV1): InputEvidenceV1 {
         const copy = structuredClone(value);
         this.attempts.set(copy, new Set(this.attempts.get(value)));

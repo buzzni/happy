@@ -1,3 +1,4 @@
+import type { BackgroundTaskNotificationItem } from '@/claude/utils/OutgoingMessageQueue';
 import type { EvidenceBatch } from '@/api/turnInputEvidence';
 import type { InputEvidenceV1 } from '@slopus/happy-wire';
 import type { SessionTurnEndStatus } from '@slopus/happy-wire';
@@ -116,6 +117,10 @@ export function createOrderedTurnDispatcher(
     target: ChannelTurnOrderingTarget,
 ): (message: unknown) => void {
     return (message: unknown) => {
+        if (message && typeof message === 'object' && '__claudeBackgroundNotification' in message) {
+            target.sendClaudeSessionMessage((message as BackgroundTaskNotificationItem).logMessage);
+            return;
+        }
         if (message && typeof message === 'object' && '__inputContinuation' in message) {
             target.continueInputEvidence?.((message as { __inputContinuation: InputEvidenceV1['continuation']['kind'] }).__inputContinuation);
             return;

@@ -6,6 +6,13 @@
  */
 
 import { AsyncLock } from '@/utils/lock';
+import type { RawJSONLines } from '@/claude/types';
+
+/** A background receipt must reach the mapper in order even though ordinary system logs are filtered. */
+export interface BackgroundTaskNotificationItem {
+    __claudeBackgroundNotification: true;
+    logMessage: RawJSONLines;
+}
 
 interface QueueItem {
     id: number;                    // Incremental ID for ordering
@@ -33,10 +40,13 @@ export class OutgoingMessageQueue {
         delay?: number,
         toolCallIds?: string[]
     }) {
+        const orderedMessage = logMessage?.type === 'system' && logMessage.subtype === 'task_notification'
+            ? { __claudeBackgroundNotification: true, logMessage } satisfies BackgroundTaskNotificationItem
+            : logMessage;
         this.lock.inLock(async () => {
             const item: QueueItem = {
                 id: this.nextId++,
-                logMessage,
+                logMessage: orderedMessage,
                 delayed: !!options?.delay,
                 delayMs: options?.delay || 0,
                 toolCallIds: options?.toolCallIds,

@@ -2772,6 +2772,7 @@ export async function runCodex(opts: {
                 } catch (error) {
                     latency?.finish('failed');
                     preemptLessonReview();
+                    if (!dispatchedWithoutStart) session.inputEvidence?.cancelPendingDispatch();
                     if (inputInvalidated) continue;
                     // Only actual errors reach here (process crash, connection failure, etc.)
                     // No task_complete/turn_aborted was ever received for this turn, so the
