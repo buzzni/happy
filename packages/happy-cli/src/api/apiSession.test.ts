@@ -1,3 +1,8 @@
+import { createSessionScanner } from '@/claude/utils/sessionScanner';
+import { getProjectPath } from '@/claude/utils/path';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { configuration } from '@/configuration';
 import type { ClaudeSessionProtocolState } from '@/claude/utils/sessionProtocolMapper';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
@@ -5,7 +10,7 @@ import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
-import { createEnvelope } from '@slopus/happy-wire';
+import { createEnvelope, sessionEnvelopeSchema, type SessionEnvelope } from '@slopus/happy-wire';
 import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
@@ -212,6 +217,155 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
 
         mockIo.mockReturnValue(mockSocket);
+    });
+
+    it.each([false, true])('T2RT-16 preserves real scanner rearm across a textless final (evidence=%s)', async supported => {
+        const client = new ApiSessionClient('fake-token', session);
+        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', supported);
+        const published: SessionEnvelope[] = [];
+        vi.spyOn(client as any, 'enqueueMessage').mockImplementation((value: unknown) => {
+            const message = value as { role: string; content: SessionEnvelope };
+            if (message.role === 'session') published.push(message.content);
+        });
+        const directory = await mkdtemp(join(tmpdir(), 't2rt-routing-'));
+        const oldConfig = process.env.CLAUDE_CONFIG_DIR;
+        process.env.CLAUDE_CONFIG_DIR = directory;
+        let scanner: Awaited<ReturnType<typeof createSessionScanner>> | undefined;
+        const state = (client as any).claudeSessionProtocolState as ClaudeSessionProtocolState;
+        const routing = () => ({ current: state.currentTurnId, request: state.currentRequestId,
+            pending: state.pendingRequestId, launches: [...(state.backgroundTaskRequestIds ?? [])] });
+        try {
+            client.setPendingTurnRequestId('channel-A');
+            if (supported) client.startClaudeInputEvidence({ inputs: [{ kind: 'channel', channelRequestId: 'channel-A' }], inputCount: 1 });
+            client.sendClaudeSessionMessage({ type: 'assistant', uuid: 'launch-A', message: { role: 'assistant', content: [
+                { type: 'tool_use', id: 'launch', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+            ] } } as any);
+            client.sendClaudeSessionMessage({ type: 'user', uuid: 'result-A', message: { role: 'user', content: [
+                { type: 'tool_result', tool_use_id: 'launch', content: 'Command running in background with ID: job.' },
+            ] } } as any);
+            client.closeClaudeSessionTurn('completed');
+            const beforeFinal = routing();
+            expect(beforeFinal).toMatchObject({ current: null, pending: null,
+                launches: [['job', 'channel-A'], ['launch', 'channel-A']] });
+            // The SDK delivered its final candidate; MCP recovery/afterTurn has not reached onReady.
+            client.sendFinalAnswerForChannelTurn('textless background result');
+            expect.soft(routing()).toEqual(beforeFinal);
+            const candidate = published.find(event => event.ev.t === 'final-answer');
+            if (supported) expect(candidate?.ev).toMatchObject({ inputEvidence: { coverage: 'incomplete' } });
+            else expect(candidate).toBeUndefined();
+            const project = getProjectPath(directory);
+            await mkdir(project, { recursive: true });
+            let scanned = 0;
+            scanner = await createSessionScanner({ sessionId: null, workingDirectory: directory,
+                onMessage: message => { client.sendClaudeSessionMessage(message); scanned++; } });
+            const sessionId = '11111111-2222-4333-8444-999999999999';
+            await writeFile(join(project, `${sessionId}.jsonl`), JSON.stringify({ type: 'attachment', uuid: 'late-attachment',
+                attachment: { type: 'queued_command', commandMode: 'task-notification', runId: 'run-1',
+                    prompt: '<task-notification><task-id>job</task-id><tool-use-id>launch</tool-use-id><status>completed</status></task-notification>' } }) + '\n');
+            await scanner.onNewSession(sessionId);
+            await vi.waitFor(() => expect(scanned).toBe(1));
+            expect.soft(state.pendingRequestId).toBe('channel-A');
+            expect(state.backgroundTaskRequestIds?.size).toBe(0); // Consumed by the scanner, not by evidence.
+            client.closeClaudeSessionTurn('completed');
+            expect.soft(published.filter(event => event.ev.t === 'turn-end').at(-1)?.ev).toMatchObject({ requestId: 'channel-A' });
+            if (supported) {
+                expect(published.find(event => event.turn === candidate?.turn && event.ev.t === 'turn-end')?.ev)
+                    .toMatchObject({ status: 'completed', inputEvidence: { terminal: true, coverage: 'incomplete' } });
+                expect(client.inputEvidence.snapshot(candidate?.turn)).toMatchObject({ terminal: true, coverage: 'incomplete',
+                    incompleteReasons: expect.arrayContaining(['background-co-consumption']) });
+            }
+            for (const event of published) expect(() => sessionEnvelopeSchema.parse(event)).not.toThrow();
+        } finally {
+            await scanner?.cleanup(); await client.close();
+            if (oldConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = oldConfig;
+            await rm(directory, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    it.each([false, true])('keeps a textless REST witness independent of routing (evidence=%s)', async supported => {
+        const client = new ApiSessionClient('fake-token', session);
+        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', supported);
+        const events: SessionEnvelope[] = [];
+        vi.spyOn(client as any, 'enqueueMessage').mockImplementation((value: unknown) => {
+            const message = value as { role: string; content: SessionEnvelope };
+            if (message.role === 'session') events.push(message.content);
+        });
+        const state = (client as any).claudeSessionProtocolState as ClaudeSessionProtocolState;
+        const routing = { ...state };
+        try {
+            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'textless', serverSeq: 1 }], inputCount: 1 });
+            client.sendFinalAnswerForChannelTurn('authoritative final');
+            client.sendFinalAnswerForChannelTurn('updated final');
+            expect(state).toEqual(routing);
+            client.closeClaudeSessionTurn('completed');
+            expect(state).toEqual(routing);
+            expect(events.map(event => event.ev.t)).toEqual(supported ? ['turn-start', 'final-answer', 'final-answer', 'turn-end'] : []);
+            if (supported) {
+                expect(new Set(events.map(event => event.turn)).size).toBe(1);
+                expect(events.at(-1)?.ev).toMatchObject({ inputEvidence: { terminal: true, coverage: 'complete',
+                    inputs: [{ kind: 'rest', serverMessageId: 'textless', serverSeq: 1 }] } });
+            }
+            for (const event of events) expect(() => sessionEnvelopeSchema.parse(event)).not.toThrow();
+        } finally { await client.close(); }
+    });
+
+    it.each([false, true])('evidence preparation leaves a pending channel request unconsumed (evidence=%s)', async supported => {
+        const client = new ApiSessionClient('fake-token', session);
+        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', supported);
+        const state = (client as any).claudeSessionProtocolState as ClaudeSessionProtocolState;
+        try {
+            client.setPendingTurnRequestId('channel-waiting');
+            const routing = { ...state };
+            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'refused', serverSeq: 1 }], inputCount: 1 });
+            client.continueClaudeInputEvidence('claude-transient');
+            expect(state).toEqual(routing);
+            if (supported) expect(client.inputEvidence.snapshot()).toMatchObject({
+                inputs: [{ kind: 'rest', serverMessageId: 'refused', serverSeq: 1 }], continuation: { state: 'pending' } });
+            client.closeClaudeSessionTurn('failed');
+        } finally { await client.close(); }
+    });
+
+    it('preserves the original textless input through an independent retry witness', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', true);
+        const state = (client as any).claudeSessionProtocolState as ClaudeSessionProtocolState;
+        const routing = { ...state };
+        try {
+            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'retry-input', serverSeq: 1 }], inputCount: 1 });
+            client.continueClaudeInputEvidence('claude-transient');
+            client.closeClaudeSessionTurn('failed');
+            expect(state).toEqual(routing);
+            const original = client.inputEvidence.snapshot()!;
+            expect(original).toMatchObject({ terminal: false, continuation: { state: 'pending' } });
+            const continuation = client.inputEvidence.claimContinuation(client.inputEvidence.takeContinuation()!)!;
+            client.startClaudeInputEvidence({ inputs: [], inputCount: 0, continuation });
+            client.sendFinalAnswerForChannelTurn('recovered');
+            client.closeClaudeSessionTurn('completed');
+            expect(state).toEqual(routing);
+            expect(client.inputEvidence.snapshot()).toMatchObject({ rootBatchId: original.rootBatchId, terminal: true,
+                inputs: original.inputs, coverage: 'complete', continuation: { kind: 'claude-transient', state: 'completed' } });
+        } finally { await client.close(); }
+    });
+
+    it('settles both witnesses conservatively if mapped output follows an unmapped final', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', true);
+        try {
+            client.startClaudeInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'late-output', serverSeq: 1 }], inputCount: 1 });
+            client.sendFinalAnswerForChannelTurn('final before mapped output');
+            const witness = client.inputEvidence.currentTurn()!;
+            client.sendClaudeSessionMessage({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'late mapped output' }] } } as any);
+            const routed = client.inputEvidence.currentTurn()!;
+            expect(routed).not.toBe(witness);
+            client.closeClaudeSessionTurn('completed');
+            for (const turn of [witness, routed]) expect(client.inputEvidence.snapshot(turn)).toMatchObject({ terminal: true,
+                coverage: 'incomplete', incompleteReasons: expect.arrayContaining(['witness-turn-interleaved']) });
+        } finally { await client.close(); }
     });
 
     it.each([

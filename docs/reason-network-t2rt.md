@@ -903,8 +903,9 @@ Desktop schema/reducer integration (T1/T2), and packaged runtime acceptance (T2r
 Core, within the existing session runtime: no schema, dependency, authority or UI
 change. Routing and evidence have separate maps and entry points. Existing
 routing functions were diffed against `9ee84191`; only evidence hooks remain.
-The non-channel final-answer path is an explicit evidence opt-in, preserving
-main's default mapper/dispatcher behavior.
+The non-channel final-answer path initially used an explicit mapper evidence
+opt-in. T2RT-16 below supersedes it: the production opt-in still changed routing
+state despite preserving the default mapper tests.
 
 Tests removed/reworked: the T2RT-07 duplicate routing matrix, T2RT-08 resumed-run
 routing assertions, T2RT-09 routing refusal, T2RT-10/11/12 default-deny/status/alias
@@ -1047,3 +1048,87 @@ environment; both test and manifest check remain unchanged. No socket EPERM was
 observed in this final selection. `git diff --check` passed. Delivery is the
 rescope commit followed by one regular latest-main merge and a normal push to
 `feat/rn-t2rt-input-evidence`.
+
+
+## T2RT-16: independent textless witness lifecycle (2026-10-26)
+
+Review base: `26a93cf14862d338f4fb887d0d20cb40e63d9026`. The medium routing-parity
+finding is accepted. Calling the mapper with `includeInputEvidenceFinal=true`
+opened an uncorrelated routing turn before `onReady`, including when evidence
+capability was disabled. A real scanner attachment then found that turn active,
+consumed the background request map without rearming A, and left the terminal
+without `requestId=channel-A`. `ensureClaudeInputEvidence` also entered the same
+routing mapper and could consume a waiting channel request during preparation.
+
+TDD first added a real `ApiSessionClient` + real `createSessionScanner` JSONL
+attachment regression in `api/apiSession.test.ts`, for both capability states.
+Before production changes: **2 failed / 159 skipped**, reproducing routing-state
+mutation, failed scanner rearm and lost terminal correlation on the review base.
+No mapper mock or direct rearm callback is used as the stimulus. The test verifies
+the task/tool map remains intact until scanner consumption and that only the
+scanner rearms A. Its 15-second timeout accommodates actual filesystem polling.
+
+Correction (Core, within the existing session host and wire contract):
+
+- Remove the routing mapper's evidence opt-in and `startClaudeInputTurn` export.
+  `mapClaudeChannelFinalAnswer`, the notification parser, request-map insertion
+  and rearm helpers now match `9ee84191` byte for byte. Normal routing activity,
+  channel final publication and native failure/terminal behavior remain owned by
+  that mapper.
+- Keep textless start/final/end entirely in `TurnInputEvidence`. The witness uses
+  its own turn ID and never receives the routing state or request maps. The API
+  publishes these events only when evidence capability is enabled. A current
+  mapped turn may receive a final witness without changing its routing state.
+- Evidence preparation and retry carry use that independent lifecycle too.
+  Ordinary textless completion closes only its witness; a scanner-rearmed
+  channel terminal follows main's routing lifecycle separately. Both the unmapped
+  witness and any following background witness remain incomplete when consumption
+  is ambiguous. Late mapped activity settles both witnesses conservatively with
+  `witness-turn-interleaved`, rather than leaving the first witness live.
+- Update the existing channel/fallback test doubles to use the same independent
+  witness lifecycle. Retain all their evidence assertions, including retry roots
+  and the 24 SDK/scanner ordering cases.
+
+Six additional real-client cases cover textless REST identity and repeated finals
+in both capability states, preparation with a pending channel in both states,
+textless transient retry root preservation, and late mapped output. Every emitted
+frame in the real-scanner and textless-final cases is checked against the wire
+schema. No schema, dependency, authority, routing-policy or unrelated file changes
+are introduced. No new files are needed. Revisit this separation only if routing
+and witness turn identity gain an explicitly approved common lifecycle contract.
+Rollback is a revert of this follow-up commit; it would reintroduce T2RT-16.
+
+Verification so far:
+
+- Repository TDD: **2 failed before / 2 passed after** for the actual scanner
+  reproduction, with both capability states covered.
+- Reviewer's unchanged `/tmp/happy-t2rt-xr-v9/api-routing.test.ts`: **2/2** against
+  the extracted `9ee84191` source and **2/2** against the fix. The reviewer's
+  existing head log records the corresponding failures on `26a93cf1`.
+- Focused standard suite: **8 files / 394 tests passed**, including all eight new
+  API cases, the complete channel/evidence matrix, mapper/scanner, evidence state,
+  and transient/personal account-switch suites. Standard global setup passed CLI
+  typecheck, pkgroll and extension-copy build.
+- Reviewer's unchanged compatibility selection: **8 files / 241 tests passed**,
+  including the extracted merge-base channel/mapper/scanner tests and main's
+  personal-fallback suite. Its config intentionally has no global build setup;
+  the separate standard runs provide that check.
+- Final standard related suite: **43 files / 1203 tests passed**. This is the
+  prior latest-main 41-file selection plus `codex/__tests__/codexUserInput.test.ts`
+  and `codex/codexSteerHandler.test.ts`. It covers all launcher/channel/mapper,
+  API/evidence/automation, permissions, queues, managed startup and related Codex
+  consumers, including the eight new API regressions. Standard global setup
+  passed CLI typecheck, pkgroll and extension-copy build against the final code.
+- `git diff --check` passed. No Unix-socket EPERM or other test failure occurred
+  in the final selection. The unchanged boot suite's previously documented
+  sandbox ownership failure was not repeated. Existing bin/empty-chunk and test
+  listener/asynchronous-rejection warnings remain.
+- No whole-suite, live-provider, Desktop, packaged-release or new routing-hardening
+  claim is made.
+
+Standard CLI commands run from the clone root use `corepack pnpm -C
+packages/happy-cli exec vitest run --project unit <files> --maxWorkers 2`.
+Reviewer reproduction commands use the same prefix with `--config
+/tmp/happy-t2rt-xr-v9/{base.config,vitest.config}.mjs`, `--project unit`, the absolute
+`api-routing.test.ts` path and `--maxWorkers 2`. No rebase, main merge, force-push,
+new PR, tag, publication or other-branch mutation is part of this follow-up.

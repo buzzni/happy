@@ -29,7 +29,6 @@ import { RECONNECT_DIAL_TIMEOUT_MS, RECONNECT_NOT_READY_POLL_MS, reconnectDelayM
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 import {
     closeClaudeTurnWithStatus,
-    startClaudeInputTurn,
     observeClaudeBackgroundInput,
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
@@ -461,7 +460,9 @@ export class ApiSessionClient extends EventEmitter {
         this.pendingClaudeEvidence = true;
     }
     private ensureClaudeInputEvidence(): void {
-        if (this.pendingClaudeEvidence) this.enqueueSessionProtocolEnvelopes(startClaudeInputTurn(this.claudeSessionProtocolState).envelopes, false);
+        if (this.inputEvidenceSupported && this.pendingClaudeEvidence) {
+            this.enqueueSessionProtocolEnvelopes(this.inputEvidence.startUnmappedTurn(), false);
+        }
     }
     continueClaudeInputEvidence(kind: Parameters<TurnInputEvidence['continuePending']>[0]): void {
         this.ensureClaudeInputEvidence();
@@ -1731,8 +1732,10 @@ export class ApiSessionClient extends EventEmitter {
     sendFinalAnswerForChannelTurn(text: string): void {
         // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
-        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text, true);
-        this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
+        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
+        const envelopes = mapped.envelopes.length || !this.inputEvidenceSupported
+            ? mapped.envelopes : this.inputEvidence.unmappedFinalAnswer(text);
+        this.enqueueSessionProtocolEnvelopes(envelopes, false);
     }
 
     /** Every later turn of this session closes with a verdict, filled in as `missing` if none came. */
@@ -1803,16 +1806,17 @@ export class ApiSessionClient extends EventEmitter {
 
     /** A launch that died before its first message: fail its turn, opening one if none is open. */
     failClaudeLaunchTurn() {
-        this.ensureClaudeInputEvidence();
         const mapped = failClaudeLaunchTurn(this.claudeSessionProtocolState);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
+        if (this.inputEvidenceSupported) this.enqueueSessionProtocolEnvelopes(this.inputEvidence.closeUnmappedTurn('failed'), false);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
     closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
-        this.ensureClaudeInputEvidence();
         const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
         this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
+        if (!mapped.envelopes.length) this.ensureClaudeInputEvidence();
+        if (this.inputEvidenceSupported) this.enqueueSessionProtocolEnvelopes(this.inputEvidence.closeUnmappedTurn(status), false);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes);
     }
 
