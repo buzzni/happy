@@ -363,7 +363,8 @@ function scheduleRenewal(){clearTimeout(S.renewTimer);if(!S.expiresAtMs)return;
 window.addEventListener('message',function(event){
  if(!fromHost(event))return;
  var d=event.data;if(!d||d.type!=='abp-capability'||typeof d.token!=='string'||typeof d.expiresAtMs!=='number')return;
- var first=!S.token;if(setCapability(d.token,d.expiresAtMs)&&first)listTasks()});
+ // The first capability lists the tasks; a renewal lists them again only when the last attempt failed (the alert is up).
+ var first=!S.token;if(setCapability(d.token,d.expiresAtMs)&&(first||!$('notice').hidden))listTasks()});
 /** The fragment is read on load and again on a later change (the host reopens the same page with a new capability). */
 function readFragment(){var h=location.hash.replace(/^#/,'');if(!h)return false;var q=new URLSearchParams(h);
  var token=q.get('abp-cap'),used=!!token&&token!==S.token&&setCapability(token,Number(q.get('abp-exp')));
@@ -409,29 +410,48 @@ function emptyState(box,title,body){box.textContent='';var e=document.createElem
  e.innerHTML='<svg aria-hidden="true"><use href="#i-inbox"/></svg>';var b=document.createElement('b');b.textContent=title;var s=document.createElement('span');s.textContent=body;
  e.appendChild(b);e.appendChild(s);box.appendChild(e)}
 /** A task card. Its text starts with the task id (the tests read it that way); the grid shows the status above it. */
-function taskButton(t){var b=document.createElement('button');b.type='button';b.setAttribute('data-task',t.taskId);var d=describe(t);
+function taskButton(t){var b=document.createElement('button');b.type='button';b.setAttribute('data-task',t.taskId);fillTaskButton(b,t);return b}
+/** The card's content; a card that is reused across renders (focus, scroll) gets its state redrawn in place. */
+function fillTaskButton(b,t){var d=describe(t);b.textContent='';
  var dot=document.createElement('i');dot.className='dot'+(d.tone?' '+d.tone:'');dot.setAttribute('aria-hidden','true');
  var id=document.createElement('span');id.className='tid';id.textContent=t.taskId;
  var what=document.createElement('span');what.className='what';var c=document.createElement('span');chip(c,d);
  var when=document.createElement('span');when.className='when';when.textContent=hhmm(t.updatedAtMs);
  what.appendChild(c);what.appendChild(document.createTextNode(' '));what.appendChild(when);
  b.appendChild(dot);b.appendChild(id);b.appendChild(document.createTextNode(' '));b.appendChild(what);
- b.onclick=function(){if(menu.open){menu.open=false;menuBtn.focus()}$('taskId').value=t.taskId;$('tabId').value=(t.tabs&&t.tabs[0])||'';watch()};return b}
-function listTasks(){if(!S.token)return;$('tasks').className='muted';$('tasks').textContent=T.loading;
+ b.onclick=function(){if(menu.open){menu.open=false;menuBtn.focus()}$('taskId').value=t.taskId;$('tabId').value=(t.tabs&&t.tabs[0])||'';watch()}}
+/** quiet: a background refresh keeps the list on screen instead of showing "loading" (the menu may be open). */
+function listTasks(quiet){if(!S.token)return;if(quiet!==true){$('tasks').className='muted';$('tasks').textContent=T.loading}
  op('listTasks',{profileId:S.profileId}).then(function(r){notice('');S.tasks=r.tasks;var first=renderTasks();
   // Opened to deal with something: show the first task that needs the user right away.
   if(!S.task&&first&&!$('taskId').value){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}
  },function(e){$('tasks').textContent=e.message;$('tasks').className='warn-text small';notice(T.tasksFailed+' · '+e.message)})}
-/** The menu's list and the badge, from S.tasks. Returns the first task that needs the user. */
-function renderTasks(){var box=$('tasks');box.textContent='';box.className='';
- if(!S.tasks.length){emptyState(box,T.noTasksTitle,T.noTasks);needCount(0);return null}
+/**
+ * The menu's list and the badge, from S.tasks. Returns the first task that needs the user. Cards are reused by task id
+ * and redrawn in place, the "other tasks" fold keeps its open state and the focused card stays focused: a render in the
+ * middle of a keyboard pick (an event on the shown task, a background refresh) must not throw the user out of the menu.
+ */
+function renderTasks(){var box=$('tasks'),old={},others=box.querySelector(':scope>details'),focused=document.activeElement&&document.activeElement.getAttribute?document.activeElement.getAttribute('data-task'):null;
+ Array.prototype.forEach.call(box.querySelectorAll('button[data-task]'),function(b){old[b.getAttribute('data-task')]=b});
+ Array.prototype.forEach.call(Array.prototype.slice.call(box.children),function(c){if(c.tagName!=='BUTTON'&&c!==others)c.remove()});
+ box.className='';
+ if(!S.tasks.length){box.textContent='';emptyState(box,T.noTasksTitle,T.noTasks);needCount(0);return null}
+ if(!others){others=document.createElement('details');others.appendChild(document.createElement('summary'))}
+ var open=others.open,summary=others.firstChild,folded=0,first=null,need=0;
  // Tasks waiting for the user come first; the others (running, parked for the agent) are folded away.
- var others=document.createElement('details'),summary=document.createElement('summary'),folded=0,first=null,need=0;others.appendChild(summary);
- S.tasks.forEach(function(t){var b=taskButton(t);
-  if(waitsForUser(t)){box.appendChild(b);need++;if(!first)first=t}else{others.appendChild(b);folded++}});
+ S.tasks.forEach(function(t){var b=old[t.taskId];if(b){fillTaskButton(b,t);delete old[t.taskId]}else b=taskButton(t);
+  if(waitsForUser(t)){box.insertBefore(b,others.parentNode===box?others:null);need++;if(!first)first=t}else{others.appendChild(b);folded++}});
+ Object.keys(old).forEach(function(id){old[id].remove()});
  needCount(need);
- if(folded){summary.textContent=T.others(folded);box.appendChild(others)}
+ if(folded){summary.textContent=T.others(folded);if(others.parentNode!==box)box.appendChild(others);others.open=open}else others.remove();
+ if(focused){var again=box.querySelector('button[data-task="'+focused+'"]');if(again&&document.activeElement!==again)again.focus()}
  if(S.task)markSelected(S.task.taskId);return first}
+// Only the shown task is subscribed: the other tasks (and new ones) reach the list and the badge through a periodic
+// refresh while the page is visible, and one more when it becomes visible again. Not while the menu is open — a
+// refresh under the user's pointer could move the card they are about to pick.
+var LIST_REFRESH_MS=15000;
+setInterval(function(){if(S.token&&!menu.open&&document.visibilityState!=='hidden')listTasks(true)},LIST_REFRESH_MS);
+document.addEventListener('visibilitychange',function(){if(S.token&&!menu.open&&document.visibilityState==='visible')listTasks(true)});
 /** A task's new state (an action's answer, a subscription refresh) reaches the list and the badge, not only the bar. */
 function syncTask(t){var i=-1;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].taskId===t.taskId)i=k;
  var old=i>=0?S.tasks[i]:null;if(i>=0)S.tasks[i]=t;else S.tasks.push(t);

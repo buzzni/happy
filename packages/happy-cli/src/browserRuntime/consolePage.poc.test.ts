@@ -433,11 +433,17 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         listTasksError = { code: 'UNAUTHORIZED', message: 'capability rejected' }
         try {
             const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('list-fail', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
-            await eventually(() => harness.evaluate(target, `!document.getElementById('notice').hidden`), Boolean, 10_000)
+            await eventually(() => harness.evaluate(target, `!(document.getElementById('notice') || { hidden: true }).hidden`), Boolean, 10_000)
             const shown = JSON.parse(String(await harness.evaluate(target, `(() => { const n = document.getElementById('notice'), r = n.getBoundingClientRect();
                 return JSON.stringify({ role: n.getAttribute('role'), text: document.getElementById('noticeText').textContent, visible: r.width > 0 && r.height > 0,
                     menuOpen: document.getElementById('taskMenu').open, inMenu: !!n.closest('#taskMenu') }) })()`)))
             expect(shown).toEqual({ role: 'alert', text: 'Could not load the tasks · UNAUTHORIZED: capability rejected', visible: true, menuOpen: false, inMenu: false })
+            // A renewed capability from the host tries the list again by itself while the alert is up.
+            ops.length = 0
+            const renewed = token('list-fail-2', Date.now() + 900_000)
+            await harness.evaluate(target, `window.postMessage({ type: 'abp-capability', token: ${JSON.stringify(renewed)}, expiresAtMs: Date.now() + 900_000 }, location.origin)`)
+            expect((await eventually(() => ops.find((entry) => entry.op === 'listTasks'), Boolean, 5_000))?.bearer).toBe(renewed)
+            expect(await harness.evaluate(target, `document.getElementById('notice').hidden`)).toBe(false)
             // Retry from the notice; once the list answers, the notice goes away.
             listTasksError = null
             ops.length = 0
@@ -491,6 +497,45 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await harness.evaluate(target, `window.dispatchEvent(new Event('blur'))`)
         expect(await eventually(() => harness.evaluate(target, `document.getElementById('taskMenu').open`), (open) => open === false, 5_000)).toBe(false)
         await harness.closeTarget(target)
+    }, 30_000)
+
+    it('keeps a keyboard pick in the menu across a state change of the shown task, and learns other tasks\' changes from a refresh', async () => {
+        const now = Date.now()
+        const login = { taskId: 'task-a', status: 'awaiting-user', waitReason: 'login', tabs: ['tab-1'], updatedAtMs: now }
+        const running = { taskId: 'task-b', status: 'running', tabs: ['tab-2'], updatedAtMs: now }
+        const detail = (t: Record<string, unknown>) => ({ ...t, stateVersion: 1, uncertainActions: [], cancelRequested: false, tabLeases: [] })
+        listedTasks = [login, running]; taskDetails = { 'task-a': detail(login), 'task-b': detail(running) }
+        try {
+            const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('list-live', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
+            await eventually(() => harness.evaluate(target, `(document.getElementById('detailId') || {}).textContent`), (id) => id === 'task-a', 10_000)
+            const state = `JSON.stringify({ count: document.getElementById('needCount').textContent, top: [...document.querySelectorAll('#tasks > button')].map((b) => b.getAttribute('data-task')),
+                folded: [...document.querySelectorAll('#tasks details button')].map((b) => b.getAttribute('data-task')), open: (document.querySelector('#tasks details') || {}).open,
+                focus: document.activeElement.getAttribute('data-task'), chipA: document.querySelector('[data-task="task-a"] .chip').textContent })`
+            // The user opens the menu, unfolds the other tasks and moves the keyboard to task-b.
+            await harness.evaluate(target, `document.getElementById('taskMenu').open = true; document.querySelector('#tasks details').open = true; document.querySelector('[data-task="task-b"]').focus()`)
+            expect(await harness.evaluate(target, state)).toBe(JSON.stringify({ count: '1', top: ['task-a'], folded: ['task-b'], open: true, focus: 'task-b', chipA: 'Login needed' }))
+            // The shown task changes (another console took it over): its card is redrawn in place, the fold and the focus stay.
+            taskDetails['task-a'] = detail({ ...login, status: 'paused', pauseReason: 'user-control', stateVersion: 2 })
+            await eventually(() => harness.evaluate(target, `document.querySelector('[data-task="task-a"] .chip').textContent`), (chip) => chip === 'You have control', 10_000)
+            expect(await harness.evaluate(target, state)).toBe(JSON.stringify({ count: '1', top: ['task-a'], folded: ['task-b'], open: true, focus: 'task-b', chipA: 'You have control' }))
+            // Another task starts needing the user: a refresh (here: the page becoming visible again) lists it first and counts it.
+            await harness.evaluate(target, `document.getElementById('taskMenu').open = false`)
+            const captcha = { ...running, status: 'awaiting-user', waitReason: 'captcha', updatedAtMs: now + 1_000 }
+            listedTasks = [login, captcha]; taskDetails['task-b'] = detail(captcha)
+            ops.length = 0
+            await harness.evaluate(target, `document.dispatchEvent(new Event('visibilitychange'))`)
+            await eventually(() => ops.some((entry) => entry.op === 'listTasks'), Boolean, 5_000)
+            expect(await eventually(() => harness.evaluate(target, `document.getElementById('needCount').textContent`), (n) => n === '2', 5_000)).toBe('2')
+            expect(await harness.evaluate(target, `JSON.stringify({ top: [...document.querySelectorAll('#tasks > button')].map((b) => b.getAttribute('data-task')), name: document.getElementById('taskMenuButton').getAttribute('aria-label') })`))
+                .toBe(JSON.stringify({ top: ['task-a', 'task-b'], name: 'You have control · task-a, 2 tasks need you' }))
+            // A background refresh is not run while the menu is open: the cards under the pointer stay put.
+            await harness.evaluate(target, `document.getElementById('taskMenu').open = true`)
+            ops.length = 0
+            await harness.evaluate(target, `document.dispatchEvent(new Event('visibilitychange'))`)
+            await harness.evaluate(target, `new Promise((r) => setTimeout(r, 300))`)
+            expect(ops.filter((entry) => entry.op === 'listTasks').length).toBe(0)
+            await harness.closeTarget(target)
+        } finally { listedTasks = defaultTasks(); taskDetails = {} }
     }, 30_000)
 
     /** The opener page, once its script has run (openFrontTab does not wait for the load). */
