@@ -1036,8 +1036,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
                         // A switch that failed at the boundary is tried again before this message reaches the used-up
                         // account. The user's own message replaces the automatic continuation.
-                        if (msg) await personalFallback?.beforeUserTurn();
-                        if (msg?.channelRequestId && personalFallback?.identity()) throw new PersonalClaudeRecheckRequired();
+                        try {
+                            if (msg) await personalFallback?.beforeUserTurn();
+                            if (msg?.channelRequestId && personalFallback?.identity()) throw new PersonalClaudeRecheckRequired();
+                        } catch (e) {
+                            // claudeRemote propagates only a generation's first nextMessage rejection; a later one just
+                            // ends its input. Recorded here, the notice is reported by `finally` on either path.
+                            if (e instanceof PersonalClaudeRecheckRequired) launchFailure = PERSONAL_RECHECK_NOTICE;
+                            throw e;
+                        }
                         if (msg && !personalFallback?.identity() && !providerStale()) await setupTokenSwitching?.switchIfWanted();
                         // A message that arrives after a switch (another boundary, or while it ran) belongs to the next provider.
                         if (msg && providerStale()) {
