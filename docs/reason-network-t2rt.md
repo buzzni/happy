@@ -1132,3 +1132,63 @@ Reviewer reproduction commands use the same prefix with `--config
 /tmp/happy-t2rt-xr-v9/{base.config,vitest.config}.mjs`, `--project unit`, the absolute
 `api-routing.test.ts` path and `--maxWorkers 2`. No rebase, main merge, force-push,
 new PR, tag, publication or other-branch mutation is part of this follow-up.
+
+## T2RT-17: settle unmapped witnesses at consumed scanner boundaries (2026-10-26)
+
+Review base: `02497601dd5ee9cd652839b44d4e14092f988538`. The evidence-only medium
+finding is accepted. A textless successful result can leave its independent
+witness open while `claudeRemote` waits for background work before `onReady`.
+A consumed scanner notification stages the next background evidence batch,
+but the routing mapper has no turn to close. The old witness then intercepted
+the textless follow-up final and falsely retained A's complete input attribution.
+
+TDD used the reviewer's unchanged real-loop `lifecycle-proof.test.ts` first:
+**1 failed / 3 passed** on the review base. The consumed scanner row plus
+textless follow-up retained A's complete witness; attachment receipt, SDK receipt
+and consumed row plus mapped assistant were the three passing controls.
+The durable regression is `api/apiSession.inputEvidenceLifecycle.test.ts`.
+It preserves all four scenarios and uses the real `claudeRemote`, converter,
+ordered dispatcher, outgoing queue, API client and JSONL scanner. Only the SDK
+and network boundaries are scripted. It additionally checks settlement at the
+consumption boundary before either form of follow-up output, a published terminal
+incomplete witness without a synthetic `turn-end`, separate follow-up turn/root
+identity, empty unproven inputs, exactly one eventual `onReady`, and wire validity.
+Those stronger immediate-settlement assertions failed for both consumed-row
+variants before the production fix (**2 failed / 2 passed**).
+
+Correction (Core, internal to the existing evidence tracker): a consumed scanner
+boundary settles any independent unmapped witness with background incomplete
+reasons and publishes its terminal evidence revision. Pending/running witness
+continuations are cancelled, and its retry carry and active witness identity are
+released. The staged background batch remains available for the follow-up's own
+witness. Unknown launch/consumption proof therefore yields empty inputs and
+incomplete coverage with background reasons, for both its final and terminal.
+Receipt-only attachment/SDK observations keep their existing conservative
+co-consumption behavior. Mapped turn settlement remains the mapper's responsibility.
+
+This transition emits only evidence; it does not emit a routing terminal or
+modify channel state, task/tool request maps, the API client, the mapper or ordered
+dispatch. The four routing helpers remain byte-identical to `9ee84191`.
+No dependency, schema, public API or authority change is introduced. Revisit
+only if the provider supplies a stronger lifecycle/consumption proof. Rollback is
+a revert of this follow-up commit, which would reintroduce T2RT-17.
+
+Verification:
+
+- Reviewer's unchanged lifecycle reproduction: **4/4 passed** after the fix.
+- Same unchanged reproduction on extracted `26a93cf1`: **4/4 passed**.
+- Repository lifecycle regression: **4/4 passed** after the fix.
+- Related standard suite: **44 files / 1207 tests passed**. This is the previous
+  43-file related selection plus the new lifecycle regression, covering launcher,
+  fallback, channel, merge-base compatibility, mapper/scanner, API/evidence,
+  automation, Codex consumers and managed startup.
+- Standard global setup passed CLI typecheck, pkgroll and extension-copy build.
+  Routing helper byte parity and `git diff --check` passed. No Unix-socket EPERM
+  or test failure occurred. Existing bin/empty-chunk and listener/asynchronous
+  rejection warnings remain. The previously documented unrelated boot suite
+  ownership failure was not repeated; no whole-suite or live-provider claim is made.
+
+The reviewer reproduction uses `corepack pnpm -C packages/happy-cli exec vitest
+run --config /tmp/happy-t2rt-xr-v10/vitest.config.mjs --project unit
+/tmp/happy-t2rt-xr-v10/lifecycle-proof.test.ts --maxWorkers 2` from the clone root.
+The durable suite uses the standard unit command documented above.
