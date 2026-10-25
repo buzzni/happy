@@ -30,11 +30,13 @@ describe('pinned credential at the SDK request boundary', () => {
         expect(f.create.mock.calls[0][0]).toMatchObject({ options });
         expect(f.received).toHaveLength(1); expect(f.received[0].message.content).toBe('hello');
     });
-    it.each(['missing-control', 'old-version', 'overlay-refused', 'managed-override', 'wrong-account', 'restricted-org', 'aborted'])(
+    it.each(['missing-control', 'old-version', 'new-minor', 'new-major', 'overlay-refused', 'managed-override', 'wrong-account', 'restricted-org', 'aborted'])(
         'refuses %s before input and exposes a sanitized failure', async kind => {
             const f = fixture();
             if (kind === 'missing-control') f.controls.getSettings = undefined as never;
             if (kind === 'old-version') f.controls.initializationResult.mockResolvedValue({ claude_code_version: '2.1.100', hooks_applied: true });
+            if (kind === 'new-minor') f.controls.initializationResult.mockResolvedValue({ claude_code_version: '2.2.0', hooks_applied: true });
+            if (kind === 'new-major') f.controls.initializationResult.mockResolvedValue({ claude_code_version: '3.0.0', hooks_applied: true });
             if (kind === 'overlay-refused') f.controls.applyFlagSettings.mockRejectedValue(new Error(TOKEN));
             if (kind === 'managed-override') f.controls.applyFlagSettings.mockImplementation(async () => {});
             if (kind === 'restricted-org') f.restrictOrganization();
