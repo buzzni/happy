@@ -168,6 +168,24 @@ describe('Claude transient API failure retry in the remote launcher (specs/claud
             inputs: [{ kind: 'rest', serverMessageId: 'human', serverSeq: 2 }] });
         expect(harness.evidenceEvents.filter(event => event.ev.t === 'turn-start')).toEqual([]);
     });
+    it('keeps a batch stopped during preparation out of the queue when the user then switches', async () => {
+        let prepared!: () => void; const reachedPreparation = new Promise<void>(resolve => { prepared = resolve; });
+        let release!: () => void; const preparation = new Promise<void>(resolve => { release = resolve; });
+        const harness = await runLauncher(async () => 'answer', () => false, 0, {
+            first: queue => queue.push('stop-me', MODE, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'stop-me', serverSeq: 1 } }),
+            session: () => ({ checkpointComposition: { beforeTurn: async () => { prepared(); await preparation; } } }),
+        });
+        await reachedPreparation;
+        const stopping = harness.handlers.get('abort')!();
+        release(); await stopping;
+        expect(harness.queue.size()).toBe(0);
+        // Local mode reads what the switch hands back: a stopped prompt must not be among it.
+        const switching = harness.handlers.get('switch')!();
+        expect(harness.queue.size()).toBe(0);
+        await switching; await harness.run;
+        expect(harness.prompts).toEqual([]);
+    });
     it('asks the same conversation again after a 503 that produced nothing, without resending the request', async () => {
         const harness = await runLauncher(async (_prompt, index) => index < 2 ? 'fail' : 'answer', (prompts) => prompts.length === 3);
         await harness.run;

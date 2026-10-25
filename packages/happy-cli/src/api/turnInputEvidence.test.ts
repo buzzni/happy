@@ -180,8 +180,10 @@ describe('TurnInputEvidence', () => {
         const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
         const child = createEnvelope('agent', { t: 'text', text: 'child' }, { turn: 'a', subagent: 'abcdefghijklmnopqrstuvwx' });
         expect(h.tracker.stamp(child)).toBe(child);
-        const huge = h.tracker.stamp(createEnvelope('agent', { t: 'final-answer', text: '가'.repeat(23000) }, { turn: 'a' }));
-        expect(huge.ev.t).toBe('turn-input-evidence');
+        const huge = h.tracker.stamp(createEnvelope('agent', { t: 'final-answer', text: '가'.repeat(23000), requestId: 'req-1' }, { turn: 'a' }));
+        // The answer is still delivered, only without evidence; the downgrade is its own revision.
+        expect(huge.ev).toEqual({ t: 'final-answer', text: '가'.repeat(23000), requestId: 'req-1' });
+        expect(h.events.at(-1)?.ev).toMatchObject({ t: 'turn-input-evidence', inputEvidence: { coverage: 'incomplete' } });
         expect(h.tracker.snapshot()?.incompleteReasons).toContain('answer-too-large');
     });
     it('keeps automation carry/replacement semantics separate from complete batch evidence', () => {

@@ -250,8 +250,9 @@ export class TurnInputEvidence {
         const value = this.turns.get(turn);
         if (!value) return envelope;
         if (ev.t === 'final-answer' && Buffer.byteLength(ev.text, 'utf8') > 65536) {
+            // The downgrade is published as its own revision; the answer still goes out, unstamped.
             this.incomplete('answer-too-large', turn);
-            return createEnvelope('agent', { t: 'turn-input-evidence', inputEvidence: this.snapshot(turn)! }, { turn });
+            return envelope;
         }
         if (ev.t === 'turn-end') {
             value.terminal = value.continuation.state !== 'pending';
