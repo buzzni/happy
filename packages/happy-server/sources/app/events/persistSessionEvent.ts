@@ -3,14 +3,14 @@ import { allocateSessionEventSeq } from "@/storage/seq";
 import { log } from "@/utils/log";
 import type { SessionEventType } from "@/app/events/sessionEventTypes";
 
-export async function persistSessionEvent(params: {
+async function insertSessionEvent(params: {
     sessionId: string;
     eventType: SessionEventType;
-    content: string;
+    content: PrismaJson.SessionEventContent;
 }) {
     const { sessionId, eventType, content } = params;
 
-    const event = await db.$transaction(async (tx) => {
+    return db.$transaction(async (tx) => {
         const session = await tx.session.update({
             where: { id: sessionId },
             select: { eventSeq: true },
@@ -22,7 +22,7 @@ export async function persistSessionEvent(params: {
                 sessionId,
                 eventType,
                 seq: session.eventSeq,
-                content: { t: 'encrypted', c: content },
+                content,
             },
             select: {
                 id: true,
@@ -30,6 +30,20 @@ export async function persistSessionEvent(params: {
                 createdAt: true,
             },
         });
+    });
+}
+
+export async function persistSessionEvent(params: {
+    sessionId: string;
+    eventType: SessionEventType;
+    content: string;
+}) {
+    const { sessionId, eventType, content } = params;
+
+    const event = await insertSessionEvent({
+        sessionId,
+        eventType,
+        content: { t: 'encrypted', c: content },
     });
 
     return event;
