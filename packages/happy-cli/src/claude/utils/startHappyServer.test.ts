@@ -618,12 +618,16 @@ describe('startHappyServer tool registration', () => {
     it.runIf(process.platform !== 'win32')('records a bash_stream process so the session clean-up can stop it', async () => {
         const sessionId = 'bash-stream-clean-up';
         const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId } as unknown as ApiSessionClient;
-        const server = await startHappyServer(client);
+        const server = await startHappyServer(client, { currentTurnId: () => 7 });
         try {
             const running = callTool(server, 6, 'bash_stream', { command: 'sleep 30' });
             await vi.waitFor(() => expect(sessionBackgroundProcesses.list(sessionId)).toHaveLength(1));
+            expect(sessionBackgroundProcesses.list(sessionId)[0]?.turnId).toBe(7);
             expect(sessionBackgroundProcesses.list('another-session')).toEqual([]);
+            // Not interrupted yet: the clean-up has nothing to do.
+            expect(await sessionBackgroundProcesses.clean(sessionId)).toEqual({ stopped: 0, failed: 0, items: [] });
 
+            sessionBackgroundProcesses.markTurnAborted(sessionId, 7);
             const result = await sessionBackgroundProcesses.clean(sessionId);
 
             expect(result).toMatchObject({ stopped: 1, failed: 0, items: [{ command: 'sleep 30', result: 'stopped' }] });

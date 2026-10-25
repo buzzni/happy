@@ -1069,6 +1069,8 @@ export async function runCodex(opts: {
      */
     async function handleAbort() {
         if (runtimeGate?.isFrozen()) return;
+        // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
+        session.markCurrentTurnAborted?.(); // optional: test doubles of the session omit it; the abort must not depend on it
         preemptLessonReview();
         // Stop means stop: a capacity continuation waiting to fire must not restart the work.
         cancelCapacityRetry();
@@ -1931,6 +1933,7 @@ export async function runCodex(opts: {
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+        currentTurnId: () => session.currentTurnId?.() ?? null,
     });
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.

@@ -8,6 +8,15 @@
  * (ADR-041 R4: "a process not in the ledger is never reclaimed"). Nothing is
  * looked up by name, age, port, cwd or process tree.
  *
+ * Scope: **only processes the interrupted turn started.** Each record carries
+ * the id of the turn that was running when it was spawned (`createTurnSequence`,
+ * fed by the runtime's thinking state). The runtime's own abort handler marks
+ * the turn it is aborting (`markTurnAborted`) before it does anything else, and
+ * the RPC cleans only records of marked turns, spending the marks. A dev server
+ * an earlier turn left running, and anything the next turn starts after the
+ * interrupt, carry other turn ids and are never touched. A mark nobody cleans
+ * expires after a TTL, and a session keeps only a few.
+ *
  * Identity, per record:
  * - **Root still unreaped** (`exitCode`/`signalCode` both null on the Node
  *   handle): the pid cannot have been reused — the kernel does not hand out a
@@ -45,6 +54,8 @@ const DEFAULT_GRACE_MS = 2_000;
 const DEFAULT_KILL_WAIT_MS = 1_000;
 const POLL_MS = 25;
 const COMMAND_PREVIEW_CHARS = 200;
+const DEFAULT_ABORTED_TURN_TTL_MS = 10 * 60_000;
+const MAX_ABORTED_TURNS_PER_SESSION = 16;
 
 type RecordedChild = Pick<ChildProcess, 'pid' | 'exitCode' | 'signalCode' | 'once'> & Partial<Pick<ChildProcess, 'kill'>>;
 type Kill = (target: number, signal: NodeJS.Signals | 0) => void;
@@ -54,6 +65,8 @@ export interface BackgroundProcessRecord {
     /** The group this runtime created for it (POSIX detached spawn); null when it shares ours. */
     processGroupId: number | null;
     command: string;
+    /** The turn running when it was spawned; null outside a turn (never cleaned). */
+    turnId: number | null;
     child: RecordedChild;
 }
 
@@ -75,6 +88,27 @@ export interface SessionBackgroundProcessesOptions {
     platform?: NodeJS.Platform;
     graceMs?: number;
     killWaitMs?: number;
+    now?: () => number;
+    abortedTurnTtlMs?: number;
+}
+
+/**
+ * Turn identity for one session runtime: a new id each time the runtime goes
+ * from idle to thinking (a turn starts), none while idle. Monotonic, so an id
+ * never comes back for a later turn.
+ */
+export function createTurnSequence() {
+    let last = 0;
+    let active: number | null = null;
+    return {
+        observeThinking(thinking: boolean): void {
+            if (thinking && active === null) active = ++last;
+            else if (!thinking) active = null;
+        },
+        current(): number | null {
+            return active;
+        },
+    };
 }
 
 type Identity = 'root-alive' | 'orphan-group' | 'gone' | 'pid-reused' | 'unverifiable';
@@ -92,6 +126,10 @@ export function createSessionBackgroundProcesses(options: SessionBackgroundProce
     const platform = options.platform ?? process.platform;
     const graceMs = options.graceMs ?? DEFAULT_GRACE_MS;
     const killWaitMs = options.killWaitMs ?? DEFAULT_KILL_WAIT_MS;
+    const now = options.now ?? Date.now;
+    const abortedTurnTtlMs = options.abortedTurnTtlMs ?? DEFAULT_ABORTED_TURN_TTL_MS;
+    /** sessionId → aborted turn id → when it was marked. */
+    const abortedTurns = new Map<string, Map<number, number>>();
     const sessions = new Map<string, Map<number, BackgroundProcessRecord>>();
     const cleaning = new Map<string, Promise<BackgroundProcessCleanupResult>>();
 
@@ -172,8 +210,18 @@ export function createSessionBackgroundProcesses(options: SessionBackgroundProce
         return item('failed', 'still-running');
     };
 
+    /** The unexpired aborted turns of a session, spent: each interrupt is cleaned at most once. */
+    const takeAbortedTurns = (sessionId: string): Set<number> => {
+        const marks = abortedTurns.get(sessionId);
+        abortedTurns.delete(sessionId);
+        const cutoff = now() - abortedTurnTtlMs;
+        return new Set([...(marks ?? [])].filter(([, markedAt]) => markedAt >= cutoff).map(([turnId]) => turnId));
+    };
+
     const cleanNow = async (sessionId: string): Promise<BackgroundProcessCleanupResult> => {
-        const records = [...(sessions.get(sessionId)?.values() ?? [])];
+        const turns = takeAbortedTurns(sessionId);
+        const records = [...(sessions.get(sessionId)?.values() ?? [])]
+            .filter((record) => record.turnId !== null && turns.has(record.turnId));
         const items = (await Promise.all(records.map((record) => stopOne(sessionId, record))))
             .filter((item): item is BackgroundProcessCleanupItem => item !== null);
         const result = {
@@ -181,7 +229,7 @@ export function createSessionBackgroundProcesses(options: SessionBackgroundProce
             failed: items.filter((item) => item.result === 'failed').length,
             items,
         };
-        logger.debug(`[background-processes] clean session=${sessionId} stopped=${result.stopped} failed=${result.failed} skipped=${items.length - result.stopped - result.failed}`);
+        logger.debug(`[background-processes] clean session=${sessionId} turns=${[...turns].join(',') || '-'} stopped=${result.stopped} failed=${result.failed} skipped=${items.length - result.stopped - result.failed}`);
         return result;
     };
 
@@ -190,13 +238,14 @@ export function createSessionBackgroundProcesses(options: SessionBackgroundProce
          * Called right after spawn, from the code that spawned it. `ownProcessGroup`
          * is true only when that spawn created a new process group (POSIX detached).
          */
-        record(input: { sessionId: string; child: RecordedChild; command: string; ownProcessGroup: boolean }): void {
+        record(input: { sessionId: string; child: RecordedChild; command: string; ownProcessGroup: boolean; turnId: number | null }): void {
             const pid = input.child.pid;
             if (!pid || pid === process.pid || pid === process.ppid) return;
             const record: BackgroundProcessRecord = {
                 pid,
                 processGroupId: input.ownProcessGroup && platform !== 'win32' ? pid : null,
                 command: input.command.slice(0, COMMAND_PREVIEW_CHARS),
+                turnId: input.turnId,
                 child: input.child,
             };
             if (!rootAlive(record)) return;
@@ -213,7 +262,22 @@ export function createSessionBackgroundProcesses(options: SessionBackgroundProce
             });
         },
 
-        /** Stops this session's recorded processes. Concurrent calls share one run. */
+        /**
+         * Called by the runtime's abort handler, synchronously before it awaits anything,
+         * so the mark exists by the time the abort RPC answers. null (no turn running) marks nothing.
+         */
+        markTurnAborted(sessionId: string, turnId: number | null): void {
+            if (turnId === null) return;
+            let marks = abortedTurns.get(sessionId);
+            if (!marks) {
+                marks = new Map();
+                abortedTurns.set(sessionId, marks);
+            }
+            marks.set(turnId, now());
+            while (marks.size > MAX_ABORTED_TURNS_PER_SESSION) marks.delete(marks.keys().next().value!);
+        },
+
+        /** Stops the records of this session's aborted turns. Concurrent calls share one run. */
         clean(sessionId: string): Promise<BackgroundProcessCleanupResult> {
             const running = cleaning.get(sessionId);
             if (running) return running;

@@ -770,6 +770,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         checkpointReader: checkpointComposition.agentReader,
         protectedBashCwd: checkpointComposition.protectedBashCwd,
         trackProtectedBashProcess: checkpointComposition.trackProtectedWriter,
+        currentTurnId: () => session.currentTurnId?.() ?? null,
         // A tool call in flight finishes across a drain freeze; none starts after it.
         ...(launchControl ? { admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))) } : {}),
     });
