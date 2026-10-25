@@ -15,8 +15,10 @@ const checkpointEventTypes = new Set<string>([
     SESSION_EVENT_TYPES.CHECKPOINT_REWIND,
 ]);
 const checkpointEventTypeValues = [...checkpointEventTypes] as [string, ...string[]];
+// turn-ready 는 서버가 CLI 의 done 알림에서만 남긴다. 클라이언트가 올리면 web-ui 완료 알림이
+// "CLI 가 한가해졌다"는 근거 없이 watch 를 끝내게 된다.
 const legacyEventTypeValues = validEventTypes.filter(
-    (eventType) => !checkpointEventTypes.has(eventType),
+    (eventType) => !checkpointEventTypes.has(eventType) && eventType !== SESSION_EVENT_TYPES.TURN_READY,
 ) as [string, ...string[]];
 
 export const sendEventBodySchema = z.union([

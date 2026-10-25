@@ -437,6 +437,8 @@ conversation text. Saycode web-ui's mobile completion push reads it with
 per-session data key, whose `turn-end` messages the server cannot decrypt. A
 SILENT automation run does not write it, matching the push suppression. A failure
 to write it is logged and does not block the existing ephemeral or push path.
+`POST /v3/sessions/:sessionId/events` rejects `turn-ready`: only the server writes
+it, so a client cannot end a completion watch without the CLI's `done`.
 
 The CLI sends `done` only when no input is waiting, and not for managed runs, so
 the event carries no turn status: readers treat it as a completed turn. Revisit if
