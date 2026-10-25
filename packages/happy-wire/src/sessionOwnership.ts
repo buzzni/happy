@@ -121,6 +121,7 @@ export function verifyOwnership(value: { type: string; signature: string }, publ
     catch { return false; }
 }
 export function ownershipFresh(value: { issuedAt: number; expiresAt: number }, now = Date.now()): boolean {
-    return value.issuedAt <= now && value.expiresAt > now;
+    // Match rotation documents: bounded future clock skew, never extended expiry.
+    return value.issuedAt <= now + 60000 && now < value.expiresAt;
 }
 export const ownershipDigest = (value: unknown) => rotationSha256(new TextEncoder().encode(canonicalOrgSetupTokenJson(value)));

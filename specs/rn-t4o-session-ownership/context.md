@@ -6,6 +6,14 @@ last_updated: 2026-10-25
 
 Happy 독립 clone `/home/walter/workspace/aplus-dev-studio-desktop/.aplus/worktrees/rn-ext/happy-t4o`에서 origin/main `9ee84191cf6e6b2739987be3f5488ef511c6474f` 기반 `feat/rn-t4o-session-ownership`으로 작업했다. 지휘 worktree와 원래 저장소는 수정하지 않는다.
 
+## PR #949 시계 오차 수정 (2026-10-25)
+
+사용자 추가 지시에 따라 c9a47efe 위 새 커밋으로 반영한다. ownershipFresh는 rotation 문서와 동일하게 issuedAt <= now + 60000을 허용한다. schema bounded의 최대 수명과 엄격한 now < expiresAt는 유지한다. A+ wire 사본에도 같은 변경을 적용하며 다른 happy-wire 파일은 수정하지 않는다. 공개 DTO·schema·소유권 권한은 바꾸지 않는다.
+
+실패 재현: +2초 문서가 helper에서 false였고 실제 HTTP create에서도 403이었다. 경계 테스트는 +2초/+60초 수락, +60001ms/만료 시점/만료 후 거부를 검사한다. HTTP는 2초 앞선 A+ 서명으로 create→confirm→lookup을 검사한다. 최종 검증: Node 22.23.1에서 `pnpm --dir packages/happy-server exec vitest run sources/app/session/sessionOwnershipBinding.spec.ts sources/app/session/sessionExecutionBinding.spec.ts sources/app/api/routes/machineSessionOwnerRoutes.spec.ts --no-file-parallelism` **3 files / 41 passed / 1 skipped**. A+ 이번 수정의 실제 signer artifact를 OWNERSHIP_PRODUCER_FIXTURE로 전달했으며 ownership 14 tests는 전부 통과했다. skip은 별도 execution producer fixture 미제공에 따른 선택 테스트다. happy-wire 및 happy-server `pnpm run typecheck` 통과, git diff --check와 A+ wire 사본 byte 일치 확인. 이 두 패키지는 lint script/config가 없어 별도 lint 통과를 주장하지 않는다. 전체 테스트·배포 build는 실행하지 않았다.
+
+A+ PR #5447의 adapter peer·poison outbox·transaction 안 Happy HTTP 항목은 A+ 소유 코드에서 수정한다. Happy에는 같은 outbox/personalAccount 경로가 없으므로 해당 세 항목의 생산 코드를 중복 변경하지 않는다. 실제 연결 풀 포화·다중 서버 경합·운영 DB·배포는 검증하지 않는다. 원래 이력과 branch를 유지하며 normal push만 한다.
+
 ## 교차 리뷰 T4O-01~03 (2026-10-25)
 
 리뷰 기준 Happy bce8eeb9 / A+ 026eb83eb. 세 항목은 모두 A+에서 수정하며 미반영 항목은 없다. Happy에는 아래 코드 근거로 동작 변경을 추가하지 않는다.
@@ -61,7 +69,7 @@ Happy의 `/v1/session-ownership/{lookup,machine}`와 `/:id/confirm`은 A+ 서명
 
 ## 후속·미확인
 
-- 지휘 세션의 고정 SHA 교차 리뷰, PR 생성과 통합. 이 작업은 branch push까지만 수행한다.
+- 기존 PR #949/#5447의 최종 SHA 재리뷰와 통합 판단은 지휘 세션이 담당한다. 이 작업은 branch push와 수정 보고까지만 수행한다.
 - T4rt의 daemon prepare/commit/start/status journal, main 개인 인증 세대와 caller launch/재개 RPC 검증, T1c main transport/relay 실제 호출, T2 미확인 표시와 통합 수락은 별도다.
 - ownedSpawnPrepareV1/inputEvidenceV1는 runtime 담당이 구현·광고한다. 이 서버가 해당 capability를 광고하지 않는다.
 - happy-wire 기존 export/manifest/pin을 수정하지 않았으므로 runtime package 소비를 위한 export는 통합 담당이 반영해야 한다. Happy server는 source alias로 bundling을 검증했다.

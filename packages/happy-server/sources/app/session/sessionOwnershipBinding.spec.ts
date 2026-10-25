@@ -26,7 +26,7 @@ vi.mock('@/app/events/eventRouter', () => ({
 vi.mock('@/app/session/sessionDelete', () => ({ sessionDelete: vi.fn() }));
 vi.mock('@/app/session/sessionArchive', () => ({ sessionArchive: vi.fn() }));
 import { sessionOwnershipRoutes } from '@/app/api/routes/sessionOwnershipRoutes';
-import { signOwnership, ownershipDigest, SessionOwnershipProofSchema, type SessionOwnershipProof } from '@session-ownership';
+import { signOwnership, ownershipDigest, ownershipFresh, SessionOwnershipProofSchema, type SessionOwnershipProof } from '@session-ownership';
 import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
 import { machineSessionOwnerRoutes } from '@/app/api/routes/machineSessionOwnerRoutes';
 
@@ -268,4 +268,36 @@ describe('T4o creation ownership at the HTTP and SQL boundary', () => {
     expect((await query('company-account')).json().machine).toEqual({ machineId: 'machine-1', accountId: 'company-account' });
     expect((await query('personal-account')).json().machine).toBeNull();
   });
+});
+
+it('accepts bounded future ownership clock skew but never extends an expired document', () => {
+    const now = 1000000;
+    for (const offset of [2000, 60000, 60001]) {
+        const value = { issuedAt: now + offset, expiresAt: now + offset + 60000 };
+        expect(ownershipFresh(value, now)).toBe(offset <= 60000);
+    }
+    expect(ownershipFresh({ issuedAt: now - 60000, expiresAt: now }, now)).toBe(false);
+    expect(ownershipFresh({ issuedAt: now - 60001, expiresAt: now - 1 }, now)).toBe(false);
+});
+
+it('accepts a proof and confirm/lookup assertions from an A+ clock two seconds ahead', async () => {
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const times = { issuedAt: now + 2000, expiresAt: now + 62000 };
+    const p = await proof(createBody, times);
+    const created = await create(p);
+    expect(created.statusCode, created.body).toBe(200);
+    const { session, ownership } = created.json();
+    const confirmed = await app.inject({ method: 'POST', url: `/v1/session-ownership/${session.id}/confirm`,
+        payload: await assertion('saycode-session-ownership-confirm', { ...times,
+            requestId: 'confirmation', sessionId: session.id, bindingId: ownership.ownershipBindingId,
+            createDigest: ownership.createDigest, operationId: 'op', sessionAccountId: 'personal-account',
+            subject: { issuer: 'https://studio.example', userId: 'alice' } }) });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
+    const inspected = await app.inject({ method: 'POST', url: '/v1/session-ownership/lookup',
+        payload: await assertion('saycode-session-ownership-lookup', { ...times,
+            subject: { issuer: 'https://studio.example', userId: 'alice' },
+            sessions: [{ sessionId: session.id, sessionAccountId: 'personal-account' }] }) });
+    expect(inspected.statusCode, inspected.body).toBe(200);
+    expect(inspected.json().sessions[0].ownership).toMatchObject({ state: 'confirmed', ownerSubject: { userId: 'alice' } });
 });

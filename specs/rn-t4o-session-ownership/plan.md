@@ -24,3 +24,7 @@ Core: 개인 신원·권한과 authoritative ownership을 소유한다. Happy는
 키 교체는 Happy에 새 공개키 추가 → A+ signer 교체 → 구 키 철회 순이다. binding을 바꾸지 않으며 descriptor/contact는 짧은 기한 안에 새 키로 갱신한다. 운영 DB migration 적용·배포는 실행하지 않았다.
 
 happy-wire 기존 파일/manifest/export/lockfile은 통합 담당 예약이다. 새 sessionOwnership.ts를 Happy server tsconfig source alias로 소비하고 standalone bundle을 검증했다. 배포용 wire export/pin은 통합 담당이 순차 반영한다.
+
+## PR #949 시계 오차 수정 (2026-10-25)
+
+사용자 추가 승인 범위다. ownershipFresh를 rotation 문서와 같은 +60초 미래 시계 오차로 맞춘다. schema bounded의 최대 수명과 expiresAt의 엄격한 만료 거부는 유지한다. 기존 server spec에서 +2초/+60초 허용, +60001ms/만료 거부를 실패 재현하고, 실제 create→confirm→lookup HTTP도 +2초 서명으로 검증한다. A+ wire 사본에도 동일 변경을 적용한다. sessionProtocol 등 다른 wire 파일·schema·배포는 변경하지 않는다. c9a47efe 위 새 커밋과 일반 push로 제출한다.
