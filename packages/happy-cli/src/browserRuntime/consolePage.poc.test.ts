@@ -25,12 +25,21 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     let harness: HarnessCdp
     let server: http.Server
     let viewer: WebSocketServer
-    /** Stands in for the pinned noVNC: it only connects to the ticketed path in its address. */
+    /**
+     * Stands in for the pinned noVNC: it connects to the ticketed path in its address, takes the socket only if it
+     * passes noVNC 1.3.0's raw-channel check (core/websock.js attach() reads the props off the instance's own
+     * prototype), and then speaks first.
+     */
     const viewerRoot = mkdtempSync(join(tmpdir(), 'abp-console-viewer-'))
     writeFileSync(join(viewerRoot, 'vnc_lite.html'), '<!doctype html><html><head><title>noVNC</title></head><body><script type="module">'
-        + "new WebSocket('ws://' + location.host + '/' + new URLSearchParams(location.search).get('path'))</script></body></html>")
+        + "const s = new WebSocket('ws://' + location.host + '/' + new URLSearchParams(location.search).get('path'));"
+        + 'const props = [...Object.keys(s), ...Object.getOwnPropertyNames(Object.getPrototypeOf(s))];'
+        + "if (['send', 'close', 'binaryType', 'onerror', 'onmessage', 'onopen', 'protocol', 'readyState'].every((p) => props.includes(p)))"
+        + " s.onopen = () => s.send('RFB 003.008\\n')</script></body></html>")
     /** Viewer connections by ticket; the Runtime closes the one listed here with that code once it is open. */
     const viewerTickets: string[] = []
+    /** Tickets whose viewer took the socket and spoke. */
+    const viewerHandshakes: string[] = []
     const viewerCloses = new Map<string, number>()
     let origin = ''
     const port = () => (server.address() as AddressInfo).port
@@ -98,6 +107,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         viewer.on('connection', (socket, req) => {
             const ticket = new URL(req.url ?? '/', 'http://localhost').searchParams.get('ticket') ?? ''
             viewerTickets.push(ticket)
+            socket.once('message', () => viewerHandshakes.push(ticket))
             const code = viewerCloses.get(ticket)
             if (code) setTimeout(() => socket.close(code, 'control changed'), 100)
         })
@@ -295,6 +305,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     it('reconnects the screen with a fresh ticket when the Runtime closes the viewer after control changed', async () => {
         ops.length = 0
         viewerTickets.length = 0
+        viewerHandshakes.length = 0
         // Released after sending input: the Runtime closes that viewer (4002) to prove the input was drained.
         viewerCloses.set('ticket-1', 4002)
         try {
@@ -313,6 +324,8 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             // The new connection stays open: no further tickets.
             await new Promise((resolve) => setTimeout(resolve, 1_000))
             expect(ops.filter((entry) => entry.op === 'viewerTicket')).toHaveLength(2)
+            // The close report leaves noVNC a socket it accepts, on both connections.
+            expect(viewerHandshakes).toEqual(['ticket-1', 'ticket-2'])
             await harness.closeTarget(target)
         } finally { viewerCloses.clear() }
     }, 40_000)

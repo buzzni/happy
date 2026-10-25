@@ -92,11 +92,12 @@ const VIEWER_PATH_RESTORE = "<script>(function(){try{if(location.search||window.
  * Also in vnc_lite.html's <head>, so it runs before noVNC's module opens its connection:
  * tells the console that framed the page (same origin only) how the viewer connection
  * closed. noVNC drops the screen on close, and after a control change (4002) the console
- * reconnects with a new ticket.
+ * reconnects with a new ticket. The constructor is wrapped, not subclassed: noVNC 1.3.0
+ * rejects a socket whose own prototype does not carry the WebSocket members.
  */
 const VIEWER_CLOSE_REPORT = "<script>(function(){try{var W=window.WebSocket;if(window.parent===window||!W)return;"
-    + "window.WebSocket=class extends W{constructor(){super(...arguments);this.addEventListener('close',function(e){"
-    + "try{window.parent.postMessage({type:'abp-viewer-closed',code:e.code},location.origin)}catch(x){}})}}}catch(e){}})()</script>"
+    + "window.WebSocket=new Proxy(W,{construct:function(t,a,n){var s=Reflect.construct(t,a,n);s.addEventListener('close',function(e){"
+    + "try{window.parent.postMessage({type:'abp-viewer-closed',code:e.code},location.origin)}catch(x){}});return s}})}catch(e){}})()</script>"
 
 /**
  * Serves the pinned noVNC client (the Runtime image copies the Debian novnc
