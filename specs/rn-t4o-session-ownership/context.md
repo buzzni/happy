@@ -6,7 +6,17 @@ last_updated: 2026-10-25
 
 Happy 독립 clone `/home/walter/workspace/aplus-dev-studio-desktop/.aplus/worktrees/rn-ext/happy-t4o`에서 origin/main `9ee84191cf6e6b2739987be3f5488ef511c6474f` 기반 `feat/rn-t4o-session-ownership`으로 작업했다. 지휘 worktree와 원래 저장소는 수정하지 않는다.
 
-## 구현·검증
+## 교차 리뷰 T4O-01~03 (2026-10-25)
+
+리뷰 기준 Happy bce8eeb9 / A+ 026eb83eb. 세 항목은 모두 A+에서 수정하며 미반영 항목은 없다. Happy에는 아래 코드 근거로 동작 변경을 추가하지 않는다.
+
+- **T4O-01**: 실패한 advisory lock은 A+ sessionOwnershipService.lockOwnership → sessionOwnershipAuthority.createOwnershipDatabase의 $queryRawUnsafe 경계다. Happy는 기존 storage/inTx의 Prisma ORM transaction을 사용하며 이 void 반환 SQL을 호출하지 않는다. A+ lock의 ::text 변환과 생성된 Prisma client 회귀 테스트가 수정 범위다.
+- **T4O-02**: 회사 bearer를 차단한 findByToken 전역 게이트는 A+ appRoutes/httpAuthGate에만 있다. Happy의 machine-identity는 기존 account principal과 machine 행을 대조한다. A+에서 정확한 두 POST 예외와 전역 게이트 포함 HTTP 테스트를 추가한다.
+- **T4O-03**: Happy confirmOwnership은 기존 confirmedAt이 있으면 그 행을 그대로 반환하고, 최초 확인만 update한다. migration의 불변 trigger도 confirmedAt의 변경을 막는다. confirmed를 pending으로 덮어쓴 곳은 A+ OwnershipConfirmation outbox다. A+에서 완료 상태 보존·유효 receipt 재사용·만료 receipt 관측 갱신/503을 구현한다.
+
+A+ 기존 직접 PGlite/route-only harness가 놓친 경계를 생성된 Prisma client·생산 adapter·실제 전역 게이트 통합 테스트로 보완했다. 신규 A+ Prisma producer artifact로 Happy `sessionOwnershipBinding.spec.ts`를 재실행해 **12 tests 모두 통과**했다. A+ 관련 6 files / 393 tests, 변경 TypeScript 파일 lint, typecheck ratchet(기존 490 diagnostics baseline, 신규 오류 없음)도 통과했다. Happy 코드·schema·wire는 이번 수정에서 바꾸지 않으므로 Happy 타입/lint/build는 다시 실행하지 않았다. 문서 검증은 git diff --check로 완료했다. 운영 DB/배포에는 접근하지 않고 문서만 새 커밋으로 추가한다.
+
+## 최초 구현·검증 (교차 리뷰 전)
 
 신규 세션과 owner 후보를 원자적으로 저장하며 exact replay만 같은 세션으로 수렴한다. 선점된 legacy 행·재등록·사후 부착은 거부하고 proof 없음은 owner 없음, 개인 confirm 전 effective owner는 null이다. 서명·account·machine·body/tag·기한 검사, 삭제 tombstone, owner 불변 trigger, 두 proof 합성과 commit 직전 기한 재검사를 구현했다.
 
