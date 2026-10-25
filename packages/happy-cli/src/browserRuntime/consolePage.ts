@@ -37,7 +37,7 @@
  * noVNC's own scaleViewport on the frame's RFB object (handed over by the Runtime's viewer hook as
  * `__abpRfb`; the console's choice is read back from `__abpViewerFit` when a frame loads), so it
  * never reconnects and never asks the remote display to change size. The same hook sets noVNC's viewOnly from
- * `__abpViewerControl` (whether the user holds the shown task's control), so without control a wheel over an
+ * `__abpViewerControl` (whether this console's own capability holds the shown task's lease), so without control a wheel over an
  * actual-size screen pans the frame instead of being swallowed by the canvas. Activity and Advanced are
  * buttons on that line whose panels open under the screen, closed by default.
  */
@@ -277,7 +277,7 @@ summary::-webkit-details-marker{display:none}
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
-var S={cursor:0,seen:{},task:null,tasks:[],pendingTasks:null,listSeq:0,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
+var S={cursor:0,seen:{},task:null,tasks:[],pendingTasks:null,listSeq:0,gen:0,token:'',expiresAtMs:0,profileId:'',principalId:'',viewerSessionId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000,HOST_ORIGINS=${hostOrigins};
 var Q=new URLSearchParams(location.search),THEME=Q.get('theme');
 if(THEME==='dark'||THEME==='light')document.documentElement.setAttribute('data-theme',THEME);
@@ -356,6 +356,8 @@ function setCapability(token,expiresAtMs){var renewal=!!S.token;
  var parts=String(token||'').split('.');var payload=parts.length>=3?decodePart(parts[parts.length===4?2:1]):null;
  if(!payload||typeof payload.profileId!=='string'){capPill(T.unreadable,'bad');return false}
  S.token=token;S.profileId=payload.profileId;S.expiresAtMs=Number(expiresAtMs)||Number(payload.expiresAtMs)||0;
+ // Who this console is, for the lease check: the Runtime binds a takeover to (principal, viewer session).
+ S.principalId=typeof payload.principalId==='string'?payload.principalId:'';S.viewerSessionId=typeof payload.viewerSessionId==='string'?payload.viewerSessionId:'';
  capPill(T.connected+(S.expiresAtMs?' · '+(LANG==='ko'?hhmm(S.expiresAtMs)+' '+T.until:T.until+' '+hhmm(S.expiresAtMs)):''),'on');
  $('capState').title='profile '+S.profileId;
  scheduleRenewal();if(renewal&&S.screenOpen)openScreen();return true}
@@ -381,6 +383,8 @@ function op(name,body){return fetch('/v1/ops/'+name,{method:'POST',headers:{'con
  * user is still awaited: the same rule as waitsForUser.
  */
 function describe(t){
+ // A finished task keeps its last pause/wait reason on the view: the end comes first.
+ if(finished(t))return {label:T[t.status],tone:t.status==='succeeded'?'ok':'',reason:'',icon:'i-globe'};
  if(t.pendingApproval&&!t.cancelRequested)return {label:T.needApproval,tone:'warn',reason:T.rApproval,icon:'i-shield'};
  if(t.pauseReason==='user-control')return {label:T.userControl,tone:'ok',reason:T.rControl,icon:'i-hand'};
  if(t.pauseReason==='user-input-complete')return {label:T.released,tone:'ok',reason:T.rReleased,icon:'i-hand'};
@@ -392,7 +396,6 @@ function describe(t){
  if(t.status==='running')return {label:T.running,tone:'run',reason:T.rRunning,icon:'i-activity'};
  if(t.pauseReason==='awaiting-agent')return {label:T.awaitingAgent,tone:'',reason:'',icon:'i-activity'};
  if(t.status==='paused')return {label:T.paused,tone:'',reason:'',icon:'i-globe'};
- if(finished(t))return {label:T[t.status],tone:t.status==='succeeded'?'ok':'',reason:'',icon:'i-globe'};
  return {label:t.status||'',tone:'',reason:'',icon:'i-globe'}}
 /** The Runtime's terminal statuses: listTasks leaves them out, so the menu does too. */
 function finished(t){return t.status==='succeeded'||t.status==='failed'||t.status==='cancelled'}
@@ -403,8 +406,10 @@ function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.sta
  $('detailTitle').textContent=d.label||t.taskId; $('detailReason').textContent=d.reason;$('detailReason').hidden=!d.reason;$('detailId').textContent=t.taskId;
  $('detailTile').className='tile'+(d.tone?' '+d.tone:'');$('detailIcon').setAttribute('href','#'+d.icon);menuLabel();
  // The control a user is most likely to need next is the loud one.
- var holding=t.pauseReason==='user-control',released=t.pauseReason==='user-input-complete';
- $('takeOver').className=holding||released?'':'primary';$('release').className=holding?'primary':'';$('resume').className=released?'primary':'';
+ var done=finished(t),mine=!done&&ownLease(t),released=!done&&t.pauseReason==='user-input-complete';
+ $('takeOver').className=done||mine||released?'':'primary';$('release').className=mine?'primary':'';$('resume').className=released?'primary':'';
+ // A finished task takes no control, resume or stop (the Runtime answers CONFLICT); the bar only says how it ended.
+ ['takeOver','release','resume','stop'].forEach(function(id){$(id).disabled=done});
  syncTask(t);markSelected(t.taskId);applyControl();
  var a=t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a)}
 /**
@@ -412,8 +417,8 @@ function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.sta
  * control noVNC is view-only, so a wheel over an actual-size screen pans the frame (and keys are not grabbed); with
  * control they reach the page. The server's lease decides what is actually accepted; this only keeps the viewer honest.
  */
-function applyControl(){var holding=!!S.task&&S.task.pauseReason==='user-control';window.__abpViewerControl=holding;
- try{var w=$('screen').contentWindow;if(w&&w.__abpRfb)w.__abpRfb.viewOnly=!holding}catch(e){}}
+function applyControl(){var mine=holding();window.__abpViewerControl=mine;
+ try{var w=$('screen').contentWindow;if(w&&w.__abpRfb)w.__abpRfb.viewOnly=!mine}catch(e){}}
 function renderApproval(a){var box=$('approval');box.textContent='';var d=document.createElement('div');d.className='desc';d.textContent=a.description;
  var m=document.createElement('div');m.className='meta';var o=document.createElement('span');o.textContent=T.origin+' · '+a.origin;
  var x=document.createElement('span');x.textContent=T.expires+' · '+hhmm(a.expiresAtMs);m.appendChild(o);m.appendChild(x);box.appendChild(d);box.appendChild(m)}
@@ -446,10 +451,11 @@ function listTasks(quiet){if(!S.token)return;quiet=quiet===true;var seq=++S.list
  */
 function applyTasks(tasks,quiet){var shown=S.task;
  if(shown)tasks=tasks.map(function(t){return t.taskId===shown.taskId&&(Number(shown.stateVersion)||0)>=(Number(t.stateVersion)||0)?shown:t});
+ tasks=tasks.filter(function(t){return !finished(t)});
  if(quiet&&menu.open){S.pendingTasks=tasks;return}
  S.pendingTasks=null;S.tasks=tasks;var first=renderTasks();
- // Opened to deal with something: show the first task that needs the user right away.
- if(!S.task&&first&&!$('taskId').value){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}}
+ // Opened to deal with something (or the shown task is over): show the first task that needs the user right away.
+ if(first&&(S.task?finished(S.task):!$('taskId').value)){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}}
 menu.addEventListener('toggle',function(){if(!menu.open&&S.pendingTasks)applyTasks(S.pendingTasks,false)});
 /**
  * The menu's list and the badge, from S.tasks. Returns the first task that needs the user. Cards are reused by task id
@@ -469,7 +475,9 @@ function renderTasks(){var box=$('tasks'),old={},others=box.querySelector(':scop
  Object.keys(old).forEach(function(id){old[id].remove()});
  needCount(need);
  if(folded){summary.textContent=T.others(folded);if(others.parentNode!==box)box.appendChild(others);others.open=open}else others.remove();
- if(focused){var again=box.querySelector('button[data-task="'+focused+'"]');if(again&&document.activeElement!==again)again.focus()}
+ if(focused){var again=box.querySelector('button[data-task="'+focused+'"]');
+  // A card that moved into the closed fold is unfocusable there: open the fold so the user's place is kept.
+  if(again&&again.parentNode===others&&!others.open)others.open=true;if(again&&document.activeElement!==again)again.focus()}
  if(S.task)markSelected(S.task.taskId);return first}
 // Only the shown task is subscribed: the other tasks (and new ones) reach the list and the badge through a periodic
 // refresh while the page is visible, and one more when it becomes visible again. Not while the menu is open — a
@@ -483,6 +491,19 @@ function syncTask(t){var i=-1;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].tas
  if(finished(t)){if(i>=0){S.tasks.splice(i,1);renderTasks()}return}
  if(i>=0)S.tasks[i]=t;else S.tasks.push(t);
  if(!old||waitsForUser(old)!==waitsForUser(t)||describe(old).label!==describe(t).label)renderTasks()}
+/**
+ * Whether THIS console holds the shown task's control: a tab lease owned by this capability's principal and viewer
+ * session (the Runtime binds a takeover to both; another console of the same user is a different viewer session and
+ * its lease is not ours). A view without lease detail falls back to the task's pause reason.
+ */
+function holding(){var t=S.task;if(!t)return false;
+ // The Runtime admits input while every user lease of the profile is this viewer's: a lease of ours on another task of
+ // the profile (opened to look at it) counts too. A finished task holds nothing.
+ if(ownLease(t))return true;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].taskId!==t.taskId&&ownLease(S.tasks[k]))return true;return false}
+function ownLease(t){if(finished(t))return false;var leases=t.tabLeases;
+ if(!leases||!leases.length)return t.pauseReason==='user-control';
+ for(var i=0;i<leases.length;i++){var o=leases[i].owner;if(o&&o.kind==='user'&&(!S.viewerSessionId||o.viewerSessionId===S.viewerSessionId)&&(!S.principalId||o.principalId===S.principalId))return true}
+ return false}
 /** Same rule as the Runtime's sessionWaiting: the user's move now (a stale approval on a task being cancelled is not). */
 function waitsForUser(t){if(t.cancelRequested)return false;return !!t.pendingApproval||t.status==='awaiting-user'||t.pauseReason==='user-control'
  ||(t.pauseReason==='grant-expired'&&(t.waitReason==='login'||t.waitReason==='captcha'||t.waitReason==='handoff'))}
@@ -515,7 +536,7 @@ $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),re
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
 /** The screen counts as open from the click, so a renewal during the first ticket request reopens it; only the latest reply is shown. */
 function openScreen(){S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{profileId:S.profileId}).then(function(r){if(n!==S.screenSeq)return;
- var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;window.__abpViewerFit=S.fit;window.__abpViewerControl=!!S.task&&S.task.pauseReason==='user-control';
+ var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;window.__abpViewerFit=S.fit;window.__abpViewerControl=holding();
  // scale=1 only as a fallback for a client without the Runtime's hook: the hook reads the choice from __abpViewerFit.
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path)+(S.fit?'&scale=1':'');$('screenBox').hidden=false;$('screenEmpty').hidden=true
 },function(e){if(n!==S.screenSeq)return;S.screenOpen=false;var out=$('actionResult');out.className='err';out.textContent=e.message})}

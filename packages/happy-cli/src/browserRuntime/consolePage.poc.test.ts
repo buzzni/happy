@@ -18,7 +18,7 @@ const novncDir = process.env.ABP_VIEWER_ASSETS_DIR ?? '/usr/share/novnc'
 const hasNovnc = existsSync(`${novncDir}/vnc_lite.html`)
 const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
 const token = (tag: string, expiresAtMs: number) =>
-    `abp2.${b64({ alg: 'EdDSA', kid: 'k', typ: 'abp-cap' })}.${b64({ kind: 'interactive', profileId: 'profile-a', capabilityId: tag, expiresAtMs })}.sig-${tag}`
+    `abp2.${b64({ alg: 'EdDSA', kid: 'k', typ: 'abp-cap' })}.${b64({ kind: 'interactive', profileId: 'profile-a', principalId: 'user-1', viewerSessionId: 'viewer-this', capabilityId: tag, expiresAtMs })}.sig-${tag}`
 
 describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     let chrome: LaunchedChrome
@@ -428,14 +428,20 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         expect(await eventually(() => harness.evaluate(target, `${rfb}.scaleViewport`), (v) => v === true, 5_000)).toBe(true)
         expect(await harness.evaluate(target, `JSON.stringify(${pressed})`)).toBe(JSON.stringify(['true', 'false']))
         expect(ops.filter((entry) => entry.op === 'viewerTicket').length).toBe(2)
-        // Without the shown task's control the viewer is view-only (a wheel pans an actual-size frame); taking over lifts it.
+        // Without the shown task's control the viewer is view-only (a wheel pans an actual-size frame); our own take over lifts it.
         expect(await harness.evaluate(target, `${rfb}.viewOnly`)).toBe(true)
         const holding = { taskId: 'task-1', status: 'paused', pauseReason: 'user-control', stateVersion: 5, tabs: ['tab-1'], uncertainActions: [], cancelRequested: false,
-            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 8, owner: { kind: 'user' } }] }
+            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 8, owner: { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' } }] }
         try {
-            taskDetail = holding
+            // Held by another console of the same user (another viewer session): not ours, the viewer stays view-only and Release is not the loud button.
+            taskDetail = { ...holding, tabLeases: [{ tabId: 'tab-1', leaseEpoch: 8, owner: { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-other' } }] }
+            await eventually(() => harness.evaluate(target, `document.getElementById('detailTitle').textContent`), (bar) => bar === 'You have control', 10_000)
+            await harness.evaluate(target, `new Promise((r) => setTimeout(r, 300))`)
+            expect(await harness.evaluate(target, `JSON.stringify({ viewOnly: ${rfb}.viewOnly, release: document.getElementById('release').className })`)).toBe(JSON.stringify({ viewOnly: true, release: '' }))
+            taskDetail = { ...holding, stateVersion: 6 }
             expect(await eventually(() => harness.evaluate(target, `${rfb}.viewOnly`), (v) => v === false, 10_000)).toBe(false)
-            taskDetail = { ...holding, pauseReason: 'user-input-complete', stateVersion: 6 }
+            expect(await harness.evaluate(target, `document.getElementById('release').className`)).toBe('primary')
+            taskDetail = { ...holding, pauseReason: 'user-input-complete', stateVersion: 7, tabLeases: [{ tabId: 'tab-1', leaseEpoch: 9, owner: { kind: 'none' } }] }
             expect(await eventually(() => harness.evaluate(target, `${rfb}.viewOnly`), (v) => v === true, 10_000)).toBe(true)
         } finally { taskDetail = undefined }
         await harness.closeTarget(target)
@@ -450,13 +456,31 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         try {
             const target = await harness.openFrontTab(`${origin}/console?lang=en#abp-cap=${token('finished', Date.now() + 600_000)}&abp-exp=${Date.now() + 600_000}`)
             await eventually(() => harness.evaluate(target, `(document.getElementById('detailId') || {}).textContent`), (id) => id === 'task-a', 10_000)
-            taskDetails['task-a'] = detail({ ...login, status: 'succeeded', waitReason: undefined, stateVersion: 2 })
-            await eventually(() => harness.evaluate(target, `document.getElementById('detailTitle').textContent`), (bar) => bar === 'Finished', 10_000)
-            expect(await harness.evaluate(target, `JSON.stringify({ count: document.getElementById('needCount').textContent, cards: [...document.querySelectorAll('#tasks button')].map((b) => b.getAttribute('data-task')),
-                summary: document.querySelector('#tasks summary').textContent, label: document.getElementById('taskMenuLabel').textContent })`))
-                .toBe(JSON.stringify({ count: '0', cards: ['task-b'], summary: '1 other open task', label: 'Finished · task-a' }))
+            // A refresh (still listing task-a as open) is held while the menu is open; meanwhile the task finishes, keeping its last pause reason on the view.
+            listTasksDelayMs = 400
+            await harness.evaluate(target, `document.dispatchEvent(new Event('visibilitychange'))`)
+            await harness.evaluate(target, `document.getElementById('taskMenu').open = true`)
+            // Stopped while the user held control: the Runtime keeps the pause reason on the view and reclaims the lease.
+            taskDetails['task-a'] = detail({ ...login, status: 'cancelled', cancelRequested: true, pauseReason: 'user-control', stateVersion: 2, tabLeases: [{ tabId: 'tab-1', leaseEpoch: 3, owner: { kind: 'none' } }] })
+            await eventually(() => harness.evaluate(target, `document.getElementById('detailTitle').textContent`), (bar) => bar === 'Cancelled', 10_000)
+            const shape = `JSON.stringify({ count: document.getElementById('needCount').textContent, cards: [...document.querySelectorAll('#tasks button')].map((b) => b.getAttribute('data-task')),
+                summary: document.querySelector('#tasks summary').textContent, label: document.getElementById('taskMenuLabel').textContent,
+                loud: ['takeOver', 'release', 'resume'].filter((id) => document.getElementById(id).className === 'primary'), disabled: ['takeOver', 'release', 'resume', 'stop'].every((id) => document.getElementById(id).disabled),
+                control: window.__abpViewerControl })`
+            expect(await harness.evaluate(target, shape)).toBe(JSON.stringify({ count: '0', cards: ['task-b'], summary: '1 other open task', label: 'Cancelled · task-a', loud: [], disabled: true, control: false }))
+            // Closing the menu applies the held list: the finished task does not come back.
+            await harness.evaluate(target, `new Promise((r) => setTimeout(r, 600))`)
+            await harness.evaluate(target, `document.getElementById('taskMenu').open = false`)
+            await harness.evaluate(target, `new Promise((r) => setTimeout(r, 200))`)
+            expect(await harness.evaluate(target, shape)).toBe(JSON.stringify({ count: '0', cards: ['task-b'], summary: '1 other open task', label: 'Cancelled · task-a', loud: [], disabled: true, control: false }))
+            // Another task starts needing the user: the next refresh moves on from the finished one to it.
+            const captcha = { ...running, status: 'awaiting-user', waitReason: 'captcha', stateVersion: 2, updatedAtMs: now + 1_000 }
+            listedTasks = [captcha]; taskDetails['task-b'] = detail(captcha)
+            await harness.evaluate(target, `document.dispatchEvent(new Event('visibilitychange'))`)
+            await eventually(() => harness.evaluate(target, `(document.getElementById('detailId') || {}).textContent`), (id) => id === 'task-b', 10_000)
+            expect(await harness.evaluate(target, `JSON.stringify({ bar: document.getElementById('detailTitle').textContent, disabled: document.getElementById('takeOver').disabled })`)).toBe(JSON.stringify({ bar: 'Human verification needed', disabled: false }))
             await harness.closeTarget(target)
-        } finally { listedTasks = defaultTasks(); taskDetails = {} }
+        } finally { listedTasks = defaultTasks(); taskDetails = {}; listTasksDelayMs = 0 }
     }, 30_000)
 
     it('shows a task list failure above the task with a retry, not only inside the closed menu', async () => {
@@ -488,7 +512,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     it("updates the number of tasks needing the user from the task's own state changes, not only from a list refresh", async () => {
         const now = Date.now()
         const holding = { taskId: 'task-a', status: 'paused', pauseReason: 'user-control', stateVersion: 4, tabs: ['tab-1'], updatedAtMs: now, uncertainActions: [], cancelRequested: false,
-            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'user' } }] }
+            tabLeases: [{ tabId: 'tab-1', leaseEpoch: 7, owner: { kind: 'user', principalId: 'user-1', viewerSessionId: 'viewer-this' } }] }
         const released = { ...holding, pauseReason: 'user-input-complete', stateVersion: 5, tabLeases: [{ tabId: 'tab-1', leaseEpoch: 8, owner: { kind: 'none' } }] }
         listedTasks = [holding]; taskDetail = holding; releasedTask = released
         try {
@@ -548,6 +572,14 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             taskDetails['task-a'] = detail({ ...login, status: 'paused', pauseReason: 'user-control', stateVersion: 2 })
             await eventually(() => harness.evaluate(target, `document.querySelector('[data-task="task-a"] .chip').textContent`), (chip) => chip === 'You have control', 10_000)
             expect(await harness.evaluate(target, state)).toBe(JSON.stringify({ count: '1', top: ['task-a'], folded: ['task-b'], open: true, focus: 'task-b', chipA: 'You have control' }))
+            // The focused card's task stops needing the user: it moves into the fold, which opens so the focus is kept.
+            await harness.evaluate(target, `document.querySelector('#tasks details').open = false; document.querySelector('[data-task="task-a"]').focus()`)
+            taskDetails['task-a'] = detail({ ...login, status: 'running', waitReason: undefined, stateVersion: 3 })
+            await eventually(() => harness.evaluate(target, `document.querySelector('[data-task="task-a"] .chip').textContent`), (chip) => chip === 'Running', 10_000)
+            expect(await harness.evaluate(target, `JSON.stringify({ focus: document.activeElement.getAttribute('data-task'), open: document.querySelector('#tasks details').open, folded: [...document.querySelectorAll('#tasks details button')].map((b) => b.getAttribute('data-task')) })`))
+                .toBe(JSON.stringify({ focus: 'task-a', open: true, folded: ['task-a', 'task-b'] }))
+            taskDetails['task-a'] = detail({ ...login, status: 'paused', pauseReason: 'user-control', stateVersion: 4 })
+            await eventually(() => harness.evaluate(target, `document.querySelector('[data-task="task-a"] .chip').textContent`), (chip) => chip === 'You have control', 10_000)
             // Another task starts needing the user: a refresh (here: the page becoming visible again) lists it first and counts it.
             await harness.evaluate(target, `document.getElementById('taskMenu').open = false`)
             const captcha = { ...running, status: 'awaiting-user', waitReason: 'captcha', updatedAtMs: now + 1_000 }
