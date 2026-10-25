@@ -456,6 +456,8 @@ export async function runCodex(opts: {
         sessionOptions: standaloneLaunch ? { trackShutdownStorage: true } : undefined,
         onSessionSwap: (newSession) => {
             session = newSession;
+            newSession.configureInputQueue(messageQueue, 'remote', true);
+            newSession.setInputSteerAvailable(true);
             // Update permission handler with new session to avoid stale reference
             if (permissionHandler) {
                 permissionHandler.updateSession(newSession);
@@ -498,6 +500,7 @@ export async function runCodex(opts: {
     }
 
     const messageQueue = new MessageQueue2<EnhancedMode>(hashCodexEnhancedMode);
+    session.configureInputQueue(messageQueue, 'remote', true);
     /**
      * Correlation for a turn answering an external messenger request
      * (Saycode specs/desktop-messenger-channels). Set when the batch carrying it becomes the
@@ -780,6 +783,7 @@ export async function runCodex(opts: {
                 text: deferredTurn?.text ?? message.content.text,
                 mode: enhancedMode,
                 queue: messageQueue,
+                evidence: session.queueInput(message),
                 attachments: attachmentsForThisMessage,
                 latencyTrace,
                 attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
@@ -846,7 +850,8 @@ export async function runCodex(opts: {
         const generation = capacityContinuationModes.get(mode);
         return generation === undefined || generation === capacityRetryGeneration;
     };
-    const cancelCapacityRetry = () => {
+    const cancelCapacityRetry = (state: 'cancelled' | 'replaced' | null = 'cancelled') => {
+        if (state) session.inputEvidence.cancelContinuation(state);
         capacityRetryGeneration += 1;
         if (capacityRetryTimer) clearTimeout(capacityRetryTimer);
         capacityRetryTimer = null;
@@ -1462,7 +1467,9 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('codex-auth-recover', async (params: Record<string, unknown>) =>
         runtimeGate?.isClosed() ? authRecovery.recover(params) : admitRpc(() => authRecovery.recover(params)));
 
+    session.setInputSteerAvailable(true);
     registerCodexSteerHandler({
+        protocolTurnId: () => currentTurnId,
         admit: admitRpc,
         client: {
             steerTurn: async (text) => {
@@ -1918,6 +1925,9 @@ export async function runCodex(opts: {
             codexActiveSubagents = mapped.activeSubagents;
             codexProviderSubagentToSessionSubagent = mapped.providerSubagentToSessionSubagent;
             for (const envelope of mapped.envelopes) {
+                if (envelope.ev.t === 'turn-end' && envelope.ev.status !== 'cancelled' && turnServerOverloaded && !envelope.ev.requestId) {
+                    session.inputEvidence.continuePending('codex-capacity');
+                }
                 session.sendSessionProtocolMessage(envelope);
             }
         }
@@ -2615,9 +2625,15 @@ export async function runCodex(opts: {
                     latency?.submitted();
                     const memoryIngest = reserveCompletedTurnIngest(activeThreadId);
                     // Any turn that starts — the continuation itself, or input from any path — supersedes a pending one.
-                    cancelCapacityRetry();
+                    cancelCapacityRetry(message.continuation ? null : 'replaced');
                     const turnCapacityRetryGeneration = capacityRetryGeneration;
                     turnServerOverloaded = false;
+                    const validInput = messageQueue.revalidateBatch(message);
+                    if (validInput !== message) {
+                        if (validInput?.items) messageQueue.queue.unshift(...validInput.items);
+                        continue;
+                    }
+                    session.setPendingInputEvidence({ inputs: message.inputs ?? [], inputCount: message.inputCount, continuation: message.continuation });
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
                         ...(memoryIngest ? { onCompleted: memoryIngest.onCompleted,
@@ -2710,6 +2726,7 @@ export async function runCodex(opts: {
                         && turnCapacityRetryGeneration === capacityRetryGeneration) {
                         await reportAgentTaskCapacityFailure();
                     }
+                    if (!retry) session.inputEvidence.cancelContinuation('cancelled');
                     if (retry) {
                         const notice = `Model at capacity — continuing automatically in ${Math.round(retry.delayMs / 1000)}s (${retry.attempt}/${retry.maxAttempts}).`;
                         messageBuffer.addMessage(notice, 'status');
@@ -2721,6 +2738,7 @@ export async function runCodex(opts: {
                             // Whatever the user sent meanwhile is the next turn instead.
                             if (turnCapacityRetryGeneration !== capacityRetryGeneration
                                 || shouldExit || thinking || pending || messageQueue.size() > 0 || messageQueue.isClosed()) {
+                                session.inputEvidence.cancelContinuation('replaced');
                                 logger.debug('[Codex] Capacity continuation skipped: session moved on');
                                 // A run-once session stayed only for this continuation; wake its idle wait so it exits.
                                 if (runOnceTurnEnded && !pending && messageQueue.size() === 0) {
@@ -2729,7 +2747,9 @@ export async function runCodex(opts: {
                                 }
                                 return;
                             }
-                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode, undefined, turnAttendance?.continuationInput());
+                            messageQueue.unshiftIsolated(CODEX_CAPACITY_CONTINUE_PROMPT, continuationMode, undefined, turnAttendance?.continuationInput(), {
+                                ref: { kind: 'unidentified', runtimeInputId: randomUUID() }, continuation: session.inputEvidence.takeContinuation(),
+                            });
                         }, retry.delayMs);
                     }
                 } catch (error) {
@@ -2781,6 +2801,7 @@ export async function runCodex(opts: {
                     if (!routingApplied) {
                         difficultyRoutingCommitter.discardPending(message.requestIds ?? [], owningForegroundSignal.aborted ? 'cancelled' : 'failed');
                     }
+                    session.setPendingInputEvidence(null);
                     activeLessonTurn = null;
                     lessonProposalTurn.cancel();
                     // specs/linux-checkpoint-enforcement-backend R4 — the checkpoint turn is opened before

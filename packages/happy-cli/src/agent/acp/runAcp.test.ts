@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => {
   let killHandler: (() => Promise<void>) | null = null;
 
   const mockSession = {
+    configureInputQueue: vi.fn(),
+    queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
     on: vi.fn(),
     onUserMessage: vi.fn((handler: (message: any) => void) => {
       userMessageHandler = handler;

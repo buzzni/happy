@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import type { InputRef, InputEvidenceV1 } from '@slopus/happy-wire';
+import type { QueueInputEvidence } from '@/api/turnInputEvidence';
 import { logger } from "@/ui/logger";
 import type { InputAttendance } from "@/api/turnAttendance";
 
@@ -6,7 +9,8 @@ export type PendingAttachment = { data: Uint8Array; mimeType: string; name: stri
 /** An opt-in, daemon-local marker for one browser chat input. It never holds text or a session id. */
 export type QueueLatencyTrace = { id: string; receivedAt: number };
 
-interface QueueItem<T> {
+export interface QueueItem<T> {
+    evidence?: QueueInputEvidence;
     message: string;
     mode: T;
     modeHash: string;
@@ -37,6 +41,10 @@ interface QueueItem<T> {
 }
 
 export type CollectedBatch<T> = {
+    /** Original entries survive dequeue so a mode transition can remove only guarded inputs. */
+    items?: QueueItem<T>[];
+    inputs?: InputRef[];
+    continuation?: InputEvidenceV1;
     message: string;
     mode: T;
     hash: string;
@@ -72,6 +80,25 @@ export class MessageQueue2<T> {
     private closed = false;
     private onMessageHandler: ((message: string, mode: T) => void) | null = null;
     modeHasher: (mode: T) => string;
+    private inputValidator: ((input: QueueInputEvidence) => boolean) | null = null;
+
+    private inputAccepted: ((input: QueueInputEvidence) => void) | null = null;
+    setInputValidator(validator: (input: QueueInputEvidence) => boolean, accepted?: (input: QueueInputEvidence) => void): void {
+        this.inputValidator = validator;
+        this.inputAccepted = accepted ?? null;
+    }
+    private valid(item: QueueItem<T>): boolean { return !item.evidence || !this.inputValidator || this.inputValidator(item.evidence); }
+    discardInvalid(): void { this.queue = this.queue.filter(item => this.valid(item)); }
+    revalidateBatch(batch: CollectedBatch<T>): CollectedBatch<T> | null {
+        if (!batch.items) return batch;
+        const items = batch.items.filter(item => this.valid(item));
+        if (items.length === batch.items.length) return batch;
+        if (!items.length) return null;
+        const queue = new MessageQueue2<T>(this.modeHasher);
+        queue.queue = items;
+        const rebuilt = queue.collectBatch()!;
+        return { ...rebuilt, mode: batch.mode, hash: batch.hash };
+    }
 
     constructor(
         modeHasher: (mode: T) => string,
@@ -100,7 +127,8 @@ export class MessageQueue2<T> {
      * Push a message to the queue with a mode and an optional list of
      * attachments that travel with this message.
      */
-    push(message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance): void {
+    push(message: string, mode: T, attachments?: PendingAttachment[], requestIds?: string[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance, evidence?: QueueInputEvidence): void {
+        if (evidence && this.inputValidator && !this.inputValidator(evidence)) return;
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -111,6 +139,7 @@ export class MessageQueue2<T> {
         this.queue.push({
             message,
             mode,
+            evidence,
             modeHash,
             isolate: false,
             attachments,
@@ -118,6 +147,8 @@ export class MessageQueue2<T> {
             latencyTrace,
             ...(attendance ? { attendance } : {}),
         });
+
+        if (evidence) this.inputAccepted?.(evidence);
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -139,7 +170,8 @@ export class MessageQueue2<T> {
      * Push a message immediately without batching delay.
      * Does not clear the queue or enforce isolation.
      */
-    pushImmediate(message: string, mode: T, latencyTrace?: QueueLatencyTrace): void {
+    pushImmediate(message: string, mode: T, latencyTrace?: QueueLatencyTrace, evidence?: QueueInputEvidence): void {
+        if (evidence && this.inputValidator && !this.inputValidator(evidence)) return;
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -150,10 +182,13 @@ export class MessageQueue2<T> {
         this.queue.push({
             message,
             mode,
+            evidence,
             modeHash,
             isolate: false,
             latencyTrace,
         });
+
+        if (evidence) this.inputAccepted?.(evidence);
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -182,7 +217,8 @@ export class MessageQueue2<T> {
      * needs to know they are dead — otherwise their decisions sit in the state
      * forever, indistinguishable from work still in flight.
      */
-    pushIsolateAndClear(message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance): string[] {
+    pushIsolateAndClear(message: string, mode: T, attachments?: PendingAttachment[], latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance, evidence?: QueueInputEvidence): string[] {
+        if (evidence && this.inputValidator && !this.inputValidator(evidence)) return [];
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -197,12 +233,15 @@ export class MessageQueue2<T> {
         this.queue.push({
             message,
             mode,
+            evidence,
             modeHash,
             isolate: true,
             attachments,
             latencyTrace,
             ...(attendance ? { attendance } : {}),
         });
+
+        if (evidence) this.inputAccepted?.(evidence);
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -232,7 +271,9 @@ export class MessageQueue2<T> {
         requestIds?: string[],
         channelRequestId?: string,
         latencyTrace?: QueueLatencyTrace,
+        evidence?: QueueInputEvidence,
     ): void {
+        if (evidence && this.inputValidator && !this.inputValidator(evidence)) return;
         if (this.closed) {
             throw new Error('Cannot push to closed queue');
         }
@@ -243,6 +284,7 @@ export class MessageQueue2<T> {
         this.queue.push({
             message,
             mode,
+            evidence,
             modeHash,
             isolate: true,
             attachments,
@@ -250,6 +292,8 @@ export class MessageQueue2<T> {
             latencyTrace,
             channelRequestId,
         });
+
+        if (evidence) this.inputAccepted?.(evidence);
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -272,13 +316,15 @@ export class MessageQueue2<T> {
      * that were already queued. Used for an automation turn that wakes an
      * existing session while preserving subsequent user input.
      */
-    unshiftIsolated(message: string, mode: T, latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance): void {
+    unshiftIsolated(message: string, mode: T, latencyTrace?: QueueLatencyTrace, attendance?: InputAttendance, evidence?: QueueInputEvidence): void {
+        if (evidence && this.inputValidator && !this.inputValidator(evidence)) return;
         if (this.closed) {
             throw new Error('Cannot unshift to closed queue');
         }
 
         const modeHash = this.modeHasher(mode);
-        this.queue.unshift({ message, mode, modeHash, isolate: true, latencyTrace, ...(attendance ? { attendance } : {}) });
+        this.queue.unshift({ message, mode, evidence, modeHash, isolate: true, latencyTrace, ...(attendance ? { attendance } : {}) });
+        if (evidence) this.inputAccepted?.(evidence);
         if (this.onMessageHandler) {
             this.onMessageHandler(message, mode);
         }
@@ -292,7 +338,8 @@ export class MessageQueue2<T> {
     /**
      * Push a message to the beginning of the queue with a mode.
      */
-    unshift(message: string, mode: T, latencyTrace?: QueueLatencyTrace): void {
+    unshift(message: string, mode: T, latencyTrace?: QueueLatencyTrace, evidence?: QueueInputEvidence): void {
+        if (evidence && this.inputValidator && !this.inputValidator(evidence)) return;
         if (this.closed) {
             throw new Error('Cannot unshift to closed queue');
         }
@@ -303,10 +350,13 @@ export class MessageQueue2<T> {
         this.queue.unshift({
             message,
             mode,
+            evidence,
             modeHash,
             isolate: false,
             latencyTrace,
         });
+
+        if (evidence) this.inputAccepted?.(evidence);
 
         // Trigger message handler if set
         if (this.onMessageHandler) {
@@ -362,6 +412,7 @@ export class MessageQueue2<T> {
      * Get the current queue size
      */
     size(): number {
+        this.discardInvalid();
         return this.queue.length;
     }
 
@@ -370,6 +421,7 @@ export class MessageQueue2<T> {
      * Returns { message: string, mode: T } or null if aborted/closed
      */
     async waitForMessagesAndGetAsString(abortSignal?: AbortSignal, claim?: () => boolean): Promise<CollectedBatch<T> | null> {
+        this.discardInvalid();
         // If we have messages, return them immediately
         if (this.queue.length > 0) {
             return this.collectBatch(claim);
@@ -394,6 +446,7 @@ export class MessageQueue2<T> {
      * Collect a batch of messages with the same mode, respecting isolation requirements
      */
     private collectBatch(claim?: () => boolean): CollectedBatch<T> | null {
+        this.discardInvalid();
         if (this.queue.length === 0) {
             return null;
         }
@@ -401,6 +454,7 @@ export class MessageQueue2<T> {
         // Claim ownership before dequeue and before the async caller can yield. Refusal preserves the batch.
         if (claim && !claim()) return null;
         const firstItem = this.queue[0];
+        const items: QueueItem<T>[] = [];
         const sameModeMessages: string[] = [];
         const collectedAttachments: PendingAttachment[] = [];
         const collectedRequestIds: string[] = [];
@@ -414,6 +468,7 @@ export class MessageQueue2<T> {
         // If the first message requires isolation, only process it alone
         if (firstItem.isolate) {
             const item = this.queue.shift()!;
+            items.push(item);
             sameModeMessages.push(item.message);
             if (item.attachments) collectedAttachments.push(...item.attachments);
             if (item.requestIds) collectedRequestIds.push(...item.requestIds);
@@ -427,6 +482,7 @@ export class MessageQueue2<T> {
                 this.queue[0].modeHash === targetModeHash &&
                 !this.queue[0].isolate) {
                 const item = this.queue.shift()!;
+                items.push(item);
                 sameModeMessages.push(item.message);
                 if (item.attachments) collectedAttachments.push(...item.attachments);
                 if (item.requestIds) collectedRequestIds.push(...item.requestIds);
@@ -440,6 +496,14 @@ export class MessageQueue2<T> {
         const combinedMessage = sameModeMessages.join('\n');
 
         return {
+            items,
+            inputs: items.map(item => {
+                if (!item.evidence) item.evidence = { ref: item.channelRequestId
+                    ? { kind: 'channel', channelRequestId: item.channelRequestId }
+                    : { kind: 'unidentified', runtimeInputId: randomUUID() } };
+                return item.evidence.ref;
+            }),
+            ...(items[0]?.evidence?.continuation ? { continuation: items[0].evidence.continuation } : {}),
             message: combinedMessage,
             mode,
             hash: targetModeHash,

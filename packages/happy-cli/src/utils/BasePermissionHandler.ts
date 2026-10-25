@@ -35,12 +35,15 @@ export interface PendingRequest {
     reject: (error: Error) => void;
     toolName: string;
     input: unknown;
+    evidenceTurnId?: string;
 }
 
 /**
  * Result of a permission request.
  */
 export interface PermissionResult {
+    /** Runtime-only receipt; request_user_input settles it after validating its provider response. */
+    settleInputEvidence?: (state?: 'accepted' | 'rejected' | 'unknown') => void;
     decision: 'approved' | 'approved_for_session' | 'denied' | 'abort';
     updatedInput?: Record<string, unknown>;
     policyGrant?: 'session';
@@ -154,7 +157,11 @@ export abstract class BasePermissionHandler {
                     result.updatedInput = response.updatedInput;
                 }
                 if (response.approved && response.policyGrant === 'session') result.policyGrant = 'session';
+                const accepted = this.session.recordPermissionInput?.(response.id, pending.toolName, response, pending.evidenceTurnId);
+                if (pending.toolName === 'request_user_input' && accepted) result.settleInputEvidence = accepted;
                 pending.resolve(result);
+                // Codex tool approvals forward a decision only; edited text is not provider input.
+                if (pending.toolName !== 'request_user_input') accepted?.('rejected');
                 // After the request is gone and resolved, so a throwing subscriber cannot turn an
                 // answered permission into an unanswered one.
                 this.notifySettled(response.id, 'answered');

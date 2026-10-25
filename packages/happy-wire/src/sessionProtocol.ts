@@ -92,8 +92,53 @@ export const sessionFileEventSchema = z.object({
  * "the last assistant message" or on a sequence number is wrong as soon as anything else is in
  * flight. Absent for every ordinary in-app turn.
  */
+/** Input witnesses are independent of channel routing IDs. No prompt or permission text belongs here. */
+const evidenceId = z.string().min(1).max(128).regex(/^[\x20-\x7e]+$/);
+const evidenceCount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+export const hubPromptGuardSchema = z.object({
+  v: z.literal(1), targetSessionId: evidenceId, expectedRuntimeId: evidenceId,
+  expectedMode: z.literal('remote'), expectedModeEpoch: evidenceCount,
+}).strict();
+export type HubPromptGuardV1 = z.infer<typeof hubPromptGuardSchema>;
+export const inputRefSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('rest'), serverMessageId: evidenceId, serverSeq: evidenceCount.nullable() }),
+  z.object({ kind: z.literal('channel'), channelRequestId: evidenceId }),
+  z.object({ kind: z.literal('unidentified'), runtimeInputId: evidenceId }),
+]);
+export type InputRef = z.infer<typeof inputRefSchema>;
+export const inputEvidenceSchema = z.object({
+  v: z.literal(1), runtimeId: evidenceId, turnId: evidenceId, batchId: evidenceId, rootBatchId: evidenceId,
+  revision: evidenceCount.min(1), inputCount: evidenceCount, inputs: z.array(inputRefSchema).max(256),
+  coverage: z.enum(['complete', 'incomplete']), incompleteReasons: z.array(z.string().max(128)).max(32),
+  additional: z.object({
+    attempted: evidenceCount, accepted: evidenceCount, pending: evidenceCount, unknown: evidenceCount,
+    items: z.array(z.object({ attemptId: evidenceId, kind: z.enum(['steer', 'question-answer', 'permission-text']),
+      state: z.enum(['pending', 'accepted', 'rejected', 'unknown']) })).max(128),
+  }),
+  continuation: z.object({
+    kind: z.enum(['none', 'claude-transient', 'codex-capacity', 'claude-account-switch', 'background']),
+    state: z.enum(['none', 'pending', 'running', 'completed', 'cancelled', 'replaced']),
+    previousTurn: z.object({ runtimeId: evidenceId, turnId: evidenceId }).nullable(),
+    retryId: evidenceId.nullable(), rootExclusive: z.boolean().nullable(),
+  }),
+  terminal: z.boolean(),
+}).refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 65536, 'Input evidence exceeds 64KiB');
+export type InputEvidenceV1 = z.infer<typeof inputEvidenceSchema>;
+export const sessionTurnInputEvidenceEventSchema = z.object({
+  t: z.literal('turn-input-evidence'), inputEvidence: inputEvidenceSchema,
+});
+export const hubInputAdmissionSchema = z.object({
+  t: z.literal('hub-input-admission'), v: z.literal(1), serverMessageId: evidenceId, targetSessionId: evidenceId,
+  expectedRuntimeId: evidenceId.nullable(), observedRuntimeId: evidenceId,
+  expectedModeEpoch: evidenceCount.nullable(), observedModeEpoch: evidenceCount,
+  state: z.enum(['accepted', 'rejected']),
+  reason: z.enum(['matched', 'runtime-mismatch', 'mode-mismatch', 'mode-changed', 'invalid-guard']),
+});
+export type HubInputAdmissionV1 = z.infer<typeof hubInputAdmissionSchema>;
+
 export const sessionTurnStartEventSchema = z.object({
   t: z.literal('turn-start'),
+  inputEvidence: inputEvidenceSchema.optional(),
   requestId: z.string().min(1).max(128).optional(),
 });
 
@@ -107,6 +152,7 @@ export type SessionTurnEndStatus = z.infer<typeof sessionTurnEndStatusSchema>;
 
 export const sessionTurnEndEventSchema = z.object({
   t: z.literal('turn-end'),
+  inputEvidence: inputEvidenceSchema.optional(),
   status: sessionTurnEndStatusSchema,
   /** Same handle as the matching `turn-start`; see that schema. */
   requestId: z.string().min(1).max(128).optional(),
@@ -131,6 +177,7 @@ export const sessionTurnEndEventSchema = z.object({
  */
 export const sessionFinalAnswerEventSchema = z.object({
   t: z.literal('final-answer'),
+  inputEvidence: inputEvidenceSchema.optional(),
   text: z.string(),
   requestId: z.string().min(1).max(128).optional(),
 });
@@ -389,7 +436,7 @@ export const sessionPlanEventSchema = z.object({
   steps: z.array(z.object({
     text: z.string().min(1).max(PLAN_LIMITS.text),
     status: z.enum(PLAN_STEP_STATUSES),
-  })).min(1).max(PLAN_LIMITS.steps),
+  })).max(PLAN_LIMITS.steps),
 });
 
 export const sessionEventSchema = z.discriminatedUnion('t', [
@@ -405,6 +452,8 @@ export const sessionEventSchema = z.discriminatedUnion('t', [
   sessionChannelPermissionEventSchema,
   sessionChannelPermissionWithdrawnEventSchema,
   sessionTurnStartEventSchema,
+  sessionTurnInputEvidenceEventSchema,
+  hubInputAdmissionSchema,
   sessionStartEventSchema,
   sessionTurnEndEventSchema,
   sessionStopEventSchema,

@@ -174,9 +174,14 @@ describe('channel turn ordering through the launcher dispatcher', () => {
         expect(envelopes[1].ev).toMatchObject({ text: 'finished without a transcript' });
     });
 
-    it('does not open a channel turn for an uncorrelated or empty result', async () => {
+    it('publishes an ordinary final without a channel handle and keeps an empty channel result separate', async () => {
         const { queue, envelopes } = harness();
         queue.enqueue(finalAnswerItem('ordinary result'));
+        queue.enqueue(turnEndItem('completed'));
+        await queue.flush();
+        expect(shape(envelopes)).toEqual(['turn-start', 'final-answer', 'turn-end']);
+        expect(requestIds(envelopes)).toEqual([]);
+        envelopes.length = 0;
         queue.enqueue(pendingRequestItem('core-empty'));
         queue.enqueue(finalAnswerItem('   '));
         await queue.flush();

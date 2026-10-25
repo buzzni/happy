@@ -17,7 +17,7 @@ import type { ClaudeAuthObservation, ObservedAiAuthSource } from "./aiAuthObserv
 import { ClaudeSideQuestionBridge, createSideQuestionRpcHandler } from "./claudeSideQuestion";
 import { PermissionHandler } from "./utils/permissionHandler";
 import { Future } from "@/utils/future";
-import type { QueueLatencyTrace } from "@/utils/MessageQueue2";
+import type { CollectedBatch, QueueLatencyTrace } from "@/utils/MessageQueue2";
 import { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "./sdk";
 import { formatClaudeMessageForInk } from "@/ui/messageFormatterInk";
 import { logger } from "@/ui/logger";
@@ -38,7 +38,7 @@ import { judgeStructuredOutput, type StructuredOutputResult } from '@/claude/str
 import { getToolName } from "./utils/getToolName";
 import { getAskUserQuestionToolCallIds } from "./utils/questionNotification";
 import { cleanupStdinAfterInk } from "@/utils/terminalStdinCleanup";
-import type { MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources';
+import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
 import { createEnvelope, type McpRuntimeServerStatus } from '@slopus/happy-wire';
 import type { McpRuntimeRecovery } from './mcpRuntimeRecovery';
 import { registerMcpReconnectHandler } from './registerMcpReconnectHandler';
@@ -118,6 +118,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     let launchFailure: string | null = null;
     let abortFuture: Future<void> | null = null;
     let activeInputSender: ClaudeActiveInputSender | null = null;
+    let pending: CollectedBatch<EnhancedMode> | null = null;
+    // A dequeued batch can still be awaiting lessons/checkpoints before the SDK write.
+    let preparingBatch: CollectedBatch<EnhancedMode> | null = null;
 
     /**
      * This generation's SDK exit observer, reachable from the abort path.
@@ -139,6 +142,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const startedGeneration = (): GenerationProof | null => generationProofs.current();
 
     async function abort() {
+        session.client.inputEvidence?.cancelContinuation('cancelled');
         session.cancelLessonReview();
         // Stop means stop: a retry waiting to fire must not restart the work (and exit/switch end it too).
         transientRetry.cancel();
@@ -157,6 +161,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     async function doAbort() {
+        session.client.inputEvidence?.cancelContinuation('cancelled');
         logger.debug('[remote]: doAbort');
         // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
         session.client.markCurrentTurnAborted?.(); // optional: test doubles of the client omit it; the abort must not depend on it
@@ -174,6 +179,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     }
 
     async function doSwitch() {
+        session.client.setInputMode?.('transitioning');
+        for (const batch of [preparingBatch, pending]) {
+            if (!batch) continue;
+            const surviving = session.queue.revalidateBatch(batch);
+            if (surviving?.items) session.queue.queue.unshift(...surviving.items);
+        }
+        preparingBatch = pending = null;
         logger.debug('[remote]: doSwitch');
         if (!exitReason) {
             exitReason = 'switch';
@@ -181,6 +193,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         await abort();
     }
 
+    session.client.setInputMode?.('remote');
+    session.client.setInputSteerAvailable?.(true);
     // When to abort
     session.client.rpcHandlerManager.registerHandler('abort', doAbort); // When abort clicked
     session.client.rpcHandlerManager.registerHandler('switch', doSwitch); // When switch clicked
@@ -204,11 +218,20 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         const gate = session.standaloneDrain?.gate;
         if (gate?.isClosed()) return { success: false, error: 'This session is shutting down' };
         const steer = async () => {
-            if (!await activeInputSender?.(text)) {
-                return { success: false, error: 'No active Claude turn' };
+            await messageQueue.flush(); // Bind against the transcript already emitted before writing again.
+            const attempt = session.client.inputEvidence?.attempt('steer');
+            try {
+                if (!await activeInputSender?.(text)) {
+                    attempt?.settle('rejected');
+                    return { success: false, error: 'No active Claude turn' };
+                }
+                attempt?.settle('accepted');
+                session.onActiveUserInputAccepted?.(text);
+                return { success: true };
+            } catch (error) {
+                attempt?.settle('unknown');
+                throw error;
             }
-            session.onActiveUserInputAccepted?.(text);
-            return { success: true };
         };
         return gate ? gate.admit(steer) : steer();
     });
@@ -283,6 +306,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     const observedAiAuthByLogMessage = new WeakMap<object, ObservedAiAuthSource>();
     const orderingTarget: ChannelTurnOrderingTarget = {
         setPendingTurnRequestId: (requestId) => session.client.setPendingTurnRequestId(requestId),
+        setPendingInputEvidence: batch => session.client.startClaudeInputEvidence?.(batch),
+        continueInputEvidence: kind => session.client.continueClaudeInputEvidence?.(kind),
         sendFinalAnswerForChannelTurn: (text) => session.client.sendFinalAnswerForChannelTurn(text),
         sendStructuredOutput: (envelope) => session.client.sendStructuredOutput(envelope),
         closeClaudeSessionTurn: (status) => session.client.closeClaudeSessionTurn(status),
@@ -304,6 +329,26 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         createOrderedTurnDispatcher(orderingTarget),
         (signal) => session.client.noteContextUsageSignal(signal),
     ));
+
+    const commitInput = (batch: CollectedBatch<EnhancedMode>) => {
+        preparingBatch = batch;
+        return () => {
+            if (preparingBatch !== batch) return false; // switch already returned its surviving items
+            preparingBatch = null;
+            const valid = session.queue.revalidateBatch(batch);
+            if (valid !== batch) {
+                if (valid?.items) session.queue.queue.unshift(...valid.items);
+                return false;
+            }
+            if (batch.continuation && session.client.inputEvidence
+                && !session.client.inputEvidence.isContinuationCurrent(batch.continuation)) return false;
+            messageQueue.enqueue(pendingRequestItem(batch.channelRequestId ?? null, {
+                inputs: batch.inputs ?? [], inputCount: batch.inputCount,
+                continuation: batch.continuation ? session.client.inputEvidence?.takeContinuation() ?? batch.continuation : undefined,
+            }));
+            return true;
+        };
+    };
 
     /*
      * The prompt→turn binding and the sanitized observation. The ordering this depends on lives in
@@ -372,7 +417,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         rebind: requestSetupTokenRebind,
         applyEnvironment: (environment) => { for (const [key, value] of Object.entries(environment)) process.env[key] = value; },
         notify: (message) => session.client.sendSessionEvent({ type: 'message', message }),
-        notifyState: (message, state) => session.client.sendSessionEvent({ type: 'message', message, setupTokenRotation: { version: 1, state } }),
+        notifyState: (message, state) => {
+            if (state === 'retry-expired') session.client.inputEvidence?.cancelContinuation('cancelled');
+            session.client.sendSessionEvent({ type: 'message', message, setupTokenRotation: { version: 1, state } });
+        },
     }) : null;
     // Saycode specs/managed-account-session-continuation — said once per move, not again when this process relaunches.
     if (process.env[SETUP_TOKEN_RESUME_REBOUND_ENV] === '1') {
@@ -616,24 +664,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     // its `finally`, once the loop is really over.
     let gracefulStop: ManagedGracefulStop | null = null;
     try {
-        let pending: {
-            message: MessageParam['content'];
-            mode: EnhancedMode;
-            hash: string;
-            /**
-             * Kept on the held-back batch too. A message deferred because the mode
-             * changed still has to commit its routing decision when the next
-             * generation actually runs it — dropping the ids here would lose the
-             * decision for exactly the turns that were queued behind a mode change.
-             */
-            requestIds?: string[];
-            inputCount: number;
-            latencyTraces: QueueLatencyTrace[];
-            /** Carried through the deferral so an isolated channel turn keeps its handle. */
-            channelRequestId?: string;
-            /** Carried through the deferral so the turn is classified by its own inputs (R10a). */
-            allUnattended?: boolean;
-        } | null = null;
+
         /*
          * Queue time ends when a generation takes the batch. A batch held back
          * behind a provider restart is taken by the next generation, so it is
@@ -826,17 +857,26 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         return permissionHandler.isAborted(toolCallId);
                     },
                     nextMessage: async () => {
+                        await messageQueue.flush();
                         if (mode) lastTurnMode = mode;
+                        const wasAccountRefused = setupTokenSwitching?.hasAccountRefusal();
                         const accountSwitch = await setupTokenSwitching?.switchIfWanted();
                         if (accountSwitch?.switched && accountSwitch.continueAfter && !lastResultSucceeded && !lastTurnChannel && !controller.signal.aborted) {
                             continuation = mode ?? lastTurnMode;
+                        }
+                        if (wasAccountRefused && accountSwitch && !accountSwitch.switched && !setupTokenSwitching?.backgroundSignal()
+                            && session.client.inputEvidence?.snapshot()?.continuation.kind === 'claude-account-switch') {
+                            session.client.inputEvidence.cancelContinuation('cancelled');
                         }
                         // A running provider keeps the token it started with: end it, the loop resumes the conversation.
                         if (providerStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
                             if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
-                                session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
+                                session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput(), {
+                                    ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
+                                    continuation: session.client.inputEvidence?.takeContinuation(),
+                                });
                             }
                             continuation = null;
                         }
@@ -848,10 +888,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // This is the path an isolated channel turn actually takes: it was
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
-                            messageQueue.enqueue(pendingRequestItem(p.channelRequestId ?? null));
+
                             session.turnAttendance?.startTurn({ allUnattended: p.allUnattended, channel: p.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(p.channelRequestId);
                             lastTurnCommand = isCommandText(p.message);
+                            if (!p.continuation) session.client.inputEvidence?.cancelContinuation('replaced');
                             transientRetry.userTurnStarted();
                             // This message starts the new provider. Seed its comparison
                             // baseline too, or the next model/effort change is missed.
@@ -877,7 +918,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 p = { ...p, mode: revisedMode };
                             }
                             dispatchTurn();
-                            return { ...p, latency: toTurnLatency(p) };
+                            return { ...p, commitInput: commitInput(p), latency: toTurnLatency(p) };
                         }
 
                         /*
@@ -943,7 +984,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 if (providerStale()) return null;
                                 if (!providerRunning && continuation) {
                                     if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
-                                        session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
+                                        session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput(), {
+                                            ref: { kind: 'unidentified', runtimeInputId: randomUUID() },
+                                            continuation: session.client.inputEvidence?.takeContinuation(),
+                                        });
                                     }
                                     continuation = null;
                                 }
@@ -959,7 +1003,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             if (!due) continue;
                             session.client.noteTransientRetryDispatched();
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
-                            messageQueue.enqueue(pendingRequestItem(null));
+                            await messageQueue.flush();
+                            const inherited = session.client.inputEvidence?.takeContinuation();
                             lastTurnChannel = false;
                             lastTurnCommand = false;
                             // The failed turn again keeps its attendance and its spent wait budget (R10a, Q6).
@@ -969,10 +1014,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             permissionHandler.handleModeChange(mode.permissionMode);
                             logger.debug(`[remote]: transient API failure retry ${due.attempt}`);
                             dispatchTurn();
-                            return { message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode };
+                            return { message: CLAUDE_TRANSIENT_CONTINUE_PROMPT, mode, commitInput: () => {
+                                if (inherited && session.client.inputEvidence
+                                    && !session.client.inputEvidence.isContinuationCurrent(inherited)) return false;
+                                messageQueue.enqueue(pendingRequestItem(null, { inputs: [], inputCount: 0, continuation: inherited }));
+                                return true;
+                            } };
                         }
                         // The user's own input replaces a waiting retry, and a background wait for an account.
-                        if (msg) { transientRetry.userTurnStarted(); setupTokenSwitching?.userTurnStarted(); }
+                        if (msg) {
+                            if (!msg.continuation) session.client.inputEvidence?.cancelContinuation('replaced');
+                            transientRetry.userTurnStarted(); setupTokenSwitching?.userTurnStarted();
+                        }
                         if (msg === null && gracefulStop?.requested() && !controller.signal.aborted) {
                             /*
                              * Woken by the stop rather than aborted — and the
@@ -1025,7 +1078,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // two points the queue may have reordered, isolated or dropped it.
                             // A batch with no channel message clears it, so an in-app turn never
                             // inherits an id.
-                            messageQueue.enqueue(pendingRequestItem(msg.channelRequestId ?? null));
+
                             session.turnAttendance?.startTurn({ allUnattended: msg.allUnattended, channel: msg.channelRequestId !== undefined });
                             lastTurnChannel = Boolean(msg.channelRequestId);
                             lastTurnCommand = isCommandText(msg.message);
@@ -1090,6 +1143,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 logger.debug(`[remote] Combined ${contentBlocks.length - 1} image(s) with text message`);
                                 dispatchTurn();
                                 return {
+                                    commitInput: commitInput(msg),
                                     message: contentBlocks,
                                     mode: msg.mode,
                                     latency,
@@ -1103,6 +1157,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             // but the handle travels on every path so no future route drops it.
                             dispatchTurn();
                             return {
+                                commitInput: commitInput(msg),
                                 message: msg.message,
                                 mode: msg.mode,
                                 latency,
@@ -1197,7 +1252,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         // Queued, not called: a terminal emitted ahead of the transcript closes a
                         // turn that has not received its text yet, and the later flush opens a
                         // second, unrelated one.
-                        messageQueue.enqueue(turnEndItem(lastResultSucceeded ? 'completed' : 'failed'));
+
                         const turnMode = mode ?? lastTurnMode;
                         // Channel requests are terminal after their turn; a managed or run-once turn
                         // answers only its admitted prompt; a note in its place cannot re-run a command.
@@ -1206,6 +1261,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             && !session.managedRun && !session.exitAfterFirstTurn && !controller.signal.aborted
                             && !pending && session.queue.size() === 0 && !gracefulStop?.requested()
                             ? { mode: turnMode, hash: modeHash } : null);
+                        const accountRetry = !lastResultSucceeded && !lastTurnChannel && setupTokenSwitching?.hasAccountRefusal();
+                        if (retry?.kind === 'scheduled' || accountRetry) messageQueue.enqueue({
+                            __inputContinuation: accountRetry ? 'claude-account-switch' : 'claude-transient',
+                        });
+                        messageQueue.enqueue(turnEndItem(lastResultSucceeded ? 'completed' : 'failed'));
                         if (retry) {
                             const notice = retry.kind === 'scheduled'
                                 ? `Temporary API error${retry.state.status === null ? '' : ` (${retry.state.status})`} — retrying automatically in ${Math.round((retry.state.retryAt - retry.state.scheduledAt) / 1000)}s (${retry.state.attempt}/${retry.state.maxAttempts}). Send a message or stop to cancel.`
@@ -1260,6 +1320,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     // Reported after `finally` has flushed what the run already produced, so the
                     // failure is the last thing in the turn and closes it exactly once.
                     if (setupTokenSwitching?.hasAccountRefusal()) {
+                        await messageQueue.flush();
+                        if (!lastTurnChannel) session.client.continueClaudeInputEvidence?.('claude-account-switch');
+                        session.client.closeClaudeSessionTurn('failed');
                         lastResultSucceeded = false;
                         const switched = await setupTokenSwitching.switchIfWanted();
                         if (switched.switched && switched.continueAfter && !lastTurnChannel && !controller.signal.aborted) continuation = mode ?? lastTurnMode;
@@ -1368,6 +1431,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         streamRelay.dispose();
         // Nothing will run it now; a state left behind would show a countdown to nothing.
         transientRetry.cancel();
+        session.client.inputEvidence?.cancelContinuation('cancelled');
+        session.client.setInputSteerAvailable?.(false);
         setupTokenSwitching?.dispose();
 
         // Clean up permission handler

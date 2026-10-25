@@ -1,3 +1,4 @@
+import type { TurnInputEvidence } from '@/api/turnInputEvidence';
 import { createEnvelope, type SessionEnvelope } from '@slopus/happy-wire';
 
 type CodexSteerRpcResult = { success: true } | { success: false; error: string };
@@ -7,7 +8,9 @@ type CodexSteerHandlerInput = {
     client: {
         steerTurn(text: string): Promise<void>;
     };
+    protocolTurnId?: () => string | null;
     session: {
+        inputEvidence?: TurnInputEvidence;
         rpcHandlerManager: {
             registerHandler(method: string, handler: CodexSteerRpcHandler): void;
         };
@@ -39,7 +42,14 @@ export function registerCodexSteerHandler(input: CodexSteerHandlerInput): void {
 
         try {
             const work = async () => {
-                await input.client.steerTurn(text);
+                const attempt = input.session.inputEvidence?.attempt('steer', input.protocolTurnId?.() ?? null);
+                try {
+                    await input.client.steerTurn(text);
+                    attempt?.settle('accepted');
+                } catch (error) {
+                    attempt?.settle('unknown');
+                    throw error;
+                }
                 input.session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
                 return { success: true as const };
             };

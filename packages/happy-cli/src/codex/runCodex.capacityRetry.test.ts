@@ -1,3 +1,6 @@
+import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
+import type { SessionEnvelope } from '@slopus/happy-wire';
+import type { UserMessage } from '@/api/types';
 /**
  * A turn that Codex ends with "Selected model is at capacity" is continued automatically —
  * driven through the real consumer loop and the real `MessageQueue2`, with only the
@@ -54,7 +57,7 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
     return { ...original, MessageQueue2: Recorded };
 });
 
-const protocolMessages: { ev?: { t?: string; requestId?: string; nonce?: string; text?: string; status?: string } }[] = [];
+const protocolMessages: SessionEnvelope[] = [];
 type Outcome = 'overloaded' | 'ok';
 let script: { outcome: Outcome; after?: () => void | Promise<void> }[] = [];
 let turnsSent: string[] = [];
@@ -114,13 +117,21 @@ const sessionEvents: { message?: string }[] = [];
 let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', codexThreadId: 'thread-1' };
 
 function sessionStub() {
+    const evidence = new TurnInputEvidence('runtime-test', envelope => protocolMessages.push(envelope));
     return {
+        inputEvidence: evidence,
+        configureInputQueue: (queue: InstanceType<typeof import('@/utils/MessageQueue2').MessageQueue2>) => {
+            queue.setInputValidator(input => !input.continuation || evidence.isContinuationCurrent(input.continuation));
+        },
+        setInputSteerAvailable: vi.fn(),
+        setPendingInputEvidence: (batch: EvidenceBatch | null) => evidence.setPending(batch),
+        queueInput: (message: UserMessage) => ({ ref: { kind: 'rest', serverMessageId: message.serverMessageId ?? 'test-input', serverSeq: message.serverSeq ?? 1 } }),
         sessionId: 'sess-1',
         runtimeId: 'runtime-test',
         awaitMessageAck: vi.fn(async () => ({ ok: true })),
         sendSessionEvent: vi.fn((event: { message?: string }) => { sessionEvents.push(event); }),
         sendSessionProtocolMessage: vi.fn((envelope: typeof protocolMessages[number]) => {
-            protocolMessages.push(envelope);
+            protocolMessages.push(evidence.stamp(envelope));
             const ev = envelope.ev;
             if (ev?.t === 'channel-ready') queueMicrotask(() => {
                 void rpc.get('channel-authorize')?.({ requestId: ev.requestId, expectedRuntimeId: 'runtime-test', nonce: ev.nonce, decision: 'allow' });
@@ -200,13 +211,20 @@ describe('automatic continuation after a capacity failure', () => {
     it('continues the same thread once the overloaded turn has ended', async () => {
         script = [{ outcome: 'overloaded' }, { outcome: 'ok', after: closeQueue }];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(turnsSent).toHaveLength(2);
         expect(turnsSent[0]).toContain('fix the bug');
         expect(turnsSent[1]).toContain(CODEX_CAPACITY_CONTINUE_PROMPT);
         expect(notices()).toHaveLength(1);
+        const ends = protocolMessages.filter(event => event.ev.t === 'turn-end');
+        expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
+            continuation: { kind: 'codex-capacity', state: 'pending' } } });
+        expect(ends[1].ev).toMatchObject({ inputEvidence: { inputCount: 1,
+            inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
+            terminal: true, continuation: { kind: 'codex-capacity', state: 'completed' } } });
     }, 60_000);
 
     it('gives up after the retry budget and leaves the failure to the user', async () => {
@@ -216,7 +234,8 @@ describe('automatic continuation after a capacity failure', () => {
             { outcome: 'overloaded', after: () => { setTimeout(closeQueue, 200); } },
         ];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(turnsSent).toHaveLength(3);
@@ -233,7 +252,8 @@ describe('automatic continuation after a capacity failure', () => {
             { outcome: 'ok', after: async () => { await sleep(100); setTimeout(closeQueue, 100); } },
         ];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(turnsSent).toHaveLength(2);
@@ -250,7 +270,8 @@ describe('automatic continuation after a capacity failure', () => {
             },
         }];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
 
         expect(rpc.has('abort')).toBe(true);
@@ -266,7 +287,8 @@ describe('automatic continuation after a capacity failure', () => {
             },
         }];
         await run(async () => {
-            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never);
+            queues[0]!.pushIsolated('fix the bug', { permissionMode: 'default' } as never, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
         });
         expect(continuations()).toHaveLength(0);
         expect(notices()).toHaveLength(0);

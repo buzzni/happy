@@ -27,5 +27,5 @@ export function codexPlanEvent(msg: Record<string, unknown>): Extract<SessionEve
         steps.push({ text: step.slice(0, PLAN_LIMITS.text), status });
         if (steps.length === PLAN_LIMITS.steps) break;
     }
-    return steps.length > 0 ? { t: 'plan', steps } : null;
+    return steps.length > 0 || msg.plan.length === 0 ? { t: 'plan', steps } : null;
 }

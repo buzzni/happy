@@ -19,6 +19,9 @@ const fixture = vi.hoisted(() => ({
     completedThread: null as { id: string; path: string } | null,
     completedTurnId: 'native-completed-turn',
     session: {
+        configureInputQueue: vi.fn(), setInputSteerAvailable: vi.fn(), setPendingInputEvidence: vi.fn(),
+        queueInput: vi.fn(() => ({ ref: { kind: 'unidentified', runtimeInputId: 'test-input' } })),
+        inputEvidence: { attempt: vi.fn(() => ({ settle: vi.fn() })), cancelContinuation: vi.fn(), continuePending: vi.fn(), takeContinuation: vi.fn() },
         sessionId: 'lesson-session', getMetadata: () => ({ path: '/tmp/lesson-test' }),
         drainAttachmentsForUserMessage: vi.fn(async () => []),
         onUserMessage: vi.fn(), onFileEvent: vi.fn(), on: vi.fn(), hasTitle: () => true,

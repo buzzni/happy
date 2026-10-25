@@ -1,3 +1,5 @@
+import type { EvidenceBatch } from '@/api/turnInputEvidence';
+import type { InputEvidenceV1 } from '@slopus/happy-wire';
 import type { SessionTurnEndStatus } from '@slopus/happy-wire';
 import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 
@@ -31,6 +33,7 @@ import type { StructuredOutputEnvelope } from '@/claude/structuredOutput';
 export interface ChannelPendingRequestItem {
     __channelPendingRequestId: true;
     requestId: string | null;
+    inputEvidence?: EvidenceBatch;
 }
 
 export interface ChannelFinalAnswerItem {
@@ -69,8 +72,8 @@ export type ChannelOrderedItem =
     | ChannelTurnEndItem
     | ChannelPermissionBindingItem;
 
-export function pendingRequestItem(requestId: string | null): ChannelPendingRequestItem {
-    return { __channelPendingRequestId: true, requestId };
+export function pendingRequestItem(requestId: string | null, inputEvidence?: EvidenceBatch): ChannelPendingRequestItem {
+    return { __channelPendingRequestId: true, requestId, ...(inputEvidence ? { inputEvidence } : {}) };
 }
 
 export function finalAnswerItem(text: string): ChannelFinalAnswerItem {
@@ -96,6 +99,8 @@ export function permissionBindingItem(
 /** The subset of the session client these ordered items act on. */
 export interface ChannelTurnOrderingTarget {
     setPendingTurnRequestId(requestId: string | null): void;
+    setPendingInputEvidence?(batch: EvidenceBatch): void;
+    continueInputEvidence?(kind: InputEvidenceV1['continuation']['kind']): void;
     sendFinalAnswerForChannelTurn(text: string): void;
     sendStructuredOutput(envelope: StructuredOutputEnvelope): void;
     closeClaudeSessionTurn(status: SessionTurnEndStatus): void;
@@ -111,9 +116,15 @@ export function createOrderedTurnDispatcher(
     target: ChannelTurnOrderingTarget,
 ): (message: unknown) => void {
     return (message: unknown) => {
+        if (message && typeof message === 'object' && '__inputContinuation' in message) {
+            target.continueInputEvidence?.((message as { __inputContinuation: InputEvidenceV1['continuation']['kind'] }).__inputContinuation);
+            return;
+        }
         const item = message as Partial<ChannelOrderedItem> | null;
         if (item && (item as ChannelPendingRequestItem).__channelPendingRequestId === true) {
             target.setPendingTurnRequestId((item as ChannelPendingRequestItem).requestId);
+            const batch = (item as ChannelPendingRequestItem).inputEvidence;
+            if (batch) target.setPendingInputEvidence?.(batch);
             return;
         }
         if (item && (item as ChannelFinalAnswerItem).__channelFinalAnswer === true) {

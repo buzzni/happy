@@ -1,3 +1,8 @@
+import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
+import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapClaudeChannelFinalAnswer,
+    startClaudeInputTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
+import type { SessionEnvelope, SessionTurnEndStatus, InputEvidenceV1 } from '@slopus/happy-wire';
+import type { RawJSONLines } from './types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { claudeRemoteLauncher } from './claudeRemoteLauncher';
@@ -37,6 +42,33 @@ const assistant = (id: string) => ({ type: 'assistant', uuid: `uuid-${id}`, sess
     message: { id, role: 'assistant', model: 'claude-sonnet-5', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 1, output_tokens: 1 } } });
 const refused = { type: 'rate_limit_event', uuid: 'rl-1', session_id: 'claude-1',
     rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', resetsAt: Math.floor(Date.now() / 1000) + 3600 } };
+
+function attachInputEvidence(client: {
+    sendClaudeSessionMessage: ReturnType<typeof vi.fn>; setPendingTurnRequestId: ReturnType<typeof vi.fn>;
+    sendFinalAnswerForChannelTurn: ReturnType<typeof vi.fn>; closeClaudeSessionTurn: ReturnType<typeof vi.fn>;
+}) {
+    const events: SessionEnvelope[] = [];
+    const tracker = new TurnInputEvidence('host', event => events.push(event));
+    const state: ClaudeSessionProtocolState = { currentTurnId: null };
+    let pending = false;
+    const accept = (envelopes: SessionEnvelope[]) => {
+        for (const envelope of envelopes) {
+            if (envelope.ev.t === 'turn-start') pending = false;
+            events.push(tracker.stamp(envelope));
+        }
+    };
+    const ensure = () => { if (pending) accept(startClaudeInputTurn(state).envelopes); };
+    Object.assign(client, {
+        inputEvidence: tracker,
+        startClaudeInputEvidence: (batch: EvidenceBatch) => { tracker.setPending(batch); pending = true; },
+        continueClaudeInputEvidence: (kind: InputEvidenceV1['continuation']['kind']) => { ensure(); tracker.continuePending(kind); },
+    });
+    client.setPendingTurnRequestId.mockImplementation((id: string | null) => { state.pendingRequestId = id; });
+    client.sendClaudeSessionMessage.mockImplementation((body: RawJSONLines) => accept(mapClaudeLogMessageToSessionEnvelopes(body, state).envelopes));
+    client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => accept(mapClaudeChannelFinalAnswer(state, text).envelopes));
+    client.closeClaudeSessionTurn.mockImplementation((status: SessionTurnEndStatus) => { ensure(); accept(closeClaudeTurnWithStatus(state, status).envelopes); });
+    return { events, tracker };
+}
 
 describe('setup-token account switch in the remote launcher (Saycode specs/claude-setup-token-account-selection)', () => {
     // Saycode specs/managed-account-session-continuation — the daemon moved this conversation at resume.
@@ -169,6 +201,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
                 applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
+            const witness = attachInputEvidence(client);
             const generations: Array<{ token?: string; resume?: string; prompts: string[] }> = [];
             vi.mocked(query).mockImplementation(({ prompt, options }) => {
                 const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, resume: options?.resume, prompts: [] as string[] };
@@ -191,7 +224,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 })();
                 return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
             });
-            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' }, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
             const session: Record<string, unknown> = {
                 lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
                 cancelLessonReview: vi.fn(),
@@ -205,6 +239,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
             expect(generations.map(generation => generation.resume)).toEqual(['claude-1', 'claude-1']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
+            const ends = witness.events.filter(event => event.ev.t === 'turn-end');
+            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
+                continuation: { kind: 'claude-account-switch', state: 'pending' } } });
+            expect(ends.at(-1)?.ev).toMatchObject({ inputEvidence: { inputCount: 1,
+                inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
+                terminal: true, continuation: { kind: 'claude-account-switch', state: 'completed' } } });
             const running = `shared-machine:${SHARED_A}`;
             expect(requestSetupTokenRebind).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
             expect(reportSetupTokenUsage).toHaveBeenCalledWith('happy-session-1', running, expect.objectContaining({ reason: 'rate-limited' }), expect.any(AbortSignal));
@@ -372,6 +412,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
                 applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
             };
+            const witness = attachInputEvidence(client);
             const generations: Array<{ token?: string; prompts: string[] }> = [];
             vi.mocked(query).mockImplementation(({ prompt, options }) => {
                 const generation = { token: options?.env?.CLAUDE_CODE_OAUTH_TOKEN, prompts: [] as string[] };
@@ -394,7 +435,8 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
                 })();
                 return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
             });
-            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+            queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' }, undefined, undefined, undefined, undefined,
+                { ref: { kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 } });
             const session: Record<string, unknown> = {
                 lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
                 cancelLessonReview: vi.fn(),
@@ -408,6 +450,7 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(generations).toHaveLength(1);
             if (action === 'stop') {
                 await handlers.get('abort')!();
+                expect(witness.tracker.snapshot()).toMatchObject({ terminal: true, continuation: { state: 'cancelled' } });
                 const notices = client.sendSessionEvent.mock.calls.filter(([event]) => 'setupTokenRotation' in event).length;
                 await vi.advanceTimersByTimeAsync(5 * 60000);
                 expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1);
@@ -423,6 +466,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             expect(requestSetupTokenRebind).toHaveBeenCalledTimes(2);
             expect(generations.map(generation => generation.token)).toEqual(['sk-ant-oat01-first', 'sk-ant-oat01-second']);
             expect(generations[1].prompts[0]).toContain(CONTINUE_PROMPT);
+            const ends = witness.events.filter(event => event.ev.t === 'turn-end');
+            expect(ends[0].ev).toMatchObject({ inputEvidence: { terminal: false,
+                continuation: { kind: 'claude-account-switch', state: 'pending' } } });
+            expect(ends.at(-1)?.ev).toMatchObject({ inputEvidence: { inputCount: 1,
+                inputs: [{ kind: 'rest', serverMessageId: 'original-input', serverSeq: 1 }],
+                terminal: true, continuation: { kind: 'claude-account-switch', state: 'completed' } } });
             expect(client.sendSessionEvent).toHaveBeenCalledWith({ type: 'message', message: SWITCHED_NOTICE, setupTokenRotation: { version: 1, state: 'switched' } });
         } finally {
             vi.useRealTimers();

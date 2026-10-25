@@ -1,3 +1,5 @@
+import { configuration } from '@/configuration';
+import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -209,6 +211,69 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
 
         mockIo.mockReturnValue(mockSocket);
+    });
+
+    it.each([
+        { supported: false, managed: false, mode: 'remote' as const, evidence: null, prompt: true },
+        { supported: true, managed: false, mode: 'remote' as const, evidence: 1, prompt: true },
+        { supported: true, managed: false, mode: 'local' as const, evidence: null, prompt: false },
+        { supported: true, managed: true, mode: 'remote' as const, evidence: null, prompt: false },
+    ])('advertises actual host capability $mode supported=$supported managed=$managed', async example => {
+        const client = new ApiSessionClient('fake-token', session, example.managed ? { serverOrigin: configuration.serverUrl } : undefined);
+        let metadata = session.metadata!;
+        vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), example.mode, example.supported);
+        expect(metadata.runtimeCapabilities?.agentContact).toMatchObject({ v: 1, runtimeId: client.runtimeId,
+            principal: example.managed ? 'managed' : 'account', prompt: example.prompt, inputEvidence: example.evidence,
+            guardedPrompt: 1, mode: example.mode, modeEpoch: client.inputGate.modeEpoch });
+        await client.close();
+    });
+
+    it('gates malformed and stale hub input before callback/automation, preserving the trusted row identity', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        const queue = new MessageQueue2<string>(mode => mode);
+        client.configureInputQueue(queue, 'remote', true);
+        const publish = vi.spyOn(client, 'sendSessionProtocolMessage');
+        const received: unknown[] = [];
+        client.onUserMessage(message => { received.push(message); queue.push(message.content.text, 'mode', undefined,
+            undefined, undefined, undefined, client.queueInput(message)); });
+        const guard = { v: 1, targetSessionId: client.sessionId, expectedRuntimeId: client.runtimeId,
+            expectedMode: 'remote', expectedModeEpoch: client.inputGate.modeEpoch };
+        const send = (seq: number, hubPrompt: unknown) => emitSocketEvent('update', createNewMessageUpdate(seq, encryptContent(session, {
+            role: 'user', content: { type: 'text', text: 'secret text' }, serverMessageId: 'spoof', serverSeq: 999,
+            meta: { hubPrompt },
+        })));
+        send(1, { ...guard, v: 2 });
+        expect(received).toHaveLength(0); expect(queue.size()).toBe(0);
+        expect(publish.mock.calls.at(-1)?.[0].ev).toMatchObject({ t: 'hub-input-admission', serverMessageId: 'msg-1', reason: 'invalid-guard' });
+        send(2, guard);
+        expect(received).toHaveLength(1);
+        expect(received[0]).toMatchObject({ serverMessageId: 'msg-2', serverSeq: 2 });
+        client.setInputMode('transitioning');
+        client.setInputMode('local');
+        expect(queue.size()).toBe(0);
+        client.setInputMode('remote');
+        send(3, guard);
+        expect(received).toHaveLength(1);
+        expect(publish.mock.calls.at(-1)?.[0].ev).toMatchObject({ state: 'rejected', reason: 'mode-changed' });
+        expect(JSON.stringify(publish.mock.calls.map(call => call[0].ev))).not.toContain('secret text');
+        await client.close();
+    });
+
+    it('binds question and permission-text to their tool turn, excluding binary answers', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', true);
+        client.setPendingInputEvidence({ inputs: [{ kind: 'rest', serverMessageId: 'm', serverSeq: 1 }], inputCount: 1 });
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'turn-start' }, { turn: 't1' }));
+        client.sendSessionProtocolMessage(createEnvelope('agent', { t: 'tool-call-start', call: 'q', name: 'AskUserQuestion', title: 'Question', description: 'Question', args: {} }, { turn: 't1' }));
+        client.recordPermissionInput('q', 'AskUserQuestion', { id: 'q', approved: true, updatedInput: { answers: { a: 'private answer' } } })();
+        client.recordPermissionInput('q', 'Bash', { id: 'q', approved: true })();
+        client.recordPermissionInput('q', 'Bash', { id: 'q', approved: false, reason: 'private reason' })();
+        expect(client.inputEvidence.snapshot('t1')?.additional).toMatchObject({ attempted: 2, accepted: 2, pending: 0 });
+        expect(JSON.stringify(client.inputEvidence.snapshot('t1'))).not.toContain('private');
+        client.recordPermissionInput('q', 'Bash', { id: 'q', approved: true, unexpected: 'instruction' })();
+        expect(client.inputEvidence.snapshot('t1')?.coverage).toBe('incomplete');
+        await client.close();
     });
 
     it('registers machine.run with the daemon-owned trusted profile registry', () => {
@@ -1637,6 +1702,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(onUserMessage).toHaveBeenCalledWith({
             ...userMessage,
             serverMessageId: 'msg-1',
+            serverSeq: 1,
         });
         expect((client as any).lastSeq).toBe(1);
     });
@@ -1779,7 +1845,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         await (client as any).fetchMessages();
 
-        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1' });
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1', serverSeq: 1 });
     });
 
     it('fetchMessages uses incremental cursor and paginates while hasMore is true', async () => {
@@ -1905,7 +1971,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await (client as any).fetchMessages();
 
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1' });
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1', serverSeq: 1 });
         expect(onMessage).toHaveBeenCalledTimes(1);
         expect(onMessage).toHaveBeenCalledWith(agentMessage);
     });
@@ -2020,6 +2086,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             role: 'user',
             content: { type: 'text', text: 'fast-path' },
             serverMessageId: 'msg-2',
+            serverSeq: 2,
         });
         expect((client as any).lastSeq).toBe(2);
         expect(mockAxiosGet).not.toHaveBeenCalled();
@@ -2068,6 +2135,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(onUserMessage).toHaveBeenCalledWith({
             ...userMessage,
             serverMessageId: 'msg-1',
+            serverSeq: 1,
         });
         expect((client as any).lastSeq).toBe(1);
     });
@@ -2275,7 +2343,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
             emitSocketEvent('update', createNewMessageUpdate(1, encryptContent(session, firstMessage)));
 
             expect(onUserMessage).toHaveBeenCalledTimes(1);
-            expect(onUserMessage).toHaveBeenCalledWith({ ...firstMessage, serverMessageId: 'msg-1' });
+            expect(onUserMessage).toHaveBeenCalledWith({ ...firstMessage, serverMessageId: 'msg-1', serverSeq: 1 });
             expect((client as any).lastSeq).toBe(1);
             expect(mockAxiosGet).not.toHaveBeenCalled();
         } finally {
@@ -2346,7 +2414,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
 
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-2' });
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-2', serverSeq: 2 });
         expect((client as any).lastSeq).toBe(2);
         expect(mockAxiosGet).toHaveBeenCalledTimes(1);
     });
@@ -2382,7 +2450,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(mockAxiosGet.mock.calls[0][1].params.after_seq).toBe(1);
         expect(onUserMessage).toHaveBeenCalledTimes(1);
-        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-2' });
+        expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-2', serverSeq: 2 });
         expect((client as any).lastSeq).toBe(2);
     });
 
@@ -2700,7 +2768,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await vi.advanceTimersByTimeAsync(29_000);
         expect(onUserMessage).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1_000);
-        expect(onUserMessage).toHaveBeenCalledExactlyOnceWith({ ...body, serverMessageId: 'idle-1' });
+        expect(onUserMessage).toHaveBeenCalledExactlyOnceWith({ ...body, serverMessageId: 'idle-1', serverSeq: 1 });
         await client.close();
         const closedReads = reads.length;
         await vi.advanceTimersByTimeAsync(60_000);
@@ -2779,7 +2847,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         await waitForCheck(() => {
             expect(messagesCalls()).toHaveLength(2);
-            expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1' });
+            expect(onUserMessage).toHaveBeenCalledWith({ ...userMessage, serverMessageId: 'msg-1', serverSeq: 1 });
         });
         expect(messagesCalls()[1][1].params.after_seq).toBe(0);
         expect((client as any).lastSeq).toBe(1);

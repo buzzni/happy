@@ -182,6 +182,7 @@ export async function runGemini(opts: {
     if (pendingSessionSwap) {
       logger.debug('[gemini] Applying pending session swap');
       session = pendingSessionSwap;
+      session.configureInputQueue(messageQueue, 'remote', false);
       if (permissionHandler) {
         permissionHandler.updateSession(pendingSessionSwap);
       }
@@ -209,6 +210,7 @@ export async function runGemini(opts: {
       } else {
         // Safe to swap immediately
         session = newSession;
+        newSession.configureInputQueue(messageQueue, 'remote', false);
         if (permissionHandler) {
           permissionHandler.updateSession(newSession);
         }
@@ -218,6 +220,7 @@ export async function runGemini(opts: {
   session = initialSession;
 
   const messageQueue = new MessageQueue2<GeminiMode>(hashGeminiMode);
+  session.configureInputQueue(messageQueue, 'remote', false);
 
   // Conversation history for context preservation across model changes
   const conversationHistory = new ConversationHistory({ maxMessages: 20, maxCharacters: 50000 });
@@ -314,7 +317,7 @@ export async function runGemini(opts: {
     };
     const deferredTurn = deferredContinuation.prepare(originalUserMessage);
     try {
-      messageQueue.push(deferredTurn?.text ?? originalUserMessage, mode, undefined, undefined, undefined, attendance);
+      messageQueue.push(deferredTurn?.text ?? originalUserMessage, mode, undefined, undefined, undefined, attendance, session.queueInput(message));
       deferredTurn?.commit();
     } catch (error) {
       deferredTurn?.rollback();

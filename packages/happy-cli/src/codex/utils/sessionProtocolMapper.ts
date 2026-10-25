@@ -606,13 +606,12 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
          * `final_answer` can legitimately be a clarifying question the model then continues past,
          * so what makes it deliverable is the matching `turn-end` with `status: 'completed'`.
          *
-         * Emitted only for a turn answering a channel request; an in-app turn already shows its
-         * answer in the transcript.
+         * REST input witnesses need the same candidate; the channel request slot stays optional.
          */
-        if (message.phase === 'final_answer' && !subagent && state.currentRequestId) {
+        if (message.phase === 'final_answer' && !subagent && state.currentTurnId) {
             envelopes.push(createEnvelope(
                 'agent',
-                { t: 'final-answer', text: message.message, requestId: state.currentRequestId },
+                { t: 'final-answer', text: message.message, ...(state.currentRequestId ? { requestId: state.currentRequestId } : {}) },
                 opts,
             ));
         }

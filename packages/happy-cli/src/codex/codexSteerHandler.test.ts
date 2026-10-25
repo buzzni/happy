@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { SessionEnvelope } from '@slopus/happy-wire';
+import { createEnvelope, type SessionEnvelope } from '@slopus/happy-wire';
+import { TurnInputEvidence } from '@/api/turnInputEvidence';
 import { registerCodexSteerHandler } from './codexSteerHandler';
 
 function createHarness(
-    steerTurn = vi.fn(async (_text: string) => undefined),
+    steerTurn = vi.fn(async (_text: string): Promise<void> => undefined),
     managedRun = false,
+    inputEvidence?: TurnInputEvidence,
 ) {
     let handler: ((params: Record<string, unknown>) => Promise<unknown>) | undefined;
     const sendSessionProtocolMessage = vi.fn((_envelope: SessionEnvelope) => undefined);
@@ -12,7 +14,9 @@ function createHarness(
 
     registerCodexSteerHandler({
         client: { steerTurn },
+        protocolTurnId: () => inputEvidence?.currentTurn() ?? null,
         session: {
+            inputEvidence,
             rpcHandlerManager: {
                 registerHandler: (_method, registeredHandler) => {
                     handler = registeredHandler;
@@ -72,7 +76,7 @@ describe('registerCodexSteerHandler', () => {
      * the provider.
      */
     it('refuses to steer a managed run, without reaching the turn', async () => {
-        const steerTurn = vi.fn(async (_text: string) => undefined);
+        const steerTurn = vi.fn(async (_text: string): Promise<void> => undefined);
         const { handler, sendSessionProtocolMessage, onFailure } = createHarness(steerTurn, true);
 
         await expect(handler({ text: 'do something else' }))
@@ -86,9 +90,26 @@ describe('registerCodexSteerHandler', () => {
     });
 
     it('still steers an ordinary run', async () => {
-        const steerTurn = vi.fn(async (_text: string) => undefined);
+        const steerTurn = vi.fn(async (_text: string): Promise<void> => undefined);
         const { handler } = createHarness(steerTurn, false);
         await expect(handler({ text: 'do something else' })).resolves.toEqual({ success: true });
         expect(steerTurn).toHaveBeenCalledWith('do something else');
     });
+});
+
+it('writes a pending attempt before awaiting provider ACK and keeps unknown on ACK loss', async () => {
+    const events: SessionEnvelope[] = [];
+    const evidence = new TurnInputEvidence('runtime', event => events.push(event));
+    evidence.setPending({ inputs: [{ kind: 'rest', serverMessageId: 'input', serverSeq: 1 }], inputCount: 1 });
+    evidence.stamp(createEnvelope('agent', { t: 'turn-start' }, { turn: 'native-mapped-turn' }));
+    let reject!: (error: Error) => void;
+    const provider = new Promise<void>((_resolve, fail) => { reject = fail; });
+    const harness = createHarness(vi.fn(() => provider), false, evidence);
+    const response = harness.handler({ text: 'a private instruction' });
+    expect(events.at(-1)?.ev).toMatchObject({ inputEvidence: { additional: { attempted: 1, pending: 1 } } });
+    evidence.stamp(createEnvelope('agent', { t: 'turn-end', status: 'completed' }, { turn: 'native-mapped-turn' }));
+    reject(new Error('ACK lost'));
+    await response;
+    expect(evidence.snapshot('native-mapped-turn')?.additional).toMatchObject({ attempted: 1, pending: 0, unknown: 1 });
+    expect(JSON.stringify(events)).not.toContain('private instruction');
 });

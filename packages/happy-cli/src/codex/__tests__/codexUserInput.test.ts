@@ -1,3 +1,5 @@
+import { TurnInputEvidence } from '@/api/turnInputEvidence';
+import { createEnvelope } from '@slopus/happy-wire';
 import { describe, expect, it, vi } from 'vitest';
 import { CodexAppServerClient } from '../codexAppServerClient';
 import { CodexPermissionHandler } from '../utils/permissionHandler';
@@ -10,12 +12,13 @@ const questions = [
     { id: 'second', header: '두 번째', question: '진행할까요?', isOther: true, isSecret: false, options: null },
 ];
 
-function boundary() {
+function boundary(recordPermissionInput?: (id: string, tool: string, response: unknown, turn?: string) => (state?: 'accepted' | 'rejected' | 'unknown') => void) {
     let state: any = {};
     let permission!: (input: any) => Promise<unknown>;
     const writes: any[] = [];
     const events: any[] = [];
     const session = {
+        recordPermissionInput,
         sendSessionProtocolMessage: (envelope: any) => { events.push(envelope); },
         rpcHandlerManager: { registerHandler: (name: string, handler: typeof permission) => { if (name === 'permission') permission = handler; } },
         updateAgentState: (update: (value: any) => any) => { state = update(state); },
@@ -41,6 +44,22 @@ function boundary() {
 const params = { threadId: 'thread', turnId: 'turn', itemId: 'item', questions };
 
 describe('Codex structured user input boundary', () => {
+    it.each([true, false])('settles question evidence only after provider response validation (valid=%s)', async valid => {
+        const evidence = new TurnInputEvidence('host', () => {});
+        evidence.setPending({ inputs: [{ kind: 'rest', serverMessageId: 'A', serverSeq: 1 }], inputCount: 1 });
+        evidence.stamp(createEnvelope('agent', { t: 'turn-start' }, { turn: 'protocol-turn' }));
+        const b = boundary((_id, tool, _response, turn) => {
+            expect(tool).toBe('request_user_input'); expect(turn).toBe('protocol-turn');
+            const attempt = evidence.attempt('question-answer', turn);
+            expect(b.writes).toEqual([]);
+            expect(evidence.snapshot()?.additional.pending).toBe(1);
+            return state => attempt.settle(state!);
+        });
+        await b.send('item/tool/requestUserInput', params, 101);
+        await b.answer(b.pending()[0], { answers: valid ? { first: 'a', second: 'b' } : { first: 'missing second' } });
+        expect(evidence.snapshot()?.additional).toMatchObject({ attempted: 1, accepted: valid ? 1 : 0,
+            pending: 0, items: [{ state: valid ? 'accepted' : 'rejected' }] });
+    });
     it('waits for Desktop and returns answers by question ID on the original JSON-RPC request', async () => {
         const b = boundary();
         await b.send('item/tool/requestUserInput', params, 101);

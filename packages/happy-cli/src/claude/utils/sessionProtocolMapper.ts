@@ -55,6 +55,8 @@ export type ClaudeSessionProtocolState = {
      * a later turn cannot be answered from the previous one.
      */
     toolCallTurns?: Map<string, { turnId: string; requestId: string | null }>;
+    onBackgroundInputLaunch?: (id: string, turnId: string) => void;
+    onBackgroundInputRearm?: (ids: string[]) => void;
     startedSubagents?: Set<string>;
     activeSubagents?: Set<string>;
 };
@@ -153,6 +155,7 @@ function rememberBackgroundTaskRequest(state: ClaudeSessionProtocolState, id: st
  * the request whose own launch produced this task; an unknown notification stays an in-app event.
  */
 function rearmBackgroundTaskRequest(state: ClaudeSessionProtocolState, ids: { taskId?: string; toolUseId?: string }): void {
+    state.onBackgroundInputRearm?.([ids.taskId, ids.toolUseId].filter((id): id is string => Boolean(id)));
     const requests = state.backgroundTaskRequestIds;
     const requestId = (ids.taskId ? requests?.get(ids.taskId) : undefined)
         ?? (ids.toolUseId ? requests?.get(ids.toolUseId) : undefined);
@@ -631,6 +634,13 @@ function toToolArgs(input: unknown): Record<string, unknown> {
     return { input };
 }
 
+/** A batch was dispatched, even when the provider produces no assistant text. */
+export function startClaudeInputTurn(state: ClaudeSessionProtocolState): ClaudeMapperResult {
+    const envelopes: SessionEnvelope[] = [];
+    ensureTurn(state, envelopes);
+    return { currentTurnId: state.currentTurnId, envelopes };
+}
+
 /** An authoritative result may be the first activity of a channel turn. */
 export function mapClaudeChannelFinalAnswer(
     state: ClaudeSessionProtocolState,
@@ -638,9 +648,9 @@ export function mapClaudeChannelFinalAnswer(
 ): ClaudeMapperResult {
     const envelopes: SessionEnvelope[] = [];
     const requestId = state.currentTurnId ? state.currentRequestId : state.pendingRequestId;
-    if (requestId && typeof text === 'string' && text.trim().length > 0) {
+    if (typeof text === 'string' && text.trim().length > 0) {
         const turn = ensureTurn(state, envelopes);
-        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, requestId }, { turn }));
+        envelopes.push(createEnvelope('agent', { t: 'final-answer', text, ...(requestId ? { requestId } : {}) }, { turn }));
     }
     return { currentTurnId: state.currentTurnId, envelopes };
 }
@@ -922,6 +932,10 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
                     : extractBackgroundTaskId((block as { content?: unknown }).content);
                 // Task parent calls are hidden from the transcript, but their result still carries
                 // the launch id needed to correlate the later notification.
+                if (backgroundTaskId && state.currentTurnId) {
+                    state.onBackgroundInputLaunch?.(backgroundTaskId, state.currentTurnId);
+                    state.onBackgroundInputLaunch?.(block.tool_use_id, state.currentTurnId);
+                }
                 if (backgroundTaskId && state.currentRequestId) {
                     rememberBackgroundTaskRequest(state, backgroundTaskId, state.currentRequestId);
                     rememberBackgroundTaskRequest(state, block.tool_use_id, state.currentRequestId);
