@@ -131,9 +131,9 @@ function proofHarness() {
         receipt('job', 'launch-original', 'completed', 'run-1'); await h.queue.flush();
         started('run-2'); h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
     };
-    const overflow = async () => {
+    const overflow = async (count = 1005) => {
         // Batched draining still processes every real receipt and follow-up turn in order.
-        for (let i = 0; i < 205; i++) {
+        for (let i = 0; i < count; i++) {
             receipt(`other-${i}`, undefined, 'completed', `other-run-${i}`);
             h.queue.enqueue(assistant(`other-${i}`)); h.queue.enqueue(turnEndItem('completed'));
         }
@@ -149,7 +149,12 @@ function proofHarness() {
         if (!workingDirectory) {
             workingDirectory = await mkdtemp(join(tmpdir(), 't2rt-proof-'));
             scanner = await createSessionScanner({ sessionId: null, workingDirectory,
-                onMessage: message => { h.sendScannerMessage(message); scanned++; } });
+                onMessage: message => {
+                    if (message.type !== 'user' || message.isSidechain) return;
+                    const content = message.message.content;
+                    if (typeof content !== 'string' || !content.trim()) return;
+                    h.sendScannerMessage(message); scanned++;
+                } });
             await mkdir(getProjectPath(workingDirectory), { recursive: true });
         }
         const id = ++serial;
@@ -174,6 +179,114 @@ function proofHarness() {
 }
 
 describe('default-deny background routing proof', () => {
+    it.each(['sdk', 'scanner'].flatMap(source => [false, true].map(lost => ({ source, lost }))))(
+        'T2RT-13 blocks an old start replay after history loss ($source, lost=$lost)', async ({ source, lost }) => {
+            const d = proofHarness();
+            const debug = vi.spyOn(logger, 'debug');
+            try {
+                await d.launch('channel-A', 'run-1', true, 'old-job');
+                await d.deliver(source, 'old-job', 'launch-original', 'completed', 'run-1');
+                expect(await d.finish('original A')).toMatchObject({ requestId: 'channel-A' });
+                if (lost) await d.overflow();
+                else expect(d.h.state.backgroundCompletions?.historyLost).toBe(false);
+                await d.launch('channel-B', 'run-2', false, 'current-job');
+                const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+                d.started('run-1', 'old-job'); await d.h.queue.flush();
+                if (lost) expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                d.h.queue.enqueue(turnEndItem('completed')); await d.h.queue.flush();
+                await d.deliver(source, 'old-job', 'launch-original', 'completed', 'run-1');
+                expect.soft(await d.finish('old run stale answer')).not.toHaveProperty('requestId');
+                if (lost) {
+                    expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                    expect.soft(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+                    expect.soft(debug).toHaveBeenCalledWith('[claude] Background completion not routed',
+                        expect.objectContaining({ reason: 'history-lost' }));
+                }
+                await d.deliver(source, 'current-job', 'launch-original', 'completed', 'run-2');
+                const current = await d.finish('actual current B');
+                if (lost) {
+                    expect.soft(current).not.toHaveProperty('requestId');
+                    expect.soft(current).toMatchObject({ inputEvidence: { coverage: 'incomplete',
+                        incompleteReasons: expect.arrayContaining(['background-request-unrouted']) } });
+                    expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                } else expect.soft(current).toMatchObject({ requestId: 'channel-B' });
+            } finally { debug.mockRestore(); await d.destroy(); }
+        }, 15000,
+    );
+
+    it.each(['sdk', 'scanner'])('stops every shape at the first completion eviction through %s', async source => {
+        const d = proofHarness();
+        try {
+            // 999 unrelated terminal identities plus this started run fill the 1000 slots.
+            for (let i = 0; i < 999; i++) {
+                d.receipt(`before-${i}`, undefined, 'completed', `run-${i}`);
+                d.h.queue.enqueue(assistant(`before-${i}`)); d.h.queue.enqueue(turnEndItem('completed'));
+            }
+            await d.h.queue.flush();
+            await d.launch('channel-A', 'run-current');
+            expect.soft(d.h.state.backgroundCompletions?.entries.size).toBe(1000);
+            expect.soft(d.h.state.backgroundCompletions?.historyLost).toBe(false);
+            await d.deliver(source, 'job', 'launch-original', 'completed', 'run-current');
+            expect.soft(await d.finish('last route before loss')).toMatchObject({ requestId: 'channel-A' });
+            // Opening a new identity triggers the very first eviction in task_started.
+            await d.launch('channel-B', 'run-next', true, 'new-job');
+            expect(d.h.state.backgroundCompletions?.historyLost).toBe(true);
+            const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+            for (const [i, status] of ['completed', undefined, 'done', 'running'].entries()) {
+                for (const [j, identity] of ['run', 'task', 'tool', 'task+tool', 'none'].entries()) {
+                    await d.deliver(source, identity === 'tool' || identity === 'none' ? undefined : 'new-job',
+                        identity === 'tool' || identity === 'task+tool' ? 'launch-original' : undefined,
+                        status, identity === 'run' ? 'run-next' : undefined);
+                    const result = await d.finish(`after loss ${i}/${j}`);
+                    expect(result).not.toHaveProperty('requestId');
+                    expect(result).toMatchObject({ inputEvidence: { coverage: 'incomplete',
+                        incompleteReasons: expect.arrayContaining(['background-request-unrouted']) } });
+                    expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                    expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+                }
+            }
+        } finally { await d.destroy(); }
+    }, 15000);
+
+    it.each(['sdk', 'scanner'])('refuses the completion that first evicts history through %s', async source => {
+        const d = proofHarness();
+        try {
+            for (let i = 0; i < 1000; i++) {
+                d.receipt(`full-${i}`, undefined, 'completed', `run-${i}`);
+                d.h.queue.enqueue(assistant(`full-${i}`)); d.h.queue.enqueue(turnEndItem('completed'));
+            }
+            await d.h.queue.flush();
+            await d.launch('channel-A');
+            expect(d.h.state.backgroundCompletions?.historyLost).toBe(false);
+            const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+            await d.deliver(source, 'job', 'launch-original', 'completed');
+            expect(d.h.state.backgroundCompletions?.historyLost).toBe(true);
+            expect(await d.finish('first evicting completion')).not.toHaveProperty('requestId');
+            expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+            expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+        } finally { await d.destroy(); }
+    }, 15000);
+
+    it.each(['sdk', 'scanner'])('latches launch-only eviction without losing a completion record through %s', async source => {
+        const d = proofHarness();
+        try {
+            // No task_started or completion events: only launch mappings can overflow here.
+            for (let i = 0; i < 1000; i++) await d.launch('channel-A', undefined, true, `launch-job-${i}`);
+            expect(d.h.state.backgroundCompletions?.entries.size).toBe(0);
+            expect(d.h.state.backgroundCompletions?.historyLost).toBe(false);
+            expect(d.h.state.backgroundTaskLaunches?.size).toBe(1000);
+            await d.launch('channel-A', undefined, true, 'launch-job-1000');
+            expect(d.h.state.backgroundCompletions?.historyLost).toBe(true);
+            expect(d.h.state.backgroundTaskLaunches?.size).toBe(1000);
+            const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+            d.started('run-new', 'launch-job-1000'); await d.h.queue.flush();
+            await d.deliver(source, 'launch-job-1000', 'launch-original', 'completed', 'run-new');
+            expect(await d.finish('after launch eviction')).not.toHaveProperty('requestId');
+            expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+            expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+        } finally { await d.destroy(); }
+    }, 30000);
+
     it.each(['sdk', 'scanner'])('keeps explicit run identity scoped to its task through %s', async source => {
         const d = proofHarness();
         try {
@@ -230,7 +343,12 @@ describe('default-deny background routing proof', () => {
                 expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
                 expect.soft(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
                 await d.deliver('sdk', 'job', 'launch-original', 'completed', 'run-2');
-                expect.soft(await d.finish('real current answer')).toMatchObject({ requestId: 'channel-A' });
+                const current = await d.finish('real current answer');
+                if (status === 'tool-alias') expect.soft(current).toMatchObject({ requestId: 'channel-A' });
+                else {
+                    expect.soft(current).not.toHaveProperty('requestId');
+                    expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                }
             } finally { await d.destroy(); }
         },
     );
@@ -244,8 +362,8 @@ describe('default-deny background routing proof', () => {
         const tool = ['tool', 'task+tool', 'alias-switch'].includes(identity) ? 'launch-original' : undefined;
         const terminal = status === 'terminal' ? 'completed' : status === 'unknown' ? 'done' : status === 'nonterminal' ? 'running' : undefined;
         const run = identity === 'run' ? 'run-2' : undefined;
-        const permitted = status === 'terminal' && (identity === 'run'
-            || (prior === 'fresh' && history === 'intact' && ['task', 'tool', 'task+tool'].includes(identity)));
+        const permitted = history === 'intact' && status === 'terminal' && (identity === 'run'
+            || (prior === 'fresh' && ['task', 'tool', 'task+tool'].includes(identity)));
         try {
             if (prior === 'resumed-run') await d.resume();
             else await d.launch('channel-A', identity === 'run' ? 'run-2' : undefined);
@@ -268,10 +386,15 @@ describe('default-deny background routing proof', () => {
                 expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
                 d.started('run-2'); await d.h.queue.flush();
                 await d.deliver(source, 'job', 'launch-original', 'completed', 'run-2');
-                expect(await d.finish('recovered A')).toMatchObject({ requestId: 'channel-A' });
+                const current = await d.finish('recovered A');
+                if (history === 'intact') expect(current).toMatchObject({ requestId: 'channel-A' });
+                else {
+                    expect(current).not.toHaveProperty('requestId');
+                    expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                }
             }
-            // Every cell also replays its old shape against a newer live channel launch.
-            // An exact old run, legacy alias or malformed status must never take B.
+            // After loss even a genuinely new launch cannot restore channel routing.
+            // Intact cells still replay old shapes against a newer live launch.
             await d.launch('channel-B', 'run-3');
             const newer = [...d.h.state.backgroundTaskLaunches!.values()];
             await d.deliver(source, task, tool, terminal, identity === 'run' ? 'run-0' : undefined);
@@ -282,7 +405,12 @@ describe('default-deny background routing proof', () => {
             expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(newer);
             expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
             await d.deliver(source, 'job', 'launch-original', 'completed', 'run-3');
-            expect(await d.finish('real B')).toMatchObject({ requestId: 'channel-B' });
+            const current = await d.finish('real B');
+            if (history === 'intact') expect(current).toMatchObject({ requestId: 'channel-B' });
+            else {
+                expect(current).not.toHaveProperty('requestId');
+                expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(newer);
+            }
         } finally { await d.destroy(); }
     }, 15000);
 
@@ -530,11 +658,11 @@ describe('channel turn ordering through the launcher dispatcher', () => {
     );
 
     it.each(['tasks', 'runs'].flatMap(kind => [false, true].map(idle => ({ kind, idle }))))(
-        'T2RT-09 bounds 600 completed $kind and handles an evicted scanner identity (idle=$idle)', async ({ kind, idle }) => {
+        'T2RT-09 bounds 1005 completed $kind at 1000 and handles an evicted scanner identity (idle=$idle)', async ({ kind, idle }) => {
         const h = harness(true);
         const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
         try {
-            for (let i = 0; i < 600; i++) {
+            for (let i = 0; i < 1005; i++) {
                 h.queue.enqueue(converter.convert({ type: 'system', subtype: 'task_notification',
                     task_id: kind === 'tasks' ? `job-${i}` : 'job', run_id: `run-${i}`, status: 'completed',
                     session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000009', output_file: '/tmp/job.output', summary: 'Done' }));
@@ -542,16 +670,15 @@ describe('channel turn ordering through the launcher dispatcher', () => {
                 await h.queue.flush();
             }
             const ledger = h.state.backgroundCompletions!;
-            expect.soft(ledger.entries.size).toBeLessThanOrEqual(200);
-            expect.soft(ledger.aliases.size).toBeLessThanOrEqual(400);
+            expect.soft(ledger.entries.size).toBeLessThanOrEqual(1000);
+            expect.soft(ledger.aliases.size).toBeLessThanOrEqual(2000);
             expect.soft(ledger.historyLost).toBe(true);
             expect.soft([...ledger.entries.values()].every(receipt => receipt.phase === 'settled' && !receipt.turn)).toBe(true);
             h.queue.enqueue(pendingRequestItem('channel-B', { inputs: [{ kind: 'channel', channelRequestId: 'channel-B' }], inputCount: 1 }));
             h.queue.enqueue(assistant('B begins')); await h.queue.flush();
             const taskId = kind === 'tasks' ? 'job-0' : 'job';
             if (idle) {
-                // A newer launch of the same task retains a valid channel/source mapping. An
-                // evicted OLD completion must not claim it as a fresh exclusive continuation.
+                // A post-loss launch cannot restore background channel correlation.
                 h.queue.enqueue(converter.convert({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
                     { type: 'tool_use', id: 'resume', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
                 ] } } as Parameters<typeof converter.convert>[0]));
@@ -601,7 +728,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             // The spawning turn is still open: live tool membership binds the resumed run
             // to A, even though run-1's completion consumed the original launch record.
             started('run-2'); h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
-            for (let i = 0; i < 205; i++) {
+            for (let i = 0; i < 1005; i++) {
                 completion(`other-${i}`, `other-run-${i}`);
                 await finish(`unrelated-${i}`);
             }
@@ -620,18 +747,20 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             expect.soft(h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
             expect.soft([...h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
             expect.soft(debug).toHaveBeenCalledWith('[claude] Background completion not routed',
-                expect.objectContaining({ reason: 'launch-identity-unproven' }));
+                expect.objectContaining({ reason: 'history-lost' }));
             completion('job', 'run-2', 'launch-original');
-            expect.soft(await finish('actual run-2 answer')).toMatchObject({ requestId: 'channel-A', inputEvidence: {
-                coverage: 'incomplete', incompleteReasons: expect.arrayContaining(['background-completion-uncertain']),
+            const current = await finish('actual run-2 answer');
+            expect.soft(current).not.toHaveProperty('requestId');
+            expect.soft(current).toMatchObject({ inputEvidence: {
+                coverage: 'incomplete', incompleteReasons: expect.arrayContaining(['background-request-unrouted']),
             } });
-            expect.soft(h.rearm).toHaveBeenLastCalledWith(['job', 'launch-original'], ['background-completion-uncertain']);
-            expect.soft(h.state.backgroundTaskLaunches?.size).toBe(0);
+            expect.soft(h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+            expect.soft([...h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
         } finally { debug.mockRestore(); h.queue.destroy(); }
     }, 15000);
 
     it.each(['sdk', 'scanner'].flatMap(source => ['before-result', 'after-result', 'tool-only'].map(start => ({ source, start }))))(
-        'routes only a proven retained launch after completion eviction ($source, $start)', async ({ source, start }) => {
+        'does not reconstruct channel routing after completion eviction ($source, $start)', async ({ source, start }) => {
         const h = harness(true);
         const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
         const sdk = (message: Parameters<typeof converter.convert>[0]) => h.queue.enqueue(converter.convert(message));
@@ -641,7 +770,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
         const debug = vi.spyOn(logger, 'debug');
         try {
             // Evict the same task's old run, not just unrelated tasks.
-            for (let i = 0; i < 205; i++) {
+            for (let i = 0; i < 1005; i++) {
                 sdk(completion(i === 0 ? 'job' : `other-${i}`, `run-${i}`));
                 h.queue.enqueue(assistant('old response')); h.queue.enqueue(turnEndItem('completed'));
                 await h.queue.flush();
@@ -659,7 +788,6 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             ] } });
             if (start === 'after-result') started();
             h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
-            const original = h.evidence.snapshot()!;
             // A late earlier run must not take the new launch, even with a matching tool ID.
             if (start !== 'tool-only') {
                 h.sendScannerMessage({ type: 'user', uuid: 'old-run', origin: { kind: 'task-notification', runId: 'run-0' },
@@ -668,7 +796,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
                 h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
                 expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'late old result')?.ev).not.toHaveProperty('requestId');
                 expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
-                expect(debug).toHaveBeenCalledWith('[claude] Background completion not routed', expect.objectContaining({ reason: 'launch-identity-unproven' }));
+                expect(debug).toHaveBeenCalledWith('[claude] Background completion not routed', expect.objectContaining({ reason: 'history-lost' }));
             }
             const run = start === 'tool-only' ? undefined : 'run-new';
             const tool = start === 'tool-only' ? 'launch-new' : undefined;
@@ -678,20 +806,13 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             h.queue.enqueue(assistant('actual final')); h.queue.enqueue(finalAnswerItem('actual final'));
             h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
             const final = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'actual final')?.ev;
-            if (start === 'tool-only') {
-                // T2RT-10: eviction precludes proving uniqueness even if this runtime never
-                // saw a run ID for the launch. Keep its channel/source mapping available.
-                expect(final).not.toHaveProperty('requestId');
-                expect(final).toMatchObject({ inputEvidence: { coverage: 'incomplete',
-                    incompleteReasons: expect.arrayContaining(['background-request-unrouted']) } });
-                expect(h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
-                expect([...h.state.backgroundTaskLaunches!.values()]).toEqual([
-                    expect.objectContaining({ taskId: 'job', toolUseId: 'launch-new', requestId: 'channel-A' }),
-                ]);
-            } else expect(final).toMatchObject({ requestId: 'channel-A', inputEvidence: { rootBatchId: original.rootBatchId,
-                    coverage: 'incomplete', incompleteReasons: expect.arrayContaining(['background-completion-uncertain']) } });
+            expect(final).not.toHaveProperty('requestId');
+            expect(final).toMatchObject({ inputEvidence: { coverage: 'incomplete',
+                incompleteReasons: expect.arrayContaining(['background-request-unrouted']) } });
+            expect(h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+            expect(h.state.backgroundTaskLaunches?.size ?? 0).toBe(0);
         } finally { debug.mockRestore(); h.queue.destroy(); }
-    });
+    }, 15000);
 
     it.each(['tasks', 'runs'])('round 5 bounds retained launch identities for %s and signals an unroutable completion', async kind => {
         const h = harness(true);
@@ -699,7 +820,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
         const sdk = (message: Parameters<typeof converter.convert>[0]) => h.queue.enqueue(converter.convert(message));
         try {
             h.queue.enqueue(pendingRequestItem('channel-A', { inputs: [{ kind: 'channel', channelRequestId: 'channel-A' }], inputCount: 1 }));
-            for (let i = 0; i < 600; i++) {
+            for (let i = 0; i < 1005; i++) {
                 const taskId = kind === 'tasks' ? `job-${i}` : 'job';
                 sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
                     { type: 'tool_use', id: `launch-${i}`, name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
@@ -711,7 +832,8 @@ describe('channel turn ordering through the launcher dispatcher', () => {
                 ] } });
             }
             h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
-            expect(h.state.backgroundTaskLaunches?.size).toBe(kind === 'tasks' ? 200 : 1);
+            expect(h.state.backgroundTaskLaunches?.size).toBe(kind === 'tasks' ? 1000 : 1);
+            const retained = [...h.state.backgroundTaskLaunches!.values()];
             // A registered run without a witnessed spawning call proves no channel ownership.
             sdk({ type: 'system', subtype: 'task_started', task_id: 'orphan', run_id: 'orphan-run', tool_use_id: 'unseen-call',
                 description: 'Detached task', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000045' });
@@ -721,16 +843,15 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
             expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'orphan answer')?.ev).not.toHaveProperty('requestId');
             expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
-            for (const i of [0, 599]) {
+            for (const i of [0, 999, 1004]) {
                 sdk({ type: 'system', subtype: 'task_notification', task_id: kind === 'tasks' ? `job-${i}` : 'job', run_id: `run-${String(i).padStart(4, '0')}`, tool_use_id: `launch-${i}`,
                     status: 'completed', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000035', output_file: '/tmp/job.output', summary: 'Done' });
                 h.queue.enqueue(assistant(`answer-${i}`)); h.queue.enqueue(finalAnswerItem(`answer-${i}`));
                 h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
                 const final = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === `answer-${i}`)!.ev;
-                if (i === 0) {
-                    expect(final).not.toHaveProperty('requestId');
-                    expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
-                } else expect(final).toMatchObject({ requestId: 'channel-A' });
+                expect(final).not.toHaveProperty('requestId');
+                expect(h.evidence.snapshot()?.incompleteReasons).toContain('background-request-unrouted');
+                expect([...h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
             }
         } finally { h.queue.destroy(); }
     }, 15000);

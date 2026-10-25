@@ -17,6 +17,8 @@ type LaunchIdentity = CompletionIds & {
     receiptShape?: string;
 };
 
+export const BACKGROUND_HISTORY_LIMIT = 1000;
+
 export class BackgroundCompletionTracker {
     // One fixed-size record per run: neither task count nor a task's run count can grow unbounded.
     readonly entries = new Map<string, CompletionRecord>();
@@ -50,7 +52,7 @@ export class BackgroundCompletionTracker {
         identity.toolUseId ??= ids.toolUseId;
         if (run && (!identity.runId || run > identity.runId)) identity.runId = run;
         for (const key of keys) this.aliases.set(key, identity);
-        while (this.aliases.size > 400) {
+        while (this.aliases.size > 2 * BACKGROUND_HISTORY_LIMIT) {
             this.aliases.delete(this.aliases.keys().next().value!);
             this.historyLost = true;
         }
@@ -67,8 +69,9 @@ export class BackgroundCompletionTracker {
 
     completion(ids: CompletionIds, run: string | null, status: string | undefined, turn: string | null, scope?: string)
         : { decision: CompletionDecision; unique: boolean } {
+        if (this.historyLost) return { decision: 'uncertain', unique: false };
         const identity = this.link(ids, run, scope);
-        if (!identity) return { decision: 'uncertain', unique: false };
+        if (!identity || this.historyLost) return { decision: 'uncertain', unique: false };
         const shape = ids.taskId ? ids.toolUseId ? 'task+tool' : 'task' : 'tool';
         if (identity.receiptShape && identity.receiptShape !== shape) identity.ambiguous = true;
         identity.receiptShape = shape;
@@ -92,10 +95,9 @@ export class BackgroundCompletionTracker {
 
     private remember(key: string, record: CompletionRecord): void {
         this.entries.set(key, record);
-        while (this.entries.size > 200) {
+        while (this.entries.size > BACKGROUND_HISTORY_LIMIT) {
             this.entries.delete(this.entries.keys().next().value!);
-            // A cache miss can now be a late duplicate. Never turn that lack of proof into
-            // a fresh exclusive continuation, even if the task's launch mapping survived.
+            // Any loss permanently disables background routing, including exact run matches.
             this.historyLost = true;
         }
     }
@@ -124,7 +126,7 @@ export class BackgroundCompletionTracker {
         const related = [...this.entries.values()].filter(record => record.task === identity.task);
         const consumed = related.some(record => record.phase !== 'started');
         const legacy = this.entries.get(JSON.stringify([scope ?? null, task, null]));
-        const uncertain = this.historyLost || previous?.status !== undefined
+        const uncertain = previous?.status !== undefined
             || (run === null && related.length > 0)
             || (run !== null && legacy !== undefined);
         this.remember(identity.key, { task: identity.task, phase: 'observed', status, ...(turn ? { turn } : {}) });

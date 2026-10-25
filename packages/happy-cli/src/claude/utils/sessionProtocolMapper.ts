@@ -15,7 +15,7 @@ import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
 import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
 
-import { BackgroundCompletionTracker } from './backgroundCompletionTracker';
+import { BACKGROUND_HISTORY_LIMIT, BackgroundCompletionTracker } from './backgroundCompletionTracker';
 
 type BackgroundTaskLaunch = {
     taskId: string;
@@ -173,6 +173,13 @@ function consumeBackgroundCompletion(
     const run = typeof rawRun === 'string' && rawRun ? rawRun : null;
     const tracker = state.backgroundCompletions ??= new BackgroundCompletionTracker();
     const { decision, unique } = tracker.completion({ taskId: ids.taskId, toolUseId: ids.toolUseId }, run, status, state.currentTurnId, subagent);
+    // Irreversible for this runtime. Check after observation too: it may cause the first loss.
+    // Neither a retained exact run nor replayed starts can restore channel ownership proof.
+    if (tracker.historyLost) {
+        state.onBackgroundInputRearm?.([], ['background-request-unrouted']);
+        logUnroutedBackground(ids, run, 'history-lost');
+        return;
+    }
     const launch = findBackgroundTaskLaunch(state, ids, subagent);
     const conflict = launch && ((run && launch.runId && run !== launch.runId)
         || (ids.toolUseId && launch.toolUseId && ids.toolUseId !== launch.toolUseId));
@@ -225,6 +232,8 @@ function backgroundLaunchRequest(state: ClaudeSessionProtocolState, toolUseId?: 
 }
 
 function rememberBackgroundTaskLaunch(state: ClaudeSessionProtocolState, launch: BackgroundTaskLaunch): void {
+    const tracker = state.backgroundCompletions ??= new BackgroundCompletionTracker();
+    if (tracker.historyLost) return;
     const entries = state.backgroundTaskLaunches ??= new Map<string, BackgroundTaskLaunch>();
     const key = JSON.stringify([launch.subagent ?? null, launch.taskId]);
     const previous = entries.get(key);
@@ -232,12 +241,19 @@ function rememberBackgroundTaskLaunch(state: ClaudeSessionProtocolState, launch:
     if (launch.runId && previous?.runId && launch.runId < previous.runId) return;
     const generation = launch.toolUseId ? state.toolCallTurns?.get(launch.toolUseId)?.turnId
         ?? (state.hiddenParentToolCalls?.has(launch.toolUseId) ? state.currentTurnId ?? undefined : undefined) : undefined;
-    (state.backgroundCompletions ??= new BackgroundCompletionTracker()).launch(
+    tracker.launch(
         { taskId: launch.taskId, toolUseId: launch.toolUseId }, launch.runId ?? null, launch.subagent, generation);
+    if (tracker.historyLost) return;
+    if (Buffer.byteLength(JSON.stringify(launch), 'utf8') > 4096) {
+        tracker.historyLost = true;
+        return;
+    }
     entries.delete(key);
-    if (Buffer.byteLength(JSON.stringify(launch), 'utf8') > 4096) return;
     entries.set(key, launch);
-    while (entries.size > 200) entries.delete(entries.keys().next().value!);
+    while (entries.size > BACKGROUND_HISTORY_LIMIT) {
+        entries.delete(entries.keys().next().value!);
+        tracker.historyLost = true;
+    }
 }
 
 function isSubagentTool(name: string): boolean {
@@ -825,7 +841,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
         // follow-up turn on the same ordered stream; the transcript row of an idle notification
         // reaches us only through the scanner, which can be late.
         const notification = message as { subtype?: unknown; task_id?: unknown; run_id?: unknown; tool_use_id?: unknown };
-        if (notification.subtype === 'task_started' && typeof notification.task_id === 'string') {
+        if (notification.subtype === 'task_started' && typeof notification.task_id === 'string' && !state.backgroundCompletions?.historyLost) {
             const runId = typeof notification.run_id === 'string' && notification.run_id ? notification.run_id : undefined;
             const toolUseId = typeof notification.tool_use_id === 'string' ? notification.tool_use_id : undefined;
             (state.backgroundCompletions ??= new BackgroundCompletionTracker()).started({ taskId: notification.task_id, toolUseId }, runId ?? null, subagent);

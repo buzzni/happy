@@ -754,6 +754,108 @@ Verification:
   is a new behavioral commit directly above the review base and a normal push
   to the existing branch; no PR or history rewrite.
 
+## Round 8: T2RT-13 disables routing after any history loss (2026-10-25)
+
+Review base: `3d89d5c94671cdecdad1c03ca50afadacff9d03b`. T2RT-11/12 remain
+closed. The user accepts exclusion of the no-status positive control: review
+verified that it is not a production completion shape in Claude Code 2.1.299.
+
+User-approved rule: **history loss ⇒ no channel routing for the rest of the
+session; availability limit accepted by the user for zero wrong delivery**.
+This supersedes every earlier exact-launch recovery after eviction. A matching
+task/run, replayed `task_started`, current tool membership or reconstructed launch
+owner cannot restore permission to route after the loss flag is set.
+
+Implementation (Core, within the existing runtime boundary):
+
+1. Reproduce T2RT-13 through the SDK pipeline and real scanner files, retaining
+   the no-eviction controls. Add first-eviction and independent launch-only loss
+   regressions without direct state mutation or rearm stimuli.
+2. Keep one irreversible runtime loss flag shared by completion and launch
+   retention. Check it before duplicate/proof shortcuts and after observations
+   that may cause the first loss. Refuse with incomplete coverage, empty source
+   IDs and `background-request-unrouted`; file diagnostics use `history-lost`.
+   Preserve retained launch/source mappings. Do not record new launch ownership
+   or rebind replayed starts/results after loss.
+3. Increase completion and launch retention from 200 to **1000 records each**,
+   keeping their 4096-byte identity/record bounds. Increase the corresponding
+   alias budget from 400 to **2000 keys** (task/tool pairs). Any eviction or
+   oversized identity/launch drops routing availability for this runtime.
+   Foreground turn permission membership and witness-source budgets are separate.
+4. Leave the pre-loss default-deny proof unchanged. Update post-loss expectations
+   to refusal and preserve >cap bound reproductions. Remove obsolete post-loss
+   recovery paths while retaining pre-loss run/alias handling.
+5. Run related standard tests and type/build checks, record changed expectations,
+   commit directly above the review base and push the existing branch normally.
+
+Revisit only with a newly approved contract that proves generation-specific,
+non-replayable launch ownership and completion identity independently of lost
+bounded history, verified through SDK and real-scanner adversarial tests. Larger
+caps or reconstructed state alone are not grounds to lift this limit. Starting a
+new runtime creates a new session-local tracker; no in-session reset is provided.
+Rollback is a revert of this behavioral commit. Only the tracker, mapper, existing
+channel ordering tests and this report change; no public API/schema, dependency,
+authority, UI, Desktop or T1b changes, and no new files.
+
+Changed expectations in the existing 271 channel cases:
+
+- The 96 `history=lost` matrix cells no longer route an exact candidate, recover
+  channel-A, or recover a subsequently launched channel-B. Intact-history cells
+  retain their existing proof/routing assertions.
+- The three post-loss T2RT-11 malformed-status cases no longer recover channel-A
+  via the exact current run; the no-loss T2RT-12 tool-alias control still does.
+- Both T2RT-10 cases preserve the surviving run-2 mapping but refuse its exact
+  completion after loss. They now require the `history-lost` diagnostic.
+- All six `666faa96` recovery variants now refuse routing and assert that starts
+  and results after loss cannot reconstruct a launch owner, including exact runs
+  and both start/result orders. Obsolete post-loss root-recovery assertions and
+  their unused snapshot were removed. Pre-loss `sameRun`/legacy proof and the
+  incomplete-evidence reason for ambiguous pre-loss observations remain live.
+- Both launch-retention stress cases refuse every sampled completion, including
+  the exact retained latest run, without consuming any surviving launch mapping.
+- The four T2RT-09 bound cases now process 1005 completions (>1000), asserting at
+  most 1000 completion records / 2000 aliases. Launch stress also uses 1005 starts
+  and asserts the 1000 launch limit. Existing foreground channel membership is
+  preserved; refusing a background rearm does not detach an active foreground turn.
+
+Verification:
+
+- Original external T2RT-13 reproduction on the unchanged review base: **2 failed /
+  2 passed**, with two unrelated exploratory tests excluded. The SDK and real
+  scanner post-eviction stale answers both reached channel-B. Repository TDD red:
+  **6 failed / 2 passed**, including both no-eviction controls passing.
+- Final external reproduction adapted solely for the new retention boundary:
+  **4/4 selected passed** (two unrelated exploratory cases excluded). The copy
+  `/tmp/happy-t2rt-xr-v7/cap1000.test.ts` changes overflow from 205 to 1005, asserts
+  `historyLost=true` after overflow, and allows 30 seconds for the longer fixture.
+  Both actual Desktop tracker outcomes are `[]` after loss and no old/new launch
+  owner is reconstructed. The unchanged 205-event harness also passes 4/4, but
+  now exercises pre-loss history; it is not claimed as evidence of eviction.
+  Command: `corepack pnpm -C packages/happy-cli exec vitest run --config
+  /tmp/happy-t2rt-xr-v7/vitest.config.mjs --configLoader runner
+  /tmp/happy-t2rt-xr-v7/cap1000.test.ts -t 'does not rebind' --maxWorkers 2`.
+- Ten new repository cases cover SDK/file-scanner replay with/without loss, the
+  first eviction in `task_started`, the completion that causes the first eviction,
+  all receipt status/identity classes after that boundary, and launch-only loss
+  with zero completion records. The 1000th-slot normal completion still routes;
+  the 1001st identity cannot restore routing, including via replayed starts.
+- Final standard related suite: **10 files / 642 tests passed**, including all
+  **281 channel ordering cases** (the existing 271 with the approved expectation
+  changes and ten new cases). All 192 matrix cells pass; all 96 lost-history cells
+  refuse current/reconstructed exact-run recovery, while intact-history proof
+  and the four genuine first-legacy controls retain their existing behavior.
+  T2RT-07's 24 cases and T2RT-08's four cases remain unchanged and green.
+- Selection is the same ten files listed in round 5, run from the clone root:
+  `corepack pnpm -C packages/happy-cli exec vitest run --project unit <files>
+  --maxWorkers 2`. Standard global setup passed CLI `tsc --noEmit`, pkgroll and
+  extension-copy build against the final production change.
+- `git diff --check` passed. Existing bin-location/empty-chunk build warnings and
+  asynchronously-handled-rejection harness warnings remain. No final related test
+  failed and no Unix-socket EPERM occurred in this selection. No whole-suite,
+  paid-provider, Desktop-app or packaged-release acceptance is claimed. Delivery
+  is a new behavioral commit directly above the review base with a normal push
+  to the existing branch; no new PR, rebase or history rewrite.
+
 ## Known integration boundaries
 
 - Additional-input acceptance records the host's provider handoff. A rejected or
