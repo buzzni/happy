@@ -119,3 +119,32 @@ describe('trusted session agent execution', () => {
     } finally { await broker.close() }
   }, 30000)
 })
+
+it('uses private host IPC for fresh personal ownership, never provider env claims', async () => {
+  const root = await fixture(), entrypoint = join(root, 'owner-cli.mjs')
+  await writeFile(entrypoint, `
+    if (!process.send) { console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,ownership:null})})); }
+    else {
+      process.on('message', response => {
+        console.log(JSON.stringify({exitCode:0,stdout:JSON.stringify({ok:true,ownership:response.ownership})}));
+        process.disconnect();
+      });
+      process.send({type:'agent-ownership-v1',requestId:'request',targetSessionId:'sibling'});
+    }
+  `)
+  let own = true
+  const authority = { inspect: async () => own
+    ? { relation: 'own-sibling' as const, proof: 'personal-same-account' as const, reason: 'same-account' }
+    : { relation: 'unknown' as const, proof: null, reason: 'identity-changed' } }
+  const execute = createAgentHostExecutor({ sessionId: 'current', directory: root,
+    env: { SAYCODE_AGENT_PERSONAL: 'true', SAYCODE_AGENT_OWNER: 'forged' }, entrypoint, identityAuthority: authority })
+  expect(JSON.parse((await execute(['prompt', 'sibling', 'hello'], new AbortController().signal)).stdout).ownership)
+    .toMatchObject({ relation: 'own-sibling', proof: 'personal-same-account' })
+  own = false
+  expect(JSON.parse((await execute(['prompt', 'sibling', 'hello'], new AbortController().signal)).stdout).ownership)
+    .toMatchObject({ relation: 'unknown' })
+  const missing = createAgentHostExecutor({ sessionId: 'current', directory: root,
+    env: { SAYCODE_AGENT_PERSONAL: 'true' }, entrypoint })
+  expect(JSON.parse((await missing(['prompt', 'sibling', 'hello'], new AbortController().signal)).stdout).ownership)
+    .toMatchObject({ relation: 'unknown' })
+})
