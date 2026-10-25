@@ -758,7 +758,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const turnAttendance = new TurnAttendanceState(exitAfterFirstTurn);
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
-        agentControl: principal.kind === 'account' && sandboxPolicyMode !== 'mandatory',
+        // A mandatory scope launch needs the broker most: its trust floor denies access.key (#898). The
+        // agent-sbx launcher drops SAYCODE_AGENT_* from the provider env, so it gets none.
+        agentControl: principal.kind === 'account' && (sandboxPolicyMode !== 'mandatory' || Boolean(scopeLaunch)),
         exitAfterFirstTurn,
         delegatedAttendance: () => delegatedAttendanceFor(turnAttendance.current()),
         browserHostContinues: process.env.HAPPY_AUTOMATION_BROWSER_CONTINUATION === '1',
