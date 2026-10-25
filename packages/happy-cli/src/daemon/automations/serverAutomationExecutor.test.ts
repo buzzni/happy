@@ -806,7 +806,10 @@ describe('runServerAutomationTick', () => {
 
     await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_MAX_MS)
     expect(transport.heartbeat).toHaveBeenCalledTimes(renewalsAtCap)
-    expect(logDebug.mock.calls.some(([line]) => String(line).includes('run=run-1 heartbeat stopped'))).toBe(true)
+    const stopped = logDebug.mock.calls.map(([line]) => String(line)).find((line) => line.includes('run=run-1 heartbeat stopped'))
+    expect(stopped).toBeDefined()
+    // 10분 멈춤의 위치를 알 수 있어야 한다 — 2026-10-25 11:39 의 정지는 이 한 줄이 없어 단계를 특정하지 못했다.
+    expect(stopped).toContain('last step: spawn-session')
   })
 
   // 2026-09-12 프로덕션 — aplus 트리거 설정을 저장하자 generation 이 13 → 14 로 올랐고,
