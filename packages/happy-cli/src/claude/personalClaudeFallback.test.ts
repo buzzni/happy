@@ -2,12 +2,13 @@ import { describe, it, expect, vi } from 'vitest'
 import { createPersonalClaudeFallback } from './personalClaudeFallback'
 const credential = { accountRef: 'personal-ref', label: 'pe…@example.test', accessToken: 'fixture-personal', expiresAt: 900000 }
 function fixture() {
+ const clock={now:1000}
  const env: Record<string, string | undefined> = { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'org-binding', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-org', ANTHROPIC_API_KEY: 'must-remove' }
  const availability = vi.fn(async () => ({ allLimited: true, consentApproved: true, availableAccountIds: [] as string[] }))
  const personal = vi.fn(async () => credential)
  const rebind = vi.fn(async () => ({ ok: true as const, environment: { HAPPY_AI_AUTH_SETUP_TOKEN_BINDING: 'new-org-binding', CLAUDE_CODE_OAUTH_TOKEN: 'new-org-token' } }))
- const state = createPersonalClaudeFallback({ env, binding: () => env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING, availability, personal, rebind, busy: () => false, now: () => 1000, notify: vi.fn() })
- return { state, env, availability, personal, rebind }
+ const state = createPersonalClaudeFallback({ env, binding: () => env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING, availability, personal, rebind, busy: () => false, now: () => clock.now, notify: vi.fn() })
+ return { state, env, availability, personal, rebind, clock }
 }
 describe('same conversation personal fallback', () => {
  it('never switches without scoped consent and rejects stale or revoked quota evidence', async () => {
@@ -72,4 +73,36 @@ it('supports an organization-only restoration without granting another personal 
  expect(await f.state.restoreOrganization()).toBe(true)
  expect(f.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('new-org-token')
  expect(f.state.identity()).toBeNull()
+})
+
+it('requires a matching error reason at acceptance and can continue only with live authority', async () => {
+ const f=fixture()
+ f.availability.mockResolvedValue({allLimited:false,availableAccountIds:[],consentApproved:true,fallbackReason:'organization-authentication'} as any)
+ const offer=await f.state.status()
+ expect(offer).toMatchObject({reason:'organization-authentication'})
+ await f.state.accept(offer!.accountRef,offer!.nonce!,'fixture-proof')
+ await expect(f.state.beforeUserTurn()).resolves.toBeUndefined()
+ f.availability.mockRejectedValue(new Error('membership unavailable'))
+ await expect(f.state.beforeUserTurn()).rejects.toThrow()
+ const g=fixture(),old=await g.state.status()
+ g.availability.mockResolvedValue({allLimited:false,availableAccountIds:[],consentApproved:true,fallbackReason:'organization-lookup'} as any)
+ await expect(g.state.accept(old!.accountRef,old!.nonce!,'fixture-proof')).rejects.toThrow()
+ expect(g.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-org')
+})
+
+it('forwards a provider refusal time without mistaking a transport failure for authorization', async () => {
+ const f=fixture()
+ f.state.noteOrganizationAuthentication(true)
+ await f.state.status()
+ expect(f.availability).toHaveBeenLastCalledWith('org-binding',undefined,{kind:'authentication',observedAt:1000})
+ f.state.noteOrganizationAuthentication(false)
+ await f.state.status()
+ expect(f.availability).toHaveBeenLastCalledWith('org-binding',undefined,undefined)
+})
+
+it('rejects consent that expires during the online authority check', async () => {
+ const f=fixture(),offer=await f.state.status()
+ f.availability.mockImplementation(async()=>{f.clock.now=61001;return{allLimited:true,availableAccountIds:[],consentApproved:true}})
+ await expect(f.state.accept(offer!.accountRef,offer!.nonce!,'fixture-proof')).rejects.toThrow()
+ expect(f.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('fixture-org')
 })

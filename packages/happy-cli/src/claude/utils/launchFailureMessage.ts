@@ -44,3 +44,13 @@ export function isClaudeTokenRefreshFailure(result: { is_error?: unknown; result
         && /oauth session expired and could not be refreshed/i.test(result.result);
 }
 
+
+/** Only a failed provider result is evidence; quoted assistant/tool text never is. */
+export function isClaudeAuthenticationFailure(value: { type?: unknown; error?: unknown; is_error?: unknown; result?: unknown; errors?: unknown; subtype?: unknown }): boolean {
+    if (value.type === 'assistant' && value.error === 'authentication_failed') return true;
+    if (value.is_error !== true) return false;
+    const texts = [value.result, ...(Array.isArray(value.errors) ? value.errors : [])];
+    return texts.some(text => typeof text === 'string' && (/^not logged in\b/i.test(text.trim())
+        || /oauth session expired and could not be refreshed/i.test(text)
+        || /^(?:API Error: 401\b|Failed to authenticate\b)/i.test(text.trim())));
+}

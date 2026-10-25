@@ -551,14 +551,15 @@ export async function requestSetupTokenRebind(sessionId: string, binding: string
 }
 
 /** Secret-free, authenticated quota evidence. An unanswered/old server never authorizes personal spending. */
-export async function requestSetupTokenAvailability(sessionId: string, binding: string, personalConsent?: { proof: string; accountRef: string; nonce: string }): Promise<{ allLimited: boolean; availableAccountIds: string[]; consentApproved: boolean }> {
-    const result = await daemonPost('/setup-token/availability', { sessionId, binding, ...(personalConsent ? { personalConsent } : {}) }, undefined, 30_000)
+export async function requestSetupTokenAvailability(sessionId: string, binding: string, personalConsent?: { proof: string; accountRef: string; nonce: string }, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<{ allLimited: boolean; availableAccountIds: string[]; consentApproved: boolean; fallbackReason?: 'quota-exhausted' | 'organization-authentication' | 'organization-lookup' }> {
+    const result = await daemonPost('/setup-token/availability', { sessionId, binding, ...(personalConsent ? { personalConsent } : {}), ...(organizationFailure ? { organizationFailure } : {}) }, undefined, 30_000)
+    if (result?.fallbackReason !== undefined && !['quota-exhausted', 'organization-authentication', 'organization-lookup'].includes(result.fallbackReason)) throw new Error('CLAUDE_ORGANIZATION_AVAILABILITY_UNCONFIRMED')
     if (result?.ok !== true || typeof result.allLimited !== 'boolean' || !Array.isArray(result.availableAccountIds)
         || !result.availableAccountIds.every((id: unknown) => typeof id === 'string')) throw new Error('CLAUDE_ORGANIZATION_AVAILABILITY_UNCONFIRMED')
-    return { allLimited: result.allLimited, availableAccountIds: result.availableAccountIds, consentApproved: result.consentApproved === true }
+    return { allLimited: result.allLimited, availableAccountIds: result.availableAccountIds, consentApproved: result.consentApproved === true, ...(result.fallbackReason ? { fallbackReason: result.fallbackReason } : {}) }
 }
-export async function returnFromPersonalClaude(sessionId: string, binding: string): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }> {
-    const result = await daemonPost('/setup-token/return', { sessionId, binding }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS)
+export async function returnFromPersonalClaude(sessionId: string, binding: string, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }> {
+    const result = await daemonPost('/setup-token/return', { sessionId, binding, ...(organizationFailure ? { organizationFailure } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS)
     if (result?.ok === true && result.environment && typeof result.environment === 'object' && Object.values(result.environment).every(value => typeof value === 'string'))
         return { ok: true, environment: result.environment }
     return { ok: false, reason: 'CLAUDE_ORGANIZATION_RETURN_UNCONFIRMED' }

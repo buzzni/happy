@@ -378,3 +378,15 @@ describe('shared PC setup-token account switch (Saycode specs/shared-pc-session-
     expect(session.sharedSetupTokenAccount).toBe(A)
   })
 })
+
+it('forwards authenticated failure context and rejects unsupported reason data', async () => {
+ const f=setup(),failure={kind:'authentication' as const,observedAt:1000}
+ vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,allLimited:false,availableAccountIds:[],fallbackReason:'organization-authentication'}))
+ expect(await f.switcher.availability('session-a',RUNNING_A,undefined,failure)).toMatchObject({ok:true,fallbackReason:'organization-authentication'})
+ expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[0][1]?.body))).toHaveProperty('organizationFailure',failure)
+ vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,allLimited:false,availableAccountIds:[],fallbackReason:['organization-lookup']}))
+ expect(await f.switcher.availability('session-a',RUNNING_A)).toMatchObject({ok:false})
+ vi.mocked(f.deps.fetch).mockResolvedValueOnce(Response.json({version:1,bindingGrant:'claims.signature',managedAccountId:B,credentialGeneration:1,tier:'available'}))
+ expect(await f.switcher.returnFromPersonal('session-a',RUNNING_A,failure)).toMatchObject({ok:true})
+ expect(JSON.parse(String(vi.mocked(f.deps.fetch).mock.calls[2][1]?.body))).toHaveProperty('organizationFailure',failure)
+})

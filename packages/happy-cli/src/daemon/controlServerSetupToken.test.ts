@@ -27,12 +27,13 @@ describe('setup-token control routes (specs/claude-setup-token-account-selection
       expect(switcher.rebind).not.toHaveBeenCalled()
       expect(await (await post('/setup-token/usage', { sessionId: 'session-a', binding: '{}', observation })).json()).toEqual({ ok: true })
       expect(switcher.reportUsage).toHaveBeenCalledWith('session-a', '{}', observation, expect.any(AbortSignal))
+      const organizationFailure={kind:'authentication',observedAt:1000}
       const personalConsent={proof:'fixture-proof',accountRef:'a'.repeat(64),nonce:'b'.repeat(48)}
-      expect((await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent},false)).status).toBe(401)
-      expect(await (await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent})).json()).toMatchObject({ok:true,allLimited:true,consentApproved:true})
-      expect(switcher.availability).toHaveBeenCalledWith('session-a','{}',personalConsent)
-      expect(await (await post('/setup-token/return',{sessionId:'session-a',binding:'{}'})).json()).toMatchObject({ok:true})
-      expect(switcher.returnFromPersonal).toHaveBeenCalledWith('session-a','{}')
+      expect((await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent,organizationFailure},false)).status).toBe(401)
+      expect(await (await post('/setup-token/availability',{sessionId:'session-a',binding:'{}',personalConsent,organizationFailure})).json()).toMatchObject({ok:true,allLimited:true,consentApproved:true})
+      expect(switcher.availability).toHaveBeenCalledWith('session-a','{}',personalConsent,organizationFailure)
+      expect(await (await post('/setup-token/return',{sessionId:'session-a',binding:'{}',organizationFailure})).json()).toMatchObject({ok:true})
+      expect(switcher.returnFromPersonal).toHaveBeenCalledWith('session-a','{}',organizationFailure)
       expect(await (await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}' })).json()).toEqual({ ok: true, environment: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-next' } })
       const finalRefusal = { observedAt: 10, reason: 'rate-limited', retryAt: null, windows: [] };
       expect((await post('/setup-token/rebind', { sessionId: 'session-a', binding: '{}', observation: finalRefusal })).status).toBe(200);

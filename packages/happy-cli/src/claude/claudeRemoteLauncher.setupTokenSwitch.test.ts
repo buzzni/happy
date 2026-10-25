@@ -501,12 +501,12 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
     });
 });
 
-it.each(['automatic', 'organization-only'])('keeps one conversation through organization, approved personal continuation and verified organization return (%s)', async (returnMode) => {
+it.each(['automatic', 'organization-only', 'authentication'])('keeps one conversation through organization, approved personal continuation and verified organization return (%s)', async (returnMode) => {
     const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
     process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
     let available = false;
     vi.mocked(requestSetupTokenRebind).mockResolvedValue({ok:false,reason:'NO_ACCOUNT'});
-    vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id,_binding,consent) => ({allLimited:!available,availableAccountIds:available?['org-account']:[],consentApproved:!!consent}));
+    vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id,_binding,consent) => ({allLimited:!available && returnMode!=='authentication',availableAccountIds:available?['org-account']:[],consentApproved:!!consent,...(!available && returnMode==='authentication'?{fallbackReason:'organization-authentication' as const}:{})}));
     vi.mocked(returnFromPersonalClaude).mockResolvedValue({ok:true,environment:{CLAUDE_CODE_OAUTH_TOKEN:'fixture-org-return',HAPPY_AI_AUTH_SETUP_TOKEN_BINDING:original,HAPPY_AI_AUTH_SOURCE:'org-bundle'}});
     vi.mocked(readPersonalClaudeCredential).mockResolvedValue({accountRef:'a'.repeat(64),label:'pe…@example.test',accessToken:'fixture-personal',expiresAt:Date.now()+600000});
     const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
@@ -523,17 +523,17 @@ it.each(['automatic', 'organization-only'])('keeps one conversation through orga
             for await(const message of prompt as AsyncIterable<SDKUserMessage>) {
                 generation.prompts.push(JSON.stringify(message.message.content));
                 if(nth===1) {
-                    yield refused;
+                    if(returnMode==='authentication') yield {...assistant('auth-refused'),error:'authentication_failed'}; else yield refused;
                     setTimeout(() => { void (async () => {
                         const offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer;
                         await handlers.get('personal-claude-fallback')!({action:'accept',accountRef:offer.accountRef,nonce:offer.nonce,consentProof:'fixture-proof'});
                     })(); }, 0);
-                    yield {type:'result',subtype:'error_during_execution',is_error:true,errors:['usage limit'],uuid:'refused-personal'};
+                    yield {type:'result',subtype:'error_during_execution',is_error:true,errors:[returnMode==='authentication'?'API Error: 401 token expired':'usage limit'],uuid:'refused-personal'};
                 } else {
                     yield assistant(`personal-${nth}`);
                     if(nth===2) {
                         available=true;
-                        if(returnMode==='automatic') queue.push('next request after recovery',{permissionMode:'default',model:'claude-sonnet-5'});
+                        if(returnMode!=='organization-only') queue.push('next request after recovery',{permissionMode:'default',model:'claude-sonnet-5'});
                         else setTimeout(()=>{void(async()=>{
                             const restored=await handlers.get('personal-claude-fallback')!({action:'restore-organization'});expect(restored.restored).toBe(true);
                             queue.push('next request after recovery',{permissionMode:'default',model:'claude-sonnet-5'});

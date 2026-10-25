@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_NOT_SIGNED_IN_NOTICE, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
+import { CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
@@ -45,3 +45,11 @@ describe('isClaudeTokenRefreshFailure', () => {
     });
 });
 
+
+ it('classifies provider authentication refusals without trusting normal output or arbitrary failures', () => {
+  expect(isClaudeAuthenticationFailure({type:'assistant',error:'authentication_failed'})).toBe(true);
+  expect(isClaudeAuthenticationFailure({is_error:true,errors:['API Error: 401 token expired']})).toBe(true);
+  expect(isClaudeAuthenticationFailure({is_error:true,result:'Failed to authenticate. API Error: 401'})).toBe(true);
+  expect(isClaudeAuthenticationFailure({is_error:false,result:'API Error: 401 example'})).toBe(false);
+  expect(isClaudeAuthenticationFailure({is_error:true,result:'Tool failed: permission denied'})).toBe(false);
+ });

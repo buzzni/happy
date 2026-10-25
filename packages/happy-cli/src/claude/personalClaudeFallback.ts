@@ -6,19 +6,23 @@ const BINDING = 'HAPPY_AI_AUTH_SETUP_TOKEN_BINDING'
 const AUTH_KEYS = [...CLAUDE_AUTH_OVERRIDE_ENV_KEYS, BINDING, 'HAPPY_AI_AUTH_SOURCE', 'HAPPY_AI_AUTH_CONNECTION_VERSION']
 export const PERSONAL_RECHECK_NOTICE = 'The next request was not sent because Claude account availability could not be verified. Check the account and send again.'
 export class PersonalClaudeRecheckRequired extends Error { constructor() { super('CLAUDE_PERSONAL_FALLBACK_RECHECK_REQUIRED') } }
-type Availability = { allLimited: boolean; availableAccountIds: string[]; consentApproved?: boolean }
+type Reason = 'quota-exhausted' | 'organization-authentication' | 'organization-lookup'
+type Availability = { allLimited: boolean; availableAccountIds: string[]; consentApproved?: boolean; fallbackReason?: Reason }
+const reasonOf = (quota: Availability): Reason | undefined => quota.fallbackReason ?? (quota.allLimited ? 'quota-exhausted' : undefined)
 type Deps = {
     env: Record<string, string | undefined>; binding(): string | undefined; now(): number; busy(): boolean
-    availability(binding: string, consent?: { proof: string; accountRef: string; nonce: string }): Promise<Availability>
+    availability(binding: string, consent?: { proof: string; accountRef: string; nonce: string }, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<Availability>
     personal(): Promise<PersonalClaudeCredential | null>
-    rebind(binding: string): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }>
+    rebind(binding: string, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<{ ok: true; environment: Record<string, string> } | { ok: false; reason: string }>
     notify(message: string): void
 }
 /** A wrapper-process lease, never a machine login change. Losing the process loses personal consent. */
 export function createPersonalClaudeFallback(deps: Deps) {
     let original: string | null = null, personal: PersonalClaudeCredential | null = null, generation = 0
     let backup: Record<string, string | undefined> | null = null
-    let offer: { nonce: string; accountRef: string; binding: string; expiresAt: number } | null = null
+    let offer: { nonce: string; accountRef: string; binding: string; expiresAt: number; reason: Reason } | null = null
+    let authenticationFailedAt: number | null = null
+    const availability = (binding: string, consent?: { proof: string; accountRef: string; nonce: string }) => deps.availability(binding, consent, authenticationFailedAt !== null ? { kind: 'authentication', observedAt: authenticationFailedAt } : undefined)
     let transition = false, wake = new AbortController(), stopped = false, cancellationEpoch = 0
     const fail = () => new PersonalClaudeRecheckRequired()
     const apply = (environment: Record<string, string>) => {
@@ -27,12 +31,13 @@ export function createPersonalClaudeFallback(deps: Deps) {
         generation++; wake.abort(); wake = new AbortController()
     }
     const applyOrganization = async (binding: string) => {
-        const result = await deps.rebind(binding)
+        const result = await deps.rebind(binding, authenticationFailedAt !== null ? { kind: 'authentication', observedAt: authenticationFailedAt } : undefined)
         if (!result.ok || stopped || !result.environment.CLAUDE_CODE_OAUTH_TOKEN || !result.environment[BINDING]) throw fail()
-        apply(result.environment); original = null; personal = null; backup = null
+        apply(result.environment); authenticationFailedAt = null; original = null; personal = null; backup = null
         deps.notify('Organization Claude is available again. This conversation continues with the organization account.')
     }
     return {
+        noteOrganizationAuthentication(failed: boolean) { if (!personal) { authenticationFailedAt = failed ? deps.now() : null; offer = null } },
         generation: () => generation,
         signal: (): AbortSignal => wake.signal,
         identity: () => personal ? { accountRef: personal.accountRef, label: personal.label } : null,
@@ -42,14 +47,14 @@ export function createPersonalClaudeFallback(deps: Deps) {
             if (stopped || transition || deps.busy()) return null
             if (personal) return { state: 'personal' as const, accountRef: personal.accountRef, label: personal.label }
             const binding = deps.binding(); if (!binding) return null
-            const quota = await deps.availability(binding)
-            if (stopped || binding !== deps.binding() || !quota.allLimited) { offer = null; return null }
+            const quota = await availability(binding)
+            if (stopped || binding !== deps.binding() || !reasonOf(quota)) { offer = null; return null }
             const candidate = await deps.personal()
             if (!candidate || stopped || binding !== deps.binding()) return null
             // Polling and a second viewer must not invalidate an already displayed confirmation.
-            if (!offer || offer.binding !== binding || offer.accountRef !== candidate.accountRef || offer.expiresAt <= deps.now())
-                offer = { nonce: randomBytes(24).toString('hex'), accountRef: candidate.accountRef, binding, expiresAt: deps.now() + 60_000 }
-            return { state: 'offer' as const, label: candidate.label, accountRef: candidate.accountRef, nonce: offer.nonce }
+            if (!offer || offer.binding !== binding || offer.accountRef !== candidate.accountRef || offer.expiresAt <= deps.now() || offer.reason !== reasonOf(quota))
+                offer = { nonce: randomBytes(24).toString('hex'), accountRef: candidate.accountRef, binding, expiresAt: deps.now() + 60_000, reason: reasonOf(quota)! }
+            return { state: 'offer' as const, label: candidate.label, accountRef: candidate.accountRef, nonce: offer.nonce, reason: offer.reason }
         },
         async accept(accountRef: string, nonce: string, proof: string) {
             const consent = offer, epoch = cancellationEpoch
@@ -57,8 +62,8 @@ export function createPersonalClaudeFallback(deps: Deps) {
                 || consent.expiresAt <= deps.now() || consent.binding !== deps.binding()) throw fail()
             transition = true; offer = null
             try {
-                const quota = await deps.availability(consent.binding, { proof, accountRef, nonce }), candidate = await deps.personal()
-                if (stopped || epoch !== cancellationEpoch || deps.busy() || consent.binding !== deps.binding() || !quota.allLimited || quota.consentApproved !== true || !candidate || candidate.accountRef !== accountRef) throw fail()
+                const quota = await availability(consent.binding, { proof, accountRef, nonce }), candidate = await deps.personal()
+                if (stopped || consent.expiresAt <= deps.now() || epoch !== cancellationEpoch || deps.busy() || consent.binding !== deps.binding() || reasonOf(quota) !== consent.reason || quota.consentApproved !== true || !candidate || candidate.accountRef !== accountRef) throw fail()
                 backup = Object.fromEntries(AUTH_KEYS.map(key => [key, deps.env[key]])); original = consent.binding; personal = candidate
                 apply({ CLAUDE_CODE_OAUTH_TOKEN: candidate.accessToken, HAPPY_AI_AUTH_SOURCE: 'personal-subscription' })
                 deps.notify('Personal Claude usage was approved for this conversation. It returns to organization Claude when an account is available.')
@@ -69,7 +74,7 @@ export function createPersonalClaudeFallback(deps: Deps) {
             const binding = original ?? deps.binding(); if (!binding) return false
             transition = true
             try {
-                const quota = await deps.availability(binding)
+                const quota = await availability(binding)
                 if (stopped) return false
                 if (!personal) return true
                 if (!quota.availableAccountIds.length) return false
@@ -83,12 +88,12 @@ export function createPersonalClaudeFallback(deps: Deps) {
             transition = true
             try {
                 // Failure is not permission to keep spending personal quota after authority was lost.
-                const quota = await deps.availability(original)
+                const quota = await availability(original)
                 if (stopped) throw fail()
                 if (quota.availableAccountIds.length) {
                     await applyOrganization(original)
                 } else {
-                    if (!quota.allLimited) throw fail()
+                    if (!reasonOf(quota)) throw fail()
                     const current = await deps.personal()
                     if (!current || stopped || current.accountRef !== personal.accountRef) throw fail()
                     // Refresh only the selected local access token; no refresh credential is copied or used.
