@@ -174,9 +174,10 @@ function consumeBackgroundCompletion(
     // A run mismatch vetoes the tool fallback: resumed runs can retain a tool/task ID.
     const conflict = launch && ((run && launch.runId && run !== launch.runId)
         || (ids.toolUseId && launch.toolUseId && ids.toolUseId !== launch.toolUseId));
-    const exact = launch && !conflict && ((run && run === launch.runId)
-        || (ids.toolUseId && ids.toolUseId === launch.toolUseId));
-    if (conflict || (decision === 'uncertain' && (!exact || launch?.requestId === undefined))) {
+    // A reusable tool/task ID does not identify a generation. Launch records have no
+    // independent generation identity, so an uncertain receipt needs a shared explicit run.
+    const sameRun = run && run === launch?.runId;
+    if (conflict || (decision === 'uncertain' && (!sameRun || launch?.requestId === undefined))) {
         state.onBackgroundInputRearm?.([], ['background-request-unrouted']);
         logUnroutedBackground(ids, run, 'launch-identity-unproven');
         return;

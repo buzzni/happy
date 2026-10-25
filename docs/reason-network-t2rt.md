@@ -506,6 +506,9 @@ src/toolPolicy/grants.test.ts
 
 ## Round 5: route proven launches after completion eviction (2026-10-25)
 
+Historical record: T2RT-10 below supersedes this round's tool-ID fallback for
+uncertain completions. A reusable tool ID alone does not identify a run.
+
 Started from `281f5a02`, directly above the parent-integrated review fix `3aa3b97d`.
 The stopped-batch and oversized-final-answer fixes are preserved. This follow-up
 supersedes round 4's blanket refusal to route every `uncertain` completion; it does
@@ -594,6 +597,67 @@ src/claude/runClaude.test.ts
 
 Delivery: a new behavioral commit and normal push on the existing branch, as
 requested for round 5. No history rewriting, new PR, merge, release or deployment.
+
+## Round 6: T2RT-10 blocks unproven run-ID-less completions (2026-10-25)
+
+Review base: `666faa968a81c7d27c0ca55f4f83a07159511485`.
+T2RT-10 is accepted. The user approved safe refusal: **wrong delivery 0 takes
+priority over availability**. A resumed task can retain both task and tool IDs;
+the absence of a conflicting run ID is not proof that a completion belongs to
+the retained launch.
+
+Completed implementation and scope (Core, within existing session-host ownership):
+
+1. Reproduce SDK and scanner late run-ID-less receipts after run-1 → same-tool
+   run-2 → 205 unrelated completions, through the real production queue/mapper.
+2. Require a shared explicit run ID for an `uncertain` completion to consume a
+   retained launch. The current records contain no independently proven
+   generation-specific launch identity, so neither task nor tool equality can
+   substitute. Keep existing legacy routing for first observations where the
+   tracker has no ambiguity/history loss; do not infer uniqueness after eviction.
+3. Report `background-request-unrouted` and incomplete coverage with empty source
+   IDs when proof is absent. Preserve the launch and source mappings, do not
+   rearm the channel, and let the later exact run-2 completion retain channel-A.
+4. Run the external reproduction and related standard unit selection, including
+   T2RT-07/09, CLI typecheck/build, and diff validation; commit on top of the
+   review base and push normally to the existing branch.
+
+Only the mapper, its existing channel ordering tests and this report change.
+No public API/schema, dependency, authority, UI, Desktop or T1b file changes.
+Rollback is a revert of this behavioral commit. Revisit the availability limit
+only if a producer supplies an independently verifiable generation identity;
+cache retention, source pairing and a unique current tool match are insufficient.
+
+Verification:
+
+- TDD red on unchanged production code: both new repository SDK/scanner cases
+  failed (**2 failed / 63 skipped**) with the standard unit command below. The
+  external `/tmp/happy-t2rt-xr-v5/adversarial.test.ts` independently reproduced
+  exactly the reported failures (**2 failed / 5 passed**): the old receipt took
+  channel-A and deleted the run-2 launch; the exact run-2 answer was unrouted.
+- After the fix, the unchanged external reproduction passed **7/7**. Both SDK
+  and scanner output show no request ID on the late receipt, the retained
+  `{taskId: job, toolUseId: launch-original, runId: run-2, requestId: channel-A}`
+  launch, and `requestId=channel-A` on the real run-2 final. Both controls and the
+  oversized-answer checks pass. Command: `corepack pnpm -C packages/happy-cli
+  exec vitest run --config /tmp/happy-t2rt-xr-v5/vitest.config.mjs --configLoader
+  runner /tmp/happy-t2rt-xr-v5/adversarial.test.ts --maxWorkers 2`.
+- The two existing post-eviction tool-only cases now require safe refusal and
+  retained mappings, including when neither side ever supplied a run ID. The
+  existing first-observation legacy mapper cases retain their routing assertions.
+  All 24 T2RT-07 and four T2RT-09 cases remain unchanged.
+- Final standard related suite: **10 files / 426 tests passed**, including all
+  **65 channel ordering cases**, the unchanged **24 T2RT-07** and **four T2RT-09**
+  cases, and both new T2RT-10 SDK/scanner cases. Standard global setup completed
+  CLI `tsc --noEmit`, pkgroll and extension-copy build successfully against the
+  final production change. Selection is the same ten files listed in round 5,
+  with `--maxWorkers 2`:
+  `corepack pnpm -C packages/happy-cli exec vitest run --project unit <files>
+  --maxWorkers 2`.
+- `git diff --check` passed. Existing bin-location/empty-chunk build warnings and
+  asynchronously-handled-rejection harness warnings remain. No final test failed;
+  no Unix-socket EPERM failure occurred in this selection. No whole-suite, live
+  paid-provider, Desktop or packaged-release acceptance is claimed.
 
 ## Known integration boundaries
 
