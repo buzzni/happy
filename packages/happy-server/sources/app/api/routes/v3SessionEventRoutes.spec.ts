@@ -134,6 +134,13 @@ describe('sendEventBodySchema', () => {
         }).success).toBe(false);
     });
 
+    it('rejects turn-ready from clients because only the server records it', () => {
+        expect(sendEventBodySchema.safeParse({
+            eventType: 'turn-ready',
+            content: 'encrypted-detail',
+        }).success).toBe(false);
+    });
+
     it('preserves legacy parsing that strips unrelated extra fields', () => {
         expect(sendEventBodySchema.parse({
             eventType: 'session-end',
