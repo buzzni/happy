@@ -139,6 +139,7 @@ model Session {
     accessKeys        AccessKey[]
 
     executionBinding SessionExecutionBinding?
+    ownershipBinding SessionOwnershipBinding?
 
     @@unique([id, accountId])
     @@unique([accountId, tag])
@@ -1167,4 +1168,34 @@ model SessionExecutionBinding {
     @@unique([companyId, machineId, launchId])
     @@unique([companyId, initialNonce])
     @@unique([companyId, machineId, operationId])
+}
+
+/// A creation candidate is immutable, including across session deletion.
+/// Rollback disables producers and retains this table; never backfill from metadata.
+model SessionOwnershipBinding {
+    sessionId          String   @id
+    sessionRowId       String?  @unique
+    session            Session? @relation(fields: [sessionRowId], references: [id], onDelete: SetNull, onUpdate: Restrict)
+    bindingId          String   @unique
+    subjectIssuer      String
+    ownerUserId        String
+    sessionAccountId   String
+    originProjectId    String?
+    machineId          String
+    machineAccountId   String
+    companyId          String?
+    parentHubSessionId String?
+    intentId           String
+    operationId        String
+    nonce              String
+    createDigest       String
+    proofDigest        String
+    issuedAt           DateTime
+    createdAt          DateTime @default(now())
+    confirmedAt        DateTime?
+    schemaVersion      Int      @default(1)
+
+    @@unique([subjectIssuer, intentId])
+    @@unique([subjectIssuer, operationId])
+    @@unique([subjectIssuer, nonce])
 }

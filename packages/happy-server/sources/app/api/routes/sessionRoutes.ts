@@ -12,6 +12,7 @@ import { sessionDelete } from "@/app/session/sessionDelete";
 import { sessionArchive } from "@/app/session/sessionArchive";
 import { requireSessionScopeAuth, requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
 import { createExecutionBoundSession, ExecutionBindingError } from "@/app/session/sessionExecutionBinding";
+import { createOwnershipBoundSession, OwnershipError } from "@/app/session/sessionOwnershipBinding";
 
 export function sessionRoutes(app: Fastify) {
 
@@ -480,7 +481,7 @@ export function sessionRoutes(app: Fastify) {
             const raw = Buffer.concat(chunks);
             try {
                 const parsed: unknown = JSON.parse(raw.toString('utf8'));
-                if (parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'executionProof')) {
+                if (parsed && typeof parsed === 'object' && ['executionProof', 'ownershipProof'].some(key => Object.prototype.hasOwnProperty.call(parsed, key))) {
                     parseCanonicalOrgSetupTokenJson(new TextDecoder('utf-8', { fatal: true }).decode(raw));
                 }
             } catch { throw new ExecutionBindingError(400, 'Invalid session execution JSON'); }
@@ -493,6 +494,7 @@ export function sessionRoutes(app: Fastify) {
                 agentState: z.string().nullish(),
                 dataEncryptionKey: z.string().nullish(),
                 executionProof: z.unknown().optional(),
+                ownershipProof: z.unknown().optional(),
             }).passthrough()
         },
         preHandler: app.authenticate
@@ -500,12 +502,14 @@ export function sessionRoutes(app: Fastify) {
         const userId = request.userId;
         const { tag, metadata, dataEncryptionKey } = request.body;
 
-        if (Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {
+        const hasOwnership = Object.prototype.hasOwnProperty.call(request.body, 'ownershipProof');
+        if (hasOwnership || Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {
             if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
-            const { executionProof, ...createBody } = request.body;
+            const { executionProof, ownershipProof, ...createBody } = request.body;
             try {
-                const session = await createExecutionBoundSession(userId, createBody, executionProof);
-                return reply.send({ session: {
+                const owned = hasOwnership ? await createOwnershipBoundSession(userId, createBody, ownershipProof, executionProof) : null;
+                const session = owned?.session ?? await createExecutionBoundSession(userId, createBody, executionProof);
+                return reply.send({ ...(owned ? { ownership: owned.ownership } : {}), session: {
                     id: session.id, seq: session.seq, metadata: session.metadata, metadataVersion: session.metadataVersion,
                     agentState: session.agentState, agentStateVersion: session.agentStateVersion,
                     dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
@@ -514,6 +518,7 @@ export function sessionRoutes(app: Fastify) {
                 } });
             } catch (error) {
                 if (error instanceof ExecutionBindingError) return reply.code(error.statusCode).send({ error: error.message });
+                if (error instanceof OwnershipError) return reply.code(error.statusCode).send({ error: error.message });
                 throw error;
             }
         }

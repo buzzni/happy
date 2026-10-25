@@ -7,6 +7,7 @@ import { authRoutes } from "./routes/authRoutes";
 import { readSessionIdleReaperMode, sessionIdleReaperRoutes } from "./routes/sessionIdleReaperRoutes";
 import { pushRoutes } from "./routes/pushRoutes";
 import { sessionRoutes } from "./routes/sessionRoutes";
+import { sessionOwnershipRoutes } from "./routes/sessionOwnershipRoutes";
 import { connectRoutes } from "./routes/connectRoutes";
 import { accountRoutes } from "./routes/accountRoutes";
 import { startSocket } from "./socket";
@@ -176,6 +177,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     if (idleReaperMode) sessionIdleReaperRoutes(typed, { mode: idleReaperMode });
     pushRoutes(typed);
     sessionRoutes(typed);
+    sessionOwnershipRoutes(typed);
     accountRoutes(typed);
     agentProfileRoutes(typed);
     connectRoutes(typed);
