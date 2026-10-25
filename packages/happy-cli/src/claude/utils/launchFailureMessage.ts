@@ -1,4 +1,4 @@
-import { PERSONAL_CLAUDE_AUTH_FAILURE } from '../sdk/credentialPin';
+export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
 
 /**
  * What the user is told when Claude Code exits before its first SDK message (Desktop
