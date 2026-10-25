@@ -378,6 +378,21 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         rebind: (binding, failure) => returnFromPersonalClaude(session.client.sessionId, binding, failure),
         notify: message => session.client.sendSessionEvent({ type: 'message', message }),
     }) : null;
+    const recheckPersonalInput = async (message: { channelRequestId?: string } | null) => {
+        if (!message) return;
+        try {
+            await personalFallback?.beforeUserTurn();
+            if (message.channelRequestId && personalFallback?.identity()) throw new PersonalClaudeRecheckRequired();
+        } catch (error) {
+            if (error instanceof PersonalClaudeRecheckRequired) {
+                launchFailure = PERSONAL_RECHECK_NOTICE;
+                // Bind the refusal in order, after the previous turn's queued terminal.
+                messageQueue.enqueue(pendingRequestItem(message.channelRequestId ?? null));
+                if (message.channelRequestId) messageQueue.enqueue(finalAnswerItem(PERSONAL_RECHECK_NOTICE));
+            }
+            throw error;
+        }
+    };
     session.client.rpcHandlerManager.registerHandler('personal-claude-fallback', async (params: { action?: unknown; accountRef?: unknown; nonce?: unknown; consentProof?: unknown }) => {
         if (!personalFallback) return { version: 1, supported: false };
         if (params.action === 'restore-organization') {
@@ -779,6 +794,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
             providerRunning = false;
+            const optionsCredentialGeneration = personalFallback?.generation() ?? 0;
+            const providerOptionsStale = () => providerStale() || optionsCredentialGeneration !== (personalFallback?.generation() ?? 0);
             try {
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
@@ -872,7 +889,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             continuation = mode ?? lastTurnMode;
                         }
                         // A running provider keeps the token it started with: end it, the loop resumes the conversation.
-                        if (providerStale()) return null;
+                        if (providerOptionsStale()) return null;
                         // The next provider's first turn: ahead of anything the user queued meanwhile, and alone.
                         if (!providerRunning && continuation) {
                             if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
@@ -885,6 +902,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
                             let p = pending;
                             pending = null;
+                            await recheckPersonalInput(p);
+                            if (providerOptionsStale()) {
+                                pending = p;
+                                drain?.releaseClaim();
+                                return null;
+                            }
                             // This is the path an isolated channel turn actually takes: it was
                             // deferred when the previous query ended, and *this* is the moment it
                             // becomes the running turn.
@@ -982,7 +1005,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 if (accountSwitch.switched && accountSwitch.continueAfter && !lastResultSucceeded && !lastTurnChannel) {
                                     continuation = mode ?? lastTurnMode;
                                 }
-                                if (providerStale()) return null;
+                                if (providerOptionsStale()) return null;
                                 if (!providerRunning && continuation) {
                                     if (!pending && session.queue.size() === 0 && !session.queue.isClosed()) {
                                         session.queue.unshiftIsolated(CONTINUE_PROMPT, continuation, undefined, session.turnAttendance?.continuationInput());
@@ -1036,18 +1059,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
                         // A switch that failed at the boundary is tried again before this message reaches the used-up
                         // account. The user's own message replaces the automatic continuation.
-                        try {
-                            if (msg) await personalFallback?.beforeUserTurn();
-                            if (msg?.channelRequestId && personalFallback?.identity()) throw new PersonalClaudeRecheckRequired();
-                        } catch (e) {
-                            // claudeRemote propagates only a generation's first nextMessage rejection; a later one just
-                            // ends its input. Recorded here, the notice is reported by `finally` on either path.
-                            if (e instanceof PersonalClaudeRecheckRequired) launchFailure = PERSONAL_RECHECK_NOTICE;
-                            throw e;
-                        }
+                        await recheckPersonalInput(msg);
                         if (msg && !personalFallback?.identity() && !providerStale()) await setupTokenSwitching?.switchIfWanted();
                         // A message that arrives after a switch (another boundary, or while it ran) belongs to the next provider.
-                        if (msg && providerStale()) {
+                        if (msg && providerOptionsStale()) {
                             pending = msg;
                             drain?.releaseClaim();
                             return null;
