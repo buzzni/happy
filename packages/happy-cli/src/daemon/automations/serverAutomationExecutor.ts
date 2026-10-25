@@ -92,6 +92,8 @@ export interface ServerAutomationExecutorInput {
   runtimeStore: ServerAutomationRuntimeStore
   machineSecretKey: Uint8Array
   now: number
+  /** 틱 러너가 이 tick 을 버리면 abort 된다. 없으면 끝까지 돈다. */
+  signal?: AbortSignal
   transport: ServerAutomationTransport
   decryptPayload: (automation: EncryptedServerAutomation, machineSecretKey: Uint8Array) => ServerAutomationPayload
   runScript: (input: { command: string; cwd: string; timeout: number }) => Promise<{ ok: boolean; stdout: string; error?: string }>
@@ -281,6 +283,12 @@ const HEARTBEAT_MS = 60_000
 export const RUN_HEARTBEAT_MAX_MS = 10 * 60_000
 // 실행이 어느 await 에서 멈췄는지 heartbeat 상한 로그에 남기기 위한 진행 표시.
 type RunTrace = { step: string }
+/** 틱 워치독이 이 tick 을 버렸다 — 다음 단계로 넘어가지 않고 run 을 실패로 보고해 서버가 풀게 한다. */
+class TickAbandonedError extends Error {
+  constructor(readonly step: string) {
+    super(`tick abandoned at ${step}`)
+  }
+}
 const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
 // 한 틱이 새로 집어오는 GitHub 이벤트 수. 폭주하는 저장소가 한 번에 큐를 다 비우지
 // 않게 하는 유입 제한이다.
@@ -1272,6 +1280,10 @@ async function executeStartedRun(
   /** 프롬프트를 세션에 전달하기 전 단계가 상대에 닿지 못해 실패한 코드 (automationUnreachableRetry). */
   unreachable?: string
 }> {
+  const step = (name: string): void => {
+    trace.step = name
+    if (input.signal?.aborted) throw new TickAbandonedError(name)
+  }
   if (input.hostCommandsAllowed === false && (payload.scriptCommand || payload.githubTrigger)) {
     input.logDebug?.(`[server-automation] ${automation.automationId} needs host commands, which this runtime does not allow`)
     return { outcome: 'ERROR', sessionId: null, failureCode: 'HOST_COMMANDS_UNSUPPORTED' }
@@ -1309,7 +1321,7 @@ async function executeStartedRun(
       input.logDebug?.(`[server-automation] ${automation.automationId} ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
-    trace.step = 'cleanup-issue-progress-markers'
+    step('cleanup-issue-progress-markers')
     degradedCode = await cleanupInactiveGithubIssueProgressMarkers(
       input,
       automation,
@@ -1375,7 +1387,7 @@ async function executeStartedRun(
       githubEnvironment: query.githubEnvironment,
     }
   } else if (payload.githubTrigger) {
-    trace.step = 'query-pull-requests'
+    step('query-pull-requests')
     const query = await input.queryGithubPullRequests({
       cwd: payload.directory,
       githubCredentialId: payload.githubTrigger.githubCredentialId,
@@ -1390,7 +1402,7 @@ async function executeStartedRun(
       input.logDebug?.(`[server-automation] ${automation.automationId} ${query.error}`)
       return { outcome: 'ERROR', sessionId: null }
     }
-    trace.step = 'cleanup-issue-progress-markers'
+    step('cleanup-issue-progress-markers')
     degradedCode = await cleanupInactiveGithubIssueProgressMarkers(
       input,
       automation,
@@ -1417,7 +1429,7 @@ async function executeStartedRun(
       previous,
     })
     if (fileCandidates.length > 0) {
-      trace.step = 'query-pull-request-files'
+      step('query-pull-request-files')
       const details = await input.queryGithubPullRequestFiles({
         numbers: fileCandidates,
         cwd: payload.directory,
@@ -1466,7 +1478,7 @@ async function executeStartedRun(
       if (!credentialId) return { outcome: 'ERROR', sessionId: null }
       // Resolve before claiming a task: failed secret lookup must not strand a
       // dispatched task without a worker, nor consume its pending GitHub event.
-      trace.step = 'resolve-project-environment'
+      step('resolve-project-environment')
       const projectEnvironment = await input.resolveProjectEnvironment(run)
       if (!projectEnvironment.ok) {
         const failureCode = projectEnvironment.code ?? 'PROJECT_ENVIRONMENT_UNAVAILABLE'
@@ -1476,7 +1488,7 @@ async function executeStartedRun(
           failureCode,
         }
       }
-      trace.step = 'dispatch-agent-task'
+      step('dispatch-agent-task')
       const bridged = await input.dispatchAgentTask({
         runId: run.runId,
         claimToken: run.claimToken,
@@ -1524,7 +1536,7 @@ async function executeStartedRun(
           : null
         const shas = reviewShasFromDispatchInput(bridged.dispatch.input)
         if (shas.length > 0) {
-          trace.step = 'ensure-review-objects'
+          step('ensure-review-objects')
           const provisioned = await (input.ensureReviewObjects ?? ensureAgentTaskReviewObjects)({
             directory: payload.directory,
             shas,
@@ -1547,7 +1559,7 @@ async function executeStartedRun(
         // 조건이라, 지금까지 대부분의 apply 가 아무것도 반영하지 못했다.
         const applyRequest = applyWorktreeRequestFromDispatchInput(bridged.dispatch.input)
         if (applyRequest) {
-          trace.step = 'read-head-sha'
+          step('read-head-sha')
           const headSha = await (input.readHeadSha ?? readWorkspaceHeadSha)({
             directory: payload.directory,
           })
@@ -1648,7 +1660,7 @@ async function executeStartedRun(
 
   let scriptOutput: string | null = null
   if (payload.scriptCommand) {
-    trace.step = 'run-script'
+    step('run-script')
     const script = await input.runScript({
       command: payload.scriptCommand,
       cwd: payload.directory,
@@ -1668,7 +1680,7 @@ async function executeStartedRun(
     }
     scriptOutput = script.stdout
   }
-  trace.step = 'resolve-mcp-spawn-context'
+  step('resolve-mcp-spawn-context')
   const mcpContext = agentTaskDispatch
     ? { ok: true as const, value: null }
     : await input.resolveMcpSpawnContext(run)
@@ -1699,7 +1711,7 @@ async function executeStartedRun(
     if (payload.conversation && (context.connectorPolicy !== 'optional' || context.requiredConnectors.length > 0)) return { outcome: 'ERROR', sessionId: null, failureCode: 'CONVERSATION_POLICY_UNSUPPORTED' }
     expectedConnectors = context.requiredConnectors
     if (context.connectorPolicy !== 'none') {
-      trace.step = 'preflight-mcp-connectors'
+      step('preflight-mcp-connectors')
       const preflight = await input.preflightMcpConnectors({ runId: run.runId, context })
       if (!preflight.ok) {
         input.logDebug?.(
@@ -1727,7 +1739,7 @@ async function executeStartedRun(
   let githubWorktree: GithubTriggerWorktreePlan | null = null
   if (githubWorktreeRequest) {
     let plannedWorktree: GithubTriggerWorktreePlan | null = null
-    trace.step = 'prepare-github-worktree'
+    step('prepare-github-worktree')
     const prepared = await input.prepareGithubWorktree({
       runId: run.runId,
       directory: payload.directory,
@@ -1788,7 +1800,7 @@ async function executeStartedRun(
     }
   }
   if (payload.conversation) {
-    trace.step = 'resolve-project-environment'
+    step('resolve-project-environment')
     const authority = await input.resolveProjectEnvironment({ ...run, conversationSessionId: payload.conversation.sessionId,
       ...(!mcpContext.value?.mcpConfigProjectId.startsWith('chat:') ? { conversationDirectory: payload.directory } : {}) })
     if (!authority.ok) {
@@ -1836,7 +1848,7 @@ async function executeStartedRun(
     )
   }
   if (resumeTarget && input.resumeServerChosenSession !== false) {
-    trace.step = 'resume-session'
+    step('resume-session')
     const resumed = await input.resumeSession({
       sessionId: resumeTarget.sessionId,
       directory: payload.directory,
@@ -1858,7 +1870,7 @@ async function executeStartedRun(
       input.logDebug?.(
         `[server-automation] original requester session unavailable; using a new apply worker: ${resumed.error}`,
       )
-      trace.step = 'spawn-session'
+      step('spawn-session')
       spawned = await input.spawnSession(workerSpawnInput)
     } else {
       input.logDebug?.(
@@ -1867,7 +1879,7 @@ async function executeStartedRun(
       spawned = resumed
     }
   } else {
-    trace.step = payload.conversation ? 'deliver-conversation' : 'spawn-session'
+    step(payload.conversation ? 'deliver-conversation' : 'spawn-session')
     spawned = payload.conversation
       ? await input.deliverConversation?.({ ...run, sessionId: payload.conversation.sessionId, directory: payload.directory, prompt: initialPrompt }) ?? { ok: false, error: 'conversation delivery unsupported' }
       : await input.spawnSession(workerSpawnInput)
@@ -1879,7 +1891,7 @@ async function executeStartedRun(
       sessionId: spawned.sessionId,
     } : undefined)
     if (issueProgressMarker) {
-      trace.step = 'create-issue-progress-marker'
+      step('create-issue-progress-marker')
       degradedCode = await createIssueProgressMarkerAfterSpawn(
         input,
         automation,
@@ -1902,7 +1914,7 @@ async function executeStartedRun(
         )
         deferGithubWorktreeCleanup(input, run.runId, WORKTREE_CLEANUP_RETRY_MS)
       } else {
-        trace.step = 'discard-github-worktree'
+        step('discard-github-worktree')
         const discarded = await input.discardGithubWorktree({
           repositoryRoot: githubWorktree.repositoryRoot,
           worktreePath: githubWorktree.worktreePath,
@@ -2007,6 +2019,10 @@ export async function runServerAutomationTick(
   const workQueue = [...decryptableAutomations]
   const immediateWorkerIds = new Set<string>()
   while (workQueue.length > 0) {
+    if (input.signal?.aborted) {
+      input.logDebug?.('[server-automation] tick abandoned; leaving the remaining automations to the next tick')
+      break
+    }
     const automation = workQueue.shift()!
     if (automation.paused || automation.migrationPending === true) continue
     const runtimeState = input.runtimeStore.read()
@@ -2125,8 +2141,13 @@ export async function runServerAutomationTick(
         ? { outcome: 'SKIPPED_GATE', sessionId: waitingSessionId }
         : await executeStartedRun(input, automation, payload, { runId, claimToken }, githubMode, trace)
     } catch (error) {
-      input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
-      result = { outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_FAILED' }
+      if (error instanceof TickAbandonedError) {
+        input.logDebug?.(`[server-automation] ${automation.automationId} run=${runId} abandoned at ${error.step}; reporting the run as failed so the server releases it`)
+        result = { outcome: 'ERROR', sessionId: null, failureCode: 'TICK_ABANDONED' }
+      } else {
+        input.logDebug?.(`[server-automation] ${automation.automationId} failed: ${error}`)
+        result = { outcome: 'ERROR', sessionId: null, failureCode: 'AUTOMATION_EXECUTION_FAILED' }
+      }
     } finally {
       clearInterval(heartbeat)
     }

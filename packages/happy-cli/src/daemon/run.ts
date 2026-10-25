@@ -4874,8 +4874,9 @@ export async function startDaemon(): Promise<void> {
     const serverAutomationTickRunner = createAutomationTickRunner({
       // Windows standalone: sessions launch through the verified Job owner, so scheduled
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
-      runTick: () => runServerAutomationTick({
+      runTick: (signal) => runServerAutomationTick({
         hostCommandsAllowed: !standaloneWindows,
+        signal,
         delivery: automationDelivery,
         cache: serverAutomationCache,
         runtimeStore: serverAutomationRuntimeStore,

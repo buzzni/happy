@@ -815,6 +815,42 @@ describe('runServerAutomationTick', () => {
     expect(stopped).toContain('last step: spawn-session')
   })
 
+  it('abandonsARunAtTheNextStepOnceTheTickSignalIsAborted', async () => {
+    const { input, transport, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    const controller = new AbortController()
+    input.signal = controller.signal
+    const resolveMcpSpawnContext = input.resolveMcpSpawnContext
+    input.resolveMcpSpawnContext = async (run) => {
+      // 이 await 가 돌아오는 사이 워치독이 tick 을 버렸다.
+      controller.abort()
+      return resolveMcpSpawnContext(run)
+    }
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'FAILED', outcome: 'ERROR', failureCode: 'TICK_ABANDONED',
+    }))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('run=run-1 abandoned at '))
+  })
+
+  it('stopsBeforeTheNextAutomationOnceTheTickIsAbandoned', async () => {
+    const { input, transport, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    const controller = new AbortController()
+    controller.abort()
+    input.signal = controller.signal
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('tick abandoned'))
+  })
+
   // 2026-09-12 프로덕션 — aplus 트리거 설정을 저장하자 generation 이 13 → 14 로 올랐고,
   // pruneRuntimeState 가 옛 generation 의 githubTriggers 행을 통째로 버렸다. 다음 폴링이
   // "baseline recorded from 100 pull requests; nothing fires until a newer one appears" 를
