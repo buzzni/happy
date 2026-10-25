@@ -267,6 +267,8 @@ export interface PendingApprovalSummary {
 }
 
 export interface TaskView {
+    /** Runtime-only consent; absent on older servers. Never persisted or accepted from an agent. */
+    approvalMode?: { mode: 'manual' | 'auto'; origins: string[]; availableOrigins: string[]; expiresAtMs?: number; runtimeId: string }
     schemaVersion: typeof SCHEMA_VERSION
     taskId: TaskId
     taskSpaceId: TaskSpaceId
@@ -370,6 +372,8 @@ export interface ElementDescription {
     currentRole?: string
     currentName?: string
     tag?: string
+    /** Fresh DOM evidence for a local disclosure or a tab controlling a same-document panel. */
+    uiAction?: 'disclosure' | 'tab'
     /** Absolute href when the element is (inside) a link */
     linkUrl?: string
     /** The link's effective browsing-context target (its own, else <base target>, else '') */
@@ -429,6 +433,7 @@ export interface DriverTabHandle {
  * makes; a mismatch is refused (before input) or stopped (after it).
  */
 export interface DispatchExpectation {
+    uiAction?: 'disclosure' | 'tab'
     role: string
     name: string
     linkUrl?: string
@@ -442,6 +447,8 @@ export interface DriverOptions {
     timeoutMs: number
     /** click only */
     expect?: DispatchExpectation
+    /** In-process authorization fence, called immediately before actual input. Never a wire field. */
+    validateDispatch?: () => void
 }
 
 export interface BrowserDriver {
@@ -500,7 +507,10 @@ export interface GetTaskRequest { taskId: TaskId }
 export interface ListTasksRequest { profileId: ProfileId }
 export interface ListTasksResult { tasks: TaskView[] }
 export interface SubscribeRequest { taskId: TaskId; afterSeq: number }
-export interface ApproveRequest { taskId: TaskId; approvalId: ApprovalId; bindingHash: string; requestId: RequestId; decision: 'approve' | 'reject' }
+export interface ActionApprovalRequest { taskId: TaskId; approvalId: ApprovalId; bindingHash: string; requestId: RequestId; decision: 'approve' | 'reject' }
+/** Additive human-only branch of the existing approve capability; never answers a pending approval. */
+export interface ApprovalModeRequest { taskId: TaskId; requestId: RequestId; mode: 'manual' | 'auto'; origins: string[]; runtimeId: string }
+export type ApproveRequest = ActionApprovalRequest | ApprovalModeRequest
 export interface TakeOverRequest { taskId: TaskId; tabId: TabId; expectedEpoch: number; requestId: RequestId }
 export interface ReleaseControlRequest { taskId: TaskId; tabId: TabId; expectedEpoch: number; requestId: RequestId }
 export interface ResumeRequest { taskId: TaskId; expectedVersion: number; requestId: RequestId }
@@ -524,7 +534,7 @@ export type SubscribeResult =
 export interface OpenPageResult { tabId: TabId; actionId: ActionId; url: string; task: TaskView }
 export interface CancelResult { status: 'cancel-accepted'; task: TaskView; fenceAckMs: number }
 export interface ControlResult { leaseEpoch: number; owner: InputOwner; task: TaskView; settling?: boolean }
-export interface ApproveResult { outcome: 'approved' | 'rejected'; task: TaskView; batch?: BatchResult }
+export interface ApproveResult { outcome: 'approved' | 'rejected' | 'mode-updated'; task: TaskView; batch?: BatchResult }
 
 export type InputOwner =
     | { kind: 'agent'; agentSessionId: AgentSessionId; taskId: TaskId; segmentId: BatchId | ActionId }

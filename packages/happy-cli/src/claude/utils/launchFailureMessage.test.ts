@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_NOT_SIGNED_IN_NOTICE, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
+import { CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeAuthenticationFailure, claudeNotSignedInNotice, describeClaudeLaunchFailure, isClaudeTokenRefreshFailure } from './launchFailureMessage';
 
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
 describe('describeClaudeLaunchFailure', () => {
+    it('explains a refused personal credential without treating it as a general startup failure', () => {
+        expect(describeClaudeLaunchFailure(new Error('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED'))).toMatch(/Personal Claude stopped.*account or policy/);
+    });
+
     it('names the root refusal and what to do', () => {
         const message = describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1. stderr: --dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons'));
         expect(message).toMatch(/root/);
@@ -45,3 +49,11 @@ describe('isClaudeTokenRefreshFailure', () => {
     });
 });
 
+
+ it('classifies provider authentication refusals without trusting normal output or arbitrary failures', () => {
+  expect(isClaudeAuthenticationFailure({type:'assistant',error:'authentication_failed'})).toBe(true);
+  expect(isClaudeAuthenticationFailure({is_error:true,errors:['API Error: 401 token expired']})).toBe(true);
+  expect(isClaudeAuthenticationFailure({is_error:true,result:'Failed to authenticate. API Error: 401'})).toBe(true);
+  expect(isClaudeAuthenticationFailure({is_error:false,result:'API Error: 401 example'})).toBe(false);
+  expect(isClaudeAuthenticationFailure({is_error:true,result:'Tool failed: permission denied'})).toBe(false);
+ });

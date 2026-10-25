@@ -240,9 +240,22 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
   inflating it in the Runtime (a 1x1 ZRLE rectangle can expand to 512 KiB). Cost: noVNC uses Hextile
   (more bandwidth over the tunnel).
 - `/viewer/` serves the pinned noVNC client (Runtime image copies Debian bookworm `novnc=1:1.3.0-1`,
-  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The served page reports each
-  viewer WebSocket close code to its same-origin console (`abp-viewer-closed`); on 4002 the console
-  asks for a new ticket and reconnects (noVNC drops the screen on close), showing "reconnecting" in the frame.
+  no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The Runtime adds three inline scripts to
+  `vnc_lite.html` only: one before noVNC's module hands the page's RFB object to its same-origin console as
+  `window.__abpRfb` (first assignment of `scaleViewport`, initial value from the console's
+  `__abpViewerFit`; `viewOnly` from `__abpViewerControl` = the user holds the shown task's control, so
+  without control a wheel over an actual-size screen pans the frame instead of being swallowed), one
+  last in `<head>` restores `?path=` a relay stripped. The third reports each viewer WebSocket close code
+  to the same-origin console (`abp-viewer-closed`); on 4002 the console asks for a new ticket and reconnects
+  (noVNC drops the screen on close), showing "reconnecting" in the frame. Fit / actual size in the
+  console is therefore noVNC's own `scaleViewport` switched in place (same frame, same ticket; the lease
+  and capability are untouched); `resizeSession` is never set, so the display size never changes the
+  remote resolution. Verified with the pinned 1.3.0 (class accessor) and Debian 1.0.0 (prototype accessor).
+- Console (`GET /console`, consolePage.ts; aplus `agent-browser-screen-first`): one column that fills the
+  window — header with the task menu (`#taskMenu`, `#needCount` = tasks needing the user, shown while
+  closed), approval card when one is pending, one state + control bar, then the screen taking the width
+  and the remaining height; Activity and Advanced are buttons on the screen's head line whose panels
+  open under it, closed by default. Fit (`#fitToggle`) / actual size (`#actualSize`) as above.
 - Harness: `poc.mjs up --viewer runtime` (pocStack `viewer: 'runtime'`) is the production layout — no
   websockify, nothing published but the Runtime. The default harness layout still starts and publishes
   noVNC (`ABP_HARNESS_NOVNC=1`) because A11 probes it directly; A04/A09 inject human input with xdotool
@@ -350,3 +363,45 @@ still allowed). Fault-injection hook: `testHooks.guardFailure`.
 - Login completion uses the site's `loginCompleteWhen` (URL prefix + optional text/element);
   login *detection* is still the fixture's `/login` path rule.
 - Harness mode: `testing/fixtureSitePolicy.ts` reproduces the PoC classifier for the synthetic origins.
+
+## Task-scoped Auto (2026-10-23 source candidate)
+
+`approve` accepts either the existing bound action decision or a separate human-only
+`{taskId, requestId, mode: "auto" | "manual", origins, runtimeId}` branch. A mode
+change never consumes a pending approval or resumes a batch. Existing interactive
+`approve` capability and task ownership checks apply; agent grants cannot change modes.
+
+Consent lives only in `BrowserRuntime` memory. Exact origins must have been observed
+in the task and admitted by its grant. A runtime nonce prevents stale clients from
+replaying enables after a restart. Consent expires with the earlier human/agent
+credential, and is discarded on task/session end, cancellation, grant revocation or
+runtime restart. A disabled/replaced consent is checked again immediately before
+CDP input; late descriptions and pointer preparation cannot retain earlier consent.
+
+`policy.ts` applies explicit site policy and handoff rules first. Only unmatched,
+non-form disclosure/tab interactions with live DOM evidence can gain automatic
+classification. Unknown buttons, effectful labels and sensitive contexts still ask;
+Auto never grants general sending, deletion, upload, payment or account privileges.
+The CDP driver recomputes UI evidence after hover alongside the existing label/link/form
+binding. DOM semantics are a conservative classifier, not proof of arbitrary site JS
+being harmless; keep the admitted action set narrow when extending it. The existing
+postcondition requirement for formerly approval-held clicks remains in effect.
+
+The console shows the selected task's mode, exact sites, expiry and an explicit
+scope dialog, with native modal focus/Escape handling. Missing `approvalMode` means
+an older runtime: no enabled Auto control. Neither a new service/model nor a new
+capability token format, organization policy, persisted consent or runtime pin is introduced.
+Source changes require an ordinary reviewed runtime release before installed users see them.
+
+Review hardening: consent also records the interactive capability ID, whose revocation
+immediately invalidates the final input fence. Mode bookkeeping preserves the agent's
+stateVersion and wakes subscribers by sequence only. Request IDs are bounded to 64
+per active task, retained to prevent stale enables, and discarded on task/session end.
+At the bound, manual revocation remains possible while further enables require a new
+task. Failed requests are retriable only while no newer user choice superseded them;
+in-flight requests never report success early. UI-evidence comparison applies only to
+clicks that actually gained permission from Auto, preserving manual/site-auto behavior.
+
+### Desktop approval entry
+
+The console advertises task-scoped controls with `window.__abpTaskAutoControls === 1`. Desktop scoped launches withhold the interactive capability until this marker is confirmed. An older console never receives it through that path. `agentSessionId` is a UI selection hint, not authority: the task API still checks the capability owner/profile. An empty scope clears the previous selection and never picks another conversation. Approval cards share the explicit scope dialog; changing mode does not answer their pending approval.

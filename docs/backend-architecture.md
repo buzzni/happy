@@ -426,3 +426,21 @@ With `include_legacy=1`, legacy records come back without an envelope; the web
 history reader opts in and uses the encrypted content. Retire this compatibility
 only after web producers and stored history have migrated to a distinct event
 type. No database migration or plaintext inspection is needed.
+
+## Turn-ready session events
+
+When a CLI or daemon reports `POST /v1/sessions/:sessionId/push-event` with
+`kind: 'done'`, the server also writes a `turn-ready` session event whose content
+is `{ t: 'plain' }`. It records only that the session went idle, never any
+conversation text. Saycode web-ui's mobile completion push reads it with
+`GET /v3/sessions/:sessionId/events?type=turn-ready` for sessions sealed with a
+per-session data key, whose `turn-end` messages the server cannot decrypt. A
+SILENT automation run does not write it, matching the push suppression. A failure
+to write it is logged and does not block the existing ephemeral or push path.
+`POST /v3/sessions/:sessionId/events` rejects `turn-ready`: only the server writes
+it, so a client cannot end a completion watch without the CLI's `done`.
+
+The CLI sends `done` only when no input is waiting, and not for managed runs, so
+the event carries no turn status: readers treat it as a completed turn. Revisit if
+the CLI starts reporting each turn's status to the server, or if managed runs need
+completion pushes.

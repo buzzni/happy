@@ -1,3 +1,5 @@
+export const PERSONAL_CLAUDE_AUTH_FAILURE = 'CLAUDE_PERSONAL_AUTH_NOT_VERIFIED';
+
 /**
  * What the user is told when Claude Code exits before its first SDK message (Desktop
  * specs/headless-standalone-server R21). The SDK's error already carries the child's stderr, but that
@@ -6,6 +8,7 @@
  */
 export function describeClaudeLaunchFailure(error: unknown): string {
     const text = error instanceof Error ? error.message : String(error);
+    if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';
     const code = (error as { code?: unknown } | null)?.code;
     if (/cannot be used with root\/sudo privileges/i.test(text)) {
         return 'Claude Code could not start: it refuses to run with permission prompts skipped as root. '
@@ -44,3 +47,13 @@ export function isClaudeTokenRefreshFailure(result: { is_error?: unknown; result
         && /oauth session expired and could not be refreshed/i.test(result.result);
 }
 
+
+/** Only a failed provider result is evidence; quoted assistant/tool text never is. */
+export function isClaudeAuthenticationFailure(value: { type?: unknown; error?: unknown; is_error?: unknown; result?: unknown; errors?: unknown; subtype?: unknown }): boolean {
+    if (value.type === 'assistant' && value.error === 'authentication_failed') return true;
+    if (value.is_error !== true) return false;
+    const texts = [value.result, ...(Array.isArray(value.errors) ? value.errors : [])];
+    return texts.some(text => typeof text === 'string' && (/^not logged in\b/i.test(text.trim())
+        || /oauth session expired and could not be refreshed/i.test(text)
+        || /^(?:API Error: 401\b|Failed to authenticate\b)/i.test(text.trim())));
+}
