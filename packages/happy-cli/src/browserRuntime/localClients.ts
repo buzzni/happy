@@ -133,8 +133,9 @@ export async function openLocalClients(options: LocalClientOptions) {
                 const ownerGrant = owner.credential
                 if (req.origins.some(o => !ownerGrant.allowedOrigins.includes(o)))
                     throw new BrowserRuntimeError('SCOPE_DENIED', 'Client origin is outside owner policy')
-                if (Object.values(records).filter(r => !r.revoking && r.principalId === owner.credential.principalId).length >= 16) throw new BrowserRuntimeError('CONFLICT', 'Too many local client connections')
-                const now = options.now(), clientSecret = randomBytes(32).toString('base64url')
+                const now = options.now()
+                if (Object.values(records).filter(r => !r.revoking && r.expiresAtMs > now && r.principalId === owner.credential.principalId).length >= 16) throw new BrowserRuntimeError('CONFLICT', 'Too many local client connections')
+                const clientSecret = randomBytes(32).toString('base64url')
                 const r: ClientRecord = { clientSessionId: `client-${randomUUID()}`, secretHash: hash(clientSecret),
                     principalId: owner.credential.principalId, workspaceId: owner.credential.workspaceId, machineId: owner.credential.machineId,
                     profileId: owner.credential.profileId, assignmentId: owner.credential.assignmentId,

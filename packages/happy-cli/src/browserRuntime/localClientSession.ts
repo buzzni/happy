@@ -19,9 +19,12 @@ export function createLocalClientSession(options: {
         const approver = options.approver()
         if (!approver) throw new Error('Human approval is unavailable in this session')
         const timeout = AbortSignal.timeout(120_000)
+        const approvalSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+        approvalSignal.throwIfAborted()
         const answer = await approver.requestPolicyApproval({ id: randomUUID(), toolName, args,
             policy: { reasonCode: 'browser_client_delegation', ruleId: 'browser-local-client', humanOnly: true, grantOffer: 'once' },
-            signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+            signal: approvalSignal })
+        approvalSignal.throwIfAborted()
         if (!answer.approved) throw new Error('User did not approve this connection')
     }
     return {
@@ -56,7 +59,7 @@ export function createLocalClientSession(options: {
                 const pinnedFile = `/proc/self/fd/${directory.fd}/${basename(output)}`
                 const code = await dependencies.command(['create', '--space', args.taskSpaceId, '--profile', profileId,
                     ...args.origins.flatMap(origin => ['--origin', origin]), '--lease-minutes', String(args.leaseMinutes), '--out', pinnedFile], {
-                    allowCreate: true, env: { HAPPY_BROWSER_TASK_SESSION_SECRET: options.sessionSecret,
+                    allowCreate: true, signal, env: { HAPPY_BROWSER_TASK_SESSION_SECRET: options.sessionSecret,
                         HAPPY_BROWSER_TASK_BROKER_SOCKET: options.socketPath, HAPPY_BROWSER_TASK_RUNTIME_URL: options.runtimeUrl },
                     output: value => responses.push(value), broker: dependencies.broker,
                 })

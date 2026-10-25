@@ -248,3 +248,10 @@ it('revocation succeeds with cleanup pending and does not spend an active connec
     h.clock.advance(60_001); await h.broker().sweepOrphans()
     expect(h.store.getSpace(h.space.taskSpaceId)?.tabs).not.toContain(page.tabId)
 })
+it('admits a new connection after all sixteen leases expire before the next cleanup sweep', async () => {
+    const h = await harness()
+    for (let n = 0; n < 16; n++) expect((await h.create()).status).toBe(200)
+    expect((await h.create()).status).toBe(409)
+    h.clock.advance(60_001)
+    expect((await h.create()).status).toBe(200)
+})

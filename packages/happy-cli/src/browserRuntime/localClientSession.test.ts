@@ -29,6 +29,30 @@ it.skipIf(process.platform !== 'linux')('uses the captured parent credential aft
     expect(JSON.stringify(reply)).not.toMatch(/parent-secret|bounded-secret/)
     expect(process.env.HAPPY_BROWSER_TASK_SESSION_SECRET).toBeUndefined()
 })
+it.skipIf(process.platform !== 'linux')('revokes a registration delivered after cancellation and leaves no connection file', async () => {
+    const h = await setup(true)
+    const controller = new AbortController()
+    const register = h.broker.getMockImplementation()!
+    h.broker.mockImplementationOnce(async (...args) => {
+        const result = await register(...args)
+        controller.abort(new Error('Caller cancelled while registration was in flight'))
+        return result
+    })
+    await expect(h.client.create(h.args, controller.signal)).rejects.toThrow()
+    expect(h.broker.mock.calls.map(c => c[1])).toEqual(['register', 'revoke'])
+    expect(h.broker.mock.calls[1]).toEqual(['/local/broker.sock', 'revoke', 'bounded-secret', { schemaVersion: 1 }])
+    await expect(stat(join(h.cwd, 'connection.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+})
+it('does not revoke a connection when cancellation races with the approval answer', async () => {
+    const h = await setup(true)
+    const controller = new AbortController()
+    h.requestPolicyApproval.mockImplementationOnce(async () => {
+        controller.abort(new Error('Caller cancelled before the approval continuation'))
+        return { approved: true, policyGrant: 'once' }
+    })
+    await expect(h.client.revoke('client-lost-file', controller.signal)).rejects.toThrow()
+    expect(h.broker).not.toHaveBeenCalled()
+})
 it('refuses missing approver, denial and paths outside the project without issuing or writing', async () => {
     for (const approved of [null, false]) {
         const h = await setup(approved)

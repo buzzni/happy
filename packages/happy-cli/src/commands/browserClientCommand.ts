@@ -12,6 +12,7 @@ const descriptorSchema = z.object({ schemaVersion: z.literal(1), brokerSocket: z
 type Json = Record<string, any>
 interface Dependencies {
     allowCreate?: boolean
+    signal?: AbortSignal
     env: NodeJS.ProcessEnv
     output(value: unknown): void
     broker(socket: string, action: string, secret: string, body: unknown): Promise<Json>
@@ -103,11 +104,15 @@ export async function handleBrowserClientCommand(args: string[], overrides: Part
             const file = await open(out, 'wx', 0o600)
             let created: Json | undefined
             try {
+                deps.signal?.throwIfAborted()
                 created = await deps.broker(socket, 'register', secret, { schemaVersion: 1, profileId: profile, taskSpaceId: space, origins, leaseMs: minutes * 60_000 })
+                // Keep the response so cancellation can revoke authority already issued by the broker.
+                deps.signal?.throwIfAborted()
                 const descriptor = descriptorSchema.parse({ schemaVersion: 1, brokerSocket: socket, runtimeUrl,
                     clientSecret: created.clientSecret, clientSessionId: created.clientSessionId, profileId: created.profileId,
                     taskSpaceId: created.taskSpaceId, expiresAtMs: created.expiresAtMs })
                 await file.writeFile(JSON.stringify(descriptor) + '\n'); await file.sync()
+                deps.signal?.throwIfAborted()
                 deps.output({ ok: true, file: out, clientSessionId: descriptor.clientSessionId, expiresAtMs: descriptor.expiresAtMs })
             } catch (error) {
                 if (created?.clientSecret) await deps.broker(socket, 'revoke', created.clientSecret, { schemaVersion: 1 }).catch(() => undefined)
