@@ -292,7 +292,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  notConnected:'not connected',waitingHost:'Waiting for Saycode',connected:'Connected',until:'until',unreadable:'capability is not readable',loading:'loading',
  noTasksTitle:'Nothing needs you',noTasks:'no open tasks',others:function(n){return n+' other open task'+(n>1?'s':'')},live:'live',retrying:'retrying',
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
- running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',succeeded:'Finished',failed:'Failed',cancelled:'Cancelled',
+ running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',succeeded:'Finished',failed:'Failed',cancelled:'Cancelled',releaseNeeded:'Release control',
  rLogin:'Take over, sign in on the screen, then release.',rCaptcha:'Take over and complete the verification on the screen, then release.',
  rHandoff:'The agent handed the page to you. Take over to continue.',rApproval:'The agent wants to do something that needs your approval.',
  rControl:'Your input reaches the page. Release when you are done so the agent continues.',rRunning:'The agent is working on it.',
@@ -308,7 +308,7 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  notConnected:'연결 안 됨',waitingHost:'Saycode 연결 대기 중',connected:'연결됨',until:'까지',unreadable:'권한을 읽을 수 없어요',loading:'불러오는 중',
  noTasksTitle:'지금 확인할 작업이 없어요',noTasks:'열린 작업이 없어요',others:function(n){return '다른 작업 '+n+'개'},live:'실시간 연결됨',retrying:'다시 시도 중',
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
- running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',succeeded:'완료됨',failed:'실패',cancelled:'취소됨',
+ running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',succeeded:'완료됨',failed:'실패',cancelled:'취소됨',releaseNeeded:'제어권 반납 필요',
  rLogin:'제어권을 가져와 화면에서 로그인한 뒤 반납하세요.',rCaptcha:'제어권을 가져와 화면에서 확인을 마친 뒤 반납하세요.',
  rHandoff:'에이전트가 화면을 넘겼어요. 제어권을 가져와 이어서 진행하세요.',rApproval:'에이전트가 승인이 필요한 작업을 하려고 해요.',
  rControl:'입력이 화면에 전달되고 있어요. 다 하면 반납해야 에이전트가 이어서 진행해요.',rRunning:'에이전트가 작업하고 있어요.',
@@ -383,7 +383,9 @@ function op(name,body){return fetch('/v1/ops/'+name,{method:'POST',headers:{'con
  * user is still awaited: the same rule as waitsForUser.
  */
 function describe(t){
- // A finished task keeps its last pause/wait reason on the view: the end comes first.
+ // A finished task keeps its last pause/wait reason on the view: the end comes first. A lease of ours that outlived
+ // it is the one thing left to do on it, and the loud one: it fences the profile for the agent until given back.
+ if(finished(t)&&ownLease(t))return {label:T.releaseNeeded,tone:'warn',reason:T.rLeaseAfterEnd,icon:'i-hand'};
  if(finished(t))return {label:T[t.status],tone:t.status==='succeeded'?'ok':'',reason:'',icon:'i-globe'};
  if(t.pendingApproval&&!t.cancelRequested)return {label:T.needApproval,tone:'warn',reason:T.rApproval,icon:'i-shield'};
  if(t.pauseReason==='user-control')return {label:T.userControl,tone:'ok',reason:T.rControl,icon:'i-hand'};
@@ -401,11 +403,11 @@ function describe(t){
 function finished(t){return t.status==='succeeded'||t.status==='failed'||t.status==='cancelled'}
 function chip(el,d){el.className='chip'+(d.tone?' '+d.tone:'');el.textContent=d.label}
 function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.status,pauseReason:t.pauseReason,waitReason:t.waitReason,stateVersion:t.stateVersion,tabs:t.tabs,cancelRequested:t.cancelRequested,uncertainActions:t.uncertainActions},null,2);
- if(!$('tabId').value&&t.tabs&&t.tabs[0])$('tabId').value=t.tabs[0];
+ // The tab the controls name must be this task's: coming back from another task (or a typed id) must not send
+ // the other task's tab (SCOPE_DENIED) — an empty or foreign id falls back to the task's first tab.
+ if(t.tabs&&t.tabs.length&&t.tabs.indexOf($('tabId').value.trim())<0)$('tabId').value=t.tabs[0];
  var d=describe(t);$('placeholder').hidden=true;$('detail').hidden=false;
- // A lease of ours that outlived the task is the one thing left to do on it: say so where the reason goes.
- var reason=finished(t)&&ownLease(t)?T.rLeaseAfterEnd:d.reason;
- $('detailTitle').textContent=d.label||t.taskId; $('detailReason').textContent=reason;$('detailReason').hidden=!reason;$('detailId').textContent=t.taskId;
+ $('detailTitle').textContent=d.label||t.taskId; $('detailReason').textContent=d.reason;$('detailReason').hidden=!d.reason;$('detailId').textContent=t.taskId;
  $('detailTile').className='tile'+(d.tone?' '+d.tone:'');$('detailIcon').setAttribute('href','#'+d.icon);menuLabel();
  // The control a user is most likely to need next is the loud one.
  var done=finished(t),mine=ownLease(t),released=!done&&t.pauseReason==='user-input-complete';
@@ -455,12 +457,16 @@ function listTasks(quiet){if(!S.token)return;quiet=quiet===true;var seq=++S.list
  */
 function applyTasks(tasks,quiet){var shown=S.task;
  if(shown)tasks=tasks.map(function(t){return t.taskId===shown.taskId&&(Number(shown.stateVersion)||0)>=(Number(t.stateVersion)||0)?shown:t});
- tasks=tasks.filter(function(t){return !finished(t)});
+ tasks=tasks.filter(function(t){return !finished(t)||ownLease(t)});
+ // The Runtime lists open tasks only: a finished one whose lease is still ours is carried over from what we know,
+ // ahead of the rest (nothing of the agent's moves until it is given back).
+ [shown].concat(S.tasks).forEach(function(k){if(k&&finished(k)&&ownLease(k)&&!tasks.some(function(t){return t.taskId===k.taskId}))tasks.unshift(k)});
  if(quiet&&menu.open){S.pendingTasks=tasks;return}
  S.pendingTasks=null;S.tasks=tasks;var first=renderTasks();applyControl();
  // Opened to deal with something (or the shown task is over, holds nothing of ours and no other pick is under way):
  // show the first task that needs the user. A finished task whose lease is still ours stays until it is given back.
- if(first&&(S.task?finished(S.task)&&!ownLease(S.task)&&$('taskId').value.trim()===S.task.taskId:!$('taskId').value)){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}}
+ var typed=$('taskId').value.trim();
+ if(first&&(S.task?finished(S.task)&&!ownLease(S.task)&&(!typed||typed===S.task.taskId):!typed)){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}}
 menu.addEventListener('toggle',function(){if(!menu.open&&S.pendingTasks)applyTasks(S.pendingTasks,false)});
 /**
  * The menu's list and the badge, from S.tasks. Returns the first task that needs the user. Cards are reused by task id
@@ -493,7 +499,9 @@ document.addEventListener('visibilitychange',function(){if(S.token&&!menu.open&&
 /** A task's new state (an action's answer, a subscription refresh) reaches the list and the badge, not only the bar. */
 function syncTask(t){var i=-1;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].taskId===t.taskId)i=k;
  var old=i>=0?S.tasks[i]:null;
- if(finished(t)){if(i>=0){S.tasks.splice(i,1);renderTasks()}return}
+ // A finished task leaves the list — unless a lease of ours outlived it: then it stays, loud, until given back, so the
+ // user can get back to it from any other task (its own tab is the only one the release can name).
+ if(finished(t)&&!ownLease(t)){if(i>=0){S.tasks.splice(i,1);renderTasks()}return}
  if(i>=0)S.tasks[i]=t;else S.tasks.push(t);
  if(!old||waitsForUser(old)!==waitsForUser(t)||describe(old).label!==describe(t).label)renderTasks()}
 /**
@@ -503,7 +511,7 @@ function syncTask(t){var i=-1;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].tas
  */
 function holding(){var t=S.task;if(!t)return false;
  // The Runtime admits input while every user lease of the profile is this viewer's: a lease of ours on another task of
- // the profile (opened to look at it) counts too. A finished task holds nothing.
+ // the profile (opened to look at it) counts too, and so does one on a finished task — it fences the profile until given back.
  if(ownLease(t))return true;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].taskId!==t.taskId&&ownLease(S.tasks[k]))return true;return false}
 function ownLease(t){var leases=t.tabLeases;
  // A lease outlives the task's end (stopping a task reclaims only the agent's leases): an own lease on a finished
@@ -512,7 +520,7 @@ function ownLease(t){var leases=t.tabLeases;
  for(var i=0;i<leases.length;i++){var o=leases[i].owner;if(o&&o.kind==='user'&&(!S.viewerSessionId||o.viewerSessionId===S.viewerSessionId)&&(!S.principalId||o.principalId===S.principalId))return true}
  return false}
 /** Same rule as the Runtime's sessionWaiting: the user's move now (a stale approval on a task being cancelled is not). */
-function waitsForUser(t){if(t.cancelRequested)return false;return !!t.pendingApproval||t.status==='awaiting-user'||t.pauseReason==='user-control'
+function waitsForUser(t){if(finished(t))return ownLease(t);if(t.cancelRequested)return false;return !!t.pendingApproval||t.status==='awaiting-user'||t.pauseReason==='user-control'
  ||(t.pauseReason==='grant-expired'&&(t.waitReason==='login'||t.waitReason==='captcha'||t.waitReason==='handoff'))}
 /** The Runtime checks the selected tab's own lease epoch, not a global maximum. */
 function tabEpoch(){var tab=$('tabId').value.trim();var leases=(S.task&&S.task.tabLeases)||[];for(var i=0;i<leases.length;i++)if(leases[i].tabId===tab)return leases[i].leaseEpoch;return 0}
@@ -533,6 +541,8 @@ $('useToken').onclick=function(){if(setCapability($('token').value.trim()))listT
 $('refreshTasks').onclick=listTasks;$('connect').onclick=watch;
 function act(p){var out=$('actionResult');out.className='';out.textContent='…';
  p.then(function(r){var v=r.status||r.outcome||r.owner;out.className='ok';out.textContent=typeof v==='string'?T.ok+' · '+v:T.ok;if(r.task)showTask(r.task);return refresh()})
+ // Giving back the lease of a finished task leaves nothing to do on it: the list says where to go next, now.
+ .then(function(){if(S.task&&finished(S.task)&&!ownLease(S.task))listTasks(true)})
  .catch(function(e){out.className='err';out.textContent=e.message;if(e.body&&e.body.code==='STALE_LEASE')refresh()})}
 function decide(d){var a=S.task&&S.task.pendingApproval;if(!a)return;act(op('approve',{taskId:S.task.taskId,approvalId:a.approvalId,bindingHash:a.bindingHash,requestId:rid(),decision:d}))}
 $('approve').onclick=function(){decide('approve')};$('reject').onclick=function(){decide('reject')};
