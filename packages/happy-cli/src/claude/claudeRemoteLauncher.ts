@@ -1369,6 +1369,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     launchFailure = null;
                 }
 
+                // A batch this generation left uncommitted (stopped, refused) was dropped, not held back.
+                preparingBatch = null;
                 // Reset abort controller and future
                 abortController = null;
                 abortFuture?.resolve(undefined);
