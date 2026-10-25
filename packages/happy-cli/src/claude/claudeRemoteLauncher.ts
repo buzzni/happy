@@ -158,6 +158,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
 
     async function doAbort() {
         logger.debug('[remote]: doAbort');
+        // aplus-dev-studio-desktop#2111 — before any await, so the mark is in place when this RPC answers.
+        session.client.markCurrentTurnAborted?.(); // optional: test doubles of the client omit it; the abort must not depend on it
         session.onAbort();
         setupTokenSwitching?.cancelForStop();
         /*

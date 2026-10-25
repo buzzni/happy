@@ -24,6 +24,7 @@ import type { SessionEnvelope } from "@slopus/happy-wire";
 import { runBashStream } from "./bashStream";
 import { bashStreamSpillStoreFor, removeBashStreamSpillStore, renderBashStreamResult } from "./bashStreamOutput";
 import { getActiveBashStreamCall } from "./bashStreamCallRegistry";
+import { sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 import { requestBrowser, readDaemonControlPort, fetchBrowserStatus, BrowserClientError } from "@/daemon/browserClient";
 import { runBrowserTool, BROWSER_TOOL_NAMES, type BridgeRequest } from "./browserTools";
 import { readFile } from 'node:fs/promises';
@@ -60,6 +61,8 @@ export interface HappyServerHandlers {
     turnCards?: TurnCards;
     protectedBashCwd?: () => string | null;
     trackProtectedBashProcess?: (child: ChildProcess) => void;
+    /** aplus-dev-studio-desktop#2111 — the runner's current turn; absent means bash_stream records belong to no turn. */
+    currentTurnId?: () => number | null;
     browserTaskRuntime?: RuntimeClient;
     /** The granted profile: fixed, or (execution machine H) the one the broker's grant names. */
     browserTaskProfileId?: string | (() => Promise<string>);
@@ -244,7 +247,17 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
                 command: args.command,
                 cwd: protectedCwd ?? args.cwd,
                 detached: Boolean(handlers.protectedBashCwd),
-                onSpawn: handlers.trackProtectedBashProcess,
+                onSpawn: (child) => {
+                    // aplus-dev-studio-desktop#2111 — recorded at spawn so an interrupt can clean it up later.
+                    sessionBackgroundProcesses.record({
+                        sessionId: handlers.client.sessionId,
+                        child,
+                        command: String(args.command),
+                        ownProcessGroup: Boolean(handlers.protectedBashCwd),
+                        turnId: handlers.currentTurnId?.() ?? null,
+                    });
+                    handlers.trackProtectedBashProcess?.(child);
+                },
                 spill,
                 onProgress: (progress) => {
                     const call = getActiveBashStreamCall();
@@ -551,6 +564,7 @@ export async function startHappyServer(
         turnCards?: TurnCards;
         protectedBashCwd?: () => string | null;
         trackProtectedBashProcess?: (child: ChildProcess) => void;
+        currentTurnId?: () => number | null;
     } = {},
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
@@ -633,6 +647,7 @@ export async function startHappyServer(
             turnCards: options.turnCards,
             protectedBashCwd: options.protectedBashCwd,
             trackProtectedBashProcess: options.trackProtectedBashProcess,
+            currentTurnId: options.currentTurnId,
             browserTaskRuntime,
             browserTaskProfileId,
             exitAfterFirstTurn: options.exitAfterFirstTurn,
