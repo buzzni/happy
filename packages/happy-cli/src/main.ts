@@ -48,6 +48,7 @@ import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
 import { readManagedStartup } from '@/managed/managedStartup';
 import { resolveDaemonMcpConfigEnvironment } from './daemon/daemonMcpConfig'
+import { resolveDaemonStudioOriginEnvironment } from './daemon/daemonStudioOrigin'
 import { waitForDaemonStart } from './daemon/waitForDaemonStart'
 
 
@@ -633,7 +634,14 @@ Conversation history is preserved on the server, but in-flight tool calls are in
         }
         daemonEnv = { ...process.env, HAPPY_APLUS_MCP_CONFIG_URL: presetUrl }
       }
-      daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
+      try {
+        daemonEnv = await resolveDaemonStudioOriginEnvironment(daemonEnv, configuration.serverUrl)
+        daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
+      } catch (error) {
+        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Invalid daemon configuration')
+        process.exit(1)
+        return
+      }
 
       // Spawn detached daemon process.
       // stdio is captured, never ignored: if start-sync dies before its logger
@@ -672,9 +680,20 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       await preflightDaemonControlServer()
       process.exit(0)
     } else if (daemonSubcommand === 'start-sync') {
-      const daemonEnv = await resolveDaemonMcpConfigEnvironment(process.env, { persistExplicit: true })
+      let daemonEnv = process.env
+      try {
+        daemonEnv = await resolveDaemonStudioOriginEnvironment(daemonEnv, configuration.serverUrl)
+        daemonEnv = await resolveDaemonMcpConfigEnvironment(daemonEnv, { persistExplicit: true })
+      } catch (error) {
+        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Invalid daemon configuration')
+        process.exit(1)
+        return
+      }
       if (daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL) {
         process.env.HAPPY_APLUS_MCP_CONFIG_URL = daemonEnv.HAPPY_APLUS_MCP_CONFIG_URL
+      }
+      if (daemonEnv.HAPPY_APLUS_STUDIO_ORIGIN) {
+        process.env.HAPPY_APLUS_STUDIO_ORIGIN = daemonEnv.HAPPY_APLUS_STUDIO_ORIGIN
       }
       await startDaemon()
       process.exit(0)

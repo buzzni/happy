@@ -61,6 +61,8 @@ interface Settings {
   webappUrl?: string
   /** Non-secret endpoint restored when a later CLI invocation restarts the daemon. */
   aplusMcpConfigUrl?: string
+  /** Explicit Studio trust anchor, restored before daemon startup independently of the relay URL. */
+  aplusStudioOrigin?: string
   /**
    * aplus §6-1 Phase 3b — aplus claim setup 커맨드가 남기는 계정 box 공개키
    * (base64). 존재하면 legacy 자격증명에 머신 키를 1회 provisioning 한다.
@@ -178,7 +180,7 @@ export interface DaemonLocallyPersistedState {
   identity?: DaemonIdentity;
 }
 
-export async function readSettings(): Promise<Settings> {
+export async function readSettings(options: { strict?: boolean } = {}): Promise<Settings> {
   if (!existsSync(configuration.settingsFile)) {
     return { ...defaultSettings }
   }
@@ -187,6 +189,10 @@ export async function readSettings(): Promise<Settings> {
     // Read raw settings
     const content = await readFile(configuration.settingsFile, 'utf8')
     const raw = JSON.parse(content)
+    // Trust configuration must distinguish a missing file from an unreadable or malformed one.
+    if (options.strict && (raw === null || typeof raw !== 'object' || Array.isArray(raw))) {
+      throw new Error('Invalid settings structure')
+    }
 
     // Check schema version (default to 1 if missing)
     const schemaVersion = raw.schemaVersion ?? 1;
@@ -214,6 +220,7 @@ export async function readSettings(): Promise<Settings> {
     // Merge with defaults to ensure all required fields exist
     return { ...defaultSettings, ...migrated };
   } catch (error: any) {
+    if (options.strict) throw new Error('Failed to read settings')
     logger.warn(`Failed to read settings: ${error.message}`);
     // Return defaults on any error
     return { ...defaultSettings }
@@ -240,7 +247,8 @@ export async function writeSettings(settings: Settings): Promise<void> {
  * @returns The updated settings
  */
 export async function updateSettings(
-  updater: (current: Settings) => Settings | Promise<Settings>
+  updater: (current: Settings) => Settings | Promise<Settings>,
+  options: { strict?: boolean } = {},
 ): Promise<Settings> {
   // Timing constants
   const LOCK_RETRY_INTERVAL_MS = 100;  // How long to wait between lock attempts
@@ -283,7 +291,7 @@ export async function updateSettings(
 
   try {
     // Read current settings with defaults
-    const current = await readSettings() || { ...defaultSettings };
+    const current = await readSettings(options) || { ...defaultSettings };
 
     // Apply update
     const updated = await updater(current);
