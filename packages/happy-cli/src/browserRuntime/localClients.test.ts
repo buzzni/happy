@@ -255,3 +255,37 @@ it('admits a new connection after all sixteen leases expire before the next clea
     h.clock.advance(60_001)
     expect((await h.create()).status).toBe(200)
 })
+
+it('v2 app consent uses the real broker and runtime, and fences all descendants on revocation', async () => {
+    const h = await harness()
+    const scope = { profileId: 'main', taskSpaceId: h.space.taskSpaceId, origins: ['https://fixture.test'], projectRoot: '/project', outFile: '/project/.private/client.json' }
+    const result = await h.call('/v2/clients/register-app', h.parentSecret, { schemaVersion: 2, requestId: 'register-v2', requestedAtMs: h.clock.now(), ...scope, name: 'Dashboard', leaseMinutes: 1440, rememberSameScope: true })
+    expect(result.status).toBe(200)
+    const app = result.result
+    const g = await h.call('/v2/clients/grant', app.clientSecret, { schemaVersion: 2 }); expect(g.status).toBe(200)
+    expect((await h.grant(app.clientSecret)).status).toBe(401)
+    const auth = verifyToken(g.result.token, { agentKey: key }, h.clock.now())
+    await expect(h.runtime.createTask(auth, { taskSpaceId: h.space.taskSpaceId, requestId: 'v2-task' as never })).resolves.toBeDefined()
+    const second = await h.call('/v2/clients/connect-app', h.parentSecret, { schemaVersion: 2, requestId: 'repeat-v2', requestedAtMs: h.clock.now(), ...scope, appId: app.appId, appSecret: app.appSecret, leaseMinutes: 15 })
+    expect(second.status).toBe(200)
+    const [revoked, raced] = await Promise.all([
+        h.call('/v2/clients/revoke-app', h.parentSecret, { schemaVersion: 2, profileId: 'main', appId: app.appId }),
+        h.call('/v2/clients/connect-app', h.parentSecret, { schemaVersion: 2, requestId: 'raced-v2', requestedAtMs: h.clock.now(), ...scope, appId: app.appId, appSecret: app.appSecret, leaseMinutes: 15 }),
+    ])
+    expect(revoked.result.revoked).toBe(true); expect(raced.status).not.toBe(200)
+    expect((await h.call('/v2/clients/grant', second.result.clientSecret, { schemaVersion: 2 })).status).not.toBe(200)
+    await expect(h.runtime.createTask(auth, { taskSpaceId: h.space.taskSpaceId, requestId: 'after-revoke' as never })).rejects.toThrow()
+    await h.restart()
+    expect((await h.call('/v2/clients/grant', app.clientSecret, { schemaVersion: 2 })).status).not.toBe(200)
+})
+
+it('shares the active connection limit across concurrent v1 and v2 issuance', async () => {
+    const h = await harness()
+    for (let i = 0; i < 15; i++) expect((await h.create()).status).toBe(200)
+    const results = await Promise.all([h.create(), h.call('/v2/clients/register-app', h.parentSecret, {
+        schemaVersion: 2, requestId: 'mixed-limit', requestedAtMs: h.clock.now(), profileId: 'main', taskSpaceId: h.space.taskSpaceId,
+        origins: ['https://fixture.test'], projectRoot: '/project', outFile: '/project/app.json', name: 'Dashboard', leaseMinutes: 15, rememberSameScope: false,
+    })])
+    expect(results.filter(r => r.status === 200)).toHaveLength(1)
+    expect(results.filter(r => r.status === 409)).toHaveLength(1)
+})

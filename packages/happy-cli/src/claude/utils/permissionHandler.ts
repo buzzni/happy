@@ -1,3 +1,4 @@
+import { parseBrowserClientConsent } from '@/browserRuntime/localClientConsent';
 /**
  * Permission Handler for canCallTool integration
  *
@@ -367,7 +368,7 @@ export class PermissionHandler implements PolicyApprover {
             // A messenger answer is yes/no only (R11.4); it never widens to the conversation.
             const policyGrant = response?.policyGrant === 'session' && !response.channelClaim ? 'session' : 'once';
             return result.behavior === 'allow'
-                ? { approved: true, policyGrant }
+                ? { approved: true, policyGrant, ...(request.policy.reasonCode === 'browser_client_delegation' && request.args.browserClientConsentVersion === 2 && !response?.channelClaim ? { browserClientConsent: parseBrowserClientConsent(response?.updatedInput?.browserClientConsent) } : {}) }
                 : { approved: false, policyGrant: 'once', reason: response?.reason, userReason: response?.userReason };
         } catch (error) {
             // An abort was already recorded by the request's own abort handler; this covers the rest.

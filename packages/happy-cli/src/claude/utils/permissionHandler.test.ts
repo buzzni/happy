@@ -927,6 +927,13 @@ describe('PermissionHandler tool policy approvals (aplus-dev-studio specs/agent-
         return handler.requestPolicyApproval({ id: 'toolu_policy', toolName: 'mcp__cua-driver__click', args: { pid: 13 }, policy: POLICY, signal });
     }
 
+    it('passes browser consent only from the human reply, never the requested arguments', async () => {
+        const stub = createRecordingSessionStub(), handler = new PermissionHandler(stub.session);
+        const pending = handler.requestPolicyApproval({ id: 'browser-v2', toolName: 'browser_task_create_client', args: { browserClientConsentVersion: 2, browserClientConsent: { leaseMinutes: 1440, rememberSameScope: true } }, policy: { ...POLICY, reasonCode: 'browser_client_delegation', humanOnly: true, grantOffer: 'once' }, signal: new AbortController().signal });
+        await stub.answer({ id: 'browser-v2', approved: true, updatedInput: { browserClientConsent: { leaseMinutes: 15, rememberSameScope: false } } });
+        await expect(pending).resolves.toMatchObject({ browserClientConsent: { leaseMinutes: 15, rememberSameScope: false } });
+    });
+
     it('raises an ordinary request that also carries the policy metadata', async () => {
         const stub = createRecordingSessionStub();
         const answered = ask(stub);

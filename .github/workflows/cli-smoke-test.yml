@@ -65,6 +65,17 @@ jobs:
         fi
         pnpm --filter @buzzni/happy-cli exec vitest run --project integration-claude-auth-pin
 
+    - name: Verify browser app consent and reconnect recovery
+      timeout-minutes: 10
+      run: |
+        pnpm --filter @buzzni/happy-cli exec vitest run --project unit \
+          src/browserRuntime/localClientApps.test.ts \
+          src/browserRuntime/localClientConsent.test.ts \
+          src/browserRuntime/localClientSession.test.ts \
+          src/browserRuntime/localClientReconnect.test.ts \
+          src/browserRuntime/localClients.test.ts \
+          src/commands/browserClientCommand.test.ts
+
     - name: Verify local browser client with Chrome and Unix broker
       if: matrix.node-version == 24
       timeout-minutes: 10

@@ -497,6 +497,13 @@ describe('CodexPermissionHandler tool policy approval (agent-tool-policy R11)', 
         await permission![1](response);
     };
 
+    it('passes a bounded browser consent response through the real permission handler', async () => {
+        const { session } = createSessionMock(), handler = new CodexPermissionHandler(session as any);
+        const pending = handler.requestPolicyApproval({ id: 'browser-v2', toolName: 'browser_task_create_client', args: { browserClientConsentVersion: 2 }, policy: { ...policy, reasonCode: 'browser_client_delegation', humanOnly: true, grantOffer: 'once' }, signal: new AbortController().signal });
+        await answer(session, { id: 'browser-v2', approved: true, updatedInput: { browserClientConsent: { leaseMinutes: 60, rememberSameScope: true } } });
+        await expect(pending).resolves.toMatchObject({ browserClientConsent: { leaseMinutes: 60, rememberSameScope: true } });
+    });
+
     it('raises an ordinary request carrying the policy meta and reads the conversation grant from the answer', async () => {
         const { session, getState } = createSessionMock();
         const handler = new CodexPermissionHandler(session as any);

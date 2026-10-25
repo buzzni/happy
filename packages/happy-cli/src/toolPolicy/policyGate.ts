@@ -52,6 +52,7 @@ export interface PermissionPolicyMeta {
 }
 
 export interface PolicyApprovalAnswer {
+    browserClientConsent?: { leaseMinutes: 15 | 60 | 1440; rememberSameScope: boolean };
     approved: boolean;
     /** R11.3: absent from older clients, which means `once`. */
     policyGrant: 'once' | 'session';
