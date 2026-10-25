@@ -72,7 +72,7 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
             ANTHROPIC_BASE_URL: baseUrl, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1',
 
         };
-        const args: string[][] = [];
+        const args: string[][] = []; const stderr: string[] = [];
         const options = {
             cwd: project, env, settingSources: ['user', 'project', 'local'] as const,
             pathToClaudeCodeExecutable: process.env.HAPPY_CLAUDE_AUTH_PIN_BINARY,
@@ -83,10 +83,10 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
                 // namespace supplies the actual policy path without changing the host's /etc.
                 const command = managedConflict ? 'bwrap' : opts.command;
                 const argv = managedConflict ? ['--ro-bind', '/', '/', '--tmpfs', '/etc', '--ro-bind', '/etc/passwd', '/etc/passwd', '--ro-bind', root, '/etc/claude-code', '--unshare-pid', '--proc', '/proc', '--die-with-parent', '--', opts.command, ...opts.args] : opts.args;
-                const child = spawn(command, argv, { cwd: opts.cwd, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'] }); children.push(child); return child;
+                const child = spawn(command, argv, { cwd: opts.cwd, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'] }); child.stderr?.on('data', chunk => stderr.push(String(chunk))); children.push(child); return child;
             },
         };
-        return { received, options: { ...options, settingSources: [...options.settingSources] }, hooksPath, files, settings, args };
+        return { received, options: { ...options, settingSources: [...options.settingSources] }, hooksPath, files, settings, args, stderr };
     }
     it.each(['default', 'explicit'] as const)('keeps CLAUDE.md, hooks and deny rules through two personal requests (%s sources)', async sources => {
         const f = await prepare(); const originals = f.files.map(path => readFileSync(path, 'utf8'));
@@ -138,7 +138,9 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
             await new Promise(() => {});
         }
         q = queryWithPinnedCredential(sdkQuery, { prompt: prompt(), options: { ...f.options, settings: { disableAllHooks: disableHooks } } }, TOKEN);
-        await expect((async () => { for await (const _ of q!) {} })()).rejects.toThrow('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED');
+        const error = await (async () => { for await (const _ of q!) {} })().then(() => undefined, error => error);
+        const diagnostic = `Policy reload diagnostic: requests=${f.received.length}; child=${f.stderr.join('').slice(-1800)}`;
+        expect(error instanceof Error ? error.message : undefined, diagnostic).toBe('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED');
         expect(f.received).toHaveLength(1); expect(f.received[0].owned).toBe(true);
     }, 30_000);
     it.skipIf(process.platform !== 'linux')('refuses a conflicting managed policy before any prompt reaches the fake endpoint', async () => {
