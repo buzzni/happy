@@ -44,7 +44,10 @@ export const REQUEST_SCHEMAS: Record<Operation, z.ZodType> = {
     finishTask: z.object({ taskId: id, expectedVersion: version, requestId: id }).strict(),
     getTask: z.object({ taskId: id }).strict(),
     subscribe: z.object({ taskId: id, afterSeq: version, waitMs: z.number().int().nonnegative().max(MAX_SUBSCRIBE_WAIT_MS).optional() }).strict(),
-    approve: z.object({ taskId: id, approvalId: id, bindingHash: z.string().min(1), requestId: id, decision: z.enum(['approve', 'reject']) }).strict(),
+    approve: z.union([
+        z.object({ taskId: id, approvalId: id, bindingHash: z.string().min(1), requestId: id, decision: z.enum(['approve', 'reject']) }).strict(),
+        z.object({ taskId: id, requestId: id, mode: z.enum(['manual', 'auto']), origins: z.array(z.string().min(1).max(2048)).max(20), runtimeId: id }).strict(),
+    ]),
     takeOver: z.object({ taskId: id, tabId: id, expectedEpoch: version, requestId: id }).strict(),
     releaseControl: z.object({ taskId: id, tabId: id, expectedEpoch: version, requestId: id }).strict(),
     resume: z.object({ taskId: id, expectedVersion: version, requestId: id }).strict(),

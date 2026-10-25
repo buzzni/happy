@@ -225,6 +225,16 @@ summary::-webkit-details-marker{display:none}
 .menu-panel h2{margin:0;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px}
 .menu-panel h2 svg{color:var(--muted-foreground)}
 @media (prefers-reduced-motion:reduce){*,::before,::after{transition:none!important;animation:none!important}}
+.approval-mode-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+#modeState{font-size:12px;color:var(--muted-foreground)}
+#autoMode[aria-pressed="true"]{color:var(--primary-text);border-color:var(--primary)}
+#modeScope{font-size:12px;color:var(--muted-foreground);overflow-wrap:anywhere;margin:6px 0 0}
+dialog{width:min(420px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;border:0;border-radius:14px;background:var(--card);color:var(--foreground);padding:24px}
+dialog::backdrop{background:rgba(0,0,0,.45)}dialog h2{font-size:18px;margin:0 0 16px}dialog p{font-size:14px;margin:0 0 16px}
+dialog .row{justify-content:flex-end;margin-top:24px}dialog button{height:36px;border:0;background:transparent}
+dialog label{display:flex;align-items:flex-start;gap:8px;font-size:14px;font-weight:400;color:var(--foreground);overflow-wrap:anywhere;margin:8px 0}
+dialog input[type="checkbox"]{width:16px;height:16px;flex:none;padding:0;margin:3px 0;accent-color:var(--primary)}
+#modeError{font-size:12px;color:var(--danger-text);overflow-wrap:anywhere}#modeError:empty{display:none}
 </style></head><body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
 <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
@@ -250,8 +260,8 @@ summary::-webkit-details-marker{display:none}
 <div id="detail" hidden>
 <section class="card" id="approvalBox" hidden><h2><svg aria-hidden="true"><use href="#i-shield"/></svg><span data-t="approvalTitle">Approval required</span></h2>
 <div id="approval"></div>
-<div class="row"><button id="approve" class="primary" type="button" data-t="approve">Approve</button><button id="reject" type="button" data-t="reject">Reject</button></div></section>
-<section class="card bar"><div class="title"><span class="tile" id="detailTile"><svg aria-hidden="true"><use id="detailIcon" href="#i-globe"/></svg></span>
+<div class="row"><button id="approve" class="primary" type="button" data-t="approve">Approve</button><button id="reject" type="button" data-t="reject">Reject</button><button id="approvalAutoMode" type="button" data-t="autoTaskEntry" disabled>Enable Auto for this task</button></div></section>
+<section class="card bar"><div class="approval-mode-row"><span data-t="modeLabel">Approval mode</span><span id="modeState" role="status"></span><button id="autoMode" type="button" aria-pressed="false" disabled>Auto</button></div><p id="modeScope"></p><p id="modeError" role="alert"></p><div class="title"><span class="tile" id="detailTile"><svg aria-hidden="true"><use id="detailIcon" href="#i-globe"/></svg></span>
 <div class="title-text"><h2 id="detailTitle"></h2><p id="detailReason" class="reason"></p><p class="mono muted" id="detailId"></p></div></div>
 <div class="row"><button id="takeOver" class="primary" type="button" data-t="takeOver">Take over</button><button id="release" type="button" data-t="release">Release</button>
 <button id="resume" type="button" data-t="resume">Resume</button><button id="stop" class="danger" type="button" data-t="stop">Stop</button></div>
@@ -274,6 +284,10 @@ summary::-webkit-details-marker{display:none}
 <div class="adv-block"><label data-t="rawTask">Task details</label><pre id="task" class="muted">not connected</pre></div>
 </section>
 </main>
+<dialog id="autoDialog" aria-labelledby="autoDialogTitle"><h2 id="autoDialogTitle" data-t="autoTitle">Enable Auto for this task?</h2>
+<p data-t="autoExplanation">Disclosures and tab changes continue automatically. Sending, deleting and unclear actions still need you.</p>
+<p id="autoTask" class="mono small"></p><div id="autoOrigins"></div><p data-t="autoExpiry">Only this task and the selected sites, until this connection expires. Restarting clears Auto.</p>
+<div class="row"><button id="autoCancel" type="button" data-t="autoCancel">Cancel</button><button id="autoConfirm" type="button" class="primary" data-t="autoConfirm">Enable Auto</button></div></dialog>
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
@@ -281,6 +295,7 @@ var S={cursor:0,seen:{},task:null,tasks:[],pendingTasks:null,listSeq:0,gen:0,tok
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000,HOST_ORIGINS=${hostOrigins};
 var Q=new URLSearchParams(location.search),THEME=Q.get('theme');
 if(THEME==='dark'||THEME==='light')document.documentElement.setAttribute('data-theme',THEME);
+Object.defineProperty(window,'__abpTaskAutoControls',{value:1});
 var LANG=(Q.get('lang')||navigator.language||'en').toLowerCase().indexOf('ko')===0?'ko':'en';
 var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refresh:'Refresh',advanced:'Advanced',taskId:'Task id',tabId:'Tab id (for take over / release)',watch:'Watch task',
  paste:'Paste a capability token',useToken:'Use token',rawTask:'Task details',pickTitle:'Pick a task',pickBody:'Tasks that need you are in the task menu above.',pickTask:'Pick a task',
@@ -314,6 +329,10 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  rControl:'입력이 화면에 전달되고 있어요. 다 하면 반납해야 에이전트가 이어서 진행해요.',rRunning:'에이전트가 작업하고 있어요.',
  rReleased:'계속 진행을 눌러 에이전트에게 넘기거나, 에이전트가 이어서 진행하기를 기다리세요.',rLeaseAfterEnd:'이 작업은 끝났지만 입력 제어권이 아직 이 콘솔에 있어요. 반납해야 에이전트가 브라우저를 다시 쓸 수 있어요.',
  origin:'사이트',expires:'만료',ok:'완료했어요'}};
+Object.assign(M.en,{modeLabel:'Approval mode',manualMode:'Manual',autoOff:'Turn off Auto',autoTitle:'Enable Auto for this task?',autoExplanation:'Disclosures and tab changes continue automatically. Sending, deleting and unclear actions still need your approval. Pending approvals remain unchanged.',autoExpiry:'Only this task and the selected sites, until this connection expires. Restarting clears Auto.',autoCancel:'Cancel',autoConfirm:'Enable Auto',autoUnavailable:'Auto is not available on this runtime.',autoNoSites:'Observe a page in this task before enabling Auto.',autoFailed:'Could not change Auto. Check the task and try again.',autoScope:'Sites',autoTaskEntry:'Enable Auto for this task'});
+Object.assign(M.ko,{modeLabel:'승인 방식',manualMode:'수동',autoOff:'Auto 끄기',autoTitle:'이 작업에서 Auto를 켤까요?',autoExplanation:'접기·펼치기와 탭 전환은 자동으로 진행해요. 전송·삭제·불명확한 조작은 계속 확인하고, 이미 대기 중인 승인은 그대로 둬요.',autoExpiry:'현재 작업과 선택한 사이트에만 연결 만료까지 적용해요. 런타임을 다시 시작하면 꺼져요.',autoCancel:'취소',autoConfirm:'Auto 켜기',autoUnavailable:'이 런타임에서는 Auto를 사용할 수 없어요.',autoNoSites:'이 작업에서 페이지를 먼저 확인한 뒤 Auto를 켜세요.',autoFailed:'Auto를 바꾸지 못했어요. 작업을 확인하고 다시 시도하세요.',autoScope:'사이트',autoTaskEntry:'이 작업에서 Auto 켜기'});
+var modeBusy=false,modeDialogTask=null,modeTimer=null,modeTrigger='autoMode';
+var taskSession=new URLSearchParams(location.search).get('agentSessionId');
 var T=M[LANG];document.documentElement.lang=LANG;
 document.querySelectorAll('[data-t]').forEach(function(el){var v=T[el.getAttribute('data-t')];if(typeof v==='string')el.textContent=v});
 document.querySelectorAll('[data-tt]').forEach(function(el){var v=T[el.getAttribute('data-tt')];if(typeof v==='string'){el.title=v;el.setAttribute('aria-label',v)}});
@@ -402,7 +421,7 @@ function describe(t){
 /** The Runtime's terminal statuses: listTasks leaves them out, so the menu does too. */
 function finished(t){return t.status==='succeeded'||t.status==='failed'||t.status==='cancelled'}
 function chip(el,d){el.className='chip'+(d.tone?' '+d.tone:'');el.textContent=d.label}
-function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.status,pauseReason:t.pauseReason,waitReason:t.waitReason,stateVersion:t.stateVersion,tabs:t.tabs,cancelRequested:t.cancelRequested,uncertainActions:t.uncertainActions},null,2);
+function showTask(t){if(taskSession&&t.agentSessionId!==taskSession)return;if(modeDialogTask&&modeDialogTask.taskId!==t.taskId)closeAutoDialog();S.task=t;$('task').textContent=JSON.stringify({status:t.status,pauseReason:t.pauseReason,waitReason:t.waitReason,stateVersion:t.stateVersion,tabs:t.tabs,cancelRequested:t.cancelRequested,uncertainActions:t.uncertainActions},null,2);
  // The tab the controls name must be this task's: coming back from another task (or a typed id) must not send
  // the other task's tab (SCOPE_DENIED) — an empty or foreign id falls back to the task's first tab.
  if(t.tabs&&t.tabs.length&&t.tabs.indexOf($('tabId').value.trim())<0)$('tabId').value=t.tabs[0];
@@ -415,7 +434,7 @@ function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.sta
  // A finished task takes no control, resume or stop (the Runtime answers CONFLICT); a lease of ours that outlived it
  // is still given back here, since it keeps the profile fenced for the agent until then.
  ['takeOver','resume','stop'].forEach(function(id){$(id).disabled=done});$('release').disabled=done&&!mine;
- syncTask(t);markSelected(t.taskId);applyControl();
+ renderMode(t);syncTask(t);markSelected(t.taskId);applyControl();
  // An approval left on a stopped task is nothing to decide (the Runtime answers CONFLICT): the card goes with the task.
  var a=!done&&t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a)}
 /**
@@ -455,14 +474,15 @@ function listTasks(quiet){if(!S.token)return;quiet=quiet===true;var seq=++S.list
  * was answered a moment ago: its own state wins unless the list carries a newer version. A quiet answer landing while
  * the menu is open waits for it to close — the cards under the user's keyboard or pointer stay put.
  */
-function applyTasks(tasks,quiet){var shown=S.task;
+function clearScopedTask(){if(modeDialogTask)closeAutoDialog();S.task=null;++S.gen;$('taskId').value='';$('tabId').value='';$('detail').hidden=true;$('placeholder').hidden=false;menuLabel();applyControl()}
+function applyTasks(tasks,quiet){if(taskSession)tasks=tasks.filter(function(t){return t.agentSessionId===taskSession});var shown=S.task;
  if(shown)tasks=tasks.map(function(t){return t.taskId===shown.taskId&&(Number(shown.stateVersion)||0)>=(Number(t.stateVersion)||0)?shown:t});
  tasks=tasks.filter(function(t){return !finished(t)||ownLease(t)});
  // The Runtime lists open tasks only: a finished one whose lease is still ours is carried over from what we know,
  // ahead of the rest (nothing of the agent's moves until it is given back).
  [shown].concat(S.tasks).forEach(function(k){if(k&&finished(k)&&ownLease(k)&&!tasks.some(function(t){return t.taskId===k.taskId}))tasks.unshift(k)});
  if(quiet&&menu.open){S.pendingTasks=tasks;return}
- S.pendingTasks=null;S.tasks=tasks;var first=renderTasks();applyControl();
+ S.pendingTasks=null;S.tasks=tasks;if(taskSession&&!tasks.length)clearScopedTask();var first=renderTasks();if(taskSession&&!first)first=tasks[0];applyControl();
  // Opened to deal with something (or the shown task is over, holds nothing of ours and no other pick is under way):
  // show the first task that needs the user. A finished task whose lease is still ours stays until it is given back.
  var typed=$('taskId').value.trim();
@@ -529,14 +549,14 @@ function addEvent(e){if(S.seen[e.seq])return;S.seen[e.seq]=1;if(e.seq>S.cursor)S
  var k=document.createElement('span');k.className='k';k.textContent=e.type;var d=document.createElement('span');d.className='d';
  var data=JSON.stringify(e.data);d.textContent=data;d.title=data;line.appendChild(t);line.appendChild(k);line.appendChild(d);$('events').prepend(line)}
 /** A late answer for a task the user has since left (an automatic pick racing a manual one) is dropped. */
-function refresh(){return op('getTask',{taskId:$('taskId').value.trim()}).then(function(t){if(t&&t.taskId===$('taskId').value.trim())showTask(t)})}
+function refresh(){return op('getTask',{taskId:$('taskId').value.trim()}).then(function(t){if(taskSession&&t.agentSessionId!==taskSession){clearScopedTask();return null}if(t&&t.taskId===$('taskId').value.trim())showTask(t);return t})}
 function loop(gen){if(gen!==S.gen)return;
  op('subscribe',{taskId:$('taskId').value.trim(),afterSeq:S.cursor,waitMs:25000}).then(function(r){
   if(gen!==S.gen)return;$('conn').textContent=T.live;
   if(r.kind==='snapshot-required'){S.cursor=r.highWatermarkSeq;S.seen={};showTask(r.snapshot)}
   else if(r.events.length){r.events.forEach(addEvent);return refresh()}
  }).then(function(){loop(gen)},function(e){$('conn').textContent=e.message+' ('+T.retrying+')';setTimeout(function(){loop(gen)},2000)})}
-function watch(){S.cursor=0;S.seen={};$('events').textContent='';var gen=++S.gen;refresh().then(function(){loop(gen)},function(e){$('conn').textContent=e.message})}
+function watch(){S.cursor=0;S.seen={};$('events').textContent='';var gen=++S.gen;refresh().then(function(t){if(t)loop(gen)},function(e){$('conn').textContent=e.message})}
 $('useToken').onclick=function(){if(setCapability($('token').value.trim()))listTasks();$('token').value=''};
 $('refreshTasks').onclick=listTasks;$('connect').onclick=watch;
 function act(p){var out=$('actionResult');out.className='';out.textContent='…';
@@ -545,6 +565,36 @@ function act(p){var out=$('actionResult');out.className='';out.textContent='…'
  .then(function(){if(S.task&&finished(S.task)&&!ownLease(S.task))listTasks(true)})
  .catch(function(e){out.className='err';out.textContent=e.message;if(e.body&&e.body.code==='STALE_LEASE')refresh()})}
 function decide(d){var a=S.task&&S.task.pendingApproval;if(!a)return;act(op('approve',{taskId:S.task.taskId,approvalId:a.approvalId,bindingHash:a.bindingHash,requestId:rid(),decision:d}))}
+function renderMode(t){clearTimeout(modeTimer);var m=t.approvalMode,active=!!m&&m.mode==='auto'&&m.expiresAtMs>Date.now();
+ var closed=t.cancelRequested||['succeeded','failed','cancelled'].indexOf(t.status)>=0;
+ $('modeState').textContent=active?'Auto':T.manualMode;$('autoMode').textContent=active?T.autoOff:'Auto';
+ $('autoMode').setAttribute('aria-pressed',String(active));$('autoMode').disabled=closed||!m||(!active&&!m.availableOrigins.length);
+ if(active&&document.activeElement===$('approvalAutoMode'))$('autoMode').focus();$('approvalAutoMode').hidden=active;$('approvalAutoMode').disabled=$('autoMode').disabled;
+ $('autoMode').setAttribute('aria-busy',String(modeBusy));$('autoMode').setAttribute('aria-disabled',String(modeBusy||$('autoMode').disabled));$('approvalAutoMode').setAttribute('aria-busy',String(modeBusy));
+ $('modeScope').textContent=!m?T.autoUnavailable:active?T.autoScope+' · '+m.origins.join(', ')+' · '+hhmm(m.expiresAtMs):!m.availableOrigins.length?T.autoNoSites:'';
+ if(active)modeTimer=setTimeout(function(){if(S.task&&S.task.taskId===t.taskId){renderMode(S.task);refresh().catch(function(){})}},Math.min(2147483647,Math.max(1,m.expiresAtMs-Date.now())));
+}
+function closeAutoDialog(){$('autoDialog').close();modeDialogTask=null;$(modeTrigger).focus()}
+$('autoDialog').addEventListener('cancel',function(){modeDialogTask=null;setTimeout(function(){$(modeTrigger).focus()},0)});
+$('autoCancel').onclick=closeAutoDialog;
+$('autoOrigins').onchange=function(){$('autoConfirm').disabled=!$('autoOrigins').querySelector('input:checked')};
+function changeMode(task,mode,origins){if(modeBusy)return;modeBusy=true;$('modeError').textContent='';renderMode(S.task);
+ var token=S.token,taskId=task.taskId;
+ return op('approve',{taskId:taskId,requestId:rid(),mode:mode,origins:origins,runtimeId:task.approvalMode.runtimeId}).then(function(r){
+  if(S.token!==token)return;
+  if(S.task&&S.task.taskId===taskId)showTask(r.task);
+ },function(){if(S.token===token&&S.task&&S.task.taskId===taskId)$('modeError').textContent=T.autoFailed;
+ }).finally(function(){modeBusy=false;if(S.task)renderMode(S.task)})}
+function openAutoMode(trigger){modeTrigger=trigger;var t=S.task,m=t&&t.approvalMode;if(!m||modeBusy)return;
+ if(m.mode==='auto')return changeMode(t,'manual',[]);
+ modeDialogTask=t;$('autoTask').textContent=t.taskId;var box=$('autoOrigins');box.textContent='';
+ m.availableOrigins.forEach(function(origin){var label=document.createElement('label'),input=document.createElement('input');input.type='checkbox';input.checked=true;input.value=origin;label.appendChild(input);label.appendChild(document.createTextNode(origin));box.appendChild(label)});
+ $('autoConfirm').disabled=!m.availableOrigins.length;$('autoDialog').showModal();$('autoCancel').focus()};
+$('autoMode').onclick=function(){return openAutoMode('autoMode')};
+$('approvalAutoMode').onclick=function(){return openAutoMode('approvalAutoMode')};
+$('autoConfirm').onclick=function(){var t=modeDialogTask;if(!t||!S.task||t.taskId!==S.task.taskId)return closeAutoDialog();
+ var origins=Array.prototype.map.call($('autoOrigins').querySelectorAll('input:checked'),function(input){return input.value});
+ closeAutoDialog();if(origins.length)changeMode(t,'auto',origins)};
 $('approve').onclick=function(){decide('approve')};$('reject').onclick=function(){decide('reject')};
 $('takeOver').onclick=function(){act(op('takeOver',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()}))};
 $('release').onclick=function(){act(op('releaseControl',{taskId:$('taskId').value.trim(),tabId:$('tabId').value.trim(),expectedEpoch:tabEpoch(),requestId:rid()}))};

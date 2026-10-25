@@ -105,6 +105,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private readonly commitTails = new Map<TaskId, Promise<unknown>>()
     private readonly eventWaiters = new Map<TaskId, Set<() => void>>()
     private readonly requestFlights = new Map<string, { hash: string; promise: Promise<unknown> }>()
+    private readonly approvalRuntimeId = randomUUID()
+    private readonly autoApprovals = new Map<TaskId, { origins: string[]; expiresAtMs: number; grantId: string; capabilityId: string; epoch: number }>()
+    private readonly approvalModeEpochs = new Map<TaskId, number>()
+    private readonly approvalModeRequests = new Map<TaskId, Map<string, { hash: string; pending: boolean; epoch: number; failed?: true }>>()
     private readonly recovery: Promise<void>
     private readonly cleanup: Promise<void>
     constructor(private readonly options: BrowserRuntimeOptions) {
@@ -198,8 +202,9 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         this.withRequestFlight(auth, req.requestId, { operation: 'submitBatch', ...req }, () => this.submitBatchImpl(auth, req, opts))
     finishTask: BrowserRuntimeApi['finishTask'] = (auth, req) =>
         this.withRequestFlight(auth, req.requestId, { operation: 'finishTask', ...req }, () => this.finishTaskImpl(auth, req))
-    approve: BrowserRuntimeApi['approve'] = (auth, req) =>
-        this.withRequestFlight(auth, req.requestId, { operation: 'approve', ...req }, () => this.approveImpl(auth, req))
+    approve: BrowserRuntimeApi['approve'] = (auth, req) => 'mode' in req
+        ? this.setApprovalMode(auth, req)
+        : this.withRequestFlight(auth, req.requestId, { operation: 'approve', ...req }, () => this.approveImpl(auth, req))
     takeOver: BrowserRuntimeApi['takeOver'] = (auth, req) =>
         this.withRequestFlight(auth, req.requestId, { operation: 'takeOver', ...req }, () => this.takeOverImpl(auth, req))
     releaseControl: BrowserRuntimeApi['releaseControl'] = (auth, req) =>
@@ -927,6 +932,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
      * Idempotent.
      */
     async endSession(agentSessionId: string): Promise<void> {
+        for (const task of this.options.store.listTasks())
+            if (task.agentSessionId === agentSessionId) this.clearApprovalMode(task.taskId)
         await this.recovery
         const tasks = this.options.store.listTasks().filter((task) => task.agentSessionId === agentSessionId)
         const spaceIds = new Set([...this.options.store.listSpaces().filter((space) => {
@@ -1211,6 +1218,93 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 await this.persistTabLease(task.taskId, task.taskSpaceId, lease.tabId, lease.leaseEpoch)
         }
     }
+    private availableAutoOrigins(task: StoredTask): string[] {
+        const grant = task.agentGrant as AgentGrant | undefined
+        return [...new Set(task.tabs.flatMap(tabId => {
+            const url = this.latestAgentUrls.get(tabId)
+            if (!url || !grant) return []
+            try { return [assertAllowedOrigin(url, grant)] } catch { return [] }
+        }))].slice(0, 20)
+    }
+    private clearApprovalMode(taskId: TaskId): void {
+        this.autoApprovals.delete(taskId)
+        this.approvalModeEpochs.delete(taskId)
+        this.approvalModeRequests.delete(taskId)
+    }
+    private autoApprovalFor(task: StoredTask) {
+        const consent = this.autoApprovals.get(task.taskId)
+        const grant = task.agentGrant as AgentGrant | undefined
+        const space = this.options.store.getSpace(task.taskSpaceId)
+        if (task.cancelRequested || TERMINAL_STATUSES.includes(task.status) || space?.closed
+            || space?.reclaimingSinceMs !== undefined || space?.endedSessionIds?.includes(task.agentSessionId)) {
+            this.clearApprovalMode(task.taskId)
+            return undefined
+        }
+        if (consent && (consent.expiresAtMs <= this.clock.now() || !grant || grant.grantId !== consent.grantId
+            || grant.expiresAtMs <= this.clock.now() || this.options.store.isRevoked(grant.grantId)
+            || this.options.store.isRevoked(consent.capabilityId))) {
+            this.autoApprovals.delete(task.taskId)
+            return undefined
+        }
+        return consent
+    }
+    private async setApprovalMode(auth: AuthContext, req: import('./contracts').ApprovalModeRequest): Promise<ApproveResult> {
+        await this.recovery
+        const task = this.requireTask(req.taskId)
+        await this.authorizeTask(auth, 'approve', task)
+        if (auth.credential.kind !== 'interactive') throw new BrowserRuntimeError('SCOPE_DENIED', 'Only the user can change Auto')
+        if (req.runtimeId !== this.approvalRuntimeId) throw new BrowserRuntimeError('CONFLICT', 'Runtime restarted; refresh before changing Auto')
+        const key = `${auth.credential.capabilityId}/${req.requestId}`
+        const hash = payloadHash(req)
+        const requests = this.approvalModeRequests.get(task.taskId) ?? new Map<string, { hash: string; pending: boolean; epoch: number; failed?: true }>()
+        const prior = requests.get(key)
+        if (prior && prior.hash !== hash) throw new BrowserRuntimeError('CONFLICT', 'requestId was already used with different input')
+        if (prior?.pending) throw new BrowserRuntimeError('CONFLICT', 'Mode request is still being applied; retry the same requestId')
+        if (prior?.failed) {
+            if (prior.epoch !== this.approvalModeEpochs.get(task.taskId))
+                throw new BrowserRuntimeError('CONFLICT', 'This failed mode request was superseded by a newer choice')
+        } else if (prior) return { outcome: 'mode-updated', task: this.view(this.requireTask(req.taskId)) }
+        if (req.mode !== 'auto' && req.mode !== 'manual') throw new BrowserRuntimeError('INVALID_REQUEST', 'Unknown approval mode')
+        const grant = task.agentGrant as AgentGrant | undefined
+        if (req.mode === 'auto') {
+            const available = this.availableAutoOrigins(task)
+            if (!req.origins.length || req.origins.length > 20 || req.origins.some(origin => !available.includes(origin)))
+                throw new BrowserRuntimeError('ORIGIN_DENIED', 'Auto requires exact sites already observed in this task')
+            if (!grant || !this.isCredentialLive({ credential: grant, verifiedAtMs: this.clock.now() })
+                || task.cancelRequested || TERMINAL_STATUSES.includes(task.status))
+                throw new BrowserRuntimeError('CONFLICT', 'Task is no longer available for Auto')
+            if (requests.size - (prior?.failed ? 1 : 0) >= 64) throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'This task reached its Auto mode-change limit; start a new task')
+        }
+        // Keep a failed request’s supersede guard until every retry validation has passed.
+        if (prior?.failed) requests.delete(key)
+        // Revoke synchronously before the journal await. A delayed enable or description cannot race past it.
+        const epoch = (this.approvalModeEpochs.get(task.taskId) ?? 0) + 1
+        this.approvalModeEpochs.set(task.taskId, epoch)
+        this.autoApprovals.delete(task.taskId)
+        // Never evict old enable IDs in a live task: they must not re-enable Auto after a disable.
+        // At the per-task bound manual still revokes, but cannot grow the request map or permit new enables.
+        const recordRequest = requests.size < 64
+        if (recordRequest) requests.set(key, { hash, pending: true, epoch })
+        this.approvalModeRequests.set(task.taskId, requests)
+        try {
+            await this.options.store.mutate(task.taskId, current => ({
+                patch: { stateVersion: current.stateVersion },
+                event: this.event('state-changed', { approvalModeChanged: req.mode }, current.stateVersion),
+            }))
+            const current = this.requireTask(task.taskId)
+            this.checkCredential(auth, 'approve', current.profileId, current.taskSpaceId)
+            if (req.mode === 'auto' && this.approvalModeEpochs.get(task.taskId) === epoch) {
+                this.autoApprovals.set(task.taskId, { origins: [...new Set(req.origins)], capabilityId: auth.credential.capabilityId,
+                    expiresAtMs: Math.min(auth.credential.expiresAtMs, grant!.expiresAtMs), grantId: grant!.grantId, epoch })
+            }
+            if (recordRequest) requests.set(key, { hash, pending: false, epoch })
+            return { outcome: 'mode-updated', task: this.view(current) }
+        } catch (error) {
+            if (recordRequest) requests.set(key, { hash, pending: false, failed: true, epoch })
+            throw error
+        }
+    }
+
     private async approveImpl(auth: AuthContext, req: {
         taskId: TaskId
         approvalId: ApprovalId
@@ -2347,6 +2441,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                     throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'Action intent was not committed')
                 task = intent
                 let description: ElementDescription | undefined
+                const autoConsent = this.autoApprovalFor(task)
+                let usedAutoConsent = false
                 let decision: ReturnType<typeof classifySiteAction> = 'auto'
                 try {
                     if (['click', 'fill'].includes(step.kind)) {
@@ -2366,8 +2462,11 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                             && (description.currentName !== description.name || description.currentRole !== description.role))
                             throw new BrowserRuntimeError('STALE_REF', 'Element label changed since the snapshot; observe again', false, false)
                     }
-                    if (step.actionId !== approvedActionId)
-                        decision = classifySiteAction(this.options.sites, effectiveStep, description)
+                    if (step.actionId !== approvedActionId) {
+                        const manualDecision = classifySiteAction(this.options.sites, effectiveStep, description)
+                        decision = classifySiteAction(this.options.sites, effectiveStep, description, autoConsent?.origins)
+                        usedAutoConsent = manualDecision !== 'auto' && decision === 'auto'
+                    }
                     if (decision === 'deny')
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Site policy refuses this destination', false, false)
                     // Refuse an incomplete plan before creating approval or sending browser input.
@@ -2497,13 +2596,19 @@ export class BrowserRuntime implements BrowserRuntimeApi {
                 if (this.leases.owner(step.tabId, task.profileId).leaseEpoch !== leaseEpoch
                     || await driver.currentOrigin(step.tabId) !== origin)
                     throw new BrowserRuntimeError('STALE_LEASE', 'Input lease or origin changed before dispatch')
+                if (usedAutoConsent && this.autoApprovalFor(task) !== autoConsent)
+                    throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
                 this.leases.assert(step.tabId, task.profileId, task.taskId, batchId, leaseEpoch)
                 const armed = driver as DriverWithAction
                 armed.armAction?.(step.actionId)
                 this.inFlightDriverCalls.add(task.taskId)
                 try {
                     const dispatchResult = await this.dispatch(driver, effectiveStep, grant, controller.signal,
-                        step.kind === 'click' && description ? dispatchExpectation(description) : undefined)
+                        step.kind === 'click' && description ? dispatchExpectation(description, usedAutoConsent) : undefined,
+                        usedAutoConsent ? () => {
+                            if (this.autoApprovalFor(this.requireTask(task.taskId)) !== autoConsent)
+                                throw new BrowserRuntimeError('APPROVAL_REQUIRED', 'Auto was disabled or expired before input', false, false)
+                        } : undefined)
                     const finalOrigin = await driver.currentOrigin(step.tabId)
                     if (!originAllowed(grant.allowedOrigins, finalOrigin))
                         throw new BrowserRuntimeError('ORIGIN_DENIED', 'Action navigated to a disallowed origin', false, false)
@@ -2722,8 +2827,8 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         }
     }
     private async dispatch(driver: BrowserDriver, step: BatchStep, grant: AgentGrant,
-        signal: AbortSignal, expect?: DispatchExpectation): ReturnType<typeof dispatchStep> {
-        return dispatchStep(driver, step, grant, signal, expect)
+        signal: AbortSignal, expect?: DispatchExpectation, validateDispatch?: () => void): ReturnType<typeof dispatchStep> {
+        return dispatchStep(driver, step, grant, signal, expect, validateDispatch)
     }
     /**
      * `guard` runs against the current task inside the serialized write; if it throws,
@@ -2900,7 +3005,12 @@ export class BrowserRuntime implements BrowserRuntimeApi {
     private allocateTabId(): TabId { return `lease-reservation-${randomUUID()}` as TabId; }
     private view(task: StoredTask): TaskView { const { owner: _owner, agentGrant: _grant, actions: _actions, approvals: _approvals,
         batches: _batches, dedupe: _dedupe, tabTargets: _tabTargets, tabLeaseEpochs: _tabLeaseEpochs,
-        __events: _events, lastSeq: _lastSeq, ...view } = task; return structuredClone({ ...view,
+        __events: _events, lastSeq: _lastSeq, ...view } = task;
+        const auto = this.autoApprovalFor(task)
+        return structuredClone({ ...view,
+        approvalMode: { mode: auto ? 'auto' as const : 'manual' as const, origins: auto?.origins ?? [],
+            availableOrigins: this.availableAutoOrigins(task), runtimeId: this.approvalRuntimeId,
+            ...(auto ? { expiresAtMs: auto.expiresAtMs } : {}) },
         tabLeases: task.tabs.map((tabId) => ({ tabId, ...this.leases.owner(tabId, task.profileId) })) }); }
     private taskRequest(task: StoredTask, auth: AuthContext, requestId: string,
         payload: unknown): unknown | undefined { const key = requestKey(auth, requestId); const old = task.dedupe[key]; if (!old)
@@ -3004,10 +3114,11 @@ function safeError(error: unknown): RuntimeErrorBody {
 }
 
 /** What the driver must find again right before a click: the classified label, link and submission. */
-function dispatchExpectation(description: ElementDescription): DispatchExpectation {
+function dispatchExpectation(description: ElementDescription, autoUiAction = false): DispatchExpectation {
     return {
         role: description.currentRole ?? description.role,
         name: description.currentName ?? description.name,
+        ...(autoUiAction && description.uiAction ? { uiAction: description.uiAction } : {}),
         ...(description.linkUrl ? { linkUrl: description.linkUrl, linkTarget: description.linkTarget ?? '' } : {}),
         ...(description.form ? { formDigest: description.form.digest } : {}),
     }

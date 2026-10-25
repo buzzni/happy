@@ -42,6 +42,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
     /** A long poll that does not answer within the test, as a quiet task does. */
     let holdSubscribe = false
     let listedTasks: Array<Record<string, unknown>> = defaultTasks()
+    let rejectModeChanges = false
     let taskDetail: Record<string, unknown> | undefined
     /** Per-task getTask answers, ahead of taskDetail (a list whose tasks the detail must agree with). */
     let taskDetails: Record<string, Record<string, unknown>> = {}
@@ -89,6 +90,12 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
             req.on('end', () => {
                 const body = JSON.parse(raw || '{}')
                 ops.push({ op: m[1], bearer: String(req.headers.authorization ?? '').replace(/^Bearer /, ''), body })
+                if (m[1] === 'approve' && body.mode) {
+                    if (rejectModeChanges) { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: { code: 'RUNTIME_UNAVAILABLE', message: 'fixture failure' } })); return }
+                    if (taskDetail) taskDetail.approvalMode = { ...(taskDetail.approvalMode as object), mode: body.mode,
+                        origins: body.origins, ...(body.mode === 'auto' ? { expiresAtMs: Date.now() + 60_000 } : {}) }
+                    res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, result: { outcome: 'mode-updated', task: taskDetail } })); return
+                }
                 const result = m[1] === 'listTasks'
                     ? { tasks: listedTasks }
                     : m[1] === 'getTask'
@@ -126,7 +133,7 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         const listed = await eventually(() => ops.find((entry) => entry.op === 'listTasks'), Boolean, 10_000)
         expect(listed).toMatchObject({ bearer: first, body: { profileId: 'profile-a' } })
         expect(await harness.evaluate(target, 'location.hash + "|" + sessionStorage.length + "|" + localStorage.length')).toBe('|0|0')
-        expect(await harness.evaluate(target, 'document.getElementById("tasks").textContent')).toContain('task-1')
+        expect(await eventually(() => harness.evaluate(target, 'document.getElementById("tasks")?.textContent'), text => text?.includes('task-1'))).toContain('task-1')
         await harness.closeTarget(target)
     }, 30_000)
 
@@ -748,4 +755,85 @@ describe.skipIf(!chromePath)('console page (real Chrome)', () => {
         await harness.evaluate(studio, 'window.__console.close()')
         await harness.closeTarget(studio)
     }, 30_000)
+    it('limits conversation links to that conversation and never picks another on an empty match', async () => {
+        holdSubscribe = true
+        listedTasks = [
+            { taskId: 'mine', agentSessionId: 'current', status: 'paused', tabs: ['tab-1'] },
+            { taskId: 'other', agentSessionId: 'different', status: 'awaiting-user', tabs: ['tab-2'] },
+        ]
+        taskDetail = { ...listedTasks[0], approvalMode: { mode: 'manual', origins: [], availableOrigins: [origin], runtimeId: 'runtime-test' } }
+        const cap = token('scoped', Date.now() + 600_000)
+        const target = await harness.openFrontTab(`${origin}/console?agentSessionId=current#abp-cap=${cap}`)
+        const empty = await harness.openFrontTab(`${origin}/console?agentSessionId=missing#abp-cap=${cap}`)
+        try {
+            await eventually(() => harness.evaluate(target, 'document.getElementById("tasks").textContent'), text => text.includes('mine'))
+            expect(await harness.evaluate(target, `document.querySelector('[data-task="other"]') !== null`)).toBe(false)
+            expect(await eventually(() => harness.evaluate(target, 'document.getElementById("detailId")?.textContent'), text => text === 'mine')).toBe('mine')
+            expect(await eventually(() => harness.evaluate(empty, 'document.getElementById("tasks").textContent'), text => !text.includes('Loading'))).not.toContain('other')
+            expect(await harness.evaluate(empty, 'document.getElementById("detail").hidden')).toBe(true)
+        } finally { await harness.closeTarget(target); await harness.closeTarget(empty); taskDetail = undefined; listedTasks = defaultTasks(); holdSubscribe = false }
+    }, 30_000)
+
+    it('selects a new conversation task after the scoped list was empty', async () => {
+        holdSubscribe = true
+        listedTasks = [{ taskId: 'before-empty', agentSessionId: 'current', status: 'awaiting-user', tabs: ['tab-1'] }]
+        taskDetail = { ...listedTasks[0] }
+        const target = await harness.openFrontTab(`${origin}/console?agentSessionId=current#abp-cap=${token('empty', Date.now() + 600_000)}`)
+        try {
+            await eventually(() => harness.evaluate(target, 'document.getElementById("detailId")?.textContent'), t => t === 'before-empty')
+            listedTasks = []
+            await harness.evaluate(target, 'document.getElementById("refreshTasks").click()')
+            await eventually(() => harness.evaluate(target, 'document.getElementById("detail").hidden'), v => v === true)
+            expect(await harness.evaluate(target, 'document.getElementById("taskId").value')).toBe('')
+            listedTasks = [{ taskId: 'after-empty', agentSessionId: 'current', status: 'paused', tabs: ['tab-2'] }]
+            taskDetail = { ...listedTasks[0] }
+            await harness.evaluate(target, 'document.getElementById("refreshTasks").click()')
+            expect(await eventually(() => harness.evaluate(target, 'document.getElementById("detailId")?.textContent'), t => t === 'after-empty')).toBe('after-empty')
+        } finally { await harness.closeTarget(target); taskDetail = undefined; listedTasks = defaultTasks(); holdSubscribe = false }
+    }, 30_000)
+
+    it('confirms Auto scope, preserves pending approval, handles Escape and disables Auto', async () => {
+        ops.length = 0; holdSubscribe = true
+        taskDetail = { taskId: 'task-1', status: 'awaiting-user', stateVersion: 3, tabs: ['tab-1'],
+            pendingApproval: { approvalId: 'pending', bindingHash: 'bound', origin, description: 'Send draft', expiresAtMs: Date.now() + 60_000 },
+            approvalMode: { mode: 'manual', origins: [], availableOrigins: [origin], runtimeId: 'runtime-test' } }
+        const target = await harness.openFrontTab(`${origin}/console?lang=ko#abp-cap=${token('mode', Date.now() + 600_000)}`)
+        try {
+            await eventually(() => harness.evaluate(target, 'document.getElementById("autoMode")?.disabled'), value => value === false)
+            await harness.evaluate(target, 'document.getElementById("autoMode").click()')
+            expect(await harness.evaluate(target, 'document.getElementById("autoDialog").open')).toBe(true)
+            expect(await harness.evaluate(target, 'document.getElementById("autoOrigins").textContent')).toBe(origin)
+            expect(ops.some(entry => entry.op === 'approve')).toBe(false)
+            const { sessionId } = await harness.conn.send('Target.attachToTarget', { targetId: target, flatten: true })
+            await harness.conn.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, sessionId)
+            await harness.conn.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, sessionId)
+            await harness.conn.send('Target.detachFromTarget', { sessionId })
+            await eventually(() => harness.evaluate(target, 'document.getElementById("autoDialog").open'), open => open === false)
+            expect(await eventually(() => harness.evaluate(target, 'document.activeElement.id'), id => id === 'autoMode')).toBe('autoMode')
+            await harness.evaluate(target, 'document.getElementById("approvalAutoMode").click();document.getElementById("autoConfirm").click()')
+            await eventually(() => harness.evaluate(target, 'document.getElementById("autoMode").getAttribute("aria-pressed")'), value => value === 'true')
+            expect(await harness.evaluate(target, 'document.activeElement.id')).toBe('autoMode')
+            expect(ops.find(entry => entry.op === 'approve')?.body).toMatchObject({ taskId: 'task-1', mode: 'auto', origins: [origin], runtimeId: 'runtime-test' })
+            expect(ops.find(entry => entry.op === 'approve')?.body.approvalId).toBeUndefined()
+            expect(await harness.evaluate(target, 'document.getElementById("approvalBox").hidden')).toBe(false)
+            await harness.evaluate(target, 'document.getElementById("autoMode").click()')
+            await eventually(() => harness.evaluate(target, 'document.getElementById("autoMode").getAttribute("aria-pressed")'), value => value === 'false')
+            expect(ops.filter(entry => entry.op === 'approve').map(entry => entry.body.mode)).toEqual(['auto', 'manual'])
+        } finally { await harness.closeTarget(target); taskDetail = undefined; holdSubscribe = false }
+    }, 30_000)
+
+    it('keeps manual mode and presents a retryable error when changing Auto fails', async () => {
+        holdSubscribe = true; rejectModeChanges = true
+        taskDetail = { taskId: 'task-1', status: 'paused', stateVersion: 3, tabs: ['tab-1'],
+            approvalMode: { mode: 'manual', origins: [], availableOrigins: [origin], runtimeId: 'runtime-test' } }
+        const target = await harness.openFrontTab(`${origin}/console?lang=ko#abp-cap=${token('mode-error', Date.now() + 600_000)}`)
+        try {
+            await eventually(() => harness.evaluate(target, 'document.getElementById("autoMode")?.disabled'), value => value === false)
+            await harness.evaluate(target, 'document.getElementById("autoMode").click();document.getElementById("autoConfirm").click()')
+            await eventually(() => harness.evaluate(target, 'document.getElementById("modeError").textContent'), text => text.includes('바꾸지 못했어요'))
+            expect(await harness.evaluate(target, 'document.getElementById("autoMode").getAttribute("aria-pressed")')).toBe('false')
+            expect(await harness.evaluate(target, 'document.getElementById("autoMode")?.disabled')).toBe(false)
+        } finally { await harness.closeTarget(target); taskDetail = undefined; holdSubscribe = false; rejectModeChanges = false }
+    }, 30_000)
+
 })
