@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createSessionScanner } from '@/claude/utils/sessionScanner';
+import { getProjectPath } from '@/claude/utils/path';
 import { OutgoingMessageQueue } from '@/claude/utils/OutgoingMessageQueue';
 import { SDKToLogConverter } from '@/claude/utils/sdkToLogConverter';
 import { withContextUsageSignals } from '@/claude/claudeContextUsage';
@@ -152,7 +157,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
         { sdkRunId: undefined, scannerRunId: 'run-1' },
     ].flatMap(identity => ['follow-up', 'idle', 'unrelated'].flatMap(phase =>
         ['sdk', 'scanner'].map(first => ({ ...identity, phase, first })))))(
-        'T2RT-07 consumes completion once (sdk=$sdkRunId, scanner=$scannerRunId, late=$phase, first=$first)',
+        'T2RT-07 preserves correlation and only deduplicates proven identities (sdk=$sdkRunId, scanner=$scannerRunId, late=$phase, first=$first)',
         async ({ sdkRunId, scannerRunId, phase, first }) => {
             const h = harness(true);
             const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
@@ -201,30 +206,164 @@ describe('channel turn ordering through the launcher dispatcher', () => {
                 if (phase === 'unrelated') duplicate();
                 finish('B actual final'); await h.queue.flush();
 
+                // Missing run identity is now intentionally conservative (T2RT-08): it cannot
+                // prove a duplicate, but must not close the active turn or lose its request ID.
+                const ambiguous = !sdkRunId || !scannerRunId;
+                const fIncomplete = ambiguous && phase === 'follow-up';
+                const bIncomplete = ambiguous && phase !== 'follow-up';
+                const reasons = (incomplete: boolean) => incomplete ? expect.arrayContaining(['background-source-unavailable']) : [];
                 const finalF = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'F actual final')!;
                 expect.soft(finalF).toMatchObject({ turn: followUp, ev: { requestId: 'channel-A',
-                    inputEvidence: { rootBatchId: original.rootBatchId, coverage: 'complete', incompleteReasons: [] } } });
+                    inputEvidence: { rootBatchId: original.rootBatchId, coverage: fIncomplete ? 'incomplete' : 'complete', incompleteReasons: reasons(fIncomplete) } } });
                 expect.soft(h.envelopes.filter(e => e.turn === followUp && e.ev.t === 'turn-end')).toHaveLength(1);
                 expect.soft(h.evidence.snapshot(followUp)).toMatchObject({ rootBatchId: original.rootBatchId,
-                    coverage: 'complete', incompleteReasons: [], terminal: true });
+                    coverage: fIncomplete ? 'incomplete' : 'complete', incompleteReasons: reasons(fIncomplete), terminal: true });
                 const finalB = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'B actual final')!;
                 expect.soft(finalB.ev).toMatchObject({ requestId: 'channel-B' });
                 const evidenceB = h.evidence.snapshot(finalB.turn)!;
-                expect.soft(evidenceB).toMatchObject({ coverage: 'complete', incompleteReasons: [],
+                expect.soft(evidenceB).toMatchObject({ coverage: bIncomplete ? 'incomplete' : 'complete', incompleteReasons: reasons(bIncomplete),
                     inputs: [{ kind: 'channel', channelRequestId: 'channel-B' }], terminal: true });
                 expect.soft(evidenceB.rootBatchId).not.toBe(original.rootBatchId);
-                expect.soft(h.rearm).toHaveBeenCalledOnce();
+                expect.soft(h.rearm).toHaveBeenCalledTimes(ambiguous ? 2 : 1);
                 expect.soft(h.envelopes).toContainEqual(expect.objectContaining({ id: 'task-notification:long-job',
                     ev: { t: 'text', text: details } }));
                 expect.soft(h.envelopes).toContainEqual(expect.objectContaining({ id: 'task-notification:long-job:receipt:completed' }));
                 // A resumed run is new input, including after both old receipts lacked run IDs.
                 receipt('run-2'); text('Resumed task'); await h.queue.flush();
-                expect(h.rearm).toHaveBeenCalledTimes(2);
+                expect(h.rearm).toHaveBeenCalledTimes(ambiguous ? 3 : 2);
                 expect(h.evidence.snapshot()).toMatchObject({ coverage: 'incomplete',
                     incompleteReasons: ['background-source-unavailable'] });
             } finally { h.queue.destroy(); }
         },
     );
+
+    it.each(['origin', 'attachment'])('keeps a real promoted scanner duplicate harmless using %s run identity', async location => {
+        const h = harness(true);
+        const workingDirectory = await mkdtemp(join(tmpdir(), 't2rt-completion-'));
+        const projectDir = getProjectPath(workingDirectory);
+        let scanner: Awaited<ReturnType<typeof createSessionScanner>> | undefined;
+        let scanned = 0;
+        try {
+            const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: workingDirectory, gitBranch: 'main' });
+            h.queue.enqueue(converter.convert({ type: 'system', subtype: 'task_notification', task_id: 'job', run_id: 'run-1',
+                status: 'completed', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000028',
+                output_file: '/tmp/job.output', summary: 'Done' }));
+            h.queue.enqueue(assistant('F')); h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            h.queue.enqueue(pendingRequestItem('channel-B', { inputs: [{ kind: 'channel', channelRequestId: 'channel-B' }], inputCount: 1 }));
+            h.queue.enqueue(assistant('B begins')); await h.queue.flush();
+            scanner = await createSessionScanner({ sessionId: null, workingDirectory,
+                onMessage: message => { h.sendScannerMessage(message); scanned++; } });
+            await mkdir(projectDir, { recursive: true });
+            const sessionId = '11111111-2222-4333-8444-999999999999';
+            await writeFile(join(projectDir, `${sessionId}.jsonl`), JSON.stringify({ type: 'attachment', uuid: 'late-details',
+                attachment: { type: 'queued_command', commandMode: 'task-notification',
+                    ...(location === 'origin' ? { origin: { kind: 'task-notification', runId: 'run-1' } } : { runId: 'run-1' }),
+                    prompt: '<task-notification><task-id>job</task-id><status>completed</status><summary>Full result</summary></task-notification>' },
+            }) + '\n');
+            scanner.onNewSession(sessionId);
+            await vi.waitFor(() => expect(scanned).toBe(1));
+            h.queue.enqueue(finalAnswerItem('B final')); h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            expect(h.rearm).toHaveBeenCalledOnce();
+            expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'B final')?.ev)
+                .toMatchObject({ requestId: 'channel-B', inputEvidence: { coverage: 'complete' } });
+            expect(h.evidence.snapshot()).toMatchObject({ coverage: 'complete', terminal: true });
+        } finally {
+            await scanner?.cleanup(); h.queue.destroy();
+            await rm(workingDirectory, { recursive: true, force: true });
+            await rm(projectDir, { recursive: true, force: true });
+        }
+    });
+
+    it.each(['sdk', 'scanner'].flatMap(first => [false, true].map(started => ({ first, started }))))(
+        'T2RT-08 consumes a resumed run after only $first reported the legacy completion (started=$started)',
+        async ({ first, started }) => {
+            const h = harness(true);
+            const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+            const sdk = (message: Parameters<typeof converter.convert>[0]) => h.queue.enqueue(converter.convert(message));
+            const batch = (id: string) => h.queue.enqueue(pendingRequestItem(`channel-${id}`, {
+                inputs: [{ kind: 'channel', channelRequestId: `channel-${id}` }], inputCount: 1,
+            }));
+            const finish = (value: string) => {
+                h.queue.enqueue(assistant(value)); h.queue.enqueue(finalAnswerItem(value)); h.queue.enqueue(turnEndItem('completed'));
+            };
+            const completion = (source: string, runId?: string) => {
+                if (source === 'sdk') sdk({ type: 'system', subtype: 'task_notification', task_id: 'job', tool_use_id: 'launch',
+                    status: 'completed', ...(runId ? { run_id: runId } : {}), session_id: 'sdk-session',
+                    uuid: '00000000-0000-4000-8000-000000000008', output_file: '/tmp/job.output', summary: 'Done' });
+                else h.sendScannerMessage({ type: 'user', uuid: `scanner-${runId ?? 'legacy'}`,
+                    origin: { kind: 'task-notification', ...(runId ? { runId } : {}) }, message: { role: 'user',
+                        content: '<task-notification><task-id>job</task-id><tool-use-id>launch</tool-use-id><status>completed</status></task-notification>' } });
+            };
+            try {
+                batch('A');
+                sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+                    { type: 'tool_use', id: 'launch', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+                ] } } as Parameters<typeof converter.convert>[0]);
+                sdk({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+                    { type: 'tool_result', tool_use_id: 'launch', content: 'Command running in background with ID: job.' },
+                ] } });
+                h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+                const original = h.evidence.snapshot()!;
+                completion(first); finish('F'); await h.queue.flush();
+                expect(h.evidence.snapshot()).toMatchObject({ rootBatchId: original.rootBatchId, coverage: 'complete', terminal: true });
+                expect(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'F')?.ev).toMatchObject({ requestId: 'channel-A' });
+                batch('B'); h.queue.enqueue(assistant('B begins')); await h.queue.flush();
+                if (started) {
+                    sdk({ type: 'system', subtype: 'task_started', task_id: 'job', run_id: 'run-2', tool_use_id: 'resume',
+                        description: 'Resumed job', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000018' });
+                    await h.queue.flush();
+                    expect([...h.state.backgroundCompletions!.entries.values()].some(record => record.phase === 'started')).toBe(true);
+                }
+                completion(first === 'sdk' ? 'scanner' : 'sdk', 'run-2'); finish('B final'); await h.queue.flush();
+                expect.soft(h.rearm).toHaveBeenCalledTimes(2);
+                expect.soft(h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'B final')?.ev)
+                    .toMatchObject({ requestId: 'channel-B', inputEvidence: { coverage: 'incomplete' } });
+                expect.soft(h.evidence.snapshot()).toMatchObject({ coverage: 'incomplete', terminal: true });
+            } finally { h.queue.destroy(); }
+        },
+    );
+
+    it.each(['tasks', 'runs'].flatMap(kind => [false, true].map(idle => ({ kind, idle }))))(
+        'T2RT-09 bounds 600 completed $kind and handles an evicted scanner identity (idle=$idle)', async ({ kind, idle }) => {
+        const h = harness(true);
+        const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+        try {
+            for (let i = 0; i < 600; i++) {
+                h.queue.enqueue(converter.convert({ type: 'system', subtype: 'task_notification',
+                    task_id: kind === 'tasks' ? `job-${i}` : 'job', run_id: `run-${i}`, status: 'completed',
+                    session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000009', output_file: '/tmp/job.output', summary: 'Done' }));
+                h.queue.enqueue(assistant(`follow-up-${i}`)); h.queue.enqueue(turnEndItem('completed'));
+                await h.queue.flush();
+            }
+            const ledger = h.state.backgroundCompletions!;
+            expect.soft(ledger.entries.size).toBeLessThanOrEqual(200);
+            expect.soft(ledger.historyLost).toBe(true);
+            expect.soft([...ledger.entries.values()].every(receipt => receipt.phase === 'settled' && !receipt.turn)).toBe(true);
+            h.queue.enqueue(pendingRequestItem('channel-B', { inputs: [{ kind: 'channel', channelRequestId: 'channel-B' }], inputCount: 1 }));
+            h.queue.enqueue(assistant('B begins')); await h.queue.flush();
+            const taskId = kind === 'tasks' ? 'job-0' : 'job';
+            if (idle) {
+                // A newer launch of the same task retains a valid channel/source mapping. An
+                // evicted OLD completion must not claim it as a fresh exclusive continuation.
+                h.queue.enqueue(converter.convert({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+                    { type: 'tool_use', id: 'resume', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+                ] } } as Parameters<typeof converter.convert>[0]));
+                h.queue.enqueue(converter.convert({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+                    { type: 'tool_result', tool_use_id: 'resume', content: `Command running in background with ID: ${taskId}.` },
+                ] } }));
+                h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            }
+            h.sendScannerMessage({ type: 'user', uuid: 'late-evicted', origin: { kind: 'task-notification', runId: 'run-0' },
+                message: { role: 'user', content: `<task-notification><task-id>${kind === 'tasks' ? 'job-0' : 'job'}</task-id><status>completed</status></task-notification>` } });
+            h.queue.enqueue(assistant('after late scanner'));
+            h.queue.enqueue(finalAnswerItem('B final')); h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+            const final = h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === 'B final')!.ev;
+            expect.soft(final).toMatchObject({ inputEvidence: { coverage: 'incomplete' } });
+            if (idle) expect.soft(final).not.toHaveProperty('requestId');
+            else expect.soft(final).toMatchObject({ requestId: 'channel-B' });
+            expect.soft(h.evidence.snapshot()).toMatchObject({ coverage: 'incomplete', terminal: true });
+        } finally { h.queue.destroy(); }
+    }, 15000);
 
     it('emits start, text, final answer and terminal in order under one request id', async () => {
         const { queue, envelopes } = harness();

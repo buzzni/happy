@@ -1,4 +1,5 @@
 import { configuration } from '@/configuration';
+import type { ClaudeSessionProtocolState } from '@/claude/utils/sessionProtocolMapper';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
@@ -1514,6 +1515,26 @@ describe('ApiSessionClient v3 messages API migration', () => {
             lastProcessedSeq: expect.any(Number),
             mode: 'remote'
         });
+    });
+
+    it('releases background completion turn ownership on manual question cancellation', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        client.sendClaudeSessionMessage({ type: 'system', subtype: 'task_notification', uuid: 'bg-notification',
+            task_id: 'job', run_id: 'run-1', status: 'completed' });
+        client.sendClaudeSessionMessage({ type: 'assistant', uuid: 'ask-after-completion', message: { content: [
+            { type: 'tool_use', id: 'ask-completion', name: 'AskUserQuestion', input: { questions: [] } },
+        ] } });
+        const state = (client as unknown as { claudeSessionProtocolState: ClaudeSessionProtocolState }).claudeSessionProtocolState;
+        expect([...state.backgroundCompletions!.entries.values()]).toEqual([
+            expect.objectContaining({ phase: 'observed', turn: state.currentTurnId }),
+        ]);
+        client.closeOpenAskUserQuestionsAsCancelled();
+        expect(state.currentTurnId).toBeNull();
+        expect([...state.backgroundCompletions!.entries.values()]).toEqual([
+            expect.objectContaining({ phase: 'settled' }),
+        ]);
+        expect([...state.backgroundCompletions!.entries.values()][0]).not.toHaveProperty('turn');
+        await client.close();
     });
 
     it('persists pending AskUserQuestion as cancelled before shutdown', async () => {

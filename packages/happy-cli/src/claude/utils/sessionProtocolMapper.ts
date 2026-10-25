@@ -14,10 +14,7 @@ import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
 import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
 
-type BackgroundCompletionReceipt = {
-    runs: Set<string | null>;
-    unidentifiedSources: Set<'sdk' | 'scanner'>;
-};
+import { BackgroundCompletionTracker } from './backgroundCompletionTracker';
 
 export type ClaudeSessionProtocolState = {
     currentTurnId: string | null;
@@ -40,8 +37,8 @@ export type ClaudeSessionProtocolState = {
     currentRequestId?: string | null;
     /** Background task id/tool call id → the channel request that launched it. */
     backgroundTaskRequestIds?: Map<string, string>;
-    /** Runtime-local completion receipts, retained across turns for arbitrarily late scanner rows. */
-    appliedBackgroundCompletions?: Map<string, BackgroundCompletionReceipt>;
+    /** Bounded completion state; turn end releases ownership but retains identity tombstones. */
+    backgroundCompletions?: BackgroundCompletionTracker;
     uuidToProviderSubagent?: Map<string, string>;
     taskPromptToSubagents?: Map<string, string[]>;
     providerSubagentToSessionSubagent?: Map<string, string>;
@@ -145,47 +142,32 @@ function extractTaskNotificationIds(content: unknown): { taskId?: string; toolUs
     };
 }
 
-/**
- * SDK receipts and scanner details have different display IDs, but consume one input. Keep
- * their lifecycle identity in the session's runtime state, independently of evictable turn/task
- * maps. Run IDs distinguish resumed runs of the same task; older CLIs only supply task/status.
- * Nonterminal Monitor events have no completion identity and must continue to be consumed.
- */
-function takeBackgroundCompletion(
-    state: ClaudeSessionProtocolState, message: RawJSONLines, text: string | null, subagent: string | undefined,
-): boolean {
-    if (!text) return true;
-    const ids = extractTaskNotificationIds(text);
-    const status = text.match(/<status>\s*(completed|failed|stopped|cancelled|killed)\s*<\/status>/)?.[1];
-    if ((!ids.taskId && !ids.toolUseId) || !status) return true;
-    const raw = message as { run_id?: unknown; origin?: { runId?: unknown } };
-    const rawRunId = message.type === 'system' ? raw.run_id : raw.origin?.runId;
-    const runId = typeof rawRunId === 'string' && rawRunId ? rawRunId : null;
-    const key = JSON.stringify([subagent ?? null,
-        ids.taskId ? ['task', ids.taskId] : ['tool', ids.toolUseId],
-        status === 'cancelled' || status === 'killed' ? 'stopped' : status]);
-    const source = message.type === 'system' ? 'sdk' : 'scanner';
-    const applied = state.appliedBackgroundCompletions ??= new Map<string, BackgroundCompletionReceipt>();
-    const receipt = applied.get(key);
-    if (!receipt) {
-        applied.set(key, { runs: new Set([runId]), unidentifiedSources: new Set(runId ? [] : [source]) });
-        return true;
+/** Apply lifecycle effects once only when identity is proven; ambiguous inputs still reduce coverage. */
+function consumeBackgroundCompletion(
+    state: ClaudeSessionProtocolState, message: RawJSONLines, text: string | null,
+    subagent: string | undefined, envelopes: SessionEnvelope[], closePrevious = false,
+): void {
+    const raw = message as { task_id?: unknown; tool_use_id?: unknown; run_id?: unknown; origin?: { runId?: unknown } };
+    const ids = message.type === 'system' ? {
+        taskId: typeof raw.task_id === 'string' ? raw.task_id : undefined,
+        toolUseId: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
+    } : extractTaskNotificationIds(text);
+    const status = text?.match(/<status>\s*(completed|failed|stopped|cancelled|killed)\s*<\/status>/)?.[1];
+    const rawRun = message.type === 'system' ? raw.run_id : raw.origin?.runId;
+    const run = typeof rawRun === 'string' && rawRun ? rawRun : null;
+    const task = ids.taskId ? `task:${ids.taskId}` : ids.toolUseId ? `tool:${ids.toolUseId}` : undefined;
+    const tracker = state.backgroundCompletions ??= new BackgroundCompletionTracker();
+    const decision = task && status ? tracker.observe(task, run,
+        status === 'cancelled' || status === 'killed' ? 'stopped' : status, state.currentTurnId, subagent) : 'first';
+    if (decision === 'duplicate') return;
+    if (decision === 'uncertain') {
+        // No source lookup or channel re-arm: an evicted/ambiguous completion cannot prove
+        // exclusive inheritance. The evidence callback records unknown input even while idle.
+        state.onBackgroundInputRearm?.([]);
+        return;
     }
-    // A metadata-poor row still describes the same task completion. Track which sources have
-    // supplied it: only its missing counterpart can bind an unidentified receipt to a run ID.
-    // Once both old sources were consumed, a new explicit run must remain new input.
-    if (runId === null) {
-        if (receipt.runs.has(null)) receipt.unidentifiedSources.add(source);
-        return false;
-    }
-    if (receipt.runs.has(runId)) return false;
-    const bindsUnidentifiedRun = receipt.runs.has(null) && !receipt.unidentifiedSources.has(source);
-    if (bindsUnidentifiedRun) {
-        receipt.runs.delete(null);
-        receipt.unidentifiedSources.clear();
-    }
-    receipt.runs.add(runId);
-    return !bindsUnidentifiedRun;
+    if (closePrevious && decision === 'first' && state.currentTurnId) closeTurn(state, 'completed', envelopes);
+    rearmBackgroundTaskRequest(state, ids);
 }
 
 function rememberBackgroundTaskRequest(state: ClaudeSessionProtocolState, id: string, requestId: string): void {
@@ -629,6 +611,7 @@ function ensureTurn(state: ClaudeSessionProtocolState, envelopes: SessionEnvelop
     const requestId = state.pendingRequestId ?? undefined;
     envelopes.push(createEnvelope('agent', { t: 'turn-start', ...(requestId ? { requestId } : {}) }, { turn: turnId }));
     state.currentTurnId = turnId;
+    state.backgroundCompletions?.attachTurn(turnId);
     state.currentRequestId = requestId ?? null;
     state.pendingRequestId = null;
     return turnId;
@@ -659,6 +642,7 @@ function closeTurn(
         { turn: turnId },
     ));
     forgetToolCallTurns(state, turnId);
+    state.backgroundCompletions?.endTurn(turnId);
     state.currentTurnId = null;
     state.currentRequestId = null;
     clearSubagentTracking(state);
@@ -797,15 +781,14 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
         // The SDK's own report of a finished background task. It precedes the provider's
         // follow-up turn on the same ordered stream; the transcript row of an idle notification
         // reaches us only through the scanner, which can be late.
-        const notification = message as { subtype?: unknown; task_id?: unknown; tool_use_id?: unknown };
+        const notification = message as { subtype?: unknown; task_id?: unknown; run_id?: unknown };
+        if (notification.subtype === 'task_started' && typeof notification.task_id === 'string') {
+            (state.backgroundCompletions ??= new BackgroundCompletionTracker()).started(`task:${notification.task_id}`,
+                typeof notification.run_id === 'string' && notification.run_id ? notification.run_id : null, subagent);
+        }
         if (notification.subtype === 'task_notification') {
             const text = sdkBackgroundTaskCompletion(message);
-            if (takeBackgroundCompletion(state, message, text, subagent)) {
-                rearmBackgroundTaskRequest(state, {
-                    ...(typeof notification.task_id === 'string' ? { taskId: notification.task_id } : {}),
-                    ...(typeof notification.tool_use_id === 'string' ? { toolUseId: notification.tool_use_id } : {}),
-                });
-            }
+            consumeBackgroundCompletion(state, message, text, subagent, envelopes);
             if (text && !message.isSidechain && !subagent) envelopes.push(createEnvelope('user', { t: 'text', text }, { claudeUuid, id: backgroundTaskNoticeId(text, 'receipt') }));
         }
         return {
@@ -917,9 +900,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             // (specs/midturn-task-notification-sync R2). Emit the user text
             // and leave the turn state untouched.
             if ((message as { happyTaskNotification?: unknown }).happyTaskNotification === true) {
-                if (takeBackgroundCompletion(state, message, message.message.content, subagent)) {
-                    rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
-                }
+                consumeBackgroundCompletion(state, message, message.message.content, subagent, envelopes);
                 envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
                 return {
                     currentTurnId: state.currentTurnId,
@@ -933,10 +914,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
             } else if ((message as { origin?: { kind?: unknown } }).origin?.kind === 'task-notification') {
                 // Only the first observation can close/re-arm a turn. The SDK may already have
                 // opened (or finished) the follow-up before this richer scanner row arrives.
-                if (takeBackgroundCompletion(state, message, message.message.content, subagent)) {
-                    if (state.currentTurnId) closeTurn(state, 'completed', envelopes);
-                    rearmBackgroundTaskRequest(state, extractTaskNotificationIds(message.message.content));
-                }
+                consumeBackgroundCompletion(state, message, message.message.content, subagent, envelopes, true);
                 envelopes.push(createEnvelope('user', { t: 'text', text: message.message.content }, { claudeUuid, id: backgroundTaskNoticeId(message.message.content) }));
             } else {
                 closeTurn(state, 'completed', envelopes);

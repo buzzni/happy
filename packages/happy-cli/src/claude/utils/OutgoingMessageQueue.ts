@@ -8,7 +8,7 @@
 import { AsyncLock } from '@/utils/lock';
 import type { RawJSONLines } from '@/claude/types';
 
-/** A background receipt must reach the mapper in order even though ordinary system logs are filtered. */
+/** Task starts and completion receipts must reach the mapper in order; ordinary system logs stay filtered. */
 export interface BackgroundTaskNotificationItem {
     __claudeBackgroundNotification: true;
     logMessage: RawJSONLines;
@@ -40,7 +40,8 @@ export class OutgoingMessageQueue {
         delay?: number,
         toolCallIds?: string[]
     }) {
-        const orderedMessage = logMessage?.type === 'system' && logMessage.subtype === 'task_notification'
+        const orderedMessage = logMessage?.type === 'system'
+            && (logMessage.subtype === 'task_notification' || logMessage.subtype === 'task_started')
             ? { __claudeBackgroundNotification: true, logMessage } satisfies BackgroundTaskNotificationItem
             : logMessage;
         this.lock.inLock(async () => {

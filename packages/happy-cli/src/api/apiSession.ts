@@ -1837,6 +1837,7 @@ export class ApiSessionClient extends EventEmitter {
             { turn: turnId },
         ));
 
+        this.claudeSessionProtocolState.backgroundCompletions?.endTurn(turnId);
         this.claudeSessionProtocolState.currentTurnId = null;
         // Cleared for the same reason the mapper clears them: an id left behind here would be
         // stamped onto whatever turn opens next, which answers the wrong request.

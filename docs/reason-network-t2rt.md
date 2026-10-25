@@ -192,6 +192,7 @@ Verification:
 ## Third fixed-SHA cross-review follow-up: T2RT-07 (2026-10-25)
 
 Review base: `495c743f7c99b8d4ac7e7c47c4ecf7140e543dbc`.
+Historical record: round 4 below replaces this unbounded ledger and its cross-source identity inference.
 T2RT-07 is accepted. The SDK receipt and the scanner's richer row describe one
 consumed completion, despite their intentionally different display IDs. The mapper
 now records completion identity in its runtime-local state before applying turn
@@ -260,6 +261,87 @@ No finding is deferred. No public API/schema, authority, shared export or T1b-ow
 file changes are needed. This is an internal implementation correction within the
 approved contract, with no design deviation. Only the mapper, its existing channel
 integration test file and this report change. No new files or dependencies.
+
+## Round 4: T2RT-08 / T2RT-09 (2026-10-25)
+
+Review base: `415c1b303528ae8143538ce3be90e7b43e688cd7`.
+Both findings are accepted. This round replaces the deduplication model rather
+than adding another source-pairing exception.
+
+The internal `backgroundCompletionTracker.ts` owns one bounded map keyed by
+runtime-local scope, task (tool ID only when task ID is absent), and explicit run
+identity. Each record has one terminal status and a `started` → `observed` →
+`settled` lifecycle. There are no per-task run sets or missing-counterpart sets.
+Only an observed matching explicit run/status proves a duplicate. Different
+sources do not prove equality, and a currently started run is never assigned to
+a metadata-poor scanner row. The ordered queue now preserves SDK `task_started`
+generation events as well as completion receipts; repeated starts cannot reset
+an already-consumed run.
+
+Normal turn end and manual AskUserQuestion cancellation release active turn
+ownership. Bounded settled identity tombstones remain because deleting every
+identity at turn end would recreate T2RT-07 when the scanner arrives later.
+The map holds at most **200 records in total**, including starts, distinct tasks
+and repeated runs of one task; identity keys exceeding **4096 UTF-8 bytes** are
+not retained. FIFO eviction/oversized identity sets a constant-size `historyLost`
+flag. Thereafter a cache miss is uncertain, not proof of new exclusive input.
+Exact retained identities can still be deduplicated. This deliberately favors
+incomplete coverage for unseen background completions after history loss until
+a new runtime is created; ordinary batches without such observations are not
+globally downgraded.
+
+Uncertain observations use the existing evidence callback without source IDs.
+They reduce current/pending coverage or preserve an unknown-input marker while
+idle, but cannot claim a retained launch mapping, rearm a channel request, or
+close a live turn. A first scanner-only legacy completion still follows the old
+launch/root/request path. A later ambiguous or distinct-run observation is never
+silently discarded as its missing counterpart.
+
+Scanner attachment promotion preserves `origin.runId`, with `attachment.runId`
+as fallback, matching the installed SDK's `sdk.mjs` queued-command promotion and
+`sdk.d.ts` task-run contract. Origin metadata, detailed text, and the scanner's
+separate display ID remain available. No new wire fields or identity guesses.
+
+Tests and semantic clarification:
+
+- Before production changes, real converter/queue/dispatcher/mapper integration
+  tests had **6 failures / 45 passes**: four scanner-only/SDK-only legacy → F ends
+  → B → opposite-source explicit run-2 cases (with/without a start event), plus
+  600-task and 600-run retention cases. B incorrectly stayed complete; the old
+  ledger retained 600 keys or 600 runs of one key.
+- Real file-scanner attachment regressions first failed **3/3** (9 existing tests
+  passed): origin run ID, attachment fallback, and precedence when both exist.
+- A manual question-cancellation API regression first failed **1/1**: the turn
+  ended but its completion still held active ownership. The manual path now uses
+  the same end transition as the mapper.
+- Focused correction passed **274/274** across four files. The channel integration
+  file subsequently passed **55/55**, including two additional real SDK queue →
+  follow-up end → B → file-scanner attachment → final/end cases.
+- Retention tests cover 600 distinct tasks and 600 runs of one task, both with B
+  active and with the runtime idle. The idle case leaves a newer launch mapping
+  for the same task: the evicted old completion must not inherit that source or
+  its channel request. All retained consumed records release their turn fields.
+- The earlier 24 ordering cases still preserve request IDs and roots. The six
+  cases with shared explicit run identity retain complete coverage and one
+  rearm. The 18 cases lacking shared run identity now intentionally mark the
+  affected F/B incomplete rather than asserting a duplicate they cannot prove,
+  as required by T2RT-08. Detailed scanner text remains visible in either case.
+- Final standard related CLI selection: **16 files / 482 tests passed** with
+  `corepack pnpm -C packages/happy-cli exec vitest run --project unit <selection>
+  --maxWorkers 1`. Standard global setup passed CLI `tsc --noEmit`, pkgroll and
+  extension copy against the final production changes.
+- Wire schema regressions: **39/39 passed** with `corepack pnpm -C
+  packages/happy-wire exec vitest run src/sessionProtocol.test.ts`.
+- `git diff --check` passed. Existing bin-location/empty-chunk build warnings and
+  asynchronously-handled-rejection harness warnings remain; no final test failed.
+  Full-suite, live paid-provider, Desktop and packaged acceptance were not run.
+
+The related CLI selection is the same 16 files listed in round 3. The two findings
+are not deferred. This changes internal evidence bookkeeping within the existing
+conservative-coverage contract; no public API/schema/authority changes or design
+change approval are needed. Eight existing files and one internal tracker module
+are changed, including this report. T1b files, shared barrels, manifests and the
+lockfile are untouched. No Desktop, release, or UI-guide changes are included.
 
 ## Contract decisions and implementation details
 

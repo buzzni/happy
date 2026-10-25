@@ -242,15 +242,21 @@ function parseTaskNotificationAttachment(message: unknown): RawJSONLines | null 
     if (!message || typeof message !== 'object') return null;
     const row = message as { type?: unknown; uuid?: unknown; attachment?: unknown };
     if (row.type !== 'attachment' || typeof row.uuid !== 'string' || row.uuid.length === 0) return null;
-    const attachment = row.attachment as { type?: unknown; commandMode?: unknown; prompt?: unknown } | undefined;
+    const attachment = row.attachment as { type?: unknown; commandMode?: unknown; prompt?: unknown; origin?: { kind?: unknown; runId?: unknown }; runId?: unknown } | undefined;
     if (!attachment || typeof attachment !== 'object') return null;
     if (attachment.type !== 'queued_command' || attachment.commandMode !== 'task-notification') return null;
     if (typeof attachment.prompt !== 'string' || attachment.prompt.trim().length === 0) return null;
+    // Match the SDK's queued-command promotion: preserve origin; its runId wins over the
+    // attachment fallback. Do not infer a run from the currently active background task.
+    const origin = typeof attachment.origin?.kind === 'string' ? attachment.origin : { kind: 'task-notification' };
+    const runId = origin.kind === 'task-notification'
+        ? typeof origin.runId === 'string' ? origin.runId : attachment.runId : undefined;
     const synthetic = {
         type: 'user',
         uuid: row.uuid,
         isSidechain: false,
         happyTaskNotification: true,
+        origin: { ...origin, ...(typeof runId === 'string' ? { runId } : {}) },
         message: { role: 'user', content: attachment.prompt },
     };
     const parsed = RawJSONLinesSchema.safeParse(synthetic);

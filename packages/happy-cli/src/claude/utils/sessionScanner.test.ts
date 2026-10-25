@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { createSessionScanner } from './sessionScanner'
 import { RawJSONLines } from '../types'
 import type { ClaudeGoalStatusTranscriptEvent } from '../claudeGoalStatus'
@@ -407,6 +407,20 @@ describe('sessionScanner', () => {
         message: { role: 'user', content: NOTIFICATION_PROMPT },
       })
       expect(collectedTranscriptEvents).toHaveLength(0)
+    })
+
+    it.each(['origin', 'attachment', 'both'])('preserves completion run identity from %s during attachment promotion', async location => {
+      scanner = await createSessionScanner({ sessionId: null, workingDirectory: testDir,
+        onMessage: msg => collectedMessages.push(msg) })
+      const row = JSON.parse(notificationAttachmentRow('att-run'))
+      if (location !== 'attachment') row.attachment.origin = { kind: 'task-notification', runId: 'run-origin' }
+      if (location !== 'origin') row.attachment.runId = 'run-attachment'
+      const sessionId = '11111111-2222-4333-8444-777777777777'
+      await writeFile(join(projectDir, `${sessionId}.jsonl`), JSON.stringify(row) + '\n')
+      scanner.onNewSession(sessionId)
+      await vi.waitFor(() => expect(collectedMessages).toHaveLength(1))
+      expect(collectedMessages[0]).toMatchObject({ happyTaskNotification: true,
+        origin: { kind: 'task-notification', runId: location === 'attachment' ? 'run-attachment' : 'run-origin' } })
     })
 
     it('does not re-emit a promoted notification on rescan (R1)', async () => {
