@@ -6,6 +6,8 @@ import { join } from 'node:path'
 const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
   startDaemon: vi.fn(),
+  stopDaemon: vi.fn(),
+  isInstalledVersion: vi.fn(),
 }))
 
 // Exercise the real CLI dispatch, configuration bootstrap and settings I/O,
@@ -16,6 +18,8 @@ vi.mock('@/ui/auth', () => ({}))
 vi.mock('@/daemon/run', () => ({ startDaemon: mocks.startDaemon }))
 vi.mock('@/daemon/controlClient', () => ({
   checkIfDaemonRunningAndCleanupStaleState: async () => true,
+  isDaemonRunningCurrentlyInstalledHappyVersion: mocks.isInstalledVersion,
+  stopDaemon: mocks.stopDaemon,
 }))
 vi.mock('@/utils/spawnHappyCLI', () => ({
   spawnHappyCLI: mocks.spawn,
@@ -40,6 +44,8 @@ describe('daemon MCP config CLI startup', () => {
     vi.stubEnv('HAPPY_APLUS_CAPABILITY_TOKEN', 'session-capability')
     mocks.spawn.mockReturnValue({ unref: vi.fn(), once: vi.fn() }) // daemon start listens for the start-sync exit
     mocks.startDaemon.mockImplementation(async () => undefined)
+    mocks.stopDaemon.mockResolvedValue(undefined)
+    mocks.isInstalledVersion.mockResolvedValue(false)
     vi.spyOn(process, 'exit').mockImplementation(() => undefined as never)
     vi.spyOn(console, 'log').mockImplementation(() => undefined)
   })
@@ -63,6 +69,13 @@ describe('daemon MCP config CLI startup', () => {
   function readPersistedSettings() {
     return JSON.parse(readFileSync(join(happyHome, 'settings.json'), 'utf8'))
   }
+
+  it('still drains a running daemon before spawning a validated replacement', async () => {
+    await runCommand('restart')
+    expect(mocks.stopDaemon).toHaveBeenCalledTimes(1)
+    expect(mocks.spawn).toHaveBeenCalledTimes(1)
+    expect(mocks.stopDaemon.mock.invocationCallOrder[0]).toBeLessThan(mocks.spawn.mock.invocationCallOrder[0])
+  })
 
   it('bootstraps a pristine home, persists a preset and restores it on a later detached start', async () => {
     expect(existsSync(happyHome)).toBe(false)
@@ -177,7 +190,7 @@ describe('daemon MCP config CLI startup', () => {
     expect(mocks.spawn.mock.calls[0][1].env.HAPPY_APLUS_STUDIO_ORIGIN).toBe('http://localhost:5174')
   })
 
-  it.each(['start', 'start-sync'])('reports malformed settings without starting a daemon or replacing the file (%s)', async command => {
+  it.each(['start', 'start-sync', 'restart'])('reports malformed settings without stopping a running daemon, starting a replacement or replacing the file (%s)', async command => {
     vi.stubEnv('HAPPY_SERVER_URL', undefined)
     await import('./configuration')
     const file = join(happyHome, 'settings.json')
@@ -190,6 +203,7 @@ describe('daemon MCP config CLI startup', () => {
     expect(error).toHaveBeenCalledWith(expect.stringContaining('Error:'), 'Failed to read settings')
     expect(mocks.spawn).not.toHaveBeenCalled()
     expect(mocks.startDaemon).not.toHaveBeenCalled()
+    expect(mocks.stopDaemon).not.toHaveBeenCalled()
     expect(readFileSync(file, 'utf8')).toBe('{broken-json')
   })
 })
