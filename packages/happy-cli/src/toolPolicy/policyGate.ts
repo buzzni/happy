@@ -30,6 +30,7 @@ import { BUILTIN_TABLES, type CuaAction, type MachinePolicy, type ToolPolicyTabl
 import type { PolicyGrantStore } from './grants';
 import type { TargetResolver } from './targetResolver';
 import type { ToolPolicyAuditLog, ToolPolicyOutcome } from './audit';
+import { composePolicyDenyMessage } from '@/utils/permissionDenyMessage';
 
 export const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -54,7 +55,10 @@ export interface PolicyApprovalAnswer {
     approved: boolean;
     /** R11.3: absent from older clients, which means `once`. */
     policyGrant: 'once' | 'session';
+    /** An older client's reason. A policy deny never had a default sentence in it, so it is read as the person's own. */
     reason?: string;
+    /** Only what the person wrote. Wins over `reason`. */
+    userReason?: string;
 }
 
 export interface PolicyApprover {
@@ -138,9 +142,10 @@ export function createToolPolicyGate(deps: {
         });
     };
 
-    const refuse = (call: PreToolUseCall, verdict: PolicyVerdict, reasonCode: string, outcome: ToolPolicyOutcome): HookVerdict => {
+    // The answer's reason goes to the model only; the audit records the outcome, never what the person wrote.
+    const refuse = (call: PreToolUseCall, verdict: PolicyVerdict, reasonCode: string, outcome: ToolPolicyOutcome, answer: Pick<PolicyApprovalAnswer, 'reason' | 'userReason'> = {}): HookVerdict => {
         audit(call, verdict, outcome, 'blocked', reasonCode);
-        return { kind: 'deny', reasonCode, reason: blockedMessage({ ...verdict, reasonCode }, call.toolName, tables) };
+        return { kind: 'deny', reasonCode, reason: composePolicyDenyMessage(blockedMessage({ ...verdict, reasonCode }, call.toolName, tables), answer) };
     };
 
     const evaluate = async (call: PreToolUseCall, args: Record<string, unknown>): Promise<PolicyVerdict> => {
@@ -205,7 +210,7 @@ export function createToolPolicyGate(deps: {
                 });
                 if (!answer.approved) {
                     deps.grants.recordDenial(verdict.denialKey);
-                    return refuse(call, verdict, 'user_denied', 'denied');
+                    return refuse(call, verdict, 'user_denied', 'denied', answer);
                 }
                 if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys);
                 audit(call, verdict, 'approved', 'ask');

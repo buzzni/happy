@@ -26,8 +26,11 @@ import { APPROVAL_TIMEOUT_ABORT_REASON, type PermissionPolicyMeta, type PolicyAp
 import { ResolvedPermissionLog, type PermissionAck, type PermissionResolution } from "@/utils/permissionResolution";
 import { ApprovalExpiryTimers, withoutExpiresAt } from "@/utils/approvalExpiry";
 import { unattendedExpiryMessage, type TurnAttendanceState } from "@/api/turnAttendance";
+import { composeDenyMessage, recordedDenyReason } from "@/utils/permissionDenyMessage";
 
 export type { PermissionAck };
+
+const TOOL_DENY_MESSAGE = `The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.`;
 
 interface PermissionResponse {
     id: string;
@@ -41,7 +44,10 @@ interface PermissionResponse {
         channelRequestId?: unknown;
         runtimeId?: unknown;
     };
+    /** The whole message the model reads on a deny, verbatim (older Desktop builds join it themselves). */
     reason?: string;
+    /** Only what the person wrote; the default deny instruction stays in front of it. Wins over `reason`. */
+    userReason?: string;
     mode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
     allowTools?: string[];
     updatedInput?: Record<string, unknown>;
@@ -257,7 +263,7 @@ export class PermissionHandler implements PolicyApprover {
 
                 pending.resolve({ behavior: 'allow', updatedInput: (pending.input as Record<string, unknown>) || {} });
             } else {
-                pending.resolve({ behavior: 'deny', message: response.reason || 'Plan rejected' });
+                pending.resolve({ behavior: 'deny', message: composeDenyMessage('Plan rejected', response) });
             }
         } else {
             // Handle default case for all other tools
@@ -267,7 +273,7 @@ export class PermissionHandler implements PolicyApprover {
                 : originalInput;
             const result: PermissionResult = response.approved
                 ? { behavior: 'allow', updatedInput }
-                : { behavior: 'deny', message: response.reason || `The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.` };
+                : { behavior: 'deny', message: composeDenyMessage(TOOL_DENY_MESSAGE, response) };
 
             pending.resolve(result);
         }
@@ -362,7 +368,7 @@ export class PermissionHandler implements PolicyApprover {
             const policyGrant = response?.policyGrant === 'session' && !response.channelClaim ? 'session' : 'once';
             return result.behavior === 'allow'
                 ? { approved: true, policyGrant }
-                : { approved: false, policyGrant: 'once', reason: response?.reason };
+                : { approved: false, policyGrant: 'once', reason: response?.reason, userReason: response?.userReason };
         } catch (error) {
             // An abort was already recorded by the request's own abort handler; this covers the rest.
             this.withdrawRequest(request.id, request.signal.aborted ? 'Tool policy approval withdrawn' : 'Tool policy approval failed', 'aborted');
@@ -778,7 +784,7 @@ export class PermissionHandler implements PolicyApprover {
                         ...request,
                         completedAt,
                         status: message.approved ? 'approved' : 'denied',
-                        reason: message.reason,
+                        reason: recordedDenyReason(message),
                         mode: message.mode,
                         allowTools: message.allowTools,
                         resolution: 'answered',

@@ -714,6 +714,66 @@ describe('the ordinary permission method stays compatible', () => {
     });
 });
 
+describe('a denied tool use tells the model the person\'s reason (aplus-dev-studio specs/permission-deny-reason)', () => {
+    const TOOL_DENY = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.";
+
+    function deny(toolName: string, answer: Record<string, unknown>) {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        const decided = handler.handleToolCall(toolName, { command: 'rm -rf build' }, { permissionMode: 'default' }, stubOptions());
+        return stub.answer({ id: 'tool-call-1', approved: false, ...answer }).then(() => decided);
+    }
+
+    async function completedReason(answer: Record<string, unknown>) {
+        const stub = createRecordingSessionStub();
+        const handler = new PermissionHandler(stub.session);
+        const decided = handler.handleToolCall('Bash', { command: 'rm -rf build' }, { permissionMode: 'default' }, stubOptions());
+        await stub.answer({ id: 'tool-call-1', approved: false, ...answer });
+        await decided;
+        const completed = (stub.state() as { completedRequests: Record<string, Record<string, unknown>> }).completedRequests;
+        return completed['tool-call-1'];
+    }
+
+    it('records the person\'s own reason on the completed request, so clients show what the model was told', async () => {
+        await expect(completedReason({ userReason: ' use the staging build ', reason: 'something else' }))
+            .resolves.toMatchObject({ status: 'denied', reason: 'use the staging build' });
+    });
+
+    it('records the legacy reason as it came when there is no reason of the person\'s own', async () => {
+        await expect(completedReason({ userReason: '  ', reason: 'assembled by an older Desktop' }))
+            .resolves.toMatchObject({ status: 'denied', reason: 'assembled by an older Desktop' });
+        await expect(completedReason({})).resolves.toMatchObject({ status: 'denied', reason: undefined });
+    });
+
+    it('falls back to the legacy reason when the person\'s own one is blank', async () => {
+        await expect(deny('Bash', { userReason: ' \u0000 ', reason: 'legacy text' })).resolves.toEqual({ behavior: 'deny', message: 'legacy text' });
+    });
+
+    it('keeps the default instruction in front of the person\'s own reason', async () => {
+        await expect(deny('Bash', { userReason: 'use the staging build' }))
+            .resolves.toEqual({ behavior: 'deny', message: `${TOOL_DENY}\n\nUser's reason: use the staging build` });
+    });
+
+    it('still sends a reason assembled by an older Desktop verbatim, without repeating the instruction', async () => {
+        const assembled = `${TOOL_DENY}\n\nUser's reason: use the staging build`;
+        await expect(deny('Bash', { reason: assembled })).resolves.toEqual({ behavior: 'deny', message: assembled });
+    });
+
+    it('denies with the default instruction when no reason is given', async () => {
+        await expect(deny('Bash', {})).resolves.toEqual({ behavior: 'deny', message: TOOL_DENY });
+    });
+
+    it('keeps "Plan rejected" in front of the person\'s reason for a rejected plan', async () => {
+        await expect(deny('ExitPlanMode', { userReason: 'split it into two PRs' }))
+            .resolves.toEqual({ behavior: 'deny', message: "Plan rejected\n\nUser's reason: split it into two PRs" });
+    });
+
+    it('sends a legacy plan rejection reason verbatim', async () => {
+        await expect(deny('ExitPlanMode', { reason: 'Not this plan' })).resolves.toEqual({ behavior: 'deny', message: 'Not this plan' });
+        await expect(deny('ExitPlanMode', {})).resolves.toEqual({ behavior: 'deny', message: 'Plan rejected' });
+    });
+});
+
 describe('a non-binary prompt is observed as guidance but never answerable', () => {
     const CLAIM = { turnId: 'turn-a', channelRequestId: 'req-1', runtimeId: 'runtime-1' };
 
@@ -888,6 +948,13 @@ describe('PermissionHandler tool policy approvals (aplus-dev-studio specs/agent-
         const answered = ask(stub);
         await stub.answer({ id: 'toolu_policy', approved: false, reason: 'not now' });
         await expect(answered).resolves.toEqual({ approved: false, policyGrant: 'once', reason: 'not now' });
+    });
+
+    it('passes the person\'s own reason on to the gate beside the legacy one', async () => {
+        const stub = createRecordingSessionStub();
+        const answered = ask(stub);
+        await stub.answer({ id: 'toolu_policy', approved: false, userReason: '비용이 커요' });
+        await expect(answered).resolves.toEqual({ approved: false, policyGrant: 'once', userReason: '비용이 커요' });
     });
 
     it('raises nothing for a caller that has already given up', async () => {
