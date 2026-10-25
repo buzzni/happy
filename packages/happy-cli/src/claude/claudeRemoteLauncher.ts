@@ -827,7 +827,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         }
                         : {}),
                     path: session.path,
-                    managedSettingsLockdown: session.managedSettingsLockdown || !!personalFallback?.identity(),
+                    managedSettingsLockdown: session.managedSettingsLockdown,
+                    personalClaudeAuth: personalFallback?.identity() ? { oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? '' } : undefined,
                     managedRun: session.managedRun,
                     /*
                      * A fresh observer for **this** generation.

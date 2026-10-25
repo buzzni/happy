@@ -49,6 +49,16 @@ jobs:
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
 
+    - name: Verify personal Claude authentication with the real SDK
+      if: matrix.node-version == 24
+      timeout-minutes: 5
+      env:
+        HAPPY_CLAUDE_AUTH_PIN_INTEGRATION: '1'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bubblewrap
+        pnpm --filter @buzzni/happy-cli exec vitest run --project integration-claude-auth-pin
+
     - name: Verify local browser client with Chrome and Unix broker
       if: matrix.node-version == 24
       timeout-minutes: 10

@@ -1,3 +1,5 @@
+import { PERSONAL_CLAUDE_AUTH_FAILURE } from '../sdk/credentialPin';
+
 /**
  * What the user is told when Claude Code exits before its first SDK message (Desktop
  * specs/headless-standalone-server R21). The SDK's error already carries the child's stderr, but that
@@ -6,6 +8,7 @@
  */
 export function describeClaudeLaunchFailure(error: unknown): string {
     const text = error instanceof Error ? error.message : String(error);
+    if (text === PERSONAL_CLAUDE_AUTH_FAILURE) return 'Personal Claude stopped because the selected account or policy could not be verified. Check the account and send again.';
     const code = (error as { code?: unknown } | null)?.code;
     if (/cannot be used with root\/sudo privileges/i.test(text)) {
         return 'Claude Code could not start: it refuses to run with permission prompts skipped as root. '

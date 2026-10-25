@@ -32,6 +32,8 @@ export type CanCallToolCallback = CanUseTool
  * used throughout the codebase. The query() wrapper handles the translation.
  */
 export interface QueryOptions {
+    /** Process-local selected personal credential, delivered only over SDK stdin control. */
+    personalClaudeAuth?: { oauthToken: string }
     abort?: AbortSignal
     allowedTools?: string[]
     appendSystemPrompt?: string

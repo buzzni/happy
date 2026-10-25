@@ -4,6 +4,10 @@ import { CLAUDE_NOT_SIGNED_IN_NOTICE, isClaudeAuthenticationFailure, claudeNotSi
 // Desktop specs/headless-standalone-server R21: the user sees why Claude Code did not start, but
 // never raw stderr — it can carry paths, env values or tokens.
 describe('describeClaudeLaunchFailure', () => {
+    it('explains a refused personal credential without treating it as a general startup failure', () => {
+        expect(describeClaudeLaunchFailure(new Error('CLAUDE_PERSONAL_AUTH_NOT_VERIFIED'))).toMatch(/Personal Claude stopped.*account or policy/);
+    });
+
     it('names the root refusal and what to do', () => {
         const message = describeClaudeLaunchFailure(new Error('Claude Code process exited with code 1. stderr: --dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons'));
         expect(message).toMatch(/root/);

@@ -502,6 +502,17 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
     });
 });
 
+function pinnedSdkControls() {
+    let effective: Record<string, unknown> = {};
+    return {
+        initializationResult: async () => ({ claude_code_version: '2.1.308', hooks_applied: true }),
+        applyFlagSettings: async (settings: Record<string, unknown>) => { effective = settings; },
+        getSettings: async () => ({ effective, sources: [] }),
+        reinitialize: async () => ({ account: { apiProvider: 'firstParty', tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN' } }),
+        close: () => {},
+    };
+}
+
 it.each(['automatic', 'organization-only', 'authentication'])('keeps one conversation through organization, approved personal continuation and verified organization return (%s)', async (returnMode) => {
     const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
     process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
@@ -545,7 +556,7 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
                     if(nth===3) return;
                 }
             }
-        })(),{mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
+        })(),{...pinnedSdkControls(),mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
     });
     queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
     const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
@@ -556,7 +567,7 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
     expect(generations.map(g=>g.prompts.length)).toEqual([1,1,1]);
     expect(client.setPersonalClaudeFallback).toHaveBeenLastCalledWith(undefined);
     expect(client.setClaudeRuntimeAccount).toHaveBeenLastCalledWith(undefined);
-    expect(generations[1].settingSources).toEqual([]);
+    expect(generations[1].settingSources).toEqual(generations[0].settingSources);
     expect(returnFromPersonalClaude).toHaveBeenCalledOnce();
     expect(client.setPersonalClaudeFallback.mock.calls.filter(([v])=>v!==undefined).map(([v])=>v.personal?.accountRef??null)).toEqual([null,'a'.repeat(64),null]);
 });
@@ -608,7 +619,7 @@ it.each(['authority', 'channel', 'pending-authority', 'pending-recovery'] as con
             if(nth===2 && kind==='pending-authority') recheckFails=true;
             if(nth===2 && kind==='pending-recovery') recovered=true;
             if(nth>1 && kind!=='pending-recovery') setTimeout(()=>{void handlers.get('switch')!();},20);
-        })(),{mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
+        })(),{...pinnedSdkControls(),mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
     });
     queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
     const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},

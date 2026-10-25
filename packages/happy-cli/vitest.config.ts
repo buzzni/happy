@@ -8,6 +8,18 @@ export default defineConfig({
         globalSetup: ['./src/test-setup.ts'],
         projects: [
             {
+                test: {
+                    name: 'integration-claude-auth-pin',
+                    environment: 'node',
+                    include: ['src/claude/sdk/credentialPin.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 30_000,
+                    hookTimeout: 10_000,
+                },
+            },
+            {
                 extends: true,
                 test: {
                     name: 'integration-scheduled-tools',

@@ -11,6 +11,7 @@ import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { ensureLocalProxyBypass } from '../utils/proxyBypass'
 import { resolveHappyEntrypoint } from './happyEntrypoint'
+import { queryWithPinnedCredential } from './credentialPin'
 import { sanitizeChildEnv } from '@/utils/childEnv'
 
 /**
@@ -94,6 +95,10 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
             return callback(toolName, input, options)
         }
     }
+
+    if (opts?.personalClaudeAuth) return queryWithPinnedCredential(sdkQuery, {
+        prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
+    }, opts.personalClaudeAuth.oauthToken)
 
     return sdkQuery({
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>,
