@@ -197,6 +197,55 @@ describe('Claude model changes across provider restarts', () => {
         expect(launches[1]).toMatchObject({ model: 'claude-fable-5-1', effort: 'high', systemPrompt: { append: expect.stringContaining('turn context B') } });
     }, 15_000);
 
+    it('never answers a changed tool policy on the provider that still runs the old one, background work or not', async () => {
+        // Tool lists are query options only; the running provider would still allow what the message disallows.
+        const before: EnhancedMode = { permissionMode: 'default', model: 'claude-sonnet-5' };
+        const narrowed: EnhancedMode = { ...before, disallowedTools: ['Write'] };
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const received: string[] = [];
+        let inputEnded = false;
+        const client = {
+            sessionId: 'background-tool-policy-test',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        vi.mocked(query).mockImplementation(({ prompt, options }) => {
+            const response = (async function* () {
+                yield { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [] };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    received.push(String(message.message.content));
+                    yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'ci-watch', task_type: 'local_bash', description: 'watch CI' }] };
+                    yield { type: 'result', subtype: 'success', result: '', is_error: false, uuid: `result-${received.length}` };
+                    if (received.length === 1) queue.push('turn-1', narrowed);
+                }
+                inputEnded = true;
+                await new Promise((resolve) => options!.abortController!.signal.addEventListener('abort', resolve));
+            })();
+            return Object.assign(response, {
+                mcpServerStatus: async () => [], setPermissionMode: async () => {},
+                setModel: async () => {}, applyFlagSettings: async () => {},
+            }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('turn-0', before);
+        const session = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: null, path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(),
+        } as unknown as Session;
+        const launcher = claudeRemoteLauncher(session);
+        // The restart path: the old provider's input ends instead of taking the message.
+        await vi.waitFor(() => expect(inputEnded).toBe(true));
+        expect(received).toEqual(['turn-0']);
+        await handlers.get('switch')!();
+        await launcher;
+    });
+
     it('fails the turn of a launch that dies before its first message, after flushing, and keeps the session', async () => {
         // Desktop specs/headless-standalone-server R21: root makes Claude Code exit at once; clients
         // stayed on "responding" because no turn was open to close.

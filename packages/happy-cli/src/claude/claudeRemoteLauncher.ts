@@ -1,5 +1,6 @@
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { Metadata } from '@/api/types';
 import { render } from "ink";
 import { createManagedGracefulStop, registerManagedGracefulStop, type ManagedGracefulStop } from '@/managed/managedGracefulStop'
@@ -1023,10 +1024,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                  * provider with the settings that need a new process.
                                  *
                                  * Not for an isolated turn, which needs its own provider, nor
-                                 * for a managed run, whose model and effort its plan binds.
+                                 * for a managed run, whose model and effort its plan binds,
+                                 * nor for a changed tool policy: tool lists are query options
+                                 * only, and the running provider would still allow what the
+                                 * message disallows.
                                  */
                                 const keepForBackgroundWork = !msg.isolate && !session.managedRun
-                                    && (backgroundTasks?.tasks?.length ?? 0) > 0;
+                                    && (backgroundTasks?.tasks?.length ?? 0) > 0
+                                    && isDeepStrictEqual(mode?.allowedTools, msg.mode.allowedTools)
+                                    && isDeepStrictEqual(mode?.disallowedTools, msg.mode.disallowedTools);
                                 if (!keepForBackgroundWork) {
                                     logger.debug('[remote]: mode has changed, pending message');
                                     pending = msg;
