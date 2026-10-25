@@ -106,6 +106,16 @@ describe('runtime HTTP server', () => {
         expect(calls).toHaveLength(0)
     })
 
+    it('accepts scoped Auto mode without an approval decision and rejects mixed or unbound requests', async () => {
+        const { base, calls } = await start()
+        const mode = { taskId: 't1', requestId: 'mode', mode: 'auto', origins: ['https://fixture.test'], runtimeId: 'runtime' }
+        expect((await post(base, 'approve', mode)).status).toBe(200)
+        expect(calls[0]).toMatchObject({ op: 'approve', req: mode })
+        expect((await post(base, 'approve', { ...mode, decision: 'approve', approvalId: 'a', bindingHash: 'b' })).status).toBe(400)
+        const { runtimeId: _, ...unbound } = mode
+        expect((await post(base, 'approve', unbound)).status).toBe(400)
+    })
+
     it('passes the verified auth context and request to the api', async () => {
         const { base, calls } = await start()
         const res = await post(base, 'getTask', { taskId: 't1' })
@@ -287,6 +297,26 @@ describe('viewer client assets (D2)', () => {
             expect(restore).toBeGreaterThan(html.indexOf('<script type="module">'))
             expect(restore).toBeLessThan(html.indexOf('</head>'))
             expect(html).toContain('location.search')
+        } finally {
+            rmSync(root, { recursive: true, force: true })
+        }
+    })
+
+    it("hands vnc_lite.html's RFB object to its same-origin console (fit / actual size), ahead of noVNC's own module", async () => {
+        const root = mkdtempSync(join(tmpdir(), 'abp-viewer-assets-'))
+        try {
+            writeFileSync(join(root, 'vnc_lite.html'), '<html><head><title>noVNC</title><script type="module">read()</script></head><body></body></html>')
+            server = await startRuntimeServer({ api: makeFake().api, verifyToken, port: 0, health: () => ({}), viewerAssetsDir: root })
+            const html = await (await fetch(`${server.url}/viewer/vnc_lite.html`)).text()
+            const hook = html.indexOf('__abpRfb')
+            // Module scripts run in document order: the hook must precede the module that constructs the RFB.
+            expect(hook).toBeGreaterThan(html.indexOf('<head>'))
+            expect(hook).toBeLessThan(html.indexOf('<script type="module">read()'))
+            expect(html).toContain("import RFB from './core/rfb.js'")
+            // The console's current choice is read from the parent window; the address alone is restored last in <head>.
+            expect(html).toContain('__abpViewerFit')
+            expect(html).toContain('__abpViewerControl')
+            expect(html.indexOf('__abpViewerPath')).toBeGreaterThan(html.indexOf('<script type="module">read()'))
         } finally {
             rmSync(root, { recursive: true, force: true })
         }

@@ -30,8 +30,16 @@ import { BUILTIN_TABLES, type CuaAction, type MachinePolicy, type ToolPolicyTabl
 import type { PolicyGrantStore } from './grants';
 import type { TargetResolver } from './targetResolver';
 import type { ToolPolicyAuditLog, ToolPolicyOutcome } from './audit';
+import { composePolicyDenyMessage } from '@/utils/permissionDenyMessage';
 
 export const APPROVAL_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * The abort reason the gate gives a policy approval it stops waiting for (codexcli-approval-session-binding
+ * T15). Approvers compare `signal.reason` with it to record the withdrawal as `expired` rather than
+ * `aborted`; any other abort (the hook went away) stays `aborted`.
+ */
+export const APPROVAL_TIMEOUT_ABORT_REASON = Object.freeze({ kind: 'tool-policy-approval-timeout' as const });
 
 /** Rides on `agentState.requests[id].policy` (R11). Clients that do not know it show a plain prompt. */
 export interface PermissionPolicyMeta {
@@ -48,7 +56,10 @@ export interface PolicyApprovalAnswer {
     approved: boolean;
     /** R11.3: absent from older clients, which means `once`. */
     policyGrant: 'once' | 'session';
+    /** An older client's reason. A policy deny never had a default sentence in it, so it is read as the person's own. */
     reason?: string;
+    /** Only what the person wrote. Wins over `reason`. */
+    userReason?: string;
 }
 
 export interface PolicyApprover {
@@ -97,8 +108,12 @@ export function createToolPolicyGate(deps: {
     grants: PolicyGrantStore;
     audit: ToolPolicyAuditLog;
     approver: () => PolicyApprover | null;
-    /** A run with nobody to answer (run-once automation): `ask` becomes `blocked`. */
-    unattended: boolean;
+    /**
+     * Nobody can answer this turn (agent-tool-policy R3): `ask` becomes `blocked`. Read on every
+     * decision, because it is the current turn's attendance (codexcli-approval-session-binding R10a,
+     * Q9) — a person writing mid-turn makes the next `ask` wait for them.
+     */
+    unattended: () => boolean;
     /** True while the session runs in Claude's terminal UI, where a person answers Claude's own prompt. */
     terminalPrompt?: () => boolean;
     platform?: NodeJS.Platform;
@@ -128,9 +143,10 @@ export function createToolPolicyGate(deps: {
         });
     };
 
-    const refuse = (call: PreToolUseCall, verdict: PolicyVerdict, reasonCode: string, outcome: ToolPolicyOutcome): HookVerdict => {
+    // The answer's reason goes to the model only; the audit records the outcome, never what the person wrote.
+    const refuse = (call: PreToolUseCall, verdict: PolicyVerdict, reasonCode: string, outcome: ToolPolicyOutcome, answer: Pick<PolicyApprovalAnswer, 'reason' | 'userReason'> = {}): HookVerdict => {
         audit(call, verdict, outcome, 'blocked', reasonCode);
-        return { kind: 'deny', reasonCode, reason: blockedMessage({ ...verdict, reasonCode }, call.toolName, tables) };
+        return { kind: 'deny', reasonCode, reason: composePolicyDenyMessage(blockedMessage({ ...verdict, reasonCode }, call.toolName, tables), answer) };
     };
 
     const evaluate = async (call: PreToolUseCall, args: Record<string, unknown>): Promise<PolicyVerdict> => {
@@ -165,7 +181,7 @@ export function createToolPolicyGate(deps: {
 
             // The hook went away while the target was being looked up: nobody will read an answer.
             if (signal.aborted) return refuse(call, verdict, 'aborted', 'aborted');
-            if (deps.unattended) return refuse(call, verdict, 'unattended_no_approver', 'unattended');
+            if (deps.unattended()) return refuse(call, verdict, 'unattended_no_approver', 'unattended');
             const approver = deps.approver();
             if (!approver && call.origin === undefined && deps.terminalPrompt?.()) {
                 audit(call, verdict, 'terminal_prompt', 'ask');
@@ -177,7 +193,7 @@ export function createToolPolicyGate(deps: {
             const onAbort = () => controller.abort();
             signal.addEventListener('abort', onAbort, { once: true });
             let timedOut = false;
-            const timer = setTimeout(() => { timedOut = true; controller.abort(); }, approvalTimeoutMs);
+            const timer = setTimeout(() => { timedOut = true; controller.abort(APPROVAL_TIMEOUT_ABORT_REASON); }, approvalTimeoutMs);
             try {
                 const answer = await approver.requestPolicyApproval({
                     id: call.toolUseId ?? deps.newRequestId?.() ?? `policy-${now()}`,
@@ -195,7 +211,7 @@ export function createToolPolicyGate(deps: {
                 });
                 if (!answer.approved) {
                     deps.grants.recordDenial(verdict.denialKey);
-                    return refuse(call, verdict, 'user_denied', 'denied');
+                    return refuse(call, verdict, 'user_denied', 'denied', answer);
                 }
                 if (answer.policyGrant === 'session' && verdict.grantOffer === 'session') deps.grants.grant(verdict.grantKeys);
                 audit(call, verdict, 'approved', 'ask');

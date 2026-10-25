@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createChangeTitleHandler, startHappyServer } from './startHappyServer';
 import { unixMcpFetch } from './unixMcpFetch';
+import { sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 import { MandatorySandboxError } from '@/sandbox/sandboxPolicy';
 import type { ApiSessionClient } from '@/api/apiSession';
 
@@ -610,6 +611,31 @@ describe('startHappyServer tool registration', () => {
         } finally {
             server.stop();
             await rm(fixtureRoot, { recursive: true, force: true });
+        }
+    });
+
+    // aplus-dev-studio-desktop#2111 — a bash_stream the interrupt left running is recorded for its session.
+    it.runIf(process.platform !== 'win32')('records a bash_stream process so the session clean-up can stop it', async () => {
+        const sessionId = 'bash-stream-clean-up';
+        const client = { hasTitle: () => false, sendClaudeSessionMessage: vi.fn(), sessionId } as unknown as ApiSessionClient;
+        const server = await startHappyServer(client, { currentTurnId: () => 7 });
+        try {
+            const running = callTool(server, 6, 'bash_stream', { command: 'sleep 30' });
+            await vi.waitFor(() => expect(sessionBackgroundProcesses.list(sessionId)).toHaveLength(1));
+            expect(sessionBackgroundProcesses.list(sessionId)[0]?.turnId).toBe(7);
+            expect(sessionBackgroundProcesses.list('another-session')).toEqual([]);
+            // Not interrupted yet: the clean-up has nothing to do.
+            expect(await sessionBackgroundProcesses.clean(sessionId)).toEqual({ stopped: 0, failed: 0, items: [] });
+
+            sessionBackgroundProcesses.markTurnAborted(sessionId, 7);
+            const result = await sessionBackgroundProcesses.clean(sessionId);
+
+            expect(result).toMatchObject({ stopped: 1, failed: 0, items: [{ command: 'sleep 30', result: 'stopped' }] });
+            const payload = await running;
+            expect(payload.result.isError).toBe(true);
+            expect(sessionBackgroundProcesses.list(sessionId)).toEqual([]);
+        } finally {
+            server.stop();
         }
     });
 });

@@ -62,7 +62,7 @@ async function setup(options: { answer?: PolicyApprovalAnswer; policyReachable?:
         grants: createPolicyGrantStore(),
         audit: createToolPolicyAuditLog({ path: auditPath, sessionId: () => 's1' }),
         approver: () => approver,
-        unattended: false,
+        unattended: () => false,
         platform: 'darwin',
     });
     server = await startHookServer({ onSessionHook: () => undefined, preToolUse: { secret: SECRET, decide: gate.decide, toolsListed: gate.toolsListed } });

@@ -418,6 +418,17 @@ ${FORM_SUBMISSION}
         result.linkTarget = link.hasAttribute('target') ? String(link.getAttribute('target') || '') : baseTargetOf(document)
     }
     const form = element.form || (element.closest && element.closest('form'))
+    if (!form && !link) {
+        const controlledId = element.getAttribute('aria-controls')
+        const controlled = controlledId && element.ownerDocument.getElementById(controlledId)
+        if (tag === 'summary' && element.parentElement?.tagName === 'DETAILS'
+            && Array.from(element.parentElement.children).find(child => child.tagName === 'SUMMARY') === element)
+            result.uiAction = 'disclosure'
+        else if (tag === 'button' && ['true', 'false'].includes(element.getAttribute('aria-expanded')) && controlled)
+            result.uiAction = 'disclosure'
+        else if (result.role === 'tab' && element.closest('[role="tablist"]')
+            && controlled?.getAttribute('role') === 'tabpanel') result.uiAction = 'tab'
+    }
     if (!form) return result
     const formProp = (name) => Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, name).get.call(form)
     for (const field of Array.from(formProp('elements'))) {

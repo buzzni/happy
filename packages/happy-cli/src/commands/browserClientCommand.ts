@@ -14,6 +14,7 @@ const anyDescriptor = z.union([descriptorSchema, appDescriptorSchema])
 type Json = Record<string, any>
 interface Dependencies {
     allowCreate?: boolean
+    signal?: AbortSignal
     appRegistration?: { name: string; projectRoot: string; outFile: string; rememberSameScope: boolean }
     env: NodeJS.ProcessEnv
     output(value: unknown): void
@@ -106,14 +107,18 @@ export async function handleBrowserClientCommand(args: string[], overrides: Part
             const file = await open(out, 'wx', 0o600)
             let created: Json | undefined
             try {
+                deps.signal?.throwIfAborted()
                 created = await deps.broker(socket, overrides.appRegistration ? 'v2:register-app' : 'register', secret, overrides.appRegistration
-                    ? { schemaVersion: 2, requestId: randomUUID(), ...overrides.appRegistration, profileId: profile, taskSpaceId: space, origins, leaseMinutes: minutes }
+                    ? { schemaVersion: 2, requestId: randomUUID(), requestedAtMs: Date.now(), ...overrides.appRegistration, profileId: profile, taskSpaceId: space, origins, leaseMinutes: minutes }
                     : { schemaVersion: 1, profileId: profile, taskSpaceId: space, origins, leaseMs: minutes * 60_000 })
+                // Cancellation must revoke any authority already issued.
+                deps.signal?.throwIfAborted()
                 const descriptor = anyDescriptor.parse({ schemaVersion: overrides.appRegistration ? 2 : 1, brokerSocket: socket, runtimeUrl,
                     ...(overrides.appRegistration ? { appId: created.appId, appSecret: created.appSecret, projectRoot: overrides.appRegistration.projectRoot, outFile: overrides.appRegistration.outFile, origins, name: overrides.appRegistration.name, maxLeaseMinutes: minutes } : {}),
                     clientSecret: created.clientSecret, clientSessionId: created.clientSessionId, profileId: created.profileId,
                     taskSpaceId: created.taskSpaceId, expiresAtMs: created.expiresAtMs })
                 await file.writeFile(JSON.stringify(descriptor) + '\n'); await file.sync()
+                deps.signal?.throwIfAborted()
                 deps.output({ ok: true, file: out, clientSessionId: descriptor.clientSessionId, expiresAtMs: descriptor.expiresAtMs })
             } catch (error) {
                 if (created?.clientSecret) await deps.broker(socket, overrides.appRegistration ? 'v2:revoke-app' : 'revoke', overrides.appRegistration ? secret : created.clientSecret, overrides.appRegistration ? { schemaVersion: 2, profileId: profile, appId: created.appId } : { schemaVersion: 1 }).catch(() => undefined)

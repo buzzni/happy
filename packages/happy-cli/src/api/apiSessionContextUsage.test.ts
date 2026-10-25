@@ -29,6 +29,7 @@ vi.mock('@/api/rpc/RpcHandlerManager', () => ({
         onSocketConnect = vi.fn();
         onSocketDisconnect = vi.fn();
         handleRequest = vi.fn(async () => '');
+        registerHandler = vi.fn();
     },
 }));
 vi.mock('@/modules/common/registerCommonHandlers', () => ({ registerCommonHandlers: vi.fn() }));

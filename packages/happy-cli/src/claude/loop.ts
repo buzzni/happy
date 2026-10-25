@@ -1,3 +1,4 @@
+import type { TurnAttendanceState } from '@/api/turnAttendance';
 import type { ScopeClaudeSandbox } from '@/daemon/sessionWriteScopeClaude';
 import type { ClaudeStandaloneDrain } from './claudeStandaloneDrain';
 import type { LessonProposalTurn } from '@/utils/lessonProposalTurn';
@@ -100,6 +101,8 @@ interface LoopOptions {
     outputFormat?: ClaudeOutputFormat
     getSaycodeSystemPromptEnabled: () => boolean | undefined
     getSaycodePromptBlocks: () => SaycodePromptBlockOverrides | undefined
+    /** codexcli-approval-session-binding R10a — the run's turn attendance. */
+    turnAttendance?: TurnAttendanceState
 }
 
 export async function loop(opts: LoopOptions): Promise<number> {
@@ -137,6 +140,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         startingMode: opts.startingMode,
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
         outputFormat: opts.outputFormat,
+        turnAttendance: opts.turnAttendance,
         lessons: opts.lessons,
         lessonProposalTurn: opts.lessonProposalTurn,
         turnCards: opts.turnCards,

@@ -430,7 +430,7 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         }
     }
 
-    for (const action of ['register-app', 'connect-app', 'list-apps', 'disable-app', 'revoke-app', 'grant', 'status', 'revoke']) {
+    for (const action of ['register-app', 'connect-app', 'list-apps', 'disable-app', 'revoke-app', 'grant', 'status', 'revoke', 'list', 'revoke-owned']) {
         routes[`POST /v2/clients/${action}`] = async req => {
             if (!apps) throw new BrowserRuntimeError('UNSUPPORTED_OPERATION', 'Local browser apps are unavailable')
             await options.admit?.()

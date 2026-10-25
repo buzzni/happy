@@ -29,6 +29,30 @@ it.skipIf(process.platform !== 'linux')('uses the captured parent credential aft
     expect(JSON.stringify(reply)).not.toMatch(/parent-secret|bounded-secret/)
     expect(process.env.HAPPY_BROWSER_TASK_SESSION_SECRET).toBeUndefined()
 })
+it.skipIf(process.platform !== 'linux')('revokes a registration delivered after cancellation and leaves no connection file', async () => {
+    const h = await setup(true)
+    const controller = new AbortController()
+    const register = h.broker.getMockImplementation()!
+    h.broker.mockImplementationOnce(async (...args) => {
+        const result = await register(...args)
+        controller.abort(new Error('Caller cancelled while registration was in flight'))
+        return result
+    })
+    await expect(h.client.create(h.args, controller.signal)).rejects.toThrow()
+    expect(h.broker.mock.calls.map(c => c[1])).toEqual(['register', 'revoke'])
+    expect(h.broker.mock.calls[1]).toEqual(['/local/broker.sock', 'revoke', 'bounded-secret', { schemaVersion: 1 }])
+    await expect(stat(join(h.cwd, 'connection.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+})
+it('does not revoke a connection when cancellation races with the approval answer', async () => {
+    const h = await setup(true)
+    const controller = new AbortController()
+    h.requestPolicyApproval.mockImplementationOnce(async () => {
+        controller.abort(new Error('Caller cancelled before the approval continuation'))
+        return { approved: true, policyGrant: 'once' }
+    })
+    await expect(h.client.revoke('client-lost-file', controller.signal)).rejects.toThrow()
+    expect(h.broker).not.toHaveBeenCalled()
+})
 it('refuses missing approver, denial and paths outside the project without issuing or writing', async () => {
     for (const approved of [null, false]) {
         const h = await setup(approved)
@@ -43,8 +67,8 @@ it('refuses missing approver, denial and paths outside the project without issui
 it('owner can inspect and revoke without the connection file, with approval for revocation', async () => {
     const h = await setup(true)
     await h.client.list(); await h.client.revoke('client-lost-file')
-    expect(h.broker.mock.calls.map(c => c[1])).toEqual(['list', 'revoke-owned'])
-    expect(h.broker.mock.calls[1][3]).toMatchObject({ clientSessionId: 'client-lost-file', profileId: 'main' })
+    expect(h.broker.mock.calls.map(c => c[1])).toEqual(['list', 'v2:list', 'v2:list', 'revoke-owned'])
+    expect(h.broker.mock.calls[3][3]).toMatchObject({ clientSessionId: 'client-lost-file', profileId: 'main' })
     expect(h.requestPolicyApproval).toHaveBeenCalledTimes(1)
 })
 it.skipIf(process.platform !== 'linux')('does not follow a destination directory replaced during the approval prompt', async () => {
@@ -106,4 +130,16 @@ it.skipIf(process.platform !== 'linux')('v2 refuses old yes-only approval withou
     const h = await setup(true)
     await expect(h.client.create({ ...h.args, appName: 'Dashboard' })).rejects.toThrow('explicit browser app consent')
     expect(h.broker).not.toHaveBeenCalled()
+})
+
+it('includes app connections in session listing and routes approved owner revocation to v2', async () => {
+    const h = await setup(true)
+    h.broker.mockImplementation(async (_socket, action) => {
+        if (action === 'list') return { clients: [{ clientSessionId: 'legacy-client' }] } as any
+        if (action === 'v2:list') return { clients: [{ clientSessionId: 'app-client' }] } as any
+        return { revoked: true } as any
+    })
+    await expect(h.client.list()).resolves.toEqual({ clients: [{ clientSessionId: 'legacy-client' }, { clientSessionId: 'app-client' }] })
+    await h.client.revoke('app-client')
+    expect(h.broker).toHaveBeenLastCalledWith('/local/broker.sock', 'v2:revoke-owned', 'parent-secret', { schemaVersion: 2, profileId: 'main', clientSessionId: 'app-client' })
 })

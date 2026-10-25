@@ -17,8 +17,9 @@ export async function dispatchStep(
     signal: AbortSignal,
     /** click: what was classified/approved, re-verified by the driver right before input */
     expect?: DispatchExpectation,
+    validateDispatch?: () => void,
 ): Promise<Observation | { url: string; documentGeneration: number } | void> {
-    const options = { signal, timeoutMs: step.timeoutMs }
+    const options = { signal, timeoutMs: step.timeoutMs, ...(validateDispatch ? { validateDispatch } : {}) }
     switch (step.kind) {
         case 'navigate': {
             if (!step.url) throw new BrowserRuntimeError('INVALID_REQUEST', 'navigate requires url')

@@ -132,6 +132,7 @@ interface DescribedElement {
     role: string
     name: string
     tag: string
+    uiAction?: ElementDescription['uiAction']
     linkUrl?: string
     linkTarget?: string
     formAction?: string
@@ -880,6 +881,7 @@ export class CdpDriver implements BrowserDriver {
             const live = opts.expect ? await this.assertExpectation(conn, binding, objectId, opts.expect) : undefined
             this.assertFresh(tab, binding, snapshotId)
             if (live?.form) await this.armSubmitGuard(conn, tab, binding, objectId, live.form)
+            opts.validateDispatch?.()
             op.markDispatch()
             const base = { x: point.x, y: point.y, button: 'left', clickCount: 1 }
             await conn.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1 }, binding.sessionId)
@@ -919,6 +921,7 @@ export class CdpDriver implements BrowserDriver {
                 currentRole: context.role,
                 currentName: context.name,
                 tag: context.tag,
+                ...(context.uiAction ? { uiAction: context.uiAction } : {}),
                 ...(context.linkUrl ? { linkUrl: context.linkUrl, linkTarget: context.linkTarget ?? '' } : {}),
                 ...(context.form ? { form: { ...context.form, digest: formDigest(context.form) }, submitsForm: context.submitsForm === true } : {}),
             }
@@ -1598,6 +1601,7 @@ export class CdpDriver implements BrowserDriver {
         const { result } = await conn.send('Runtime.callFunctionOn', { functionDeclaration: DESCRIBE_ELEMENT, objectId, returnByValue: true }, binding.sessionId)
         const live = result.value as DescribedElement
         const same = live.role === expected.role && live.name === expected.name
+            && (!expected.uiAction || live.uiAction === expected.uiAction)
             && (live.linkUrl ?? undefined) === expected.linkUrl
             && (live.linkUrl ? (live.linkTarget ?? '') : undefined) === (expected.linkUrl ? (expected.linkTarget ?? '') : undefined)
             && (live.form ? formDigest(live.form) : undefined) === expected.formDigest

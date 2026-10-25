@@ -45,6 +45,8 @@ export interface CreateSessionMetadataOptions {
     createdBy?: { accountId: string; displayName?: string };
     /** Who started the session (takeSessionSourceFromEnv); a terminal start has none. */
     source?: SessionSource;
+    /** The runner wires the unattended approval wait (codexcli-approval-session-binding R15). */
+    approvalLifecycle?: boolean;
 }
 
 /**
@@ -88,6 +90,7 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         version: packageJson.version,
         runtimeCapabilities: {
             saycodeSystemPromptPreference: true,
+            ...(opts.approvalLifecycle ? { approvalLifecycle: 1 as const } : {}),
         },
         rpcBinding: RPC_BINDING_CAPABILITY,
         os: os.platform(),

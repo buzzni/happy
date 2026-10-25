@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { runManagedScript } from './managedScriptRunner';
 const exec = promisify(execFile);
-const docker = (args: string[]) => exec('docker', args, { timeout: 30000, maxBuffer: 1024 * 1024 });
+const docker = (args: string[]) => exec('docker', args, { timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true });
 type Owner = { ownerId: string; directory: string };
 
 export async function recoverManagedScriptContainers(input: Owner) {

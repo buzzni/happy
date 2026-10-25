@@ -22,7 +22,8 @@ import {
 } from '@/channel/channelApprovalEvent';
 import type { ChannelPermissionBinding } from '@/channel/channelPermissionBinding';
 import { createEnvelope } from '@slopus/happy-wire';
-import type { PermissionPolicyMeta, PolicyApprovalAnswer, PolicyApprover } from '@/toolPolicy/policyGate';
+import { APPROVAL_TIMEOUT_ABORT_REASON, type PermissionPolicyMeta, type PolicyApprovalAnswer, type PolicyApprover } from '@/toolPolicy/policyGate';
+import type { PermissionResolution } from '@/utils/permissionResolution';
 
 // Re-export types for backwards compatibility
 export type { PermissionResult, PendingRequest };
@@ -36,7 +37,7 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
     /** A launch shutdown is permanent; ordinary user abortAll remains reusable. */
     closeForShutdown(): void {
         this.shutdownClosed = true;
-        this.abortAll('Session shutting down');
+        this.abortAll('Session shutting down', 'shutdown');
     }
 
     // Exact tool names that should always be auto-approved. Include the bare
@@ -167,9 +168,9 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
     private readonly withdrawnPolicyRequestIds = new Set<string>();
 
     /** The Stop button and shutdown withdraw a policy request; they are not a person declining it. */
-    override abortAll(reason?: string): void {
+    override abortAll(reason?: string, resolution?: PermissionResolution): void {
         for (const id of this.policyRequestIds) if (this.pendingRequests.has(id)) this.withdrawnPolicyRequestIds.add(id);
-        super.abortAll(reason);
+        super.abortAll(reason, resolution);
     }
 
     async requestPolicyApproval(request: {
@@ -182,7 +183,10 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
         if (this.shutdownClosed || request.signal.aborted) throw new Error('Tool policy approval unavailable');
         // Two calls must never share a card: an answer or a withdrawal would settle the other one.
         if (this.pendingRequests.has(request.id)) throw new Error('Tool policy approval id already waiting');
-        const onAbort = () => this.cancelRequest(request.id);
+        // The gate gives up on a timed-out approval with its own reason (T15): that is `expired`.
+        const onAbort = () => this.cancelRequest(
+            request.id, request.signal.reason === APPROVAL_TIMEOUT_ABORT_REASON ? 'expired' : 'aborted',
+        );
         this.policyRequestIds.add(request.id);
         const result = await new Promise<PermissionResult>((resolve, reject) => {
             request.signal.addEventListener('abort', onAbort, { once: true });
@@ -252,11 +256,12 @@ export class CodexPermissionHandler extends BasePermissionHandler implements Pol
             });
 
             // Update agent state with pending request
-            this.addPendingRequestToState(toolCallId, toolName, input);
+            const raised = this.addPendingRequestToState(toolCallId, toolName, input);
 
             // After the pending request exists, and swallowing anything thrown: a channel
             // publisher that fails must not stop the Desktop user from being asked at all.
-            if (context?.channelTurn) {
+            // A prompt declined at once (the turn's wait is spent) is never published.
+            if (raised && context?.channelTurn) {
                 try {
                     this.observeChannelWait({
                         permissionId: toolCallId,

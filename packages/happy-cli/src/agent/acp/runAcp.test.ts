@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => {
     keepAlive: vi.fn(),
     /** Default to a titled session so existing prompt assertions stay verbatim. */
     hasTitle: vi.fn(() => true),
+    getMetadata: vi.fn(() => null),
     sendSessionProtocolMessage: vi.fn(),
     sendSessionEvent: vi.fn(),
     updateMetadata: vi.fn(),
@@ -519,6 +520,55 @@ describe('runAcp', () => {
 
     await mocks.getKillHandler()!();
     await runPromise.catch(() => { });
+  });
+
+  describe('unattended approval wait (codexcli-approval-session-binding R10a)', () => {
+    /** The pending request the handler last wrote for a call, from the agent-state updates. */
+    const raisedRequest = (callId: string): Record<string, unknown> | undefined => {
+      // The mock applies each update to an empty state and drops the result; apply them again here.
+      const states = mocks.mockSession.updateAgentState.mock.calls.map(([update]) => update({}) as { requests?: Record<string, Record<string, unknown>> });
+      return states.map((state) => state?.requests?.[callId]).filter(Boolean).at(-1);
+    };
+
+    async function raiseApprovalAfter(meta: Record<string, unknown> | undefined): Promise<() => Promise<void>> {
+      mocks.backendState.silentPrompt = true;
+      const runPromise = runAcp({
+        credentials: { token: 'token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+        agentName: 'opencode',
+        command: 'opencode',
+        args: ['--acp'],
+      });
+      await vi.waitFor(() => {
+        expect(mocks.getUserMessageHandler()).toBeTypeOf('function');
+      });
+      mocks.getUserMessageHandler()!({ role: 'user', content: { type: 'text', text: 'run' }, ...(meta ? { meta } : {}) });
+      await vi.waitFor(() => {
+        expect(mocks.backendState.prompts).toHaveLength(1);
+      });
+      void mocks.backendState.constructorArgs.permissionHandler
+        .handleToolCall('tool-1', 'Bash', { command: 'ls' }).catch(() => { });
+      await vi.waitFor(() => {
+        expect(raisedRequest('tool-1')).toBeDefined();
+      });
+      return async () => {
+        await mocks.getKillHandler()!();
+        await runPromise.catch(() => { });
+      };
+    }
+
+    it('gives a daemon automation turn a deadline, and declares the capability', async () => {
+      const stop = await raiseApprovalAfter({ sentFrom: 'automation' });
+      expect(raisedRequest('tool-1')?.expiresAt).toEqual(expect.any(Number));
+      const [payload] = mocks.mockGetOrCreateSession.mock.calls[0] as unknown as [{ metadata: { runtimeCapabilities?: Record<string, unknown> } }];
+      expect(payload.metadata.runtimeCapabilities?.approvalLifecycle).toBe(1);
+      await stop();
+    });
+
+    it('lets a person\'s turn wait without a deadline', async () => {
+      const stop = await raiseApprovalAfter(undefined);
+      expect(raisedRequest('tool-1')).not.toHaveProperty('expiresAt');
+      await stop();
+    });
   });
 
   it('records grok sessions under their own flavor rather than generic acp', async () => {

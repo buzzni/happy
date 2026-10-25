@@ -11,6 +11,9 @@ declare global {
         type SessionEventContent = {
             t: 'encrypted';
             c: string;
+        } | {
+            // 서버가 직접 남기는 본문 없는 이벤트(turn-ready).
+            t: 'plain';
         };
 
         type CheckpointEventMetadata = CheckpointEventEnvelope;

@@ -20,9 +20,12 @@ export function createLocalClientSession(options: {
         const approver = options.approver()
         if (!approver) throw new Error('Human approval is unavailable in this session')
         const timeout = AbortSignal.timeout(120_000)
+        const approvalSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+        approvalSignal.throwIfAborted()
         const answer = await approver.requestPolicyApproval({ id: randomUUID(), toolName, args,
             policy: { reasonCode: 'browser_client_delegation', ruleId: 'browser-local-client', humanOnly: true, grantOffer: 'once' },
-            signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+            signal: approvalSignal })
+        approvalSignal.throwIfAborted()
         if (!answer.approved) throw new Error('User did not approve this connection')
         return answer.browserClientConsent
     }
@@ -60,7 +63,7 @@ export function createLocalClientSession(options: {
                 const pinnedFile = `/proc/self/fd/${directory.fd}/${basename(output)}`
                 const code = await dependencies.command(['create', '--space', args.taskSpaceId, '--profile', profileId,
                     ...args.origins.flatMap(origin => ['--origin', origin]), '--lease-minutes', String(consent?.leaseMinutes ?? args.leaseMinutes), '--out', pinnedFile], {
-                    allowCreate: true, ...(args.appName && consent ? { appRegistration: { name: args.appName, projectRoot: root, outFile: file, rememberSameScope: consent.rememberSameScope } } : {}), env: { HAPPY_BROWSER_TASK_SESSION_SECRET: options.sessionSecret,
+                    allowCreate: true, signal, ...(args.appName && consent ? { appRegistration: { name: args.appName, projectRoot: root, outFile: file, rememberSameScope: consent.rememberSameScope } } : {}), env: { HAPPY_BROWSER_TASK_SESSION_SECRET: options.sessionSecret,
                         HAPPY_BROWSER_TASK_BROKER_SOCKET: options.socketPath, HAPPY_BROWSER_TASK_RUNTIME_URL: options.runtimeUrl },
                     output: value => responses.push(value), broker: dependencies.broker,
                 })
@@ -74,13 +77,22 @@ export function createLocalClientSession(options: {
         async manageApps(action: 'list-apps' | 'disable-app' | 'revoke-app', appId?: string) {
             return dependencies.broker(options.socketPath, `v2:${action}`, options.sessionSecret, { schemaVersion: 2, profileId: await options.profileId(), ...(appId ? { appId } : {}) })
         },
-        async list() { return dependencies.broker(options.socketPath, 'list', options.sessionSecret,
-            { schemaVersion: 1, profileId: await options.profileId() }) },
+        async list() {
+            const profileId = await options.profileId()
+            const [legacy, apps] = await Promise.all([
+                dependencies.broker(options.socketPath, 'list', options.sessionSecret, { schemaVersion: 1, profileId }),
+                dependencies.broker(options.socketPath, 'v2:list', options.sessionSecret, { schemaVersion: 2, profileId }),
+            ])
+            return { clients: [...legacy.clients ?? [], ...apps.clients ?? []] }
+        },
         async revoke(clientSessionId: string, signal?: AbortSignal) {
             const profileId = await options.profileId()
             await approve(LOCAL_CLIENT_TOOL_NAMES[2], { clientSessionId, profileId }, signal)
-            return dependencies.broker(options.socketPath, 'revoke-owned', options.sessionSecret,
-                { schemaVersion: 1, profileId, clientSessionId })
+            const apps = await dependencies.broker(options.socketPath, 'v2:list', options.sessionSecret, { schemaVersion: 2, profileId })
+            signal?.throwIfAborted()
+            const isApp = (apps.clients ?? []).some((client: { clientSessionId: string }) => client.clientSessionId === clientSessionId)
+            return dependencies.broker(options.socketPath, isApp ? 'v2:revoke-owned' : 'revoke-owned', options.sessionSecret,
+                { schemaVersion: isApp ? 2 : 1, profileId, clientSessionId })
         },
     }
 }

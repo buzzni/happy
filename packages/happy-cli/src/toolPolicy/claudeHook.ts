@@ -31,10 +31,14 @@ export function isToolPolicyEnabled(env: NodeJS.ProcessEnv): boolean {
  * Machine metadata `toolPolicy`; absent when the policy is switched off. `enforcement` names the
  * adapters this runtime has: every Claude `mcp__*` call (hook), cua-driver for both providers
  * (shadow proxy) and Saycode-injected servers under Codex (stdio bridge). A user's own non-cua MCP
- * server under Codex has no adapter (Q5) — hence no `codex-user-mcp`.
+ * server under Codex has no adapter (Q5) — hence no `codex-user-mcp`. `verb-words:<rule>` names the MCP
+ * verb rule this daemon decides by (policy-tables §4), so Desktop labels a conversation's tools by its PC's rule.
+ * `policyVersion` names its table: Desktop's labels use its own PC's dictionary, so a different version labels nothing.
  */
-export function toolPolicyMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforcement: string[] } | undefined {
-    return isToolPolicyEnabled(env) ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge'] } : undefined;
+export function toolPolicyMachineCapability(env: NodeJS.ProcessEnv): { version: 1; enforcement: string[]; policyVersion: string } | undefined {
+    return isToolPolicyEnabled(env)
+        ? { version: 1, enforcement: ['claude-hook', 'cua-proxy', 'codex-bridge', `verb-words:${BUILTIN_TABLES.mcp.verbWords}`], policyVersion: BUILTIN_TABLES.policyVersion }
+        : undefined;
 }
 
 export function toolPolicyFilePath(happyHomeDir: string): string {

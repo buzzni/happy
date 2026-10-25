@@ -118,7 +118,7 @@ export function createEvidenceIo(): EvidenceIo {
   return {
     platform: process.platform,
     exec: (file, args, timeoutMs) => new Promise<ExecResult>((resolve) => {
-      execFile(file, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      execFile(file, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
         if (!err) {
           resolve({ status: 'ok', stdout })
           return

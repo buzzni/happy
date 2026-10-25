@@ -74,7 +74,7 @@ describe.skipIf(!codexAvailable())('Codex cua-driver shadow (approval policy nev
             grants: createPolicyGrantStore(),
             audit: createToolPolicyAuditLog({ path: join(dir, 'audit.jsonl'), sessionId: () => 's1' }),
             approver: () => ({ requestPolicyApproval: async (request) => { asked.push(request.toolName); return { approved: true, policyGrant: 'once' }; } }),
-            unattended: false,
+            unattended: () => false,
             platform: 'darwin',
         });
         server = await startHookServer({ onSessionHook: () => undefined, preToolUse: { secret: SECRET, decide: gate.decide, toolsListed: gate.toolsListed } });

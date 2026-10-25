@@ -9,6 +9,7 @@ import {
 } from './claudeOffTurnTitle';
 
 const base: QueryOptions = {
+    personalClaudeAuth: { oauthToken: 'fixture-selected-personal' },
     cwd: '/work/project',
     model: 'claude-opus-5-5',
     effort: 'high',
@@ -27,6 +28,7 @@ describe('buildClaudeTitleQueryOptions', () => {
     it('shouldKeepThePayerAndSandboxInputsOfTheMainQuery', () => {
         const signal = new AbortController().signal;
         const options = buildClaudeTitleQueryOptions(base, { model: 'claude-haiku-4-5', settingsPath: '/tmp/title.json', signal });
+        expect(options.personalClaudeAuth).toBe(base.personalClaudeAuth);
         expect(options.cwd).toBe('/work/project');
         expect(options.settingSources).toEqual(['user', 'project']);
         expect(options.sandbox).toEqual({ enabled: true });

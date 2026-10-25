@@ -110,6 +110,17 @@ export async function openLocalClients(options: LocalClientOptions) {
     const activeCount = (principal: string) => Object.values(records).filter(r => !r.revoking && r.expiresAtMs > options.now() && r.principalId === principal).length
     return {
         activeCount,
+        hasClient: (clientId: string) => Boolean(records[clientId]),
+        /** Trusted registry recovery; never exposed as an unauthenticated broker action. */
+        revokeMatching: (matches: (clientId: string) => boolean) => exclusive(async () => {
+            let cleanupPending = false
+            for (const record of Object.values(records)) {
+                if (!matches(record.clientSessionId)) continue
+                try { cleanupPending = (await revoke(record)).cleanupPending || cleanupPending }
+                catch { cleanupPending = true }
+            }
+            return { revoked: true, cleanupPending }
+        }),
         isActive: (id: string) => Boolean(records[id] && !records[id].revoking && records[id].expiresAtMs > options.now()),
         sweep,
         drain: () => tail.then(() => undefined),

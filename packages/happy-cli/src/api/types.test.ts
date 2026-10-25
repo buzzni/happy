@@ -2,6 +2,17 @@ import { describe, expect, it } from 'vitest';
 import { MachineMetadataSchema, MessageMetaSchema } from './types';
 
 describe('MessageMetaSchema', () => {
+  it('keeps the fields that say who sent the turn (codexcli-approval-session-binding T20 (a))', () => {
+    expect(MessageMetaSchema.parse({ sentFrom: 'daemon', source: 'agent-browser', turnTrigger: 'schedule', delegatedAttendance: 'unattended' }))
+      .toMatchObject({ sentFrom: 'daemon', source: 'agent-browser', turnTrigger: 'schedule', delegatedAttendance: 'unattended' });
+  });
+
+  it('degrades malformed sender fields to unknown instead of dropping the turn', () => {
+    const parsed = MessageMetaSchema.safeParse({ turnTrigger: 7, source: {}, delegatedAttendance: 'everyone' });
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toEqual({});
+  });
+
   it('preserves an explicit Saycode system prompt policy', () => {
     expect(MessageMetaSchema.parse({ saycodeSystemPromptEnabled: false }))
       .toEqual({ saycodeSystemPromptEnabled: false });
