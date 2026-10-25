@@ -1,6 +1,6 @@
 import { TurnInputEvidence, type EvidenceBatch } from '@/api/turnInputEvidence';
 import { closeClaudeTurnWithStatus, mapClaudeLogMessageToSessionEnvelopes, mapClaudeChannelFinalAnswer,
-    startClaudeInputTurn, failClaudeLaunchTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
+    failClaudeLaunchTurn, type ClaudeSessionProtocolState } from './utils/sessionProtocolMapper';
 import type { SessionEnvelope, SessionTurnEndStatus, InputEvidenceV1 } from '@slopus/happy-wire';
 import type { RawJSONLines } from './types';
 import { formatSetupTokenBinding } from '@/daemon/sessionEnv';
@@ -63,7 +63,7 @@ function attachInputEvidence(client: {
             events.push(tracker.stamp(envelope));
         }
     };
-    const ensure = () => { if (pending) accept(startClaudeInputTurn(state).envelopes); };
+    const ensure = () => { if (pending) accept(tracker.startUnmappedTurn()); };
     Object.assign(client, {
         inputEvidence: tracker,
         startClaudeInputEvidence: (batch: EvidenceBatch) => { tracker.setPending(batch); pending = true; },
@@ -71,9 +71,19 @@ function attachInputEvidence(client: {
     });
     client.setPendingTurnRequestId.mockImplementation((id: string | null) => { state.pendingRequestId = id; });
     client.sendClaudeSessionMessage.mockImplementation((body: RawJSONLines) => accept(mapClaudeLogMessageToSessionEnvelopes(body, state).envelopes));
-    client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => accept(mapClaudeChannelFinalAnswer(state, text, true).envelopes));
-    client.closeClaudeSessionTurn.mockImplementation((status: SessionTurnEndStatus) => { ensure(); accept(closeClaudeTurnWithStatus(state, status).envelopes); });
-    client.failClaudeLaunchTurn?.mockImplementation(() => { ensure(); accept(failClaudeLaunchTurn(state).envelopes); });
+    client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => {
+        const mapped = mapClaudeChannelFinalAnswer(state, text).envelopes;
+        accept(mapped.length ? mapped : tracker.unmappedFinalAnswer(text));
+    });
+    client.closeClaudeSessionTurn.mockImplementation((status: SessionTurnEndStatus) => {
+        const mapped = closeClaudeTurnWithStatus(state, status).envelopes;
+        if (!mapped.length) ensure();
+        accept(tracker.closeUnmappedTurn(status)); accept(mapped);
+    });
+    client.failClaudeLaunchTurn?.mockImplementation(() => {
+        const mapped = failClaudeLaunchTurn(state).envelopes;
+        accept(tracker.closeUnmappedTurn('failed')); accept(mapped);
+    });
     return { events, tracker };
 }
 

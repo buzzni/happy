@@ -54,13 +54,16 @@ function harness(witnessed = false) {
         setPendingInputEvidence: (batch: EvidenceBatch) => evidence.setPending(batch),
         setPendingTurnRequestId: (requestId: string | null) => { state.pendingRequestId = requestId; },
         sendFinalAnswerForChannelTurn: (text: string) => {
-            append(mapClaudeChannelFinalAnswer(state, text, witnessed).envelopes);
+            const mapped = mapClaudeChannelFinalAnswer(state, text).envelopes;
+            append(mapped.length || !witnessed ? mapped : evidence.unmappedFinalAnswer(text));
         },
         sendStructuredOutput: (envelope: Parameters<typeof mapClaudeStructuredOutput>[1]) => {
             append(mapClaudeStructuredOutput(state, envelope).envelopes);
         },
         closeClaudeSessionTurn: (status: SessionTurnEndStatus) => {
-            append(closeClaudeTurnWithStatus(state, status).envelopes);
+            const mapped = closeClaudeTurnWithStatus(state, status).envelopes;
+            if (witnessed) append(evidence.closeUnmappedTurn(status));
+            append(mapped);
         },
         sendClaudeSessionMessage: (logMessage: unknown) => {
             const mapped = mapClaudeLogMessageToSessionEnvelopes(logMessage as never, state);

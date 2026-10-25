@@ -1,7 +1,7 @@
 /** Runtime input witnesses. This is deliberately independent of AutomationTurnTracker's single-run arming. */
 import { randomUUID } from 'node:crypto';
 import { createEnvelope, hubPromptGuardSchema, inputRefSchema, type HubInputAdmissionV1,
-    type InputEvidenceV1, type InputRef, type SessionEnvelope } from '@slopus/happy-wire';
+    type InputEvidenceV1, type InputRef, type SessionEnvelope, type SessionTurnEndStatus } from '@slopus/happy-wire';
 
 export type EvidenceBatch = { inputs: InputRef[]; inputCount: number; continuation?: InputEvidenceV1; incompleteReasons?: string[] };
 type AdditionalKind = InputEvidenceV1['additional']['items'][number]['kind'];
@@ -46,6 +46,7 @@ export class TurnInputEvidence {
     private readonly attempts = new WeakMap<InputEvidenceV1, Set<Attempt>>();
     private readonly turns = new Map<string, InputEvidenceV1>();
     private current: string | null = null;
+    private unmappedTurn: string | null = null;
     private last: string | null = null;
     private carry: InputEvidenceV1 | null = null;
     private readonly backgroundTurns = new Map<string, string>();
@@ -57,12 +58,14 @@ export class TurnInputEvidence {
         const turn = ids.map(id => this.backgroundTurns.get(id)).find(Boolean);
         for (const id of ids) this.backgroundTurns.delete(id);
         const source = turn ? this.snapshot(turn) : null;
+        const unmapped = this.current !== null && this.current === this.unmappedTurn;
+        if (unmapped) incompleteReasons = [...incompleteReasons, 'background-co-consumption'];
         const reasons = [...incompleteReasons, 'background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
         // Scanner consumption can close the previous mapper turn before its envelopes are stamped.
         // Its background observation belongs to the next turn, not that still-stamped current turn.
         if (this.current && !nextTurn) for (const reason of reasons) this.incomplete(reason, this.current);
         if (this.pending) this.pending.incompleteReasons = [...(this.pending.incompleteReasons ?? []), ...reasons];
-        if ((this.current && !nextTurn) || this.pending) return;
+        if ((this.current && !nextTurn && !unmapped) || this.pending) return;
         if (this.background) {
             this.background.incompleteReasons = [...(this.background.incompleteReasons ?? []), ...reasons];
             return;
@@ -79,6 +82,22 @@ export class TurnInputEvidence {
     }
     constructor(readonly runtimeId: string, private readonly emit: (envelope: SessionEnvelope) => void) {}
     currentTurn(): string | null { return this.current; }
+    /** Textless dispatches need a witness, without opening or consuming a channel routing turn. */
+    startUnmappedTurn(): SessionEnvelope[] {
+        if (this.current || this.unmappedTurn) return [];
+        this.unmappedTurn = randomUUID();
+        return [createEnvelope('agent', { t: 'turn-start' }, { turn: this.unmappedTurn })];
+    }
+    unmappedFinalAnswer(text: string): SessionEnvelope[] {
+        if (typeof text !== 'string' || !text.trim()) return [];
+        const start = this.startUnmappedTurn();
+        const turn = this.current ?? this.unmappedTurn!;
+        return [...start, createEnvelope('agent', { t: 'final-answer', text }, { turn })];
+    }
+    closeUnmappedTurn(status: SessionTurnEndStatus): SessionEnvelope[] {
+        return this.unmappedTurn ? [createEnvelope('agent', { t: 'turn-end', status }, { turn: this.unmappedTurn })] : [];
+    }
+
     setPending(batch: EvidenceBatch | null): void {
         // Background observations survive replacement/cancellation of a batch that never dispatched.
         const reasons = (this.pending?.incompleteReasons ?? []).filter(reason => reason.startsWith('background-'));
@@ -213,6 +232,8 @@ export class TurnInputEvidence {
         if (envelope.role !== 'agent' || envelope.subagent || !envelope.turn) return envelope;
         const { ev, turn } = envelope;
         if (ev.t === 'turn-start') {
+            const interleaved = this.unmappedTurn && this.unmappedTurn !== turn;
+            if (interleaved) this.incomplete('witness-turn-interleaved', this.unmappedTurn);
             const batch = this.pending ?? this.background;
             const continuation = batch?.continuation;
             const validContinuation = continuation && (continuation.continuation.kind === 'background'
@@ -226,6 +247,7 @@ export class TurnInputEvidence {
             const inputs = inherited?.inputs ?? batch?.inputs ?? [];
             const reasons = [...(inherited?.incompleteReasons ?? []), ...(batch?.incompleteReasons ?? [])];
             if (!batch) reasons.push('unobserved-input');
+            if (interleaved) reasons.push('witness-turn-interleaved');
             if (continuation && !validContinuation) reasons.push('continuation-invalidated');
             if (inputs.length > 256) reasons.push('input-limit');
             if (inputs.some(ref => !inputRefSchema.safeParse(ref).success)) reasons.push('invalid-input-ref');
@@ -257,6 +279,7 @@ export class TurnInputEvidence {
             return envelope;
         }
         if (ev.t === 'turn-end') {
+            if (this.unmappedTurn === turn) this.unmappedTurn = null;
             value.terminal = value.continuation.state !== 'pending';
             if (value.continuation.state === 'running') value.continuation.state = 'completed';
             if (this.current === turn) this.current = null;
