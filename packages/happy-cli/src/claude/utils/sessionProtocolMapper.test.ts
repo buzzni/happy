@@ -929,7 +929,7 @@ describe('channel correlation on runs that produce no text', () => {
         closeClaudeTurnWithStatus(state, 'completed');
         mapClaudeLogMessageToSessionEnvelopes({
             type: 'user', uuid: 'task-notification', happyTaskNotification: true,
-            message: { role: 'user', content: '<task-notification><task-id>task-hidden-1</task-id><status>completed</status></task-notification>' },
+            message: { role: 'user', content: '<task-notification><task-id>task-hidden-1</task-id></task-notification>' },
         } as any, state);
         const resumed = mapClaudeLogMessageToSessionEnvelopes({
             type: 'assistant', uuid: 'task-follow-up',
@@ -1014,7 +1014,7 @@ describe('channel correlation on runs that produce no text', () => {
     it('keeps the re-armed request when the idle row follows the SDK notification', () => {
         const state = launchBackgroundTaskAndClose('core-req-idle-both');
         mapClaudeLogMessageToSessionEnvelopes({
-            type: 'system', subtype: 'task_notification', uuid: 'sdk-idle-both', task_id: 'task-idle-1', tool_use_id: 'tool-idle', status: 'completed',
+            type: 'system', subtype: 'task_notification', uuid: 'sdk-idle-both', task_id: 'task-idle-1', tool_use_id: 'tool-idle',
         } as any, state);
         const row = mapClaudeLogMessageToSessionEnvelopes(idleNotificationRow as any, state);
 

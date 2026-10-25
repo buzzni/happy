@@ -65,7 +65,7 @@ function attachInputEvidence(client: {
     });
     client.setPendingTurnRequestId.mockImplementation((id: string | null) => { state.pendingRequestId = id; });
     client.sendClaudeSessionMessage.mockImplementation((body: RawJSONLines) => accept(mapClaudeLogMessageToSessionEnvelopes(body, state).envelopes));
-    client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => accept(mapClaudeChannelFinalAnswer(state, text).envelopes));
+    client.sendFinalAnswerForChannelTurn.mockImplementation((text: string) => accept(mapClaudeChannelFinalAnswer(state, text, true).envelopes));
     client.closeClaudeSessionTurn.mockImplementation((status: SessionTurnEndStatus) => { ensure(); accept(closeClaudeTurnWithStatus(state, status).envelopes); });
     return { events, tracker };
 }

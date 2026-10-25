@@ -97,7 +97,7 @@ export class BackgroundCompletionTracker {
         this.entries.set(key, record);
         while (this.entries.size > BACKGROUND_HISTORY_LIMIT) {
             this.entries.delete(this.entries.keys().next().value!);
-            // Any loss permanently disables background routing, including exact run matches.
+            // Any loss permanently disables complete background evidence, including exact run matches.
             this.historyLost = true;
         }
     }

@@ -90,7 +90,7 @@ async function runLauncher(step: Step, done: (prompts: string[]) => boolean, set
             acceptEnvelopes(mapClaudeLogMessageToSessionEnvelopes(body, protocol).envelopes);
         }), sendStreamDelta: vi.fn(),
         setPendingTurnRequestId: vi.fn((id: string | null) => { protocol.pendingRequestId = id; }),
-        sendFinalAnswerForChannelTurn: vi.fn((text: string) => acceptEnvelopes(mapClaudeChannelFinalAnswer(protocol, text).envelopes)),
+        sendFinalAnswerForChannelTurn: vi.fn((text: string) => acceptEnvelopes(mapClaudeChannelFinalAnswer(protocol, text, true).envelopes)),
         applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn((status: SessionTurnEndStatus) => acceptEnvelopes(closeClaudeTurnWithStatus(protocol, status).envelopes)), sendSessionEvent: vi.fn(),
         failClaudeLaunchTurn: vi.fn(),
     };

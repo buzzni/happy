@@ -100,6 +100,7 @@ export function permissionBindingItem(
 /** The subset of the session client these ordered items act on. */
 export interface ChannelTurnOrderingTarget {
     setPendingTurnRequestId(requestId: string | null): void;
+    observeClaudeBackgroundInput?(message: BackgroundTaskNotificationItem['logMessage']): void;
     setPendingInputEvidence?(batch: EvidenceBatch): void;
     continueInputEvidence?(kind: InputEvidenceV1['continuation']['kind']): void;
     sendFinalAnswerForChannelTurn(text: string): void;
@@ -118,7 +119,7 @@ export function createOrderedTurnDispatcher(
 ): (message: unknown) => void {
     return (message: unknown) => {
         if (message && typeof message === 'object' && '__claudeBackgroundNotification' in message) {
-            target.sendClaudeSessionMessage((message as BackgroundTaskNotificationItem).logMessage);
+            target.observeClaudeBackgroundInput?.((message as BackgroundTaskNotificationItem).logMessage);
             return;
         }
         if (message && typeof message === 'object' && '__inputContinuation' in message) {

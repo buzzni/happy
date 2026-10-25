@@ -305,6 +305,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     if (judgeTurnStructuredOutput) session.client.enableStructuredOutputVerdicts();
     const observedAiAuthByLogMessage = new WeakMap<object, ObservedAiAuthSource>();
     const orderingTarget: ChannelTurnOrderingTarget = {
+        observeClaudeBackgroundInput: message => session.client.observeClaudeBackgroundInput?.(message),
         setPendingTurnRequestId: (requestId) => session.client.setPendingTurnRequestId(requestId),
         setPendingInputEvidence: batch => session.client.startClaudeInputEvidence?.(batch),
         continueInputEvidence: kind => session.client.continueClaudeInputEvidence?.(kind),

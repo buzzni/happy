@@ -4,6 +4,26 @@ Canonical requirements: Desktop `specs/reason-network-adoption/p0a-contract.md`
 §3, §7.1 (T2rt ownership), §7.2, and the approved P1 plan/tasks. This report covers
 Happy only; Desktop consumers and release/artifact acceptance belong to later tasks.
 
+## Current scope decision (2026-10-26)
+
+PR #951 **only adds runtime input evidence**. Background channel routing remains
+exactly the scanner-driven behavior of `9ee84191` (the merge base). This user
+scope decision supersedes the routing requirements and claimed routing fixes in
+all historical review rounds below: nine rounds of routing regressions resulted
+from T2rt changing routing. Routing hardening belongs to separate follow-ups.
+
+SDK task starts/notifications feed an evidence-only dispatcher entry point. They
+cannot close/open turns, rearm/consume channel requests, or alter launch ownership.
+The mapper retains main's original request map, parser, rearm function and
+notification/tool-result routing blocks. Bounded completion/launch state,
+default-deny proof and history-loss state now affect **evidence only**. An observed
+SDK receipt is not proof of provider consumption: its coverage is incomplete with
+`background-consumption-unproven`. A consumed scanner row may retain complete
+coverage only with already-observed launch/identity proof; otherwise it is
+incomplete with a background reason. Missing starts never borrow an earlier
+launch's run ID. Scanner consumption staged before the previous terminal is
+stamped belongs to the next evidence turn.
+
 ## Scope and architecture
 
 Core: authoritative runtime input consumption, host mode transitions and permission
@@ -875,3 +895,60 @@ The requested branch is `feat/rn-t2rt-input-evidence`, based on origin/main
 `/home/walter/workspace/aplus-dev-studio-desktop/.aplus/worktrees/rn-ext/happy-t2rt`.
 The coordinating session owns fixed-SHA cross-review, PR creation, downstream
 Desktop schema/reducer integration (T1/T2), and packaged runtime acceptance (T2r).
+
+
+## Rescope on top of 678863db (2026-10-26)
+
+Core, within the existing session runtime: no schema, dependency, authority or UI
+change. Routing and evidence have separate maps and entry points. Existing
+routing functions were diffed against `9ee84191`; only evidence hooks remain.
+The non-channel final-answer path is an explicit evidence opt-in, preserving
+main's default mapper/dispatcher behavior.
+
+Tests removed/reworked: the T2RT-07 duplicate routing matrix, T2RT-08 resumed-run
+routing assertions, T2RT-09 routing refusal, T2RT-10/11/12 default-deny/status/alias
+routing matrix, T2RT-13 history-loss/recovery routing assertions and launch-map
+routing stress expectations. These no longer define #951's behavior. Retained
+or rewritten evidence coverage includes T2RT-02/03 active/pending/idle delivery
+and witness eviction, identity/status uncertainty, bounded history, actual scanner
+metadata from both locations, SDK observation without routing, consumed-scanner
+positive proof and the two reviewer risk classes with incomplete evidence.
+Two actual scanner cases have an explicit 15-second timeout for polling under load.
+
+`channelTurnOrdering.mainCompatibility.test.ts` is the **byte-for-byte**
+`9ee84191` channel suite (15 cases). `sessionProtocolMapper.test.ts` is restored
+byte-for-byte to that base (50 cases), including its missing-status routing
+fixtures. Both run unchanged against the additive implementation.
+
+### Out-of-scope main risks
+
+Both classes reproduce on the actual `9ee84191` mapper, loaded from a temporary
+full source copy without switching branches. Two probes assert the observed
+misattribution and passed **2/2**; these are reproductions, not fixes:
+
+- **T2RT-14 class / restart reset:** discard the old runtime mapper after A's
+  launch, create a fresh mapper and launch the same task for B, then deliver A's
+  old consumed scanner row. The follow-up is stamped `requestId=channel-B`.
+  Main has no T2rt history-loss latch to persist; its task/request map is local
+  to the mapper. Durable restart/generation ownership is a separate follow-up.
+- **T2RT-15 class / old-run/new-owner mix:** A launches the task, then B resumes
+  the same task/tool without its own observed start; A's old explicit-run
+  scanner completion takes B's task mapping. The follow-up is stamped
+  `requestId=channel-B`. Main's routing map does not track provider run identity.
+  Generation-aware routing is a separate follow-up.
+
+These are scanner-path reproductions. SDK notifications are filtered out of
+main's production routing stream, and remain evidence-only in #951. The retained
+regressions explicitly preserve those routing outcomes while requiring incomplete
+evidence for the ambiguous background input.
+
+Validation before merge: 8 files / 174 tests passed, including the 2 baseline
+risk probes, both unchanged compatibility suites, channel evidence, evidence state
+and all three remote-launcher suites. Standard global setup passed typecheck,
+pkgroll and extension-copy build. An earlier baseline check exposed ordinary
+non-channel final publication changing main's default; the explicit evidence
+opt-in corrected it. Final rescope selection, including the extra scanner-staging regression: **4 files /
+141 tests passed**; standard typecheck/build passed again. `git diff --check` passed.
+
+Main merge and final validation: pending. No paid-provider, Desktop or packaged
+runtime acceptance is claimed.

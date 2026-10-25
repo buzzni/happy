@@ -8,7 +8,7 @@
 import { AsyncLock } from '@/utils/lock';
 import type { RawJSONLines } from '@/claude/types';
 
-/** Task starts and completion receipts must reach the mapper in order; ordinary system logs stay filtered. */
+/** Task starts and completion receipts must reach evidence in order; ordinary system logs stay filtered. */
 export interface BackgroundTaskNotificationItem {
     __claudeBackgroundNotification: true;
     logMessage: RawJSONLines;

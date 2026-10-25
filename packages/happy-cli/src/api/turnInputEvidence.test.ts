@@ -52,6 +52,19 @@ describe('TurnInputEvidence', () => {
         expect(h.tracker.snapshot()).toMatchObject({ coverage: 'incomplete', inputs: [], continuation: { kind: 'none' } });
         expect(h.tracker.snapshot()!.rootBatchId).not.toBe(root);
     });
+    it('stages scanner consumption for the next turn before the previous terminal is stamped', () => {
+        const h = harness();
+        h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
+        const root = h.tracker.snapshot()!.rootBatchId;
+        h.tracker.rememberBackground('job', 'a'); h.end('a');
+        h.tracker.setPending({ inputs: [ref('B')], inputCount: 1 }); h.start('b');
+        // The mapper has closed B; its terminal is still waiting to be stamped.
+        h.tracker.rearmBackground(['job'], [], true);
+        h.end('b'); h.start('follow-up');
+        expect(h.tracker.snapshot('b')).toMatchObject({ inputs: [ref('B')], coverage: 'complete' });
+        expect(h.tracker.snapshot()).toMatchObject({ inputs: [ref('A')], rootBatchId: root, coverage: 'complete',
+            continuation: { kind: 'background' } });
+    });
     it.each(['background-first', 'batch-first'])('T2RT-02 preserves co-consumption in %s order', order => {
         const h = harness(); h.tracker.setPending({ inputs: [ref('A')], inputCount: 1 }); h.start('a');
         h.tracker.rememberBackground('job', 'a'); h.end('a');

@@ -30,6 +30,7 @@ import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope, type 
 import {
     closeClaudeTurnWithStatus,
     startClaudeInputTurn,
+    observeClaudeBackgroundInput,
     failClaudeLaunchTurn,
     mapClaudeChannelFinalAnswer,
     mapClaudeStructuredOutput,
@@ -553,7 +554,7 @@ export class ApiSessionClient extends EventEmitter {
     private skippedInitialMessageSeqs = new Set<number>();
     private claudeSessionProtocolState: ClaudeSessionProtocolState = {
         onBackgroundInputLaunch: (id, turn) => this.inputEvidence.rememberBackground(id, turn),
-        onBackgroundInputRearm: (ids, reasons) => this.inputEvidence.rearmBackground(ids, reasons),
+        onBackgroundInputRearm: (ids, reasons, nextTurn) => this.inputEvidence.rearmBackground(ids, reasons, nextTurn),
         currentTurnId: null,
         uuidToProviderSubagent: new Map<string, string>(),
         taskPromptToSubagents: new Map<string, string[]>(),
@@ -1728,7 +1729,7 @@ export class ApiSessionClient extends EventEmitter {
     sendFinalAnswerForChannelTurn(text: string): void {
         // The same authoritative answer, for a scheduled prompt's turn (Saycode specs/_archive/automation-result-delivery).
         this.automationTurns.noteFinalAnswer(text);
-        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text);
+        const mapped = mapClaudeChannelFinalAnswer(this.claudeSessionProtocolState, text, true);
         this.enqueueSessionProtocolEnvelopes(mapped.envelopes, false);
     }
 
@@ -1792,6 +1793,10 @@ export class ApiSessionClient extends EventEmitter {
             this.sendSync.invalidate();
         }
         this.applyClaudeSessionMessageSideEffects(body);
+    }
+
+    observeClaudeBackgroundInput(message: RawJSONLines): void {
+        observeClaudeBackgroundInput(message, this.claudeSessionProtocolState);
     }
 
     /** A launch that died before its first message: fail its turn, opening one if none is open. */

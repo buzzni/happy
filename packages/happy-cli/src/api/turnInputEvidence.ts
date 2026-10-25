@@ -53,14 +53,16 @@ export class TurnInputEvidence {
         this.backgroundTurns.set(id, turn);
         while (this.backgroundTurns.size > 200) this.backgroundTurns.delete(this.backgroundTurns.keys().next().value!);
     }
-    rearmBackground(ids: string[], incompleteReasons: string[] = []): void {
+    rearmBackground(ids: string[], incompleteReasons: string[] = [], nextTurn = false): void {
         const turn = ids.map(id => this.backgroundTurns.get(id)).find(Boolean);
         for (const id of ids) this.backgroundTurns.delete(id);
         const source = turn ? this.snapshot(turn) : null;
         const reasons = [...incompleteReasons, 'background-co-consumption', ...(!source ? ['background-source-unavailable'] : [])];
-        if (this.current) for (const reason of reasons) this.incomplete(reason, this.current);
+        // Scanner consumption can close the previous mapper turn before its envelopes are stamped.
+        // Its background observation belongs to the next turn, not that still-stamped current turn.
+        if (this.current && !nextTurn) for (const reason of reasons) this.incomplete(reason, this.current);
         if (this.pending) this.pending.incompleteReasons = [...(this.pending.incompleteReasons ?? []), ...reasons];
-        if (this.current || this.pending) return;
+        if ((this.current && !nextTurn) || this.pending) return;
         if (this.background) {
             this.background.incompleteReasons = [...(this.background.incompleteReasons ?? []), ...reasons];
             return;
