@@ -10,6 +10,8 @@ export const SESSION_EVENT_TYPES = {
     CHECKPOINT_REWIND: 'checkpoint-rewind',
     MESSAGE_HIDDEN: 'message-hidden',
     MESSAGE_UNHIDDEN: 'message-unhidden',
+    // 세션이 한가해졌다는 서버 기록. 본문이 없어 E2EE 세션에서도 서버가 완료를 알 수 있다.
+    TURN_READY: 'turn-ready',
 } as const;
 
 export type SessionEventType = typeof SESSION_EVENT_TYPES[keyof typeof SESSION_EVENT_TYPES];

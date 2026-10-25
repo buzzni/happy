@@ -3,6 +3,8 @@ import { type Fastify } from "../types";
 import { db } from "@/storage/db";
 import { dispatchSessionEventPush } from "@/app/push/pushDispatch";
 import { buildSessionEventEphemeral, eventRouter } from "@/app/events/eventRouter";
+import { persistTurnReadySessionEvent } from "@/app/events/persistSessionEvent";
+import { log } from "@/utils/log";
 
 export function pushRoutes(app: Fastify) {
     
@@ -132,6 +134,12 @@ export function pushRoutes(app: Fastify) {
             });
             if (silentAutomationRun) {
                 return reply.send({ success: true });
+            }
+            // 기록 실패가 기존 알림 경로를 막지 않게 한다 — web-ui 완료 알림만 늦어진다.
+            try {
+                await persistTurnReadySessionEvent(sessionId);
+            } catch (error) {
+                log({ module: 'push', level: 'warn' }, `turn-ready event not recorded for session ${sessionId}: ${error}`);
             }
         }
 
