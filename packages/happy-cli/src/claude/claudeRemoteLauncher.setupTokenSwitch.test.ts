@@ -9,6 +9,7 @@ import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenRebind, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
+import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
@@ -558,4 +559,55 @@ it.each(['automatic', 'organization-only', 'authentication'])('keeps one convers
     expect(generations[1].settingSources).toEqual([]);
     expect(returnFromPersonalClaude).toHaveBeenCalledOnce();
     expect(client.setPersonalClaudeFallback.mock.calls.filter(([v])=>v!==undefined).map(([v])=>v.personal?.accountRef??null)).toEqual([null,'a'.repeat(64),null]);
+});
+
+it('tells the user when the authority recheck refuses a later request of a running personal generation', async () => {
+    const original = formatSetupTokenBinding({ companyId:'org',groupScope:'org',userId:'owner',machineId:'pc',managedAccountId:'11111111-1111-4111-8111-111111111111',credentialGeneration:1,keyId:'f'.repeat(64),nonce:'22222222-2222-4222-8222-222222222222',issuedAt:1 })
+    process.env.HAPPY_AI_AUTH_SETUP_TOKEN_BINDING = original;
+    let recheckFails = false;
+    vi.mocked(requestSetupTokenRebind).mockResolvedValue({ok:false,reason:'NO_ACCOUNT'});
+    vi.mocked(requestSetupTokenAvailability).mockImplementation(async (_id,_binding,consent) => {
+        if (recheckFails) throw new Error('daemon unreachable');
+        return {allLimited:true,availableAccountIds:[],consentApproved:!!consent};
+    });
+    vi.mocked(readPersonalClaudeCredential).mockResolvedValue({accountRef:'a'.repeat(64),label:'pe…@example.test',accessToken:'fixture-personal',expiresAt:Date.now()+600000});
+    const queue = new MessageQueue2<EnhancedMode>(hashObject), handlers = new Map<string, (params?: any) => Promise<any>>();
+    const client = { sessionId:'happy-session-1',rpcHandlerManager:{registerHandler:(name:string,handler:any)=>handlers.set(name,handler)},
+        updateAgentState:vi.fn(),updateMetadata:vi.fn(),getMetadata:()=>({}),setPersonalClaudeFallback:vi.fn(),setClaudeRuntimeAccount:vi.fn(),
+        sendClaudeSessionMessage:vi.fn(),sendStreamDelta:vi.fn(),setPendingTurnRequestId:vi.fn(),sendFinalAnswerForChannelTurn:vi.fn(),
+        applyClaudeTurnResult:vi.fn(),noteContextUsageSignal:vi.fn(),closeClaudeSessionTurn:vi.fn(),sendSessionEvent:vi.fn(),failClaudeLaunchTurn:vi.fn() };
+    const generations: Array<{token:string|undefined,prompts:string[]}> = [];
+    vi.mocked(query).mockImplementation(({prompt}) => {
+        const generation = {token:process.env.CLAUDE_CODE_OAUTH_TOKEN,prompts:[] as string[]};generations.push(generation);
+        const nth=generations.length;
+        return Object.assign((async function* () {
+            yield {type:'system',subtype:'init',session_id:'',tools:[],mcp_servers:[],apiKeySource:'none'};
+            for await(const message of prompt as AsyncIterable<SDKUserMessage>) {
+                generation.prompts.push(JSON.stringify(message.message.content));
+                if(nth===1) {
+                    yield refused;
+                    setTimeout(() => { void (async () => {
+                        const offer=(await handlers.get('personal-claude-fallback')!({action:'status'})).offer;
+                        await handlers.get('personal-claude-fallback')!({action:'accept',accountRef:offer.accountRef,nonce:offer.nonce,consentProof:'fixture-proof'});
+                    })(); }, 0);
+                    yield {type:'result',subtype:'error_during_execution',is_error:true,errors:['usage limit'],uuid:'refused-personal'};
+                } else {
+                    yield assistant(`personal-${nth}`);
+                    // The second request of this personal generation meets a failing authority recheck.
+                    if(generation.prompts.length===1) setTimeout(()=>{recheckFails=true;queue.push('second request while personal',{permissionMode:'default',model:'claude-sonnet-5'});},0);
+                    yield {type:'result',subtype:'success',result:'done',is_error:false,uuid:`result-personal-${nth}-${generation.prompts.length}`};
+                }
+            }
+            if(nth>1) setTimeout(()=>{void handlers.get('switch')!();},20);
+        })(),{mcpServerStatus:async()=>[],setPermissionMode:async()=>{}}) as unknown as ReturnType<typeof query>;
+    });
+    queue.push('continue this task',{permissionMode:'default',model:'claude-sonnet-5'});
+    const session={lessonReviewLifecycle:{controller:new AbortController(),completedAssistantTurns:0},cancelLessonReview:vi.fn(),sessionId:'claude-1',path:process.cwd(),queue,client,mcpServers:{},
+        api:{push:()=>({sendSessionNotification:vi.fn()})},consumeOneTimeFlags:vi.fn(),onThinkingChange:vi.fn(),onAbort:vi.fn()};
+    await claudeRemoteLauncher(session as unknown as Session);
+    expect(generations.map(g=>g.token)).toEqual(['sk-ant-oat01-first','fixture-personal']);
+    expect(generations[1].prompts).toHaveLength(1);
+    expect(queue.size()).toBe(0);
+    expect(client.sendSessionEvent.mock.calls.map(([event])=>event.message)).toContain(PERSONAL_RECHECK_NOTICE);
+    expect(client.failClaudeLaunchTurn).toHaveBeenCalledOnce();
 });
