@@ -659,6 +659,101 @@ Verification:
   no Unix-socket EPERM failure occurred in this selection. No whole-suite, live
   paid-provider, Desktop or packaged-release acceptance is claimed.
 
+## Round 7: T2RT-11/12 default-deny routing proof (2026-10-25)
+
+Review base: `93420d6d35e1f3505648095cbfc7149dc70acd57`. Both findings are
+accepted and addressed together within Core's existing runtime ownership.
+This round supersedes all earlier first-observation fallbacks: parsing failure,
+an unfamiliar alias or a cache miss is never positive routing proof.
+
+Implementation:
+
+1. Retain the reviewer's missing/unknown/nonterminal-status and task-to-tool
+   namespace reproductions, including refused receipt → real queued-command
+   scanner attachment → exact current-run completion.
+2. Use one positive proof predicate before any channel rearm, source consumption
+   or launch deletion. Require a recognized terminal status and consistent launch
+   identity/ownership, plus either a shared exact scoped task/run ID or a provably
+   unique legacy launch. Legacy uniqueness requires intact history and no recorded
+   ambiguity, prior completion, resume, spawning-turn reuse or task/tool alias
+   change. Missing, unknown and nonterminal statuses are refused even with
+   matching explicit run metadata.
+3. Canonicalize scoped task/tool aliases in the completion tracker and retain
+   ambiguity across turn ends and launch consumption. Bound aliases as well as
+   completions; losing either history permanently disables legacy inference for
+   this runtime. The completion budget stays 200; the alias budget is 400 keys,
+   with a 4096-byte bound on each incoming identity. No per-task run sets grow.
+   Known explicit duplicates remain harmless observations. Explicit task IDs
+   retain distinct run tombstones even when recycled tools connect their alias
+   history: the SDK promises run identity per task, not global run-ID uniqueness.
+4. Refusal calls the evidence callback with empty source IDs and
+   `background-request-unrouted`, preserves all launch/source mappings and keeps
+   coverage incomplete. Wrong delivery 0 continues to take priority over
+   availability. Revisit only with independently verifiable generation evidence.
+5. Exercise 4 statuses × 6 identities × 2 history states × 2 prior states = 96
+   cells through each of SDK and real file scanner (192 cases). Each cell checks
+   its initial routing decision, then replays an old receipt against a newer live
+   channel and verifies exact-run recovery. Keep four first-terminal legacy
+   controls and all existing ordering/deduplication regressions. Six additional
+   SDK/file-scanner cases check spawning-turn reuse, partial start metadata and
+   task changes sharing the same run string/tool. All generation changes stay
+   ambiguous for legacy routing, while exact current task/run receipts can route.
+
+Only the internal tracker, mapper, their existing channel/mapper tests and this
+report change. No dependency, public API/schema, authority, Desktop, T1b or UI
+change. Rollback is a revert of the new behavioral commit. No new files.
+
+Verification:
+
+- Unchanged external v6 harness at the review base: **6 failed / 6 passed**.
+  Missing/unknown/nonterminal status and task-to-tool namespace changes consumed
+  the newer launch; both real-file scanner cases produced deliverable stale
+  Desktop channel outcomes and lost the exact current-run answer.
+- TDD: the initial 200-case repository selection failed **137/200** before the
+  implementation (the four first-terminal legacy controls passed). The four
+  spawning-turn/partial-start cases and two scoped task/run cases were then added
+  red before completing the unified identity model; all six failed as intended.
+- The first standard related run passed **629/630**, including all 269 ordering
+  cases then present. Its only failure was an old mapper fixture expecting a
+  missing-status SDK row to rearm. Both that duplicate-preservation fixture and
+  the hidden-Task correlation fixture now provide explicit terminal status.
+  Missing-status refusal remains covered by the matrix rather than preserving
+  a contradictory positive expectation.
+- Final external reproduction: **18 passed / 1 deliberately excluded** across
+  v5 (7/7, preserving T2RT-10) and v6 (11/11 selected). The v6 harness's old
+  `scanner-legacy-no-status` positive control is excluded because it conflicts
+  with the approved rule. The other safety reproductions/legacy controls are
+  unchanged. Both real-file scanner attacks now produce `outcomes=[]`, retain
+  the current launch, and deliver the exact current task/run answer to channel-A.
+  Command, from the clone root:
+
+  ```sh
+  corepack pnpm -C packages/happy-cli exec vitest run \
+    --config /tmp/happy-t2rt-xr-v6/vitest.config.mjs --configLoader runner \
+    /tmp/happy-t2rt-xr-v6/adversarial.test.ts /tmp/happy-t2rt-xr-v5/adversarial.test.ts \
+    -t '^(?!.*scanner-legacy-no-status)' --maxWorkers 2
+  ```
+
+- Final standard related suite: **10 files / 632 tests passed**. Channel ordering
+  passed **271/271**, including all existing 65 cases (24 T2RT-07, four T2RT-08,
+  four T2RT-09 and both T2RT-10 cases), **192/192 matrix cases** with no stale
+  channel delivery in any replay, the four valid first-terminal legacy controls,
+  four real-scanner finding regressions and six generation/task-scope checks.
+  The matrix exercises 96 SDK cells and 96 real JSONL scanner cells, both initial
+  proof decisions and newer-launch stale replays followed by exact-run recovery.
+  No direct tracker mutation or evidence rearm is used as a test stimulus.
+- Selection is the same ten files listed in round 5, run from the clone root
+  with `corepack pnpm -C packages/happy-cli exec vitest run --project unit
+  <files> --maxWorkers 2`. Final standard global setup passed CLI `tsc --noEmit`,
+  pkgroll and extension-copy build. A separate CLI `typecheck` also passed during
+  implementation; the final build rechecked the completed change.
+- `git diff --check` passed. Existing bin-location/empty-chunk build warnings and
+  asynchronously-handled-rejection harness warnings remain. No final related test
+  failed and no Unix-socket EPERM occurred in the selection. No whole-suite,
+  live-provider, Desktop-app or packaged-release acceptance is claimed. Delivery
+  is a new behavioral commit directly above the review base and a normal push
+  to the existing branch; no PR or history rewrite.
+
 ## Known integration boundaries
 
 - Additional-input acceptance records the host's provider handoff. A rejected or

@@ -98,6 +98,211 @@ function requestIds(envelopes: SessionEnvelope[]) {
         .filter((id): id is string => typeof id === 'string');
 }
 
+/** All stimuli use the SDK stream or an actual queued-command JSONL file. */
+function proofHarness() {
+    const h = harness(true);
+    const converter = new SDKToLogConverter({ sessionId: 'sdk-session', cwd: '/workspace', gitBranch: 'main' });
+    const sdk = (message: Parameters<typeof converter.convert>[0]) => h.queue.enqueue(converter.convert(message));
+    const started = (run: string, task = 'job') => sdk({ type: 'system', subtype: 'task_started', task_id: task, run_id: run,
+        tool_use_id: 'launch-original', description: 'Running', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000016' });
+    const receipt = (task?: string, tool?: string, status?: string, run?: string) => sdk({ type: 'system', subtype: 'task_notification',
+        ...(task ? { task_id: task } : {}), ...(tool ? { tool_use_id: tool } : {}), ...(status ? { status } : {}),
+        ...(run ? { run_id: run } : {}), session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000006', output_file: '/tmp/output', summary: 'Done',
+    } as Parameters<typeof converter.convert>[0]);
+    const finish = async (text: string) => {
+        h.queue.enqueue(assistant(text)); h.queue.enqueue(finalAnswerItem(text)); h.queue.enqueue(turnEndItem('completed'));
+        await h.queue.flush();
+        return h.envelopes.find(e => e.ev.t === 'final-answer' && e.ev.text === text)!.ev;
+    };
+    const launch = async (channel: string, run?: string, end = true, task = 'job') => {
+        h.queue.enqueue(pendingRequestItem(channel, { inputs: [{ kind: 'channel', channelRequestId: channel }], inputCount: 1 }));
+        sdk({ type: 'assistant', parent_tool_use_id: null, message: { role: 'assistant', content: [
+            { type: 'tool_use', id: 'launch-original', name: 'Bash', input: { command: 'sleep 10', run_in_background: true } },
+        ] } } as Parameters<typeof converter.convert>[0]);
+        if (run) started(run, task);
+        sdk({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [
+            { type: 'tool_result', tool_use_id: 'launch-original', content: `Command running in background with ID: ${task}.` },
+        ] } });
+        if (end) h.queue.enqueue(turnEndItem('completed'));
+        await h.queue.flush();
+    };
+    const resume = async () => {
+        await launch('channel-A', 'run-1', false);
+        receipt('job', 'launch-original', 'completed', 'run-1'); await h.queue.flush();
+        started('run-2'); h.queue.enqueue(turnEndItem('completed')); await h.queue.flush();
+    };
+    const overflow = async () => {
+        // Batched draining still processes every real receipt and follow-up turn in order.
+        for (let i = 0; i < 205; i++) {
+            receipt(`other-${i}`, undefined, 'completed', `other-run-${i}`);
+            h.queue.enqueue(assistant(`other-${i}`)); h.queue.enqueue(turnEndItem('completed'));
+        }
+        await h.queue.flush();
+        expect(h.state.backgroundCompletions?.historyLost).toBe(true);
+    };
+    let workingDirectory: string | undefined;
+    let scanner: Awaited<ReturnType<typeof createSessionScanner>> | undefined;
+    let scanned = 0;
+    let serial = 0;
+    const deliver = async (source: string, task?: string, tool?: string, status?: string, run?: string) => {
+        if (source === 'sdk') { receipt(task, tool, status, run); await h.queue.flush(); return; }
+        if (!workingDirectory) {
+            workingDirectory = await mkdtemp(join(tmpdir(), 't2rt-proof-'));
+            scanner = await createSessionScanner({ sessionId: null, workingDirectory,
+                onMessage: message => { h.sendScannerMessage(message); scanned++; } });
+            await mkdir(getProjectPath(workingDirectory), { recursive: true });
+        }
+        const id = ++serial;
+        const sessionId = `11111111-2222-4333-8444-${String(id).padStart(12, '0')}`;
+        const prompt = `<task-notification>${task ? `<task-id>${task}</task-id>` : ''}${tool ? `<tool-use-id>${tool}</tool-use-id>` : ''}`
+            + `${status ? `<status>${status}</status>` : ''}<summary>Receipt</summary></task-notification>`;
+        const before = scanned;
+        await writeFile(join(getProjectPath(workingDirectory), `${sessionId}.jsonl`), JSON.stringify({ type: 'attachment', uuid: `receipt-${id}`,
+            attachment: { type: 'queued_command', commandMode: 'task-notification', prompt,
+                ...(run ? { origin: { kind: 'task-notification', runId: run } } : {}) } }) + '\n');
+        await scanner!.onNewSession(sessionId);
+        await vi.waitFor(() => expect(scanned).toBe(before + 1));
+    };
+    const destroy = async () => {
+        await scanner?.cleanup(); h.queue.destroy();
+        if (workingDirectory) {
+            await rm(getProjectPath(workingDirectory), { recursive: true, force: true });
+            await rm(workingDirectory, { recursive: true, force: true });
+        }
+    };
+    return { h, sdk, started, receipt, finish, launch, resume, overflow, deliver, destroy };
+}
+
+describe('default-deny background routing proof', () => {
+    it.each(['sdk', 'scanner'])('keeps explicit run identity scoped to its task through %s', async source => {
+        const d = proofHarness();
+        try {
+            await d.launch('channel-A', 'run-shared');
+            await d.deliver(source, 'job', 'launch-original', 'completed', 'run-shared');
+            expect(await d.finish('original task')).toMatchObject({ requestId: 'channel-A' });
+            await d.launch('channel-B', 'run-shared', true, 'other-job');
+            const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+            // Run IDs have a per-task contract. A recycled tool plus the same run string
+            // cannot identify which task produced this old receipt.
+            await d.deliver(source, undefined, 'launch-original', 'completed', 'run-shared');
+            expect.soft(await d.finish('aliased old task')).not.toHaveProperty('requestId');
+            expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+            await d.deliver(source, 'other-job', 'launch-original', 'completed', 'run-shared');
+            expect.soft(await d.finish('exact current task')).toMatchObject({ requestId: 'channel-B' });
+        } finally { await d.destroy(); }
+    });
+
+    it.each(['sdk', 'scanner'].flatMap(source => ['new-turn', 'partial-start'].map(kind => ({ source, kind }))))(
+        'does not infer uniqueness across $kind reuse through $source', async ({ source, kind }) => {
+            const d = proofHarness();
+            try {
+                await d.launch('channel-A', undefined, kind === 'new-turn');
+                if (kind === 'new-turn') await d.launch('channel-B');
+                else {
+                    d.sdk({ type: 'system', subtype: 'task_started', task_id: 'job', tool_use_id: 'launch-original',
+                        description: 'Legacy start', session_id: 'sdk-session', uuid: '00000000-0000-4000-8000-000000000026' });
+                    d.started('run-2'); d.h.queue.enqueue(turnEndItem('completed')); await d.h.queue.flush();
+                }
+                const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+                await d.deliver(source, 'job', 'launch-original', 'completed');
+                expect.soft(await d.finish('late unqualified receipt')).not.toHaveProperty('requestId');
+                expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                d.started('run-2'); await d.h.queue.flush();
+                await d.deliver(source, 'job', 'launch-original', 'completed', 'run-2');
+                expect.soft(await d.finish('exact new generation')).toMatchObject({ requestId: kind === 'new-turn' ? 'channel-B' : 'channel-A' });
+            } finally { await d.destroy(); }
+        },
+    );
+
+    it.each(['missing', 'done', 'running', 'tool-alias'])(
+        'T2RT-11/12 preserves the launch after refusal then a real scanner $0 receipt', async status => {
+            const d = proofHarness();
+            try {
+                await d.resume();
+                if (status !== 'tool-alias') await d.overflow();
+                else expect(d.h.state.backgroundCompletions?.historyLost).toBe(false);
+                await d.deliver('scanner', 'job', 'launch-original', 'completed');
+                expect(await d.finish('first refused')).not.toHaveProperty('requestId');
+                const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+                await d.deliver('scanner', status === 'tool-alias' ? undefined : 'job', 'launch-original',
+                    status === 'missing' ? undefined : status === 'tool-alias' ? 'completed' : status);
+                expect.soft(await d.finish('stale scanner answer')).not.toHaveProperty('requestId');
+                expect.soft([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                expect.soft(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+                await d.deliver('sdk', 'job', 'launch-original', 'completed', 'run-2');
+                expect.soft(await d.finish('real current answer')).toMatchObject({ requestId: 'channel-A' });
+            } finally { await d.destroy(); }
+        },
+    );
+
+    const matrix = ['sdk', 'scanner'].flatMap(source => ['terminal', 'missing', 'unknown', 'nonterminal'].flatMap(status =>
+        ['run', 'task', 'tool', 'task+tool', 'alias-switch', 'none'].flatMap(identity =>
+            ['intact', 'lost'].flatMap(history => ['fresh', 'resumed-run'].map(prior => ({ source, status, identity, history, prior }))))));
+    it.each(matrix)('proof matrix $source/$status/$identity/$history/$prior', async ({ source, status, identity, history, prior }) => {
+        const d = proofHarness();
+        const task = ['run', 'task', 'task+tool'].includes(identity) ? 'job' : undefined;
+        const tool = ['tool', 'task+tool', 'alias-switch'].includes(identity) ? 'launch-original' : undefined;
+        const terminal = status === 'terminal' ? 'completed' : status === 'unknown' ? 'done' : status === 'nonterminal' ? 'running' : undefined;
+        const run = identity === 'run' ? 'run-2' : undefined;
+        const permitted = status === 'terminal' && (identity === 'run'
+            || (prior === 'fresh' && history === 'intact' && ['task', 'tool', 'task+tool'].includes(identity)));
+        try {
+            if (prior === 'resumed-run') await d.resume();
+            else await d.launch('channel-A', identity === 'run' ? 'run-2' : undefined);
+            if (history === 'lost') await d.overflow();
+            if (identity === 'alias-switch') {
+                // A refused observation under the task namespace must stay ambiguous when
+                // the next row names only the tool, even without a resume or eviction.
+                await d.deliver(source, 'job', 'launch-original');
+                expect(await d.finish('refused alias seed')).not.toHaveProperty('requestId');
+            }
+            const retained = [...d.h.state.backgroundTaskLaunches!.values()];
+            await d.deliver(source, task, tool, terminal, run);
+            const candidate = await d.finish('candidate');
+            if (permitted) expect(candidate).toMatchObject({ requestId: 'channel-A' });
+            else {
+                expect(candidate).not.toHaveProperty('requestId');
+                expect(candidate).toMatchObject({ inputEvidence: { coverage: 'incomplete',
+                    incompleteReasons: expect.arrayContaining(['background-request-unrouted']) } });
+                expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(retained);
+                expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+                d.started('run-2'); await d.h.queue.flush();
+                await d.deliver(source, 'job', 'launch-original', 'completed', 'run-2');
+                expect(await d.finish('recovered A')).toMatchObject({ requestId: 'channel-A' });
+            }
+            // Every cell also replays its old shape against a newer live channel launch.
+            // An exact old run, legacy alias or malformed status must never take B.
+            await d.launch('channel-B', 'run-3');
+            const newer = [...d.h.state.backgroundTaskLaunches!.values()];
+            await d.deliver(source, task, tool, terminal, identity === 'run' ? 'run-0' : undefined);
+            const stale = await d.finish('stale receipt');
+            expect(stale).not.toHaveProperty('requestId');
+            expect(stale).toMatchObject({ inputEvidence: { coverage: 'incomplete',
+                incompleteReasons: expect.arrayContaining(['background-request-unrouted']) } });
+            expect([...d.h.state.backgroundTaskLaunches!.values()]).toEqual(newer);
+            expect(d.h.rearm).toHaveBeenLastCalledWith([], ['background-request-unrouted']);
+            await d.deliver(source, 'job', 'launch-original', 'completed', 'run-3');
+            expect(await d.finish('real B')).toMatchObject({ requestId: 'channel-B' });
+        } finally { await d.destroy(); }
+    }, 15000);
+
+    it.each([
+        { source: 'sdk', task: 'job', tool: 'launch-original' },
+        { source: 'scanner', task: 'job', tool: 'launch-original' },
+        { source: 'scanner', task: 'job', tool: undefined },
+        { source: 'scanner', task: undefined, tool: 'launch-original' },
+    ])('keeps a genuinely first terminal legacy control ($source/$task/$tool)', async ({ source, task, tool }) => {
+        const d = proofHarness();
+        try {
+            await d.launch('channel-A');
+            const root = d.h.evidence.snapshot()!.rootBatchId;
+            await d.deliver(source, task, tool, 'completed');
+            expect(await d.finish('first legacy answer')).toMatchObject({ requestId: 'channel-A',
+                inputEvidence: { rootBatchId: root, coverage: 'complete' } });
+        } finally { await d.destroy(); }
+    });
+});
+
 describe('channel turn ordering through the launcher dispatcher', () => {
     it.each([false, true].flatMap(evicted => ['active', 'pending', 'idle'].map(phase => ({ evicted, phase }))))(
         'T2RT-02/03 delivers SDK notification before B ends (evicted=$evicted, phase=$phase)', async ({ evicted, phase }) => {
@@ -338,6 +543,7 @@ describe('channel turn ordering through the launcher dispatcher', () => {
             }
             const ledger = h.state.backgroundCompletions!;
             expect.soft(ledger.entries.size).toBeLessThanOrEqual(200);
+            expect.soft(ledger.aliases.size).toBeLessThanOrEqual(400);
             expect.soft(ledger.historyLost).toBe(true);
             expect.soft([...ledger.entries.values()].every(receipt => receipt.phase === 'settled' && !receipt.turn)).toBe(true);
             h.queue.enqueue(pendingRequestItem('channel-B', { inputs: [{ kind: 'channel', channelRequestId: 'channel-B' }], inputCount: 1 }));

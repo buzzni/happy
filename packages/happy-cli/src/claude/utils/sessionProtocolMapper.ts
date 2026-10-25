@@ -142,13 +142,16 @@ function extractBackgroundTaskId(content: unknown): string | undefined {
     return undefined;
 }
 
-function extractTaskNotificationIds(content: unknown): { taskId?: string; toolUseId?: string } {
-    if (typeof content !== 'string') return {};
-    const taskId = content.match(/<task-id>\s*([^<\s]+)\s*<\/task-id>/i)?.[1];
-    const toolUseId = content.match(/<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/i)?.[1];
+function extractTaskNotificationIds(content: string | null): { taskId?: string; toolUseId?: string; status?: string; recognized: boolean } {
+    const text = content?.trim() ?? '';
+    const tasks = [...text.matchAll(/<task-id>\s*([^<\s]+)\s*<\/task-id>/g)];
+    const tools = [...text.matchAll(/<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/g)];
+    const statuses = [...text.matchAll(/<status>\s*([^<\s]+)\s*<\/status>/g)];
     return {
-        ...(taskId ? { taskId } : {}),
-        ...(toolUseId ? { toolUseId } : {}),
+        taskId: tasks[0]?.[1], toolUseId: tools[0]?.[1], status: statuses[0]?.[1],
+        recognized: text.startsWith('<task-notification>') && text.endsWith('</task-notification>')
+            && text.indexOf('<task-notification>', 1) === -1 && tasks.length <= 1 && tools.length <= 1 && statuses.length === 1
+            && (text.match(/<\/?(?:task-id|tool-use-id|status)\b[^>]*>/g)?.length ?? 0) === 2 * (tasks.length + tools.length + statuses.length),
     };
 }
 
@@ -157,40 +160,39 @@ function consumeBackgroundCompletion(
     state: ClaudeSessionProtocolState, message: RawJSONLines, text: string | null,
     subagent: string | undefined, envelopes: SessionEnvelope[], closePrevious = false,
 ): void {
-    const raw = message as { task_id?: unknown; tool_use_id?: unknown; run_id?: unknown; origin?: { runId?: unknown } };
+    const raw = message as { task_id?: unknown; tool_use_id?: unknown; status?: unknown; run_id?: unknown; origin?: { runId?: unknown } };
     const ids = message.type === 'system' ? {
-        taskId: typeof raw.task_id === 'string' ? raw.task_id : undefined,
-        toolUseId: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
+        taskId: typeof raw.task_id === 'string' && raw.task_id ? raw.task_id : undefined,
+        toolUseId: typeof raw.tool_use_id === 'string' && raw.tool_use_id ? raw.tool_use_id : undefined,
+        status: raw.status, recognized: true,
     } : extractTaskNotificationIds(text);
-    const status = text?.match(/<status>\s*(completed|failed|stopped|cancelled|killed)\s*<\/status>/)?.[1];
+    const status = ids.recognized && typeof ids.status === 'string'
+        && /^(completed|failed|stopped|cancelled|killed)$/.test(ids.status)
+        ? ids.status === 'cancelled' || ids.status === 'killed' ? 'stopped' : ids.status : undefined;
     const rawRun = message.type === 'system' ? raw.run_id : raw.origin?.runId;
     const run = typeof rawRun === 'string' && rawRun ? rawRun : null;
-    const task = ids.taskId ? `task:${ids.taskId}` : ids.toolUseId ? `tool:${ids.toolUseId}` : undefined;
     const tracker = state.backgroundCompletions ??= new BackgroundCompletionTracker();
-    const decision = task && status ? tracker.observe(task, run,
-        status === 'cancelled' || status === 'killed' ? 'stopped' : status, state.currentTurnId, subagent) : 'first';
-    if (decision === 'duplicate') return;
+    const { decision, unique } = tracker.completion({ taskId: ids.taskId, toolUseId: ids.toolUseId }, run, status, state.currentTurnId, subagent);
     const launch = findBackgroundTaskLaunch(state, ids, subagent);
-    // A run mismatch vetoes the tool fallback: resumed runs can retain a tool/task ID.
     const conflict = launch && ((run && launch.runId && run !== launch.runId)
         || (ids.toolUseId && launch.toolUseId && ids.toolUseId !== launch.toolUseId));
-    // A reusable tool/task ID does not identify a generation. Launch records have no
-    // independent generation identity, so an uncertain receipt needs a shared explicit run.
-    const sameRun = run && run === launch?.runId;
-    if (conflict || (decision === 'uncertain' && (!sameRun || launch?.requestId === undefined))) {
+    // The producer guarantees run identity per task, not across recycled task/tool aliases.
+    const sameRun = run && run === launch?.runId && ids.taskId && ids.taskId === launch?.taskId;
+    const requestId = launch?.requestId;
+    const busy = requestId && (state.currentTurnId ? state.currentRequestId !== requestId
+        : state.pendingRequestId && state.pendingRequestId !== requestId);
+    // Default deny. Neither parsing failure nor a fresh alias/ledger key proves uniqueness.
+    // Only this predicate permits channel rearm and consumption of launch/source mappings.
+    const proven = !!(status && launch && requestId !== undefined && !conflict && !busy && (sameRun || unique));
+    // Proven duplicate observations remain harmless to a running follow-up (T2RT-07).
+    if (decision === 'duplicate' && (!launch || sameRun) && !conflict) return;
+    if (!proven) {
         state.onBackgroundInputRearm?.([], ['background-request-unrouted']);
-        logUnroutedBackground(ids, run, 'launch-identity-unproven');
+        logUnroutedBackground(ids, run, busy ? 'another-request-active' : 'launch-identity-unproven');
         return;
     }
     if (closePrevious && decision === 'first' && state.currentTurnId) closeTurn(state, 'completed', envelopes);
     const reasons = decision === 'uncertain' ? ['background-completion-uncertain'] : [];
-    const requestId = launch?.requestId;
-    const busy = requestId && (state.currentTurnId ? state.currentRequestId !== requestId
-        : state.pendingRequestId && state.pendingRequestId !== requestId);
-    if (!launch || launch.requestId === undefined || busy) {
-        reasons.push('background-request-unrouted');
-        logUnroutedBackground(ids, run, busy ? 'another-request-active' : 'launch-mapping-unavailable');
-    }
     state.onBackgroundInputRearm?.([launch?.taskId ?? ids.taskId, launch?.toolUseId ?? ids.toolUseId]
         .filter((id): id is string => Boolean(id)), reasons);
     if (requestId && !state.currentTurnId && !state.pendingRequestId) state.pendingRequestId = requestId;
@@ -228,6 +230,10 @@ function rememberBackgroundTaskLaunch(state: ClaudeSessionProtocolState, launch:
     const previous = entries.get(key);
     // SDK run IDs sort in opening order. A delayed task_started cannot replace a newer launch.
     if (launch.runId && previous?.runId && launch.runId < previous.runId) return;
+    const generation = launch.toolUseId ? state.toolCallTurns?.get(launch.toolUseId)?.turnId
+        ?? (state.hiddenParentToolCalls?.has(launch.toolUseId) ? state.currentTurnId ?? undefined : undefined) : undefined;
+    (state.backgroundCompletions ??= new BackgroundCompletionTracker()).launch(
+        { taskId: launch.taskId, toolUseId: launch.toolUseId }, launch.runId ?? null, launch.subagent, generation);
     entries.delete(key);
     if (Buffer.byteLength(JSON.stringify(launch), 'utf8') > 4096) return;
     entries.set(key, launch);
@@ -822,7 +828,7 @@ function mapClaudeLogMessageToSessionEnvelopesInternal(
         if (notification.subtype === 'task_started' && typeof notification.task_id === 'string') {
             const runId = typeof notification.run_id === 'string' && notification.run_id ? notification.run_id : undefined;
             const toolUseId = typeof notification.tool_use_id === 'string' ? notification.tool_use_id : undefined;
-            (state.backgroundCompletions ??= new BackgroundCompletionTracker()).started(`task:${notification.task_id}`, runId ?? null, subagent);
+            (state.backgroundCompletions ??= new BackgroundCompletionTracker()).started({ taskId: notification.task_id, toolUseId }, runId ?? null, subagent);
             const previous = findBackgroundTaskLaunch(state, { taskId: notification.task_id }, subagent);
             const sameLaunch = previous && ((runId && previous.runId === runId)
                 || (toolUseId && previous.toolUseId === toolUseId && !previous.runId));
