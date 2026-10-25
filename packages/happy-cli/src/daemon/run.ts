@@ -516,6 +516,8 @@ async function readDifficultyRoutingHostElection(input: {
 
 export const DIFFICULTY_ROUTING_ELECTION_POLL_MS = 15_000;
 const DIFFICULTY_ROUTING_ELECTION_MAX_POLL_MS = 15 * 60_000;
+// 서버 자동화 tick 이 이 시간을 넘기면 멈춘 것으로 보고 버린다 (정상 tick 은 1분 안에 끝난다).
+const SERVER_AUTOMATION_TICK_STALL_MS = 10 * 60_000;
 
 /**
  * Doubling delay while the route stays unreachable, capped at 15 minutes. A
@@ -5014,6 +5016,9 @@ export async function startDaemon(): Promise<void> {
         logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
       }),
       logDebug: (message) => logger.debug(`[DAEMON RUN] ${message}`),
+      // 정상 tick 은 1분 하트비트 안에 끝난다 (spawn webhook 대기 최대 60초, gh·git 호출은
+      // 각자 상한이 있다). 이를 10배 넘기면 끝나지 않는 await 다 — 버리고 새로 시작한다.
+      stalledAfterMs: SERVER_AUTOMATION_TICK_STALL_MS,
     });
     const sessionFollowupSyncState = createSessionFollowupSyncState();
     const sessionFollowupTickRunner = createAutomationTickRunner({

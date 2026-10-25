@@ -274,6 +274,11 @@ export interface ServerAutomationExecutorInput {
 
 const SCRIPT_TIMEOUT_MS = 60_000
 const HEARTBEAT_MS = 60_000
+// 한 run 의 heartbeat 수명. 실행(executeStartedRun)은 이 안에 끝난다 — 안의 await 는 모두 상한이
+// 있다. 넘기면 끝나지 않는 await 이고, 틱 워치독이 틱을 버려도 이 interval 은 finally 에 닿지
+// 못해 lease 를 계속 이어 그 자동화를 active-run 으로 영구히 막는다. 스스로 멈춰 lease 가
+// 만료되게 한다 — 그래야 다음 틱이 다시 claim 할 수 있다.
+export const RUN_HEARTBEAT_MAX_MS = 10 * 60_000
 const EXPECTED_NEXT_DAEMON_TICK_MS = 60_000
 // 한 틱이 새로 집어오는 GitHub 이벤트 수. 폭주하는 저장소가 한 번에 큐를 다 비우지
 // 않게 하는 유입 제한이다.
@@ -2064,12 +2069,21 @@ export async function runServerAutomationTick(
       leaseExpiresAt = runLeaseExpiresAt(started.value)
     }
 
+    let heartbeatRenewals = 0
     const heartbeat = setInterval(() => {
+      heartbeatRenewals += 1
       void input.transport.heartbeat({ runId, claimToken }).then((renewed) => {
         if (renewed.ok) leaseExpiresAt = runLeaseExpiresAt(renewed.value) ?? leaseExpiresAt
       }).catch((error) => {
         input.logDebug?.(`[server-automation] heartbeat failed: ${error}`)
       })
+      if (heartbeatRenewals * HEARTBEAT_MS >= RUN_HEARTBEAT_MAX_MS) {
+        clearInterval(heartbeat)
+        input.logDebug?.(
+          `[server-automation] run=${runId} heartbeat stopped after ${Math.round(RUN_HEARTBEAT_MAX_MS / 1000)}s:`
+          + ' execution has not settled; letting the lease lapse so the automation can be claimed again',
+        )
+      }
     }, HEARTBEAT_MS)
     let result: {
       outcome: ServerAutomationReportOutcome

@@ -17,6 +17,7 @@ import {
   type ServerAutomationExecutorInput,
   DIRTY_WORKTREE_WARN_AFTER_ATTEMPTS,
   MAX_GITHUB_WORKER_RUNTIME_MS,
+  RUN_HEARTBEAT_MAX_MS,
 } from './serverAutomationExecutor'
 
 // 상한을 상수에서 끌어와 만든다. 개수를 하드코딩하면 상한을 올릴 때 테스트가
@@ -785,6 +786,27 @@ describe('runServerAutomationTick', () => {
     await vi.advanceTimersByTimeAsync(1_000)
     await running
     expect(transport.report).toHaveBeenCalled()
+  })
+
+  // 틱 워치독이 멈춘 틱을 버려도 그 틱의 heartbeat interval 은 finally 에 닿지 못해 계속
+  // lease 를 잇는다. 그러면 서버는 다음 claim 에 active-run 을 돌려주고, 그 자동화 하나는
+  // 데몬 재시작 전까지 조용히 막힌다. 실행이 끝나지 않으면 heartbeat 를 스스로 멈춰 lease 가
+  // 만료되게 한다.
+  it('stopsHeartbeatingAnExecutionThatNeverSettlesSoTheLeaseCanLapse', async () => {
+    vi.useFakeTimers()
+    const { input, transport, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    spawnSession.mockImplementation(() => new Promise(() => {}))
+
+    void runServerAutomationTick(input)
+    await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_MAX_MS)
+    const renewalsAtCap = transport.heartbeat.mock.calls.length
+    expect(renewalsAtCap).toBe(RUN_HEARTBEAT_MAX_MS / 60_000)
+
+    await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_MAX_MS)
+    expect(transport.heartbeat).toHaveBeenCalledTimes(renewalsAtCap)
+    expect(logDebug.mock.calls.some(([line]) => String(line).includes('run=run-1 heartbeat stopped'))).toBe(true)
   })
 
   // 2026-09-12 프로덕션 — aplus 트리거 설정을 저장하자 generation 이 13 → 14 로 올랐고,
