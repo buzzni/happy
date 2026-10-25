@@ -68,6 +68,15 @@ export async function openLocalClientApps(options: LocalClientOptions) {
         handle: (action: string, secret: string, raw: unknown): Promise<unknown> => exclusive(async () => {
             if (unhealthy || options.now() < observedAtMs) throw denied()
             if (options.now() > observedAtMs) { observedAtMs = options.now(); await persist() }
+            if (action === 'revoke-app-proof') {
+                const req = z.object({ schemaVersion: z.literal(2), appId: id }).strict().parse(raw)
+                const app = apps.find(candidate => candidate.appId === req.appId && candidate.secretHash === hash(secret))
+                if (!app) throw denied()
+                // Newly issued proof can always reduce its own authority, even after the owner exits.
+                app.enabled = false; app.revoked = true
+                await persist()
+                return { schemaVersion: 2, revoked: true, autoApprove: false, cleanupPending: (await cleanup(app)).cleanupPending }
+            }
             if (action === 'list' || action === 'revoke-owned') {
                 const req = z.object({ schemaVersion: z.literal(2), profileId: id,
                     ...(action === 'revoke-owned' ? { clientSessionId: id } : {}) }).strict().parse(raw)

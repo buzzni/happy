@@ -79,18 +79,21 @@ export function createLocalClientSession(options: {
         },
         async list() {
             const profileId = await options.profileId()
-            const [legacy, apps] = await Promise.all([
+            const results = await Promise.allSettled([
                 dependencies.broker(options.socketPath, 'list', options.sessionSecret, { schemaVersion: 1, profileId }),
                 dependencies.broker(options.socketPath, 'v2:list', options.sessionSecret, { schemaVersion: 2, profileId }),
             ])
-            return { clients: [...legacy.clients ?? [], ...apps.clients ?? []] }
+            if (results.every(result => result.status === 'rejected')) throw new Error('Connection registries are unavailable')
+            const clients = results.flatMap(result => result.status === 'fulfilled' ? result.value.clients ?? [] : [])
+            const unavailableRegistries = results.flatMap((result, index) => result.status === 'rejected' ? [index === 0 ? 'v1' : 'v2'] : [])
+            return { clients, ...(unavailableRegistries.length ? { unavailableRegistries } : {}) }
         },
         async revoke(clientSessionId: string, signal?: AbortSignal) {
             const profileId = await options.profileId()
             await approve(LOCAL_CLIENT_TOOL_NAMES[2], { clientSessionId, profileId }, signal)
-            const apps = await dependencies.broker(options.socketPath, 'v2:list', options.sessionSecret, { schemaVersion: 2, profileId })
+            const legacy = await dependencies.broker(options.socketPath, 'list', options.sessionSecret, { schemaVersion: 1, profileId }).catch(() => undefined)
             signal?.throwIfAborted()
-            const isApp = (apps.clients ?? []).some((client: { clientSessionId: string }) => client.clientSessionId === clientSessionId)
+            const isApp = !(legacy?.clients ?? []).some((client: { clientSessionId: string }) => client.clientSessionId === clientSessionId)
             return dependencies.broker(options.socketPath, isApp ? 'v2:revoke-owned' : 'revoke-owned', options.sessionSecret,
                 { schemaVersion: isApp ? 2 : 1, profileId, clientSessionId })
         },

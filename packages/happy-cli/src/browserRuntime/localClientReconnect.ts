@@ -74,7 +74,6 @@ export async function reconnectLocalClient(options: { cwd: string; socketPath: s
             || pinnedParent.dev !== currentParent.dev || await realpath(parent) !== parent) throw new Error('Descriptor changed during reconnect')
         signal?.throwIfAborted()
         await rename(temporary, pinned); await directory.sync()
-        signal?.throwIfAborted()
         // The replaced connection may still be valid. Retire it without extending its lease.
         await call(options.socketPath, 'v2:revoke', descriptor.clientSecret, { schemaVersion: 2 }).catch(() => undefined)
         signal?.throwIfAborted()

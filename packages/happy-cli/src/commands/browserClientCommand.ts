@@ -121,7 +121,7 @@ export async function handleBrowserClientCommand(args: string[], overrides: Part
                 deps.signal?.throwIfAborted()
                 deps.output({ ok: true, file: out, clientSessionId: descriptor.clientSessionId, expiresAtMs: descriptor.expiresAtMs })
             } catch (error) {
-                if (created?.clientSecret) await deps.broker(socket, overrides.appRegistration ? 'v2:revoke-app' : 'revoke', overrides.appRegistration ? secret : created.clientSecret, overrides.appRegistration ? { schemaVersion: 2, profileId: profile, appId: created.appId } : { schemaVersion: 1 }).catch(() => undefined)
+                if (created?.clientSecret) await deps.broker(socket, overrides.appRegistration ? 'v2:revoke-app-proof' : 'revoke', overrides.appRegistration ? created.appSecret : created.clientSecret, overrides.appRegistration ? { schemaVersion: 2, appId: created.appId } : { schemaVersion: 1 }).catch(() => undefined)
                 await rm(out, { force: true }); throw error
             } finally { await file.close() }
             return 0

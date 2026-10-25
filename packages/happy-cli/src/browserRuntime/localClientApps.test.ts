@@ -115,3 +115,16 @@ it('lists and revokes v2 connections by owner session without the private descri
     await expect(h.app.handle('revoke-owned', 'owner', { schemaVersion: 2, profileId: 'p', clientSessionId: h.c.clientSessionId })).resolves.toMatchObject({ revoked: true })
     expect(h.app.isActive(h.c.clientSessionId)).toBe(false)
 })
+
+it('allows app proof to durably roll back registration after the owner disappears', async () => {
+    const h = await harness()
+    h.loseOwner()
+    await expect(h.app.handle('revoke-app-proof', 'wrong-proof', { schemaVersion: 2, appId: h.c.appId })).rejects.toThrow()
+    await expect(h.app.handle('revoke-app-proof', h.c.appSecret, { schemaVersion: 2, appId: h.c.appId })).resolves.toMatchObject({ revoked: true })
+    await h.app.sweep()
+    expect(h.app.isActive(h.c.clientSessionId)).toBe(false)
+    expect(h.app.activeCount('u')).toBe(0)
+    const restarted = await openLocalClientApps(h.options)
+    await expect(restarted.handle('grant', h.c.clientSecret, { schemaVersion: 2 })).rejects.toThrow()
+    expect(JSON.parse(await readFile(join(h.stateDir, 'browser-local-apps.v2.json'), 'utf8')).apps).toEqual([])
+})
