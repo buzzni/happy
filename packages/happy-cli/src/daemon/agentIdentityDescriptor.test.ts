@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createAgentIdentityAuthority } from './agentIdentityDescriptor'
 
 const state = { machineId: 'machine', happyAccountId: 'account', registrationRevision: 2, epoch: 'launch' }
@@ -24,6 +24,7 @@ describe('personal machine descriptor authority', () => {
   it.each([
     null, {}, { ...descriptor, registrationType: 'company' }, { ...descriptor, accountKind: 'company' },
     { ...descriptor, machineId: 'other' }, { ...descriptor, happyAccountId: 'other' },
+    { ...descriptor, epoch: 'other' }, { ...descriptor, epoch: '' }, { ...descriptor, epoch: undefined },
     { ...descriptor, registrationRevision: 1 }, { ...descriptor, expiresAt: 1_999 },
     { ...descriptor, observedAt: 3_000 }, { ...descriptor, expiresAt: 61_001 },
     { ...descriptor, ownerSubject: null },
@@ -38,6 +39,17 @@ describe('personal machine descriptor authority', () => {
     expect(await f.authority.inspect('target')).toMatchObject({ relation: 'other', proof: null })
     f.account(null)
     expect(await f.authority.inspect('target')).toMatchObject({ relation: 'unknown' })
+  })
+  it('verifies the original signed descriptor including fields outside the schema', async () => {
+    const raw = { ...descriptor, extension: 'signed-field', ownerSubject: { ...descriptor.ownerSubject, extension: 'signed-subject-field' } }
+    const verifyDescriptor = vi.fn(async (value: unknown) => value === raw)
+    const authority = createAgentIdentityAuthority({
+      readState: () => state, fetchDescriptor: async () => raw,
+      verifyDescriptor,
+      targetAccount: async () => 'account', now: () => 2_000,
+    })
+    expect(await authority.inspect('target')).toMatchObject({ relation: 'own-sibling', proof: 'personal-same-account' })
+    expect(verifyDescriptor).toHaveBeenCalledOnce()
   })
   it('invalidates an answer when daemon account state changes during target lookup', async () => {
     let current = { ...state }
