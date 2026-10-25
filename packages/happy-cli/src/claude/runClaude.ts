@@ -751,6 +751,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const lessonProposalTurn = createLessonProposalTurn();
     // Flipped by claudeRemote per turn from that turn's prompt blocks (specs/desktop-next-steps-card).
     const turnCards = createTurnCardSwitch('claude');
+    // Variable to track the current session instance (updated via onSessionReady).
+    // Used by the hook server and the browser connection approver.
+    let currentSession: Session | null = null;
     // Whether anyone can answer this run's prompts, turn by turn (codexcli-approval-session-binding
     // R10a). One owner: the permission handler's unattended wait, the tool policy gate and the
     // children this session delegates to all read it. A spawned child learns its parent's from env.
@@ -758,6 +761,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const turnAttendance = new TurnAttendanceState(exitAfterFirstTurn);
     // Start Happy MCP server
     const happyServer = await startHappyServer(session, {
+        browserClientApprover: () => currentSession?.policyApprover ?? null,
         // A mandatory scope launch needs the broker most: its trust floor denies access.key (#898). The
         // agent-sbx launcher drops SAYCODE_AGENT_* from the provider env, so it gets none.
         agentControl: principal.kind === 'account' && (sandboxPolicyMode !== 'mandatory' || Boolean(scopeLaunch)),
@@ -778,10 +782,6 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         ...(launchControl ? { admitTool: <T,>(work: () => Promise<T>) => (runtimeGate ? runtimeGate.admit(work, 'writer') : Promise.reject(new Error('Runtime input is not open'))) } : {}),
     });
     logger.debug(`[START] Happy MCP server started at ${happyServer.url}`);
-
-    // Variable to track current session instance (updated via onSessionReady callback)
-    // Used by hook server to notify Session when Claude changes session ID
-    let currentSession: Session | null = null;
 
     // Tool policy (aplus-dev-studio specs/agent-tool-policy I1a): every `mcp__*` call goes through
     // the PreToolUse hook to this gate. The daemon cannot yet tell whether a session was started on

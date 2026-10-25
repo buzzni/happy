@@ -50,6 +50,8 @@ import type { AttentionOutbox } from './attention'
 import { AGENT_OPERATIONS, BrowserRuntimeError, type AgentSessionId, type GrantId, type MachineId, type PrincipalId, type ProfileId, type WorkspaceId } from './contracts'
 import { MAX_SUBSCRIBE_WAIT_MS, httpStatusFor } from './server'
 import { adoptRegistry, dedicatedLedger, sharedLedger, type ProfileRefusal, type RegistryFile, type Registration } from './brokerLedger'
+import { openLocalClients } from './localClients'
+import type { AgentGrant, AuthContext } from './contracts'
 import { sessionOwnerSchema } from './sessionRegistration'
 import type { TenancyMode } from './tenancy'
 
@@ -87,6 +89,10 @@ export interface BrokerOptions {
     endSession?(agentSessionId: string): Promise<void>
     /** Whether an unfinished task of the agent session waits for the user (approval, login hand-off, user control). */
     sessionWaiting?(agentSessionId: string): Promise<boolean>
+    attachLocalClient?(owner: AuthContext, client: AgentGrant, expiresAtMs: number): Promise<void>
+    checkLocalClient?(client: AgentGrant): Promise<void>
+    cleanupLocalClient?(id: string): Promise<void>
+    setLocalClientValidator?(check: (id: string) => boolean): void
     attention: AttentionOutbox
     socketGid?: number
     /** Delay before retrying a start-up revocation replay that failed. */
@@ -215,6 +221,29 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
     const findByAgentSession = (agentSessionId: string): [string, Registration] | undefined =>
         Object.entries(registry.registrations).find(([, registration]) => registration.agentSessionId === agentSessionId)
 
+    const clientOwner = (secret: string, requestedProfile: string): Promise<AuthContext> => exclusive(async () => {
+            await options.admit?.()
+            const registration = secret && Object.values(registry.registrations).find(r => r.secretSha256 === sha256(secret).toString('hex'))
+            if (!registration || registration.revoking || !registration.agentSessionId)
+                throw new BrowserRuntimeError('UNAUTHORIZED', 'Registered owner session required')
+            const granted = ledger.grant(registration, requestedProfile)
+            if (granted.profileId !== requestedProfile) throw new BrowserRuntimeError('SCOPE_DENIED', 'Wrong profile')
+            return { verifiedAtMs: now(), credential: {
+                kind: 'agent-grant', grantId: `internal-${randomUUID()}` as never,
+                ...granted, ...options.identity, agentSessionId: registration.agentSessionId as AgentSessionId,
+                allowedOrigins: [...options.allowedOrigins], operations: [...AGENT_OPERATIONS], taskSpaceIds: [],
+                issuedAtMs: now(), expiresAtMs: now() + 60_000,
+            } }
+        })
+    options.setLocalClientValidator?.(() => false)
+    const clients = options.attachLocalClient && options.checkLocalClient && options.endSession ? await openLocalClients({
+        stateDir: options.stateDir, agentKey: options.agentKey, now,
+        attach: options.attachLocalClient, check: options.checkLocalClient,
+        revokeGrant: options.revokeGrant, endSession: options.endSession, cleanupSession: options.cleanupLocalClient,
+        owner: clientOwner, recheckOwner: async (secret, profile) => { await clientOwner(secret, profile) },
+    }).catch(() => { log('broker local-client registry unavailable; client issuance disabled'); return undefined }) : undefined
+    options.setLocalClientValidator?.(clients?.isActive ?? (() => false))
+
     /** Tombstone, revoke every grant, then forget the registration. Callers hold `exclusive`. */
     const finishRevocation = async (registrationId: string, registration: Registration): Promise<number> => {
         // Set before persisting, so this process issues nothing more even if the write fails;
@@ -247,7 +276,9 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
     }
 
     // Shares the bind/issue/revoke lock: a resume cannot bind halfway through reclamation.
-    const sweepOrphans = (): Promise<void> => exclusive(async () => {
+    const sweepOrphans = async (): Promise<void> => {
+        await clients?.sweep().catch(() => log('broker client cleanup pending'))
+        await exclusive(async () => {
         for (const [agentSessionId, since] of Object.entries(orphaned)) {
             if (now() - since < orphanTtlMs || !options.endSession
                 || Object.values(registry.registrations).some((r) => r.agentSessionId === agentSessionId)) continue
@@ -256,6 +287,8 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
             await persist()
         }
     })
+
+    }
 
     const routes: Record<string, (req: IncomingMessage, url: URL) => Promise<unknown>> = {
         'GET /v1/sessions': async (req) => {
@@ -372,6 +405,14 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         },
     }
 
+    for (const action of ['register', 'grant', 'status', 'revoke', 'list', 'revoke-owned']) {
+        routes[`POST /v1/clients/${action}`] = async (req) => {
+            if (!clients) throw new BrowserRuntimeError('UNSUPPORTED_OPERATION', 'Local browser clients are unavailable')
+            await options.admit?.()
+            return clients.handle(action, header(req, 'x-abp-session-secret'), await readJson(req))
+        }
+    }
+
     const server = options.server ?? createServer()
     server.on('request', (req: IncomingMessage, res: ServerResponse) => {
         const url = new URL(req.url ?? '/', 'http://broker')
@@ -407,16 +448,19 @@ export async function startBroker(options: BrokerOptions): Promise<Broker> {
         void sweepOrphans().catch(() => log('broker orphan sweep incomplete; retrying'))
     }, options.orphanSweepIntervalMs ?? 60_000)
     orphanTimer.unref()
+    const clientTimer = setInterval(() => { void clients?.sweep().catch(() => log('broker client cleanup pending')) }, options.recoveryRetryMs ?? 5_000)
+    clientTimer.unref()
     return {
         sweepOrphans,
         close: () => {
             closed = true
             clearTimeout(recoveryTimer)
             clearInterval(orphanTimer)
+            clearInterval(clientTimer)
             return new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) })
-                .then(() => exclusiveTail.catch(() => undefined)).then(() => writeTail.catch(() => undefined))
+                .then(() => clients?.drain()).then(() => exclusiveTail.catch(() => undefined)).then(() => writeTail.catch(() => undefined))
         },
-        revokingGrantIds: () => new Set(Object.values(registry.registrations).filter((registration) => registration.revoking).flatMap((registration) => registration.grantIds)),
+        revokingGrantIds: () => new Set([...Object.values(registry.registrations).filter((registration) => registration.revoking).flatMap((registration) => registration.grantIds), ...clients?.revokingGrantIds() ?? []]),
         pendingRevocations: () => Object.values(registry.registrations).filter((registration) => registration.revoking).length,
         isRetired: ledger.isRetired,
         profileRequests: () => Object.entries(registry.profileRequests ?? {})

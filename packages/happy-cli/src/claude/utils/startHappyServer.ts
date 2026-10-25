@@ -1,3 +1,5 @@
+import { createLocalClientSession, registerLocalClientTools, LOCAL_CLIENT_TOOL_NAMES, type LocalClientSession } from '@/browserRuntime/localClientSession';
+import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import { startSessionAgentBroker } from '@/commands/sessionAgentBroker';
 import type { DelegatedAttendance } from '@/api/turnAttendance';
 import { registerSessionWriteScopeTools } from '@/daemon/sessionWriteScopeAgentTools';
@@ -64,6 +66,7 @@ export interface HappyServerHandlers {
     /** aplus-dev-studio-desktop#2111 — the runner's current turn; absent means bash_stream records belong to no turn. */
     currentTurnId?: () => number | null;
     browserTaskRuntime?: RuntimeClient;
+    browserLocalClients?: LocalClientSession;
     /** The granted profile: fixed, or (execution machine H) the one the broker's grant names. */
     browserTaskProfileId?: string | (() => Promise<string>);
     exitAfterFirstTurn?: boolean;
@@ -321,6 +324,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
     // which fall back to the active tab and would bypass the task lease.
     if (handlers.browserTaskRuntime) {
         registerBrowserTaskTools(mcp, handlers.browserTaskRuntime, { agentSessionId: handlers.client.sessionId, profileId: handlers.browserTaskProfileId ?? 'default', exitAfterFirstTurn: handlers.exitAfterFirstTurn, hostContinues: handlers.browserHostContinues });
+        if (handlers.browserLocalClients) registerLocalClientTools(mcp, handlers.browserLocalClients, runTool);
     } else if (!handlers.mandatorySandbox && !scopedSession) {
         registerBrowserTools(mcp, runTool);
     }
@@ -513,7 +517,7 @@ function takeBrowserTaskSessionSecret(): string | undefined {
     return browserTaskSessionSecret;
 }
 
-function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: string): { runtime: RuntimeClient; profileId: string | (() => Promise<string>) } | undefined {
+function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: string, approver?: () => PolicyApprover | null): { runtime: RuntimeClient; profileId: string | (() => Promise<string>); localClients?: LocalClientSession } | undefined {
     const baseUrl = process.env.HAPPY_BROWSER_TASK_RUNTIME_URL;
     if (!baseUrl) return undefined;
     const socketPath = process.env.HAPPY_BROWSER_TASK_BROKER_SOCKET;
@@ -527,7 +531,9 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
             agentSessionId: () => client.sessionId,
             profileId,
         });
-        return { runtime: new RuntimeClient({ baseUrl, token: grants }), profileId: grants.grantedProfileId };
+        return { runtime: new RuntimeClient({ baseUrl, token: grants }), profileId: grants.grantedProfileId,
+            ...(approver ? { localClients: createLocalClientSession({ socketPath, sessionSecret, runtimeUrl: baseUrl,
+                cwd: client.getMetadata()?.path ?? process.cwd(), profileId: grants.grantedProfileId, approver }) } : {}) };
     }
     // Harness only: the E2E harness writes a grant file for the session.
     const grantFile = process.env.HAPPY_BROWSER_TASK_GRANT_FILE;
@@ -547,6 +553,7 @@ export async function startHappyServer(
     client: ApiSessionClient,
     options: {
         agentControl?: boolean;
+        browserClientApprover?: () => PolicyApprover | null;
         checkpointReader?: CheckpointAgentReader;
         exitAfterFirstTurn?: boolean;
         /** Set by the daemon for a Studio Chat(beta) session (HAPPY_AUTOMATION_BROWSER_CONTINUATION). */
@@ -569,7 +576,7 @@ export async function startHappyServer(
 ) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
-    const browserTask = createBrowserTaskRuntimeClient(client, process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default');
+    const browserTask = createBrowserTaskRuntimeClient(client, process.env.HAPPY_BROWSER_TASK_PROFILE_ID || 'default', options.browserClientApprover);
     const browserTaskRuntime = browserTask?.runtime;
     const browserTaskProfileId = browserTask?.profileId;
     if (browserTaskRuntime) {
@@ -650,6 +657,7 @@ export async function startHappyServer(
             currentTurnId: options.currentTurnId,
             browserTaskRuntime,
             browserTaskProfileId,
+            browserLocalClients: browserTask?.localClients,
             exitAfterFirstTurn: options.exitAfterFirstTurn,
             browserHostContinues: options.browserHostContinues,
         });
@@ -719,7 +727,7 @@ export async function startHappyServer(
         socketPath,
         mcpConfig,
         bridgeEnv,
-        toolNames: [...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
+        toolNames: [...(browserTask?.localClients ? LOCAL_CLIENT_TOOL_NAMES : []), ...(options.mandatorySandbox ? [] : TURN_CARD_TOOL_NAMES), ...(initialComputerAvailable ? ['local_tool_capabilities', 'local_tool_control'] : []), ...(options.checkpointReader ? ['checkpoint_status', 'checkpoint_list', 'checkpoint_preview', 'checkpoint_diff'] : []), ...(options.mandatorySandbox
             ? ['change_title', ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : [])]
             : [...(options.proposeLesson ? ['propose_lesson'] : []), 'change_title', 'bash_stream', 'script_automations', ...(process.env.HAPPY_WRITE_SCOPE_SESSION === '1' ? [] : ['scheduled_tasks']), ...(browserTaskRuntime ? BROWSER_TASK_TOOL_NAMES : BROWSER_TOOL_NAMES)])],
         stop: () => {

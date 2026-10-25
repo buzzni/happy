@@ -1930,6 +1930,7 @@ export async function runCodex(opts: {
     const turnCards = createTurnCardSwitch('codex');
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
+        browserClientApprover: () => permissionHandler,
         agentControl: accountToken !== null,
         exitAfterFirstTurn,
         delegatedAttendance: () => turnAttendance ? delegatedAttendanceFor(turnAttendance.current()) : null,
