@@ -19,7 +19,8 @@ export interface AutomationTickRunner {
 }
 
 export function createAutomationTickRunner(opts: {
-  runTick: () => Promise<unknown>
+  /** 버려진 tick 에는 signal 이 abort 된다 — 다음 await 에서 멈추고 더 진행하지 않는다. */
+  runTick: (signal: AbortSignal) => Promise<unknown>
   logDebug?: (message: string) => void
   /**
    * 이 시간을 넘긴 tick 은 멈춘 것으로 보고 가드를 풀어 다음 하트비트가 새 tick 을
@@ -35,6 +36,7 @@ export function createAutomationTickRunner(opts: {
   let startedAt = 0
   // 버려진 tick 이 뒤늦게 끝나며 지금 도는 tick 의 가드를 풀지 못하게 한다.
   let generation = 0
+  let controller: AbortController | null = null
   const runner: AutomationTickRunner = {
     isRunning: () => running,
     pause() {
@@ -59,14 +61,18 @@ export function createAutomationTickRunner(opts: {
         // 예외는 가드를 풀지만, 끝나지 않는 await 는 아무것도 풀지 않는다. 그 tick 은 버리고
         // 소리 내어 새로 시작한다 — 조용히 영구 정지하는 것보다 낫다.
         opts.logDebug?.(`[automation-tick] tick stalled for ${elapsed}; abandoning it and starting a new tick`)
+        // 버려진 tick 이 나중에 풀려도 세션을 띄우거나 상태를 쓰지 못하게 한다.
+        controller?.abort(new Error('tick-stalled'))
       }
       running = true
       startedAt = now()
       const mine = ++generation
+      const current = new AbortController()
+      controller = current
       // detach: 하트비트를 막지 않는다. 실패는 로그만 — 가드는 항상 해제해
       // 한 번의 예외가 자동화를 영구 정지시키지 않게 한다.
       void Promise.resolve()
-        .then(() => opts.runTick())
+        .then(() => opts.runTick(current.signal))
         .catch((error) => {
           opts.logDebug?.(`[automation-tick] tick failed: ${error instanceof Error ? error.message : String(error)}`)
         })

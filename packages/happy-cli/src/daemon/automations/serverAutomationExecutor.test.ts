@@ -407,7 +407,7 @@ describe('runServerAutomationTick', () => {
   })
 
   it('keeps an immediate run request due while another run is active', async () => {
-    const { input, store, transport, now } = setup({ claim: { ok: false, error: 'active-run' } })
+    const { input, store, transport, now, logDebug } = setup({ claim: { ok: false, error: 'active-run' } })
     const requestedAt = now - 1_000
     store.write({
       ...store.read(),
@@ -427,6 +427,9 @@ describe('runServerAutomationTick', () => {
       automationId: 'automation-1', generation: 2, scheduledFor: requestedAt,
     })
     expect(store.state().schedules[0]!.nextRunAt).toBe(requestedAt)
+    // 2026-10-25 — 버려진 run 의 lease 가 남은 6분 동안 매 틱 여기로 와서 조용히 넘어갔다.
+    // 로그 한 줄이 없으면 "due 인데 안 돈다" 를 설명할 수 없다.
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('automation-1 claim refused: active-run'))
   })
 
   it('advances a scheduled slot when another run is already active', async () => {
@@ -806,7 +809,46 @@ describe('runServerAutomationTick', () => {
 
     await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_MAX_MS)
     expect(transport.heartbeat).toHaveBeenCalledTimes(renewalsAtCap)
-    expect(logDebug.mock.calls.some(([line]) => String(line).includes('run=run-1 heartbeat stopped'))).toBe(true)
+    const stopped = logDebug.mock.calls.map(([line]) => String(line)).find((line) => line.includes('run=run-1 heartbeat stopped'))
+    expect(stopped).toBeDefined()
+    // 10분 멈춤의 위치를 알 수 있어야 한다 — 2026-10-25 11:39 의 정지는 이 한 줄이 없어 단계를 특정하지 못했다.
+    expect(stopped).toContain('last step: spawn-session')
+  })
+
+  it('abandonsARunAtTheNextStepOnceTheTickSignalIsAborted', async () => {
+    const { input, transport, spawnSession, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    const controller = new AbortController()
+    input.signal = controller.signal
+    const resolveMcpSpawnContext = input.resolveMcpSpawnContext
+    input.resolveMcpSpawnContext = async (run) => {
+      // 이 await 가 돌아오는 사이 워치독이 tick 을 버렸다.
+      controller.abort()
+      return resolveMcpSpawnContext(run)
+    }
+
+    await runServerAutomationTick(input)
+
+    expect(spawnSession).not.toHaveBeenCalled()
+    expect(transport.report).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', status: 'FAILED', outcome: 'ERROR', failureCode: 'TICK_ABANDONED',
+    }))
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('run=run-1 abandoned at '))
+  })
+
+  it('stopsBeforeTheNextAutomationOnceTheTickIsAbandoned', async () => {
+    const { input, transport, logDebug } = setup({
+      claim: { ok: true, value: { runId: 'run-1', claimToken: 'token' } },
+    })
+    const controller = new AbortController()
+    controller.abort()
+    input.signal = controller.signal
+
+    await expect(runServerAutomationTick(input)).resolves.toEqual([])
+
+    expect(transport.claim).not.toHaveBeenCalled()
+    expect(logDebug).toHaveBeenCalledWith(expect.stringContaining('tick abandoned'))
   })
 
   // 2026-09-12 프로덕션 — aplus 트리거 설정을 저장하자 generation 이 13 → 14 로 올랐고,

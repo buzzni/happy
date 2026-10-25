@@ -73,7 +73,15 @@ async function answer(
     // fan-out 뒤로 미루면 fan-out 이 늦는 만큼 tick 이 멈추고, fan-out 이 실패하면 이미
     // 저장된 결과가 invalid-input 으로 둔갑한다 (2026-10-24: ack 하나가 오지 않아 한 머신의
     // 자동화가 데몬 재시작 전까지 전부 멈췄다).
-    callback(result.ok ? { ok: true, value: wire(result.value) } : { ok: false, error: result.error });
+    let response: { ok: boolean; value?: unknown; error?: string };
+    try {
+        response = result.ok ? { ok: true, value: wire(result.value) } : { ok: false, error: result.error };
+    } catch {
+        // 직렬화 실패도 ack 로 돌려준다 — ack 없는 요청은 데몬 쪽에서 타임아웃으로만 보인다.
+        callback({ ok: false, error: 'invalid-input' });
+        return;
+    }
+    callback(response);
     if (!result.ok || !onSuccess) return;
     try {
         await onSuccess(result.value);

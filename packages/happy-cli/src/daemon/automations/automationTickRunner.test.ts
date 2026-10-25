@@ -220,4 +220,31 @@ describe('createAutomationTickRunner', () => {
     await settle()
     expect(runner.isRunning()).toBe(false)
   })
+
+  it('shouldAbortTheAbandonedTickSignalAndHandAFreshOneToTheNextTick', async () => {
+    const gate = deferred()
+    const signals: AbortSignal[] = []
+    let now = 1_000_000
+    const runner = createAutomationTickRunner({
+      runTick: (signal) => {
+        signals.push(signal)
+        return gate.promise
+      },
+      now: () => now,
+      stalledAfterMs: 600_000,
+    })
+
+    runner.trigger()
+    await settle()
+    expect(signals[0]!.aborted).toBe(false)
+
+    now += 600_000
+    runner.trigger()
+    await settle()
+
+    // 버려진 tick 은 신호로 멈추고, 새 tick 은 깨끗한 신호를 받는다.
+    expect(signals).toHaveLength(2)
+    expect(signals[0]!.aborted).toBe(true)
+    expect(signals[1]!.aborted).toBe(false)
+  })
 })
