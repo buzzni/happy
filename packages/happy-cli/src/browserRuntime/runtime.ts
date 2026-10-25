@@ -1263,7 +1263,6 @@ export class BrowserRuntime implements BrowserRuntimeApi {
         if (prior?.failed) {
             if (prior.epoch !== this.approvalModeEpochs.get(task.taskId))
                 throw new BrowserRuntimeError('CONFLICT', 'This failed mode request was superseded by a newer choice')
-            requests.delete(key)
         } else if (prior) return { outcome: 'mode-updated', task: this.view(this.requireTask(req.taskId)) }
         if (req.mode !== 'auto' && req.mode !== 'manual') throw new BrowserRuntimeError('INVALID_REQUEST', 'Unknown approval mode')
         const grant = task.agentGrant as AgentGrant | undefined
@@ -1274,8 +1273,10 @@ export class BrowserRuntime implements BrowserRuntimeApi {
             if (!grant || !this.isCredentialLive({ credential: grant, verifiedAtMs: this.clock.now() })
                 || task.cancelRequested || TERMINAL_STATUSES.includes(task.status))
                 throw new BrowserRuntimeError('CONFLICT', 'Task is no longer available for Auto')
-            if (requests.size >= 64) throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'This task reached its Auto mode-change limit; start a new task')
+            if (requests.size - (prior?.failed ? 1 : 0) >= 64) throw new BrowserRuntimeError('QUOTA_EXCEEDED', 'This task reached its Auto mode-change limit; start a new task')
         }
+        // Keep a failed request’s supersede guard until every retry validation has passed.
+        if (prior?.failed) requests.delete(key)
         // Revoke synchronously before the journal await. A delayed enable or description cannot race past it.
         const epoch = (this.approvalModeEpochs.get(task.taskId) ?? 0) + 1
         this.approvalModeEpochs.set(task.taskId, epoch)

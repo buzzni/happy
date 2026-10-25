@@ -253,4 +253,29 @@ describe('task-scoped browser Auto', () => {
         expect((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).approvalMode?.mode).toBe('manual')
     })
 
+    it('preserves the failed request guard when a retry fails origin validation', async () => {
+        const h = await harness()
+        const mutate = h.store.mutate.bind(h.store)
+        let fail = true
+        h.store.mutate = (id, callback) => mutate(id, current => {
+            const mutation = callback(current)
+            if (fail && mutation?.event.data.approvalModeChanged === 'auto') {
+                fail = false; throw new BrowserRuntimeError('JOURNAL_UNAVAILABLE', 'fixture failure')
+            }
+            return mutation
+        })
+        await expect(h.mode('auto', 'older-failed')).rejects.toMatchObject({ code: 'JOURNAL_UNAVAILABLE' })
+        h.options.sites.push({ origin: 'https://other.test', actions: [] })
+        const observeAt = async (url: string) => {
+            h.driver.seedTab(h.opened.tabId, { url, elements: [] })
+            await h.runtime.observe(h.auth, { taskId: h.task.taskId, tabId: h.opened.tabId })
+        }
+        await observeAt('https://other.test/page')
+        await expect(h.mode('auto', 'older-failed')).rejects.toMatchObject({ code: 'ORIGIN_DENIED' })
+        await h.mode('manual', 'newer-disable')
+        await observeAt(origin + '/start')
+        await expect(h.mode('auto', 'older-failed')).rejects.toMatchObject({ code: 'CONFLICT' })
+        expect((await h.runtime.getTask(h.auth, { taskId: h.task.taskId })).approvalMode?.mode).toBe('manual')
+    })
+
 })
