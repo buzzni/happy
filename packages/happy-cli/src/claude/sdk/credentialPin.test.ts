@@ -16,7 +16,7 @@ function fixture() {
     const create = vi.fn(({ prompt }: { prompt: AsyncIterable<SDKUserMessage> }) => Object.assign((async function* () {
         for await (const message of prompt) { received.push(message); yield { type: 'result', subtype: 'success' }; }
     })(), controls) as unknown as Query);
-    return { controls, create, received, tamper: () => { effective.env.ANTHROPIC_BASE_URL = 'https://wrong.example.test'; } };
+    return { controls, create, received, tamper: () => { effective.env.ANTHROPIC_BASE_URL = 'https://wrong.example.test'; }, restrictOrganization: () => { effective.forceLoginOrgUUID = 'fixture-org'; } };
 }
 const options: Options = { env: { CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, settingSources: ['user', 'project', 'local'] };
 afterEach(() => vi.useRealTimers());
@@ -30,13 +30,14 @@ describe('pinned credential at the SDK request boundary', () => {
         expect(f.create.mock.calls[0][0]).toMatchObject({ options });
         expect(f.received).toHaveLength(1); expect(f.received[0].message.content).toBe('hello');
     });
-    it.each(['missing-control', 'old-version', 'overlay-refused', 'managed-override', 'wrong-account', 'aborted'])(
+    it.each(['missing-control', 'old-version', 'overlay-refused', 'managed-override', 'wrong-account', 'restricted-org', 'aborted'])(
         'refuses %s before input and exposes a sanitized failure', async kind => {
             const f = fixture();
             if (kind === 'missing-control') f.controls.getSettings = undefined as never;
             if (kind === 'old-version') f.controls.initializationResult.mockResolvedValue({ claude_code_version: '2.1.100', hooks_applied: true });
             if (kind === 'overlay-refused') f.controls.applyFlagSettings.mockRejectedValue(new Error(TOKEN));
             if (kind === 'managed-override') f.controls.applyFlagSettings.mockImplementation(async () => {});
+            if (kind === 'restricted-org') f.restrictOrganization();
             if (kind === 'wrong-account') f.controls.reinitialize.mockResolvedValue({ account: { apiProvider: 'bedrock', tokenSource: 'CLAUDE_CODE_OAUTH_TOKEN' } });
             const abortController = new AbortController(); if (kind === 'aborted') abortController.abort();
             const q = queryWithPinnedCredential(f.create as never, { prompt: 'hello', options: { ...options, abortController } }, TOKEN);

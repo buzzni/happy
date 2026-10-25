@@ -57,7 +57,7 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
         const hooksPath = join(root, 'hooks.txt');
         const settings = (source: string) => ({
             apiKeyHelper: 'printf fixture-wrong-helper',
-            env: { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '0', ANTHROPIC_API_KEY: 'fixture-wrong-key', ANTHROPIC_AUTH_TOKEN: 'fixture-wrong-auth', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-wrong-oauth', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1', [`KEEP_${source}`]: 'yes' },
+            env: { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '0', ANTHROPIC_API_KEY: 'fixture-wrong-key', ANTHROPIC_AUTH_TOKEN: 'fixture-wrong-auth', ANTHROPIC_CUSTOM_HEADERS: 'Authorization: Bearer fixture-wrong-header', CLAUDE_CODE_OAUTH_TOKEN: 'fixture-wrong-oauth', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1', [`KEEP_${source}`]: 'yes' },
             permissions: { deny: [`Bash(${source}-denied)`] },
             hooks: { SessionStart: [{ hooks: [{ type: 'command', command: `printf '${source}\\n' >> '${hooksPath}'` }] }] },
         });
@@ -98,6 +98,7 @@ describe.skipIf(!enabled)('real SDK credential pin with project rules', () => {
             await new Promise(() => {});
         }
         q = queryWithPinnedCredential(sdkQuery, { prompt: prompt(), options: { ...f.options, settingSources: sources === 'default' ? undefined : f.options.settingSources, debugFile: join(root, 'sdk-debug.log') } }, TOKEN);
+        expect((await q.initializationResult()).account.apiKeySource).not.toBe('ANTHROPIC_API_KEY');
         let results = 0; let liveRules: string[] = []; let liveEnv: Record<string,string> = {};
         for await (const message of q) if (message.type === 'result') {
             expect(message.is_error).toBe(false); results++;

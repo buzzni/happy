@@ -61,7 +61,10 @@ export function queryWithPinnedCredential(
     async function verify() {
         const { effective } = await settings();
         const env = effective.env;
-        if (effective.apiKeyHelper !== '' || !object(env)
+        if (effective.forceLoginOrgUUID !== undefined
+            || (effective.forceLoginMethod !== undefined && effective.forceLoginMethod !== 'claudeai')
+            || (effective.allowedProviders !== undefined && (!Array.isArray(effective.allowedProviders) || !effective.allowedProviders.includes('anthropic')))
+            || effective.apiKeyHelper !== '' || !object(env)
             || Object.entries(authEnv).some(([key, value]) => env[key] !== value)) throw new Error(PERSONAL_CLAUDE_AUTH_FAILURE);
         const info = await control(() => response.reinitialize());
         const account = info.account;
