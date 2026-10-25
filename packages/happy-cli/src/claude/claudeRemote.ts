@@ -141,6 +141,7 @@ export async function claudeRemote(opts: {
     mcpServers?: Record<string, any>,
     claudeEnvVars?: Record<string, string>,
     managedSettingsLockdown?: boolean,
+    personalClaudeAuth?: QueryOptions['personalClaudeAuth'],
     /** 관리 실행인가. 마지막 경계에서 계획을 덮을지 정한다. */
     managedRun?: boolean,
     /**
@@ -505,6 +506,7 @@ async function runClaudeRemote(
     const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const writerProcessTree = opts.completeTurn ? new CheckpointWriterProcessTree() : null;
     const assembledOptions: QueryOptions = {
+        personalClaudeAuth: opts.personalClaudeAuth,
         cwd: providerPath,
         additionalDirectories: readAdditionalDirectoriesEnvironment(process.env),
         resume: startFrom ?? undefined,

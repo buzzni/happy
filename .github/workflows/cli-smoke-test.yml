@@ -49,6 +49,22 @@ jobs:
     - name: Build package
       run: pnpm --filter @buzzni/happy-cli build
 
+    - name: Verify personal Claude authentication with the real SDK
+      if: matrix.node-version == 24
+      timeout-minutes: 5
+      env:
+        HAPPY_CLAUDE_AUTH_PIN_INTEGRATION: '1'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bubblewrap
+        # Ubuntu's AppArmor user-namespace restriction prevents unprivileged bwrap
+        # before the SDK starts. Relax it only in this disposable CI runner;
+        # policies remain inside the test's private mount namespace.
+        if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        pnpm --filter @buzzni/happy-cli exec vitest run --project integration-claude-auth-pin
+
     - name: Verify local browser client with Chrome and Unix broker
       if: matrix.node-version == 24
       timeout-minutes: 10
