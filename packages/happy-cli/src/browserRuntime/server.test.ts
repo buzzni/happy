@@ -305,6 +305,7 @@ describe('viewer client assets (D2)', () => {
             expect(html).toContain("import RFB from './core/rfb.js'")
             // The console's current choice is read from the parent window; the address alone is restored last in <head>.
             expect(html).toContain('__abpViewerFit')
+            expect(html).toContain('__abpViewerControl')
             expect(html.indexOf('__abpViewerPath')).toBeGreaterThan(html.indexOf('<script type="module">read()'))
         } finally {
             rmSync(root, { recursive: true, force: true })

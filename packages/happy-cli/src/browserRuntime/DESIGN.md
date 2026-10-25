@@ -243,7 +243,9 @@ Saydo `specs/agent-browser-deploy/` D2. Files: `viewerProxy.ts`, `rfb.ts`, `serv
   no CDN; `vnc_lite.html?path=v1/viewer/websockify%3Fticket%3D…`). The Runtime adds two inline scripts to
   `vnc_lite.html` only: one before noVNC's module hands the page's RFB object to its same-origin console as
   `window.__abpRfb` (first assignment of `scaleViewport`, initial value from the console's
-  `__abpViewerFit`), one last in `<head>` restores `?path=` a relay stripped. Fit / actual size in the
+  `__abpViewerFit`; `viewOnly` from `__abpViewerControl` = the user holds the shown task's control, so
+  without control a wheel over an actual-size screen pans the frame instead of being swallowed), one
+  last in `<head>` restores `?path=` a relay stripped. Fit / actual size in the
   console is therefore noVNC's own `scaleViewport` switched in place (same frame, same ticket; the lease
   and capability are untouched); `resizeSession` is never set, so the display size never changes the
   remote resolution. Verified with the pinned 1.3.0 (class accessor) and Debian 1.0.0 (prototype accessor).

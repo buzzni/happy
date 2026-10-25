@@ -98,15 +98,18 @@ const VIEWER_PATH_RESTORE = "<script>(function(){try{if(location.search||window.
  * `?scale=`) hands the instance to `window.__abpRfb`, where the same-origin
  * console that framed the page reads it; that first value is taken from the
  * console's current choice (`parent.__abpViewerFit`) so a reconnected frame
- * keeps it. Nothing else of noVNC is touched; `resizeSession` stays as the
+ * keeps it. The same moment sets `viewOnly` from `parent.__abpViewerControl`
+ * (the console keeps it at whether the user holds the shown task's control):
+ * view-only noVNC lets a wheel over an actual-size screen scroll the frame
+ * natively instead of swallowing it. Nothing else of noVNC is touched; `resizeSession` stays as the
  * address says (the console never sets it: the remote resolution is not changed
  * by the display size). A cross-origin parent throws and is ignored.
  */
 const VIEWER_FIT_HOOK = "<script type=\"module\">import RFB from './core/rfb.js';(function(){try{"
     + "var d=Object.getOwnPropertyDescriptor(RFB.prototype,'scaleViewport');if(!d||!d.set||!d.get)return;"
     + "Object.defineProperty(RFB.prototype,'scaleViewport',{configurable:true,get:d.get,set:function(v){"
-    + "if(!window.__abpRfb){window.__abpRfb=this;try{var f=window.parent!==window&&window.parent.location.origin===location.origin?window.parent.__abpViewerFit:undefined;"
-    + "if(typeof f==='boolean')v=f}catch(e){}}d.set.call(this,v)}})}catch(e){}})()</script>"
+    + "if(!window.__abpRfb){window.__abpRfb=this;try{var p=window.parent!==window&&window.parent.location.origin===location.origin?window.parent:null,f=p?p.__abpViewerFit:undefined,c=p?p.__abpViewerControl:undefined;"
+    + "if(typeof f==='boolean')v=f;if(typeof c==='boolean')this.viewOnly=!c}catch(e){}}d.set.call(this,v)}})}catch(e){}})()</script>"
 
 /**
  * Serves the pinned noVNC client (the Runtime image copies the Debian novnc

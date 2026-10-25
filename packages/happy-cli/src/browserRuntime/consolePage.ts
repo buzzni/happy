@@ -36,7 +36,9 @@
  * and the screen takes the width and the remaining height. Fit / actual size (`#fitToggle`, `#actualSize`) is
  * noVNC's own scaleViewport on the frame's RFB object (handed over by the Runtime's viewer hook as
  * `__abpRfb`; the console's choice is read back from `__abpViewerFit` when a frame loads), so it
- * never reconnects and never asks the remote display to change size. Activity and Advanced are
+ * never reconnects and never asks the remote display to change size. The same hook sets noVNC's viewOnly from
+ * `__abpViewerControl` (whether the user holds the shown task's control), so without control a wheel over an
+ * actual-size screen pans the frame instead of being swallowed by the canvas. Activity and Advanced are
  * buttons on that line whose panels open under the screen, closed by default.
  */
 export function renderConsolePage(opts: { hostOrigins?: readonly string[] } = {}): string {
@@ -275,7 +277,7 @@ summary::-webkit-details-marker{display:none}
 <script>
 (function(){
 var $=function(i){return document.getElementById(i)};
-var S={cursor:0,seen:{},task:null,tasks:[],gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
+var S={cursor:0,seen:{},task:null,tasks:[],pendingTasks:null,listSeq:0,gen:0,token:'',expiresAtMs:0,profileId:'',renewTimer:0,screenOpen:false,screenSeq:0,fit:true};
 var RENEW_BEFORE_MS=60000,RENEW_RETRY_MS=10000,HOST_ORIGINS=${hostOrigins};
 var Q=new URLSearchParams(location.search),THEME=Q.get('theme');
 if(THEME==='dark'||THEME==='light')document.documentElement.setAttribute('data-theme',THEME);
@@ -283,14 +285,14 @@ var LANG=(Q.get('lang')||navigator.language||'en').toLowerCase().indexOf('ko')==
 var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refresh:'Refresh',advanced:'Advanced',taskId:'Task id',tabId:'Tab id (for take over / release)',watch:'Watch task',
  paste:'Paste a capability token',useToken:'Use token',rawTask:'Task details',pickTitle:'Pick a task',pickBody:'Tasks that need you are in the task menu above.',pickTask:'Pick a task',
  needCount:function(n){return n+(n>1?' tasks need you':' task needs you')},tasksFailed:'Could not load the tasks',retry:'Retry',viewMode:'Screen size',fit:'Fit to screen',actual:'Actual size',
- fitHint:'The whole screen, scaled to fit the frame',actualHint:'1:1 pixels; scroll the frame to see the rest',
+ fitHint:'The whole screen, scaled to fit the frame',actualHint:'1:1 pixels. Without control the wheel pans the frame; with control it reaches the page (drag the scrollbars to pan)',
  screenEmptyTitle:'The screen is not open',screenEmptyBody:"Open screen shows the agent's browser here. Take over to use the page yourself (login, verification); release it and the agent continues.",
  approvalTitle:'Approval required',approve:'Approve',reject:'Reject',takeOver:'Take over',release:'Release',resume:'Resume',stop:'Stop',screen:'Screen',openScreen:'Open screen',
  screenHint:'input reaches the page only while you hold take over',events:'Activity',noEvents:'No activity yet',
  notConnected:'not connected',waitingHost:'Waiting for Saycode',connected:'Connected',until:'until',unreadable:'capability is not readable',loading:'loading',
  noTasksTitle:'Nothing needs you',noTasks:'no open tasks',others:function(n){return n+' other open task'+(n>1?'s':'')},live:'live',retrying:'retrying',
  needApproval:'Needs your approval',needLogin:'Login needed',needCaptcha:'Human verification needed',needHandoff:'Waiting for you',userControl:'You have control',
- running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',
+ running:'Running',paused:'Paused',awaitingUser:'Needs you',awaitingAgent:'Waiting for the agent',released:'Released',succeeded:'Finished',failed:'Failed',cancelled:'Cancelled',
  rLogin:'Take over, sign in on the screen, then release.',rCaptcha:'Take over and complete the verification on the screen, then release.',
  rHandoff:'The agent handed the page to you. Take over to continue.',rApproval:'The agent wants to do something that needs your approval.',
  rControl:'Your input reaches the page. Release when you are done so the agent continues.',rRunning:'The agent is working on it.',
@@ -299,14 +301,14 @@ var M={en:{title:'Agent Browser',subtitle:'Runtime console',tasks:'Tasks',refres
  ko:{title:'에이전트 브라우저',subtitle:'런타임 콘솔',tasks:'작업',refresh:'새로고침',advanced:'고급',taskId:'작업 ID',tabId:'탭 ID (제어권 가져오기/반납용)',watch:'작업 보기',
  paste:'권한 토큰 붙여넣기',useToken:'토큰 사용',rawTask:'작업 상세',pickTitle:'작업을 고르세요',pickBody:'확인이 필요한 작업은 위 작업 메뉴에 나타나요.',pickTask:'작업 선택',
  needCount:function(n){return '확인 필요 '+n+'개'},tasksFailed:'작업 목록을 불러오지 못했어요',retry:'다시 시도',viewMode:'화면 크기',fit:'화면 맞춤',actual:'실제 크기',
- fitHint:'화면 전체가 보이도록 틀에 맞춰 축소해요',actualHint:'1:1 크기로 보여요. 나머지는 틀 안에서 스크롤하세요',
+ fitHint:'화면 전체가 보이도록 틀에 맞춰 축소해요',actualHint:'1:1 크기로 보여요. 제어권이 없을 때는 휠로 틀을 이동하고, 제어권을 가지면 휠이 페이지에 전달돼요(틀 이동은 스크롤바)',
  screenEmptyTitle:'화면이 아직 열리지 않았어요',screenEmptyBody:'화면 보기를 누르면 에이전트의 브라우저가 여기에 보여요. 로그인이나 사람 확인처럼 직접 해야 할 때 제어권을 가져오고, 반납하면 에이전트가 이어서 진행해요.',
  approvalTitle:'승인이 필요해요',approve:'승인',reject:'거절',takeOver:'제어권 가져오기',release:'제어권 반납',resume:'계속 진행',stop:'작업 중지',screen:'화면',openScreen:'화면 보기',
  screenHint:'제어권을 가진 동안에만 입력이 화면에 전달돼요.',events:'활동 기록',noEvents:'아직 활동이 없어요',
  notConnected:'연결 안 됨',waitingHost:'Saycode 연결 대기 중',connected:'연결됨',until:'까지',unreadable:'권한을 읽을 수 없어요',loading:'불러오는 중',
  noTasksTitle:'지금 확인할 작업이 없어요',noTasks:'열린 작업이 없어요',others:function(n){return '다른 작업 '+n+'개'},live:'실시간 연결됨',retrying:'다시 시도 중',
  needApproval:'승인 필요',needLogin:'로그인 필요',needCaptcha:'사람 확인 필요',needHandoff:'직접 조작 대기',userControl:'내가 제어 중',
- running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',
+ running:'진행 중',paused:'일시 정지',awaitingUser:'확인 필요',awaitingAgent:'에이전트 대기',released:'제어권 반납됨',succeeded:'완료됨',failed:'실패',cancelled:'취소됨',
  rLogin:'제어권을 가져와 화면에서 로그인한 뒤 반납하세요.',rCaptcha:'제어권을 가져와 화면에서 확인을 마친 뒤 반납하세요.',
  rHandoff:'에이전트가 화면을 넘겼어요. 제어권을 가져와 이어서 진행하세요.',rApproval:'에이전트가 승인이 필요한 작업을 하려고 해요.',
  rControl:'입력이 화면에 전달되고 있어요. 다 하면 반납해야 에이전트가 이어서 진행해요.',rRunning:'에이전트가 작업하고 있어요.',
@@ -331,9 +333,9 @@ document.addEventListener('pointerdown',function(e){if(menu.open&&!menu.contains
 // document closes the menu too (same origin; armed on every load, so a reconnected frame keeps it), and the window
 // losing focus to the frame (or to anything else) closes it as well.
 window.addEventListener('blur',closeMenu);
-$('screen').addEventListener('load',function(){try{var d=this.contentDocument;if(d)d.addEventListener('pointerdown',closeMenu,true)}catch(e){}});
+$('screen').addEventListener('load',function(){try{var d=this.contentDocument;if(d)d.addEventListener('pointerdown',closeMenu,true)}catch(e){}applyControl()});
 /** A list failure is shown in the notice line above the task, with a retry, not only inside the closed menu. */
-function notice(text){var n=$('notice');n.hidden=!text;$('noticeText').textContent=text||''}
+function notice(text){var n=$('notice'),el=$('noticeText');if(el.textContent!==(text||''))el.textContent=text||'';n.hidden=!text}
 $('noticeRetry').onclick=function(){listTasks()};
 function menuLabel(){var t=S.task;$('taskMenuLabel').textContent=t?describe(t).label+' · '+t.taskId:T.pickTask;menuName()}
 function needCount(n){var b=$('needCount');b.textContent=String(n);b.hidden=!n;b.title=n?T.needCount(n):'';menuName()}
@@ -390,7 +392,10 @@ function describe(t){
  if(t.status==='running')return {label:T.running,tone:'run',reason:T.rRunning,icon:'i-activity'};
  if(t.pauseReason==='awaiting-agent')return {label:T.awaitingAgent,tone:'',reason:'',icon:'i-activity'};
  if(t.status==='paused')return {label:T.paused,tone:'',reason:'',icon:'i-globe'};
+ if(finished(t))return {label:T[t.status],tone:t.status==='succeeded'?'ok':'',reason:'',icon:'i-globe'};
  return {label:t.status||'',tone:'',reason:'',icon:'i-globe'}}
+/** The Runtime's terminal statuses: listTasks leaves them out, so the menu does too. */
+function finished(t){return t.status==='succeeded'||t.status==='failed'||t.status==='cancelled'}
 function chip(el,d){el.className='chip'+(d.tone?' '+d.tone:'');el.textContent=d.label}
 function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.status,pauseReason:t.pauseReason,waitReason:t.waitReason,stateVersion:t.stateVersion,tabs:t.tabs,cancelRequested:t.cancelRequested,uncertainActions:t.uncertainActions},null,2);
  if(!$('tabId').value&&t.tabs&&t.tabs[0])$('tabId').value=t.tabs[0];
@@ -400,8 +405,15 @@ function showTask(t){S.task=t;$('task').textContent=JSON.stringify({status:t.sta
  // The control a user is most likely to need next is the loud one.
  var holding=t.pauseReason==='user-control',released=t.pauseReason==='user-input-complete';
  $('takeOver').className=holding||released?'':'primary';$('release').className=holding?'primary':'';$('resume').className=released?'primary':'';
- syncTask(t);markSelected(t.taskId);
+ syncTask(t);markSelected(t.taskId);applyControl();
  var a=t.pendingApproval;$('approvalBox').hidden=!a;if(a)renderApproval(a)}
+/**
+ * Whether this user holds the shown task's control decides what the viewer does with the wheel and the keys: without
+ * control noVNC is view-only, so a wheel over an actual-size screen pans the frame (and keys are not grabbed); with
+ * control they reach the page. The server's lease decides what is actually accepted; this only keeps the viewer honest.
+ */
+function applyControl(){var holding=!!S.task&&S.task.pauseReason==='user-control';window.__abpViewerControl=holding;
+ try{var w=$('screen').contentWindow;if(w&&w.__abpRfb)w.__abpRfb.viewOnly=!holding}catch(e){}}
 function renderApproval(a){var box=$('approval');box.textContent='';var d=document.createElement('div');d.className='desc';d.textContent=a.description;
  var m=document.createElement('div');m.className='meta';var o=document.createElement('span');o.textContent=T.origin+' · '+a.origin;
  var x=document.createElement('span');x.textContent=T.expires+' · '+hhmm(a.expiresAtMs);m.appendChild(o);m.appendChild(x);box.appendChild(d);box.appendChild(m)}
@@ -420,12 +432,25 @@ function fillTaskButton(b,t){var d=describe(t);b.textContent='';
  what.appendChild(c);what.appendChild(document.createTextNode(' '));what.appendChild(when);
  b.appendChild(dot);b.appendChild(id);b.appendChild(document.createTextNode(' '));b.appendChild(what);
  b.onclick=function(){if(menu.open){menu.open=false;menuBtn.focus()}$('taskId').value=t.taskId;$('tabId').value=(t.tabs&&t.tabs[0])||'';watch()}}
-/** quiet: a background refresh keeps the list on screen instead of showing "loading" (the menu may be open). */
-function listTasks(quiet){if(!S.token)return;if(quiet!==true){$('tasks').className='muted';$('tasks').textContent=T.loading}
- op('listTasks',{profileId:S.profileId}).then(function(r){notice('');S.tasks=r.tasks;var first=renderTasks();
-  // Opened to deal with something: show the first task that needs the user right away.
-  if(!S.task&&first&&!$('taskId').value){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}
- },function(e){$('tasks').textContent=e.message;$('tasks').className='warn-text small';notice(T.tasksFailed+' · '+e.message)})}
+/**
+ * quiet: a background refresh keeps the list on screen instead of showing "loading", and a failure touches only the
+ * notice line, never the cards. Only the latest request's answer counts: an older one still in flight is dropped.
+ */
+function listTasks(quiet){if(!S.token)return;quiet=quiet===true;var seq=++S.listSeq;if(!quiet){$('tasks').className='muted';$('tasks').textContent=T.loading}
+ op('listTasks',{profileId:S.profileId}).then(function(r){if(seq!==S.listSeq)return;notice('');applyTasks(r.tasks,quiet)},
+  function(e){if(seq!==S.listSeq)return;if(!quiet){$('tasks').textContent=e.message;$('tasks').className='warn-text small'}notice(T.tasksFailed+' · '+e.message)})}
+/**
+ * A list answer reaches the cards and the badge. The shown task is subscribed and so may be fresher than the list that
+ * was answered a moment ago: its own state wins unless the list carries a newer version. A quiet answer landing while
+ * the menu is open waits for it to close — the cards under the user's keyboard or pointer stay put.
+ */
+function applyTasks(tasks,quiet){var shown=S.task;
+ if(shown)tasks=tasks.map(function(t){return t.taskId===shown.taskId&&(Number(shown.stateVersion)||0)>=(Number(t.stateVersion)||0)?shown:t});
+ if(quiet&&menu.open){S.pendingTasks=tasks;return}
+ S.pendingTasks=null;S.tasks=tasks;var first=renderTasks();
+ // Opened to deal with something: show the first task that needs the user right away.
+ if(!S.task&&first&&!$('taskId').value){$('taskId').value=first.taskId;$('tabId').value=(first.tabs&&first.tabs[0])||'';watch()}}
+menu.addEventListener('toggle',function(){if(!menu.open&&S.pendingTasks)applyTasks(S.pendingTasks,false)});
 /**
  * The menu's list and the badge, from S.tasks. Returns the first task that needs the user. Cards are reused by task id
  * and redrawn in place, the "other tasks" fold keeps its open state and the focused card stays focused: a render in the
@@ -433,7 +458,7 @@ function listTasks(quiet){if(!S.token)return;if(quiet!==true){$('tasks').classNa
  */
 function renderTasks(){var box=$('tasks'),old={},others=box.querySelector(':scope>details'),focused=document.activeElement&&document.activeElement.getAttribute?document.activeElement.getAttribute('data-task'):null;
  Array.prototype.forEach.call(box.querySelectorAll('button[data-task]'),function(b){old[b.getAttribute('data-task')]=b});
- Array.prototype.forEach.call(Array.prototype.slice.call(box.children),function(c){if(c.tagName!=='BUTTON'&&c!==others)c.remove()});
+ Array.prototype.forEach.call(Array.prototype.slice.call(box.childNodes),function(c){if(c.tagName!=='BUTTON'&&c!==others)c.remove()});
  box.className='';
  if(!S.tasks.length){box.textContent='';emptyState(box,T.noTasksTitle,T.noTasks);needCount(0);return null}
  if(!others){others=document.createElement('details');others.appendChild(document.createElement('summary'))}
@@ -454,7 +479,9 @@ setInterval(function(){if(S.token&&!menu.open&&document.visibilityState!=='hidde
 document.addEventListener('visibilitychange',function(){if(S.token&&!menu.open&&document.visibilityState==='visible')listTasks(true)});
 /** A task's new state (an action's answer, a subscription refresh) reaches the list and the badge, not only the bar. */
 function syncTask(t){var i=-1;for(var k=0;k<S.tasks.length;k++)if(S.tasks[k].taskId===t.taskId)i=k;
- var old=i>=0?S.tasks[i]:null;if(i>=0)S.tasks[i]=t;else S.tasks.push(t);
+ var old=i>=0?S.tasks[i]:null;
+ if(finished(t)){if(i>=0){S.tasks.splice(i,1);renderTasks()}return}
+ if(i>=0)S.tasks[i]=t;else S.tasks.push(t);
  if(!old||waitsForUser(old)!==waitsForUser(t)||describe(old).label!==describe(t).label)renderTasks()}
 /** Same rule as the Runtime's sessionWaiting: the user's move now (a stale approval on a task being cancelled is not). */
 function waitsForUser(t){if(t.cancelRequested)return false;return !!t.pendingApproval||t.status==='awaiting-user'||t.pauseReason==='user-control'
@@ -488,7 +515,7 @@ $('stop').onclick=function(){act(op('cancel',{taskId:$('taskId').value.trim(),re
 /** A viewer connection is bound to the capability it was ticketed with: renewal reconnects it. */
 /** The screen counts as open from the click, so a renewal during the first ticket request reopens it; only the latest reply is shown. */
 function openScreen(){S.screenOpen=true;var n=++S.screenSeq;op('viewerTicket',{profileId:S.profileId}).then(function(r){if(n!==S.screenSeq)return;
- var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;window.__abpViewerFit=S.fit;
+ var path='v1/viewer/websockify?ticket='+encodeURIComponent(r.ticket);window.__abpViewerPath=path;window.__abpViewerFit=S.fit;window.__abpViewerControl=!!S.task&&S.task.pauseReason==='user-control';
  // scale=1 only as a fallback for a client without the Runtime's hook: the hook reads the choice from __abpViewerFit.
  $('screen').src='/viewer/vnc_lite.html?path='+encodeURIComponent(path)+(S.fit?'&scale=1':'');$('screenBox').hidden=false;$('screenEmpty').hidden=true
 },function(e){if(n!==S.screenSeq)return;S.screenOpen=false;var out=$('actionResult');out.className='err';out.textContent=e.message})}
