@@ -19,6 +19,20 @@ export function resolveInputEvidenceOption(explicit: boolean | undefined, ownMet
     return explicit ?? ownMetadata?.inputEvidenceEnabled === true;
 }
 
+/** Carry only the original conversation's setting into a replacement Happy session. */
+export function resolveRecoveredInputEvidenceEnvironment(input: {
+    savedEnvironment?: NodeJS.ProcessEnv;
+    metadata?: { inputEvidenceEnabled?: boolean };
+    requestedEnvironment?: Record<string, string>;
+}): Record<string, string> {
+    const saved = input.savedEnvironment?.[INPUT_EVIDENCE_ENV];
+    const enabled = resolveInputEvidenceOption(saved === '0' || saved === '1' ? saved === '1' : undefined, input.metadata);
+    return {
+        [INPUT_EVIDENCE_ENV]: enabled ? '1' : '0',
+        ...requestedInputEvidenceEnvironment(input.requestedEnvironment ?? {}),
+    };
+}
+
 /** Only ON adds metadata; missing means OFF on recovery, preserving main's OFF document. */
 export function inputEvidenceMetadata<T extends { inputEvidenceEnabled?: boolean }>(metadata: T, enabled: boolean): T {
     if (enabled) return { ...metadata, inputEvidenceEnabled: true };

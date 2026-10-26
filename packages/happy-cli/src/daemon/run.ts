@@ -124,6 +124,7 @@ import {
   SETUP_TOKEN_RESUME_REBOUND_ENV,
 } from './sessionEnv';
 import { sanitizeChildEnv } from '@/utils/childEnv';
+import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
@@ -3398,7 +3399,14 @@ export async function startDaemon(): Promise<void> {
       const spawned = await spawnSession({
         directory: decision.directory,
         agent: decision.agent,
-        environmentVariables: options.environmentVariables,
+        environmentVariables: {
+          ...options.environmentVariables,
+          ...resolveRecoveredInputEvidenceEnvironment({
+            savedEnvironment: persistedSession?.agentEnvironment,
+            metadata: serverSession.metadata,
+            requestedEnvironment: options.environmentVariables,
+          }),
+        },
         permissionMode: options.permissionMode,
         mcpCallerGrantEnvelope: options.mcpCallerGrantEnvelope,
         mcpConfigProjectId: options.mcpConfigProjectId,

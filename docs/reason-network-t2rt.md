@@ -71,7 +71,11 @@ captures the validated `0`/`1` alongside that session's existing resume state an
 restores it after restart. A resume request's explicit setting overrides its own
 saved value. ON also records `metadata.inputEvidenceEnabled=true` for same-session
 recovery when no tracked environment survives; explicit OFF removes that marker.
-Fresh OFF sessions add no setting metadata. ACP remains unsupported.
+Fresh OFF sessions add no setting metadata. Standalone `happy resume <id>`
+restores only the evidence setting from the resolved original Happy ID (validated
+saved `0`/`1`, then original server metadata). `--input-evidence 0|1` explicitly
+overrides it; the caller's `HAPPY_INPUT_EVIDENCE` is scrubbed and never used as
+that override. ACP remains unsupported.
 The session host advertises `agentContact.inputEvidence=1` only when enabled
 and otherwise eligible under the existing account/remote-mode checks. The API
 publication gate suppresses all evidence/admission envelopes while OFF, and
@@ -1705,3 +1709,102 @@ Resume settings use existing per-session captured state and encrypted metadata;
 no daemon-wide preference, credential policy change or additional authority is
 introduced. The Desktop consumer prerequisites above remain mandatory before
 opting in. Native wire turn ownership and channel routing remain main's.
+
+## T2RT-28: replacement-ID recovery (2026-10-26)
+
+Review base: `1b26f35f`. The user authorizes a new behavioral commit and normal
+push on `feat/rn-t2rt-input-evidence`; no rebase, force-push or PR creation.
+The earlier exclusion of `daemon/run.ts` is superseded for this narrow fix.
+
+Plan (Core, existing session state; no new API, dependency or authority):
+
+1. Reproduce replacement-ID loss at the actual `spawnRecoveredSession` boundary
+   for Claude/Codex, absent/corrupt cursors and both saved sources, with explicit
+   OFF/ON overrides and an unrelated-session control.
+2. Resolve only the original owner's validated evidence setting: saved validated
+   environment, then original metadata, then validated explicit request override.
+   Forward that single setting without copying the original environment.
+3. User follow-up includes standalone `happy resume <id>`: share resolution with
+   daemon recovery, restore only the resolved setting from the original full ID,
+   and support explicit `--input-evidence 0|1` without reading the caller's flag.
+4. Audit other resume/recovery/restart and reattachment paths, run focused
+   regressions/typecheck/build, record results and commit/push normally.
+
+Rollback: revert the new behavioral commit. Routing and native wire lifecycle
+remain unchanged; unrelated sessions still default OFF.
+
+Implementation: `resolveRecoveredInputEvidenceEnvironment` in the existing
+settings module is shared by daemon replacement recovery and standalone Happy-ID
+resume. It admits saved literal `0`/`1` only, falls back to the original session's
+boolean metadata marker, and validates/overlays explicit request `0`/`1` last.
+Only that setting is carried; neither path copies the original environment.
+Standalone CLI overrides use an argument so an opted-in caller cannot implicitly
+enable a different conversation. The resolved full ID, not a user-supplied
+prefix, selects persisted state. Neither routing nor provider/native lifecycle
+code changes.
+
+Recovery/resume/restart audit (all source paths relative to
+`packages/happy-cli/src`; grouped callers share the implementation named here):
+
+| Path | Evidence setting resolution |
+| --- | --- |
+| `daemon/run.ts:spawnRecoveredSession`, replacement Happy ID | New shared resolver: original validated saved setting → original server metadata → validated explicit request override. Applies to Claude and Codex, absent or corrupt processed cursor. |
+| `resume/handleResumeCommand.ts:handleResumeCommand` (`happy resume <id>`) | Same shared resolver using the original full Happy ID; `--input-evidence 0\|1` overrides. Caller evidence env is scrubbed; only the resolved setting is added back. No cursor is needed for this native-conversation/new-Happy-ID launch. |
+| `daemon/run.ts:spawnRecoveredSession`, same Happy ID | `hydrateRecoveredSessionFromPersisted` validates the owner's captured environment, then `spawnResumedSession` below supplies the owner's current reconnect metadata and request override. |
+| `daemon/run.ts:spawnResumedSession` (machine RPC, control/terminal resume, idle-reaped/stopped sessions, restored worktrees, unused Codex/unstarted execution-bound Claude) | `buildResumedSessionSpawnEnvironment` retains the owner's captured setting, overlays validated request/automation settings, and scrubs inherited flags. Claude/Codex runners consume once and fall back to that owner's `buildReconnectSessionEnvironment` metadata only if no saved/request setting survives. |
+| Daemon restart/live-child reattachment, persisted finished-session lookup and orphan adoption (`daemon/run.ts`, `daemon/persistedSessionHydration.ts`, `daemon/orphanAdoption.ts`) | Existing live runners keep their captured boolean. Tracked/finished records hydrate the validated per-session environment; later child replacement uses the same `spawnResumedSession` route and own server metadata. No daemon-wide flag is restored. |
+| Checkpoint protection refresh/disable restart (`daemon/checkpointProtectedRestart.ts`), write-scope replacement (`daemon/sessionWriteScopeRestart.ts`, `daemon/sessionWriteScopeRuntime.ts`) | Preserve the original tracked state, then call `spawnResumedSession`; their policy-only overlays do not change the evidence setting. |
+| Scheduled automation target resume, autonomous-quality ensure-running, durable session follow-up and BYOS offline-delivery wake (`daemon/run.ts:resumeAutomationSession` and `ensureSessionRunning`/`ensureRunning` adapters) | All reach `resumeSession` → `spawnResumedSession`. Automation's validated explicit setting can override its target's saved value; no override means own saved value/own metadata. A fallback/new automation spawn is a new session and defaults OFF. |
+| Held browser-attention/continuation wakes (`daemon/run.ts:resumeForBrowserAttention` and browser continuation broker) | Same resume route; re-sends that session's remembered request environment, never another session's flag. Restart hydration retains its own setting. |
+| Claude transient retry, account/setup-token switch, local/remote switch, checkpoint/provider restart, MCP reconnect, native-session change/compact (`claude/runClaude.ts`, `claude/loop.ts`, `claude/claudeRemoteLauncher.ts`, `claude/session.ts`) | Keep the same Happy client/runner and its already-captured boolean. Credential/env updates and native-session ID changes do not re-read the flag. |
+| Codex capacity continuation, app-server reconnect/thread resume, forced-interrupt restart, idle auth recovery, MCP/checkpoint recovery, native thread reset (`codex/runCodex.ts`, `codex/codexAppServerClient.ts`, `codex/codexMcpRuntimeRecovery.ts`) | Keep the same Happy client/runner and captured boolean. Provider reconnect/resume cannot enable/disable it. |
+| Offline→online client replacement (`utils/setupOfflineReconnection.ts`, `claude/runClaude.ts`, `codex/runCodex.ts`) | Carry the captured metadata; Codex's `onSessionSwap` explicitly configures the new client with the same captured boolean. Claude's offline local transcript bridge carries that metadata without starting a new remote input queue. No process-env re-resolution. |
+| Precreated channel-host and machine-bound initial attachments (`channelHost/channelHostSessions.ts`, `daemon/machineSetupTokenRuntime.ts`), managed run bootstrap (`managed/managedStartup.ts`) | These attach the session just allocated for a new launch/run, not an original conversation being recovered. Validated explicit session seed applies, otherwise OFF; no prior/caller setting is borrowed. Later machine-bound resumes go through `spawnResumedSession`. |
+| Direct native-ID `happy --resume` / `happy codex --resume`, forks/duplicates and unrelated spawns | These are new Happy launches without an original Happy-ID recovery contract. They retain default OFF unless explicitly seeded under the existing direct/daemon launch contract; parent lineage/native IDs never imply opt-in. |
+
+TDD verification. Initial daemon red: **24 failures / 56 passes**
+(18 setting-preservation assertions and six invalid-request-before-spawn checks).
+Initial standalone CLI red: **36 failures / 23 passes** (missing restoration and
+unsupported explicit override). Test fixture typing was corrected before these
+red runs; no production code changed until each boundary's red run completed.
+
+Final local verification: **14 files / 369 tests passed across the focused runs**:
+
+- Actual daemon recovery boundary: **80/80** (Claude/Codex × absent/corrupt cursor
+  × saved/metadata precedence × absent/explicit OFF/ON override, plus missing
+  record and invalid-request controls). Every matrix case also verifies unrelated
+  launches default OFF and prior environment/lineage is not copied.
+- Standalone resume/parser/help: **62/62**, including both providers, metadata-only,
+  saved ON/OFF precedence, corrupt saved option fallback, full-ID lookup from a
+  prefix, caller-env isolation, explicit OFF/ON, invalid/missing/duplicate options
+  and unrelated-session controls.
+- Codex capacity/startup/capture/resume: **31/31**.
+- Claude startup/capture/own-metadata resume: **9/9** selected by
+  `-t 'T2RT-(23|26)'`; **62 unrelated cases intentionally skipped**. No whole-file
+  or whole-suite Claude pass is claimed.
+- Supporting session env, reconnect snapshot, persistence hydration, recovery
+  decision, request-env memory/wiring, checkpoint restart, write-scope restart and
+  original-session lookup: **185/185** across nine existing files.
+- Source parity: **58/58 OFF and 58/58 ON**, **232 source replays** in two passing
+  parent tests. OFF still matches `9ee84191` in full envelopes and metadata;
+  ON preserves native-turn/routing/consumer parity. No routing code changed.
+
+All commands ran from the clone root using
+`corepack pnpm -C packages/happy-cli exec vitest run --project unit <files> --maxWorkers 2`.
+The ten-file daemon/supporting selection passed during the first green attempt;
+that same invocation also exposed 36 CLI fixture assertions against a pre-existing
+inherited sandbox policy. Isolating that fixture (no production-policy change)
+and adding parser boundary cases yielded the clean 62-case CLI rerun above.
+The CLI/Codex/parity invocation passed **95/95**; the selected Claude invocation
+passed **9/9**. These are distinct cases, not repeated runs added to the total.
+
+Standard global setup passed CLI `tsc --noEmit`, pkgroll and extension-copy build.
+Existing bin-outside-dist/empty-chunk warnings remain. No Unix-socket EPERM or
+other environmental failure occurred. `git diff --check` passed. Happy has no
+Desktop release-note, guide or preflight script; no Desktop, server, wire schema,
+package version, dependency or lockfile changed. No paid-provider/live-app test
+or whole-suite run is claimed.
+
+Status: implementation, audit and local verification complete. The authorized
+branch receives one new behavioral commit on `1b26f35f` and a normal push; no
+history rewrite, other-branch mutation, PR creation or publication.
