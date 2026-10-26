@@ -423,6 +423,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 const resp = await api.getOrCreateSession({ tag: randomUUID(), metadata, state });
                 if (!resp) throw new Error('Server unavailable');
                 const session = api.sessionSyncClient(resp);
+                session.configureInputEvidenceRecovery(inputEvidenceEnabled);
                 let latestClaudeGoalStatus: AgentGoalStatus | null = null;
                 const observedClaudeGoalRevisions = new Set<string>();
                 const goalCommandSupported = () => {

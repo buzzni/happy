@@ -71,6 +71,13 @@ captures the validated `0`/`1` alongside that session's existing resume state an
 restores it after restart. A resume request's explicit setting overrides its own
 saved value. ON also records `metadata.inputEvidenceEnabled=true` for same-session
 recovery when no tracked environment survives; explicit OFF removes that marker.
+A live opted-in host repairs dropped evidence/contact markers without changing its
+captured setting or overwriting explicit values, another runtime's advertisement,
+or archival. **Residual for installed old app versions:** editing an offline
+session's metadata can erase the recovery marker. If no validated saved session
+environment survives, later metadata-only recovery is OFF. This never enables
+evidence incorrectly; a validated saved value or explicit request still wins.
+
 Fresh OFF sessions add no setting metadata. Standalone `happy resume <id>`
 restores only the evidence setting from the resolved original Happy ID (validated
 saved `0`/`1`, then original server metadata). `--input-evidence 0|1` explicitly
@@ -1808,3 +1815,132 @@ or whole-suite run is claimed.
 Status: implementation, audit and local verification complete. The authorized
 branch receives one new behavioral commit on `1b26f35f` and a normal push; no
 history rewrite, other-branch mutation, PR creation or publication.
+
+## T2RT-29: metadata writer preservation and live repair (2026-10-26)
+
+Review base: `5c5d4f2b`. The approved scope includes happy-app write-back and
+shared CLI session-host repair, plus a read-only writer audit. One new behavioral
+commit and normal push on the same branch; no PR or history rewrite.
+
+Plan (Core: session metadata consistency, existing transport and ownership):
+
+1. Reproduce title write-back and CAS conflict loss using actual app metadata
+   parsing/encryption/title/write-back source and the real recovery resolver.
+2. Preserve unknown metadata, including nested runtime capabilities and summary
+   fields; CAS retries must retain the newest server-owned unowned fields.
+3. Live Claude/Codex session hosts restore missing captured-setting markers after
+   metadata observation, with idempotent writes and no overwrite of explicit
+   values, foreign runtime contact, or archival. Test socket/CAS paths and delayed acknowledgements.
+4. Audit Happy server/agent/CLI/app, Desktop and pinned runtime writers; document
+   the offline old-app residual; rerun focused tests and OFF/ON source parity.
+
+Rollback: revert this new behavioral commit. No routing, wire schema, session
+setting resolution order, dependency, provider or public authority changes.
+
+Implementation and ownership:
+
+- Happy-app's `MetadataSchema` passes through unknown root keys and unknown keys
+  inside runtime capabilities, summary and the declared model/mode/MCP records.
+  Known-field validation remains in place. The actual `SessionEncryption` parser
+  and cache retain those values instead of projecting them away.
+- The title transform preserves unowned summary fields. CAS retry merges only
+  `summary.text`/`updatedAt` onto the newest server record, including its branch
+  slug and future fields. The ACK is decrypted and cached together with its
+  version in storage; a subsequent title edit without a socket refresh retains
+  newly discovered fields. A pending local title survives ACK application and
+  an older ACK cannot replace a newer observed session document.
+- The shared `ApiSessionClient` receives Claude/Codex's already-captured setting
+  via `configureInputQueue`. ON records its current contact advertisement and
+  repairs only omitted setting/contact keys when newer socket metadata arrives.
+  Outgoing transforms/CAS retries recheck current metadata and current mode.
+  Present values (including explicit OFF), foreign runtime contact and archival
+  are left alone. OFF never adds markers; disabling withdraws stale markers.
+- Claude's offline→online local transcript bridge does not configure a remote
+  queue. It explicitly passes the runner's captured boolean to
+  `configureInputEvidenceRecovery`, owning only the recovery hint. It can repair
+  that omitted hint without enabling evidence publication, guarded admissions,
+  or an `agentContact` advertisement. A callback after process-env mutation
+  retains the captured ON/OFF choice; it never reads a later ambient seed.
+- Repair transforms return the unchanged record once satisfied; only this new
+  repair path skips unchanged writes. Confirmed echoes and multiple queued
+  observations do not create extra writes. Delayed repair ACKs cannot roll back
+  a newer observed document or suppress its pending repair. That ACK freshness
+  guard is ON-only so OFF retains the baseline's existing ACK behavior.
+- Recovery resolution is unchanged: the daemon-saved validated setting is first,
+  followed by original metadata and then validated explicit request override.
+
+**Residual for installed old app versions:** while no online CLI host observes
+the session, no live repair can restore a stripped hint. An old app title edit can
+remove `inputEvidenceEnabled` and `agentContact` from server metadata. If no
+validated saved session environment remains, later metadata-only recovery is
+OFF. This can disable evidence, never incorrectly enable it. Saved validated ON
+still restores ON; saved/explicit OFF wins; contact capability alone is never
+used as an ON recovery hint. No attempt is made to repair installed old apps or
+bypass the Desktop consumer prerequisites.
+
+Writer audit (source inspection, not a live fleet claim):
+
+| Writer / reader | Finding |
+| --- | --- |
+| `happy-app/sources/sync/storageTypes.ts`, `encryption/sessionEncryption.ts`, `storage.ts`, `ops.ts` | The actual stripping writer, fixed as above. Both first write and CAS retry retain unowned root/nested fields. ACK/cache consistency prevents a second write from reintroducing the loss. The only `sessionUpdateMetadata` caller is the title write-back in storage. Machine metadata has a separate schema/endpoint and is not session metadata. |
+| Current happy-cli `api/apiSession.ts`, Claude/Codex title/provider/lifecycle handlers, `utils/reconnectSessionMetadata.ts` | Metadata is decrypted as the complete record; ordinary handlers spread the current document. No session metadata projection schema in the API writer. Fresh launcher-owned runtime capabilities are republished by the opted-in host. New repair covers old writers dropping the two host markers while this process is live. |
+| happy-cli `resume/resolveHappySession.ts` and daemon persistence hydration | `ResumableMetadataSchema` already uses passthrough; saved environment hydration admits only validated session values. Neither writer-side schema changes nor the repair change the T2RT-28 precedence. |
+| `happy-server/sources/app/api/socket/sessionUpdateHandler.ts`, session create routes and managed bridges/execution binding | Server treats metadata as opaque encrypted strings, applies version CAS, stores and relays the supplied ciphertext unchanged. It cannot project decrypted keys. Session creation with an existing tag returns the existing record instead of overwriting it. No server change required. |
+| `happy-agent/src/session.ts`, `api.ts`, `index.ts` | Raw metadata decrypt/read and new-session creation only; no existing-session `update-metadata` emitter or metadata parse/projection/write-back path found. Existing-tag create goes through the server behavior above. No agent change required. |
+| Desktop at `d58812b75e41f384d0c5242b011249fea074efea`: `src/sync/sessionMetadataMutation.ts`, `sessionMetadataCipher.ts`, `sessionTitle.ts`, `projectConversationLifecycle.ts` | Title rename and lifecycle restore open the raw complete `Record<string, unknown>`, spread it, change owned fields and repeat against the latest conflict record. Neither legacy nor DEK cipher projects fields. No equivalent strip found. Desktop was inspected read-only. |
+| Desktop `src/sync/standaloneImport.ts` | New imported record spreads decrypted metadata, deliberately removes the local machine ID and adds import provenance; no projection of these markers. It is not an existing-session title writer. No Desktop CLI/Electron direct existing-session metadata writer found outside the shared mutation path. |
+| Desktop-pinned CLI `9ee84191cf6e6b2739987be3f5488ef511c6474f` (`1.1.10-aplus.357`) | Its API metadata writer uses raw records and spread-based title/lifecycle transforms, preserving unknown root keys. Its shallow reconnect merge overlays fresh launcher metadata, including a new `runtimeCapabilities` object, so startup can discard an earlier nested contact advertisement. This old runtime has no T2rt support or self-heal and is not an evidence-capable host. The existing no-Desktop-opt-in prerequisite remains mandatory; a pin upgrade alone is not enablement. No pinned source/branch was changed. |
+
+TDD and verification:
+
+- First standard red run: **23 failed / 4 passed / 171 unrelated cases skipped**.
+  It reproduced app forward-field loss and live omission/CAS repair absence,
+  with OFF/explicit-OFF/foreign-runtime/archive controls passing.
+- First implementation: **199/199** across API and actual-app round-trip tests.
+  Further inspection found the app ACK cache/version gap. Extending the actual
+  storage ACK callback/second-title-write test produced a second red run:
+  **16/16 failed**, covering both CAS cache loss and stale ACK overwrite.
+- The final path audit found the offline→online Claude local bridge needed its
+  own marker-only ownership seed. Actual runner reproduction: **2 failed / 2
+  existing controls passed** before that seed was added. Both captured OFF/ON
+  cases now pass after changing the process seed during the async boundary.
+- Final API/producer→consumer selection: **203/203** (186 API checks, including
+  15 live repair/ownership/race/local-bridge controls; 17 actual-app/recovery checks).
+  The app harness executes actual production schema, encryption/cache classes,
+  title transform, metadata writer and ACK callback. Crypto uses real CLI legacy
+  encryption through the app adapter; transport alone is simulated. No copied
+  schema, writer or storage-transform implementation stands in for production.
+- Related recovery/resume/env/hydration selection: **269/269** across four files
+  (80 replacement recovery, 62 standalone resume, 108 environment, 19 hydration).
+- Source parity: **58/58 OFF and 58/58 ON**, **232 actual source replays** in two
+  passing parent tests. OFF still matches `9ee84191` for complete envelopes and
+  whole metadata documents; ON retains native lifecycle/routing/consumer parity.
+  No mapper, routing parser, native lifecycle or wire schema changed.
+- Claude offline branch: **4/4**, including both new captured-setting/bridge
+  ownership checks and the two existing required-confirmation controls.
+- Final standard invocation: **8 files / 478 tests passed**, with no skipped
+  cases in that invocation. Earlier iteration passes are not added to this total.
+
+All tests used the requested command from the clone root:
+`corepack pnpm -C packages/happy-cli exec vitest run --project unit <files> --maxWorkers 2`.
+Files: `src/api/appMetadata.inputEvidence.test.ts`, `src/api/apiSession.test.ts`,
+`src/api/apiSession.inputEvidenceLifecycle.test.ts`,
+`src/daemon/sessionRecovery.inputEvidence.test.ts`,
+`src/resume/handleResumeCommand.test.ts`, `src/daemon/sessionEnv.test.ts`,
+`src/daemon/persistedSessionHydration.test.ts`,
+`src/claude/runClaudeOfflineAck.test.ts`.
+CLI global setup passed `tsc --noEmit`, pkgroll and extension-copy build. Existing
+bin-outside-dist/empty-chunk warnings remain. No Unix-socket EPERM occurred.
+`git diff --check` passed.
+
+Full Expo app typecheck/build was not run: config resolution with
+`tsc --showConfig --project ../happy-app/tsconfig.json` reports TS6053,
+`expo/tsconfig.base.json` not found; happy-app dependencies are not installed in
+this clone. Actual app runtime source was exercised via the CLI harness above;
+that does not substitute for an Expo/native build. No whole-suite, live-provider,
+Desktop application, server integration or fleet validation is claimed. No
+package/dependency/lockfile/version, Desktop source or runtime pin changed.
+
+Status: implementation, writer audit, residual documentation and focused local
+verification complete. One new behavioral commit on `5c5d4f2b`, normal push only;
+no PR creation, force-push, rebase, publication or other-branch mutation.
