@@ -1,3 +1,5 @@
+import ts from 'typescript';
+import { readFileSync } from 'node:fs';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
@@ -6,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { configuration } from '@/configuration';
 import type { ClaudeSessionProtocolState } from '@/claude/utils/sessionProtocolMapper';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
-import { inputEvidenceMetadata } from '@/utils/inputEvidenceSettings';
+import { inputEvidenceMetadata, resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
@@ -182,6 +184,32 @@ async function waitForCheck(check: () => void, timeoutMs = 2000) {
         }
     }
     throw lastError;
+}
+
+// Execute the runners' real expressions with the actual CAS client below;
+// keep production wiring in this regression, rather than copying its transform.
+function runnerStartupTransforms(flavor: 'claude' | 'codex', inputEvidenceEnabled: boolean, original: Metadata, freshMetadata: Metadata) {
+    const file = `../${flavor}/run${flavor === 'claude' ? 'Claude' : 'Codex'}.ts`;
+    const source = ts.createSourceFile(file, readFileSync(new URL(file, import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
+    let initializer = '', refresh = '';
+    const visit = (node: ts.Node) => {
+        if (ts.isVariableDeclaration(node) && node.name.getText(source) === 'metadata'
+            && node.initializer?.getText(source).startsWith('inputEvidenceMetadata(')) initializer = node.initializer.getText(source);
+        if (ts.isCallExpression(node) && node.expression.getText(source) === 'session.updateMetadata'
+            && node.arguments[0]?.getText(source).includes('mergeReconnectSessionMetadata')) refresh = node.arguments[0].getText(source);
+        ts.forEachChild(node, visit);
+    };
+    visit(source);
+    if (!initializer || !refresh) throw new Error(`Startup metadata expressions missing in ${file}`);
+    const dependencies = { inputEvidenceMetadata, mergeReconnectSessionMetadata,
+        reconnectSession: { metadata: original }, freshMetadata, inputEvidenceEnabled };
+    const evaluate = (expression: string) => {
+        const compiled = ts.transpileModule(`const value = ${expression};`, {
+            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+        }).outputText;
+        return Function(...Object.keys(dependencies), `${compiled}; return value;`)(...Object.values(dependencies));
+    };
+    return { metadata: evaluate(initializer) as Metadata, refresh: evaluate(refresh) as (metadata: Metadata) => Metadata };
 }
 
 describe('ApiSessionClient v3 messages API migration', () => {
@@ -409,6 +437,54 @@ describe('ApiSessionClient v3 messages API migration', () => {
             expect(server.runtimeCapabilities?.agentContact).toMatchObject({ runtimeId: currentOn.runtimeId, guardedPrompt: 1, inputEvidence: 1 });
         } finally { await oldOff.close(); await currentOn.close(); }
     });
+    for (const flavor of ['claude', 'codex'] as const) for (const enabled of [false, true])
+    for (const conflicts of [0, 1, 2]) {
+        it.each([false, true])(`T2RT-34 ${flavor} startup ON=${enabled}, conflicts=${conflicts}, tracked=%s preserves captured setting and latest metadata`, async tracked => {
+            const original: Metadata = inputEvidenceMetadata({ ...session.metadata, flavor,
+                summary: { text: 'original title', updatedAt: 0 },
+                ...(flavor === 'claude' ? { claudeSessionId: 'original-native' } : { codexThreadId: 'original-native' }),
+            }, !enabled);
+            const fresh: Metadata = { ...makeSession().metadata, flavor, hostPid: 99,
+                runtimeCapabilities: { saycodeSystemPromptPreference: true } };
+            const startup = runnerStartupTransforms(flavor, enabled, original, fresh);
+            let server = original, version = 1, successfulWrites = 0;
+            const attempts: Metadata[] = [];
+            mockSocket.emitWithAck.mockImplementation(async (event: string, request: any) => {
+                expect(event).toBe('update-metadata');
+                attempts.push(decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(request.metadata)) as Metadata);
+                if (attempts.length <= conflicts) {
+                    // An ordinary concurrent title writer retains the original setting.
+                    server = { ...server, summary: { text: `concurrent title ${attempts.length}`, updatedAt: attempts.length },
+                        futureProviderState: { revision: attempts.length } } as Metadata;
+                    version++;
+                }
+                if (request.expectedVersion !== version) return { result: 'version-mismatch', version, metadata: encryptContent(session, server) };
+                server = attempts.at(-1)!;
+                successfulWrites++;
+                return { result: 'success', version: ++version, metadata: request.metadata };
+            });
+            const client = new ApiSessionClient('fake-token', { ...session, metadata: startup.metadata, metadataVersion: 1 },
+                undefined, { trackShutdownStorage: tracked });
+            try {
+                client.updateMetadata(startup.refresh); // The existing startup write, no repair/write added.
+                await waitForCheck(() => expect(successfulWrites).toBe(1));
+                expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(conflicts + 1);
+                for (const attempt of attempts) {
+                    if (enabled) expect(attempt.inputEvidenceEnabled).toBe(true);
+                    else expect(attempt).not.toHaveProperty('inputEvidenceEnabled');
+                }
+                expect(server).toMatchObject({ ...fresh, summary: conflicts
+                    ? { text: `concurrent title ${conflicts}`, updatedAt: conflicts } : original.summary,
+                    ...(conflicts ? { futureProviderState: { revision: conflicts } } : {}),
+                    ...(flavor === 'claude' ? { claudeSessionId: 'original-native' } : { codexThreadId: 'original-native' }),
+                });
+                expect(resolveRecoveredInputEvidenceEnvironment({ metadata: server }).HAPPY_INPUT_EVIDENCE).toBe(enabled ? '1' : '0');
+                await new Promise(resolve => setImmediate(resolve));
+                expect(successfulWrites).toBe(1);
+            } finally { await client.close(); }
+        });
+    }
+
     it.each([false, true])('T2RT-16 preserves real scanner rearm across a textless final (evidence=%s)', async supported => {
         const client = new ApiSessionClient('fake-token', session);
         vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);

@@ -566,7 +566,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         if (allowAutomationReconnectPrompt) {
             session.capRuntimeProcessedSeq(response.seq);
         }
-        session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
+        session.updateMetadata((meta) => inputEvidenceMetadata(mergeReconnectSessionMetadata(meta, freshMetadata), inputEvidenceEnabled));
     }
 
     // Fork backfill: when this Happy session was just spawned as a fork

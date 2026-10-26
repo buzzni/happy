@@ -499,7 +499,7 @@ export async function runCodex(opts: {
         if (allowAutomationReconnectPrompt) {
             session.capRuntimeProcessedSeq(response?.seq ?? 0);
         }
-        session.updateMetadata((meta) => mergeReconnectSessionMetadata(meta, freshMetadata));
+        session.updateMetadata((meta) => inputEvidenceMetadata(mergeReconnectSessionMetadata(meta, freshMetadata), inputEvidenceEnabled));
     }
 
     const messageQueue = new MessageQueue2<EnhancedMode>(hashCodexEnhancedMode);

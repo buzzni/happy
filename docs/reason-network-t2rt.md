@@ -41,6 +41,13 @@ is a hard prerequisite before Desktop opts in to the capability. No extra native
 an incompatible consumer. Capability-disabled sessions publish neither evidence
 revisions (standalone or mapped) nor admission metadata, including late callbacks.
 
+**Hard T2 caller prerequisite (T2RT-33):** guarded delivery requires a live,
+evidence-ON runtime check using a fresh matching contact/epoch and ON marker,
+plus a bounded admission-receipt timeout. Cached metadata or message storage
+alone cannot establish delivery; absent receipt means not delivered. An OFF
+runtime never executes guarded prompts. The detailed requirement is recorded
+with T2RT-21 in [the capability-gate prerequisites](#t2rt-2022-refusal-parity-capability-gate-and-missing-retry-settlement).
+
 Production-source check at Desktop `d58812b75e41f384d0c5242b011249fea074efea`:
 `config/happy-runtime-pin.json` pins CLI `1.1.10-aplus.357` / `9ee84191`, which
 does not implement this capability. No Desktop opt-in was found in `src`, `cli`,
@@ -1538,6 +1545,20 @@ real-runner receipt assertion independently reproduced the pending/nonterminal r
   answer and the hard consumer prerequisite are recorded at the top of this
   report. The capability-on Desktop reader defect is intentionally deferred to
   that prerequisite; these CLI changes do not claim to fix Desktop hydration.
+
+  **HARD Desktop T2 caller requirement (T2RT-33):** a guarded-prompt sender
+  must not trust cached session metadata. Before sending, it must confirm that
+  the target runtime is live and evidence-ON, for example through a fresh
+  `agentContact` with the matching `runtimeId`/`modeEpoch`, `inputEvidence:1`
+  and `guardedPrompt:1`, and an ON `inputEvidenceEnabled` marker. It must also require a
+  message-bound admission receipt within a bounded timeout. Missing receipt
+  means **not delivered**; durable message storage alone is not admission, and
+  the caller must not wait forever. A runtime can be replaced after discovery,
+  so fresh discovery does not remove the receipt/timeout requirement.
+  An **OFF runtime never executes a guarded prompt** and publishes no admission
+  envelopes. Its metadata may retain a prior ON runtime's advertisement. Handling
+  this stale-advertisement/absent-receipt case belongs to the Desktop T2 sender;
+  this PR deliberately makes no T2RT-33 runtime behavior change.
 - **T2RT-22:** before an orphan snapshot discards a claimed continuation,
   cancel its exact original retry receipt, make it terminal/incomplete and
   publish an evidence-only revision with `missing-provider-turn`. A fresh empty
@@ -2090,3 +2111,73 @@ Files: `src/api/apiSession.test.ts`, `src/api/appMetadata.inputEvidence.test.ts`
 App passthrough, recovery resolution, runner startup, routing and wire schemas
 are unchanged. One new behavioral commit on the requested branch, normal push
 only; no new PR, rebase, force-push or other-branch mutation.
+
+## T2RT-33/34: caller admission prerequisite and startup CAS setting (2026-10-26)
+
+Base: `a0ecd641`, branch `feat/rn-t2rt-followup`, existing PR #965. User-approved
+scope: T2RT-34 runtime fix; T2RT-33 documentation only, with no change to guarded
+intake, admission envelopes, live marker repair or ordinary OFF metadata writes.
+One new behavioral commit and normal push; no PR creation or history rewrite.
+Existing Core metadata consistency fix, with no new dependency or protocol.
+
+Plan:
+
+1. Execute each provider's actual startup initializer and retryable callback with
+   the real API CAS writer. Cover captured OFF/ON, zero/one/two concurrent title
+   conflicts, ordinary/tracked state writes, newest unrelated metadata and later
+   metadata-only recovery. A single existing startup write must suffice.
+2. Apply the captured boolean inside both retryable startup transforms:
+   `inputEvidenceMetadata(mergeReconnectSessionMetadata(meta, freshMetadata), inputEvidenceEnabled)`.
+   Every CAS attempt reapplies the same setting to the newest document. No new
+   metadata write, contact-deletion operation or caller environment read.
+3. Record T2RT-33 next to the T2RT-21 prerequisites as a hard Desktop T2 sender
+   contract: verify the live evidence-ON target with fresh matching contact and
+   ON marker, and require a bounded, message-bound admission receipt; absence
+   means not delivered. OFF never executes guarded prompts. No current caller
+   opts in; the future Desktop T2 sender owns this prerequisite.
+4. Rerun all existing 82 OFF + 58 ON source-parity scenarios and the new 24
+   actual-runner CAS cases, plus related API/app/recovery/resume/env tests.
+
+Rollback: revert this new behavioral commit. App passthrough and saved-setting
+recovery precedence remain; old stripping writers with only metadata fallback
+still safely default OFF. This fix prevents the distinct race that retained a
+stale ON marker after explicit OFF startup.
+
+TDD red: **16 conflict cases failed / 8 no-conflict controls passed**, with
+195 unrelated API cases skipped. Both providers and both ordinary/tracked CAS
+paths reproduced the captured-setting loss after one or two title conflicts.
+The production change wraps each existing callback; all 24 cases now pass.
+
+Final verification:
+
+- **8 files / 511 tests passed**, no skipped cases: 219 API (including 24 new
+  startup CAS cases), 17 actual-app producer-consumer/recovery, 80 replacement
+  recovery, 62 standalone resume, 108 environment, 19 hydration, 4 Claude
+  offline/reconnect, and 2 actual-source parity parent tests.
+- Source parity: **82/82 OFF + 58/58 ON** against `9ee84191`, **280 source
+  replays**, including the existing stale/foreign-contact and marker matrix.
+  Routing, full OFF metadata and wire envelopes retain parity.
+- The additional **24/24 actual-runner startup cases** execute production
+  initializer/callback expressions with real encryption, the real API CAS writer
+  and the real metadata-only recovery resolver; only the server transport/title
+  race is simulated. Both settings survive every attempted CAS document, the
+  latest concurrent title/unknown provider fields and original native identity
+  survive, and each startup produces exactly one successful metadata write
+  (one to three requests according to the number of conflicts). These are
+  setting/recovery regressions alongside the paired source-parity matrix.
+- CLI global setup passed `tsc --noEmit`, pkgroll and extension-copy build.
+  Existing bin-outside-dist/empty-chunk warnings remain; no Unix-socket EPERM
+  occurred. `git diff --check` and T2rt documentation anchors passed.
+
+Command from the clone root:
+`corepack pnpm -C packages/happy-cli exec vitest run --project unit <files> --maxWorkers 2`.
+Files: `src/api/apiSession.test.ts`, `src/api/appMetadata.inputEvidence.test.ts`,
+`src/api/apiSession.inputEvidenceLifecycle.test.ts`,
+`src/daemon/sessionRecovery.inputEvidence.test.ts`,
+`src/resume/handleResumeCommand.test.ts`, `src/daemon/sessionEnv.test.ts`,
+`src/daemon/persistedSessionHydration.test.ts`,
+`src/claude/runClaudeOfflineAck.test.ts`.
+The production diff is two existing startup callback expressions. No API-session
+runtime, guarded intake/admission, routing, app passthrough, environment capture
+or recovery resolver behavior is changed. T2RT-33 remains a hard future Desktop
+T2 caller prerequisite; it is not claimed as a runtime fix in this PR.

@@ -47,7 +47,10 @@ revisions when the consumer explicitly opts in through the validated session
 launch setting (`environmentVariables.HAPPY_INPUT_EVIDENCE="1"`); Claude/Codex
 default off. Runners consume the seed once and retain a session-owned value
 through replacements and resume/recovery; daemon/new-session boundaries scrub
-implicit inheritance. OFF adds neither T2rt contact capabilities nor its extra
+implicit inheritance. Both retryable startup metadata refreshes reapply that
+captured setting on each CAS attempt while retaining the newest unrelated
+metadata; explicit OFF cannot recover as ON after a concurrent title edit.
+OFF adds neither T2rt contact capabilities nor its extra
 Codex non-channel final/empty-plan events. Guards received while OFF are refused;
 ON advertises guarded prompting together with its admission receipts. A final without
 a mapped turn produces an incomplete revision with no
@@ -58,13 +61,17 @@ preserved. The source-parity regression and reconsideration boundary are recorde
 in [the T2rt report](reason-network-t2rt.md#t2rt-19-structural-correction-evidence-never-owns-wire-turns-2026-10-26).
 The [T2 hand-off](reason-network-t2rt.md#t2-hand-off-explicit-consumer-opt-in)
 defines the launching consumer's ownership and required reader compatibility.
+The hard T2 caller contract beside T2RT-21 requires fresh live evidence-ON
+discovery and a bounded admission-receipt timeout; cached advertisements or
+durable message storage do not prove delivery. OFF never executes guarded prompts.
 
 Happy-app metadata parsing passes through unknown keys, including nested runtime
 capabilities and summary fields. Title CAS retries merge only app-owned title
 fields onto the latest server document; acknowledged metadata and version stay
 together in its cache. Live CLI hosts do not restore omitted evidence/contact
-markers on observation, title writes or CAS retries. OFF mode changes never
-publish metadata or delete incoming contacts, including stale or foreign runtime
+markers on observation or ordinary post-startup metadata writes/CAS retries.
+OFF mode changes never publish metadata or delete incoming contacts, including
+stale or foreign runtime
 advertisements. Observed capabilities cannot enable an OFF host. Recovery prefers
 validated daemon-saved environment, then original-session metadata, with an
 explicit validated request overriding either. If an old app strips the hint and
