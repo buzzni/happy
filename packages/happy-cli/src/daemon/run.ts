@@ -128,6 +128,7 @@ import {
 import { sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
+import { createCollectorSchedule } from './collectorSchedule';
 import { resumeSetupTokenEnvironment } from './resumeSetupTokenRebind';
 import type { AiAuthSource } from '@/usage/aiAuthSource';
 import { detectCLIAvailability } from '@/utils/detectCLI';
@@ -4657,6 +4658,8 @@ export async function startDaemon(): Promise<void> {
       machineSetupTokenStart: async binding => { await (await machineRuntimeFor(binding.companyId)).recordProviderStart(binding); },
       machineSetupTokenAuthority: async binding => { await (await machineRuntimeFor(binding.companyId)).validateAuthority(binding); },
       setupTokenBinding: trustedStudioOrigin ? createSetupTokenBindingVerifier({ origin: trustedStudioOrigin, machineId }) : undefined,
+      // Saycode specs/setup-token-switch-usage-check — a shared PC asks Studio which of its accounts to use (bound below).
+      sharedChoose: async input => setupTokenAccountSwitch ? setupTokenAccountSwitch.sharedChoose(input) : undefined,
       // A group sync never removes the organization account a live session runs on; it waits for a later sync.
       setupTokenAccountsInUse: () => getCurrentChildren().flatMap(session => {
         // A corrupt record cannot be resumed anyway, so it holds no slot back.
@@ -4670,7 +4673,15 @@ export async function startDaemon(): Promise<void> {
       }).catch(() => undefined);
     }, 5_000);
     personalProbeTimer.unref();
-    const stopPersonalProbes = () => { clearInterval(personalProbeTimer); aiCredentialRuntime.stopPersonalScheduler(); };
+    // Saycode specs/setup-token-switch-usage-check Phase 5 — this machine collects the accounts its collector policies
+    // name while it is online, with no Desktop open. Studio decides which are due.
+    const collectorSchedule = createCollectorSchedule({ studioOrigin: trustedStudioOrigin, machineId, bearer: () => credentials.token, fetch,
+      measure: aiCredentialRuntime.measureWithPermit });
+    const collectorScheduleTimer = setInterval(() => {
+      if (apiMachine.getConnectionHealth().connected) void collectorSchedule.tick();
+    }, 60_000);
+    collectorScheduleTimer.unref();
+    const stopPersonalProbes = () => { clearInterval(personalProbeTimer); clearInterval(collectorScheduleTimer); aiCredentialRuntime.stopPersonalScheduler(); };
     stopClaudeSwapSupervisor = () => { stopPersonalProbes(); claudeSwapSupervisor.shutdown(); };
 
     resolveManagedAiCredentialEnvironment = (agent, selection, recorded) => aiCredentialRuntime.sessionEnvironment(agent, selection, recorded);
@@ -4711,6 +4722,8 @@ export async function startDaemon(): Promise<void> {
       // Passed as is: catching a session up resumes its recorded binding, the runtime's third argument.
       sessionEnvironment: aiCredentialRuntime.sessionEnvironment,
       recordAgentEnvironment: persistSetupTokenBinding,
+      // Saycode specs/setup-token-switch-usage-check — check a candidate nobody measured recently before moving onto it.
+      measure: aiCredentialRuntime.measureWithPermit,
       machineRuntime: (companyId) => machineRotation?.runtime(companyId) ?? null,
       // Saycode specs/shared-pc-session-account-continuation — an unbound shared-PC session moves within this PC's assignment.
       sharedMachine: {

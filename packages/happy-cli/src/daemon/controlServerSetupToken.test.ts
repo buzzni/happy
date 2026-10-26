@@ -4,7 +4,7 @@ import type { SetupTokenAccountSwitch } from './setupTokenAccountSwitch'
 
 const observation = { observedAt: 10, reason: 'ok', retryAt: null, windows: [{ kind: 'unified5h', pct: 96, resetsAt: 20 }] }
 
-async function control(switcher: SetupTokenAccountSwitch | null) {
+async function control(switcher: Pick<SetupTokenAccountSwitch, 'availability' | 'returnFromPersonal' | 'reportUsage' | 'rebind'> | null) {
   return startDaemonControlServer({
     getSetupTokenAccountSwitch: () => switcher,
     getChildren: () => [], stopSession: () => ({ status: 'not-found' } as any),

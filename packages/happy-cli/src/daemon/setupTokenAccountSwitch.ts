@@ -35,6 +35,12 @@ export type SetupTokenAccountSwitchDeps = {
   fetch: typeof fetch
   /** A new grant (a switch), or the daemon's recorded binding (catching up a session that missed a switch). */
   sessionEnvironment(agent: string, selection: AiAuthSelection, recorded?: SetupTokenBinding): Promise<Record<string, string>>
+  /**
+   * Measures a candidate with the switch permit Studio reserved for it, as the periodic collector would
+   * (Saycode specs/setup-token-switch-usage-check). The reading to publish, or null when the check told nothing.
+   * Without it the daemon does not offer to check candidates and Studio answers as before.
+   */
+  measure?(input: { companyId: string; machineId: string; managedAccountId: string; credentialGeneration: number; permit: Record<string, unknown> }): Promise<Record<string, unknown> | null>
   /** Durable ACK required; change committed memory only after publication succeeds. */
   recordAgentEnvironment(session: TrackedSession, binding: string): SessionPersistenceResult | Promise<SessionPersistenceResult>
   /**
@@ -56,6 +62,8 @@ export type SetupTokenAccountSwitchDeps = {
 export type SwitchFailure = 'NOT_BOUND' | 'STALE' | 'STUDIO_UNAVAILABLE' | 'NO_ACCOUNT' | 'APPLY_REQUIRED' | 'FORBIDDEN' | 'REQUEST_FAILED' | 'BINDING_REJECTED' | 'PERSISTENCE_FAILED' | 'PERSISTENCE_INDETERMINATE' | 'STUDIO_BUDGET' | 'UNSUPPORTED' | 'ROTATION_LIMIT'
 
 const REQUEST_TIMEOUT_MS = 15_000
+/** Studio asks for at most this many checks per switch (its MAX_PROBES_PER_SWITCH); a further ask is not followed. */
+const MAX_CHECKS_PER_SWITCH = 3
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const parseBinding = (value: string | undefined) => {
@@ -131,6 +139,23 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     return { ok: true, environment }
   }
 
+  /**
+   * One check: reserve a switch permit, measure on this PC, publish. Every outcome is logged; none stops the switch.
+   * `routes`: the member routes (a bound session's proof) or the shared-PC ones (the machine's own).
+   */
+  async function checkCandidate(routes: 'measure' | 'shared/measure', proof: { machineId: string; companyId: string }, candidate: { managedAccountId: string; credentialGeneration: number }) {
+    const label = `[setup-token-switch] candidate ${candidate.managedAccountId}`
+    try {
+      const reserved = await post(`${routes}/reserve`, { ...proof, ...candidate })
+      const permit = await reserved.json().catch(() => null) as Record<string, unknown> | null
+      if (!reserved.ok || !permit || typeof permit.permitId !== 'string') { logger.debug(`${label}: not measured (${reserved.status} ${String(permit?.error ?? '')})`); return }
+      const observation = await deps.measure!({ companyId: proof.companyId, machineId: proof.machineId, ...candidate, permit })
+      if (!observation) { logger.debug(`${label}: measurement told nothing`); return }
+      const published = await post(`${routes}/publish`, { ...proof, ...candidate, permitId: permit.permitId, observation })
+      logger.debug(`${label}: measured, ${published.ok ? 'published' : `publish refused ${published.status}`}`)
+    } catch (error) { logger.debug(`${label}: check failed ${(error as Error)?.name ?? 'error'}`) }
+  }
+
   async function rebindOnce(sessionId: string, running: string, confirmedOnly = false, organizationFailure?: { kind: 'authentication'; observedAt: number }): Promise<RebindResult> {
     const bound = boundSession(deps, sessionId, running)
     if (!bound) return failure('NOT_BOUND', `rebind: no binding recorded for session ${sessionId}`)
@@ -153,11 +178,27 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
     const binding = recorded.binding
     const tokenProof = !isMachineSetupTokenBinding(binding) && !!binding.tokenProof
     let grant: Record<string, unknown>
+    const proof = { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce }
+    // Candidates checked in this switch; a switch to another account (not a return) offers to check.
+    const measured: string[] | null = deps.measure && !confirmedOnly ? [] : null
     try {
-      const response = await post(confirmedOnly ? 'return' : 'rebind', { machineId: deps.machineId, sessionId, companyId: binding.companyId, bindingNonce: binding.nonce,
-        ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}) })
-      const body = await response.json().catch(() => null) as Record<string, unknown> | null
-      if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return { ok: false, reason: 'NO_ACCOUNT' }
+      let response: Response, body: Record<string, unknown> | null
+      while (true) {
+        response = await post(confirmedOnly ? 'return' : 'rebind', { ...proof,
+          ...(tokenProof ? { credentialProofVersion: 1 } : {}), ...(organizationFailure ? { organizationFailure } : {}), ...(measured ? { measureVersion: 1, measured: [...measured] } : {}) })
+        body = await response.json().catch(() => null) as Record<string, unknown> | null
+        if (response.status !== 409 || body?.error !== 'SETUP_TOKEN_DAEMON_MEASURE_REQUIRED') break
+        const candidate = { managedAccountId: body.managedAccountId, credentialGeneration: body.credentialGeneration }
+        if (!measured || measured.length >= MAX_CHECKS_PER_SWITCH || typeof candidate.managedAccountId !== 'string' || !UUID.test(candidate.managedAccountId)
+          || !Number.isSafeInteger(candidate.credentialGeneration)) return failure('NO_ACCOUNT', `rebind: stopped checking candidates after ${measured?.length ?? 0}`)
+        measured.push(candidate.managedAccountId)
+        await checkCandidate('measure', proof, candidate as { managedAccountId: string; credentialGeneration: number })
+      }
+      if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') {
+        // Studio says when the first candidate recovers; the session does not ask again before then.
+        const earliest = body.earliestUsableAt
+        return { ok: false, reason: 'NO_ACCOUNT', ...(typeof earliest === 'number' && Number.isSafeInteger(earliest) ? { retryAfterMs: Math.max(0, earliest - Date.now()) } : {}) }
+      }
       if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_APPLY_REQUIRED') return { ok: false, reason: 'APPLY_REQUIRED' }
       if (!response.ok || !body) return failure(refusal(response.status), `rebind ${response.status} ${String(body?.error ?? '')}`)
       grant = body
@@ -263,6 +304,36 @@ export function createSetupTokenAccountSwitch(deps: SetupTokenAccountSwitchDeps)
       } catch (error) { return failure('REQUEST_FAILED', `usage ${(error as Error)?.name ?? 'error'}`) }
     },
 
+    /**
+     * Saycode specs/setup-token-switch-usage-check Phase 4 — which of the accounts this shared PC holds to use, chosen by
+     * Studio. A move (`measure`) checks a candidate nobody measured recently first; a launch is not held up by a probe.
+     * The account, null when Studio has none usable, undefined when Studio could not answer (the caller chooses locally).
+     */
+    async sharedChoose(input: { companyId: string; candidates: Array<{ managedAccountId: string; credentialGeneration: number }>; exclude: string[]; measure: boolean }): Promise<string | null | undefined> {
+      if (!deps.studioOrigin) return undefined
+      const proof = { machineId: deps.machineId, companyId: input.companyId }
+      const measured: string[] = []
+      try {
+        while (true) {
+          const response = await post('shared/select', { ...proof, candidates: input.candidates, exclude: input.exclude, measure: input.measure, measured: [...measured] })
+          const body = await response.json().catch(() => null) as Record<string, unknown> | null
+          if (response.ok && typeof body?.managedAccountId === 'string') return body.managedAccountId
+          if (response.status === 409 && body?.error === 'SETUP_TOKEN_DAEMON_NO_ACCOUNT') return null
+          const candidate = { managedAccountId: body?.managedAccountId, credentialGeneration: body?.credentialGeneration }
+          if (response.status !== 409 || body?.error !== 'SETUP_TOKEN_DAEMON_MEASURE_REQUIRED') {
+            logger.debug(`[setup-token-switch] shared choice: Studio answered ${response.status} ${String(body?.error ?? '')}; choosing locally`)
+            return undefined
+          }
+          if (!deps.measure || measured.length >= MAX_CHECKS_PER_SWITCH || typeof candidate.managedAccountId !== 'string' || !UUID.test(candidate.managedAccountId)
+            || !Number.isSafeInteger(candidate.credentialGeneration)) return null
+          measured.push(candidate.managedAccountId)
+          await checkCandidate('shared/measure', proof, candidate as { managedAccountId: string; credentialGeneration: number })
+        }
+      } catch (error) {
+        logger.debug(`[setup-token-switch] shared choice: Studio unreachable (${(error as Error)?.name ?? 'error'}); choosing locally`)
+        return undefined
+      }
+    },
     /** One switch per session at a time; a second request while one runs gets that one's answer. */
     rebind(sessionId: string, running: string, observation?: SetupTokenUsageObservation, signal?: AbortSignal): Promise<RebindResult> {
       const shared = sharedSession(sessionId, running)

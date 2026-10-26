@@ -547,7 +547,8 @@ export async function requestSetupTokenRebind(sessionId: string, binding: string
   const result = await daemonPost('/setup-token/rebind', { sessionId, binding, ...(observation ? { observation } : {}) }, undefined, SETUP_TOKEN_REBIND_TIMEOUT_MS, signal);
   if (result?.ok === true && result.environment && typeof result.environment === 'object'
     && Object.values(result.environment).every((value) => typeof value === 'string')) return { ok: true, environment: result.environment };
-  return { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED', ...(Number.isSafeInteger(result?.retryAfterMs) && result.retryAfterMs > 0 && result.retryAfterMs <= 1800000 ? { retryAfterMs: result.retryAfterMs } : {}) };
+  // A recovery later than the session's 30-minute background wait still holds the session off until that wait ends.
+  return { ok: false, reason: typeof result?.reason === 'string' ? result.reason : 'REQUEST_FAILED', ...(Number.isSafeInteger(result?.retryAfterMs) && result.retryAfterMs > 0 ? { retryAfterMs: Math.min(result.retryAfterMs, 1800000) } : {}) };
 }
 
 /** Secret-free, authenticated quota evidence. An unanswered/old server never authorizes personal spending. */
