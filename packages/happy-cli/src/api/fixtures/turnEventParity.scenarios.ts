@@ -207,11 +207,12 @@ async function harness(capability: boolean, outbox = false, scheduled = false) {
     };
 }
 
-// T2RT-31: actual socket observations and metadata CAS writes, including every
+// T2RT-31/32: actual socket observations and metadata CAS writes, including every
 // subsequent OFF mode transition. Main has no input-mode hook and publishes nothing.
 if (process.env.T2RT_PARITY_EVIDENCE === 'off') {
-    for (const flavor of ['claude', 'codex']) for (const initialMode of ['local', 'remote'] as const) {
-        it(`OFF marker-only ${flavor} starting ${initialMode}`, async () => {
+    for (const flavor of ['claude', 'codex']) for (const initialMode of ['local', 'remote'] as const)
+    for (const contact of ['absent', 'stale', 'foreign']) for (const marker of [false, true]) {
+        it(`OFF metadata ${flavor} starting ${initialMode} contact=${contact} marker=${marker}`, async () => {
             const handlers = new Map<string, Array<(value: any) => void>>();
             const session = { id: 'marker-session', seq: 0,
                 metadata: { path: '/tmp', host: 'localhost', flavor } as Metadata,
@@ -233,7 +234,11 @@ if (process.env.T2RT_PARITY_EVIDENCE === 'off') {
             const host = client as any;
             try {
                 host.configureInputQueue?.(new MessageQueue2<string>(x => x), initialMode, false);
-                metadata = { ...metadata, inputEvidenceEnabled: true };
+                metadata = { ...metadata, ...(marker ? { inputEvidenceEnabled: true } : {}),
+                    runtimeCapabilities: { saycodeSystemPromptPreference: true, ...(contact === 'absent' ? {} : {
+                        agentContact: { v: 1, runtimeId: `${contact}-runtime`, principal: 'account',
+                            prompt: true, steer: false, inputEvidence: 1, guardedPrompt: 1, mode: 'remote', modeEpoch: 7 },
+                    }) } };
                 for (const handler of handlers.get('update') ?? []) handler({ body: { t: 'update-session', sid: session.id,
                     metadata: { version: ++version, value: encodeBase64(encrypt(session.encryptionKey, 'legacy', metadata)) } } });
                 for (const mode of ['local', 'transitioning', 'remote', 'local', 'remote']) {
@@ -241,7 +246,7 @@ if (process.env.T2RT_PARITY_EVIDENCE === 'off') {
                     await new Promise(resolve => setImmediate(resolve));
                     transitions.push(structuredClone(client.getMetadata()!));
                 }
-                await appendFile(process.env.T2RT_PARITY_OUTPUT!, JSON.stringify({ name: `off-marker-${flavor}-${initialMode}`,
+                await appendFile(process.env.T2RT_PARITY_OUTPUT!, JSON.stringify({ name: `off-metadata-${flavor}-${initialMode}-${contact}-${marker}`,
                     turns: [], wire: [], metadata, metadataWrites, transitions }) + '\n');
             } finally { await client.close(); }
         });

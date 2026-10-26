@@ -72,8 +72,8 @@ restores it after restart. A resume request's explicit setting overrides its own
 saved value. ON also records `metadata.inputEvidenceEnabled=true` for same-session
 recovery when no tracked environment survives; explicit OFF removes that marker.
 Live hosts do not repair dropped evidence/contact markers on observation or
-ordinary metadata writes. An ambient ON marker alone never triggers an OFF
-host's mode-change metadata publication. **Residual for installed old app
+ordinary metadata writes. OFF mode transitions never publish metadata, even
+after incoming documents with an ON marker or a stale/foreign contact. **Residual for installed old app
 versions:** editing a session's metadata can erase the recovery marker, including
 while a host is live. If no validated saved session
 environment survives, later metadata-only recovery is OFF. This never enables
@@ -87,8 +87,9 @@ that override. ACP remains unsupported.
 The session host advertises `agentContact.inputEvidence=1` only when enabled
 and otherwise eligible under the existing account/remote-mode checks. The API
 publication gate suppresses all evidence/admission envelopes while OFF, and
-does not add `agentContact` at all: main's metadata remains unchanged. Stale
-T2rt contact advertisements are withdrawn on disablement. All guarded input is
+does not add or delete `agentContact`: ordinary OFF mode transitions preserve
+main's metadata under every incoming document. Received advertisements never
+enable this host's evidence or guarded-input capability. All guarded input is
 refused while OFF, including matching, malformed and stale guards; no guard is
 ever stripped to execute its prompt as unguarded input. No guard/admission
 contract is advertised in that mode. Unguarded input retains main's behavior.
@@ -1953,6 +1954,11 @@ no PR creation, force-push, rebase, publication or other-branch mutation.
 
 ## T2RT-30/31: remove live marker repair (2026-10-26)
 
+**Historical verification at `3303bc51`.** T2RT-32 below removes the remaining
+OFF contact-withdrawal branch and expands the incoming-document parity matrix.
+The parent subsequently pushed this commit; the no-push instructions recorded
+in this section applied to that author turn only.
+
 Current base: `9ddebeac` on `feat/rn-t2rt-followup` (PR #965), after #951 merged.
 The user's decision supersedes T2RT-29 part (b): remove live marker repair
 entirely, retaining app passthrough (a) and recovery precedence (c). This is an
@@ -2019,3 +2025,68 @@ Files: `src/api/appMetadata.inputEvidence.test.ts`, `src/api/apiSession.test.ts`
 Production `apiSession.ts` and `runClaude.ts` match their pre-repair parent
 `1e7549f6` exactly; app passthrough and recovery resolution sources are unchanged.
 No new PR or push is performed in this session.
+
+## T2RT-32: OFF mode transitions never publish metadata (2026-10-26)
+
+Base: `3303bc51`, branch `feat/rn-t2rt-followup`, PR #965. The review bot has
+reviewed the prior base; the current user authorizes one new commit and normal
+push, with no new PR or history rewrite. Existing Core metadata consistency fix;
+no dependency, protocol, app schema, recovery precedence or routing change.
+
+Plan:
+
+1. Reproduce incoming stale/foreign contacts and overlapping OFF/ON hosts using
+   real API clients, encrypted socket observations and simulated server CAS.
+   Include both providers, marker absent/present, and an incoming contact naming
+   this runtime as a control. An OFF queue configuration must not publish even
+   if that client previously advertised ON in a direct API test.
+2. Remove ordinary OFF contact withdrawal and its otherwise-unused advertisement
+   state. Production captures the setting once; there is no live opt-out flow
+   needing a new owned-withdrawal operation. ON advertisements remain unchanged.
+   The existing launch-time metadata construction and explicit OFF marker
+   transform remain unchanged; no new contact deletion operation is introduced.
+3. Extend actual-source full-document OFF parity: Claude/Codex, local/remote
+   initial mode, absent/stale/foreign contact, absent/present ON marker, each
+   followed by local/transitioning/remote/local/remote. This is 24 document cases
+   (the prior four marker-only cases plus 20 additions), retaining 58 original
+   OFF and 58 ON scenarios. Run related app/recovery/resume/env/hydration tests.
+
+Rollback: revert this new commit. Saved validated environment still wins over
+metadata fallback, then validated explicit request overlay; old stripping writers
+with metadata-only recovery still safely default OFF. App passthrough remains.
+
+TDD red: **15/15 direct T2RT-32 cases failed** before the production change,
+including both overlapping-host cases. The expanded OFF parity parent also
+failed with contact deletions; ON parity passed. Standard run: **16 failed,
+1 passed, 180 unrelated cases skipped**.
+
+Final verification:
+
+- **8 files / 487 tests passed**, no skipped cases: 195 API (including all 15
+  T2RT-32 checks), 17 actual-app producer-consumer/recovery, 80 replacement
+  recovery, 62 standalone resume, 108 environment, 19 hydration, 4 Claude
+  offline/reconnect, and 2 actual-source parity parent tests.
+- **82/82 OFF + 58/58 ON** against `9ee84191`, **280 source replays**. This
+  retains the original 58 OFF + 58 ON and covers all 24 incoming-document cases
+  (8 contact-absent controls, 16 stale/foreign-contact cases). Every OFF transition
+  preserves the complete metadata document and sends zero metadata writes.
+  Both overlapping OFF/ON hosts preserve the current ON runtime's contact and
+  guarded-prompt/evidence capabilities without increasing the server write count.
+- The direct cases also preserve an incoming contact naming the OFF runtime
+  itself, test steering-availability mode updates, and verify that OFF queue
+  configuration cannot implicitly withdraw even this client's prior advertisement.
+- CLI global setup passed `tsc --noEmit`, pkgroll and extension-copy build.
+  Existing bin-outside-dist/empty-chunk warnings remain; no Unix-socket EPERM
+  occurred. `git diff --check` and T2rt documentation anchors passed.
+
+Tests ran from the clone root using:
+`corepack pnpm -C packages/happy-cli exec vitest run --project unit <files> --maxWorkers 2`.
+Files: `src/api/apiSession.test.ts`, `src/api/appMetadata.inputEvidence.test.ts`,
+`src/api/apiSession.inputEvidenceLifecycle.test.ts`,
+`src/daemon/sessionRecovery.inputEvidence.test.ts`,
+`src/resume/handleResumeCommand.test.ts`, `src/daemon/sessionEnv.test.ts`,
+`src/daemon/persistedSessionHydration.test.ts`,
+`src/claude/runClaudeOfflineAck.test.ts`.
+App passthrough, recovery resolution, runner startup, routing and wire schemas
+are unchanged. One new behavioral commit on the requested branch, normal push
+only; no new PR, rebase, force-push or other-branch mutation.

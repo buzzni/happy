@@ -336,6 +336,79 @@ describe('ApiSessionClient v3 messages API migration', () => {
         } finally { await host.client.close(); }
     });
 
+    for (const flavor of ['claude', 'codex']) for (const contact of ['stale', 'foreign', 'own']) {
+        it.each([false, true])(`T2RT-32 ${flavor} OFF preserves ${contact} contact with marker=%s`, async marker => {
+            const host = await evidenceMetadataHost(false, flavor);
+            const metadata: Metadata = { ...session.metadata, ...(marker ? { inputEvidenceEnabled: true } : {}),
+                runtimeCapabilities: { saycodeSystemPromptPreference: true, agentContact: {
+                    v: 1, runtimeId: contact === 'own' ? host.client.runtimeId : `${contact}-runtime`,
+                    principal: 'account', prompt: true, steer: false, inputEvidence: 1, guardedPrompt: 1,
+                    mode: 'remote', modeEpoch: 7,
+                } } };
+            try {
+                host.observe(metadata);
+                await new Promise(resolve => setImmediate(resolve));
+                expect(mockSocket.emitWithAck).not.toHaveBeenCalled();
+                for (const mode of ['local', 'transitioning', 'remote', 'local', 'remote'] as const) {
+                    host.client.setInputMode(mode);
+                    await new Promise(resolve => setImmediate(resolve));
+                    expect(mockSocket.emitWithAck).not.toHaveBeenCalled();
+                    expect(host.server()).toEqual(metadata);
+                    expect(host.client.getMetadata()).toEqual(metadata);
+                }
+                host.client.setInputSteerAvailable(true);
+                await new Promise(resolve => setImmediate(resolve));
+                expect(mockSocket.emitWithAck).not.toHaveBeenCalled();
+            } finally { await host.client.close(); }
+        });
+    }
+
+    it.each(['claude', 'codex'])('T2RT-32 overlapping %s OFF host never removes the current ON advertisement', async flavor => {
+        let server: Metadata = { ...session.metadata, flavor };
+        let version = 0;
+        const sockets: Array<{ handlers: SocketHandlers; socket: any }> = [];
+        let writes = 0;
+        const observeAll = () => {
+            const update = { body: { t: 'update-session', sid: session.id,
+                metadata: { version, value: encryptContent(session, server) } } };
+            for (const s of sockets) for (const cb of s.handlers.update ?? []) cb(update);
+        };
+        mockIo.mockImplementation(() => {
+            const handlers: SocketHandlers = {};
+            const socket: any = { connected: true, connect: vi.fn(), off: vi.fn(), emit: vi.fn(), close: vi.fn(), volatile: { emit: vi.fn() },
+                on: (event: string, handler: SocketHandler) => { (handlers[event] ??= []).push(handler); },
+                timeout() { return this; },
+                emitWithAck: async (event: string, request: any) => {
+                    expect(event).toBe('update-metadata');
+                    if (request.expectedVersion !== version) return { result: 'version-mismatch', version, metadata: encryptContent(session, server) };
+                    if (++writes > 20) throw Error('metadata write loop');
+                    server = decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(request.metadata)) as Metadata;
+                    const ack = { result: 'success', version: ++version, metadata: request.metadata };
+                    observeAll();
+                    return ack;
+                },
+            };
+            sockets.push({ handlers, socket }); return socket;
+        });
+        const oldOff = new ApiSessionClient('fake-token', { ...session, metadata: server, metadataVersion: version });
+        oldOff.configureInputQueue(new MessageQueue2<string>(x => x), 'remote', false);
+        const currentOn = new ApiSessionClient('fake-token', { ...session, metadata: server, metadataVersion: version });
+        try {
+            currentOn.configureInputQueue(new MessageQueue2<string>(x => x), 'remote', true);
+            await waitForCheck(() => expect(server.runtimeCapabilities?.agentContact?.runtimeId).toBe(currentOn.runtimeId));
+            expect(oldOff.getMetadata()?.runtimeCapabilities?.agentContact?.runtimeId).toBe(currentOn.runtimeId);
+            const writesBefore = writes;
+            const advertised = structuredClone(server);
+            for (const mode of ['local', 'transitioning', 'remote', 'local', 'remote'] as const) {
+                oldOff.setInputMode(mode);
+                await new Promise(resolve => setImmediate(resolve));
+                expect(writes).toBe(writesBefore);
+                expect(server).toEqual(advertised);
+                expect(oldOff.getMetadata()).toEqual(advertised);
+            }
+            expect(server.runtimeCapabilities?.agentContact).toMatchObject({ runtimeId: currentOn.runtimeId, guardedPrompt: 1, inputEvidence: 1 });
+        } finally { await oldOff.close(); await currentOn.close(); }
+    });
     it.each([false, true])('T2RT-16 preserves real scanner rearm across a textless final (evidence=%s)', async supported => {
         const client = new ApiSessionClient('fake-token', session);
         vi.spyOn(client, 'updateMetadata').mockImplementation(() => undefined);
@@ -548,15 +621,18 @@ describe('ApiSessionClient v3 messages API migration', () => {
         } finally { await client.close(); }
     });
 
-    it('T2RT-27 removes an earlier T2rt contact advertisement when the session is disabled', async () => {
+    it('T2RT-32 OFF queue configuration publishes nothing even after this client advertised ON', async () => {
         const client = new ApiSessionClient('fake-token', session);
         let metadata = session.metadata!;
-        vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
+        const update = vi.spyOn(client, 'updateMetadata').mockImplementation(update => { metadata = update(metadata); });
         const queue = new MessageQueue2<string>(mode => mode);
         client.configureInputQueue(queue, 'remote', true);
         expect(metadata.runtimeCapabilities?.agentContact?.guardedPrompt).toBe(1);
+        const advertised = structuredClone(metadata);
+        update.mockClear();
         client.configureInputQueue(queue, 'remote', false);
-        expect(metadata.runtimeCapabilities?.agentContact).toBeUndefined();
+        expect(update).not.toHaveBeenCalled();
+        expect(metadata).toEqual(advertised);
         await client.close();
     });
 

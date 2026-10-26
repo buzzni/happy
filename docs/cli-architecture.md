@@ -63,14 +63,15 @@ Happy-app metadata parsing passes through unknown keys, including nested runtime
 capabilities and summary fields. Title CAS retries merge only app-owned title
 fields onto the latest server document; acknowledged metadata and version stay
 together in its cache. Live CLI hosts do not restore omitted evidence/contact
-markers on observation, title writes or CAS retries. An ambient marker alone
-cannot trigger metadata publication during OFF mode changes. Recovery prefers
+markers on observation, title writes or CAS retries. OFF mode changes never
+publish metadata or delete incoming contacts, including stale or foreign runtime
+advertisements. Observed capabilities cannot enable an OFF host. Recovery prefers
 validated daemon-saved environment, then original-session metadata, with an
 explicit validated request overriding either. If an old app strips the hint and
 no validated saved setting survives, metadata-only recovery safely defaults OFF;
 this cannot incorrectly enable evidence. See the
 [T2RT-29 writer audit](reason-network-t2rt.md#t2rt-29-metadata-writer-preservation-and-live-repair-2026-10-26)
-and [T2RT-30/31 decision](reason-network-t2rt.md#t2rt-3031-remove-live-marker-repair-2026-10-26).
+and [T2RT-32 OFF parity](reason-network-t2rt.md#t2rt-32-off-mode-transitions-never-publish-metadata-2026-10-26).
 
 ## Unconfigured synced plugin MCP servers
 

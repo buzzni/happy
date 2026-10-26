@@ -1,4 +1,4 @@
-/** T2RT-16..31: replay real source revisions, not a second hand-written mapper. */
+/** T2RT-16..32: replay real source revisions, not a second hand-written mapper. */
 import { expect, it } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -39,7 +39,7 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
         const load = async (source: string): Promise<any[]> => (await readFile(join(directory, `${source}.jsonl`), 'utf8'))
             .trim().split('\n').map(line => JSON.parse(line));
         const baseline = await load('base'), head = await load('head');
-        expect(baseline).toHaveLength(enabled ? 58 : 62);
+        expect(baseline).toHaveLength(enabled ? 58 : 82);
         expect(head).toHaveLength(baseline.length);
         for (const original of baseline) {
             const actual = head.find(record => record.name === original.name);
@@ -71,7 +71,7 @@ it.each([false, true])('preserves merge-base turns/consumers with evidence opt-i
                 }
             }
             if (!enabled) expect.soft(actual.evidence ?? [], original.name).toEqual([]);
-            if (original.name.startsWith('off-marker-')) {
+            if (original.name.startsWith('off-metadata-')) {
                 expect.soft(actual.metadataWrites, original.name).toEqual([]);
                 expect.soft(actual.transitions, original.name).toHaveLength(5);
                 for (const metadata of actual.transitions) expect.soft(metadata, original.name).toEqual(original.metadata);
