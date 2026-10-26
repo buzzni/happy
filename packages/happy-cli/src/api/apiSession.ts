@@ -1,3 +1,4 @@
+import { inputEvidenceMetadata } from '@/utils/inputEvidenceSettings';
 import { HubInputGate, TurnInputEvidence, type QueueInputEvidence, type EvidenceBatch } from './turnInputEvidence';
 import type { MessageQueue2 } from '@/utils/MessageQueue2';
 import type { SetupTokenRotationState } from './types';
@@ -402,14 +403,22 @@ export class ApiSessionClient extends EventEmitter {
     readonly inputEvidence = new TurnInputEvidence(this.runtimeId, envelope => this.sendSessionProtocolMessage(envelope));
     readonly inputGate: HubInputGate;
     private inputEvidenceSupported = false;
+    private inputEvidenceRecoveryEnabled = false;
     private inputContactAdvertised = false;
+    private inputContactMetadata: NonNullable<NonNullable<Metadata['runtimeCapabilities']>['agentContact']> | null = null;
     private contactSteer = false;
     private invalidateGuardedInputs: (() => void) | null = null;
     private rejectedInputs = new Set<string>();
     private acceptedInputs = new Set<string>();
     private readonly inputToolTurns = new Map<string, string>();
 
+    /** An offline local bridge owns its resume hint without supporting queued input/admissions. */
+    configureInputEvidenceRecovery(enabled: boolean): void {
+        this.inputEvidenceRecoveryEnabled = enabled;
+        this.repairMissingInputMetadata();
+    }
     configureInputQueue<T>(queue: MessageQueue2<T>, mode: 'local' | 'remote', evidence: boolean): void {
+        this.inputEvidenceRecoveryEnabled = evidence;
         this.inputEvidenceSupported = evidence;
         queue.setInputValidator(input => this.admitInput(input), input => { this.admitInput(input, true); });
         this.invalidateGuardedInputs = () => queue.discardInvalid();
@@ -422,12 +431,14 @@ export class ApiSessionClient extends EventEmitter {
         if (!this.inputEvidenceSupported) {
             // Fresh OFF sessions leave main's metadata untouched. Also withdraw an
             // earlier host's T2rt advertisement rather than promising suppressed receipts.
-            if (this.inputContactAdvertised || this.metadata?.runtimeCapabilities?.agentContact) {
+            this.inputContactMetadata = null;
+            if (this.inputContactAdvertised || this.metadata?.runtimeCapabilities?.agentContact || (!this.inputEvidenceRecoveryEnabled && this.metadata?.inputEvidenceEnabled === true)) {
                 this.inputContactAdvertised = false;
                 this.updateMetadata(meta => {
-                    if (!meta.runtimeCapabilities?.agentContact) return meta;
-                    const { agentContact: _contact, ...capabilities } = meta.runtimeCapabilities;
-                    return { ...meta, runtimeCapabilities: capabilities };
+                    const disabled = this.inputEvidenceRecoveryEnabled ? meta : inputEvidenceMetadata(meta, false);
+                    if (!disabled.runtimeCapabilities?.agentContact) return disabled;
+                    const { agentContact: _contact, ...capabilities } = disabled.runtimeCapabilities;
+                    return { ...disabled, runtimeCapabilities: capabilities };
                 });
             }
             return;
@@ -439,7 +450,30 @@ export class ApiSessionClient extends EventEmitter {
             inputEvidence: !this.managed && this.inputEvidenceSupported && mode === 'remote' ? 1 : null, guardedPrompt: 1,
             mode, modeEpoch: this.inputGate.modeEpoch,
         };
+        this.inputContactMetadata = agentContact;
         this.updateMetadata(meta => ({ ...meta, runtimeCapabilities: { ...meta.runtimeCapabilities, agentContact } }));
+    }
+    /** Repair omissions by old writers, never present values or a replacement host's claim. */
+    private restoreMissingInputMetadata(meta: Metadata): Metadata {
+        if (!this.inputEvidenceRecoveryEnabled || !meta
+            || meta.lifecycleState === 'archiveRequested' || meta.lifecycleState === 'archived') return meta;
+        if (Object.hasOwn(meta, 'inputEvidenceEnabled') && meta.inputEvidenceEnabled !== true) return meta;
+        const contact = meta.runtimeCapabilities?.agentContact;
+        if (contact && contact.runtimeId !== this.runtimeId) return meta;
+        const missingSetting = !Object.hasOwn(meta, 'inputEvidenceEnabled');
+        const advertisedContact = this.inputContactMetadata;
+        const missingContact = advertisedContact !== null && !Object.hasOwn(meta.runtimeCapabilities ?? {}, 'agentContact');
+        if (!missingSetting && !missingContact) return meta;
+        return {
+            ...meta,
+            ...(missingSetting ? { inputEvidenceEnabled: true } : {}),
+            ...(missingContact ? { runtimeCapabilities: { ...meta.runtimeCapabilities, agentContact: advertisedContact! } } : {}),
+        };
+    }
+    private repairMissingInputMetadata(): void {
+        if (this.closed || !this.metadata || this.restoreMissingInputMetadata(this.metadata) === this.metadata) return;
+        // The transform rechecks current ownership/mode on every queued execution and CAS retry.
+        this.updateMetadata(meta => this.restoreMissingInputMetadata(meta), true);
     }
     setInputSteerAvailable(available: boolean): void { this.contactSteer = available; this.setInputMode(this.inputGate.mode); }
     queueInput(message: UserMessage): QueueInputEvidence {
@@ -841,6 +875,7 @@ export class ApiSessionClient extends EventEmitter {
                     if (data.body.metadata && data.body.metadata.version > this.metadataVersion) {
                         this.metadata = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.metadata.value));
                         this.metadataVersion = data.body.metadata.version;
+                        this.repairMissingInputMetadata();
                         // Check if session was archived from web/mobile
                         const meta = this.metadata as any;
                         if (meta?.lifecycleState === 'archiveRequested' || meta?.lifecycleState === 'archived') {
@@ -2443,13 +2478,14 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /** With storage tracking enabled, handlers must be pure and safe to replay against newer state (idempotent). */
-    updateMetadata(handler: (metadata: Metadata) => Metadata) {
+    updateMetadata(handler: (metadata: Metadata) => Metadata, skipIfUnchanged = false) {
         let attempt: { encrypted: string; expectedVersion: number; uncertain: boolean } | null = null;
         this.metadataWrites.enqueue(() => this.runStateWrite(async () => {
             if (this.closed) return false;
             if (!attempt || !this.options.trackShutdownStorage) {
                 try {
-                    const updated = handler(this.metadata!);
+                    const updated = this.restoreMissingInputMetadata(handler(this.metadata!));
+                    if (skipIfUnchanged && updated === this.metadata) return true;
                     attempt = { expectedVersion: this.metadataVersion, encrypted: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, updated)), uncertain: false };
                 } catch (error) {
                     if (this.options.trackShutdownStorage) throw new SessionStateWriteRefused('Invalid local metadata transform');
@@ -2463,8 +2499,11 @@ export class ApiSessionClient extends EventEmitter {
                 : await this.socket.emitWithAck('update-metadata', data);
             if (answer.result === 'success' || (this.options.trackShutdownStorage && answer.result === 'version-mismatch'
                 && answer.metadata === encrypted && answer.version === expectedVersion + 1)) {
-                this.metadata = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
-                this.metadataVersion = answer.version;
+                // A socket update can arrive before this ACK; retain that newer document.
+                if (!this.inputEvidenceRecoveryEnabled || answer.version >= this.metadataVersion) {
+                    this.metadata = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(answer.metadata));
+                    this.metadataVersion = answer.version;
+                }
                 return answer.metadata === encrypted && Number.isSafeInteger(answer.version) && answer.version === expectedVersion + 1;
             } else if (answer.result === 'version-mismatch') {
                 if (answer.version > this.metadataVersion) {

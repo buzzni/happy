@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { configuration } from '@/configuration';
 import type { ClaudeSessionProtocolState } from '@/claude/utils/sessionProtocolMapper';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { inputEvidenceMetadata } from '@/utils/inputEvidenceSettings';
 import { SessionStateWrites } from './sessionStateWrites';
 import { SessionStorageBarrier } from './sessionStorageBarrier';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -217,6 +218,144 @@ describe('ApiSessionClient v3 messages API migration', () => {
         };
 
         mockIo.mockReturnValue(mockSocket);
+    });
+
+    async function evidenceMetadataHost(enabled = true, flavor = 'claude', withQueue = true) {
+        session.metadata = inputEvidenceMetadata({ ...session.metadata, flavor }, enabled);
+        let server: Metadata = session.metadata;
+        let version = 0;
+        const accept = (request: any) => {
+            expect(request.expectedVersion).toBe(version);
+            server = decrypt(session.encryptionKey, session.encryptionVariant, decodeBase64(request.metadata)) as Metadata;
+            return { result: 'success', version: ++version, metadata: request.metadata };
+        };
+        mockSocket.emitWithAck.mockImplementation(async (event: string, request: any) => {
+            expect(event).toBe('update-metadata');
+            return accept(request);
+        });
+        const client = new ApiSessionClient('fake-token', session);
+        if (withQueue) client.configureInputQueue(new MessageQueue2<string>(mode => mode), 'remote', enabled);
+        else client.configureInputEvidenceRecovery(enabled);
+        if (enabled && withQueue) await waitForCheck(() => expect(client.getMetadata()?.runtimeCapabilities?.agentContact?.runtimeId).toBe(client.runtimeId));
+        mockSocket.emitWithAck.mockClear();
+        const observe = (metadata: Metadata) => {
+            server = metadata;
+            emitSocketEvent('update', { body: { t: 'update-session', sid: client.sessionId,
+                metadata: { version: ++version, value: encryptContent(session, metadata) } } });
+        };
+        return { client, observe, accept, server: () => server, version: () => version };
+    }
+
+    for (const flavor of ['claude', 'codex']) {
+        it.each(['setting', 'contact', 'both'])(`T2RT-29 ${flavor} repairs stripped %s once without losing title or other capabilities`, async stripped => {
+            const host = await evidenceMetadataHost(true, flavor);
+            const metadata = { ...host.server(), summary: { text: 'app title', updatedAt: 2 },
+                runtimeCapabilities: { ...host.server().runtimeCapabilities, saycodeSystemPromptPreference: true } };
+            if (stripped !== 'contact') delete metadata.inputEvidenceEnabled;
+            if (stripped !== 'setting') delete metadata.runtimeCapabilities.agentContact;
+            host.observe(metadata);
+            try {
+                await waitForCheck(() => {
+                    expect(host.server().inputEvidenceEnabled).toBe(true);
+                    expect(host.server().runtimeCapabilities?.agentContact?.runtimeId).toBe(host.client.runtimeId);
+                });
+                expect(host.server().summary?.text).toBe('app title');
+                expect(host.server().runtimeCapabilities?.saycodeSystemPromptPreference).toBe(true);
+                expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+                host.observe(host.server()); // confirmed echo, now with another server revision
+                await new Promise(resolve => setImmediate(resolve));
+                expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+            } finally { await host.client.close(); }
+        });
+    }
+
+    it.each(['off', 'explicit-off', 'foreign-runtime', 'archive'])('T2RT-29 does not fight %s metadata', async change => {
+        const host = await evidenceMetadataHost(change !== 'off');
+        const metadata: Metadata = { ...session.metadata, summary: { text: 'legitimate edit', updatedAt: 3 } };
+        if (change === 'explicit-off') metadata.inputEvidenceEnabled = false;
+        if (change === 'foreign-runtime') metadata.runtimeCapabilities = { agentContact: {
+            ...host.server().runtimeCapabilities!.agentContact!, runtimeId: 'replacement-runtime',
+        } };
+        if (change === 'archive') metadata.lifecycleState = 'archiveRequested';
+        try {
+            host.observe(metadata);
+            await new Promise(resolve => setImmediate(resolve));
+            expect(mockSocket.emitWithAck).not.toHaveBeenCalled();
+            expect(host.client.getMetadata()).toEqual(metadata);
+        } finally { await host.client.close(); }
+    });
+
+    it('T2RT-29 reapplies current markers after a CAS conflict and coalesces queued observations', async () => {
+        const host = await evidenceMetadataHost();
+        let release!: (value: unknown) => void;
+        const pending = new Promise(resolve => { release = resolve; });
+        mockSocket.emitWithAck.mockImplementationOnce(() => pending);
+        host.observe({ ...session.metadata, summary: { text: 'first app edit', updatedAt: 2 } });
+        try {
+            await waitForCheck(() => expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1));
+            host.observe({ ...session.metadata, summary: { text: 'latest app edit', updatedAt: 3 }, permissionMode: 'read-only' });
+            const latest = host.server();
+            release({ result: 'version-mismatch', version: host.version(), metadata: encryptContent(session, latest) });
+            await waitForCheck(() => expect(host.server().inputEvidenceEnabled).toBe(true));
+            expect(host.server().summary?.text).toBe('latest app edit');
+            expect(host.server().permissionMode).toBe('read-only');
+            await new Promise(resolve => setImmediate(resolve));
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2); // one conflict, one repair; no echo loop
+        } finally { release({ result: 'error' }); await host.client.close(); }
+    });
+
+    it('T2RT-29 a late repair ACK cannot replace a newer app edit or suppress its repair', async () => {
+        const host = await evidenceMetadataHost();
+        let release!: (value: unknown) => void;
+        const pending = new Promise(resolve => { release = resolve; });
+        let firstAck: unknown;
+        mockSocket.emitWithAck.mockImplementationOnce((_event: string, request: any) => {
+            firstAck = host.accept(request); // server commits, but its ACK is delayed
+            return pending;
+        });
+        host.observe({ ...session.metadata, summary: { text: 'first app edit', updatedAt: 2 } });
+        try {
+            await waitForCheck(() => expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1));
+            host.observe({ ...session.metadata, summary: { text: 'newer app edit', updatedAt: 3 }, permissionMode: 'read-only' });
+            release(firstAck);
+            await waitForCheck(() => expect(host.server().runtimeCapabilities?.agentContact?.runtimeId).toBe(host.client.runtimeId));
+            expect(host.server().summary?.text).toBe('newer app edit');
+            expect(host.client.getMetadata()?.permissionMode).toBe('read-only');
+            await new Promise(resolve => setImmediate(resolve));
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2);
+        } finally { release({ result: 'error' }); await host.client.close(); }
+    });
+
+    it('T2RT-29 repair keeps the captured ON setting but advertises the current local mode', async () => {
+        const host = await evidenceMetadataHost();
+        try {
+            host.client.setInputMode('local');
+            await waitForCheck(() => expect(host.server().runtimeCapabilities?.agentContact?.mode).toBe('local'));
+            const modeEpoch = host.client.inputGate.modeEpoch;
+            mockSocket.emitWithAck.mockClear();
+            host.observe({ ...session.metadata, inputEvidenceEnabled: undefined } as Metadata);
+            // JSON serialization removes the undefined field, as an old stripping writer does.
+            await waitForCheck(() => expect(host.server().runtimeCapabilities?.agentContact).toMatchObject({
+                runtimeId: host.client.runtimeId, mode: 'local', modeEpoch, prompt: false, inputEvidence: null,
+            }));
+            expect(host.server().inputEvidenceEnabled).toBe(true);
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+        } finally { await host.client.close(); }
+    });
+
+    it.each([false, true])('T2RT-29 local bridge repairs only its captured recovery hint (%s), without admissions/contact', async enabled => {
+        const host = await evidenceMetadataHost(enabled, 'claude', false);
+        try {
+            host.observe({ ...session.metadata, inputEvidenceEnabled: undefined } as Metadata);
+            if (enabled) await waitForCheck(() => expect(host.server().inputEvidenceEnabled).toBe(true));
+            else await new Promise(resolve => setImmediate(resolve));
+            expect(host.server().runtimeCapabilities?.agentContact).toBeUndefined();
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(enabled ? 1 : 0);
+            expect(host.client.admitInput({ ref: { kind: 'rest', serverMessageId: 'guarded', serverSeq: 1 }, guard: {
+                v: 1, targetSessionId: host.client.sessionId, expectedRuntimeId: host.client.runtimeId,
+                expectedMode: 'remote', expectedModeEpoch: host.client.inputGate.modeEpoch,
+            } })).toBe(false);
+        } finally { await host.client.close(); }
     });
 
     it.each([false, true])('T2RT-16 preserves real scanner rearm across a textless final (evidence=%s)', async supported => {

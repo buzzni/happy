@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Session } from '@/api/types';
 import type { Credentials, readSettings } from '@/persistence';
 
 /**
@@ -13,12 +14,14 @@ const {
     mockStartOfflineReconnection,
     mockInstallBroadKillShims,
     mockReadSettings,
+    mockSessionSyncClient,
 } = vi.hoisted(() => ({
-    mockGetOrCreateSession: vi.fn(async () => null),
+    mockGetOrCreateSession: vi.fn(async (_options?: unknown): Promise<Session | null> => null),
     mockClaudeLocal: vi.fn(async () => undefined),
-    mockStartOfflineReconnection: vi.fn(() => ({ cancel: () => {}, stop: () => {}, promise: new Promise(() => {}) })),
+    mockStartOfflineReconnection: vi.fn((_options?: { onReconnected: () => Promise<unknown> }) => ({ cancel: () => {}, stop: () => {}, promise: new Promise(() => {}) })),
     mockInstallBroadKillShims: vi.fn(),
     mockReadSettings: vi.fn(),
+    mockSessionSyncClient: vi.fn(),
 }));
 
 vi.mock('@/api/api', () => ({
@@ -27,11 +30,12 @@ vi.mock('@/api/api', () => ({
             getOrCreateSession: (...args: unknown[]) => mockGetOrCreateSession(...(args as [])),
             getOrCreateMachine: async () => ({ id: 'machine-1' }),
             machineSyncClient: () => ({ shutdown: () => {}, setRPCHandlers: () => {} }),
-            sessionSyncClient: () => { throw new Error('not reached'); },
+            sessionSyncClient: mockSessionSyncClient,
             push: async () => undefined,
         }),
     },
 }));
+vi.mock('@/claude/utils/sessionScanner', () => ({ createSessionScanner: vi.fn(async () => ({ onNewSession: vi.fn() })) }));
 vi.mock('@/claude/claudeLocal', () => ({ claudeLocal: mockClaudeLocal }));
 // Without this the run reads the developer's real Happy settings and exits 1
 // when no machineId is present — the offline branch would never be reached and
@@ -165,5 +169,25 @@ describe('runClaude offline start with required confirmed delivery', () => {
         // process ended the way that path always ends.
         expect(mockStartOfflineReconnection).toHaveBeenCalledTimes(1);
         expect(mockClaudeLocal).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('T2RT-29 Claude offline-to-online metadata ownership', () => {
+    it.each(['0', '1'])('passes captured %s to the local bridge without enabling a remote queue', async seed => {
+        const configureInputEvidenceRecovery = vi.fn();
+        const configureInputQueue = vi.fn();
+        mockSessionSyncClient.mockReturnValue({ configureInputEvidenceRecovery, configureInputQueue });
+        mockClaudeLocal.mockImplementationOnce(async () => {
+            // The bridge appears after an async boundary and after the seed was consumed.
+            process.env.HAPPY_INPUT_EVIDENCE = seed === '1' ? '0' : '1';
+            const initial = mockGetOrCreateSession.mock.calls[0][0] as { metadata: Session['metadata'] };
+            mockGetOrCreateSession.mockResolvedValueOnce({ id: 'local-reconnected', seq: 0, metadata: initial.metadata,
+                metadataVersion: 0, agentState: null, agentStateVersion: 0, encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' });
+            await mockStartOfflineReconnection.mock.calls[0][0]!.onReconnected();
+        });
+        await expect(runOffline({ HAPPY_INPUT_EVIDENCE: seed })).rejects.toMatchObject({ code: 0 });
+        expect(configureInputEvidenceRecovery).toHaveBeenCalledWith(seed === '1');
+        expect(configureInputQueue).not.toHaveBeenCalled();
+        expect(mockSessionSyncClient.mock.calls[0][0].metadata.inputEvidenceEnabled).toBe(seed === '1' ? true : undefined);
     });
 });
