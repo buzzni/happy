@@ -253,6 +253,13 @@ describe('machine-v2 actual launch and control consumer transaction', () => {
     expect([...t.disk.values()][0].current).toBeTruthy();
     expect(t.sessionEnvironment).not.toHaveBeenCalled();
   });
+  it('never creates execution-only during recovery of an ownership-coordinated launch', async () => {
+    const t = await setup(); t.loseIssue();
+    await expect(t.build().prepareLaunch({ ...t.input, ownershipPreparation: { launchId: 'owned-launch', tag: 'owned-tag' } })).rejects.toThrow();
+    await t.build().recoverLaunches();
+    expect(t.steps.filter(step => step === 'create')).toHaveLength(0);
+    expect(t.disk.get('owned-launch')?.pending?.ownershipManaged).toBe(true);
+  });
   it('isolates an unrecoverable initial launch while recovering another and permitting a fresh launch', async () => {
     const t = await setup(); t.loseIssue();
     await expect(t.build().prepareLaunch(t.input)).rejects.toThrow();

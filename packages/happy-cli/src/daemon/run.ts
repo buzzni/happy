@@ -1,3 +1,4 @@
+import { createOwnedSpawnRuntime } from './ownedSpawnRuntime';
 import { drainWorktreeOperations } from './worktreeOps';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
@@ -66,6 +67,7 @@ import {
   readPersistedSessions,
   hardenHappyHomePermissions,
   persistSession,
+  persistSessionDurably,
   persistPreparedMachineLaunch,
   recoverPreparedMachineLaunch,
   preparedMachineLaunchHomeDirs,
@@ -1847,6 +1849,7 @@ export async function startDaemon(): Promise<void> {
     let machineRotation: ReturnType<typeof createMachineRotationResolver<MachineSetupTokenRuntime>> | null = null;
     let sharedMachineScope = async (): Promise<string | null> => null;
     const pendingMachineStarts = new Set<string>();
+    const ownedMachineLaunches = new WeakMap<SpawnSessionOptions, Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>>>();
     const channelSessionKeys = new WeakMap<SpawnSessionOptions, { key: Uint8Array; wrapped: Uint8Array }>();
     /** The runtime of an existing machine-rotation launch; recovery never depends on new issuance being accepted. */
     const machineRuntimeFor = async (companyId: string): Promise<MachineSetupTokenRuntime> => {
@@ -2087,8 +2090,8 @@ export async function startDaemon(): Promise<void> {
         // specs/session-source-metadata). Malformed values are dropped, never stored.
         const sessionSource = normalizeSessionSource(options.sessionSource);
         const credentialStartedAt = Date.now();
-        let preparedMachineLaunch: Awaited<ReturnType<MachineSetupTokenRuntime['prepareLaunch']>> | undefined;
-        const machineRotationRuntime = await machineRotationFor(options);
+        let preparedMachineLaunch = ownedMachineLaunches.get(options);
+        const machineRotationRuntime = preparedMachineLaunch ? null : await machineRotationFor(options);
         if (machineRotationRuntime) {
           const ownerCredentials = stagedUserHomeDir
             ? parseCredentials(JSON.parse(await fs.readFile(join(stagedUserHomeDir, 'access.key'), 'utf8')))
@@ -2107,6 +2110,8 @@ export async function startDaemon(): Promise<void> {
               ...(sessionSource ? { source: sessionSource } : {}) },
             createSession: input => ownerApi.getOrCreateSession({ ...input, dataKey: channelSessionKeys.get(options) }),
           });
+        }
+        if (preparedMachineLaunch) {
           preparedMachineSessionId = preparedMachineLaunch.session.id;
           pendingMachineStarts.add(preparedMachineSessionId);
         }
@@ -5259,8 +5264,31 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
 
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      registration: async () => {
+        const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
+        if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
+        // Never replace the running daemon's registration with a descriptor's claims.
+        if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
+        return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
+      },
+      metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
+        homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
+        flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now() }),
+      rotation: (options, companyId) => companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
+      start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return spawnSessionAdmitted(options); },
+      tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: tracked => tracked.pid > 0 && isPidAlive(tracked.pid),
+      persist: async session => {
+        // Rotation has already persisted its execution binding; retain that trusted resume state.
+        const prior = readPersistedSessions()[session.id];
+        return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
+          seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
+          savedAt: Date.now(), lastProcessedSeq: 0 });
+      },
+    });
     // Set RPC handlers
     apiMachine.setRPCHandlers({
+      ownedSpawn,
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,

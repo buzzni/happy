@@ -14,7 +14,7 @@ const bindingRecord = z.string().max(8192).refine(raw => {
 })
 const schema = z.object({ version: z.literal(1), launchId: z.string().min(1).max(128),
   startSubmitted: z.boolean().optional(), current: bindingRecord.optional(), currentOperationId: z.string().min(1).max(128).optional(), pending: z.object({ request: DaemonRotationRequestBodySchema,
-    createBody: SessionExecutionCreateBodySchema.optional(), createProofBody: HappySessionCreateProofBodySchema.optional(), machineOwnerAccountId: z.string().min(1).max(128).optional(),
+    ownershipManaged: z.boolean().optional(), createBody: SessionExecutionCreateBodySchema.optional(), createProofBody: HappySessionCreateProofBodySchema.optional(), machineOwnerAccountId: z.string().min(1).max(128).optional(),
     binding: MachineSetupTokenBindingV2Schema.optional(), bindingDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     record: bindingRecord.optional(), claimOperationId: z.string(), commitOperationId: z.string(),
   }).strict().optional(),

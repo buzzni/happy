@@ -1,3 +1,4 @@
+import { registerOwnedSpawnRpc, type OwnedSpawnRpc } from '@/daemon/ownedSpawnRpc';
 import { z } from 'zod';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
@@ -564,6 +565,7 @@ type IsolatedViewerStartResult = {
 } & ViewerBrowserState;
 
 type MachineRpcHandlers = {
+    ownedSpawn?: OwnedSpawnRpc;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     resumeSession?: (sessionId: string, options?: {
@@ -1112,7 +1114,9 @@ export class ApiMachineClient {
         difficultyRouting,
         browserSessionWaiting,
         channelHostCall,
+        ownedSpawn,
     }: MachineRpcHandlers) {
+        if (!this.windowsStandaloneTrial) registerOwnedSpawnRpc((method, handler) => this.rpcHandlerManager.registerHandler(method, handler), ownedSpawn);
         this.daemonSessionStateRpcAvailable = !!daemonSessionState;
         if (daemonSessionState) {
             this.rpcHandlerManager.registerHandler('daemon-session-state', daemonSessionState);
