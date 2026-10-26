@@ -3,11 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import nacl from 'tweetnacl';
-import { signOwnership, ownershipDigest, sessionCreateBodyHash, sessionTagHash, rotationSha256 } from '@slopus/happy-wire';
+import { signOwnership, ownershipDigest, sessionCreateBodyHash, rotationSha256, sharedMachineRotationFixture } from '@slopus/happy-wire';
 import type { Metadata } from '@/api/types';
 import type { TrackedSession } from './types';
 import { createOwnedSpawnRuntime } from './ownedSpawnRuntime';
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
+import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 const homes: string[] = [];
 afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
 async function fixture() {
@@ -25,10 +26,11 @@ async function fixture() {
         if (String(url).includes('/v2/sessions')) return Response.json({ sessions: raw ? [raw] : [], hasNext: false, nextCursor: null });
         expect(String(url)).toBe('https://happy.test/v1/sessions'); posts++;
         const body = JSON.parse(String(options?.body));
-        raw = { id: 'session', seq: 0, metadataVersion: 1, agentStateVersion: 1, metadata: body.metadata, agentState: body.agentState, dataEncryptionKey: body.dataEncryptionKey };
+        raw = { id: 'session', seq: 0, metadataVersion: 0, agentStateVersion: 0, metadata: body.metadata,
+            agentState: body.executionProof || body.ownershipProof ? body.agentState ?? null : null, dataEncryptionKey: body.dataEncryptionKey ?? null };
         if (lose) throw new Error('lost ACK');
-        const { ownershipProof: _proof, ...create } = body;
-        return Response.json({ session: raw, ownership: { sessionId: 'session', ownershipBindingId: 'binding', registrationState: 'pending', createDigest: await sessionCreateBodyHash(create) } });
+        const { ownershipProof, executionProof: _executionProof, ...create } = body;
+        return Response.json({ session: raw, ...(ownershipProof ? { ownership: { sessionId: 'session', ownershipBindingId: 'binding', registrationState: 'pending', createDigest: await sessionCreateBodyHash(create) } } : {}) });
     }) as typeof fetch;
     const persist = vi.fn(async () => ({ status: 'committed' as const }));
     const build = () => createOwnedSpawnRuntime({ home, happyOrigin: signed.audience, env: { HAPPY_SESSION_OWNERSHIP_ENABLED: '1', HAPPY_SESSION_OWNERSHIP_ISSUER: signed.issuer,
@@ -44,7 +46,7 @@ async function fixture() {
             return { type: 'success', sessionId: 'session' };
         },
     });
-    return { spawn, intent, build, persist, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
+    return { spawn, intent, build, persist, journal: createOwnedSpawnJournal(home), clearAgentState: () => { raw!.agentState = null }, counts: () => ({ posts, starts }), lose: () => { lose = true }, logout: () => { current = false },
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
             nonce: Buffer.alloc(32, 1).toString('base64url'), createBodyHash: p.sessionCreateBodyHash, tagHash: p.sessionTagHash }, keys.secretKey) };
 }
@@ -81,4 +83,37 @@ it('recovers exact encrypted create after lost response and restart, starts pend
     expect(await next.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'created', sessionId: 'session', ownershipOutcome: 'pending' });
     await next.start({ creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
     expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+});
+
+it('recovers an unsigned creation with null server agentState after a lost response and daemon restart without duplicating it', async () => {
+    const f = await fixture(), runtime = f.build();
+    const p = await runtime.prepare({ spawn: f.spawn, intent: f.intent }); f.lose();
+    const request = { creationRequestId: 'creation', preparationId: p.preparationId, unprovenReason: 'ownership-timeout' };
+    expect(await runtime.commit(request)).toMatchObject({ state: 'committing' });
+    const next = f.build();
+    expect(await next.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'created', sessionId: 'session', ownershipOutcome: 'unproven' });
+    expect(await next.commit(request)).toMatchObject({ sessionId: 'session' });
+    const start = { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' };
+    expect(await next.start(start)).toMatchObject({ state: 'started', sessionId: 'session' });
+    await next.start(start);
+    expect(f.persist).toHaveBeenCalledWith(expect.objectContaining({ id: 'session', agentState: null }));
+    expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+});
+
+it.each(['execution', 'ownership'])('keeps agentState bound during %s proof recovery', async kind => {
+    const f = await fixture(), runtime = f.build();
+    const p = await runtime.prepare({ spawn: f.spawn, intent: f.intent });
+    if (kind === 'execution') {
+        // Seed the durable execution-proof snapshot normally supplied by the rotation port.
+        const record = (await f.journal.read('creation'))!;
+        record.snapshot!.executionProof = sharedMachineRotationFixture.executionProof as NonNullable<typeof record.snapshot>['executionProof'];
+        await f.journal.write(record);
+    }
+    f.lose();
+    await runtime.commit({ creationRequestId: 'creation', preparationId: p.preparationId,
+        ...(kind === 'execution' ? { unprovenReason: 'ownership-timeout' } : { ownershipProof: f.proof(p) }) });
+    f.clearAgentState();
+    const next = f.build();
+    expect(await next.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'committing' });
+    expect(f.counts()).toEqual({ posts: 1, starts: 0 });
 });

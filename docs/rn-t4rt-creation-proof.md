@@ -57,3 +57,23 @@ T1c 기반 통합 전 비활성이다. 배지=T2, 공식 pin=T2r. 실제 서버�
   `9ee84191`과 현재 각각 82개 시나리오의 OFF wire·metadata·전이·기존 소비자가 동일하다.
 - descriptor revision refresh·계정/머신/subject 전환 및 permanent invalidation 24개 테스트도 통과했다.
 - 전체 테스트·실제 A+/Happy 배포 서버·provider 실행·UI 실앱 검증은 실행하지 않았다.
+
+## 교차 리뷰 보완 (T4RT-01·02, 2026-10-26)
+
+- 증명 없는 생성은 서버가 agentState를 저장하지 않으므로 복구 시 metadata와 dataEncryptionKey의
+  정확한 암호문으로 후보를 찾는다. ownershipProof 또는 executionProof가 있으면 agentState 결속도
+  유지한다. 서버 API·생성 저장 의미는 변경하지 않는다. 실제 저장 형태(null state·0 versions)를 쓰는
+  회귀에서 응답 유실·daemon 재시작 뒤 같은 세션을 회수하고 POST/start 중복이 없음을 확인한다.
+- Codex가 daemon의 consume-once fresh-launch 표식을 초기 프롬프트 준비에 전달한다. 실제 runCodex →
+  initialPrompt → 큐 → provider client 호출 경계를 구동해 신규 precreated 세션만 1회 전달하고 일반
+  reconnect는 재전달하지 않음을 확인한다. 초기 프롬프트/표식은 소비 후 환경에서 제거된다.
+- Claude는 같은 처리가 이미 있으며 기존 runClaude 회귀로 확인한다. Gemini는 초기 프롬프트를 직접
+  consume-once 처리하고 reconnect ID로 폐기하지 않는다. ACP/OpenClaw는 이 reconnect bootstrap을
+  소비하지 않는다. 세 runner 모두 현재 owned-spawn schema의 Claude/Codex 허용 목록 밖이므로
+  지원 범위를 넓히지 않는다.
+- 서버·세션 이벤트 wire 변경 없음. Desktop 작업 트리는 이 리뷰 보완에서 수정하지 않는다.
+- 검증: 두 결함을 실패 테스트로 확인한 뒤 최소 수정으로 통과시켰다. 최종 저장소 기본 Vitest
+  명령(global setup의 tsc/pkgroll 포함)에서 ownedSpawn/runtime, reconnect/sessionEnv, Codex
+  initialPrompt/runCodex, Claude initialPrompt/runClaude, OFF parity 9개 파일 272 passed / 1 의도적
+  미선택(ON parity). OFF는 9ee84191과 각각 82개 시나리오를 재생해 동일성을 확인했다.
+  git diff --check 통과. 전체 suite·실제 배포 서버·실제 provider 실행은 수행하지 않았다.

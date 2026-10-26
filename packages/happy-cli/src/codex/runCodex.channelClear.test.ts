@@ -13,6 +13,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ExecSyncOptions } from 'node:child_process';
 import { logger } from '@/ui/logger';
+import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from '@/daemon/reconnectSessionEnv';
+import type { Metadata } from '@/api/types';
 
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 
@@ -220,6 +222,29 @@ describe('the real Codex consumer loop', () => {
             .filter(ev => ev?.t === 'channel-ready' && ev.requestId === requestId);
         expect(ready, `no channel-ready for ${requestId}`).toHaveLength(1);
     }
+
+    it.each([true, false])('delivers a precreated session initial prompt once only for a fresh launch (%s)', async fresh => {
+        sessionMetadata = { path: '/workspace/project', flavor: 'codex' };
+        const reconnect = buildReconnectSessionEnvironment({
+            sessionId: 'sess-1', encryption: { encryptionKey: new Uint8Array(32).fill(7), encryptionVariant: 'dataKey', seq: 0, metadataVersion: 1, agentStateVersion: 1 },
+            serverSnapshot: { metadata: sessionMetadata as Metadata, seq: 0, metadataVersion: 1, agentStateVersion: 1 }, baselineSeq: 0,
+        });
+        for (const [key, value] of Object.entries(reconnect)) vi.stubEnv(key, value);
+        if (fresh) vi.stubEnv(RECONNECT_FRESH_LAUNCH_ENV, '1');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT', 'start this owned conversation');
+        vi.stubEnv('HAPPY_INITIAL_PROMPT_LOCAL_ID', 'owned-first-prompt');
+        const { stub } = await run(async () => { queues[0]!.close(); });
+        expect(turnsSent).toHaveLength(fresh ? 1 : 0);
+        if (fresh) {
+            expect(turnsSent[0].text).toContain('start this owned conversation');
+            expect(stub.sendSessionProtocolMessage).toHaveBeenCalledWith(
+                expect.objectContaining({ role: 'user', ev: { t: 'text', text: 'start this owned conversation' } }), 'owned-first-prompt');
+        }
+        expect(protocolMessages.filter(m => (m as { role?: string }).role === 'user')).toHaveLength(fresh ? 1 : 0);
+        expect(process.env.HAPPY_INITIAL_PROMPT).toBeUndefined();
+        expect(process.env.HAPPY_INITIAL_PROMPT_LOCAL_ID).toBeUndefined();
+        expect(process.env[RECONNECT_FRESH_LAUNCH_ENV]).toBeUndefined();
+    }, 60_000);
 
     /** Step A: the harness itself. Nothing below means anything if this cannot run one turn. */
     it('consumes one local message, takes a turn, and ends when the queue closes', async () => {

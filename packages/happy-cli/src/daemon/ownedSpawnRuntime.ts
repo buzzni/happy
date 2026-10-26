@@ -99,9 +99,13 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             const page = z.object({ sessions: z.array(rawSessionSchema), nextCursor: z.string().nullable(), hasNext: z.boolean() })
                 .parse(await json(`/v2/sessions?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`));
             const body = record.snapshot!.body;
+            // Legacy proof-less creation does not persist agentState. Proof-bound creation does,
+            // so retain its exact encrypted-state binding (including execution-only launches).
+            const bindsAgentState = Boolean(record.proof || record.snapshot!.executionProof);
             for (const raw of page.sessions) {
                 if (record.created ? raw.id === record.created.sessionId
-                    : raw.metadata === body.metadata && raw.agentState === (body.agentState ?? null) && (raw.dataEncryptionKey ?? null) === (body.dataEncryptionKey ?? null)) {
+                    : raw.metadata === body.metadata && (!bindsAgentState || raw.agentState === (body.agentState ?? null))
+                        && (raw.dataEncryptionKey ?? null) === (body.dataEncryptionKey ?? null)) {
                     if (record.created) return raw;
                     if (candidate && candidate.id !== raw.id) throw new Error('ambiguous-created-session');
                     candidate = raw;
