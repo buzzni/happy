@@ -559,6 +559,69 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
             vi.useRealTimers();
         }
     });
+
+    it('answers the next user message in the live provider when the refused provider exited while no account was left', async () => {
+        // The rebind is still in flight when the refused provider exits, so both generations wait for it.
+        let finishRebind!: () => void;
+        vi.mocked(requestSetupTokenRebind).mockImplementation(() => new Promise(resolve => {
+            finishRebind = () => resolve({ ok: false, reason: 'NO_ACCOUNT' });
+        }));
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const generations: Array<{ prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const generation = { prompts: [] as string[] };
+            generations.push(generation);
+            const index = generations.length;
+            const response = (async function* () {
+                const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    if (generation.prompts.length === 0) yield init;
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    if (index === 1) {
+                        yield refused;
+                        yield { type: 'result', subtype: 'success', result: 'Claude AI usage limit reached', is_error: true, uuid: 'result-1' };
+                        // The refused provider process ends on its own while the rebind is pending.
+                        return;
+                    }
+                    yield assistant(`msg-${index}`);
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${index}` };
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session: Record<string, unknown> = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(), onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        const launched = claudeRemoteLauncher(session as unknown as Session);
+        await vi.waitFor(() => expect(requestSetupTokenRebind).toHaveBeenCalledTimes(1));
+        // Let the refused provider end and the next generation start waiting for its first input.
+        for (let tick = 0; tick < 50; tick++) await new Promise(resolve => setImmediate(resolve));
+        finishRebind();
+        for (let tick = 0; tick < 50; tick++) await new Promise(resolve => setImmediate(resolve));
+        queue.push('continue please', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        // Taken by the ended generation's wait, the message was dropped and the live one waited forever.
+        await vi.waitFor(() => expect(generations).toHaveLength(2), { timeout: 3_000 });
+        await launched;
+
+        expect(generations[1].prompts[0]).toContain('continue please');
+    });
 });
 
 function pinnedSdkControls() {

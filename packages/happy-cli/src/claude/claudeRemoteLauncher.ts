@@ -944,6 +944,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             }
                             continuation = null;
                         }
+                        // The provider ended while this call waited above (an account switch outlives a refused
+                        // provider). The live generation waits for input now: a wait registered here would replace
+                        // its waiter and hand the next message to a provider that is gone.
+                        if (providerEnded) return null;
                         if (pending) {
                             // A held-back batch is a turn like any other: refused once input is closed.
                             if (drain && !drain.claimTurn()) { exitReason = 'exit'; return null; }
