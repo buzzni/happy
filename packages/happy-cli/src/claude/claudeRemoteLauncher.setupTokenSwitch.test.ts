@@ -15,13 +15,14 @@ import { hashObject } from '@/utils/deterministicJson';
 import { requestSetupTokenRebind, reportSetupTokenUsage, requestSetupTokenAvailability, returnFromPersonalClaude } from '@/daemon/controlClient';
 import { APPLY_REQUIRED_NOTICE, CONTINUE_PROMPT, RESUME_REBOUND_NOTICE, SWITCHED_NOTICE } from './setupTokenAccountSwitching';
 import { PERSONAL_RECHECK_NOTICE } from './personalClaudeFallback';
+import { claudeCheckSession } from './utils/claudeCheckSession';
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (original) => ({
     ...await original<typeof import('@anthropic-ai/claude-agent-sdk')>(),
     query: vi.fn(),
 }));
 // The Claude conversation file lives in the provider's config directory, which a test does not have.
-vi.mock('./utils/claudeCheckSession', () => ({ claudeCheckSession: () => true }));
+vi.mock('./utils/claudeCheckSession', () => ({ claudeCheckSession: vi.fn(() => true) }));
 vi.mock('@/daemon/controlClient', async (original) => ({
     ...await original<typeof import('@/daemon/controlClient')>(),
     requestSetupTokenAvailability: vi.fn(), returnFromPersonalClaude: vi.fn(),
@@ -621,6 +622,77 @@ describe('setup-token account switch in the remote launcher (Saycode specs/claud
         await launched;
 
         expect(generations[1].prompts[0]).toContain('continue please');
+    });
+
+    // The ended generation was already waiting for input when its provider exited on its own.
+    it.each([
+        ['after the ended generation returned', 'consumeOneTimeFlags'],
+        ['while the next generation starts', 'claudeCheckSession'],
+    ] as const)('answers a message that arrives %s in the live provider', async (_when, hook) => {
+        const queue = new MessageQueue2<EnhancedMode>(hashObject);
+        const handlers = new Map<string, () => Promise<unknown>>();
+        const client = {
+            sessionId: 'happy-session-1',
+            rpcHandlerManager: { registerHandler: (name: string, handler: () => Promise<unknown>) => handlers.set(name, handler) },
+            updateAgentState: vi.fn(), updateMetadata: vi.fn(), getMetadata: () => ({}),
+            setClaudeRuntimeAccount: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendStreamDelta: vi.fn(),
+            setPendingTurnRequestId: vi.fn(), sendFinalAnswerForChannelTurn: vi.fn(),
+            applyClaudeTurnResult: vi.fn(), noteContextUsageSignal: vi.fn(), closeClaudeSessionTurn: vi.fn(), sendSessionEvent: vi.fn(),
+        };
+        const generations: Array<{ prompts: string[] }> = [];
+        vi.mocked(query).mockImplementation(({ prompt }) => {
+            const generation = { prompts: [] as string[] };
+            generations.push(generation);
+            const index = generations.length;
+            const response = (async function* () {
+                const init = { type: 'system', subtype: 'init', session_id: '', tools: [], mcp_servers: [], apiKeySource: 'none' };
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                    if (generation.prompts.length === 0) yield init;
+                    generation.prompts.push(JSON.stringify(message.message.content));
+                    yield assistant(`msg-${index}`);
+                    yield { type: 'result', subtype: 'success', result: 'done', is_error: false, uuid: `result-${index}` };
+                    if (index === 1) {
+                        // The provider exits on its own once its next-input wait is registered.
+                        await vi.waitFor(() => expect(Reflect.get(queue, 'waiter')).not.toBeNull());
+                        return;
+                    }
+                    void handlers.get('switch')!();
+                    return;
+                }
+            })();
+            return Object.assign(response, { mcpServerStatus: async () => [], setPermissionMode: async () => {} }) as unknown as ReturnType<typeof query>;
+        });
+        let arrived = false;
+        const arrive = () => {
+            if (arrived) return;
+            arrived = true;
+            queue.push('after exit', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        };
+        let checks = 0;
+        vi.mocked(claudeCheckSession).mockImplementation(() => {
+            if (hook === 'claudeCheckSession' && ++checks === 2) arrive();
+            return true;
+        });
+        queue.push('hello', { permissionMode: 'default', model: 'claude-sonnet-5' });
+        const session: Record<string, unknown> = {
+            lessonReviewLifecycle: { controller: new AbortController(), completedAssistantTurns: 0 },
+            cancelLessonReview: vi.fn(),
+            sessionId: 'claude-1', path: process.cwd(), queue, client, mcpServers: {},
+            api: { push: () => ({ sendSessionNotification: vi.fn() }) },
+            consumeOneTimeFlags: vi.fn(() => { if (hook === 'consumeOneTimeFlags') arrive(); }),
+            onThinkingChange: vi.fn(), onAbort: vi.fn(),
+        };
+
+        try {
+            const launched = claudeRemoteLauncher(session as unknown as Session);
+            // Taken by the ended generation's wait, the message was dropped and the live one waited forever.
+            await vi.waitFor(() => expect(generations).toHaveLength(2), { timeout: 3_000 });
+            await launched;
+        } finally {
+            vi.mocked(claudeCheckSession).mockImplementation(() => true);
+        }
+
+        expect(generations[1].prompts[0]).toContain('after exit');
     });
 });
 

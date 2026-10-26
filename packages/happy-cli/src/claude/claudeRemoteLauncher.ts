@@ -823,6 +823,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             abortController = controller;
             /** This generation's provider has ended; a wait it left behind must not take a due retry. */
             let providerEnded = false;
+            /** Aborted with `providerEnded`: an input wait this generation left behind frees the queue's single waiter slot. */
+            const generationEnded = new AbortController();
             abortFuture = new Future<void>();
             let modeHash: string | null = null;
             let mode: EnhancedMode | null = null;
@@ -1044,7 +1046,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             const personalWake = personalFallback?.signal() ?? null;
                             const wakes = [retryWake, switchWake, personalWake].filter((signal): signal is AbortSignal => signal !== null);
                             msg = await session.queue.waitForMessagesAndGetAsString(
-                                wakes.length ? AbortSignal.any([controller.signal, ...wakes]) : controller.signal,
+                                AbortSignal.any([controller.signal, generationEnded.signal, ...wakes]),
                                 drain ? () => drain.claimTurn() : undefined,
                             );
                             if (!msg && personalWake?.aborted && !controller.signal.aborted && providerStale()) return null;
@@ -1097,6 +1099,11 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 messageQueue.enqueue(pendingRequestItem(null, { inputs: [], inputCount: 0, continuation }));
                                 return true;
                             } };
+                        }
+                        // Woken by its own end, or handed a message just before it: the live generation answers it.
+                        if (providerEnded) {
+                            if (msg) { pending = msg; drain?.releaseClaim(); }
+                            return null;
                         }
                         // The user's own input replaces a waiting retry, and a background wait for an account.
                         if (msg) {
@@ -1436,6 +1443,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 }
             } finally {
                 providerEnded = true;
+                generationEnded.abort();
                 if (backgroundTasks) {
                     publishBackgroundTasks({ ...backgroundTasks, available: false });
                     backgroundTasks = undefined;
